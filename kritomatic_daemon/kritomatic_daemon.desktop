@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Kritomatic Daemon
+X-KDE-Library=kritomatic_daemon
+X-KDE-PluginInfo-Name=kritomatic_daemon
+ServiceTypes=Krita/PythonPlugin
+Type=Service

@@ -1,0 +1,17 @@
+category: layer
+command: move-active
+help: Move active layer to group
+args:
+- name: group_name
+  type: str
+  required: true
+  help: Destination group
+- name: --position
+  type: str
+  default: inside
+  choices:
+  - inside
+  - above
+  - below
+  help: Position relative to group
+action: move_active_layer_to_group

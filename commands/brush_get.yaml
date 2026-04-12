@@ -1,0 +1,5 @@
+category: brush
+command: get
+help: Get current brush properties
+args: []
+action: get_brush_properties

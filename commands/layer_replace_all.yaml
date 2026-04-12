@@ -1,0 +1,18 @@
+category: layer
+command: replace-all
+help: Replace text across all vector layers
+args:
+  - name: --old-text
+    type: str
+    required: true
+    help: Text to find
+  - name: --new-text
+    type: str
+    required: true
+    help: Text to replace with
+  - name: --scope
+    type: str
+    default: all
+    choices: [all, active]
+    help: Scope of search (all layers or active layer only)
+action: replace_all_text

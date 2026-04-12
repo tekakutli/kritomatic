@@ -1,0 +1,5 @@
+category: layer
+command: list
+help: List all layers
+args: []
+action: list_layers

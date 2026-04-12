@@ -1,0 +1,10 @@
+category: brush
+command: size
+help: Set brush size in pixels
+args:
+- name: value
+  type: int
+  required: true
+  help: Brush size in pixels (1-1000)
+action: set_brush_size
+mapping: value

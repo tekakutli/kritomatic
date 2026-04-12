@@ -1,0 +1,15 @@
+category: brush
+command: select-opaque
+help: Select opaque pixels
+args:
+- name: --mode
+  type: str
+  default: replace
+  choices:
+  - replace
+  - add
+  - subtract
+  - intersect
+  help: Selection mode
+action: select_opaque
+mapping: mode

@@ -1,0 +1,10 @@
+category: brush
+command: opacity
+help: Set brush opacity percentage
+args:
+- name: value
+  type: int
+  required: true
+  help: Opacity percentage (0-100)
+action: set_brush_opacity
+mapping: value

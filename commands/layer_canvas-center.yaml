@@ -1,0 +1,5 @@
+category: layer
+command: canvas-center
+help: Get canvas center coordinates
+args: []
+action: get_canvas_centerr

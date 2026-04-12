@@ -1,0 +1,12 @@
+category: mask
+command: add
+help: Add selection mask to layer
+args:
+- name: layer_name
+  type: str
+  required: true
+  help: Layer name
+- name: --from-selection
+  action: store_true
+  help: Use current selection
+action: add_selection_mask

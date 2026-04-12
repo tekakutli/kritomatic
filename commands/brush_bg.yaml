@@ -1,0 +1,10 @@
+category: brush
+command: bg
+help: Set background color
+args:
+- name: color
+  type: str
+  required: true
+  help: Hex color (e.g.,
+action: set_background_color
+mapping: color

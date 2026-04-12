@@ -1,0 +1,10 @@
+category: brush
+command: preset
+help: Switch to a brush preset
+args:
+- name: value
+  type: str
+  required: true
+  help: Brush preset name
+action: set_brush_preset
+mapping: value

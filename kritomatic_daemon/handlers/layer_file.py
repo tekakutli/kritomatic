@@ -39,7 +39,8 @@ class LayerFileHandler:
             if not os.path.exists(file_path):
                 return {'success': False, 'message': f'File not found: {file_path}'}
 
-            scaling_method = 'ToImageSize' if (width and height) else 'None'
+            # ALWAYS use 'None' for scaling - let transform mask handle everything
+            scaling_method = 'None'
             scaling_filter = 'Bicubic'
             file_layer = doc.createFileLayer(name, file_path, scaling_method, scaling_filter)
             doc.rootNode().addChildNode(file_layer, None)
@@ -47,12 +48,15 @@ class LayerFileHandler:
             from PyQt5.QtWidgets import QApplication
             QApplication.processEvents()
 
+            # If no transform needed, just return
             if not (width or height or x != 0 or y != 0):
                 doc.refreshProjection()
                 return {'success': True, 'message': f'Created file layer "{name}"', 'data': {'name': name, 'file_path': file_path}}
 
-            # Calculate scale
+            # Get original dimensions to calculate scale
             scale_x, scale_y = 1.0, 1.0
+
+            # Create a temporary layer to get original dimensions
             temp_doc = app.createDocument(1, 1, "__temp__", "RGBA", "U8", "", 72)
             temp_layer = temp_doc.createFileLayer("__temp__", file_path, 'None', 'Bicubic')
             temp_doc.rootNode().addChildNode(temp_layer, None)
@@ -60,14 +64,17 @@ class LayerFileHandler:
             QApplication.processEvents()
 
             bounds = temp_layer.bounds()
-            orig_width, orig_height = bounds.width(), bounds.height()
+            orig_width = bounds.width()
+            orig_height = bounds.height()
             temp_doc.close()
             QApplication.processEvents()
 
+            # Calculate scale factors
             if width and orig_width > 0:
                 scale_x = width / orig_width
             if height and orig_height > 0:
                 scale_y = height / orig_height
+            # Maintain aspect ratio if only one dimension specified
             if width and not height:
                 scale_y = scale_x
             if height and not width:
@@ -83,10 +90,13 @@ class LayerFileHandler:
             xml_str = transform_mask.toXML()
             root = ET.fromstring(xml_str)
 
+            # Update scale
             for elem in root.findall('.//scaleX'):
                 elem.set('value', str(scale_x))
             for elem in root.findall('.//scaleY'):
                 elem.set('value', str(scale_y))
+
+            # Update position (translation)
             for elem in root.findall('.//flattenedPerspectiveTransform'):
                 elem.set('m31', str(x))
                 elem.set('m32', str(y))

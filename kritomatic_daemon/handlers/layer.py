@@ -5,6 +5,8 @@ from .layer_text import LayerTextHandler
 from .layer_fill import LayerFillHandler
 from .layer_color import LayerColorHandler
 from .layer_export import LayerExportHandler
+from .layer_blend import LayerBlendHandler
+
 
 class LayerHandler:
     def __init__(self):
@@ -15,6 +17,7 @@ class LayerHandler:
         self.fill = LayerFillHandler()
         self.color = LayerColorHandler()
         self.export = LayerExportHandler()
+        self.blend = LayerBlendHandler()
 
     def execute(self, cmd_type, params):
         # Basic layer operations
@@ -38,6 +41,10 @@ class LayerHandler:
         # Fill operations
         elif cmd_type in ['fill_layer', 'fill_selection']:
             return self.fill.execute(cmd_type, params)
+
+        # Fill operations
+        elif cmd_type in ['create_blend_layer']:
+            return self.blend.execute(cmd_type, params)
 
         # Color operations
         elif cmd_type in ['apply_color_to_alpha', 'add_color_to_alpha_mask']:

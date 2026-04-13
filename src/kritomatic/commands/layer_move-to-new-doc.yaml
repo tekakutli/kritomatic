@@ -8,5 +8,5 @@ args:
   help: Name of the layer to move
 - name: --new-doc-name
   type: str
-  help: Name for the new document (defaults to layer name)
+  help: Name for the new document
 action: move_layer_to_new_document

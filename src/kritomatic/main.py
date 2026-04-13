@@ -10,10 +10,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from compiler import CommandCompiler
-from decorators import get_client
-from batch import BatchExecutor, BashConverter, BatchLibrary
-from registry import get_registry_manager
+from kritomatic.compiler import CommandCompiler
+from kritomatic.decorators import get_client, get_registry
+from kritomatic.batch import BatchExecutor, BashConverter, BatchLibrary
+from kritomatic.registry import get_registry_manager
 
 
 def main():

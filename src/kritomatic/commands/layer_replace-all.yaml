@@ -14,5 +14,5 @@ args:
     type: str
     default: all
     choices: [all, active]
-    help: Scope of search (all layers or active layer only)
+    help: Scope of search
 action: replace_all_text

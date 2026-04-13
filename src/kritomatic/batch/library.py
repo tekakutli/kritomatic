@@ -8,8 +8,8 @@ from typing import Dict, Any, List, Optional
 class BatchLibrary:
     def __init__(self, library_dir: Optional[Path] = None):
         if library_dir is None:
-            project_root = Path(__file__).parent.parent
-            library_dir = project_root / 'batches'
+            project_root = Path(__file__).parent.parent.parent.parent  # src/kritomatic/batch/ -> kritomatic/
+            library_dir = project_root / 'data' / 'batches'
         self.library_dir = library_dir
         self.library_dir.mkdir(parents=True, exist_ok=True)
 

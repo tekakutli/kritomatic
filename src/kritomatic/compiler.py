@@ -7,17 +7,28 @@ import shutil
 from datetime import datetime
 
 class CommandCompiler:
-    def __init__(self, base_dir=None):
-        self.base_dir = Path(base_dir) if base_dir else Path(__file__).parent
-        self.commands_dir = self.base_dir / 'commands'
-        self.bundles_dir = self.base_dir / 'bundles'
-        self.imported_dir = self.bundles_dir / 'imported'
-        self.generated_file = self.base_dir / 'commands_generated.py'
-        self.registry_cache = self.base_dir / '.command_registry.json'
+    def __init__(self):
+        # __file__ is src/kritomatic/compiler.py
+        # src_dir is src/kritomatic/
+        src_dir = Path(__file__).parent
+        # project_root is kritomatic/ (parent of src/)
+        self.project_root = src_dir.parent.parent
 
-        self.commands_dir.mkdir(exist_ok=True)
-        self.bundles_dir.mkdir(exist_ok=True)
-        self.imported_dir.mkdir(exist_ok=True)
+        # Commands are stored in src/kritomatic/commands/
+        self.commands_dir = src_dir / 'commands'
+
+        # Bundles are stored in data/bundles/
+        self.bundles_dir = self.project_root / 'data' / 'bundles'
+        self.imported_dir = self.bundles_dir / 'imported'
+
+        # Generated files go in src/kritomatic/
+        self.generated_file = src_dir / 'commands_generated.py'
+        self.registry_cache = src_dir / '.command_registry.json'
+
+        # Create directories if they don't exist
+        self.commands_dir.mkdir(parents=True, exist_ok=True)
+        self.bundles_dir.mkdir(parents=True, exist_ok=True)
+        self.imported_dir.mkdir(parents=True, exist_ok=True)
 
     def compile(self, force=False):
         all_commands = []

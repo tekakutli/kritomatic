@@ -47,38 +47,39 @@ class TransformHandler:
             if not doc:
                 return {'success': False, 'message': 'No active document'}
 
-            mask = NodeUtils.find_transform_mask(doc.rootNode(), mask_name)
+            def find_mask(node, name):
+                if node.type() == "transformmask" and node.name() == name:
+                    return node
+                for child in node.childNodes():
+                    result = find_mask(child, name)
+                    if result:
+                        return result
+                return None
+
+            mask = find_mask(doc.rootNode(), mask_name)
             if not mask:
                 return {'success': False, 'message': f'Transform mask "{mask_name}" not found'}
 
-            # Get and modify XML
+            import xml.etree.ElementTree as ET
             xml_str = mask.toXML()
-            root = ElementTree.fromstring(xml_str)
+            root = ET.fromstring(xml_str)
 
-            rad = math.radians(rot)
-            cos_r = math.cos(rad)
-            sin_r = math.sin(rad)
+            # Update scale
+            for scale_x in root.findall('.//scaleX'):
+                scale_x.set('value', str(sx))
+            for scale_y in root.findall('.//scaleY'):
+                scale_y.set('value', str(sy))
 
-            m11 = sx * cos_r
-            m12 = -sx * sin_r
-            m21 = sy * sin_r
-            m22 = sy * cos_r
+            # Update position (translation)
+            for transform in root.findall('.//flattenedPerspectiveTransform'):
+                transform.set('m31', str(tx))
+                transform.set('m32', str(ty))
 
-            final = root.find('finalTransform')
-            if final is None:
-                final = ElementTree.SubElement(root, 'finalTransform')
+            new_xml = ET.tostring(root, encoding='unicode')
+            mask.fromXML(new_xml)
 
-            final.set('m11', str(m11))
-            final.set('m12', str(m12))
-            final.set('m21', str(m21))
-            final.set('m22', str(m22))
-            final.set('dx', str(tx))
-            final.set('dy', str(ty))
-
-            mask.fromXML(ElementTree.tostring(root, encoding='unicode'))
             doc.refreshProjection()
+            return {'success': True, 'message': f'Transform mask "{mask_name}" updated'}
 
-            return {'success': True, 'message': f'Transform mask "{mask_name}" updated',
-                    'data': {'translate_x': tx, 'translate_y': ty, 'rotation': rot, 'scale_x': sx, 'scale_y': sy}}
         except Exception as e:
             return {'success': False, 'message': str(e)}

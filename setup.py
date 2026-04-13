@@ -1,14 +1,25 @@
-# setup.py
 from setuptools import setup, find_packages
 
 setup(
     name='kritomatic',
     version='1.0.0',
-    py_modules=['main', 'client', 'compiler', 'decorators'],
+    description='Command-line interface for Krita automation',
+    long_description=open('README.md').read(),
+    long_description_content_type='text/markdown',
+    author='tekakutli',
+    license='AGPLv3',
+    package_dir={'': 'src'},
+    packages=find_packages(where='src'),
+    include_package_data=True,
+    package_data={
+        'kritomatic': ['commands/*.yaml'],
+    },
     entry_points={
         'console_scripts': [
-            'kritomatic=main:main',
+            'kritomatic=kritomatic.__main__:main',
         ],
     },
-    install_requires=['pyyaml'],
+    install_requires=[
+        'pyyaml',
+    ],
 )

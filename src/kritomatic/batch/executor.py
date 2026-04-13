@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from client import KritaClient
+from kritomatic.client import KritaClient
 from .library import BatchLibrary
 
 

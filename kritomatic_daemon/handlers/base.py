@@ -81,12 +81,14 @@ class CommandHandler:
                         'select_opaque']:
             return self.handlers['brush'].execute(cmd_type, command)
 
-        # Layer commands
+        # Layer commands - all layer operations go to LayerHandler which dispatches internally
         elif cmd_type in ['create_layer', 'list_layers', 'set_active_layer', 'rename_active_layer',
                           'rename_layer_by_name', 'move_layer_to_group', 'move_active_layer_to_group',
-                          'create_file_layer', 'create_blend_layer', 'fill_layer', 'fill_selection',
-                          'add_vector_text', 'update_vector_text', 'list_shapes', 'replace_all_text',
-                          'move_layer_to_new_document']:
+                          'create_file_layer', 'convert_to_file_layer', 'create_blend_layer',
+                          'fill_layer', 'fill_selection', 'add_vector_text', 'update_vector_text',
+                          'list_shapes', 'replace_all_text', 'move_layer_to_new_document',
+                          'export_layer_to_file', 'apply_color_to_alpha', 'add_color_to_alpha_mask',
+                          'create_transform_mask', 'transform_mask']:
             return self.handlers['layer'].execute(cmd_type, command)
 
         # Palette commands
@@ -97,7 +99,7 @@ class CommandHandler:
         elif cmd_type in ['add_selection_mask', 'add_selection_mask_to_active']:
             return self.handlers['mask'].execute(cmd_type, command)
 
-        # Transform commands
+        # Transform commands (kept for direct access, though also routed through layer)
         elif cmd_type in ['create_transform_mask', 'transform_mask']:
             return self.handlers['transform'].execute(cmd_type, command)
 

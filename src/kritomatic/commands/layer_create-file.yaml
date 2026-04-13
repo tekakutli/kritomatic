@@ -1,0 +1,27 @@
+category: layer
+command: create-file
+help: Create a file layer with optional size and position
+args:
+- name: name
+  type: str
+  required: true
+  help: Layer name
+- name: --file-path
+  type: str
+  required: true
+  help: Absolute path to the image file
+- name: --width
+  type: int
+  help: Target width in pixels
+- name: --height
+  type: int
+  help: Target height in pixels
+- name: --x
+  type: float
+  default: 0
+  help: X position in pixels
+- name: --y
+  type: float
+  default: 0
+  help: Y position in pixels
+action: create_file_layer

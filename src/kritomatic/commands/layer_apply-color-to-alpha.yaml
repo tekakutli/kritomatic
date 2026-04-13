@@ -1,0 +1,17 @@
+category: layer
+command: apply-color-to-alpha
+help: Apply Color to Alpha filter destructively to a duplicate layer
+args:
+- name: layer_name
+  type: str
+  required: true
+  help: Name of the target layer
+- name: --color
+  type: str
+  default: '#ffffff'
+  help: Hex color to make transparent
+- name: --threshold
+  type: int
+  default: 255
+  help: Threshold for color matching
+action: apply_color_to_alpha

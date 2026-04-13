@@ -1,0 +1,12 @@
+category: layer
+command: convert-to-file
+help: Convert a regular layer to a file layer
+args:
+- name: layer_name
+  type: str
+  required: true
+  help: Name of the layer to convert
+- name: --output-path
+  type: str
+  help: Path to save the exported file
+action: convert_to_file_layer

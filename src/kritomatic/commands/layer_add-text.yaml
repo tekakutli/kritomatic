@@ -13,7 +13,7 @@ args:
 - name: --font-family
   type: str
   default: sans-serif
-  help: Font family (e.g., Arial, sans-serif)
+  help: Font family
 - name: --font-size
   type: int
   default: 12
@@ -29,7 +29,7 @@ args:
 - name: --color
   type: str
   default: '#000000'
-  help: Hex color (e.g.,
+  help: Hex color
 - name: --alignment
   type: str
   default: left

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import argparse
-from client import KritaClient
+from kritomatic.client import KritaClient
 
 _command_registry = {}
 _client = None

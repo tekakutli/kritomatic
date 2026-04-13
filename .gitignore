@@ -151,11 +151,15 @@ cython_debug/
 *.pid.lock
 
 # Other
+include/
 bin/
 lib64
 pyvenv.cfg
 
 #Project Cache
-.command_registry.json
-bundles/imported/
-batches/
+src/kritomatic/commands_generated.py
+src/kritomatic/.command_registry.json
+data/batches/*
+!data/batches/.gitkeep
+data/bundles/*
+!data/bundles/.gitkeep

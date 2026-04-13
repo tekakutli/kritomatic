@@ -14,8 +14,8 @@ class CommandRegistry:
 
     def __init__(self, cache_path: Optional[Path] = None):
         if cache_path is None:
-            project_dir = Path(__file__).parent
-            cache_path = project_dir / '.command_registry.json'
+            project_root = Path(__file__).parent.parent.parent
+            cache_path = project_root / 'src' / 'kritomatic' / '.command_registry.json'
         self.cache_path = cache_path
         self._registry = None
         self._parser = None

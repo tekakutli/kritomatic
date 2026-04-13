@@ -1,9 +1,0 @@
-category: palette
-command: activate
-help: Activate a palette
-args:
-- name: name
-  type: str
-  required: true
-  help: Palette name
-action: activate_palette

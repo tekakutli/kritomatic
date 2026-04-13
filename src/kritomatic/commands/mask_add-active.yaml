@@ -1,8 +1,0 @@
-category: mask
-command: add-active
-help: Add selection mask to active layer
-args:
-- name: --from-selection
-  action: store_true
-  help: Use current selection
-action: add_selection_mask_to_active

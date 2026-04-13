@@ -1,4 +1,5 @@
 from krita import *
+from ..decorators import command
 
 class DocumentHandler:
     def __init__(self):
@@ -22,6 +23,11 @@ class DocumentHandler:
             return self.create_new_with_dimensions(name, width, height, resolution, color_model, color_depth, profile)
         return {'success': False, 'message': f'Unknown document command: {cmd_type}'}
 
+    @command(
+        category='doc',
+        help_text='Get current document dimensions',
+        args={}
+    )
     def get_current_dimensions(self):
         """Get dimensions of current active document"""
         try:
@@ -51,6 +57,13 @@ class DocumentHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='doc',
+        help_text='Create a new document with same dimensions as current',
+        args={
+            'name': {'type': 'str', 'default': 'New Document', 'help': 'Name for the new document'}
+        }
+    )
     def create_new_from_current(self, name="New Document"):
         """Create a new document with same dimensions as current"""
         try:
@@ -88,6 +101,16 @@ class DocumentHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='doc',
+        help_text='Create a new document with custom dimensions',
+        args={
+            'name': {'type': 'str', 'default': 'New Document', 'help': 'Name for the new document'},
+            'width': {'type': 'int', 'default': 1920, 'help': 'Width in pixels'},
+            'height': {'type': 'int', 'default': 1080, 'help': 'Height in pixels'},
+            'resolution': {'type': 'float', 'default': 300, 'help': 'Resolution in DPI'}
+        }
+    )
     def create_new_with_dimensions(self, name, width, height, resolution=300,
                                    color_model="RGBA", color_depth="U8", profile=""):
         """Create a new document with custom dimensions"""
@@ -114,6 +137,11 @@ class DocumentHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='doc',
+        help_text='List all open documents',
+        args={}
+    )
     def get_all_documents(self):
         """Get list of all open documents"""
         try:
@@ -136,6 +164,13 @@ class DocumentHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='doc',
+        help_text='Save current document to file path',
+        args={
+            'file_path': {'type': 'str', 'required': True, 'help': 'File path to save to'}
+        }
+    )
     def save_document(self, file_path):
         """Save current document to file path"""
         try:

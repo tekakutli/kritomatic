@@ -1,9 +1,0 @@
-category: doc
-command: new-from-current
-help: Create a new document with same dimensions as current
-args:
-- name: --name
-  type: str
-  default: New Document
-  help: Name for the new document
-action: create_new_from_current

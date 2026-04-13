@@ -6,7 +6,7 @@ Control Krita from the command line.
 
 This is the CLI:
 ```bash
-pipx install .
+pipx install -e .
 ```
 
 You need to install the plugin for Krita:

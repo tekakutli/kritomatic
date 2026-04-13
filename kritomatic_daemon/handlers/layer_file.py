@@ -1,5 +1,6 @@
 import os
 from krita import Krita
+from ..decorators import command
 
 class LayerFileHandler:
     def execute(self, cmd_type, params):
@@ -9,6 +10,18 @@ class LayerFileHandler:
             return self.convert_to_file_layer(params)
         return {'success': False, 'message': f'Unknown file layer command: {cmd_type}'}
 
+    @command(
+        category='layer',
+        help_text='Create a file layer with optional size and position',
+        args={
+            'name': {'type': 'str', 'required': True, 'help': 'Layer name'},
+            'file_path': {'type': 'str', 'required': True, 'help': 'Absolute path to the image file'},
+            'width': {'type': 'int', 'required': False, 'help': 'Target width in pixels'},
+            'height': {'type': 'int', 'required': False, 'help': 'Target height in pixels'},
+            'x': {'type': 'float', 'default': 0, 'help': 'X position in pixels'},
+            'y': {'type': 'float', 'default': 0, 'help': 'Y position in pixels'}
+        }
+    )
     def create_file_layer(self, params):
         try:
             app = Krita.instance()
@@ -104,6 +117,14 @@ class LayerFileHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='layer',
+        help_text='Convert a regular layer to a file layer (exports to .kra and re-imports)',
+        args={
+            'layer_name': {'type': 'str', 'required': True, 'help': 'Name of the layer to convert'},
+            'output_path': {'type': 'str', 'required': False, 'help': 'Path to save the exported file (auto-generated if not provided)'}
+        }
+    )
     def convert_to_file_layer(self, params):
         try:
             app = Krita.instance()
@@ -215,4 +236,3 @@ class LayerFileHandler:
 
         except Exception as e:
             return {'success': False, 'message': str(e)}
-

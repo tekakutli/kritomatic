@@ -1,5 +1,0 @@
-category: doc
-command: info
-help: Get current document dimensions
-args: []
-action: get_current_dimensions

@@ -1,5 +1,0 @@
-category: brush
-command: list
-help: List all brush presets
-args: []
-action: list_brush_presets

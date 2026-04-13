@@ -1,10 +1,12 @@
 import json
+import hashlib
 from .brush import BrushHandler
 from .layer import LayerHandler
 from .palette import PaletteHandler
 from .mask import MaskHandler
 from .transform import TransformHandler
 from .document import DocumentHandler
+from ..registry import get_command_registry
 
 
 class CommandHandler:
@@ -74,6 +76,19 @@ class CommandHandler:
         """Route command to appropriate handler"""
         cmd_type = command.get('type')
 
+        # Special case: get_schema returns the command registry with version
+        if cmd_type == 'get_schema':
+            registry = get_command_registry()
+            # Calculate version hash based on registry content
+            registry_str = json.dumps(registry, sort_keys=True)
+            version = hashlib.md5(registry_str.encode()).hexdigest()[:8]
+            return {
+                'success': True,
+                'message': 'Command registry retrieved',
+                'version': version,
+                'data': registry
+            }
+
         # Brush commands
         if cmd_type in ['set_brush_size', 'set_brush_opacity', 'set_brush_flow',
                         'set_brush_blending_mode', 'set_brush_preset', 'list_brush_presets',
@@ -81,7 +96,7 @@ class CommandHandler:
                         'select_opaque']:
             return self.handlers['brush'].execute(cmd_type, command)
 
-        # Layer commands - all layer operations go to LayerHandler which dispatches internally
+        # Layer commands
         elif cmd_type in ['create_layer', 'list_layers', 'set_active_layer', 'rename_active_layer',
                           'rename_layer_by_name', 'move_layer_to_group', 'move_active_layer_to_group',
                           'create_file_layer', 'convert_to_file_layer', 'create_blend_layer',
@@ -99,7 +114,7 @@ class CommandHandler:
         elif cmd_type in ['add_selection_mask', 'add_selection_mask_to_active']:
             return self.handlers['mask'].execute(cmd_type, command)
 
-        # Transform commands (kept for direct access, though also routed through layer)
+        # Transform commands
         elif cmd_type in ['create_transform_mask', 'transform_mask']:
             return self.handlers['transform'].execute(cmd_type, command)
 

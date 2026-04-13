@@ -1,4 +1,5 @@
 from krita import Krita
+from ..decorators import command
 
 class LayerFillHandler:
     def execute(self, cmd_type, params):
@@ -8,6 +9,16 @@ class LayerFillHandler:
             return self.fill_selection(params)
         return {'success': False, 'message': f'Unknown fill command: {cmd_type}'}
 
+    @command(
+        category='layer',
+        help_text='Fill a layer with a specific color',
+        args={
+            'layer_name': {'type': 'str', 'required': True, 'help': 'Name of the layer to fill'},
+            'color': {'type': 'str', 'required': False, 'help': 'Hex color to fill with (e.g., #ff0000)'},
+            'foreground': {'type': 'bool', 'default': False, 'help': 'Use current foreground color'},
+            'background': {'type': 'bool', 'default': False, 'help': 'Use current background color'}
+        }
+    )
     def fill_layer(self, params):
         try:
             app = Krita.instance()
@@ -70,6 +81,15 @@ class LayerFillHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='layer',
+        help_text='Fill the current selection with a specific color',
+        args={
+            'color': {'type': 'str', 'required': False, 'help': 'Hex color to fill with (e.g., #ff0000)'},
+            'foreground': {'type': 'bool', 'default': False, 'help': 'Use current foreground color'},
+            'background': {'type': 'bool', 'default': False, 'help': 'Use current background color'}
+        }
+    )
     def fill_selection(self, params):
         try:
             app = Krita.instance()

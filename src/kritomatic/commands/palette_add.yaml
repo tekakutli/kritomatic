@@ -1,9 +1,0 @@
-category: palette
-command: add
-help: Add color to palette
-args:
-- name: name
-  type: str
-  required: true
-  help: Palette name
-action: add_to_palette

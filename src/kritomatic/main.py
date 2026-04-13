@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Krita Controller - Command-line interface for Krita
+Kritomatic - Command-line interface for Krita
 """
 
 import sys
@@ -10,110 +10,75 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from kritomatic.compiler import CommandCompiler
-from kritomatic.decorators import get_client, get_registry
-from kritomatic.batch import BatchExecutor, BashConverter, BatchLibrary
-from kritomatic.registry import get_registry_manager
+from decorators import get_client
+from batch import BatchExecutor, BashConverter, BatchLibrary
+from registry import get_registry_manager
+
+
+def send_to_daemon(category, subcommand, args_dict):
+    """Send a command to the daemon and print the response"""
+    client = get_client()
+    if not client.connect():
+        print("❌ Could not connect to daemon. Make sure Krita is running.")
+        return False
+
+    # Build the command type
+    # The daemon expects types like "create_file_layer", "set_brush_size", etc.
+    cmd_type = subcommand
+
+    # Send the command
+    response = client.execute(cmd_type, **args_dict)
+    if response:
+        print(json.dumps(response, indent=2))
+    else:
+        print("❌ No response from daemon")
+
+    client.close()
+    return True
 
 
 def main():
-    # First, try to load dynamic commands
+    # Handle --refresh flag (force refresh schema from daemon)
+    if '--refresh' in sys.argv:
+        from kritomatic.client import KritaClient
+
+        client = KritaClient()
+        if client.connect():
+            registry_mgr = get_registry_manager()
+            if registry_mgr.refresh_from_daemon(client):
+                print("✓ Schema refreshed from daemon")
+                registry_mgr.invalidate_cache()
+            else:
+                print("❌ Failed to refresh schema. Make sure Krita is running with the daemon enabled.")
+            client.close()
+        else:
+            print("❌ Could not connect to daemon. Make sure Krita is running.")
+        return
+
+    # Get registry manager
+    registry_mgr = get_registry_manager()
+    client = None
+
+    # Try to ensure schema is fresh (auto-refresh if cache missing or stale)
     try:
-        import commands_generated
-        from decorators import get_registry
-        registry = get_registry()
-        has_dynamic = bool(registry)
-    except ImportError:
-        registry = {}
-        has_dynamic = False
+        client = get_client()
+        if client.connect():
+            cached_version = registry_mgr._get_cached_version()
+            daemon_version = registry_mgr.get_daemon_version(client)
 
-    # Create parser with dynamic commands
-    parser = argparse.ArgumentParser(
-        prog='kritomatic',
-        description='kritomatic - Control Krita from the command line',
-        epilog='Examples:\n'
-               '  kritomatic brush size 75\n'
-               '  kritomatic layer create "My Layer"\n'
-               '  kritomatic layer fill "My Layer" --color "#ff0000"\n'
-               '  kritomatic layer add-text "Text Layer" --text "Hello" --x 400 --y 300\n'
-               '  kritomatic doc new --width 1920 --height 1080\n'
-               '  kritomatic batch run \'{"commands": [...]}\'\n'
-               '  kritomatic compile'
-    )
+            if cached_version is None or cached_version != daemon_version:
+                print(f"Schema version mismatch (cached: {cached_version}, daemon: {daemon_version}), refreshing...")
+                registry_mgr.refresh_from_daemon(client)
+        else:
+            print("⚠️ Could not connect to daemon, using cached schema if available")
+    except Exception as e:
+        print(f"⚠️ Error checking schema: {e}")
+    finally:
+        if client:
+            client.close()
 
-    subparsers = parser.add_subparsers(dest='command', help='Commands', required=True)
-
-    # ========== MANAGEMENT COMMANDS ==========
-    subparsers.add_parser('compile', help='Compile atomic YAMLs to Python')
-
-    import_parser = subparsers.add_parser('import', help='Import a command bundle (file path or pasted YAML)')
-    import_parser.add_argument('bundle_source', help='Path to bundle file (.kritomatic.yaml) or pasted YAML string')
-
-    export_parser = subparsers.add_parser('export', help='Export specific commands as a bundle')
-    export_parser.add_argument('-o', '--output', help='Output file path')
-    export_parser.add_argument('--category', help='Export only commands in this category')
-    export_parser.add_argument('--command', help='Export only this command')
-
-    export_all_parser = subparsers.add_parser('export-all', help='Export ALL commands as a bundle')
-    export_all_parser.add_argument('-o', '--output', required=True, help='Output file path')
-
-    export_schema_parser = subparsers.add_parser('export-schema', help='Export batch schema JSON')
-    export_schema_parser.add_argument('-o', '--output', help='Output file path')
-
-    remove_parser = subparsers.add_parser('remove', help='Remove a command')
-    remove_parser.add_argument('category', help='Command category')
-    remove_parser.add_argument('command', help='Command name')
-
-    list_parser = subparsers.add_parser('list', help='List all available commands')
-    list_parser.add_argument('--verbose', '-v', action='store_true', help='Show detailed information')
-    list_parser.add_argument('--tree', action='store_true', help='Show hierarchical view')
-    list_parser.add_argument('--category', help='Show only commands in this category')
-
-    subparsers.add_parser('clear', help='Delete ALL commands (confirmation required)')
-
-    clear_cat_parser = subparsers.add_parser('clear-category', help='Delete all commands in a category')
-    clear_cat_parser.add_argument('category', help='Category to clear')
-
-    # ========== BATCH COMMANDS ==========
-    batch_parser = subparsers.add_parser('batch', help='Batch operations')
-    batch_subparsers = batch_parser.add_subparsers(dest='batch_command', help='Batch subcommands', required=True)
-
-    batch_subparsers.add_parser('run', help='Run a batch from JSON string').add_argument('json_string', help='JSON string with batch commands')
-    batch_subparsers.add_parser('file', help='Run a batch from JSON file').add_argument('file_path', help='Path to JSON batch file')
-
-    save_parser = batch_subparsers.add_parser('save', help='Save a batch to the library')
-    save_parser.add_argument('name', help='Name for the saved batch')
-    save_parser.add_argument('json_string', help='JSON string with batch commands')
-
-    batch_subparsers.add_parser('run-saved', help='Run a saved batch from library').add_argument('name', help='Name of the saved batch')
-    batch_subparsers.add_parser('list-saved', help='List all saved batches in library')
-    batch_subparsers.add_parser('info', help='Show information about a saved batch').add_argument('name', help='Name of the saved batch')
-    batch_subparsers.add_parser('delete', help='Delete a saved batch from library').add_argument('name', help='Name of the saved batch')
-
-    translate_parser = batch_subparsers.add_parser('translate', help='Convert bash script to JSON')
-    translate_parser.add_argument('script_file', help='Path to bash script file')
-    translate_parser.add_argument('--save', help='Save to library with this name')
-
-    # ========== DYNAMIC COMMANDS ==========
-    if has_dynamic:
-        # Group commands by category
-        categories = {}
-        for (category, cmd_name), cmd_info in registry.items():
-            if category not in categories:
-                categories[category] = {}
-            categories[category][cmd_name] = cmd_info
-
-        for category, cmds in categories.items():
-            cat_parser = subparsers.add_parser(category, help=f'{category} operations')
-            cmd_subparsers = cat_parser.add_subparsers(dest='subcommand', help=f'{category} commands', required=True)
-
-            for cmd_name, cmd_info in cmds.items():
-                cmd_parser = cmd_subparsers.add_parser(cmd_name, help=cmd_info['help'])
-                func = cmd_info['func']
-                if hasattr(func, '_args'):
-                    for arg_name, arg_kwargs in func._args:
-                        cmd_parser.add_argument(arg_name, **arg_kwargs)
-                cmd_parser.set_defaults(func=func)
+    # Build parser from schema cache
+    parser = registry_mgr.get_parser()
 
     # Parse arguments
     if len(sys.argv) == 1:
@@ -124,49 +89,66 @@ def main():
 
     # Handle management commands
     if args.command == 'compile':
-        compiler = CommandCompiler()
-        compiler.compile()
-        get_registry_manager().invalidate_cache()
+        print("⚠️ 'compile' command is deprecated. Use '--refresh' to update schema from daemon.")
+        return
 
     elif args.command == 'import':
+        from compiler import CommandCompiler
         compiler = CommandCompiler()
-        compiler.import_bundle(args.bundle_source)
-        get_registry_manager().invalidate_cache()
+        compiler.import_bundle(args.bundle_file)
+        registry_mgr.invalidate_cache()
+        print("⚠️ Imported bundle. Run 'kritomatic --refresh' to update schema from daemon.")
+        return
 
     elif args.command == 'export':
+        from compiler import CommandCompiler
         compiler = CommandCompiler()
         compiler.export_bundle(args.output, args.category, args.command)
+        return
 
     elif args.command == 'export-all':
+        from compiler import CommandCompiler
         compiler = CommandCompiler()
         compiler.export_bundle(args.output, None, None)
+        return
 
     elif args.command == 'export-schema':
+        from compiler import CommandCompiler
         compiler = CommandCompiler()
         compiler.export_batch_schema(args.output)
+        return
 
     elif args.command == 'remove':
+        from compiler import CommandCompiler
         compiler = CommandCompiler()
         compiler.remove_command(args.category, args.command)
-        get_registry_manager().invalidate_cache()
+        registry_mgr.invalidate_cache()
+        print("⚠️ Command removed. Run 'kritomatic --refresh' to update schema from daemon.")
+        return
 
     elif args.command == 'list':
-        registry_mgr = get_registry_manager()
         registry_mgr.list_commands(
             verbose=getattr(args, 'verbose', False),
             tree=getattr(args, 'tree', False),
             category=getattr(args, 'category', None)
         )
+        return
 
     elif args.command == 'clear':
+        from compiler import CommandCompiler
         compiler = CommandCompiler()
         compiler.clear_all_commands()
-        get_registry_manager().invalidate_cache()
+        registry_mgr.invalidate_cache()
+        print("⚠️ All commands cleared. Run 'kritomatic --refresh' to update schema from daemon.")
+        return
 
     elif args.command == 'clear-category':
+        from compiler import CommandCompiler
         compiler = CommandCompiler()
         compiler.clear_category(args.category)
-        get_registry_manager().invalidate_cache()
+        registry_mgr.invalidate_cache()
+        print("⚠️ Category cleared. Run 'kritomatic --refresh' to update schema from daemon.")
+        return
 
     # Handle batch commands
     elif args.command == 'batch':
@@ -186,6 +168,7 @@ def main():
                 print(f"❌ Invalid JSON: {e}")
             finally:
                 executor.close()
+            return
 
         elif args.batch_command == 'file':
             executor = BatchExecutor()
@@ -205,6 +188,7 @@ def main():
                 print(f"❌ Invalid JSON in file: {e}")
             finally:
                 executor.close()
+            return
 
         elif args.batch_command == 'save':
             library = BatchLibrary()
@@ -219,6 +203,7 @@ def main():
                     print(f"❌ Failed to save batch '{args.name}'")
             except json.JSONDecodeError as e:
                 print(f"❌ Invalid JSON: {e}")
+            return
 
         elif args.batch_command == 'run-saved':
             library = BatchLibrary()
@@ -237,6 +222,7 @@ def main():
                 executor.close()
             else:
                 print(f"❌ Batch '{args.name}' not found")
+            return
 
         elif args.batch_command == 'list-saved':
             library = BatchLibrary()
@@ -248,6 +234,7 @@ def main():
                     print(f"  📄 {name} - {info['command_count']} commands")
             else:
                 print("No saved batches found")
+            return
 
         elif args.batch_command == 'info':
             library = BatchLibrary()
@@ -266,6 +253,7 @@ def main():
                         print(f"     ... and {len(batch['commands']) - 5} more")
             else:
                 print(f"❌ Batch '{args.name}' not found")
+            return
 
         elif args.batch_command == 'delete':
             library = BatchLibrary()
@@ -273,6 +261,7 @@ def main():
                 print(f"✓ Batch '{args.name}' deleted")
             else:
                 print(f"❌ Batch '{args.name}' not found")
+            return
 
         elif args.batch_command == 'translate':
             converter = BashConverter()
@@ -293,16 +282,17 @@ def main():
                 print(f"❌ Script file not found: {args.script_file}")
             except Exception as e:
                 print(f"❌ Error: {e}")
+            return
 
-    # Handle dynamic commands
-    elif hasattr(args, 'func'):
-        client = get_client()
-        kwargs = {k: v for k, v in vars(args).items()
-                 if k not in ['func', 'command', 'subcommand'] and v is not None}
-        result = args.func(client, **kwargs)
-        if result:
-            print(json.dumps(result, indent=2))
-        client.close()
+    # Handle dynamic commands (send to daemon)
+    elif hasattr(args, 'subcommand'):
+        # Build arguments dictionary
+        kwargs = {}
+        for key, value in vars(args).items():
+            if key not in ['command', 'subcommand', 'func'] and value is not None:
+                kwargs[key] = value
+
+        send_to_daemon(args.command, args.subcommand, kwargs)
 
     else:
         parser.print_help()

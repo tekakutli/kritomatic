@@ -11,9 +11,6 @@ setup(
     package_dir={'': 'src'},
     packages=find_packages(where='src'),
     include_package_data=True,
-    package_data={
-        'kritomatic': ['commands/*.yaml'],
-    },
     entry_points={
         'console_scripts': [
             'kritomatic=kritomatic.__main__:main',

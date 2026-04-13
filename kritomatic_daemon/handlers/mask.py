@@ -1,4 +1,5 @@
 from krita import *
+from ..decorators import command
 
 class MaskHandler:
     def execute(self, cmd_type, params):
@@ -13,6 +14,14 @@ class MaskHandler:
             )
         return {'success': False, 'message': f'Unknown mask command: {cmd_type}'}
 
+    @command(
+        category='mask',
+        help_text='Add a selection mask to a layer',
+        args={
+            'layer_name': {'type': 'str', 'required': True, 'help': 'Name of the target layer'},
+            'use_current_selection': {'type': 'bool', 'default': False, 'help': 'Use current global selection'}
+        }
+    )
     def add_selection_mask(self, layer_name, use_selection=False):
         try:
             doc = Krita.instance().activeDocument()
@@ -55,6 +64,13 @@ class MaskHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='mask',
+        help_text='Add a selection mask to the currently active layer',
+        args={
+            'use_current_selection': {'type': 'bool', 'default': False, 'help': 'Use current global selection'}
+        }
+    )
     def add_selection_mask_to_active(self, use_selection=False):
         try:
             doc = Krita.instance().activeDocument()

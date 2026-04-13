@@ -1,5 +1,0 @@
-category: palette
-command: list
-help: List all palettes
-args: []
-action: list_palettes

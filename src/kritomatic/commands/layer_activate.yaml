@@ -1,9 +1,0 @@
-category: layer
-command: activate
-help: Activate a layer
-args:
-- name: name
-  type: str
-  required: true
-  help: Layer name
-action: set_active_layer

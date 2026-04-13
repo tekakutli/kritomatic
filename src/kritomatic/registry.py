@@ -1,7 +1,6 @@
 """Unified command registry with JSON cache and parser caching"""
 
 import json
-import argparse
 import hashlib
 from pathlib import Path
 from typing import Dict, Any, Optional, List
@@ -14,284 +13,118 @@ class CommandRegistry:
 
     def __init__(self, cache_path: Optional[Path] = None):
         if cache_path is None:
-            project_root = Path(__file__).parent.parent.parent
-            cache_path = project_root / 'src' / 'kritomatic' / '.command_registry.json'
+            project_dir = Path(__file__).parent
+            cache_path = project_dir / '.schema_cache.json'
         self.cache_path = cache_path
         self._registry = None
-        self._parser = None
+        self._cached_version = None
 
-    def _get_registry_paths(self) -> List[Path]:
-        """Get all source files that affect the registry"""
-        paths = []
-
-        # Dynamic commands from YAMLs
-        yaml_dir = Path(__file__).parent / 'commands'
-        if yaml_dir.exists():
-            paths.extend(yaml_dir.glob('*.yaml'))
-
-        # Registry cache itself
+    def _get_cached_version(self) -> Optional[str]:
+        """Get version from cached schema"""
         if self.cache_path.exists():
-            paths.append(self.cache_path)
-
-        return paths
-
-    def _get_current_hash(self) -> str:
-        """Compute hash of all source files"""
-        paths = self._get_registry_paths()
-        hasher = hashlib.md5()
-
-        for path in sorted(paths):
-            hasher.update(str(path).encode())
-            if path.exists():
-                hasher.update(str(path.stat().st_mtime).encode())
-
-        return hasher.hexdigest()
-
-    def _load_base_registry(self) -> Dict[str, Any]:
-        """Load base registry with hardcoded commands"""
-        return {
-            "version": 1,
-            "commands": {
-                "compile": {
-                    "type": "management",
-                    "help": "Compile atomic YAMLs to Python",
-                    "args": []
-                },
-                "import": {
-                    "type": "management",
-                    "help": "Import a command bundle",
-                    "args": [
-                        {"name": "bundle_file", "required": True, "help": "Path to the bundle file (.kritomatic.yaml)"}
-                    ]
-                },
-                "export": {
-                    "type": "management",
-                    "help": "Export specific commands as a bundle",
-                    "args": [
-                        {"name": "-o", "dest": "output", "help": "Output file path"},
-                        {"name": "--category", "dest": "category", "help": "Export only commands in this category"},
-                        {"name": "--command", "dest": "command", "help": "Export only this command"}
-                    ]
-                },
-                "export-all": {
-                    "type": "management",
-                    "help": "Export ALL commands as a bundle",
-                    "args": [
-                        {"name": "-o", "dest": "output", "required": True, "help": "Output file path"}
-                    ]
-                },
-                "export-schema": {
-                    "type": "management",
-                    "help": "Export batch schema JSON",
-                    "args": [
-                        {"name": "-o", "dest": "output", "help": "Output file path"}
-                    ]
-                },
-                "remove": {
-                    "type": "management",
-                    "help": "Remove a command",
-                    "args": [
-                        {"name": "category", "required": True, "help": "Command category"},
-                        {"name": "command", "required": True, "help": "Command name"}
-                    ]
-                },
-                "list": {
-                    "type": "management",
-                    "help": "List all available commands",
-                    "args": [
-                        {"name": "--verbose", "action": "store_true", "help": "Show detailed information"},
-                        {"name": "-v", "action": "store_true", "help": "Alias for --verbose"},
-                        {"name": "--tree", "action": "store_true", "help": "Show hierarchical view"},
-                        {"name": "--category", "help": "Show only commands in this category"}
-                    ]
-                },
-                "clear": {
-                    "type": "management",
-                    "help": "Delete ALL commands (confirmation required)",
-                    "args": []
-                },
-                "clear-category": {
-                    "type": "management",
-                    "help": "Delete all commands in a category",
-                    "args": [
-                        {"name": "category", "required": True, "help": "Category to clear"}
-                    ]
-                },
-
-                # Batch commands (as a category)
-                "batch": {
-                    "type": "category",
-                    "help": "Batch operations",
-                    "subcommands": {
-                        "run": {
-                            "help": "Run a batch from JSON string",
-                            "args": [
-                                {"name": "json_string", "required": True, "help": "JSON string with batch commands"}
-                            ]
-                        },
-                        "file": {
-                            "help": "Run a batch from JSON file",
-                            "args": [
-                                {"name": "file_path", "required": True, "help": "Path to JSON batch file"}
-                            ]
-                        },
-                        "save": {
-                            "help": "Save a batch to the library",
-                            "args": [
-                                {"name": "name", "required": True, "help": "Name for the saved batch"},
-                                {"name": "json_string", "required": True, "help": "JSON string with batch commands"}
-                            ]
-                        },
-                        "run-saved": {
-                            "help": "Run a saved batch from library",
-                            "args": [
-                                {"name": "name", "required": True, "help": "Name of the saved batch"}
-                            ]
-                        },
-                        "list-saved": {
-                            "help": "List all saved batches in library",
-                            "args": []
-                        },
-                        "info": {
-                            "help": "Show information about a saved batch",
-                            "args": [
-                                {"name": "name", "required": True, "help": "Name of the saved batch"}
-                            ]
-                        },
-                        "delete": {
-                            "help": "Delete a saved batch from library",
-                            "args": [
-                                {"name": "name", "required": True, "help": "Name of the saved batch"}
-                            ]
-                        },
-                        "translate": {
-                            "help": "Convert bash script to JSON",
-                            "args": [
-                                {"name": "script_file", "required": True, "help": "Path to bash script file"},
-                                {"name": "--save", "help": "Save to library with this name"}
-                            ]
-                        }
-                    }
-                }
-            }
-        }
-
-    def _load_dynamic_commands(self) -> Dict[str, Any]:
-        """Load dynamic commands from compiled YAMLs and attach functions"""
-        commands = {}
-
-        try:
-            import commands_generated
-            from decorators import get_registry
-
-            registry = get_registry()
-            if not registry:
-                return commands
-
-            # Group by category
-            categories = {}
-            for (category, cmd_name), cmd_info in registry.items():
-                if category not in categories:
-                    categories[category] = []
-                categories[category].append((cmd_name, cmd_info))
-
-            # Convert to registry format
-            for category, cmds in categories.items():
-                commands[category] = {
-                    "type": "category",
-                    "help": f"{category} operations",
-                    "subcommands": {}
-                }
-
-                for cmd_name, cmd_info in cmds:
-                    # Extract args from function
-                    args = []
-                    func = cmd_info['func']
-                    if hasattr(func, '_args'):
-                        for arg_name, arg_kwargs in func._args:
-                            arg_def = {
-                                "name": arg_name,
-                                "help": arg_kwargs.get('help', '')
-                            }
-                            if 'required' in arg_kwargs:
-                                arg_def["required"] = arg_kwargs["required"]
-                            if 'default' in arg_kwargs:
-                                arg_def["default"] = arg_kwargs["default"]
-                            if 'choices' in arg_kwargs:
-                                arg_def["choices"] = arg_kwargs["choices"]
-                            if arg_name.startswith('--'):
-                                arg_def["optional"] = True
-                            args.append(arg_def)
-
-                    commands[category]["subcommands"][cmd_name] = {
-                        "help": cmd_info['help'],
-                        "args": args,
-                        "func": func
-                    }
-
-        except ImportError:
-            pass
-
-        return commands
-
-    def build_registry(self, force: bool = False) -> Dict[str, Any]:
-        """Build the complete registry from all sources"""
-        current_hash = self._get_current_hash()
-
-        # Check cache
-        if not force and self.cache_path.exists():
             try:
                 with open(self.cache_path, 'r') as f:
-                    cached = json.load(f)
-                    if cached.get('hash') == current_hash:
-                        self._registry = cached.get('registry')
-                        return self._registry
+                    cache = json.load(f)
+                    return cache.get('_version')
             except:
                 pass
+        return None
 
-        # Build fresh registry
-        registry = self._load_base_registry()
-        dynamic = self._load_dynamic_commands()
-
-        # Merge dynamic commands
-        for category, data in dynamic.items():
-            if category not in registry['commands']:
-                registry['commands'][category] = data
-            else:
-                if 'subcommands' in data:
-                    if 'subcommands' not in registry['commands'][category]:
-                        registry['commands'][category]['subcommands'] = {}
-                    registry['commands'][category]['subcommands'].update(data['subcommands'])
-
-        # Add hash and timestamp
-        registry['hash'] = current_hash
-        registry['last_updated'] = datetime.now().isoformat()
-
-        # Save cache
-        serializable_registry = self._make_serializable(registry)
+    def _save_cache(self, data: Dict, version: str):
+        """Save schema to cache with version"""
+        cache_data = {
+            '_version': version,
+            'commands': data
+        }
         with open(self.cache_path, 'w') as f:
-            json.dump({'hash': current_hash, 'registry': serializable_registry}, f, indent=2)
+            json.dump(cache_data, f, indent=2)
+        self._cached_version = version
 
-        self._registry = registry
-        return registry
+    def _load_cache(self) -> Optional[Dict]:
+        """Load schema from cache"""
+        if self.cache_path.exists():
+            try:
+                with open(self.cache_path, 'r') as f:
+                    cache = json.load(f)
+                    self._cached_version = cache.get('_version')
+                    return cache.get('commands', {})
+            except:
+                pass
+        return None
 
-    def _make_serializable(self, registry):
-        """Remove non-serializable items (like functions) for JSON cache"""
-        import copy
-        result = copy.deepcopy(registry)
+    def get_daemon_version(self, client) -> Optional[str]:
+        """Get version from daemon without full schema"""
+        try:
+            response = client.execute('get_schema')
+            if response and response.get('status') == 'success':
+                return response.get('version')
+            return None
+        except Exception:
+            return None
 
-        for cmd_name, cmd_info in result.get('commands', {}).items():
-            if cmd_info.get('type') == 'category':
-                for subcmd, subinfo in cmd_info.get('subcommands', {}).items():
-                    if 'func' in subinfo:
-                        del subinfo['func']
+    def refresh_from_daemon(self, client, force=False):
+        """Query daemon for current schema and save to cache"""
+        try:
+            response = client.execute('get_schema')
 
-        return result
+            if response and response.get('status') == 'success':
+                version = response.get('version', 'unknown')
+                data = response.get('data', {})
 
-    def get_registry(self) -> Dict[str, Any]:
-        """Get the registry, building if necessary"""
-        if self._registry is None:
-            self.build_registry()
+                if data:
+                    self._save_cache(data, version)
+                    self._registry = None
+                    self.get_parser.cache_clear()
+                    print(f"✓ Saved schema with {len(data)} commands (version: {version})")
+                    return True
+                else:
+                    print("❌ Schema data is empty")
+                    return False
+            else:
+                print(f"❌ Response status not success: {response.get('status') if response else 'None'}")
+                return False
+        except Exception as e:
+            print(f"❌ Failed to refresh schema: {e}")
+            return False
+
+    def ensure_fresh(self, client, force=False):
+        """Check if schema is fresh, refresh if needed"""
+        cached_version = self._get_cached_version()
+        daemon_version = self.get_daemon_version(client)
+
+        if force or cached_version != daemon_version:
+            if cached_version is None and daemon_version is None:
+                # Both missing, still need to refresh to get data
+                print("No schema cached, fetching from daemon...")
+                return self.refresh_from_daemon(client)
+            elif cached_version != daemon_version:
+                print(f"Schema version mismatch (cached: {cached_version}, daemon: {daemon_version}), refreshing...")
+                return self.refresh_from_daemon(client)
+
+        # Check if cache actually has data
+        if self._load_cache() is None:
+            print("Cache exists but no data, refreshing...")
+            return self.refresh_from_daemon(client)
+
+        return True
+
+    def get_registry(self, client=None, auto_refresh=True) -> Dict[str, Any]:
+        """Get the registry from cache, optionally refreshing if stale"""
+        # Try to load from cache first
+        cached = self._load_cache()
+        if cached:
+            self._registry = cached
+            return self._registry
+
+        # No cache, need to fetch
+        if client and auto_refresh:
+            if self.refresh_from_daemon(client):
+                cached = self._load_cache()
+                if cached:
+                    self._registry = cached
+                    return self._registry
+
+        self._registry = {}
         return self._registry
 
     @lru_cache(maxsize=1)
@@ -300,168 +133,176 @@ class CommandRegistry:
         return self._build_parser()
 
     def _build_parser(self):
-        """Build argparse parser from registry"""
+        """Build argparse parser from registry schema"""
         import argparse
 
         registry = self.get_registry()
 
         parser = argparse.ArgumentParser(
             prog='kritomatic',
-            description='kritomatic - Control Krita from the command line'
+            description='Kritomatic - Control Krita from the command line',
+            epilog='Examples:\n'
+                   '  kritomatic brush size 75\n'
+                   '  kritomatic layer create "My Layer"\n'
+                   '  kritomatic batch run \'{"commands": [...]}\'\n'
+                   '  kritomatic --refresh'
         )
 
         subparsers = parser.add_subparsers(dest='command', help='Commands', required=True)
 
-        for cmd_name, cmd_info in registry['commands'].items():
-            if cmd_info['type'] == 'management':
-                mgmt_parser = subparsers.add_parser(cmd_name, help=cmd_info['help'])
-                for arg in cmd_info.get('args', []):
-                    if arg.get('action') == 'store_true':
-                        mgmt_parser.add_argument(arg['name'], action='store_true', help=arg.get('help', ''))
-                    elif arg.get('dest'):
-                        mgmt_parser.add_argument(arg['name'], dest=arg['dest'], help=arg.get('help', ''))
+        # Group commands by category
+        categories = {}
+        for cmd_key, cmd_info in registry.items():
+            category = cmd_info.get('category', 'unknown')
+            if category not in categories:
+                categories[category] = []
+            categories[category].append(cmd_info)
+
+        # Add management commands
+        subparsers.add_parser('compile', help='Compile atomic YAMLs to Python')
+
+        import_parser = subparsers.add_parser('import', help='Import a command bundle')
+        import_parser.add_argument('bundle_file', help='Path to the bundle file (.krita.yaml)')
+
+        export_parser = subparsers.add_parser('export', help='Export commands as a bundle')
+        export_parser.add_argument('-o', '--output', help='Output file path')
+        export_parser.add_argument('--category', help='Export only commands in this category')
+        export_parser.add_argument('--command', help='Export only this command')
+
+        export_all_parser = subparsers.add_parser('export-all', help='Export ALL commands as a bundle')
+        export_all_parser.add_argument('-o', '--output', required=True, help='Output file path')
+
+        export_schema_parser = subparsers.add_parser('export-schema', help='Export batch schema JSON')
+        export_schema_parser.add_argument('-o', '--output', help='Output file path')
+
+        remove_parser = subparsers.add_parser('remove', help='Remove a command')
+        remove_parser.add_argument('category', help='Command category')
+        remove_parser.add_argument('command', help='Command name')
+
+        list_parser = subparsers.add_parser('list', help='List all available commands')
+        list_parser.add_argument('--verbose', '-v', action='store_true', help='Show detailed information')
+        list_parser.add_argument('--tree', action='store_true', help='Show hierarchical view')
+        list_parser.add_argument('--category', help='Show only commands in this category')
+
+        subparsers.add_parser('clear', help='Delete ALL commands (confirmation required)')
+
+        clear_cat_parser = subparsers.add_parser('clear-category', help='Delete all commands in a category')
+        clear_cat_parser.add_argument('category', help='Category to clear')
+
+        # Batch commands
+        batch_parser = subparsers.add_parser('batch', help='Batch operations')
+        batch_subparsers = batch_parser.add_subparsers(dest='batch_command', help='Batch subcommands', required=True)
+
+        batch_subparsers.add_parser('run', help='Run a batch from JSON string').add_argument('json_string', help='JSON string with batch commands')
+        batch_subparsers.add_parser('file', help='Run a batch from JSON file').add_argument('file_path', help='Path to JSON batch file')
+
+        save_parser = batch_subparsers.add_parser('save', help='Save a batch to the library')
+        save_parser.add_argument('name', help='Name for the saved batch')
+        save_parser.add_argument('json_string', help='JSON string with batch commands')
+
+        batch_subparsers.add_parser('run-saved', help='Run a saved batch from library').add_argument('name', help='Name of the saved batch')
+        batch_subparsers.add_parser('list-saved', help='List all saved batches in library')
+        batch_subparsers.add_parser('info', help='Show information about a saved batch').add_argument('name', help='Name of the saved batch')
+        batch_subparsers.add_parser('delete', help='Delete a saved batch from library').add_argument('name', help='Name of the saved batch')
+
+        translate_parser = batch_subparsers.add_parser('translate', help='Convert bash script to JSON')
+        translate_parser.add_argument('script_file', help='Path to bash script file')
+        translate_parser.add_argument('--save', help='Save to library with this name')
+
+        # Dynamic categories from schema
+        for category, commands in categories.items():
+            cat_parser = subparsers.add_parser(category, help=f'{category} operations')
+            cmd_subparsers = cat_parser.add_subparsers(dest='subcommand', help=f'{category} commands', required=True)
+
+            for cmd_info in commands:
+                cmd_name = cmd_info.get('command', 'unknown')
+                cmd_help = cmd_info.get('help', '')
+                cmd_parser = cmd_subparsers.add_parser(cmd_name, help=cmd_help)
+
+                for arg_name, arg_info in cmd_info.get('args', {}).items():
+                    arg_type = arg_info.get('type', 'str')
+                    required = arg_info.get('required', False)
+                    default = arg_info.get('default')
+                    help_text = arg_info.get('help', '')
+
+                    if arg_type == 'int':
+                        arg_type = int
+                    elif arg_type == 'float':
+                        arg_type = float
+                    elif arg_type == 'bool':
+                        arg_type = bool
                     else:
-                        mgmt_parser.add_argument(arg['name'], help=arg.get('help', ''))
+                        arg_type = str
 
-            elif cmd_info['type'] == 'category':
-                cat_parser = subparsers.add_parser(cmd_name, help=cmd_info['help'])
-                cmd_subparsers = cat_parser.add_subparsers(dest='subcommand', help=f'{cmd_name} commands', required=True)
-
-                for subcmd_name, subcmd_info in cmd_info.get('subcommands', {}).items():
-                    subcmd_parser = cmd_subparsers.add_parser(subcmd_name, help=subcmd_info['help'])
-
-                    if 'func' in subcmd_info:
-                        subcmd_parser.set_defaults(func=subcmd_info['func'])
-
-                    for arg in subcmd_info.get('args', []):
-                        if arg.get('action') == 'store_true':
-                            subcmd_parser.add_argument(arg['name'], action='store_true', help=arg.get('help', ''))
-                        elif arg.get('optional') or arg['name'].startswith('--'):
-                            subcmd_parser.add_argument(arg['name'], help=arg.get('help', ''))
+                    if arg_name.startswith('--'):
+                        if required:
+                            cmd_parser.add_argument(arg_name, type=arg_type, required=True, help=help_text)
+                        elif default is not None:
+                            cmd_parser.add_argument(arg_name, type=arg_type, default=default, help=help_text)
                         else:
-                            subcmd_parser.add_argument(arg['name'], help=arg.get('help', ''))
+                            cmd_parser.add_argument(arg_name, type=arg_type, help=help_text)
+                    else:
+                        if required:
+                            cmd_parser.add_argument(arg_name, type=arg_type, help=help_text)
+                        elif default is not None:
+                            cmd_parser.add_argument(arg_name, type=arg_type, default=default, help=help_text)
+                        else:
+                            cmd_parser.add_argument(arg_name, type=arg_type, help=help_text)
+
+                # Function will be added later when handlers are decorated
+                cmd_parser.set_defaults(func=None)
 
         return parser
 
     def invalidate_cache(self):
-        """Invalidate the parser cache"""
+        """Invalidate the parser cache and schema cache"""
         self.get_parser.cache_clear()
         self._registry = None
+        self._cached_version = None
+        if self.cache_path.exists():
+            self.cache_path.unlink()
 
     def list_commands(self, verbose: bool = False, tree: bool = False, category: str = None):
-        """List commands with various formatting options"""
+        """List commands from the registry"""
         registry = self.get_registry()
 
-        # Show only specific category
+        # Group by category
+        categories = {}
+        for cmd_key, cmd_info in registry.items():
+            cat = cmd_info.get('category', 'unknown')
+            if cat not in categories:
+                categories[cat] = []
+            categories[cat].append(cmd_info)
+
         if category:
-            if category not in registry['commands']:
+            if category not in categories:
                 print(f"❌ Category '{category}' not found")
-                print(f"Available categories: {', '.join(registry['commands'].keys())}")
                 return
-
-            cmd_info = registry['commands'][category]
-
-            if cmd_info['type'] == 'category':
-                print(f"\n📁 {category} - {cmd_info['help']}")
-                print("-" * 40)
-
-                subcommands = cmd_info.get('subcommands', {})
-                if not subcommands:
-                    print("  No subcommands found")
-                    return
-
-                for subcmd_name, subcmd_info in sorted(subcommands.items()):
-                    if verbose:
-                        print(f"\n  {subcmd_name}")
-                        print(f"    {subcmd_info['help']}")
-                        if subcmd_info.get('args'):
-                            print("    Arguments:")
-                            for arg in subcmd_info['args']:
-                                required = "required" if arg.get('required') else "optional"
-                                default_info = f" (default: {arg['default']})" if arg.get('default') else ""
-                                print(f"      {arg['name']} ({required}){default_info}")
-                                print(f"        {arg.get('help', '')}")
-                    elif tree:
-                        print(f"  ├── {subcmd_name}")
-                        print(f"  │   └── {subcmd_info['help']}")
-                    else:
-                        print(f"  {subcmd_name}")
-            else:
-                print(f"  {category} - {cmd_info['help']}")
+            print(f"\n{category}:")
+            for cmd in categories[category]:
+                print(f"  {cmd.get('command')}")
             return
 
-        # Tree view
         if tree:
-            print("\n📁 Kritomatic Commands")
-            print("=" * 40)
-            for cmd_name, cmd_info in sorted(registry['commands'].items()):
-                if cmd_info['type'] == 'management':
-                    print(f"\n📄 {cmd_name}")
-                    print(f"    └── {cmd_info['help']}")
-                elif cmd_info['type'] == 'category':
-                    print(f"\n📁 {cmd_name} - {cmd_info['help']}")
-                    for subcmd, subinfo in sorted(cmd_info.get('subcommands', {}).items()):
-                        print(f"    ├── {subcmd}")
-                        print(f"    │   └── {subinfo['help']}")
-            return
-
-        # Verbose list
-        if verbose:
-            print("\n" + "=" * 60)
-            print("KRITOMATIC - ALL COMMANDS")
-            print("=" * 60)
-
-            for cmd_name, cmd_info in sorted(registry['commands'].items()):
-                if cmd_info['type'] == 'management':
-                    print(f"\n{cmd_name.upper()}")
-                    print(f"  {cmd_info['help']}")
-                    if cmd_info.get('args'):
-                        print("  Arguments:")
-                        for arg in cmd_info['args']:
-                            required = "required" if arg.get('required') else "optional"
-                            print(f"    {arg['name']} ({required}) - {arg.get('help', '')}")
-
-                elif cmd_info['type'] == 'category':
-                    print(f"\n{cmd_name.upper()}")
-                    print(f"  {cmd_info['help']}")
-                    for subcmd, subinfo in sorted(cmd_info.get('subcommands', {}).items()):
-                        print(f"\n  {subcmd}")
-                        print(f"    {subinfo['help']}")
-                        if subinfo.get('args'):
-                            print("    Arguments:")
-                            for arg in subinfo['args']:
-                                required = "required" if arg.get('required') else "optional"
-                                default_info = f" (default: {arg['default']})" if arg.get('default') else ""
-                                print(f"      {arg['name']} ({required}){default_info}")
-                                print(f"        {arg.get('help', '')}")
-            return
-
-        # Simple list (default)
-        print("\nAvailable commands:")
-        print("-" * 40)
-
-        management = []
-        categories = []
-
-        for cmd_name, cmd_info in registry['commands'].items():
-            if cmd_info['type'] == 'management':
-                management.append(cmd_name)
-            elif cmd_info['type'] == 'category':
-                categories.append(cmd_name)
-
-        if management:
-            print("\nManagement commands:")
-            for cmd in sorted(management):
-                print(f"  {cmd}")
-
-        if categories:
-            print("\nCategories:")
-            for cat in sorted(categories):
-                print(f"  {cat}")
-
-        print("\nUse 'kritomatic list --category <name>' for category details")
-        print("Use 'kritomatic list --verbose' for detailed information")
-        print("Use 'kritomatic list --tree' for hierarchical view")
+            for cat, cmds in categories.items():
+                print(f"\n📁 {cat}")
+                for cmd in cmds:
+                    print(f"    ├── {cmd.get('command')}")
+                    print(f"    │   └── {cmd.get('help', '')}")
+        elif verbose:
+            for cat, cmds in categories.items():
+                print(f"\n{cat.upper()}")
+                for cmd in cmds:
+                    print(f"\n  {cmd.get('command')}")
+                    print(f"    {cmd.get('help', '')}")
+                    for arg_name, arg_info in cmd.get('args', {}).items():
+                        required = "required" if arg_info.get('required') else "optional"
+                        print(f"      {arg_name} ({required}) - {arg_info.get('help', '')}")
+        else:
+            for cat, cmds in categories.items():
+                print(f"\n{cat}:")
+                for cmd in cmds:
+                    print(f"  {cmd.get('command')}")
 
 
 # Global instance

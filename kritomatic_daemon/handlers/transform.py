@@ -1,5 +1,6 @@
 from krita import *
 from ..utils.node_utils import NodeUtils
+from ..decorators import command
 import math
 from xml.etree import ElementTree
 
@@ -21,6 +22,14 @@ class TransformHandler:
             )
         return {'success': False, 'message': f'Unknown transform command: {cmd_type}'}
 
+    @command(
+        category='transform',
+        help_text='Create a transform mask on a layer',
+        args={
+            'layer_name': {'type': 'str', 'required': True, 'help': 'Target layer name'},
+            'mask_name': {'type': 'str', 'default': 'Transform Mask', 'help': 'Name for the transform mask'}
+        }
+    )
     def create_transform_mask(self, layer_name, mask_name):
         try:
             doc = Krita.instance().activeDocument()
@@ -41,6 +50,18 @@ class TransformHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='transform',
+        help_text='Apply transformation to a transform mask',
+        args={
+            'mask_name': {'type': 'str', 'required': True, 'help': 'Name of the transform mask'},
+            'translate_x': {'type': 'float', 'default': 0, 'help': 'X translation in pixels'},
+            'translate_y': {'type': 'float', 'default': 0, 'help': 'Y translation in pixels'},
+            'rotation': {'type': 'float', 'default': 0, 'help': 'Rotation in degrees'},
+            'scale_x': {'type': 'float', 'default': 1.0, 'help': 'X scale factor (1.0 = 100 percent)'},
+            'scale_y': {'type': 'float', 'default': 1.0, 'help': 'Y scale factor (1.0 = 100 percent)'}
+        }
+    )
     def transform_mask(self, mask_name, tx=0, ty=0, rot=0, sx=1.0, sy=1.0):
         try:
             doc = Krita.instance().activeDocument()

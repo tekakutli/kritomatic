@@ -1,4 +1,5 @@
 from krita import *
+from ..decorators import command
 
 class BrushHandler:
     def execute(self, cmd_type, params):
@@ -24,6 +25,13 @@ class BrushHandler:
             return self.select_opaque(params.get('mode', 'replace'))
         return {'success': False, 'message': f'Unknown brush command: {cmd_type}'}
 
+    @command(
+        category='brush',
+        help_text='Set brush size in pixels',
+        args={
+            'value': {'type': 'int', 'required': True, 'help': 'Brush size in pixels (1-1000)'}
+        }
+    )
     def set_brush_size(self, size):
         try:
             view = Krita.instance().activeWindow().activeView()
@@ -33,6 +41,13 @@ class BrushHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='brush',
+        help_text='Set brush opacity percentage',
+        args={
+            'value': {'type': 'int', 'required': True, 'help': 'Opacity percentage (0-100)'}
+        }
+    )
     def set_brush_opacity(self, opacity):
         try:
             view = Krita.instance().activeWindow().activeView()
@@ -42,6 +57,13 @@ class BrushHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='brush',
+        help_text='Set brush flow percentage',
+        args={
+            'value': {'type': 'int', 'required': True, 'help': 'Flow percentage (0-100)'}
+        }
+    )
     def set_brush_flow(self, flow):
         try:
             view = Krita.instance().activeWindow().activeView()
@@ -51,6 +73,13 @@ class BrushHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='brush',
+        help_text='Set brush blending mode',
+        args={
+            'value': {'type': 'str', 'required': True, 'help': 'Blending mode (normal, multiply, screen, etc.)'}
+        }
+    )
     def set_brush_blending_mode(self, mode):
         try:
             view = Krita.instance().activeWindow().activeView()
@@ -59,6 +88,13 @@ class BrushHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='brush',
+        help_text='Switch to a brush preset',
+        args={
+            'value': {'type': 'str', 'required': True, 'help': 'Brush preset name (partial match works)'}
+        }
+    )
     def set_brush_preset(self, preset_name):
         try:
             all_presets = Krita.instance().resources('preset')
@@ -71,6 +107,11 @@ class BrushHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='brush',
+        help_text='List all brush presets',
+        args={}
+    )
     def list_brush_presets(self):
         try:
             all_presets = Krita.instance().resources('preset')
@@ -79,6 +120,11 @@ class BrushHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='brush',
+        help_text='Get current brush properties (opacity, flow, alpha lock)',
+        args={}
+    )
     def get_brush_properties(self):
         try:
             view = Krita.instance().activeWindow().activeView()
@@ -91,6 +137,13 @@ class BrushHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='brush',
+        help_text='Set foreground color',
+        args={
+            'color': {'type': 'str', 'required': True, 'help': 'Hex color (e.g., #ff0000)'}
+        }
+    )
     def set_foreground_color(self, color_hex):
         try:
             view = Krita.instance().activeWindow().activeView()
@@ -105,6 +158,13 @@ class BrushHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='brush',
+        help_text='Set background color',
+        args={
+            'color': {'type': 'str', 'required': True, 'help': 'Hex color (e.g., #0000ff)'}
+        }
+    )
     def set_background_color(self, color_hex):
         try:
             view = Krita.instance().activeWindow().activeView()
@@ -119,6 +179,13 @@ class BrushHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    @command(
+        category='brush',
+        help_text='Select opaque pixels of current layer',
+        args={
+            'mode': {'type': 'str', 'default': 'replace', 'choices': ['replace', 'add', 'subtract', 'intersect'], 'help': 'Selection mode'}
+        }
+    )
     def select_opaque(self, mode='replace'):
         try:
             app = Krita.instance()

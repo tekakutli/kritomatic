@@ -1,6 +1,8 @@
 from krita import *
 from .server.socket_server import WebSocketServer
 from .handlers.base import CommandHandler
+from .decorators import command
+from .registry import get_command_registry
 
 class KritomaticDaemon(Extension):
     def __init__(self, parent):

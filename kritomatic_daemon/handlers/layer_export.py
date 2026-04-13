@@ -18,8 +18,8 @@ class LayerExportHandler:
         category='layer',
         help_text='Move a layer to its own new document',
         args={
-            'layer_name': {'type': 'str', 'required': True, 'help': 'Name of the layer to move'},
-            'new_doc_name': {'type': 'str', 'required': False, 'help': 'Name for the new document (defaults to layer name)'}
+            '--layer_name': {'type': 'str', 'required': True, 'help': 'Name of the layer to move'},
+            '--new_doc_name': {'type': 'str', 'required': False, 'help': 'Name for the new document (defaults to layer name)'}
         }
     )
     def move_layer_to_new_document(self, params):
@@ -65,8 +65,8 @@ class LayerExportHandler:
         category='layer',
         help_text='Export a layer to a file and convert to file layer',
         args={
-            'layer_name': {'type': 'str', 'required': True, 'help': 'Name of the layer to export'},
-            'output_path': {'type': 'str', 'required': False, 'help': 'Path to save the exported file (auto-generated if not provided)'}
+            '--layer_name': {'type': 'str', 'required': True, 'help': 'Name of the layer to export'},
+            '--output_path': {'type': 'str', 'required': False, 'help': 'Path to save the exported file (auto-generated if not provided)'}
         }
     )
     def export_layer_to_file(self, params):

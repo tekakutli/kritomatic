@@ -13,9 +13,9 @@ class LayerColorHandler:
         category='layer',
         help_text='Apply Color to Alpha filter destructively to a duplicate layer',
         args={
-            'layer_name': {'type': 'str', 'required': True, 'help': 'Name of the target layer'},
-            'target_color': {'type': 'str', 'default': '#ffffff', 'help': 'Hex color to make transparent'},
-            'threshold': {'type': 'int', 'default': 255, 'help': 'Threshold for color matching (0-255)'}
+            '--layer_name': {'type': 'str', 'required': True, 'help': 'Name of the target layer'},
+            '--target_color': {'type': 'str', 'default': '#ffffff', 'help': 'Hex color to make transparent'},
+            '--threshold': {'type': 'int', 'default': 255, 'help': 'Threshold for color matching (0-255)'}
         }
     )
     def apply_color_to_alpha(self, params):
@@ -75,9 +75,9 @@ class LayerColorHandler:
         category='layer',
         help_text='Add a non-destructive Color to Alpha filter mask to a layer',
         args={
-            'layer_name': {'type': 'str', 'required': True, 'help': 'Name of the target layer'},
-            'target_color': {'type': 'str', 'default': '#ffffff', 'help': 'Hex color to make transparent'},
-            'threshold': {'type': 'int', 'default': 255, 'help': 'Threshold for color matching (0-255)'}
+            '--layer_name': {'type': 'str', 'required': True, 'help': 'Name of the target layer'},
+            '--target_color': {'type': 'str', 'default': '#ffffff', 'help': 'Hex color to make transparent'},
+            '--threshold': {'type': 'int', 'default': 255, 'help': 'Threshold for color matching (0-255)'}
         }
     )
     def add_color_to_alpha_mask(self, params):

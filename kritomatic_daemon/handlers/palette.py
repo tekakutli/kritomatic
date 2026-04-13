@@ -26,7 +26,7 @@ class PaletteHandler:
         category='palette',
         help_text='Add current foreground color to a palette',
         args={
-            'palette_name': {'type': 'str', 'required': True, 'help': 'Name of the palette'}
+            '--palette_name': {'type': 'str', 'required': True, 'help': 'Name of the palette'}
         }
     )
     def add_color_to_palette(self, palette_name):
@@ -59,9 +59,9 @@ class PaletteHandler:
         category='palette',
         help_text='Create a new palette (requires Krita restart to appear)',
         args={
-            'palette_name': {'type': 'str', 'required': True, 'help': 'Name of the new palette'},
-            'columns': {'type': 'int', 'default': 8, 'help': 'Number of columns'},
-            'rows': {'type': 'int', 'default': 8, 'help': 'Number of rows'}
+            '--palette_name': {'type': 'str', 'required': True, 'help': 'Name of the new palette'},
+            '--columns': {'type': 'int', 'default': 8, 'help': 'Number of columns'},
+            '--rows': {'type': 'int', 'default': 8, 'help': 'Number of rows'}
         }
     )
     def create_palette(self, name, columns=8, rows=8):
@@ -105,7 +105,7 @@ class PaletteHandler:
         category='palette',
         help_text='Activate a palette in the Palette Docker',
         args={
-            'palette_name': {'type': 'str', 'required': True, 'help': 'Name of the palette to activate'}
+            '--palette_name': {'type': 'str', 'required': True, 'help': 'Name of the palette to activate'}
         }
     )
     def activate_palette(self, name):

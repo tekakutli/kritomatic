@@ -13,10 +13,10 @@ class LayerFillHandler:
         category='layer',
         help_text='Fill a layer with a specific color',
         args={
-            'layer_name': {'type': 'str', 'required': True, 'help': 'Name of the layer to fill'},
-            'color': {'type': 'str', 'required': False, 'help': 'Hex color to fill with (e.g., #ff0000)'},
-            'foreground': {'type': 'bool', 'default': False, 'help': 'Use current foreground color'},
-            'background': {'type': 'bool', 'default': False, 'help': 'Use current background color'}
+            '--layer_name': {'type': 'str', 'required': True, 'help': 'Name of the layer to fill'},
+            '--color': {'type': 'str', 'required': False, 'help': 'Hex color to fill with (e.g., #ff0000)'},
+            '--foreground': {'type': 'bool', 'default': False, 'help': 'Use current foreground color'},
+            '--background': {'type': 'bool', 'default': False, 'help': 'Use current background color'}
         }
     )
     def fill_layer(self, params):
@@ -85,9 +85,9 @@ class LayerFillHandler:
         category='layer',
         help_text='Fill the current selection with a specific color',
         args={
-            'color': {'type': 'str', 'required': False, 'help': 'Hex color to fill with (e.g., #ff0000)'},
-            'foreground': {'type': 'bool', 'default': False, 'help': 'Use current foreground color'},
-            'background': {'type': 'bool', 'default': False, 'help': 'Use current background color'}
+            '--color': {'type': 'str', 'required': False, 'help': 'Hex color to fill with (e.g., #ff0000)'},
+            '--foreground': {'type': 'bool', 'default': False, 'help': 'Use current foreground color'},
+            '--background': {'type': 'bool', 'default': False, 'help': 'Use current background color'}
         }
     )
     def fill_selection(self, params):

@@ -45,7 +45,7 @@ class DocumentHandler:
             return {
                 'success': True,
                 'message': f'Current document: {width}x{height} @ {resolution} DPI',
-                'data': {
+                '--data': {
                     'width': width,
                     'height': height,
                     'resolution': resolution,
@@ -61,7 +61,7 @@ class DocumentHandler:
         category='doc',
         help_text='Create a new document with same dimensions as current',
         args={
-            'name': {'type': 'str', 'default': 'New Document', 'help': 'Name for the new document'}
+            '--name': {'type': 'str', 'default': 'New Document', 'help': 'Name for the new document'}
         }
     )
     def create_new_from_current(self, name="New Document"):
@@ -105,10 +105,10 @@ class DocumentHandler:
         category='doc',
         help_text='Create a new document with custom dimensions',
         args={
-            'name': {'type': 'str', 'default': 'New Document', 'help': 'Name for the new document'},
-            'width': {'type': 'int', 'default': 1920, 'help': 'Width in pixels'},
-            'height': {'type': 'int', 'default': 1080, 'help': 'Height in pixels'},
-            'resolution': {'type': 'float', 'default': 300, 'help': 'Resolution in DPI'}
+            '--name': {'type': 'str', 'default': 'New Document', 'help': 'Name for the new document'},
+            '--width': {'type': 'int', 'default': 1920, 'help': 'Width in pixels'},
+            '--height': {'type': 'int', 'default': 1080, 'help': 'Height in pixels'},
+            '--resolution': {'type': 'float', 'default': 300, 'help': 'Resolution in DPI'}
         }
     )
     def create_new_with_dimensions(self, name, width, height, resolution=300,
@@ -168,7 +168,7 @@ class DocumentHandler:
         category='doc',
         help_text='Save current document to file path',
         args={
-            'file_path': {'type': 'str', 'required': True, 'help': 'File path to save to'}
+            '--file_path': {'type': 'str', 'required': True, 'help': 'File path to save to'}
         }
     )
     def save_document(self, file_path):

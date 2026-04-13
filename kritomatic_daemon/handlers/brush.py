@@ -29,7 +29,7 @@ class BrushHandler:
         category='brush',
         help_text='Set brush size in pixels',
         args={
-            'value': {'type': 'int', 'required': True, 'help': 'Brush size in pixels (1-1000)'}
+            '--value': {'type': 'int', 'required': True, 'help': 'Brush size in pixels (1-1000)'}
         }
     )
     def set_brush_size(self, size):
@@ -45,7 +45,7 @@ class BrushHandler:
         category='brush',
         help_text='Set brush opacity percentage',
         args={
-            'value': {'type': 'int', 'required': True, 'help': 'Opacity percentage (0-100)'}
+            '--value': {'type': 'int', 'required': True, 'help': 'Opacity percentage (0-100)'}
         }
     )
     def set_brush_opacity(self, opacity):
@@ -61,7 +61,7 @@ class BrushHandler:
         category='brush',
         help_text='Set brush flow percentage',
         args={
-            'value': {'type': 'int', 'required': True, 'help': 'Flow percentage (0-100)'}
+            '--value': {'type': 'int', 'required': True, 'help': 'Flow percentage (0-100)'}
         }
     )
     def set_brush_flow(self, flow):
@@ -77,7 +77,7 @@ class BrushHandler:
         category='brush',
         help_text='Set brush blending mode',
         args={
-            'value': {'type': 'str', 'required': True, 'help': 'Blending mode (normal, multiply, screen, etc.)'}
+            '--value': {'type': 'str', 'required': True, 'help': 'Blending mode (normal, multiply, screen, etc.)'}
         }
     )
     def set_brush_blending_mode(self, mode):
@@ -92,7 +92,7 @@ class BrushHandler:
         category='brush',
         help_text='Switch to a brush preset',
         args={
-            'value': {'type': 'str', 'required': True, 'help': 'Brush preset name (partial match works)'}
+            '--value': {'type': 'str', 'required': True, 'help': 'Brush preset name (partial match works)'}
         }
     )
     def set_brush_preset(self, preset_name):
@@ -141,7 +141,7 @@ class BrushHandler:
         category='brush',
         help_text='Set foreground color',
         args={
-            'color': {'type': 'str', 'required': True, 'help': 'Hex color (e.g., #ff0000)'}
+            '--color': {'type': 'str', 'required': True, 'help': 'Hex color (e.g., #ff0000)'}
         }
     )
     def set_foreground_color(self, color_hex):
@@ -162,7 +162,7 @@ class BrushHandler:
         category='brush',
         help_text='Set background color',
         args={
-            'color': {'type': 'str', 'required': True, 'help': 'Hex color (e.g., #0000ff)'}
+            '--color': {'type': 'str', 'required': True, 'help': 'Hex color (e.g., #0000ff)'}
         }
     )
     def set_background_color(self, color_hex):
@@ -183,7 +183,7 @@ class BrushHandler:
         category='brush',
         help_text='Select opaque pixels of current layer',
         args={
-            'mode': {'type': 'str', 'default': 'replace', 'choices': ['replace', 'add', 'subtract', 'intersect'], 'help': 'Selection mode'}
+            '--mode': {'type': 'str', 'default': 'replace', 'choices': ['replace', 'add', 'subtract', 'intersect'], 'help': 'Selection mode'}
         }
     )
     def select_opaque(self, mode='replace'):

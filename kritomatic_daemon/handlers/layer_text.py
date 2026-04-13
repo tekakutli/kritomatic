@@ -18,14 +18,14 @@ class LayerTextHandler:
         category='layer',
         help_text='Add vector text to a vector layer',
         args={
-            'layer_name': {'type': 'str', 'required': True, 'help': 'Name of the target vector layer'},
-            'text': {'type': 'str', 'required': True, 'help': 'Text content'},
-            'font_family': {'type': 'str', 'default': 'sans-serif', 'help': 'Font family (e.g., Arial, sans-serif)'},
-            'font_size': {'type': 'int', 'default': 12, 'help': 'Font size in points'},
-            'x': {'type': 'float', 'default': 0, 'help': 'X position in pixels'},
-            'y': {'type': 'float', 'default': 0, 'help': 'Y position in pixels'},
-            'color': {'type': 'str', 'default': '#000000', 'help': 'Hex color (e.g., #ff0000)'},
-            'alignment': {'type': 'str', 'default': 'left', 'choices': ['left', 'center', 'right'], 'help': 'Text alignment'}
+            '--layer_name': {'type': 'str', 'required': True, 'help': 'Name of the target vector layer'},
+            '--text': {'type': 'str', 'required': True, 'help': 'Text content'},
+            '--font_family': {'type': 'str', 'default': 'sans-serif', 'help': 'Font family (e.g., Arial, sans-serif)'},
+            '--font_size': {'type': 'int', 'default': 12, 'help': 'Font size in points'},
+            '--x': {'type': 'float', 'default': 0, 'help': 'X position in pixels'},
+            '--y': {'type': 'float', 'default': 0, 'help': 'Y position in pixels'},
+            '--color': {'type': 'str', 'default': '#000000', 'help': 'Hex color (e.g., #ff0000)'},
+            '--alignment': {'type': 'str', 'default': 'left', 'choices': ['left', 'center', 'right'], 'help': 'Text alignment'}
         }
     )
     def add_vector_text(self, params):
@@ -81,9 +81,9 @@ class LayerTextHandler:
         category='layer',
         help_text='Update existing text on a vector layer',
         args={
-            'layer_name': {'type': 'str', 'required': True, 'help': 'Name of the target vector layer'},
-            'old_text': {'type': 'str', 'required': True, 'help': 'Current text to replace'},
-            'new_text': {'type': 'str', 'required': True, 'help': 'New text content'}
+            '--layer_name': {'type': 'str', 'required': True, 'help': 'Name of the target vector layer'},
+            '--old_text': {'type': 'str', 'required': True, 'help': 'Current text to replace'},
+            '--new_text': {'type': 'str', 'required': True, 'help': 'New text content'}
         }
     )
     def update_vector_text(self, params):
@@ -151,7 +151,7 @@ class LayerTextHandler:
         category='layer',
         help_text='List all shapes on a vector layer (for debugging)',
         args={
-            'layer_name': {'type': 'str', 'required': True, 'help': 'Name of the vector layer'}
+            '--layer_name': {'type': 'str', 'required': True, 'help': 'Name of the vector layer'}
         }
     )
     def list_shapes(self, params):
@@ -177,9 +177,9 @@ class LayerTextHandler:
         category='layer',
         help_text='Replace text across all vector layers',
         args={
-            'old_text': {'type': 'str', 'required': True, 'help': 'Text to find'},
-            'new_text': {'type': 'str', 'required': True, 'help': 'Text to replace with'},
-            'scope': {'type': 'str', 'default': 'all', 'choices': ['all', 'active'], 'help': 'Scope of search (all layers or active layer only)'}
+            '--old_text': {'type': 'str', 'required': True, 'help': 'Text to find'},
+            '--new_text': {'type': 'str', 'required': True, 'help': 'Text to replace with'},
+            '--scope': {'type': 'str', 'default': 'all', 'choices': ['all', 'active'], 'help': 'Scope of search (all layers or active layer only)'}
         }
     )
     def replace_all_text(self, params):

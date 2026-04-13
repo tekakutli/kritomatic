@@ -78,10 +78,10 @@ class LayerBasicHandler:
         category='layer',
         help_text='Create a new layer',
         args={
-            'name': {'type': 'str', 'required': True, 'help': 'Layer name'},
-            'layer_type': {'type': 'str', 'default': 'paintlayer', 'choices': ['paintlayer', 'grouplayer', 'selectionmask', 'vectorlayer', 'filterlayer'], 'help': 'Layer type'},
-            'position': {'type': 'str', 'default': 'above_current', 'choices': ['above_current', 'below_current', 'above_named', 'below_named', 'top', 'bottom'], 'help': 'Where to place the layer'},
-            'reference': {'type': 'str', 'required': False, 'help': 'Reference layer name for above_named/below_named'}
+            '--name': {'type': 'str', 'required': True, 'help': 'Layer name'},
+            '--layer_type': {'type': 'str', 'default': 'paintlayer', 'choices': ['paintlayer', 'grouplayer', 'selectionmask', 'vectorlayer', 'filterlayer'], 'help': 'Layer type'},
+            '--position': {'type': 'str', 'default': 'above_current', 'choices': ['above_current', 'below_current', 'above_named', 'below_named', 'top', 'bottom'], 'help': 'Where to place the layer'},
+            '--reference': {'type': 'str', 'required': False, 'help': 'Reference layer name for above_named/below_named'}
         }
     )
     def create_layer(self, params):
@@ -145,7 +145,7 @@ class LayerBasicHandler:
         category='layer',
         help_text='Set a specific layer as active',
         args={
-            'name': {'type': 'str', 'required': True, 'help': 'Layer name to activate'}
+            '--name': {'type': 'str', 'required': True, 'help': 'Layer name to activate'}
         }
     )
     def set_active_layer(self, params):
@@ -167,7 +167,7 @@ class LayerBasicHandler:
         category='layer',
         help_text='Rename the currently active layer',
         args={
-            'new_name': {'type': 'str', 'required': True, 'help': 'New layer name'}
+            '--new_name': {'type': 'str', 'required': True, 'help': 'New layer name'}
         }
     )
     def rename_active_layer(self, params):
@@ -190,8 +190,8 @@ class LayerBasicHandler:
         category='layer',
         help_text='Rename a layer by its current name',
         args={
-            'old_name': {'type': 'str', 'required': True, 'help': 'Current layer name'},
-            'new_name': {'type': 'str', 'required': True, 'help': 'New layer name'}
+            '--old_name': {'type': 'str', 'required': True, 'help': 'Current layer name'},
+            '--new_name': {'type': 'str', 'required': True, 'help': 'New layer name'}
         }
     )
     def rename_layer_by_name(self, params):
@@ -214,9 +214,9 @@ class LayerBasicHandler:
         category='layer',
         help_text='Move a layer into a group',
         args={
-            'layer_name': {'type': 'str', 'required': True, 'help': 'Layer to move'},
-            'group_name': {'type': 'str', 'required': True, 'help': 'Destination group name'},
-            'position': {'type': 'str', 'default': 'inside', 'choices': ['inside', 'above', 'below'], 'help': 'Position relative to group'}
+            '--layer_name': {'type': 'str', 'required': True, 'help': 'Layer to move'},
+            '--group_name': {'type': 'str', 'required': True, 'help': 'Destination group name'},
+            '--position': {'type': 'str', 'default': 'inside', 'choices': ['inside', 'above', 'below'], 'help': 'Position relative to group'}
         }
     )
     def move_layer_to_group(self, params):
@@ -262,8 +262,8 @@ class LayerBasicHandler:
         category='layer',
         help_text='Move the currently active layer into a group',
         args={
-            'group_name': {'type': 'str', 'required': True, 'help': 'Destination group name'},
-            'position': {'type': 'str', 'default': 'inside', 'choices': ['inside', 'above', 'below'], 'help': 'Position relative to group'}
+            '--group_name': {'type': 'str', 'required': True, 'help': 'Destination group name'},
+            '--position': {'type': 'str', 'default': 'inside', 'choices': ['inside', 'above', 'below'], 'help': 'Position relative to group'}
         }
     )
     def move_active_layer_to_group(self, params):

@@ -18,8 +18,8 @@ class MaskHandler:
         category='mask',
         help_text='Add a selection mask to a layer',
         args={
-            'layer_name': {'type': 'str', 'required': True, 'help': 'Name of the target layer'},
-            'use_current_selection': {'type': 'bool', 'default': False, 'help': 'Use current global selection'}
+            '--layer_name': {'type': 'str', 'required': True, 'help': 'Name of the target layer'},
+            '--use_current_selection': {'type': 'bool', 'default': False, 'help': 'Use current global selection'}
         }
     )
     def add_selection_mask(self, layer_name, use_selection=False):
@@ -68,7 +68,7 @@ class MaskHandler:
         category='mask',
         help_text='Add a selection mask to the currently active layer',
         args={
-            'use_current_selection': {'type': 'bool', 'default': False, 'help': 'Use current global selection'}
+            '--use_current_selection': {'type': 'bool', 'default': False, 'help': 'Use current global selection'}
         }
     )
     def add_selection_mask_to_active(self, use_selection=False):

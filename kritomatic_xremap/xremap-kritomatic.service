@@ -1,0 +1,17 @@
+[Unit]
+Description=Xremap Kritomatic Merger Service
+# Important: This ensures the service waits until your Wayland compositor
+# has actually started and exported its variables.
+After=graphical-session.target
+Requisite=graphical-session.target
+
+[Service]
+Type=simple
+# We don't hardcode variables here because Wayland paths change.
+# Instead, we rely on the merger to find them or for the session to provide them.
+ExecStart=/usr/bin/python REPODIR_PLACEHOLDER/merger.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

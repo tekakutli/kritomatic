@@ -1,0 +1,24 @@
+keymap:
+  # BLOCK 1: Global Keybindings
+  - name: Global Krita Shortcuts
+    remap:
+      n:
+        launch: ["python", "__CLIPBOARD_SCRIPT__"]
+      l:
+        launch: ["kritomatic", "window", "toggle_detached"]
+
+  # BLOCK 2: Krita-Specific Keybindings
+  - name: Krita Custom Scripts
+    application:
+      only: krita
+    remap:
+      M-KEY_0:
+        launch: ["kritomatic", "brush", "set_brush_preset", "--value", "Eraser Circle"]
+      KEY_1:
+        launch: ["kritomatic", "brush", "set_brush_preset", "--value", "Basic-1"]
+      KEY_2:
+        launch: ["kritomatic", "brush", "set_brush_preset", "--value", "Ink-3 Gpen"]
+      KEY_5:
+        launch: ["kritomatic", "layer", "create_blend_layer", "--name", "Normal", "--blend_mode", "Normal"]
+      KEY_8:
+        launch: ["kritomatic", "layer", "create_blend_layer", "--name", "Overlay", "--blend_mode", "Normal"]

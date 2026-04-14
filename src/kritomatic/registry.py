@@ -68,7 +68,7 @@ class CommandRegistry:
             response = client.execute('get_schema')
 
             if response and response.get('status') == 'success':
-                version = response.get('version', 'unknown')
+                version = response.get('version')
                 data = response.get('data', {})
 
                 if data:
@@ -92,37 +92,23 @@ class CommandRegistry:
         cached_version = self._get_cached_version()
         daemon_version = self.get_daemon_version(client)
 
-        if force or cached_version != daemon_version:
-            if cached_version is None and daemon_version is None:
-                # Both missing, still need to refresh to get data
-                print("No schema cached, fetching from daemon...")
-                return self.refresh_from_daemon(client)
-            elif cached_version != daemon_version:
-                print(f"Schema version mismatch (cached: {cached_version}, daemon: {daemon_version}), refreshing...")
-                return self.refresh_from_daemon(client)
-
-        # Check if cache actually has data
-        if self._load_cache() is None:
-            print("Cache exists but no data, refreshing...")
+        if cached_version is None:
+            print("No schema cached, fetching from daemon...")
             return self.refresh_from_daemon(client)
 
-        return True
+        if cached_version == daemon_version:
+            print(f"Schema is fresh (version: {cached_version})")
+            return True
+
+        print(f"Schema version mismatch (cached: {cached_version}, daemon: {daemon_version}), refreshing...")
+        return self.refresh_from_daemon(client)
 
     def get_registry(self, client=None, auto_refresh=True) -> Dict[str, Any]:
         """Get the registry from cache, optionally refreshing if stale"""
-        # Try to load from cache first
         cached = self._load_cache()
         if cached:
             self._registry = cached
             return self._registry
-
-        # No cache, need to fetch
-        if client and auto_refresh:
-            if self.refresh_from_daemon(client):
-                cached = self._load_cache()
-                if cached:
-                    self._registry = cached
-                    return self._registry
 
         self._registry = {}
         return self._registry
@@ -209,7 +195,7 @@ class CommandRegistry:
         translate_parser.add_argument('script_file', help='Path to bash script file')
         translate_parser.add_argument('--save', help='Save to library with this name')
 
-        # Dynamic categories from schema
+        # Dynamic categories from schema (including window, brush, layer, etc.)
         for category, commands in categories.items():
             cat_parser = subparsers.add_parser(category, help=f'{category} operations')
             cmd_subparsers = cat_parser.add_subparsers(dest='subcommand', help=f'{category} commands', required=True)
@@ -249,7 +235,6 @@ class CommandRegistry:
                         else:
                             cmd_parser.add_argument(arg_name, type=arg_type, help=help_text)
 
-                # Function will be added later when handlers are decorated
                 cmd_parser.set_defaults(func=None)
 
         return parser
@@ -266,7 +251,6 @@ class CommandRegistry:
         """List commands from the registry"""
         registry = self.get_registry()
 
-        # Group by category
         categories = {}
         for cmd_key, cmd_info in registry.items():
             cat = cmd_info.get('category', 'unknown')

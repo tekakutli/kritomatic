@@ -35,7 +35,7 @@ class LayerHandler:
             return self.transform.execute(cmd_type, params)
 
         # Text operations
-        elif cmd_type in ['add_vector_text', 'update_vector_text', 'list_shapes', 'replace_all_text']:
+        elif cmd_type in ['add_vector_text', 'update_vector_text', 'list_shapes', 'replace_all_text', 'extract_all_text']:
             return self.text.execute(cmd_type, params)
 
         # Fill operations

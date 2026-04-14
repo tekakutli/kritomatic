@@ -15,30 +15,8 @@ from batch import BatchExecutor, BashConverter, BatchLibrary
 from registry import get_registry_manager
 
 
-def send_to_daemon(category, subcommand, args_dict):
-    """Send a command to the daemon and print the response"""
-    client = get_client()
-    if not client.connect():
-        print("❌ Could not connect to daemon. Make sure Krita is running.")
-        return False
-
-    # Build the command type
-    # The daemon expects types like "create_file_layer", "set_brush_size", etc.
-    cmd_type = subcommand
-
-    # Send the command
-    response = client.execute(cmd_type, **args_dict)
-    if response:
-        print(json.dumps(response, indent=2))
-    else:
-        print("❌ No response from daemon")
-
-    client.close()
-    return True
-
-
 def main():
-    # Handle --refresh flag (force refresh schema from daemon)
+    # ========== HANDLE --refresh FLAG ==========
     if '--refresh' in sys.argv:
         from kritomatic.client import KritaClient
 
@@ -47,7 +25,6 @@ def main():
             registry_mgr = get_registry_manager()
             if registry_mgr.refresh_from_daemon(client):
                 print("✓ Schema refreshed from daemon")
-                registry_mgr.invalidate_cache()
             else:
                 print("❌ Failed to refresh schema. Make sure Krita is running with the daemon enabled.")
             client.close()
@@ -55,7 +32,7 @@ def main():
             print("❌ Could not connect to daemon. Make sure Krita is running.")
         return
 
-    # Get registry manager
+    # ========== NORMAL COMMAND EXECUTION ==========
     registry_mgr = get_registry_manager()
     client = None
 
@@ -66,9 +43,14 @@ def main():
             cached_version = registry_mgr._get_cached_version()
             daemon_version = registry_mgr.get_daemon_version(client)
 
-            if cached_version is None or cached_version != daemon_version:
+            if cached_version is None:
+                print("No schema cached, fetching from daemon...")
+                registry_mgr.refresh_from_daemon(client)
+            elif cached_version != daemon_version:
                 print(f"Schema version mismatch (cached: {cached_version}, daemon: {daemon_version}), refreshing...")
                 registry_mgr.refresh_from_daemon(client)
+            else:
+                print(f"Schema is fresh (version: {cached_version})")
         else:
             print("⚠️ Could not connect to daemon, using cached schema if available")
     except Exception as e:
@@ -90,6 +72,7 @@ def main():
     # Handle management commands
     if args.command == 'compile':
         print("⚠️ 'compile' command is deprecated. Use '--refresh' to update schema from daemon.")
+        print("   The daemon is now the source of truth for commands.")
         return
 
     elif args.command == 'import':
@@ -284,15 +267,24 @@ def main():
                 print(f"❌ Error: {e}")
             return
 
-    # Handle dynamic commands (send to daemon)
+    # Handle dynamic commands (all categories from registry)
     elif hasattr(args, 'subcommand'):
-        # Build arguments dictionary
+        client = get_client()
+        if not client.connect():
+            print("❌ Could not connect to daemon. Make sure Krita is running.")
+            return
+
+        # Build command type (the subcommand name is what the daemon expects)
+        cmd_type = args.subcommand
         kwargs = {}
         for key, value in vars(args).items():
             if key not in ['command', 'subcommand', 'func'] and value is not None:
                 kwargs[key] = value
 
-        send_to_daemon(args.command, args.subcommand, kwargs)
+        response = client.execute(cmd_type, **kwargs)
+        if response:
+            print(json.dumps(response, indent=2))
+        client.close()
 
     else:
         parser.print_help()

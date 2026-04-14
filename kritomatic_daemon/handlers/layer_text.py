@@ -12,6 +12,8 @@ class LayerTextHandler:
             return self.list_shapes(params)
         elif cmd_type == 'replace_all_text':
             return self.replace_all_text(params)
+        elif cmd_type == 'extract_all_text':
+            return self.extract_all_text(params)
         return {'success': False, 'message': f'Unknown text command: {cmd_type}'}
 
     @command(
@@ -272,6 +274,118 @@ class LayerTextHandler:
                     'total_replacements': total_replacements
                 }
             }
+
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    @command(
+        category='layer',
+        help_text='Extract all text from vector text objects in the document',
+        args={
+            '--layer_name': {'type': 'str', 'required': False, 'help': 'Specific layer name (optional, returns all layers if not specified)'},
+            '--output': {'type': 'str', 'required': False, 'help': 'Output file path (optional, prints to console if not specified)'}
+        }
+    )
+    def extract_all_text(self, params):
+        """Extract all text from vector text objects in the document"""
+        try:
+            app = Krita.instance()
+            doc = app.activeDocument()
+            if not doc:
+                return {'success': False, 'message': 'No active document'}
+
+            layer_name = params.get('layer_name', None)
+            output_file = params.get('output', None)
+
+            # Find all vector layers
+            vector_layers = []
+
+            def find_vector_layers(node):
+                if node.type() == 'vectorlayer':
+                    vector_layers.append(node)
+                for child in node.childNodes():
+                    find_vector_layers(child)
+
+            if layer_name:
+                # Find specific layer
+                target = doc.nodeByName(layer_name)
+                if not target:
+                    return {'success': False, 'message': f'Layer "{layer_name}" not found'}
+                if target.type() == 'vectorlayer':
+                    vector_layers = [target]
+                else:
+                    return {'success': False, 'message': f'Layer "{layer_name}" is not a vector layer'}
+            else:
+                # Get all vector layers
+                find_vector_layers(doc.rootNode())
+
+            if not vector_layers:
+                return {'success': False, 'message': 'No vector layers found'}
+
+            # Extract text from all shapes
+            import re
+            results = []
+            total_text_objects = 0
+
+            for layer in vector_layers:
+                layer_texts = []
+                for shape in layer.shapes():
+                    svg = shape.toSvg()
+                    # Extract text content from SVG
+                    # Pattern matches text between > and <, but not empty
+                    text_matches = re.findall(r'>([^<]+)<', svg)
+                    if text_matches:
+                        for text in text_matches:
+                            if text.strip():  # Skip empty text
+                                layer_texts.append(text.strip())
+                                total_text_objects += 1
+
+                if layer_texts:
+                    results.append({
+                        'layer_name': layer.name(),
+                        'texts': layer_texts,
+                        'count': len(layer_texts)
+                    })
+
+            # Format output
+            output_lines = []
+            output_lines.append(f"Document: {doc.fileName() if doc.fileName() else 'Untitled'}")
+            output_lines.append(f"Total text objects found: {total_text_objects}")
+            output_lines.append("")
+
+            for layer_result in results:
+                output_lines.append(f"Layer: {layer_result['layer_name']}")
+                output_lines.append(f"  Text objects ({layer_result['count']}):")
+                for i, text in enumerate(layer_result['texts'], 1):
+                    output_lines.append(f"    {i}. {text}")
+                output_lines.append("")
+
+            output_text = "\n".join(output_lines)
+
+            # Save to file or print
+            if output_file:
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    f.write(output_text)
+                return {
+                    'success': True,
+                    'message': f'Extracted {total_text_objects} text objects to {output_file}',
+                    'data': {
+                        'total_text_objects': total_text_objects,
+                        'layers': len(results),
+                        'output_file': output_file
+                    }
+                }
+            else:
+                print(output_text)
+                return {
+                    'success': True,
+                    'message': f'Found {total_text_objects} text objects',
+                    'data': {
+                        'total_text_objects': total_text_objects,
+                        'layers': len(results),
+                        'details': results
+                    }
+                }
 
         except Exception as e:
             return {'success': False, 'message': str(e)}

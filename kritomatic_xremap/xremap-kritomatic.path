@@ -1,12 +1,10 @@
 [Unit]
-Description=Watch Kritomatic and Personal Config for changes
+Description=Watch Kritomatic Directory for Changes
 
 [Path]
-# Watch the directory itself to catch new file writes/moves
-PathModified=REPODIR_PLACEHOLDER/
-# Also watch your personal overrides
-PathModified=%h/xremap_config.yaml
-Unit=xremap-kritomatic.service
+PathChanged=REPODIR_PLACEHOLDER/
+PathChanged=%h/xremap_config.yaml
+Unit=xremap-kritomatic-restart.service
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target

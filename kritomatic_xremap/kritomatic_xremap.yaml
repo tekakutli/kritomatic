@@ -19,6 +19,6 @@ keymap:
       KEY_2:
         launch: ["kritomatic", "brush", "set_brush_preset", "--value", "Ink-3 Gpen"]
       KEY_5:
-        launch: ["kritomatic", "layer", "create_blend_layer", "--name", "Normal", "--blend_mode", "Normal"]
+        launch: ["kritomatic", "layer", "create_blend_layer", "--name", "Normal7", "--blend_mode", "Normal"]
       KEY_8:
-        launch: ["kritomatic", "layer", "create_blend_layer", "--name", "Overlay", "--blend_mode", "Normal"]
+        launch: ["kritomatic", "layer", "create_blend_layer", "--name", "Overlay3", "--blend_mode", "Overlay"]

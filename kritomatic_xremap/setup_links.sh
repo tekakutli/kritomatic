@@ -5,63 +5,72 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 ENV_DIR="$HOME/.config/xremap"
 ENV_FILE="$ENV_DIR/xremap_kritomatic.env"
+SERVICE_FILE="$SYSTEMD_USER_DIR/xremap-kritomatic.service"
 
-echo "🛠️  Kritomatic Xremap: Initializing Portable Setup..."
+echo "🛠️  Kritomatic Xremap: Initializing Decoupled Setup..."
 
 # --- 2. ADMINISTER ENVIRONMENT FILE ---
-# This ensures we don't erase your TARGET_DEVICE or PERSONAL_CONFIG
 mkdir -p "$ENV_DIR"
 if [ ! -f "$ENV_FILE" ]; then
     echo "📄 Creating new .env file at $ENV_FILE"
     cat <<EOF > "$ENV_FILE"
 REPODIR="$REPO_DIR"
 PERSONAL_CONFIG="$HOME/xremap_config.yaml"
-TARGET_DEVICE="kanata ministeren"
+TARGET_DEVICE="kanata"
 EOF
 else
     echo "🔄 Syncing REPODIR while preserving your settings..."
-    # Update REPODIR path in case you moved the folder, but leave others alone
     sed -i "s|^REPODIR=.*|REPODIR=\"$REPO_DIR\"|" "$ENV_FILE"
 fi
 
-# --- 3. INSTALL SYSTEMD UNITS ---
-echo "🔗 Injecting paths into systemd units..."
+# --- 3. INSTALL SYSTEMD UNITS (With Hash Check) ---
+# Create a unique fingerprint of the current path/user
+CURRENT_STATE_HASH=$(echo "$REPO_DIR-$USER" | md5sum | cut -d' ' -f1)
+INSTALLED_HASH=$(grep "# STATE_HASH:" "$SERVICE_FILE" 2>/dev/null | cut -d':' -f2 | xargs)
 
-# Clear old units and ensure they aren't masked
-systemctl --user stop xremap-kritomatic.path xremap-kritomatic.service 2>/dev/null
-systemctl --user unmask xremap-kritomatic.service 2>/dev/null
-systemctl --user unmask xremap-kritomatic.path 2>/dev/null
+if [ "$CURRENT_STATE_HASH" != "$INSTALLED_HASH" ]; then
+    echo "🔗 Injecting paths and linking units..."
+    mkdir -p "$SYSTEMD_USER_DIR"
 
-# 1. Generate Service Unit from template (Injects current REPO_DIR)
-if [ -f "$REPO_DIR/xremap-kritomatic.service" ]; then
-    sed "s|REPODIR_PLACEHOLDER|$REPO_DIR|g" "$REPO_DIR/xremap-kritomatic.service" > "$SYSTEMD_USER_DIR/xremap-kritomatic.service"
-else
-    echo "❌ Error: xremap-kritomatic.service template missing!"
-    exit 1
-fi
+    # 1. Main Service (Inject REPODIR + HASH)
+    sed "s|REPODIR_PLACEHOLDER|$REPO_DIR|g" "$REPO_DIR/xremap-kritomatic.service" > "$SERVICE_FILE"
+    echo "# STATE_HASH: $CURRENT_STATE_HASH" >> "$SERVICE_FILE"
 
-# 2. Generate Path Unit from template (Injects current REPO_DIR)
-if [ -f "$REPO_DIR/xremap-kritomatic.path" ]; then
+    # 2. Path Unit
     sed "s|REPODIR_PLACEHOLDER|$REPO_DIR|g" "$REPO_DIR/xremap-kritomatic.path" > "$SYSTEMD_USER_DIR/xremap-kritomatic.path"
+
+    # 3. Restart Service (Ghost Middleman)
+    cp "$REPO_DIR/xremap-kritomatic-restart.service" "$SYSTEMD_USER_DIR/xremap-kritomatic-restart.service"
+
+    echo "🚀 Hard resetting systemd units (Path Changed)..."
+    systemctl --user daemon-reload
+    systemctl --user enable xremap-kritomatic.service xremap-kritomatic.path
+    systemctl --user disable xremap-kritomatic-restart.service 2>/dev/null
 else
-    echo "❌ Error: xremap-kritomatic.path template missing!"
-    exit 1
+    echo "⚡ Paths match. Skipping systemd re-injection."
 fi
 
-# --- 4. ACTIVATE ---
-echo "🚀 Activating and performing live reload..."
-systemctl --user daemon-reload
-systemctl --user stop xremap-kritomatic.path
-systemctl --user enable xremap-kritomatic.path
-systemctl --user enable xremap-kritomatic.service
+# --- 4. ACTIVATE (Fast Parallel Restart) ---
+echo "🔄 Refreshing Merger..."
 
-# Force restart triggers the merger immediately (No 'touch' needed)
-systemctl --user restart xremap-kritomatic.path
-systemctl --user restart xremap-kritomatic.service
+# Use '--no-block' to avoid waiting for the operation to complete
+# Run both restarts in background for parallel execution
+systemctl --user try-restart --no-block xremap-kritomatic.service &
+systemctl --user try-restart --no-block xremap-kritomatic.path &
+wait
+
+# --- 5. VERIFICATION (Non-blocking, quiet) ---
+# Small delay to let services settle
+sleep 0.2
 
 if systemctl --user is-active --quiet xremap-kritomatic.service; then
-    echo "✅ Success! System is portable and active."
-    echo "📍 Environment: $ENV_FILE"
+    echo "✅ Setup Complete. Service is running."
 else
-    echo "⚠️  Service failed to start. Check: journalctl --user -u xremap-kritomatic.service -f"
+    # One more check - maybe it's still starting
+    sleep 0.3
+    if systemctl --user is-active --quiet xremap-kritomatic.service; then
+        echo "✅ Setup Complete. Service is running."
+    else
+        echo "⚠️  Service not active. Check: systemctl --user status xremap-kritomatic.service"
+    fi
 fi

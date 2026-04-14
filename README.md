@@ -31,7 +31,7 @@ and enable it in Krita/Settings/Configure Krita/Plugin Manager/Kritomatic Daemon
 
 And (optional) setup the xremap config:
 ```bash
-yay -S go-yq # THE GO-LANG VERSION
+yay -S go-yq python-pyinotify # THE GO-LANG VERSION
 cd kritomatic/kritomatic_xremap
 chmod +x setup_links.sh && ./setup_links.sh
 ```

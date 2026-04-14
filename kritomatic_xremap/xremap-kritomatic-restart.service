@@ -1,0 +1,9 @@
+[Unit]
+Description=Restarter Middleman (Triggered by Path)
+# No After= or Requires= here to keep it fast
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --user restart xremap-kritomatic.service
+
+# NO [Install] SECTION HERE.

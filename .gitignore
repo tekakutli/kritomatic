@@ -164,3 +164,4 @@ data/batches/*
 !data/batches/.gitkeep
 data/bundles/*
 !data/bundles/.gitkeep
+.aider*

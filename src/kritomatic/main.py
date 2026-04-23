@@ -7,6 +7,7 @@ import sys
 import argparse
 import json
 from pathlib import Path
+import builtins
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -16,6 +17,9 @@ from registry import get_registry_manager
 
 
 def main():
+    # Check if this is a translate command (to suppress all messages)
+    is_translate = len(sys.argv) >= 3 and sys.argv[1] == 'batch' and sys.argv[2] == 'translate'
+
     # ========== HANDLE --refresh FLAG ==========
     if '--refresh' in sys.argv:
         from kritomatic.client import KritaClient
@@ -36,43 +40,67 @@ def main():
     registry_mgr = get_registry_manager()
     client = None
 
-    # Try to ensure schema is fresh (auto-refresh if cache missing or stale)
-    try:
-        client = get_client()
-        if client.connect():
-            cached_version = registry_mgr._get_cached_version()
-            daemon_version = registry_mgr.get_daemon_version(client)
+    # For translate command, suppress all output during schema refresh
+    if is_translate:
+        # Redirect stdout/stderr to null during schema refresh
+        import io
+        import contextlib
+        null_output = io.StringIO()
 
-            if cached_version is None:
-                print("No schema cached, fetching from daemon...")
-                registry_mgr.refresh_from_daemon(client)
-            elif cached_version != daemon_version:
-                print(f"Schema version mismatch (cached: {cached_version}, daemon: {daemon_version}), refreshing...")
-                registry_mgr.refresh_from_daemon(client)
+        with contextlib.redirect_stdout(null_output), contextlib.redirect_stderr(null_output):
+            try:
+                client = get_client()
+                if client.connect():
+                    cached_version = registry_mgr._get_cached_version()
+                    daemon_version = registry_mgr.get_daemon_version(client)
+
+                    if cached_version is None or cached_version != daemon_version:
+                        registry_mgr.refresh_from_daemon(client)
+            except Exception:
+                pass
+            finally:
+                if client:
+                    client.close()
+    else:
+        # Normal output - show messages
+        try:
+            client = get_client()
+            if client.connect():
+                cached_version = registry_mgr._get_cached_version()
+                daemon_version = registry_mgr.get_daemon_version(client)
+
+                if cached_version is None:
+                    print("No schema cached, fetching from daemon...")
+                    registry_mgr.refresh_from_daemon(client)
+                elif cached_version != daemon_version:
+                    print(f"Schema version mismatch (cached: {cached_version}, daemon: {daemon_version}), refreshing...")
+                    registry_mgr.refresh_from_daemon(client)
+                else:
+                    print(f"Schema is fresh (version: {cached_version})")
             else:
-                print(f"Schema is fresh (version: {cached_version})")
-        else:
-            print("⚠️ Could not connect to daemon, using cached schema if available")
-    except Exception as e:
-        print(f"⚠️ Error checking schema: {e}")
-    finally:
-        if client:
-            client.close()
+                print("⚠️ Could not connect to daemon, using cached schema if available")
+        except Exception as e:
+            print(f"⚠️ Error checking schema: {e}")
+        finally:
+            if client:
+                client.close()
 
     # Build parser from schema cache
     parser = registry_mgr.get_parser()
 
     # Parse arguments
     if len(sys.argv) == 1:
-        parser.print_help()
+        if not is_translate:
+            parser.print_help()
         return
 
     args = parser.parse_args()
 
     # Handle management commands
     if args.command == 'compile':
-        print("⚠️ 'compile' command is deprecated. Use '--refresh' to update schema from daemon.")
-        print("   The daemon is now the source of truth for commands.")
+        if not is_translate:
+            print("⚠️ 'compile' command is deprecated. Use '--refresh' to update schema from daemon.")
+            print("   The daemon is now the source of truth for commands.")
         return
 
     elif args.command == 'import':
@@ -80,7 +108,8 @@ def main():
         compiler = CommandCompiler()
         compiler.import_bundle(args.bundle_file)
         registry_mgr.invalidate_cache()
-        print("⚠️ Imported bundle. Run 'kritomatic --refresh' to update schema from daemon.")
+        if not is_translate:
+            print("⚠️ Imported bundle. Run 'kritomatic --refresh' to update schema from daemon.")
         return
 
     elif args.command == 'export':
@@ -106,15 +135,17 @@ def main():
         compiler = CommandCompiler()
         compiler.remove_command(args.category, args.command)
         registry_mgr.invalidate_cache()
-        print("⚠️ Command removed. Run 'kritomatic --refresh' to update schema from daemon.")
+        if not is_translate:
+            print("⚠️ Command removed. Run 'kritomatic --refresh' to update schema from daemon.")
         return
 
     elif args.command == 'list':
-        registry_mgr.list_commands(
-            verbose=getattr(args, 'verbose', False),
-            tree=getattr(args, 'tree', False),
-            category=getattr(args, 'category', None)
-        )
+        if not is_translate:
+            registry_mgr.list_commands(
+                verbose=getattr(args, 'verbose', False),
+                tree=getattr(args, 'tree', False),
+                category=getattr(args, 'category', None)
+            )
         return
 
     elif args.command == 'clear':
@@ -122,7 +153,8 @@ def main():
         compiler = CommandCompiler()
         compiler.clear_all_commands()
         registry_mgr.invalidate_cache()
-        print("⚠️ All commands cleared. Run 'kritomatic --refresh' to update schema from daemon.")
+        if not is_translate:
+            print("⚠️ All commands cleared. Run 'kritomatic --refresh' to update schema from daemon.")
         return
 
     elif args.command == 'clear-category':
@@ -130,7 +162,8 @@ def main():
         compiler = CommandCompiler()
         compiler.clear_category(args.category)
         registry_mgr.invalidate_cache()
-        print("⚠️ Category cleared. Run 'kritomatic --refresh' to update schema from daemon.")
+        if not is_translate:
+            print("⚠️ Category cleared. Run 'kritomatic --refresh' to update schema from daemon.")
         return
 
     # Handle batch commands
@@ -141,14 +174,16 @@ def main():
                 results = executor.execute_from_json(args.json_string)
                 successful = sum(1 for r in results if r['status'] == 'success')
                 failed = sum(1 for r in results if r['status'] == 'error')
-                print(f"\n✓ Batch complete: {successful} succeeded, {failed} failed")
-                if failed > 0:
-                    print("\nFailed commands:")
-                    for r in results:
-                        if r['status'] == 'error':
-                            print(f"  ✗ {r['command']}: {r['message']}")
+                if not is_translate:
+                    print(f"\n✓ Batch complete: {successful} succeeded, {failed} failed")
+                    if failed > 0:
+                        print("\nFailed commands:")
+                        for r in results:
+                            if r['status'] == 'error':
+                                print(f"  ✗ {r['command']}: {r['message']}")
             except json.JSONDecodeError as e:
-                print(f"❌ Invalid JSON: {e}")
+                if not is_translate:
+                    print(f"❌ Invalid JSON: {e}")
             finally:
                 executor.close()
             return
@@ -159,16 +194,19 @@ def main():
                 results = executor.execute_from_file(args.file_path)
                 successful = sum(1 for r in results if r['status'] == 'success')
                 failed = sum(1 for r in results if r['status'] == 'error')
-                print(f"\n✓ Batch complete: {successful} succeeded, {failed} failed")
-                if failed > 0:
-                    print("\nFailed commands:")
-                    for r in results:
-                        if r['status'] == 'error':
-                            print(f"  ✗ {r['command']}: {r['message']}")
+                if not is_translate:
+                    print(f"\n✓ Batch complete: {successful} succeeded, {failed} failed")
+                    if failed > 0:
+                        print("\nFailed commands:")
+                        for r in results:
+                            if r['status'] == 'error':
+                                print(f"  ✗ {r['command']}: {r['message']}")
             except FileNotFoundError:
-                print(f"❌ File not found: {args.file_path}")
+                if not is_translate:
+                    print(f"❌ File not found: {args.file_path}")
             except json.JSONDecodeError as e:
-                print(f"❌ Invalid JSON in file: {e}")
+                if not is_translate:
+                    print(f"❌ Invalid JSON in file: {e}")
             finally:
                 executor.close()
             return
@@ -178,14 +216,17 @@ def main():
             try:
                 batch_data = json.loads(args.json_string)
                 if library.save(args.name, batch_data):
-                    print(f"✓ Batch '{args.name}' saved")
-                    info = library.get_info(args.name)
-                    print(f"  📁 {info['path']}")
-                    print(f"  📊 {info['command_count']} commands")
+                    if not is_translate:
+                        print(f"✓ Batch '{args.name}' saved")
+                        info = library.get_info(args.name)
+                        print(f"  📁 {info['path']}")
+                        print(f"  📊 {info['command_count']} commands")
                 else:
-                    print(f"❌ Failed to save batch '{args.name}'")
+                    if not is_translate:
+                        print(f"❌ Failed to save batch '{args.name}'")
             except json.JSONDecodeError as e:
-                print(f"❌ Invalid JSON: {e}")
+                if not is_translate:
+                    print(f"❌ Invalid JSON: {e}")
             return
 
         elif args.batch_command == 'run-saved':
@@ -196,54 +237,60 @@ def main():
                 results = executor.execute(batch_data)
                 successful = sum(1 for r in results if r['status'] == 'success')
                 failed = sum(1 for r in results if r['status'] == 'error')
-                print(f"\n✓ Batch '{args.name}' (ID: {executor.get_batch_id()}) complete: {successful} succeeded, {failed} failed")
-                if failed > 0:
-                    print("\nFailed commands:")
-                    for r in results:
-                        if r['status'] == 'error':
-                            print(f"  ✗ {r['command']}: {r['message']}")
+                if not is_translate:
+                    print(f"\n✓ Batch '{args.name}' (ID: {executor.get_batch_id()}) complete: {successful} succeeded, {failed} failed")
+                    if failed > 0:
+                        print("\nFailed commands:")
+                        for r in results:
+                            if r['status'] == 'error':
+                                print(f"  ✗ {r['command']}: {r['message']}")
                 executor.close()
             else:
-                print(f"❌ Batch '{args.name}' not found")
+                if not is_translate:
+                    print(f"❌ Batch '{args.name}' not found")
             return
 
         elif args.batch_command == 'list-saved':
-            library = BatchLibrary()
-            batches = library.list_batches()
-            if batches:
-                print(f"\n📦 Saved batches ({len(batches)}):")
-                for name in batches:
-                    info = library.get_info(name)
-                    print(f"  📄 {name} - {info['command_count']} commands")
-            else:
-                print("No saved batches found")
+            if not is_translate:
+                library = BatchLibrary()
+                batches = library.list_batches()
+                if batches:
+                    print(f"\n📦 Saved batches ({len(batches)}):")
+                    for name in batches:
+                        info = library.get_info(name)
+                        print(f"  📄 {name} - {info['command_count']} commands")
+                else:
+                    print("No saved batches found")
             return
 
         elif args.batch_command == 'info':
-            library = BatchLibrary()
-            info = library.get_info(args.name)
-            if info:
-                print(f"\n📄 Batch: {info['name']}")
-                print(f"   ID: {info['id']}")
-                print(f"   Commands: {info['command_count']}")
-                print(f"   Path: {info['path']}")
-                batch = library.load(args.name)
-                if batch:
-                    print("\n   Commands:")
-                    for i, cmd in enumerate(batch.get('commands', [])[:5]):
-                        print(f"     {i+1}. {cmd.get('type')}")
-                    if len(batch.get('commands', [])) > 5:
-                        print(f"     ... and {len(batch['commands']) - 5} more")
-            else:
-                print(f"❌ Batch '{args.name}' not found")
+            if not is_translate:
+                library = BatchLibrary()
+                info = library.get_info(args.name)
+                if info:
+                    print(f"\n📄 Batch: {info['name']}")
+                    print(f"   ID: {info['id']}")
+                    print(f"   Commands: {info['command_count']}")
+                    print(f"   Path: {info['path']}")
+                    batch = library.load(args.name)
+                    if batch:
+                        print("\n   Commands:")
+                        for i, cmd in enumerate(batch.get('commands', [])[:5]):
+                            print(f"     {i+1}. {cmd.get('type')}")
+                        if len(batch.get('commands', [])) > 5:
+                            print(f"     ... and {len(batch['commands']) - 5} more")
+                else:
+                    print(f"❌ Batch '{args.name}' not found")
             return
 
         elif args.batch_command == 'delete':
             library = BatchLibrary()
             if library.delete(args.name):
-                print(f"✓ Batch '{args.name}' deleted")
+                if not is_translate:
+                    print(f"✓ Batch '{args.name}' deleted")
             else:
-                print(f"❌ Batch '{args.name}' not found")
+                if not is_translate:
+                    print(f"❌ Batch '{args.name}' not found")
             return
 
         elif args.batch_command == 'translate':
@@ -253,25 +300,31 @@ def main():
                 if args.save:
                     library = BatchLibrary()
                     if library.save(args.save, batch):
-                        print(f"✓ Script converted and saved as batch '{args.save}'")
-                        info = library.get_info(args.save)
-                        print(f"  📁 {info['path']}")
-                        print(f"  📊 {info['command_count']} commands")
+                        if not is_translate:
+                            print(f"✓ Script converted and saved as batch '{args.save}'")
+                            info = library.get_info(args.save)
+                            print(f"  📁 {info['path']}")
+                            print(f"  📊 {info['command_count']} commands")
                     else:
-                        print(f"❌ Failed to save batch '{args.save}'")
+                        if not is_translate:
+                            print(f"❌ Failed to save batch '{args.save}'")
                 else:
+                    # Only print the JSON output, no extra messages
                     print(json.dumps(batch, indent=2))
             except FileNotFoundError:
-                print(f"❌ Script file not found: {args.script_file}")
+                if not is_translate:
+                    print(f"❌ Script file not found: {args.script_file}")
             except Exception as e:
-                print(f"❌ Error: {e}")
+                if not is_translate:
+                    print(f"❌ Error: {e}")
             return
 
     # Handle dynamic commands (all categories from registry)
     elif hasattr(args, 'subcommand'):
         client = get_client()
         if not client.connect():
-            print("❌ Could not connect to daemon. Make sure Krita is running.")
+            if not is_translate:
+                print("❌ Could not connect to daemon. Make sure Krita is running.")
             return
 
         # Build command type (the subcommand name is what the daemon expects)
@@ -287,7 +340,8 @@ def main():
         client.close()
 
     else:
-        parser.print_help()
+        if not is_translate:
+            parser.print_help()
 
 
 if __name__ == '__main__':

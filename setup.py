@@ -18,5 +18,6 @@ setup(
     },
     install_requires=[
         'pyyaml',
+        'PyQt5>=5.15.11',
     ],
 )

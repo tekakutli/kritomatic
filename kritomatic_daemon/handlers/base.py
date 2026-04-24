@@ -8,6 +8,7 @@ from .transform import TransformHandler
 from .document import DocumentHandler
 from .view import ViewHandler
 from .window import WindowHandler
+from .diffusion import DiffusionHandler
 from ..registry import get_command_registry
 
 class CommandHandler:
@@ -20,7 +21,8 @@ class CommandHandler:
             'transform': TransformHandler(),
             'document': DocumentHandler(),
             'view': ViewHandler(),
-            'window': WindowHandler()
+            'window': WindowHandler(),
+            'diffusion': DiffusionHandler()
         }
 
     def handle_command(self, command, client_socket):
@@ -143,6 +145,10 @@ class CommandHandler:
         elif cmd_type in ['toggle_detached', 'toggle_fullscreen', 'toggle_dockers',
                           'toggle_docker_titles', 'new_window']:
             return self.handlers['window'].execute(cmd_type, command)
+
+        # Diffusion commands
+        elif cmd_type in ['list_workflows', 'switch_workflow', 'get_params', 'set_param', 'generate', 'export_params', 'import_params']:
+            return self.handlers['diffusion'].execute(cmd_type, command)
 
         else:
             return {'success': False, 'message': f'Unknown command type: {cmd_type}'}

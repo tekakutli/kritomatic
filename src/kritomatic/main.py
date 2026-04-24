@@ -7,7 +7,6 @@ import sys
 import argparse
 import json
 from pathlib import Path
-import builtins
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -16,10 +15,23 @@ from batch import BatchExecutor, BashConverter, BatchLibrary
 from registry import get_registry_manager
 
 
-def main():
-    # Check if this is a translate command (to suppress all messages)
-    is_translate = len(sys.argv) >= 3 and sys.argv[1] == 'batch' and sys.argv[2] == 'translate'
+def is_suppress_command():
+    """Check if current command should suppress schema refresh messages"""
+    if len(sys.argv) < 2:
+        return False
 
+    # batch translate
+    if len(sys.argv) >= 3 and sys.argv[1] == 'batch' and sys.argv[2] == 'translate':
+        return True
+
+    # diffusion export_params (when piping JSON)
+    if len(sys.argv) >= 3 and sys.argv[1] == 'diffusion' and sys.argv[2] == 'export_params':
+        return True
+
+    return False
+
+
+def main():
     # ========== HANDLE --refresh FLAG ==========
     if '--refresh' in sys.argv:
         from kritomatic.client import KritaClient
@@ -39,10 +51,10 @@ def main():
     # ========== NORMAL COMMAND EXECUTION ==========
     registry_mgr = get_registry_manager()
     client = None
+    suppress_output = is_suppress_command()
 
-    # For translate command, suppress all output during schema refresh
-    if is_translate:
-        # Redirect stdout/stderr to null during schema refresh
+    # For suppress commands, redirect stdout/stderr to null during schema refresh
+    if suppress_output:
         import io
         import contextlib
         null_output = io.StringIO()
@@ -90,7 +102,7 @@ def main():
 
     # Parse arguments
     if len(sys.argv) == 1:
-        if not is_translate:
+        if not suppress_output:
             parser.print_help()
         return
 
@@ -98,7 +110,7 @@ def main():
 
     # Handle management commands
     if args.command == 'compile':
-        if not is_translate:
+        if not suppress_output:
             print("⚠️ 'compile' command is deprecated. Use '--refresh' to update schema from daemon.")
             print("   The daemon is now the source of truth for commands.")
         return
@@ -108,7 +120,7 @@ def main():
         compiler = CommandCompiler()
         compiler.import_bundle(args.bundle_file)
         registry_mgr.invalidate_cache()
-        if not is_translate:
+        if not suppress_output:
             print("⚠️ Imported bundle. Run 'kritomatic --refresh' to update schema from daemon.")
         return
 
@@ -135,12 +147,12 @@ def main():
         compiler = CommandCompiler()
         compiler.remove_command(args.category, args.command)
         registry_mgr.invalidate_cache()
-        if not is_translate:
+        if not suppress_output:
             print("⚠️ Command removed. Run 'kritomatic --refresh' to update schema from daemon.")
         return
 
     elif args.command == 'list':
-        if not is_translate:
+        if not suppress_output:
             registry_mgr.list_commands(
                 verbose=getattr(args, 'verbose', False),
                 tree=getattr(args, 'tree', False),
@@ -153,7 +165,7 @@ def main():
         compiler = CommandCompiler()
         compiler.clear_all_commands()
         registry_mgr.invalidate_cache()
-        if not is_translate:
+        if not suppress_output:
             print("⚠️ All commands cleared. Run 'kritomatic --refresh' to update schema from daemon.")
         return
 
@@ -162,7 +174,7 @@ def main():
         compiler = CommandCompiler()
         compiler.clear_category(args.category)
         registry_mgr.invalidate_cache()
-        if not is_translate:
+        if not suppress_output:
             print("⚠️ Category cleared. Run 'kritomatic --refresh' to update schema from daemon.")
         return
 
@@ -174,7 +186,7 @@ def main():
                 results = executor.execute_from_json(args.json_string)
                 successful = sum(1 for r in results if r['status'] == 'success')
                 failed = sum(1 for r in results if r['status'] == 'error')
-                if not is_translate:
+                if not suppress_output:
                     print(f"\n✓ Batch complete: {successful} succeeded, {failed} failed")
                     if failed > 0:
                         print("\nFailed commands:")
@@ -182,7 +194,7 @@ def main():
                             if r['status'] == 'error':
                                 print(f"  ✗ {r['command']}: {r['message']}")
             except json.JSONDecodeError as e:
-                if not is_translate:
+                if not suppress_output:
                     print(f"❌ Invalid JSON: {e}")
             finally:
                 executor.close()
@@ -194,7 +206,7 @@ def main():
                 results = executor.execute_from_file(args.file_path)
                 successful = sum(1 for r in results if r['status'] == 'success')
                 failed = sum(1 for r in results if r['status'] == 'error')
-                if not is_translate:
+                if not suppress_output:
                     print(f"\n✓ Batch complete: {successful} succeeded, {failed} failed")
                     if failed > 0:
                         print("\nFailed commands:")
@@ -202,10 +214,10 @@ def main():
                             if r['status'] == 'error':
                                 print(f"  ✗ {r['command']}: {r['message']}")
             except FileNotFoundError:
-                if not is_translate:
+                if not suppress_output:
                     print(f"❌ File not found: {args.file_path}")
             except json.JSONDecodeError as e:
-                if not is_translate:
+                if not suppress_output:
                     print(f"❌ Invalid JSON in file: {e}")
             finally:
                 executor.close()
@@ -216,16 +228,16 @@ def main():
             try:
                 batch_data = json.loads(args.json_string)
                 if library.save(args.name, batch_data):
-                    if not is_translate:
+                    if not suppress_output:
                         print(f"✓ Batch '{args.name}' saved")
                         info = library.get_info(args.name)
                         print(f"  📁 {info['path']}")
                         print(f"  📊 {info['command_count']} commands")
                 else:
-                    if not is_translate:
+                    if not suppress_output:
                         print(f"❌ Failed to save batch '{args.name}'")
             except json.JSONDecodeError as e:
-                if not is_translate:
+                if not suppress_output:
                     print(f"❌ Invalid JSON: {e}")
             return
 
@@ -237,7 +249,7 @@ def main():
                 results = executor.execute(batch_data)
                 successful = sum(1 for r in results if r['status'] == 'success')
                 failed = sum(1 for r in results if r['status'] == 'error')
-                if not is_translate:
+                if not suppress_output:
                     print(f"\n✓ Batch '{args.name}' (ID: {executor.get_batch_id()}) complete: {successful} succeeded, {failed} failed")
                     if failed > 0:
                         print("\nFailed commands:")
@@ -246,12 +258,12 @@ def main():
                                 print(f"  ✗ {r['command']}: {r['message']}")
                 executor.close()
             else:
-                if not is_translate:
+                if not suppress_output:
                     print(f"❌ Batch '{args.name}' not found")
             return
 
         elif args.batch_command == 'list-saved':
-            if not is_translate:
+            if not suppress_output:
                 library = BatchLibrary()
                 batches = library.list_batches()
                 if batches:
@@ -264,7 +276,7 @@ def main():
             return
 
         elif args.batch_command == 'info':
-            if not is_translate:
+            if not suppress_output:
                 library = BatchLibrary()
                 info = library.get_info(args.name)
                 if info:
@@ -286,10 +298,10 @@ def main():
         elif args.batch_command == 'delete':
             library = BatchLibrary()
             if library.delete(args.name):
-                if not is_translate:
+                if not suppress_output:
                     print(f"✓ Batch '{args.name}' deleted")
             else:
-                if not is_translate:
+                if not suppress_output:
                     print(f"❌ Batch '{args.name}' not found")
             return
 
@@ -300,22 +312,22 @@ def main():
                 if args.save:
                     library = BatchLibrary()
                     if library.save(args.save, batch):
-                        if not is_translate:
+                        if not suppress_output:
                             print(f"✓ Script converted and saved as batch '{args.save}'")
                             info = library.get_info(args.save)
                             print(f"  📁 {info['path']}")
                             print(f"  📊 {info['command_count']} commands")
                     else:
-                        if not is_translate:
+                        if not suppress_output:
                             print(f"❌ Failed to save batch '{args.save}'")
                 else:
                     # Only print the JSON output, no extra messages
                     print(json.dumps(batch, indent=2))
             except FileNotFoundError:
-                if not is_translate:
+                if not suppress_output:
                     print(f"❌ Script file not found: {args.script_file}")
             except Exception as e:
-                if not is_translate:
+                if not suppress_output:
                     print(f"❌ Error: {e}")
             return
 
@@ -323,7 +335,7 @@ def main():
     elif hasattr(args, 'subcommand'):
         client = get_client()
         if not client.connect():
-            if not is_translate:
+            if not suppress_output:
                 print("❌ Could not connect to daemon. Make sure Krita is running.")
             return
 
@@ -335,12 +347,21 @@ def main():
                 kwargs[key] = value
 
         response = client.execute(cmd_type, **kwargs)
+
         if response:
-            print(json.dumps(response, indent=2))
+            # Check if this response contains raw JSON data (for export_params)
+            # Note: daemon returns 'status' not 'success'
+            if response.get('status') == 'success' and 'json' in response.get('data', {}):
+                # Print the raw JSON string directly
+                print(response['data']['json'])
+            else:
+                # Normal output - print the whole response
+                print(json.dumps(response, indent=2))
+
         client.close()
 
     else:
-        if not is_translate:
+        if not suppress_output:
             parser.print_help()
 
 

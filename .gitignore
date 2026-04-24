@@ -162,6 +162,7 @@ src/kritomatic/.command_registry.json
 src/kritomatic/.schema_cache.json
 data/batches/*
 !data/batches/.gitkeep
-data/bundles/*
-!data/bundles/.gitkeep
+data/diffusion/*
+!data/diffusion/.gitkeep
 .aider*
+

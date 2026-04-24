@@ -48,6 +48,12 @@ def main():
             print("❌ Could not connect to daemon. Make sure Krita is running.")
         return
 
+    # ========== HANDLE diffusion preset subcommands (client-side only) ==========
+    if len(sys.argv) >= 3 and sys.argv[1] == 'diffusion' and sys.argv[2] == 'preset':
+        from diffusion_preset import run_preset_command
+        run_preset_command()
+        return
+
     # ========== NORMAL COMMAND EXECUTION ==========
     registry_mgr = get_registry_manager()
     client = None
@@ -339,7 +345,6 @@ def main():
                 print("❌ Could not connect to daemon. Make sure Krita is running.")
             return
 
-        # Build command type (the subcommand name is what the daemon expects)
         cmd_type = args.subcommand
         kwargs = {}
         for key, value in vars(args).items():
@@ -349,13 +354,9 @@ def main():
         response = client.execute(cmd_type, **kwargs)
 
         if response:
-            # Check if this response contains raw JSON data (for export_params)
-            # Note: daemon returns 'status' not 'success'
             if response.get('status') == 'success' and 'json' in response.get('data', {}):
-                # Print the raw JSON string directly
                 print(response['data']['json'])
             else:
-                # Normal output - print the whole response
                 print(json.dumps(response, indent=2))
 
         client.close()

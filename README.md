@@ -29,7 +29,7 @@ ln -s "$SOURCE_DIR/kritomatic/kritomatic_daemon/kritomatic_daemon.desktop" "$TAR
 ```
 and enable it in Krita/Settings/Configure Krita/Plugin Manager/Kritomatic Daemon  
 
-And (optional) setup the xremap config:
+## xremap Integration (Optional)
 ```bash
 yay -S go-yq python-pyinotify # THE GO-LANG VERSION
 cd kritomatic/kritomatic_xremap
@@ -41,3 +41,12 @@ Edit `~/.config/xremap/xremap_kritomatic.env` to set your `TARGET_DEVICE` or `PE
 
 > [!TIP]
 > The setup script automatically handles pathing and systemd registration. Run it again if you move the folder.
+
+## AI Diffusion Integration (Optional)
+
+To use the AI Diffusion workflows included in this repository, link the project's workflow directory to Krita's AI Diffusion config:
+
+```bash
+# Run the setup script from the kritomatic directory
+./link_ai_diffusion_workflows.sh
+```

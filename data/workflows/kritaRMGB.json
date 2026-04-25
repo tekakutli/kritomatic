@@ -1,0 +1,564 @@
+{
+  "2": {
+    "inputs": {
+      "name": "areaToRMBG"
+    },
+    "class_type": "ETN_KritaMaskLayer",
+    "_meta": {
+      "title": "Krita Mask Layer"
+    }
+  },
+  "3": {
+    "inputs": {
+      "a": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "CM_BoolToInt",
+    "_meta": {
+      "title": "BoolToInt"
+    }
+  },
+  "4": {
+    "inputs": {
+      "name": "cutSelection?",
+      "type": "toggle",
+      "default": false
+    },
+    "class_type": "ETN_Parameter",
+    "_meta": {
+      "title": "Parameter"
+    }
+  },
+  "5": {
+    "inputs": {
+      "a": [
+        "7",
+        0
+      ]
+    },
+    "class_type": "CM_BoolToInt",
+    "_meta": {
+      "title": "BoolToInt"
+    }
+  },
+  "7": {
+    "inputs": {
+      "op": "Not",
+      "a": [
+        "23",
+        0
+      ]
+    },
+    "class_type": "CM_BoolUnaryOperation",
+    "_meta": {
+      "title": "BoolUnaryOperation"
+    }
+  },
+  "9": {
+    "inputs": {
+      "model": "RMBG-2.0",
+      "sensitivity": 1,
+      "process_res": 1024,
+      "mask_blur": 0,
+      "mask_offset": 0,
+      "invert_output": false,
+      "refine_foreground": false,
+      "background": "Alpha",
+      "background_color": "#222222",
+      "image": [
+        "25",
+        0
+      ]
+    },
+    "class_type": "RMBG",
+    "_meta": {
+      "title": "Remove Background (RMBG)"
+    }
+  },
+  "10": {
+    "inputs": {
+      "prompt": [
+        "11",
+        0
+      ],
+      "sam_model": "sam_vit_h (2.56GB)",
+      "dino_model": "GroundingDINO_SwinT_OGC (694MB)",
+      "threshold": 0.3,
+      "mask_blur": 0,
+      "mask_offset": 0,
+      "invert_output": false,
+      "background": "Alpha",
+      "background_color": "#222222",
+      "image": [
+        "25",
+        1
+      ]
+    },
+    "class_type": "Segment",
+    "_meta": {
+      "title": "Segmentation V1 (RMBG)"
+    }
+  },
+  "11": {
+    "inputs": {
+      "name": "segmentFurther",
+      "type": "text",
+      "default": "person"
+    },
+    "class_type": "ETN_Parameter",
+    "_meta": {
+      "title": "Parameter"
+    }
+  },
+  "12": {
+    "inputs": {
+      "a": [
+        "5",
+        0
+      ],
+      "b": 1
+    },
+    "class_type": "JWIntegerAdd",
+    "_meta": {
+      "title": "Integer Add"
+    }
+  },
+  "13": {
+    "inputs": {
+      "mask1": [
+        "16",
+        1
+      ],
+      "mask2": [
+        "10",
+        1
+      ]
+    },
+    "class_type": "SubtractMask",
+    "_meta": {
+      "title": "Pixelwise(MASK - MASK)"
+    }
+  },
+  "14": {
+    "inputs": {
+      "mask1": [
+        "16",
+        1
+      ],
+      "mask2": [
+        "10",
+        1
+      ]
+    },
+    "class_type": "AddMask",
+    "_meta": {
+      "title": "Pixelwise(MASK + MASK)"
+    }
+  },
+  "15": {
+    "inputs": {
+      "a": [
+        "3",
+        0
+      ],
+      "b": 1
+    },
+    "class_type": "JWIntegerAdd",
+    "_meta": {
+      "title": "Integer Add"
+    }
+  },
+  "16": {
+    "inputs": {
+      "model": "RMBG-2.0",
+      "sensitivity": 1,
+      "process_res": 1024,
+      "mask_blur": 0,
+      "mask_offset": 0,
+      "invert_output": false,
+      "refine_foreground": false,
+      "background": "Alpha",
+      "background_color": "#222222",
+      "image": [
+        "25",
+        1
+      ]
+    },
+    "class_type": "RMBG",
+    "_meta": {
+      "title": "Remove Background (RMBG)"
+    }
+  },
+  "19": {
+    "inputs": {
+      "image": [
+        "16",
+        0
+      ],
+      "mask": [
+        "14",
+        0
+      ]
+    },
+    "class_type": "ETN_ApplyMaskToImage",
+    "_meta": {
+      "title": "Apply Mask to Image"
+    }
+  },
+  "21": {
+    "inputs": {
+      "image": [
+        "16",
+        0
+      ],
+      "mask": [
+        "13",
+        0
+      ]
+    },
+    "class_type": "ETN_ApplyMaskToImage",
+    "_meta": {
+      "title": "Apply Mask to Image"
+    }
+  },
+  "22": {
+    "inputs": {},
+    "class_type": "ETN_KritaCanvas",
+    "_meta": {
+      "title": "Krita Canvas"
+    }
+  },
+  "23": {
+    "inputs": {
+      "name": "simpleSegmentation?",
+      "type": "toggle",
+      "default": true
+    },
+    "class_type": "ETN_Parameter",
+    "_meta": {
+      "title": "Parameter"
+    }
+  },
+  "24": {
+    "inputs": {
+      "select": [
+        "15",
+        0
+      ],
+      "sel_mode": false,
+      "input1": [
+        "22",
+        0
+      ],
+      "input2": [
+        "34",
+        0
+      ]
+    },
+    "class_type": "ImpactSwitch",
+    "_meta": {
+      "title": "Switch (Any)"
+    }
+  },
+  "25": {
+    "inputs": {
+      "select": [
+        "12",
+        0
+      ],
+      "sel_mode": false,
+      "input": [
+        "24",
+        0
+      ]
+    },
+    "class_type": "ImpactInversedSwitch",
+    "_meta": {
+      "title": "Inversed Switch (Any)"
+    }
+  },
+  "34": {
+    "inputs": {
+      "image_crop_multi": 1,
+      "mask_crop_multi": 1,
+      "bbox_smooth_alpha": 1,
+      "image": [
+        "22",
+        0
+      ],
+      "mask": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "easy imageCropFromMask",
+    "_meta": {
+      "title": "imageCropFromMask"
+    }
+  },
+  "41": {
+    "inputs": {
+      "images": [
+        "43",
+        0
+      ]
+    },
+    "class_type": "ETN_KritaOutput",
+    "_meta": {
+      "title": "Krita Output"
+    }
+  },
+  "43": {
+    "inputs": {
+      "select": [
+        "15",
+        0
+      ],
+      "sel_mode": false,
+      "input1": [
+        "9",
+        0
+      ],
+      "input2": [
+        "68",
+        0
+      ]
+    },
+    "class_type": "ImpactSwitch",
+    "_meta": {
+      "title": "Switch (Any)"
+    }
+  },
+  "49": {
+    "inputs": {
+      "images": [
+        "51",
+        0
+      ]
+    },
+    "class_type": "ETN_KritaOutput",
+    "_meta": {
+      "title": "Krita Output"
+    }
+  },
+  "51": {
+    "inputs": {
+      "select": [
+        "15",
+        0
+      ],
+      "sel_mode": false,
+      "input1": [
+        "21",
+        0
+      ],
+      "input2": [
+        "73",
+        0
+      ]
+    },
+    "class_type": "ImpactSwitch",
+    "_meta": {
+      "title": "Switch (Any)"
+    }
+  },
+  "52": {
+    "inputs": {
+      "images": [
+        "62",
+        0
+      ]
+    },
+    "class_type": "ETN_KritaOutput",
+    "_meta": {
+      "title": "Krita Output"
+    }
+  },
+  "57": {
+    "inputs": {
+      "images": [
+        "60",
+        0
+      ]
+    },
+    "class_type": "ETN_KritaOutput",
+    "_meta": {
+      "title": "Krita Output"
+    }
+  },
+  "60": {
+    "inputs": {
+      "select": [
+        "15",
+        0
+      ],
+      "sel_mode": false,
+      "input1": [
+        "16",
+        0
+      ],
+      "input2": [
+        "70",
+        0
+      ]
+    },
+    "class_type": "ImpactSwitch",
+    "_meta": {
+      "title": "Switch (Any)"
+    }
+  },
+  "62": {
+    "inputs": {
+      "select": [
+        "15",
+        0
+      ],
+      "sel_mode": false,
+      "input1": [
+        "19",
+        0
+      ],
+      "input2": [
+        "74",
+        0
+      ]
+    },
+    "class_type": "ImpactSwitch",
+    "_meta": {
+      "title": "Switch (Any)"
+    }
+  },
+  "65": {
+    "inputs": {
+      "index": 0,
+      "bboxes": [
+        "34",
+        2
+      ]
+    },
+    "class_type": "BboxToInt",
+    "_meta": {
+      "title": "Bbox To Int"
+    }
+  },
+  "68": {
+    "inputs": {
+      "x_position": [
+        "65",
+        0
+      ],
+      "y_position": [
+        "65",
+        1
+      ],
+      "background_image": [
+        "69",
+        0
+      ],
+      "foreground_image": [
+        "9",
+        0
+      ]
+    },
+    "class_type": "ImagePaste",
+    "_meta": {
+      "title": "Image Paste (Mikey)"
+    }
+  },
+  "69": {
+    "inputs": {
+      "width": [
+        "22",
+        1
+      ],
+      "height": [
+        "22",
+        2
+      ],
+      "batch_size": 1,
+      "red": 0,
+      "green": 0,
+      "blue": 0,
+      "alpha": 0,
+      "sample": "#000000"
+    },
+    "class_type": "D2 EmptyImage Alpha",
+    "_meta": {
+      "title": "D2 EmptyImage Alpha"
+    }
+  },
+  "70": {
+    "inputs": {
+      "x_position": [
+        "65",
+        0
+      ],
+      "y_position": [
+        "65",
+        1
+      ],
+      "background_image": [
+        "69",
+        0
+      ],
+      "foreground_image": [
+        "16",
+        0
+      ]
+    },
+    "class_type": "ImagePaste",
+    "_meta": {
+      "title": "Image Paste (Mikey)"
+    }
+  },
+  "73": {
+    "inputs": {
+      "x_position": [
+        "65",
+        0
+      ],
+      "y_position": [
+        "65",
+        1
+      ],
+      "background_image": [
+        "69",
+        0
+      ],
+      "foreground_image": [
+        "21",
+        0
+      ]
+    },
+    "class_type": "ImagePaste",
+    "_meta": {
+      "title": "Image Paste (Mikey)"
+    }
+  },
+  "74": {
+    "inputs": {
+      "x_position": [
+        "65",
+        0
+      ],
+      "y_position": [
+        "65",
+        1
+      ],
+      "background_image": [
+        "69",
+        0
+      ],
+      "foreground_image": [
+        "19",
+        0
+      ]
+    },
+    "class_type": "ImagePaste",
+    "_meta": {
+      "title": "Image Paste (Mikey)"
+    }
+  }
+}

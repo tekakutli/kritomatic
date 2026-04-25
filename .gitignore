@@ -164,5 +164,6 @@ data/batches/*
 !data/batches/.gitkeep
 data/diffusion/*
 !data/diffusion/.gitkeep
+data/workflows/*
+!data/workflows/.gitkeep
 .aider*
-

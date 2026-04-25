@@ -54,6 +54,13 @@ def main():
         run_preset_command()
         return
 
+    # ========== HANDLE diffusion node subcommands (client-side only) ==========
+    if len(sys.argv) >= 3 and sys.argv[1] == 'diffusion' and sys.argv[2] == 'node':
+        from diffusion_node import run_node_command
+        run_node_command()
+        return
+
+
     # ========== NORMAL COMMAND EXECUTION ==========
     registry_mgr = get_registry_manager()
     client = None

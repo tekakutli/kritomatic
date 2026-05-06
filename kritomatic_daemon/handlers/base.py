@@ -111,7 +111,7 @@ class CommandHandler:
                           'create_file_layer', 'convert_to_file_layer', 'create_blend_layer',
                           'fill_layer', 'fill_selection', 'move_layer_to_new_document',
                           'export_layer_to_file', 'apply_color_to_alpha', 'add_color_to_alpha_mask',
-                          'create_transform_mask', 'transform_mask']:
+                          'create_transform_mask', 'transform_mask', 'fit_to_canvas']:
             return self.handlers['layer'].execute(cmd_type, command)
 
         # Text commands
@@ -128,7 +128,7 @@ class CommandHandler:
             return self.handlers['mask'].execute(cmd_type, command)
 
         # Transform commands
-        elif cmd_type in ['create_transform_mask', 'transform_mask']:
+        elif cmd_type in ['create_transform_mask', 'transform_mask', 'fit_to_canvas']:
             return self.handlers['transform'].execute(cmd_type, command)
 
         # Document commands

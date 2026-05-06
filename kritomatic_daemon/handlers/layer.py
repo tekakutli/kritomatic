@@ -31,7 +31,7 @@ class LayerHandler:
             return self.file.execute(cmd_type, params)
 
         # Transform mask operations
-        elif cmd_type in ['create_transform_mask', 'transform_mask']:
+        elif cmd_type in ['create_transform_mask', 'transform_mask', 'fit_to_canvas']:
             return self.transform.execute(cmd_type, params)
 
         # Text operations

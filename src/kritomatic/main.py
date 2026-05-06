@@ -361,9 +361,13 @@ def main():
         response = client.execute(cmd_type, **kwargs)
 
         if response:
-            if response.get('status') == 'success' and 'json' in response.get('data', {}):
-                print(response['data']['json'])
+            # Check if this response contains raw JSON data (for export_params)
+            data = response.get('data')
+            if response.get('status') == 'success' and data and 'json' in data:
+                # Print the raw JSON string directly
+                print(data['json'])
             else:
+                # Normal output - print the whole response
                 print(json.dumps(response, indent=2))
 
         client.close()

@@ -3,7 +3,11 @@ keymap:
   - name: Global Krita Shortcuts
     remap:
       n:
-        launch: ["python", "__CLIPBOARD_SCRIPT__"]
+        launch: ["python", "__KRITA_CLIPBOARD_SCRIPT__"]
+      m:
+        launch: ["python", "__EXTRACT_TEXT_CLIPBOARD_SCRIPT__"]
+      KEY_6:
+        launch: ["python", "__PREPROCESS_CLIPBOARD_SCRIPT__"]
       l:
         launch: ["kritomatic", "window", "toggle_detached"]
 

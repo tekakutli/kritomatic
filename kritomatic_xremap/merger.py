@@ -123,11 +123,16 @@ def expand_keywords(content, repo_dir):
     root_dir = Path(repo_dir).parent
     python_src_path = str(root_dir / "src")
     main_py_path = str(root_dir / "src" / "kritomatic" / "main.py")
-    clipboard_path = os.path.join(repo_dir, "scripts", "krita_clipboard.py")
+    krita_clipboard_path = os.path.join(repo_dir, "scripts", "krita_clipboard.py")
+    extract_text_clipboard_path = os.path.join(repo_dir, "scripts", "extract_text_clipboard.py")
+    preprocess_clipboard_path = os.path.join(repo_dir, "scripts", "preprocess_clipboard.py")
+
 
     km_expansion = f'"/usr/bin/env", "PYTHONPATH={python_src_path}", "python", "{main_py_path}"'
     content = content.replace('"kritomatic"', km_expansion)
-    content = content.replace("__CLIPBOARD_SCRIPT__", clipboard_path)
+    content = content.replace("__KRITA_CLIPBOARD_SCRIPT__", krita_clipboard_path)
+    content = content.replace("__EXTRACT_TEXT_CLIPBOARD_SCRIPT__", extract_text_clipboard_path)
+    content = content.replace("__PREPROCESS_CLIPBOARD_SCRIPT__", preprocess_clipboard_path)
 
     return content
 

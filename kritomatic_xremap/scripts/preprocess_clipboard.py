@@ -4,8 +4,15 @@ Create a new Krita document from clipboard image
 """
 
 # ===== CONFIGURABLE SETTINGS =====
-CROP_WIDTH = 700   # Change this to set the crop width (e.g., 512, 1024, 2048)
-CROP_HEIGHT = 700  # Change this to set the crop height (e.g., 512, 1024, 2048)
+# Set to values between 0 and 1 to keep a proportional slice from the center
+# Set to 1.0 to use CROP_WIDTH and CROP_HEIGHT instead
+HORIZONTAL_KEEP_RATIO = 0.3333   # Keep this proportion of width from center (e.g., 0.3333 = middle 1/3)
+VERTICAL_KEEP_RATIO = 1.0        # Keep this proportion of height from center (e.g., 0.5 = middle half)
+
+# Only used if BOTH HORIZONTAL_KEEP_RATIO and VERTICAL_KEEP_RATIO are set to 1.0
+CROP_WIDTH = 700                 # Fallback crop width
+CROP_HEIGHT = 700                # Fallback crop height
+
 # STORAGE_DIR = '/tmp/stored/'  # Change this to set the storage directory
 STORAGE_DIR = '/home/tekakutli/files/Pictures/krita/twitter/captions/symbols/background/cleaned_up/logos/warningLogo/'  # Change this to set the storage directory
 STORAGE_DIR = '/tmp/cropped/'  # Change this to set the storage directory
@@ -52,8 +59,56 @@ def ensure_directory_exists(directory):
         os.makedirs(directory)
         print(f"Created directory: {directory}")
 
-def crop_image(input_path, output_path):
-    """Crop image to CROP_WIDTH x CROP_HEIGHT from center"""
+def get_image_dimensions(input_path):
+    """Get image dimensions using ImageMagick"""
+    try:
+        result = subprocess.run(
+            ['magick', 'identify', '-format', '%wx%h', input_path],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        width, height = map(int, result.stdout.strip().split('x'))
+        return width, height
+    except subprocess.CalledProcessError as e:
+        print(f"Error getting image dimensions: {e}")
+        return None, None
+
+def crop_proportional_center(input_path, output_path, horizontal_ratio, vertical_ratio):
+    """Crop to keep a proportional slice from the center of the image"""
+    try:
+        # Get original dimensions
+        width, height = get_image_dimensions(input_path)
+        if width is None or height is None:
+            return False
+
+        # Calculate crop dimensions
+        crop_width = int(width * horizontal_ratio)
+        crop_height = int(height * vertical_ratio)
+
+        # Calculate starting positions (to center the crop)
+        crop_x = (width - crop_width) // 2
+        crop_y = (height - crop_height) // 2
+
+        # Use ImageMagick to crop
+        subprocess.run(
+            ['magick', input_path, '-crop', f'{crop_width}x{crop_height}+{crop_x}+{crop_y}', '+repage', output_path],
+            check=True,
+            capture_output=True
+        )
+        print(f"Cropped to proportional center: {crop_width}x{crop_height} (from {width}x{height})")
+        print(f"  Horizontal: kept {horizontal_ratio*100:.1f}% (center {crop_width}/{width}px)")
+        print(f"  Vertical: kept {vertical_ratio*100:.1f}% (center {crop_height}/{height}px)")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Error cropping image: {e}")
+        return False
+    except FileNotFoundError:
+        print("ImageMagick 'magick' command not found. Please install ImageMagick.")
+        return False
+
+def crop_fixed_center(input_path, output_path):
+    """Crop image to CROP_WIDTH x CROP_HEIGHT from center (fallback behavior)"""
     try:
         subprocess.run(
             ['magick', input_path, '-gravity', 'center', '-extent', f'{CROP_WIDTH}x{CROP_HEIGHT}', output_path],
@@ -69,7 +124,7 @@ def crop_image(input_path, output_path):
         return False
 
 def process_clipboard_image(image_data):
-    """Save image, crop it, and store in STORAGE_DIR"""
+    """Save image, crop it (proportional or fixed), and store in STORAGE_DIR"""
 
     # Create the stored directory if it doesn't exist
     ensure_directory_exists(STORAGE_DIR)
@@ -88,18 +143,27 @@ def process_clipboard_image(image_data):
     timestamp = int(time.time())
     output_path = os.path.join(STORAGE_DIR, f'cropped_image_{timestamp}.png')
 
-    # Crop the image
-    if crop_image(original_path, output_path):
+    # Check if we should use proportional cropping or fixed dimensions
+    use_proportional = (HORIZONTAL_KEEP_RATIO < 1.0) or (VERTICAL_KEEP_RATIO < 1.0)
+
+    if use_proportional:
+        success = crop_proportional_center(original_path, output_path, HORIZONTAL_KEEP_RATIO, VERTICAL_KEEP_RATIO)
+        crop_description = f"proportional crop ({HORIZONTAL_KEEP_RATIO*100:.1f}% width, {VERTICAL_KEEP_RATIO*100:.1f}% height)"
+    else:
+        success = crop_fixed_center(original_path, output_path)
+        crop_description = f"{CROP_WIDTH}x{CROP_HEIGHT} fixed center crop"
+
+    if success:
         print(f"Cropped image saved to: {output_path}")
 
         # Optional: Clean up original image after delay
         cleanup_temp_file(original_path, delay=5)
 
-        return True
+        return True, crop_description
     else:
         # Clean up original if cropping failed
         cleanup_temp_file(original_path, delay=1)
-        return False
+        return False, crop_description
 
 def cleanup_temp_file(tmp_path, delay=10):
     """Delete temp file after delay"""
@@ -130,6 +194,15 @@ def show_notification(message, is_error=True):
         print(message)
 
 def main():
+    # Validate ratios
+    if not (0 < HORIZONTAL_KEEP_RATIO <= 1.0):
+        print(f"Error: HORIZONTAL_KEEP_RATIO must be between 0 and 1, got {HORIZONTAL_KEEP_RATIO}")
+        sys.exit(1)
+
+    if not (0 < VERTICAL_KEEP_RATIO <= 1.0):
+        print(f"Error: VERTICAL_KEEP_RATIO must be between 0 and 1, got {VERTICAL_KEEP_RATIO}")
+        sys.exit(1)
+
     # Get image from clipboard
     image_data = get_clipboard_image()
 
@@ -138,10 +211,15 @@ def main():
         sys.exit(1)
 
     # Process the image (save, crop, store)
-    if process_clipboard_image(image_data):
-        show_notification(f"Image cropped to {CROP_WIDTH}x{CROP_HEIGHT} and saved to {STORAGE_DIR}", is_error=False)
+    success, crop_description = process_clipboard_image(image_data)
+
+    if success:
+        if (HORIZONTAL_KEEP_RATIO < 1.0) or (VERTICAL_KEEP_RATIO < 1.0):
+            show_notification(f"Image cropped to center {HORIZONTAL_KEEP_RATIO*100:.1f}% width × {VERTICAL_KEEP_RATIO*100:.1f}% height and saved to {STORAGE_DIR}", is_error=False)
+        else:
+            show_notification(f"Image cropped to {CROP_WIDTH}x{CROP_HEIGHT} and saved to {STORAGE_DIR}", is_error=False)
     else:
-        show_notification("Failed to process image")
+        show_notification(f"Failed to crop image ({crop_description})")
         sys.exit(1)
 
 if __name__ == "__main__":

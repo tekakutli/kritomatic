@@ -126,6 +126,8 @@ def expand_keywords(content, repo_dir):
     krita_clipboard_path = os.path.join(repo_dir, "scripts", "krita_clipboard.py")
     extract_text_clipboard_path = os.path.join(repo_dir, "scripts", "extract_text_clipboard.py")
     preprocess_clipboard_path = os.path.join(repo_dir, "scripts", "preprocess_clipboard.py")
+    bash_function_path = os.path.join(repo_dir, "scripts", "bash_function.py")
+    swap_image_app_path = os.path.join(repo_dir, "scripts", "swap_image_app.py")
 
 
     km_expansion = f'"/usr/bin/env", "PYTHONPATH={python_src_path}", "python", "{main_py_path}"'
@@ -133,6 +135,8 @@ def expand_keywords(content, repo_dir):
     content = content.replace("__KRITA_CLIPBOARD_SCRIPT__", krita_clipboard_path)
     content = content.replace("__EXTRACT_TEXT_CLIPBOARD_SCRIPT__", extract_text_clipboard_path)
     content = content.replace("__PREPROCESS_CLIPBOARD_SCRIPT__", preprocess_clipboard_path)
+    content = content.replace("__BASH_FUNCTION_SCRIPT__", bash_function_path)
+    content = content.replace("__SWAP_IMAGE_APP_SCRIPT__", swap_image_app_path)
 
     return content
 

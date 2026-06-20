@@ -1,0 +1,94 @@
+{
+  "1": {
+    "inputs": {
+      "prompt": [
+        "6",
+        0
+      ],
+      "sam_model": "sam_vit_h (2.56GB)",
+      "dino_model": "GroundingDINO_SwinT_OGC (694MB)",
+      "threshold": 0.35,
+      "mask_blur": 0,
+      "mask_offset": 0,
+      "invert_output": false,
+      "background": "Alpha",
+      "background_color": "#222222",
+      "image": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "SegmentV2",
+    "_meta": {
+      "title": "Segmentation V2 (RMBG)"
+    }
+  },
+  "2": {
+    "inputs": {
+      "image": ""
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "4": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "6": {
+    "inputs": {
+      "text": "person"
+    },
+    "class_type": "ttN text",
+    "_meta": {
+      "title": "Text Input"
+    }
+  },
+  "7": {
+    "inputs": {
+      "prompt": [
+        "6",
+        0
+      ],
+      "sam_model": "sam_vit_h (2.56GB)",
+      "dino_model": "GroundingDINO_SwinT_OGC (694MB)",
+      "threshold": 0.3,
+      "mask_blur": 0,
+      "mask_offset": 0,
+      "invert_output": false,
+      "background": "Alpha",
+      "background_color": "#222222",
+      "image": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "Segment",
+    "_meta": {
+      "title": "Segmentation V1 (RMBG)"
+    }
+  },
+  "8": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "7",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  }
+}

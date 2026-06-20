@@ -1,19 +1,22 @@
-#!/usr/bin/env python3
+#!/home/tekakutli/code/kritomatic-auxiliary/bin/python
 """
-ComfyUI img2img CLI tool - Barebones version
-Usage: python comfy_img2img.py <input_image_path>
+Remove background from image using ComfyUI RMBG
 """
 
+import subprocess
+import sys
+import os
+import re
 import json
 import requests
-import os
-import sys
 import time
+import tempfile
 from pathlib import Path
+from collections import Counter
+from PIL import Image
 
-# --- Configuration ---
+# ComfyUI configuration
 COMFYUI_URL = "http://127.0.0.1:8188"
-# Get the directory where this script is located
 SCRIPT_DIR = Path(__file__).parent
 DEFAULT_WORKFLOW = SCRIPT_DIR / "RMBG_api.json"
 
@@ -21,8 +24,12 @@ def upload_image(file_path):
     """Upload an image to ComfyUI's server and return the filename."""
     url = f"{COMFYUI_URL}/upload/image"
 
+    # Create unique filename using timestamp
+    file_path_obj = Path(file_path)
+    unique_name = f"{file_path_obj.stem}_{int(time.time())}{file_path_obj.suffix}"
+
     with open(file_path, 'rb') as f:
-        files = {'image': f}
+        files = {'image': (unique_name, f, 'image/png')}
         data = {'overwrite': 'true'}
         response = requests.post(url, files=files, data=data)
 
@@ -71,29 +78,19 @@ def download_image(image_info, save_path):
         return True
     return False
 
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: python comfy_img2img.py <input_image_path>", file=sys.stderr)
-        sys.exit(1)
-
-    input_image_path = sys.argv[1]
-
-    # Check if input file exists
-    if not os.path.exists(input_image_path):
-        print(f"Error: Input file '{input_image_path}' not found", file=sys.stderr)
-        sys.exit(1)
-
+def remove_background(image_path):
+    """Remove background using ComfyUI RMBG workflow"""
     # Check if workflow exists
     if not DEFAULT_WORKFLOW.exists():
-        print(f"Error: Workflow not found at {DEFAULT_WORKFLOW}", file=sys.stderr)
-        sys.exit(1)
+        print(f"Error: Workflow not found at {DEFAULT_WORKFLOW}")
+        return None
 
     # Load workflow
     with open(DEFAULT_WORKFLOW, 'r', encoding='utf-8') as f:
         workflow = json.load(f)
 
-    # Upload image
-    uploaded_filename = upload_image(input_image_path)
+    # Upload image with unique name
+    uploaded_filename = upload_image(image_path)
 
     # Find LoadImage node and set the image
     for node_id, node_data in workflow.items():
@@ -110,18 +107,63 @@ def main():
     # Get output images
     images = get_output_images(history)
     if not images:
-        print("Error: No output images generated", file=sys.stderr)
-        sys.exit(1)
+        print("Error: No output images generated")
+        return None
 
-    # Save output next to input with "_output" suffix
-    input_path = Path(input_image_path)
-    output_path = input_path.parent / f"{input_path.stem}_output.png"
+    # Save output next to input with "_nobg" suffix
+    input_path = Path(image_path)
+    output_path = input_path.parent / f"{input_path.stem}_nobg.png"
 
     # Download and save
-    download_image(images[0], output_path)
+    if download_image(images[0], output_path):
+        print(f"✓ Background removed successfully")
+        return str(output_path)
+    else:
+        print("Error: Failed to download output image")
+        return None
 
-    # Print output path (for bash wrapper to capture)
-    print(output_path)
+def process_image(image_path):
+    """Main function: remove background only"""
+    # Check if input file exists
+    if not os.path.exists(image_path):
+        print(f"Error: Input file not found: {image_path}")
+        return None
+
+    # Remove background
+    print(f"Removing background from: {image_path}")
+    output_path = remove_background(image_path)
+
+    if output_path:
+        print(f"✓ Successfully processed!")
+        print(f"  Output: {output_path}")
+        return output_path
+    else:
+        print(f"✗ Failed to process image")
+        return None
+
+def print_usage():
+    """Print usage information"""
+    print("Usage: remove_background.py <image_path>")
+    print("\nThis script will:")
+    print("  1. Remove background using ComfyUI RMBG")
+    print("  2. Return the resulting image with '_nobg' suffix")
+    print("\nExample:")
+    print("  remove_background.py image.png")
+
+def main():
+    if len(sys.argv) < 2:
+        print_usage()
+        sys.exit(1)
+
+    image_path = sys.argv[1]
+
+    # Process the image
+    output_path = process_image(image_path)
+
+    if output_path:
+        sys.exit(0)
+    else:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

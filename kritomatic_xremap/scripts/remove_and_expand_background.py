@@ -5,7 +5,7 @@ Remove background from image, then place on expanded canvas with original backgr
 
 # ===== CONFIGURABLE SETTINGS =====
 
-SKIP_EXPANSION = True  # Set to True to skip canvas expansion and just change background color
+SKIP_EXPANSION = False  # Set to True to skip canvas expansion and just change background color
 
 # Expansion proportion relative to image dimensions (0 to 1)
 EXPAND_PROPORTION = 0.5  # Add this much extra space around the image
@@ -32,6 +32,8 @@ import json
 import requests
 import time
 import tempfile
+import shutil
+import argparse
 from pathlib import Path
 from collections import Counter
 from PIL import Image
@@ -45,8 +47,12 @@ def upload_image(file_path):
     """Upload an image to ComfyUI's server and return the filename."""
     url = f"{COMFYUI_URL}/upload/image"
 
+    # Create unique filename using timestamp
+    file_path_obj = Path(file_path)
+    unique_name = f"{file_path_obj.stem}_{int(time.time())}{file_path_obj.suffix}"
+
     with open(file_path, 'rb') as f:
-        files = {'image': f}
+        files = {'image': (unique_name, f, 'image/png')}
         data = {'overwrite': 'true'}
         response = requests.post(url, files=files, data=data)
 
@@ -102,11 +108,11 @@ def remove_background(image_path):
         print(f"Error: Workflow not found at {DEFAULT_WORKFLOW}")
         return None
 
-    # Load workflow
+    # Load workflow fresh each time
     with open(DEFAULT_WORKFLOW, 'r', encoding='utf-8') as f:
         workflow = json.load(f)
 
-    # Upload image
+    # Upload image with unique name
     uploaded_filename = upload_image(image_path)
 
     # Find LoadImage node and set the image
@@ -234,8 +240,11 @@ def change_background_color(foreground_path, hex_color):
         print(f"Error in change_background_color: {e}")
         return None
 
-def expand_and_composite(original_path, foreground_path, hex_color):
+def expand_and_composite(original_path, foreground_path, hex_color, skip_expansion=False):
     """Expand canvas and composite foreground onto it using PIL"""
+    if skip_expansion:
+        return change_background_color(foreground_path, hex_color)
+
     try:
         # Get original dimensions
         width, height = get_image_dimensions(original_path)
@@ -284,14 +293,18 @@ def expand_and_composite(original_path, foreground_path, hex_color):
         print(f"  Background color: {hex_color}")
         print(f"  Saved to: {output_path}")
 
-        return True
+        return output_path
 
     except Exception as e:
         print(f"Error in expand_and_composite: {e}")
-        return False
+        return None
 
-def process_image(image_path, custom_hex_color=None):
+def process_image(image_path, custom_hex_color=None, skip_expansion=None):
     """Main function: remove background, detect color (or use custom), expand canvas, composite"""
+    # Use provided skip_expansion or fall back to global setting
+    if skip_expansion is None:
+        skip_expansion = SKIP_EXPANSION
+
     # Check if input file exists
     if not os.path.exists(image_path):
         print(f"Error: Input file not found: {image_path}")
@@ -321,61 +334,85 @@ def process_image(image_path, custom_hex_color=None):
         hex_color = detect_background_color(image_path, EDGE_THICKNESS)
         print(f"Detected background color: {hex_color}")
 
-    # Step 3: Handle based on SKIP_EXPANSION setting
-    if SKIP_EXPANSION:
-        print(f"\nStep 3: Skipping expansion, changing background color only")
-        output_path = change_background_color(foreground_path, hex_color)
-        if output_path:
-            return True, output_path, hex_color
-        else:
-            return False, None, None
-    else:
-        print(f"\nStep 3: Expanding canvas and compositing foreground")
-        success = expand_and_composite(image_path, foreground_path, hex_color)
+    # Step 3: Handle based on skip_expansion setting
+    print(f"\nStep 3: {'Skipping expansion, changing background color only' if skip_expansion else 'Expanding canvas and compositing foreground'}")
+    output_path = expand_and_composite(image_path, foreground_path, hex_color, skip_expansion)
 
-        if success:
-            output_file = foreground_path.replace('_output.png', '_expanded.png')
-            return True, output_file, hex_color
-        else:
-            return False, None, None
+    if output_path:
+        return True, output_path, hex_color
+    else:
+        return False, None, None
 
 def print_usage():
     """Print usage information"""
-    print("Usage: remove_and_expand_background.py <image_path> [custom_hex_color]")
+    print("Usage: remove_and_expand_background.py [OPTIONS]")
     print("\nThis script will:")
     print("  1. Remove background using ComfyUI RMBG")
     print("  2. Detect original background color (or use custom if provided)")
-    print("  3. Create an expanded canvas with that color (or just change background if SKIP_EXPANSION is True)")
+    print("  3. Create an expanded canvas with that color (or just change background if --skip-expansion is used)")
     print("  4. Composite the foreground object onto it")
     print("\nOptions:")
-    print("  image_path          - Path to the input image")
-    print("  custom_hex_color    - (Optional) Custom background color in hex format")
-    print("                       Examples: #e78c14, e78c14, #FFF, FFF")
+    print("  -i, --image PATH           Path to the input image (required)")
+    print("  -c, --color HEX            Custom background color in hex format")
+    print("                             Examples: #e78c14, e78c14, #FFF, FFF")
+    print("  -s, --skip-expansion       Skip canvas expansion, just change background color")
+    print("  -h, --help                 Show this help message")
     print("\nConfigurable settings at the top of the script:")
     print(f"  EXPAND_PROPORTION = {EXPAND_PROPORTION}")
     print(f"  EXPAND_BOTH_DIMENSIONS = {EXPAND_BOTH_DIMENSIONS}")
     if not EXPAND_BOTH_DIMENSIONS:
         print(f"  EXPAND_WIDTH_PROPORTION = {EXPAND_WIDTH_PROPORTION}")
         print(f"  EXPAND_HEIGHT_PROPORTION = {EXPAND_HEIGHT_PROPORTION}")
-    print(f"  SKIP_EXPANSION = {SKIP_EXPANSION}")
+    print(f"  SKIP_EXPANSION = {SKIP_EXPANSION} (overridden by --skip-expansion)")
     print("\nExamples:")
-    print("  # Auto-detect background color")
-    print("  remove_and_expand_background.py image.png")
-    print("\n  # Use custom background color")
-    print("  remove_and_expand_background.py image.png #ff0000")
-    print("  remove_and_expand_background.py image.png ff0000")
-    print("  remove_and_expand_background.py image.png #f00")
+    print("  # Auto-detect background color with expansion")
+    print("  remove_and_expand_background.py -i image.png")
+    print("\n  # Use custom background color with expansion")
+    print("  remove_and_expand_background.py -i image.png -c #ff0000")
+    print("  remove_and_expand_background.py -i image.png --color ff0000")
+    print("\n  # Skip expansion and just change background color")
+    print("  remove_and_expand_background.py -i image.png --skip-expansion")
+    print("\n  # Custom color without expansion")
+    print("  remove_and_expand_background.py -i image.png -c #f00 --skip-expansion")
 
 def main():
-    if len(sys.argv) < 2:
+    # Set up argument parser
+    parser = argparse.ArgumentParser(
+        description="Remove background from image and place on expanded canvas",
+        add_help=False  # We'll handle help manually
+    )
+
+    parser.add_argument('-i', '--image',
+                        help='Path to the input image (required)')
+    parser.add_argument('-c', '--color',
+                        help='Custom background color in hex format (e.g., #e78c14, e78c14, #FFF, FFF)')
+    parser.add_argument('-s', '--skip-expansion',
+                        action='store_true',
+                        help='Skip canvas expansion, just change background color')
+    parser.add_argument('-h', '--help',
+                        action='store_true',
+                        help='Show this help message')
+
+    # Parse arguments
+    args = parser.parse_args()
+
+    # Show help if requested or no arguments
+    if args.help or len(sys.argv) == 1:
+        print_usage()
+        sys.exit(0)
+
+    # Check if image is provided
+    if not args.image:
+        print("Error: --image argument is required")
         print_usage()
         sys.exit(1)
 
-    image_path = sys.argv[1]
-    custom_hex_color = sys.argv[2] if len(sys.argv) > 2 else None
-
     # Process the image
-    success, final_output_path, hex_color = process_image(image_path, custom_hex_color)
+    success, final_output_path, hex_color = process_image(
+        args.image,
+        args.color,
+        args.skip_expansion
+    )
 
     if success:
         print(f"\n✓ Successfully processed!")

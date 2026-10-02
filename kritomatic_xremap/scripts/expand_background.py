@@ -33,11 +33,11 @@ def background_color(image_path, edge_thickness=10):
     Call the background_color script to detect background color
     Returns hex color string like '#e78c14'
     """
-    script_path = "/home/tekakutli/files/org/dotfiles/input_controller/krita_plugin/kritomatic/kritomatic_xremap/scripts/color-thief-py.py"
-    
+    script_path = Path(__file__).parent / "color-thief-py.py"
+
     try:
         result = subprocess.run(
-            [script_path, image_path],
+            [str(script_path), image_path],
             capture_output=True,
             text=True,
             check=True

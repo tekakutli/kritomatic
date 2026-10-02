@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Create a new Krita document from clipboard image
+Crop the clipboard image (proportional or fixed center crop)
+and save the result into STORAGE_DIR.
 """
 
 # ===== CONFIGURABLE SETTINGS =====

@@ -14,7 +14,7 @@ from pathlib import Path
 import shutil
 
 # Configuration
-CAPTION_SCRIPT_PATH = "/home/tekakutli/code/llama-models/caption_directory.py"
+CAPTION_SCRIPT_PATH = str(Path(__file__).parent / "caption_directory.py")
 DEFAULT_PROMPT = "Text Extractor"
 OUTPUT_DIR = "/tmp/clipboard_captions"
 

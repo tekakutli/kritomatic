@@ -41,7 +41,7 @@ from PIL import Image
 # ComfyUI configuration
 COMFYUI_URL = "http://127.0.0.1:8188"
 SCRIPT_DIR = Path(__file__).parent
-DEFAULT_WORKFLOW = SCRIPT_DIR / "RMBG_api.json"
+DEFAULT_WORKFLOW = SCRIPT_DIR / "comfy_workflow_rmbg.json"
 
 def upload_image(file_path):
     """Upload an image to ComfyUI's server and return the filename."""
@@ -345,7 +345,7 @@ def process_image(image_path, custom_hex_color=None, skip_expansion=None):
 
 def print_usage():
     """Print usage information"""
-    print("Usage: remove_and_expand_background.py [OPTIONS]")
+    print("Usage: foreground2canvas_rmbg.py [OPTIONS]")
     print("\nThis script will:")
     print("  1. Remove background using ComfyUI RMBG")
     print("  2. Detect original background color (or use custom if provided)")
@@ -366,14 +366,14 @@ def print_usage():
     print(f"  SKIP_EXPANSION = {SKIP_EXPANSION} (overridden by --skip-expansion)")
     print("\nExamples:")
     print("  # Auto-detect background color with expansion")
-    print("  remove_and_expand_background.py -i image.png")
+    print("  foreground2canvas_rmbg.py -i image.png")
     print("\n  # Use custom background color with expansion")
-    print("  remove_and_expand_background.py -i image.png -c #ff0000")
-    print("  remove_and_expand_background.py -i image.png --color ff0000")
+    print("  foreground2canvas_rmbg.py -i image.png -c #ff0000")
+    print("  foreground2canvas_rmbg.py -i image.png --color ff0000")
     print("\n  # Skip expansion and just change background color")
-    print("  remove_and_expand_background.py -i image.png --skip-expansion")
+    print("  foreground2canvas_rmbg.py -i image.png --skip-expansion")
     print("\n  # Custom color without expansion")
-    print("  remove_and_expand_background.py -i image.png -c #f00 --skip-expansion")
+    print("  foreground2canvas_rmbg.py -i image.png -c #f00 --skip-expansion")
 
 def main():
     # Set up argument parser

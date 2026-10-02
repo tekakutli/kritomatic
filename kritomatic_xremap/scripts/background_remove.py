@@ -18,7 +18,7 @@ from PIL import Image
 # ComfyUI configuration
 COMFYUI_URL = "http://127.0.0.1:8188"
 SCRIPT_DIR = Path(__file__).parent
-DEFAULT_WORKFLOW = SCRIPT_DIR / "RMBG_api.json"
+DEFAULT_WORKFLOW = SCRIPT_DIR / "comfy_workflow_rmbg.json"
 
 def upload_image(file_path):
     """Upload an image to ComfyUI's server and return the filename."""
@@ -143,12 +143,12 @@ def process_image(image_path):
 
 def print_usage():
     """Print usage information"""
-    print("Usage: remove_background.py <image_path>")
+    print("Usage: background_remove.py <image_path>")
     print("\nThis script will:")
     print("  1. Remove background using ComfyUI RMBG")
     print("  2. Return the resulting image with '_nobg' suffix")
     print("\nExample:")
-    print("  remove_background.py image.png")
+    print("  background_remove.py image.png")
 
 def main():
     if len(sys.argv) < 2:

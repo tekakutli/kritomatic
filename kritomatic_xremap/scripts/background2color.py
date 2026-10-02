@@ -47,7 +47,7 @@ def detect_background_color(image_path, edge_thickness=10):
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python color-thief-py.py <image_path>")
+        print("Usage: python background2color.py <image_path>")
         sys.exit(1)
     
     image_path = sys.argv[1]

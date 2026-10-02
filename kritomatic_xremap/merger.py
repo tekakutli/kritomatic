@@ -15,6 +15,17 @@ except ImportError:
     HAS_INOTIFY = False
 
 
+# Placeholder -> filename mapping for xremap YAML keyword expansion.
+# Add new entries here, or use inject_script.py which edits this block.
+SCRIPTS = {
+    "__CLIPBOARD2KRITA_SCRIPT__": "clipboard2krita.py",
+    "__CLIPBOARD2CAPTION_SCRIPT__": "clipboard2caption.py",
+    "__CLIPBOARD2CROPPED_SCRIPT__": "clipboard2cropped.py",
+    "__UTIL_CALL_BASH_FUNCTION_SCRIPT__": "util_call_bash_function.py",
+    "__VIEWER_TOGGLE_DEFAULT_SCRIPT__": "viewer_toggle_default.py",
+}
+
+
 def load_env():
     """Load environment variables from the standard location."""
     env_path = Path.home() / ".config/xremap/xremap_kritomatic.env"
@@ -123,20 +134,13 @@ def expand_keywords(content, repo_dir):
     root_dir = Path(repo_dir).parent
     python_src_path = str(root_dir / "src")
     main_py_path = str(root_dir / "src" / "kritomatic" / "main.py")
-    krita_clipboard_path = os.path.join(repo_dir, "scripts", "krita_clipboard.py")
-    extract_text_clipboard_path = os.path.join(repo_dir, "scripts", "extract_text_clipboard.py")
-    preprocess_clipboard_path = os.path.join(repo_dir, "scripts", "preprocess_clipboard.py")
-    bash_function_path = os.path.join(repo_dir, "scripts", "bash_function.py")
-    swap_image_app_path = os.path.join(repo_dir, "scripts", "swap_image_app.py")
-
 
     km_expansion = f'"/usr/bin/env", "PYTHONPATH={python_src_path}", "python", "{main_py_path}"'
     content = content.replace('"kritomatic"', km_expansion)
-    content = content.replace("__KRITA_CLIPBOARD_SCRIPT__", krita_clipboard_path)
-    content = content.replace("__EXTRACT_TEXT_CLIPBOARD_SCRIPT__", extract_text_clipboard_path)
-    content = content.replace("__PREPROCESS_CLIPBOARD_SCRIPT__", preprocess_clipboard_path)
-    content = content.replace("__BASH_FUNCTION_SCRIPT__", bash_function_path)
-    content = content.replace("__SWAP_IMAGE_APP_SCRIPT__", swap_image_app_path)
+
+    for placeholder, filename in SCRIPTS.items():
+        script_path = os.path.join(repo_dir, "scripts", filename)
+        content = content.replace(placeholder, script_path)
 
     return content
 

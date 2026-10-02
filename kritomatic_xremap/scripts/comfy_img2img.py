@@ -15,7 +15,7 @@ from pathlib import Path
 COMFYUI_URL = "http://127.0.0.1:8188"
 # Get the directory where this script is located
 SCRIPT_DIR = Path(__file__).parent
-DEFAULT_WORKFLOW = SCRIPT_DIR / "RMBG_api.json"
+DEFAULT_WORKFLOW = SCRIPT_DIR / "comfy_workflow_rmbg.json"
 
 def upload_image(file_path):
     """Upload an image to ComfyUI's server and return the filename."""

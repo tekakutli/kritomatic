@@ -24,7 +24,7 @@ DEFAULT_MODE = "v2"        # Default mode: "v2" or "v1" or "both"
 # ComfyUI configuration
 COMFYUI_URL = "http://127.0.0.1:8188"
 SCRIPT_DIR = Path(__file__).parent
-DEFAULT_WORKFLOW = SCRIPT_DIR / "RMBG_text_input.json"
+DEFAULT_WORKFLOW = SCRIPT_DIR / "comfy_workflow_rmbg_prompt.json"
 
 def upload_image(file_path):
     """Upload an image to ComfyUI's server and return the filename."""
@@ -222,7 +222,7 @@ def process_image(image_path, text_prompt=None, mode=None):
 
 def print_usage():
     """Print usage information"""
-    print("Usage: remove_background.py --image <image_path> [--prompt <text>] [--mode <v1|v2|both>]")
+    print("Usage: background_remove_prompted.py --image <image_path> [--prompt <text>] [--mode <v1|v2|both>]")
     print("\nThis script will:")
     print("  1. Remove background using ComfyUI RMBG with text prompt")
     print("  2. Return resulting image(s) with '_nobg' suffix")
@@ -234,13 +234,13 @@ def print_usage():
     print("  both - Use both versions and return both results")
     print("\nExamples:")
     print(f"  # Use default prompt and mode")
-    print("  remove_background.py --image image.png")
+    print("  background_remove_prompted.py --image image.png")
     print("\n  # Use custom prompt")
-    print("  remove_background.py --image image.png --prompt 'a person standing'")
+    print("  background_remove_prompted.py --image image.png --prompt 'a person standing'")
     print("\n  # Use V1 mode only")
-    print("  remove_background.py --image image.png --mode v1")
+    print("  background_remove_prompted.py --image image.png --mode v1")
     print("\n  # Use both versions")
-    print("  remove_background.py --image image.png --mode both --prompt dog")
+    print("  background_remove_prompted.py --image image.png --mode both --prompt dog")
 
 def main():
     # Set up argument parser

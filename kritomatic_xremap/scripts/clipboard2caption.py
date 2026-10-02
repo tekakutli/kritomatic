@@ -14,7 +14,7 @@ from pathlib import Path
 import shutil
 
 # Configuration
-CAPTION_SCRIPT_PATH = str(Path(__file__).parent / "caption_directory.py")
+CAPTION_SCRIPT_PATH = str(Path(__file__).parent / "llamacpp_caption_images.py")
 DEFAULT_PROMPT = "Text Extractor"
 OUTPUT_DIR = "/tmp/clipboard_captions"
 

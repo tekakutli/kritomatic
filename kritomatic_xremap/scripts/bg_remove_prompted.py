@@ -222,7 +222,7 @@ def process_image(image_path, text_prompt=None, mode=None):
 
 def print_usage():
     """Print usage information"""
-    print("Usage: background_remove_prompted.py --image <image_path> [--prompt <text>] [--mode <v1|v2|both>]")
+    print("Usage: bg_remove_prompted.py --image <image_path> [--prompt <text>] [--mode <v1|v2|both>]")
     print("\nThis script will:")
     print("  1. Remove background using ComfyUI RMBG with text prompt")
     print("  2. Return resulting image(s) with '_nobg' suffix")
@@ -234,13 +234,13 @@ def print_usage():
     print("  both - Use both versions and return both results")
     print("\nExamples:")
     print(f"  # Use default prompt and mode")
-    print("  background_remove_prompted.py --image image.png")
+    print("  bg_remove_prompted.py --image image.png")
     print("\n  # Use custom prompt")
-    print("  background_remove_prompted.py --image image.png --prompt 'a person standing'")
+    print("  bg_remove_prompted.py --image image.png --prompt 'a person standing'")
     print("\n  # Use V1 mode only")
-    print("  background_remove_prompted.py --image image.png --mode v1")
+    print("  bg_remove_prompted.py --image image.png --mode v1")
     print("\n  # Use both versions")
-    print("  background_remove_prompted.py --image image.png --mode both --prompt dog")
+    print("  bg_remove_prompted.py --image image.png --mode both --prompt dog")
 
 def main():
     # Set up argument parser

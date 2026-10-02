@@ -33,7 +33,7 @@ def background_color(image_path, edge_thickness=10):
     Call the background_color script to detect background color
     Returns hex color string like '#e78c14'
     """
-    script_path = Path(__file__).parent / "background2color.py"
+    script_path = Path(__file__).parent / "bg2color.py"
 
     try:
         result = subprocess.run(
@@ -170,10 +170,10 @@ def process_image(image_path, output_path=None):
 def main():
     # Parse command line arguments
     if len(sys.argv) < 2:
-        print("Usage: python foreground2canvas.py <image_path> [output_path]")
+        print("Usage: python fg2canvas.py <image_path> [output_path]")
         print("\nExample:")
-        print("  python foreground2canvas.py image.png")
-        print("  python foreground2canvas.py image.png expanded_image.png")
+        print("  python fg2canvas.py image.png")
+        print("  python fg2canvas.py image.png expanded_image.png")
         print("\nConfigurable settings at the top of the script:")
         print(f"  EXPAND_PROPORTION = {EXPAND_PROPORTION} (adds {EXPAND_PROPORTION*100}% to each side)")
         print(f"  EXPAND_BOTH_DIMENSIONS = {EXPAND_BOTH_DIMENSIONS}")

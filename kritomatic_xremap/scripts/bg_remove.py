@@ -143,12 +143,12 @@ def process_image(image_path):
 
 def print_usage():
     """Print usage information"""
-    print("Usage: background_remove.py <image_path>")
+    print("Usage: bg_remove.py <image_path>")
     print("\nThis script will:")
     print("  1. Remove background using ComfyUI RMBG")
     print("  2. Return the resulting image with '_nobg' suffix")
     print("\nExample:")
-    print("  background_remove.py image.png")
+    print("  bg_remove.py image.png")
 
 def main():
     if len(sys.argv) < 2:

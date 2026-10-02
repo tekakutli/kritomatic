@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-Country Flag Emoji Downloader
+Stage 1 — Country Flag Downloader
 Converts country flag emojis to PNG images with specified size.
+Writes to FLAGS_DIR from paths.py.
 """
 
 import os
 import sys
+import re
+import unicodedata
+from io import BytesIO
+
 import requests
 from PIL import Image
-from io import BytesIO
-import re
 
-# Your specific country list (Spanish names)
+from paths import FLAGS_DIR
+
+# ===== CONFIGURATION =====
 COUNTRIES = [
     "Argentina",
     "Brasil",
@@ -34,14 +39,13 @@ COUNTRIES = [
     "Turquía",
     "Estados Unidos",
     "Paraguay",
-    "Bélgica"
+    "Bélgica",
 ]
 
-# Image settings
-IMAGE_SIZE = (128, 128)  # Width, Height in pixels
-OUTPUT_DIR = "/tmp/flags"
+IMAGE_SIZE = (128, 128)
+OUTPUT_DIR = str(FLAGS_DIR)
+# =========================
 
-# Extended country code mapping with Spanish names
 COUNTRY_CODES = {
     # Spanish names
     "argentina": "ar",
@@ -73,9 +77,9 @@ COUNTRY_CODES = {
     "turquia": "tr",
     "estados unidos": "us",
     "estadosunidos": "us",
-    "paraguay": "py",  # Added Paraguay
-    "bélgica": "be",   # Added Bélgica with accent
-    "belgica": "be",   # Added Bélgica without accent
+    "paraguay": "py",
+    "bélgica": "be",
+    "belgica": "be",
 
     # English names (for compatibility)
     "united states": "us",
@@ -144,30 +148,23 @@ COUNTRY_CODES = {
     "ecuador": "ec",
     "norway": "no",
     "spain": "es",
-    "turkey": "tr"
+    "turkey": "tr",
 }
 
 
 def get_country_code(country_name):
     """Convert country name to ISO country code (case insensitive)."""
     country_lower = country_name.lower().strip()
-
-    # Remove accents for better matching
-    import unicodedata
     country_normalized = ''.join(
         c for c in unicodedata.normalize('NFD', country_lower)
         if unicodedata.category(c) != 'Mn'
     )
 
-    # Direct lookup
     if country_lower in COUNTRY_CODES:
         return COUNTRY_CODES[country_lower]
-
-    # Try normalized version (without accents)
     if country_normalized in COUNTRY_CODES:
         return COUNTRY_CODES[country_normalized]
 
-    # Try to find partial match (for more flexibility)
     for name, code in COUNTRY_CODES.items():
         if country_lower in name or name in country_lower:
             return code
@@ -178,24 +175,17 @@ def get_country_code(country_name):
 
 
 def get_emoji_url(country_code):
-    """Generate URL for flag image using flagcdn.com."""
-    # Using the w1600 format for high-quality images
     return f"https://flagcdn.com/w2560/{country_code}.png"
 
 
 def download_flag(country_code, size=IMAGE_SIZE):
-    """Download flag image and return as PIL Image."""
     url = get_emoji_url(country_code)
-
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-
         img = Image.open(BytesIO(response.content))
-
         if img.size != size:
             img = img.resize(size, Image.Resampling.LANCZOS)
-
         return img
     except requests.exceptions.RequestException as e:
         print(f"Error downloading flag for {country_code}: {e}")
@@ -203,21 +193,16 @@ def download_flag(country_code, size=IMAGE_SIZE):
 
 
 def sanitize_filename(name):
-    """Remove invalid characters from filename."""
-    # Remove accents for filename
-    import unicodedata
     name = ''.join(
         c for c in unicodedata.normalize('NFD', name)
         if unicodedata.category(c) != 'Mn'
     )
-    # Replace spaces and special chars with underscores
     name = re.sub(r'[^\w\s-]', '', name)
     name = re.sub(r'[-\s]+', '_', name)
     return name.strip('_')
 
 
 def main():
-    # Create output directory
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     print(f"Downloading flags for {len(COUNTRIES)} countries...")
@@ -231,47 +216,38 @@ def main():
     for i, country in enumerate(COUNTRIES, 1):
         print(f"[{i}/{len(COUNTRIES)}] Processing: {country}", end=" ")
 
-        # Get country code
         country_code = get_country_code(country)
         if not country_code:
             print("❌ (Country code not found)")
             failed_countries.append(country)
             continue
 
-        # Download flag
         img = download_flag(country_code)
         if not img:
             print("❌ (Download failed)")
             failed_countries.append(country)
             continue
 
-        # Create filename: {number}_{country_name}.png
         country_name = sanitize_filename(country)
         filename = f"{i:03d}_{country_name}.png"
         filepath = os.path.join(OUTPUT_DIR, filename)
-
-        # Save image
         img.save(filepath, "PNG")
         print("✅")
         success_count += 1
 
-    # Summary
     print("-" * 50)
     print(f"Summary: {success_count} flags downloaded successfully")
-
     if failed_countries:
         print(f"Failed: {len(failed_countries)} countries")
         print("Failed countries:", ", ".join(failed_countries))
-
     print(f"Files saved in: {OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":
-    # Check for required libraries
     try:
         import requests
         from PIL import Image
-    except ImportError as e:
+    except ImportError:
         print("Error: Missing required library")
         print("Please install: pip install requests pillow")
         sys.exit(1)

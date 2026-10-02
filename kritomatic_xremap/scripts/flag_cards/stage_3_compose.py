@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
 """
-Overlay multiple images onto a single base image with parallel sequential overlays.
-Matches images by index across multiple overlay directories.
+Stage 3 — Overlay Composer
+Composites three per-index overlay layers onto a base image and writes the
+result to COMPOSITES_DIR from paths.py.
 """
 
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageChops
 import argparse
 import os
 import sys
-import math
 import json
 from pathlib import Path
 
+from paths import (
+    FLAGS_DIR,
+    TEXT_IMAGES_DIR,
+    COMPOSITES_DIR,
+    BASE_IMAGE,
+    COMPANIONS_DIR,
+)
 
 # =============== USER CONFIGURABLE VARIABLES ===============
-# Define overlay configurations - images will be matched by index across all configs
 
 OVERLAY_CONFIGS = [
-    # Pass 1: Companion photos (index 0)
+    # Pass 1: Companion photos
     {
         "name": "companion_photos",
-        "input_dir": "/home/tekakutli/Documents/pera/FotosCompaneros",
+        "input_dir": str(COMPANIONS_DIR),
         "position": "center",
         "custom_x": None,
         "custom_y": None,
@@ -34,10 +40,10 @@ OVERLAY_CONFIGS = [
         "trim_to_base": True,
     },
 
-    # Pass 2: Flags (index 1)
+    # Pass 2: Flags
     {
         "name": "flags",
-        "input_dir": "/tmp/flags",
+        "input_dir": str(FLAGS_DIR),
         "position": "center",
         "custom_x": 25,
         "custom_y": 110,
@@ -51,10 +57,10 @@ OVERLAY_CONFIGS = [
         "trim_to_base": True,
     },
 
-    # Pass 3: Generated images (index 2)
+    # Pass 3: Generated images
     {
         "name": "generated_images",
-        "input_dir": "/tmp/generated_images/",
+        "input_dir": str(TEXT_IMAGES_DIR),
         "position": "center",
         "custom_x": 190,
         "custom_y": 160,
@@ -69,10 +75,9 @@ OVERLAY_CONFIGS = [
     },
 ]
 
-# Global settings
-BASE_IMAGE_PATH = "/tmp/00494f9e044d6f67fd38bc7f787312ab.png"
-OUTPUT_DIRECTORY = "/tmp/output"
-OUTPUT_SUFFIX = "_composite"  # Suffix for output filenames
+BASE_IMAGE_PATH = str(BASE_IMAGE)
+OUTPUT_DIRECTORY = str(COMPOSITES_DIR)
+OUTPUT_SUFFIX = "_composite"
 SKIP_EXISTING = False
 
 # =============== END USER CONFIGURABLE VARIABLES ===============
@@ -80,41 +85,29 @@ SKIP_EXISTING = False
 
 def calculate_overlay_size(base_image, overlay_image, use_fixed_size=False,
                           fixed_width=200, fixed_height=200, max_percentage=0.333):
-    """
-    Calculate the new size for the overlay image while maintaining aspect ratio.
-    """
     if use_fixed_size:
         return fixed_width, fixed_height
 
     base_width, base_height = base_image.size
     overlay_width, overlay_height = overlay_image.size
 
-    # Calculate maximum allowed dimensions
     max_width = int(base_width * max_percentage)
     max_height = int(base_height * max_percentage)
 
-    # Calculate scaling factors
     width_ratio = max_width / overlay_width
     height_ratio = max_height / overlay_height
-
-    # Use the smaller ratio to ensure both dimensions fit
     scale_factor = min(width_ratio, height_ratio)
 
-    # If overlay is already smaller than max size, keep original size
     if scale_factor > 1:
         return overlay_width, overlay_height
 
     new_width = int(overlay_width * scale_factor)
     new_height = int(overlay_height * scale_factor)
-
     return new_width, new_height
 
 
 def get_overlay_position(base_width, base_height, overlay_width, overlay_height,
                         position='center', custom_x=None, custom_y=None):
-    """
-    Calculate the overlay position based on position string or custom coordinates.
-    """
     positions = {
         'center': ((base_width - overlay_width) // 2, (base_height - overlay_height) // 2),
         'top-left': (0, 0),
@@ -123,59 +116,40 @@ def get_overlay_position(base_width, base_height, overlay_width, overlay_height,
         'bottom-right': (base_width - overlay_width, base_height - overlay_height),
     }
 
-    # Check for custom coordinates first
     if custom_x is not None and custom_y is not None:
         return custom_x, custom_y
 
-    # Use position string
     pos = position.lower() if position else 'center'
     return positions.get(pos, positions['center'])
 
 
 def rotate_image(image, angle, expand=True):
-    """
-    Rotate an image by a given angle.
-    """
     if angle == 0:
         return image, image.size
-
     rotated = image.rotate(angle, expand=expand, resample=Image.Resampling.BICUBIC)
     return rotated, rotated.size
 
 
 def get_visible_region_mask(base_image, overlay_position, overlay_size):
-    """
-    Create a mask that represents the visible (non-transparent) region of the base image
-    at the overlay's position.
-    """
     base_width, base_height = base_image.size
     overlay_width, overlay_height = overlay_size
     x, y = overlay_position
 
-    # Extract the base alpha channel
     base_alpha = base_image.split()[3]
 
-    # Crop the alpha channel to the overlay region
     left = max(0, x)
     top = max(0, y)
     right = min(base_width, x + overlay_width)
     bottom = min(base_height, y + overlay_height)
 
-    # If overlay is completely outside the base image
     if left >= right or top >= bottom:
         return None
 
-    # Crop the alpha channel to the region where overlay will be placed
     visible_mask = base_alpha.crop((left, top, right, bottom))
-
-    # Create a full size mask (same as overlay size) with zeros
     full_mask = Image.new('L', (overlay_width, overlay_height), 0)
 
-    # Calculate where the visible region starts within the overlay
     paste_x = max(0, -x)
     paste_y = max(0, -y)
-
-    # Paste the visible mask at the correct position
     full_mask.paste(visible_mask, (paste_x, paste_y))
 
     return full_mask
@@ -186,18 +160,12 @@ def process_single_overlay(base_image, overlay_image, position='center',
                           custom_x=None, custom_y=None, use_fixed_size=False,
                           fixed_width=200, fixed_height=200, rotation_angle=0,
                           rotation_expand=True):
-    """
-    Process a single overlay image and return it ready for compositing.
-    """
-    # Calculate the overlay size
     new_width, new_height = calculate_overlay_size(
         base_image, overlay_image, use_fixed_size, fixed_width, fixed_height, max_percentage
     )
 
-    # Resize overlay
     overlay_resized = overlay_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-    # Apply rotation if needed
     if rotation_angle != 0:
         overlay_rotated, (rotated_width, rotated_height) = rotate_image(
             overlay_resized, rotation_angle, rotation_expand
@@ -206,38 +174,24 @@ def process_single_overlay(base_image, overlay_image, position='center',
         overlay_rotated = overlay_resized
         rotated_width, rotated_height = new_width, new_height
 
-    # Calculate position
     base_width, base_height = base_image.size
-
-    # Use rotated size for positioning
     x, y = get_overlay_position(
         base_width, base_height, rotated_width, rotated_height,
         position, custom_x, custom_y
     )
 
-    # Trim to base visibility if requested
     if trim_to_base:
-        # Get the visible region mask from the base image
         visibility_mask = get_visible_region_mask(base_image, (x, y), (rotated_width, rotated_height))
-
-        # If overlay is completely outside visible area, return empty image
         if visibility_mask is not None:
-            # Apply the visibility mask to the overlay's alpha channel
             overlay_alpha = overlay_rotated.split()[3]
-
-            # Combine the overlay's own alpha with the visibility mask
             combined_alpha = ImageChops.multiply(overlay_alpha, visibility_mask)
-
-            # Create a new overlay with the combined alpha
             r, g, b, _ = overlay_rotated.split()
             overlay_final = Image.merge('RGBA', (r, g, b, combined_alpha))
         else:
-            # Return fully transparent image if outside visible area
             overlay_final = Image.new('RGBA', (rotated_width, rotated_height), (0, 0, 0, 0))
     else:
         overlay_final = overlay_rotated
 
-    # Apply opacity if needed
     if opacity < 1.0:
         alpha = overlay_final.split()[3]
         alpha = alpha.point(lambda p: int(p * opacity))
@@ -247,43 +201,28 @@ def process_single_overlay(base_image, overlay_image, position='center',
 
 
 def get_image_files(directory):
-    """
-    Get all image files in a directory, sorted alphabetically.
-    """
     image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'}
     image_files = []
-
     if not os.path.exists(directory):
         return []
-
     for file in Path(directory).iterdir():
         if file.is_file() and file.suffix.lower() in image_extensions:
             image_files.append(file)
-
     return sorted(image_files)
 
 
 def create_composite_image(base_image, overlay_files_by_config, configs, output_path):
-    """
-    Create a composite image by applying all overlays for a specific index.
-    """
-    # Start with a copy of the base image
     result = base_image.copy()
     overlay_details = []
 
-    # Process each overlay config for this index
     for config_idx, (config, overlay_path) in enumerate(zip(configs, overlay_files_by_config)):
         if overlay_path is None:
-            # Skip if no overlay file for this index
             continue
 
         try:
-            # Load overlay image
             overlay = Image.open(overlay_path).convert('RGBA')
-
-            # Process the overlay
             overlay_processed, position, sizes = process_single_overlay(
-                result,  # Use current result as base for visibility trimming
+                result,
                 overlay,
                 position=config.get('position', 'center'),
                 max_percentage=config.get('size_percentage', 0.333),
@@ -298,7 +237,6 @@ def create_composite_image(base_image, overlay_files_by_config, configs, output_
                 rotation_expand=config.get('rotation_expand', True)
             )
 
-            # Paste overlay with alpha channel
             result.paste(overlay_processed, position, overlay_processed)
 
             orig_w, orig_h, rotated_w, rotated_h = sizes
@@ -314,31 +252,23 @@ def create_composite_image(base_image, overlay_files_by_config, configs, output_
             print(f"  ✗ Error processing overlay {config['name']} from {overlay_path.name}: {e}")
             continue
 
-    # Save result
     result.save(output_path)
     return overlay_details
 
 
 def process_parallel_overlays(base_image_path, configs, output_dir, output_suffix="_composite", skip_existing=False):
-    """
-    Process all overlays in parallel, matching by index across all configs.
-    """
-    # Validate base image
     if not os.path.exists(base_image_path):
         print(f"Error: Base image '{base_image_path}' not found")
         return False
 
-    # Load base image once
     try:
         base = Image.open(base_image_path).convert('RGBA')
     except Exception as e:
         print(f"Error opening base image: {e}")
         return False
 
-    # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
-    # Get all image files from each config directory
     all_image_files = []
     max_files = 0
 
@@ -366,9 +296,7 @@ def process_parallel_overlays(base_image_path, configs, output_dir, output_suffi
     skipped = 0
     failed = 0
 
-    # Process each index
     for idx in range(max_files):
-        # Get the overlay file for each config at this index
         overlay_files = []
         has_files = False
 
@@ -377,13 +305,11 @@ def process_parallel_overlays(base_image_path, configs, output_dir, output_suffi
                 overlay_files.append(files[idx])
                 has_files = True
             else:
-                overlay_files.append(None)  # No file for this config at this index
+                overlay_files.append(None)
 
         if not has_files:
             continue
 
-        # Create output filename
-        # Use the first available file's name as base for the output filename
         first_file = next((f for f in overlay_files if f is not None), None)
         if first_file:
             stem = first_file.stem
@@ -394,24 +320,20 @@ def process_parallel_overlays(base_image_path, configs, output_dir, output_suffi
 
         output_path = os.path.join(output_dir, output_filename)
 
-        # Skip if output already exists and skip_existing is True
         if skip_existing and os.path.exists(output_path):
             print(f"Skipping composite {idx+1}/{max_files} ({output_filename}) - already exists")
             skipped += 1
             continue
 
         try:
-            # Create composite
             overlay_details = create_composite_image(
                 base, overlay_files, configs, output_path
             )
 
-            # Print summary
             overlay_names = [d['name'] for d in overlay_details]
             print(f"✓ Composite {idx+1}/{max_files}: {output_filename}")
             print(f"  Overlays applied: {', '.join(overlay_names)}")
 
-            # Check if any overlays were skipped due to missing files
             missing = [configs[i]['name'] for i, f in enumerate(overlay_files) if f is None]
             if missing:
                 print(f"  Skipped (no file): {', '.join(missing)}")
@@ -422,7 +344,6 @@ def process_parallel_overlays(base_image_path, configs, output_dir, output_suffi
             print(f"✗ Error creating composite {idx+1}/{max_files}: {e}")
             failed += 1
 
-    # Print summary
     print("-" * 60)
     print(f"Summary:")
     print(f"  Composites created: {processed}")
@@ -442,35 +363,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Use configurations defined at top of script
   %(prog)s
-
-  # Override base image
   %(prog)s -base custom_base.png
-
-  # Use JSON config file
   %(prog)s -config overlays.json
-
-  # Override output directory
   %(prog)s -o /tmp/custom_output
         """
     )
 
-    parser.add_argument('-base', '--base-image',
-                       help='Override the base image path')
-    parser.add_argument('-config', '--config-file',
-                       help='JSON config file with overlay configurations')
-    parser.add_argument('-o', '--output-dir',
-                       help='Override output directory')
-    parser.add_argument('--skip-existing',
-                       action='store_true',
+    parser.add_argument('-base', '--base-image', help='Override the base image path')
+    parser.add_argument('-config', '--config-file', help='JSON config file with overlay configurations')
+    parser.add_argument('-o', '--output-dir', help='Override output directory')
+    parser.add_argument('--skip-existing', action='store_true',
                        help='Skip processing if output file already exists')
 
     args = parser.parse_args()
 
-    # Get configurations
     if args.config_file:
-        # Load from JSON file
         try:
             with open(args.config_file, 'r') as f:
                 configs = json.load(f)
@@ -487,14 +395,10 @@ Examples:
         overlay_configs = OVERLAY_CONFIGS
         base_image_path = BASE_IMAGE_PATH
 
-    # Override base image if specified
     if args.base_image:
         base_image_path = args.base_image
 
-    # Override output directory if specified
     output_dir = args.output_dir if args.output_dir else OUTPUT_DIRECTORY
-
-    # Set skip existing
     skip_existing = args.skip_existing if args.skip_existing else SKIP_EXISTING
 
     if not overlay_configs:
@@ -507,7 +411,6 @@ Examples:
     print(f"Output directory: {output_dir}")
     print("-" * 60)
 
-    # Process the parallel overlays
     process_parallel_overlays(
         base_image_path,
         overlay_configs,

@@ -145,7 +145,6 @@ cython_debug/
 .pipx/
 
 # Your specific project files (add as needed)
-*.log
 *.pid
 *.seed
 *.pid.lock
@@ -155,8 +154,9 @@ include/
 bin/
 lib64
 pyvenv.cfg
+tmp/
 
-#Project Cache
+# Project Cache
 src/kritomatic/commands_generated.py
 src/kritomatic/.command_registry.json
 src/kritomatic/.schema_cache.json
@@ -169,3 +169,26 @@ data/workflows/*
 .aider*
 
 command_reference.md
+
+# Rust build artifacts
+other_scripts/room/leader_optimizer/target/
+
+# Other (second project)
+other_scripts/room/cable_playground.html
+other_scripts/room/boxes_playground.html
+
+*.pdf
+*.svg
+*.png
+
+*.stl
+*.step
+
+*project_dump*
+
+# Specific
+other_scripts/room/room_boxes.json
+other_scripts/room/room_dimensions.json
+other_scripts/room/room_layout.json
+other_scripts/room/room_walls.json
+other_scripts/room/floor_plan_layout.json

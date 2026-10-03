@@ -1,0 +1,1341 @@
+{
+  "items": [
+    [
+      "name",
+      "description",
+      "price",
+      "section"
+    ],
+    [
+      "absorventes humedad",
+      "1 fco",
+      196,
+      "SAM'S"
+    ],
+    [
+      "adhereso ranch",
+      "1 fco",
+      80,
+      "SAM'S"
+    ],
+    [
+      "banderillas",
+      "1 caja",
+      197,
+      "SAM'S"
+    ],
+    [
+      "barritas fresa (18) $7.00",
+      "1 caja",
+      195,
+      "SAM'S"
+    ],
+    [
+      "café capuchino moka",
+      "1 lata",
+      208,
+      "SAM'S"
+    ],
+    [
+      "café capuchino vainilla",
+      "1 lata",
+      208,
+      "SAM'S"
+    ],
+    [
+      "catsup (2)",
+      "2 pza",
+      162,
+      "SAM'S"
+    ],
+    [
+      "cereal chococrispis",
+      "1 caja",
+      224,
+      "SAM'S"
+    ],
+    [
+      "cereal corn flakes",
+      "1 caja",
+      86,
+      "SAM'S"
+    ],
+    [
+      "chistorra",
+      "1 paq",
+      210,
+      "SAM'S"
+    ],
+    [
+      "chorizo argentino",
+      "1 kilo",
+      186,
+      "SAM'S"
+    ],
+    [
+      "costilla bbq",
+      "1 paq",
+      294,
+      "SAM'S"
+    ],
+    [
+      "crema",
+      "1 fco",
+      70,
+      "SAM'S"
+    ],
+    [
+      "crema batida(2)",
+      "1 kilo",
+      221,
+      "SAM'S"
+    ],
+    [
+      "galletas marías(18)$16",
+      "3 paq",
+      286,
+      "SAM'S"
+    ],
+    [
+      "galletas ritz(18)$8.50",
+      "1 caja",
+      152,
+      "SAM'S"
+    ],
+    [
+      "harina hot cakes",
+      "4.5 kilo",
+      158,
+      "SAM'S"
+    ],
+    [
+      "huevo",
+      "1 cartón",
+      90,
+      "SAM'S"
+    ],
+    [
+      "jabón ropa",
+      "9 kilo",
+      234,
+      "SAM'S"
+    ],
+    [
+      "mermelada fresa",
+      "1 fco",
+      87,
+      "SAM'S"
+    ],
+    [
+      "nutella 2x1",
+      "1 fco",
+      117,
+      "SAM'S"
+    ],
+    [
+      "papas francesas",
+      "2 kilo",
+      172,
+      "SAM'S"
+    ],
+    [
+      "papas gajos",
+      "2 paq",
+      193,
+      "SAM'S"
+    ],
+    [
+      "pechuga deshebrada",
+      "1 paq",
+      228,
+      "SAM'S"
+    ],
+    [
+      "pechuga rellena",
+      "1 paq",
+      228,
+      "SAM'S"
+    ],
+    [
+      "piña almíbar 3k",
+      "1 lata",
+      228,
+      "SAM'S"
+    ],
+    [
+      "sopa knor 10",
+      "1 caja",
+      150,
+      "SAM'S"
+    ],
+    [
+      "suavizante 8 l",
+      "1 fco",
+      188,
+      "SAM'S"
+    ],
+    [
+      "tacos pollo",
+      "1 paq",
+      179,
+      "SAM'S"
+    ],
+    [
+      "tacos res",
+      "1 paq",
+      179,
+      "SAM'S"
+    ],
+    [
+      "tajin (3)",
+      "1 fco",
+      114,
+      "SAM'S"
+    ],
+    [
+      "tilapa",
+      "1 paq",
+      228,
+      "SAM'S"
+    ],
+    [
+      "verdura congelada",
+      "1 paq",
+      108,
+      "SAM'S"
+    ],
+    [
+      "aceite 123",
+      "2 litros",
+      91,
+      "NETO"
+    ],
+    [
+      "aromatizante líquido",
+      "1 fco",
+      25,
+      "NETO"
+    ],
+    [
+      "atún",
+      "10 latas",
+      10,
+      "NETO"
+    ],
+    [
+      "chocolate en polvo",
+      "1 bolsa",
+      33,
+      "NETO"
+    ],
+    [
+      "chorizo",
+      "2 pza",
+      13,
+      "NETO"
+    ],
+    [
+      "cloro",
+      "1 fco",
+      15,
+      "NETO"
+    ],
+    [
+      "frijoles bayos caldosos",
+      "2 latas",
+      18,
+      "NETO"
+    ],
+    [
+      "frijoles negros caldosos",
+      "2 latas",
+      18,
+      "NETO"
+    ],
+    [
+      "jabón para trastes",
+      "2 fco",
+      50,
+      "NETO"
+    ],
+    [
+      "jarabe chocolate",
+      "1 fco",
+      65,
+      "NETO"
+    ],
+    [
+      "lechera",
+      "1 fco",
+      59,
+      "NETO"
+    ],
+    [
+      "lentejas",
+      "1 paq",
+      16,
+      "NETO"
+    ],
+    [
+      "media crema",
+      "2 pza",
+      11,
+      "NETO"
+    ],
+    [
+      "papas fritas",
+      "2 pza",
+      13,
+      "NETO"
+    ],
+    [
+      "papel baño",
+      "9 paq",
+      29,
+      "NETO"
+    ],
+    [
+      "ramen pollo",
+      "3 paq",
+      8,
+      "NETO"
+    ],
+    [
+      "Ramen res",
+      "3 paq",
+      8,
+      "NETO"
+    ],
+    [
+      "refresco cítricos",
+      "1 pza",
+      17,
+      "NETO"
+    ],
+    [
+      "refresco manzana",
+      "1 pza",
+      17,
+      "NETO"
+    ],
+    [
+      "refresco naranja",
+      "1 pza",
+      17,
+      "NETO"
+    ],
+    [
+      "refresco prisco",
+      "1 pza",
+      17,
+      "NETO"
+    ],
+    [
+      "refresco toronja",
+      "1 pza",
+      17,
+      "NETO"
+    ],
+    [
+      "servilletas",
+      "2 paq",
+      40,
+      "NETO"
+    ],
+    [
+      "servitoallas",
+      "1 paq",
+      26,
+      "NETO"
+    ],
+    [
+      "aceite oliva",
+      "1/2 litro",
+      100,
+      "CHEDRAUI"
+    ],
+    [
+      "cepillos dientes",
+      "paq 3",
+      60,
+      "CHEDRAUI"
+    ],
+    [
+      "desodorante Arturo",
+      "1 fco",
+      70,
+      "CHEDRAUI"
+    ],
+    [
+      "fibra metalica trastes",
+      "1 pza",
+      25,
+      "CHEDRAUI"
+    ],
+    [
+      "fibras para trastes",
+      "2 pza",
+      22,
+      "CHEDRAUI"
+    ],
+    [
+      "knor tomate",
+      "1 caja",
+      22,
+      "CHEDRAUI"
+    ],
+    [
+      "levadura",
+      "1 caja/5pz",
+      22,
+      "CHEDRAUI"
+    ],
+    [
+      "machaca",
+      "1 paq",
+      50,
+      "CHEDRAUI"
+    ],
+    [
+      "pasta dientes",
+      "3 pzas",
+      50,
+      "CHEDRAUI"
+    ],
+    [
+      "pimienta limón",
+      "1 fco",
+      38,
+      "CHEDRAUI"
+    ],
+    [
+      "pollo milanezas empanizadas",
+      "1 kilo",
+      70,
+      "CHEDRAUI"
+    ],
+    [
+      "prispas",
+      "2 paq",
+      30,
+      "CHEDRAUI"
+    ],
+    [
+      "salami",
+      "1 paq",
+      60,
+      "CHEDRAUI"
+    ],
+    [
+      "yogurth",
+      "1 litro",
+      57,
+      "CHEDRAUI"
+    ],
+    [
+      "arrachera",
+      "1 paq",
+      52,
+      "3B"
+    ],
+    [
+      "Azúcar",
+      "6 Kilos",
+      22,
+      "3B"
+    ],
+    [
+      "café",
+      "2 fco",
+      69,
+      "3B"
+    ],
+    [
+      "consomé",
+      "1 fco",
+      40,
+      "3B"
+    ],
+    [
+      "Fijoles bayos refritos",
+      "3 pza",
+      15,
+      "3B"
+    ],
+    [
+      "frijoles negros refritos",
+      "3 pza",
+      15,
+      "3B"
+    ],
+    [
+      "galletas chispas",
+      "4 paq",
+      19,
+      "3B"
+    ],
+    [
+      "galletas chocolate",
+      "4 paq",
+      19,
+      "3B"
+    ],
+    [
+      "galletas mexicanas",
+      "4 paq",
+      9,
+      "3B"
+    ],
+    [
+      "granos elote",
+      "3 lata",
+      17,
+      "3B"
+    ],
+    [
+      "harina maiz",
+      "1 paq",
+      15,
+      "3B"
+    ],
+    [
+      "harina trigo",
+      "1 paq",
+      20,
+      "3B"
+    ],
+    [
+      "helado",
+      "1 litro",
+      40,
+      "3B"
+    ],
+    [
+      "jamón",
+      "2 paq",
+      65,
+      "3B"
+    ],
+    [
+      "leche",
+      "5 litros",
+      20,
+      "3B"
+    ],
+    [
+      "mantequilla",
+      "2 barras",
+      20,
+      "3B"
+    ],
+    [
+      "mayonesa",
+      "1 fco",
+      200,
+      "3B"
+    ],
+    [
+      "pan hot dog",
+      "1 paq",
+      25,
+      "3B"
+    ],
+    [
+      "pino",
+      "1 fco",
+      20,
+      "3B"
+    ],
+    [
+      "queso philadelphia",
+      "1 paq",
+      25,
+      "3B"
+    ],
+    [
+      "refresco coca",
+      "1 pza",
+      19,
+      "3B"
+    ],
+    [
+      "refresco peñafiel limón",
+      "1 pza",
+      25,
+      "3B"
+    ],
+    [
+      "refresco peñafiel naranja",
+      "1 pza",
+      25,
+      "3B"
+    ],
+    [
+      "salchicha",
+      "2 paq",
+      75,
+      "3B"
+    ],
+    [
+      "sopa codito",
+      "1 paq 400g",
+      25,
+      "3B"
+    ],
+    [
+      "sopa espagueti",
+      "1 paq 400g",
+      25,
+      "3B"
+    ],
+    [
+      "sopa tornillo",
+      "1 paq 400g",
+      25,
+      "3B"
+    ],
+    [
+      "tostadas",
+      "2 paq",
+      25,
+      "3B"
+    ],
+    [
+      "totopos",
+      "1 paq",
+      25,
+      "3B"
+    ],
+    [
+      "verdura",
+      "3 latas",
+      17,
+      "3B"
+    ],
+    [
+      "aceite aerosol",
+      "1 fco",
+      69,
+      "WALMART"
+    ],
+    [
+      "aromatizante baño",
+      "1 fco",
+      80,
+      "WALMART"
+    ],
+    [
+      "arroz",
+      "2 kilos",
+      40,
+      "WALMART"
+    ],
+    [
+      "azúcar glass",
+      "1/2 kilo",
+      27,
+      "WALMART"
+    ],
+    [
+      "azúcar mascabado",
+      "1/2 kilo",
+      25,
+      "WALMART"
+    ],
+    [
+      "bombones",
+      "1 bolsa",
+      20,
+      "WALMART"
+    ],
+    [
+      "cajeta",
+      "1 fco",
+      60,
+      "WALMART"
+    ],
+    [
+      "chicharrón",
+      "1 bolsa",
+      37,
+      "WALMART"
+    ],
+    [
+      "jabón baño",
+      "1 paq",
+      56,
+      "WALMART"
+    ],
+    [
+      "miel",
+      "1 fco",
+      35,
+      "WALMART"
+    ],
+    [
+      "mostaza",
+      "1 fco",
+      22,
+      "WALMART"
+    ],
+    [
+      "palomitas",
+      "3 paq",
+      50,
+      "WALMART"
+    ],
+    [
+      "adherpapelente",
+      "1 caja",
+      41,
+      "WALMART"
+    ],
+    [
+      "papel aluminio",
+      "1 caja",
+      40,
+      "WALMART"
+    ],
+    [
+      "papel encerado",
+      "1 caja",
+      40,
+      "WALMART"
+    ],
+    [
+      "pasta hojaldrada",
+      "1 paq",
+      90,
+      "WALMART"
+    ],
+    [
+      "puré papa",
+      "3 bolsa",
+      25,
+      "WALMART"
+    ],
+    [
+      "sal grano",
+      "1 kilo",
+      15,
+      "WALMART"
+    ],
+    [
+      "sal mesa",
+      "1 kilo",
+      15,
+      "WALMART"
+    ],
+    [
+      "shampoo",
+      "1 fco",
+      48,
+      "WALMART"
+    ],
+    [
+      "cacahuate salado",
+      "100 gr",
+      15,
+      "REPOSTERÍA"
+    ],
+    [
+      "chispas chocolate",
+      "100 gr",
+      40,
+      "REPOSTERÍA"
+    ],
+    [
+      "dulces",
+      "1 bolsa",
+      60,
+      "REPOSTERÍA"
+    ],
+    [
+      "nuez",
+      "100 gr",
+      60,
+      "REPOSTERÍA"
+    ],
+    [
+      "pasitas",
+      "100 gr",
+      20,
+      "REPOSTERÍA"
+    ],
+    [
+      "agua garrafón",
+      "2 pza",
+      20,
+      "PURIFICADORA"
+    ],
+    [
+      "pan",
+      "10 pzas",
+      25,
+      "PANADERÍA"
+    ],
+    [
+      "tortillas harina",
+      "1 paq",
+      25,
+      "TIENDA"
+    ],
+    [
+      "tortillas maíz",
+      "1 paq",
+      25,
+      "TIENDA"
+    ],
+    [
+      "queso oaxaca",
+      "250 gr",
+      25,
+      "TIENDA"
+    ],
+    [
+      "tocino",
+      "250 gr",
+      25,
+      "TIENDA"
+    ]
+  ],
+  "_meta": {
+    "sheets_saved_at": {
+      "test": "2026-10-03T05:29:09.395846"
+    }
+  },
+  "test": [
+    [
+      "name",
+      "quantity"
+    ],
+    [
+      "absorventes humedad",
+      0
+    ],
+    [
+      "adhereso ranch",
+      0
+    ],
+    [
+      "banderillas",
+      0
+    ],
+    [
+      "barritas fresa (18) $7.00",
+      0
+    ],
+    [
+      "café capuchino moka",
+      0
+    ],
+    [
+      "café capuchino vainilla",
+      0
+    ],
+    [
+      "catsup (2)",
+      0
+    ],
+    [
+      "cereal chococrispis",
+      50
+    ],
+    [
+      "cereal corn flakes",
+      0
+    ],
+    [
+      "chistorra",
+      0
+    ],
+    [
+      "chorizo argentino",
+      0
+    ],
+    [
+      "costilla bbq",
+      0
+    ],
+    [
+      "crema",
+      0
+    ],
+    [
+      "crema batida(2)",
+      0
+    ],
+    [
+      "galletas marías(18)$16",
+      0
+    ],
+    [
+      "galletas ritz(18)$8.50",
+      0
+    ],
+    [
+      "harina hot cakes",
+      0
+    ],
+    [
+      "huevo",
+      0
+    ],
+    [
+      "jabón ropa",
+      0
+    ],
+    [
+      "mermelada fresa",
+      0
+    ],
+    [
+      "nutella 2x1",
+      0
+    ],
+    [
+      "papas francesas",
+      0
+    ],
+    [
+      "papas gajos",
+      0
+    ],
+    [
+      "pechuga deshebrada",
+      0
+    ],
+    [
+      "pechuga rellena",
+      0
+    ],
+    [
+      "piña almíbar 3k",
+      0
+    ],
+    [
+      "sopa knor 10",
+      0
+    ],
+    [
+      "suavizante 8 l",
+      0
+    ],
+    [
+      "tacos pollo",
+      0
+    ],
+    [
+      "tacos res",
+      0
+    ],
+    [
+      "tajin (3)",
+      0
+    ],
+    [
+      "tilapa",
+      0
+    ],
+    [
+      "verdura congelada",
+      0
+    ],
+    [
+      "aceite 123",
+      0
+    ],
+    [
+      "aromatizante líquido",
+      0
+    ],
+    [
+      "atún",
+      0
+    ],
+    [
+      "chocolate en polvo",
+      0
+    ],
+    [
+      "chorizo",
+      0
+    ],
+    [
+      "cloro",
+      0
+    ],
+    [
+      "frijoles bayos caldosos",
+      0
+    ],
+    [
+      "frijoles negros caldosos",
+      0
+    ],
+    [
+      "jabón para trastes",
+      0
+    ],
+    [
+      "jarabe chocolate",
+      0
+    ],
+    [
+      "lechera",
+      0
+    ],
+    [
+      "lentejas",
+      0
+    ],
+    [
+      "media crema",
+      0
+    ],
+    [
+      "papas fritas",
+      0
+    ],
+    [
+      "papel baño",
+      2
+    ],
+    [
+      "ramen pollo",
+      0
+    ],
+    [
+      "Ramen res",
+      0
+    ],
+    [
+      "refresco cítricos",
+      0
+    ],
+    [
+      "refresco manzana",
+      60
+    ],
+    [
+      "refresco naranja",
+      0
+    ],
+    [
+      "refresco prisco",
+      0
+    ],
+    [
+      "refresco toronja",
+      0
+    ],
+    [
+      "servilletas",
+      0
+    ],
+    [
+      "servitoallas",
+      0
+    ],
+    [
+      "aceite oliva",
+      0
+    ],
+    [
+      "cepillos dientes",
+      0
+    ],
+    [
+      "desodorante Arturo",
+      0
+    ],
+    [
+      "fibra metalica trastes",
+      0
+    ],
+    [
+      "fibras para trastes",
+      0
+    ],
+    [
+      "knor tomate",
+      0
+    ],
+    [
+      "levadura",
+      0
+    ],
+    [
+      "machaca",
+      0
+    ],
+    [
+      "pasta dientes",
+      0
+    ],
+    [
+      "pimienta limón",
+      0
+    ],
+    [
+      "pollo milanezas empanizadas",
+      0
+    ],
+    [
+      "prispas",
+      0
+    ],
+    [
+      "salami",
+      0
+    ],
+    [
+      "yogurth",
+      0
+    ],
+    [
+      "arrachera",
+      0
+    ],
+    [
+      "Azúcar",
+      0
+    ],
+    [
+      "café",
+      0
+    ],
+    [
+      "consomé",
+      0
+    ],
+    [
+      "Fijoles bayos refritos",
+      0
+    ],
+    [
+      "frijoles negros refritos",
+      0
+    ],
+    [
+      "galletas chispas",
+      0
+    ],
+    [
+      "galletas chocolate",
+      0
+    ],
+    [
+      "galletas mexicanas",
+      0
+    ],
+    [
+      "granos elote",
+      0
+    ],
+    [
+      "harina maiz",
+      0
+    ],
+    [
+      "harina trigo",
+      0
+    ],
+    [
+      "helado",
+      0
+    ],
+    [
+      "jamón",
+      0
+    ],
+    [
+      "leche",
+      0
+    ],
+    [
+      "mantequilla",
+      0
+    ],
+    [
+      "mayonesa",
+      0
+    ],
+    [
+      "pan hot dog",
+      0
+    ],
+    [
+      "pino",
+      0
+    ],
+    [
+      "queso philadelphia",
+      0
+    ],
+    [
+      "refresco coca",
+      0
+    ],
+    [
+      "refresco peñafiel limón",
+      0
+    ],
+    [
+      "refresco peñafiel naranja",
+      0
+    ],
+    [
+      "salchicha",
+      0
+    ],
+    [
+      "sopa codito",
+      0
+    ],
+    [
+      "sopa espagueti",
+      0
+    ],
+    [
+      "sopa tornillo",
+      0
+    ],
+    [
+      "tostadas",
+      0
+    ],
+    [
+      "totopos",
+      0
+    ],
+    [
+      "verdura",
+      0
+    ],
+    [
+      "aceite aerosol",
+      0
+    ],
+    [
+      "aromatizante baño",
+      0
+    ],
+    [
+      "arroz",
+      0
+    ],
+    [
+      "azúcar glass",
+      0
+    ],
+    [
+      "azúcar mascabado",
+      0
+    ],
+    [
+      "bombones",
+      0
+    ],
+    [
+      "cajeta",
+      0
+    ],
+    [
+      "chicharrón",
+      0
+    ],
+    [
+      "jabón baño",
+      0
+    ],
+    [
+      "miel",
+      0
+    ],
+    [
+      "mostaza",
+      0
+    ],
+    [
+      "palomitas",
+      0
+    ],
+    [
+      "adherpapelente",
+      0
+    ],
+    [
+      "papel aluminio",
+      0
+    ],
+    [
+      "papel encerado",
+      0
+    ],
+    [
+      "pasta hojaldrada",
+      0
+    ],
+    [
+      "puré papa",
+      0
+    ],
+    [
+      "sal grano",
+      0
+    ],
+    [
+      "sal mesa",
+      0
+    ],
+    [
+      "shampoo",
+      0
+    ],
+    [
+      "cacahuate salado",
+      0
+    ],
+    [
+      "chispas chocolate",
+      0
+    ],
+    [
+      "dulces",
+      0
+    ],
+    [
+      "nuez",
+      0
+    ],
+    [
+      "pasitas",
+      0
+    ],
+    [
+      "agua garrafón",
+      0
+    ],
+    [
+      "pan",
+      0
+    ],
+    [
+      "tortillas harina",
+      0
+    ],
+    [
+      "tortillas maíz",
+      0
+    ],
+    [
+      "queso oaxaca",
+      0
+    ],
+    [
+      "tocino",
+      0
+    ]
+  ]
+}

@@ -8,6 +8,25 @@ from functools import lru_cache
 from datetime import datetime
 
 
+def _escape_help_for_argparse(text):
+    """
+    Escape % in help text so argparse's %-formatting pass renders a
+    literal percent sign.
+
+    argparse calls `help_string % params` on every `help=` value it
+    receives. A bare `%` in the string is interpreted as the start of a
+    format specifier and raises `ValueError: incomplete format`. Doubling
+    to `%%` makes argparse emit a literal `%`.
+
+    We do this here rather than asking every @command author to remember
+    argparse's quirk. Decorators write natural text ("100%"), the parser
+    builder escapes it on the way into argparse.
+    """
+    if not isinstance(text, str):
+        return text
+    return text.replace('%', '%%')
+
+
 class CommandRegistry:
     """Manages the unified command registry with caching"""
 
@@ -120,11 +139,11 @@ class CommandRegistry:
 
     def _build_parser(self):
         """Build argparse parser from registry schema"""
-        from kritomatic.helpful_argparse import HelpfulArgumentParser
+        import argparse
 
         registry = self.get_registry()
 
-        parser = HelpfulArgumentParser(
+        parser = argparse.ArgumentParser(
             prog='kritomatic',
             description='Kritomatic - Control Krita from the command line',
             epilog='Examples:\n'
@@ -197,19 +216,25 @@ class CommandRegistry:
 
         # Dynamic categories from schema (including window, brush, layer, etc.)
         for category, commands in categories.items():
-            cat_parser = subparsers.add_parser(category, help=f'{category} operations')
+            cat_parser = subparsers.add_parser(
+                category,
+                help=_escape_help_for_argparse(f'{category} operations'),
+            )
             cmd_subparsers = cat_parser.add_subparsers(dest='subcommand', help=f'{category} commands', required=True)
 
             for cmd_info in commands:
                 cmd_name = cmd_info.get('command', 'unknown')
                 cmd_help = cmd_info.get('help', '')
-                cmd_parser = cmd_subparsers.add_parser(cmd_name, help=cmd_help)
+                cmd_parser = cmd_subparsers.add_parser(
+                    cmd_name,
+                    help=_escape_help_for_argparse(cmd_help),
+                )
 
                 for arg_name, arg_info in cmd_info.get('args', {}).items():
                     arg_type = arg_info.get('type', 'str')
                     required = arg_info.get('required', False)
                     default = arg_info.get('default')
-                    help_text = arg_info.get('help', '')
+                    help_text = _escape_help_for_argparse(arg_info.get('help', ''))
 
                     if arg_type == 'int':
                         arg_type = int

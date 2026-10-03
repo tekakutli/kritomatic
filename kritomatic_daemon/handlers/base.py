@@ -25,32 +25,66 @@ class CommandHandler:
             'diffusion': DiffusionHandler()
         }
 
+    def _send_line(self, client_socket, payload):
+        """Send a single JSON object followed by a newline (NDJSON framing)."""
+        try:
+            client_socket.send((json.dumps(payload) + '\n').encode('utf-8'))
+        except Exception:
+            pass
+
     def handle_command(self, command, client_socket):
         try:
             if 'commands' in command:
-                results = []
                 batch_id = command.get('id', None)
+                commands = command.get('commands', [])
+                total = len(commands)
+                results = []
 
-                for i, cmd in enumerate(command['commands']):
+                for i, cmd in enumerate(commands):
                     cmd_type = cmd.get('type')
-                    result = self._dispatch(cmd)
-                    results.append({
+
+                    # Per-command isolation: a handler exception must not
+                    # abort the whole batch. It becomes a single error entry.
+                    try:
+                        result = self._dispatch(cmd)
+                        ok = bool(result.get('success'))
+                        entry = {
+                            'index': i,
+                            'command': cmd_type,
+                            'status': 'success' if ok else 'error',
+                            'message': result.get('message', ''),
+                            'data': result.get('data', None),
+                        }
+                    except Exception as e:
+                        entry = {
+                            'index': i,
+                            'command': cmd_type,
+                            'status': 'error',
+                            'message': f'Processing error: {e}',
+                            'data': None,
+                        }
+
+                    results.append(entry)
+
+                    # Stream this command's result to the client immediately.
+                    self._send_line(client_socket, {
+                        'type': 'progress',
                         'index': i,
-                        'command': cmd_type,
-                        'status': 'success' if result.get('success') else 'error',
-                        'message': result.get('message', ''),
-                        'data': result.get('data', None)
+                        'total': total,
+                        'result': entry,
                     })
 
-                response = {
+                summary = {
+                    'type': 'batch_complete',
                     'status': 'batch_complete',
-                    'total': len(results),
+                    'total': total,
                     'successful': sum(1 for r in results if r['status'] == 'success'),
                     'failed': sum(1 for r in results if r['status'] == 'error'),
-                    'results': results
+                    'results': results,
                 }
                 if batch_id:
-                    response['id'] = batch_id
+                    summary['id'] = batch_id
+                self._send_line(client_socket, summary)
 
             else:
                 cmd_type = command.get('type')
@@ -63,20 +97,13 @@ class CommandHandler:
                 }
                 if cmd_type == 'get_schema' and 'version' in result:
                     response['version'] = result['version']
-            try:
-                client_socket.send(json.dumps(response).encode('utf-8'))
-            except:
-                pass
+                self._send_line(client_socket, response)
 
         except Exception as e:
-            error_response = {
+            self._send_line(client_socket, {
                 'status': 'error',
                 'message': f'Processing error: {str(e)}'
-            }
-            try:
-                client_socket.send(json.dumps(error_response).encode('utf-8'))
-            except:
-                pass
+            })
 
     def _dispatch(self, command):
         """Route command to appropriate handler"""

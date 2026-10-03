@@ -144,37 +144,56 @@ class BatchExecutor:
         if len(raw_commands) != len(commands):
             print(f"📋 Flattened {len(raw_commands)} commands into {len(commands)} (resolved includes)")
 
-        results = []
         total = len(commands)
 
-        for i, cmd in enumerate(commands):
-            cmd_type = cmd.get('type')
-            processed_cmd = self._process_command(cmd)
+        # Pre-process every command (apply hierarchical prefix) and build
+        # the single bundled payload. This is the only thing we send.
+        bundled_commands: List[Dict[str, Any]] = []
+        original_names: List[Optional[str]] = []
+        for cmd in commands:
+            bundled_commands.append(self._process_command(cmd))
+            original_names.append(
+                cmd.get('name') or cmd.get('layer_name') or cmd.get('mask_name')
+            )
+
+        payload = {
+            'id': self.batch_id,
+            'commands': bundled_commands,
+        }
+
+        results: List[Dict[str, Any]] = []
+
+        def handle_progress(index: int, result_entry: Dict[str, Any]):
+            processed_cmd = bundled_commands[index] if index < len(bundled_commands) else {}
             params = {k: v for k, v in processed_cmd.items() if k != 'type'}
-
-            result = self.client.execute(cmd_type, **params)
-
-            # Determine success properly
-            is_success = self._is_success(result)
+            cmd_type = result_entry.get('command', processed_cmd.get('type'))
+            is_success = result_entry.get('status') == 'success'
 
             result_data = {
-                'index': i,
+                'index': index,
                 'command': cmd_type,
-                'original_name': cmd.get('name') or cmd.get('layer_name') or cmd.get('mask_name'),
+                'original_name': original_names[index] if index < len(original_names) else None,
                 'processed_name': params.get('name') or params.get('layer_name') or params.get('mask_name'),
                 'prefix': self._get_current_prefix(),
                 'status': 'success' if is_success else 'error',
-                'message': result.get('message', '') if result else 'No response',
-                'data': result.get('data', None) if result else None
+                'message': result_entry.get('message', ''),
+                'data': result_entry.get('data', None),
             }
             results.append(result_data)
 
-            # Print progress for each command (optional)
             status_icon = "✓" if is_success else "✗"
             print(f"  {status_icon} {cmd_type}: {result_data['message']}")
 
             for callback in self.callbacks:
-                callback(i + 1, total, cmd_type, result_data)
+                callback(index + 1, total, cmd_type, result_data)
+
+        response = self.client.send_batch(payload, on_progress=handle_progress)
+
+        # Fallback: if for some reason the daemon didn't stream any progress
+        # lines (older daemon), reconstruct results from the final summary.
+        if response and not results:
+            for r in response.get('results', []):
+                handle_progress(r.get('index', 0), r)
 
         return results
 

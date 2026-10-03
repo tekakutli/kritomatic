@@ -215,7 +215,7 @@ class ViewHandler:
             canvas = self._get_canvas()
             zoom = percent / 100.0
             canvas.setZoomLevel(zoom)
-            return {'success': True, 'message': f'Zoomed to {percent}%%', 'data': {'zoom': zoom}}
+            return {'success': True, 'message': f'Zoomed to {percent}%', 'data': {'zoom': zoom}}
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
@@ -233,7 +233,7 @@ class ViewHandler:
             current = canvas.zoomLevel()
             new_zoom = current * factor
             canvas.setZoomLevel(new_zoom)
-            return {'success': True, 'message': f'Zoomed in to {new_zoom * 100:.1f}%%', 'data': {'zoom': new_zoom}}
+            return {'success': True, 'message': f'Zoomed in to {new_zoom * 100:.1f}%', 'data': {'zoom': new_zoom}}
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
@@ -251,13 +251,13 @@ class ViewHandler:
             current = canvas.zoomLevel()
             new_zoom = current / factor
             canvas.setZoomLevel(new_zoom)
-            return {'success': True, 'message': f'Zoomed out to {new_zoom * 100:.1f}%%', 'data': {'zoom': new_zoom}}
+            return {'success': True, 'message': f'Zoomed out to {new_zoom * 100:.1f}%', 'data': {'zoom': new_zoom}}
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
     @command(
         category='view',
-        help_text='Reset zoom to 100%%',
+        help_text='Reset zoom to 100%',
         args={}
     )
     def reset(self):
@@ -265,7 +265,7 @@ class ViewHandler:
         try:
             canvas = self._get_canvas()
             canvas.resetZoom()
-            return {'success': True, 'message': 'Zoom reset to 100%%'}
+            return {'success': True, 'message': 'Zoom reset to 100%'}
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
@@ -280,9 +280,8 @@ class ViewHandler:
             zoom, cx, cy = self._get_current_state()
             return {
                 'success': True,
-                'message': f'Zoom: {zoom * 100:.1f}%%, Center: ({cx:.1f}, {cy:.1f})',
+                'message': f'Zoom: {zoom * 100:.1f}%, Center: ({cx:.1f}, {cy:.1f})',
                 'data': {'zoom': zoom, 'center_x': cx, 'center_y': cy}
             }
         except Exception as e:
             return {'success': False, 'message': str(e)}
-

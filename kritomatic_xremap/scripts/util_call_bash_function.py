@@ -1,17 +1,36 @@
 #!/usr/bin/env python3
 """
-Call a bash function from my configuration
+util_call_bash_function.py
+
+Source a shell config file and call a function defined in it.
+
+The function to call comes from the BASH_FUNCTION variable, or from an
+optional positional argument that overrides it. The config file to source
+is set by CONFIG_FILE.
+
+Usage:
+    python util_call_bash_function.py [function_name]
+
+Examples:
+    # Use BASH_FUNCTION variable
+    python util_call_bash_function.py
+
+    # Override with a function name
+    python util_call_bash_function.py viewer_toggle_default
 """
 
 import subprocess
 import sys
 import os
+import argparse
 
-# Configure which bash function to call
-BASH_FUNCTION = "swap_image_app"
+# ===== CONFIGURABLE SETTINGS =====
+# Which bash function to call. Overridden by the positional argument.
+BASH_FUNCTION = "viewer_toggle_default"
 
-# Path to your config file (change if needed)
+# Path to the config file to source
 CONFIG_FILE = os.path.expanduser("~/.zshenv")
+# =================================
 
 def show_notification(message, is_error=True):
     """Show desktop notification"""
@@ -27,14 +46,14 @@ def show_notification(message, is_error=True):
     except FileNotFoundError:
         print(message)
 
-def call_bash_function():
+def call_bash_function(bash_function):
     """Call the configured bash function"""
     try:
         # Source the config file (as bash, since you said it's bash syntax despite .zshenv)
         bash_command = f"""
             if [ -f {CONFIG_FILE} ]; then
                 source {CONFIG_FILE}
-                {BASH_FUNCTION}
+                {bash_function}
             else
                 echo "Config file not found: {CONFIG_FILE}"
                 exit 1
@@ -57,8 +76,20 @@ def call_bash_function():
         return False
 
 def main():
-    if call_bash_function():
-        show_notification(f"Called {BASH_FUNCTION} BASH CONFIG FUNCTION successfully", is_error=False)
+    parser = argparse.ArgumentParser(
+        description='Call a bash function defined in a sourced config file. '
+                    'Configure via variables in the script; the only positional '
+                    'argument overrides BASH_FUNCTION.'
+    )
+    parser.add_argument('function_name', nargs='?', default=None,
+                        help='Bash function to call (overrides BASH_FUNCTION variable)')
+    args = parser.parse_args()
+
+    # Resolve the function name: positional overrides variable
+    bash_function = args.function_name or BASH_FUNCTION
+
+    if call_bash_function(bash_function):
+        show_notification(f"Called {bash_function} BASH CONFIG FUNCTION successfully", is_error=False)
         sys.exit(0)
     else:
         sys.exit(1)

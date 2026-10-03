@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
 Stage 2 — Text to Image Generator
-Renders each string in TEXT_LIST as an image via text_as_image.py.
+Renders each string in TEXT_LIST as an image by calling text_as_image.py
+in-process: import it, patch its module-level variables, call main().
+
 Writes to TEXT_IMAGES_DIR from paths.py.
 """
 
 import os
 import sys
-import subprocess
 from pathlib import Path
 
 from paths import TEXT_IMAGES_DIR
+
+# Make text_as_image.py importable from the parent scripts/ directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import text_as_image  # noqa: E402
 
 # ===== CONFIGURATION =====
 TEXT_LIST = [
@@ -41,10 +46,27 @@ TEXT_LIST = [
 
 OUTPUT_DIR = str(TEXT_IMAGES_DIR)
 BG_COLOR = "white"
-
-# Target script in the parent scripts/ directory
-TEXT_GENERATOR_SCRIPT = Path(__file__).resolve().parent.parent / "text_as_image.py"
 # =========================
+
+
+def render_one(text, output_path, bg_color):
+    """
+    Render a single string by patching text_as_image's module-level
+    variables and calling its main().
+    """
+    text_as_image.OUTPUT_FILE = output_path
+    text_as_image.BG_COLOR = bg_color
+    text_as_image.TEXT_TO_RENDER = text
+
+    # text_as_image.main() parses sys.argv to pick up the positional text.
+    # Neutralize argv to just the text so it takes the positional branch
+    # and does not see leftover arguments from this script.
+    saved_argv = sys.argv
+    sys.argv = ["text_as_image.py", text]
+    try:
+        text_as_image.main()
+    finally:
+        sys.argv = saved_argv
 
 
 def generate_images():
@@ -65,34 +87,22 @@ def generate_images():
         filename = f"{index:03d}_{safe_filename}.png"
         output_path = os.path.join(OUTPUT_DIR, filename)
 
-        cmd = [
-            sys.executable,
-            str(TEXT_GENERATOR_SCRIPT),
-            "--text", text,
-            "--output", output_path,
-            "--bg-color", BG_COLOR,
-        ]
-
         print(f"🔄 [{index}/{len(TEXT_LIST)}] Generating: '{text}'")
         print(f"   → Output: {output_path}")
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            render_one(text, output_path, BG_COLOR)
             print(f"   ✅ Success: {filename}")
             success_count += 1
-            if result.stdout:
-                print(f"   📤 Output: {result.stdout.strip()}")
-        except subprocess.CalledProcessError as e:
-            print(f"   ❌ Error generating '{text}'")
-            print(f"   Error code: {e.returncode}")
-            if e.stderr:
-                print(f"   Error message: {e.stderr.strip()}")
-        except FileNotFoundError:
-            print(f"   ❌ Error: Python script not found at {TEXT_GENERATOR_SCRIPT}")
-            print("   Please check the path and update TEXT_GENERATOR_SCRIPT")
-            break
+        except SystemExit as e:
+            # text_as_image.main() calls sys.exit(1) on failure
+            if e.code in (0, None):
+                print(f"   ✅ Success: {filename}")
+                success_count += 1
+            else:
+                print(f"   ❌ Failed (exit code {e.code})")
         except Exception as e:
-            print(f"   ❌ Unexpected error: {str(e)}")
+            print(f"   ❌ Unexpected error: {e}")
 
         print("-" * 50)
 

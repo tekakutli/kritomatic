@@ -1,21 +1,38 @@
 #!/usr/bin/env python3
 """
-Nautilus right-click: extract text from image via img2caption.py.
+Nautilus right-click: caption an image via the clipboard2caption tool
+(router.py), with the "Text Extractor" prompt. On failure, opens an error
+file in Emacs.
 Place in ~/.local/share/nautilus/scripts/ or a submenu directory.
 """
 
-import sys
+import json
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
-import shutil
 from pathlib import Path
 
 # ==================== CONFIGURATION ====================
-SCRIPT_PATH = Path(__file__).resolve().parent.parent / "img2caption.py"
 DEFAULT_PROMPT = "Text Extractor"
+
+# Interpreter used to run router.py (and, through it, the tool scripts).
+# Must be the venv python so the tools can import requests / PIL / wand.
+VENV_PYTHON = str(Path(__file__).resolve().parents[3] / ".venv" / "bin" / "python")
 # ======================================================
+
+ROUTER_PATH = Path(__file__).resolve().parent.parent / "router.py"
+
+
+def run_tool(instruction):
+    return subprocess.run(
+        [VENV_PYTHON, str(ROUTER_PATH), json.dumps(instruction)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 def open_with_emacs(file_path, content=None):
@@ -54,6 +71,26 @@ def open_with_emacs(file_path, content=None):
         return False
 
 
+def write_error_file(file_path, result):
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    temp_file = os.path.join(
+        tempfile.gettempdir(), f"extract_text_error_{timestamp}.txt"
+    )
+    error_content = f"""# Text Extraction Error
+# Time: {time.strftime('%Y-%m-%d %H:%M:%S')}
+# Image: {file_path}
+# Error: router exited with code {result.returncode}
+{'=' * 80}
+
+YOU NEED TO RUN LLAMA
+
+{'=' * 80}
+Error details:
+{result.stderr if result.stderr else 'No error details available'}
+"""
+    open_with_emacs(temp_file, error_content)
+
+
 def main():
     file_paths = sys.argv[1:]
     if not file_paths:
@@ -64,56 +101,36 @@ def main():
         if file_path.startswith('~'):
             file_path = os.path.expanduser(file_path)
 
-        escaped_path = f'"{file_path}"'
-        cmd = f'python3 "{SCRIPT_PATH}" {escaped_path} -p "{DEFAULT_PROMPT}"'
-        print(f"Running: {cmd}")
+        instruction = {
+            "tool": "clipboard2caption",
+            "params": {
+                "IMAGE_PATH": file_path,
+                "DEFAULT_PROMPT": DEFAULT_PROMPT,
+            },
+        }
+        print(f"Running: clipboard2caption on {file_path}")
 
         try:
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            result = run_tool(instruction)
 
             if result.returncode == 0:
                 print(f"\u2705 Successfully processed: {file_path}")
+                if result.stdout:
+                    print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
             else:
                 print(f"\u274C Script failed for: {file_path}")
-                print(f"Error output: {result.stderr}")
+                if result.stdout:
+                    print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+                if result.stderr:
+                    print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr)
+                write_error_file(file_path, result)
 
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                temp_file = os.path.join(tempfile.gettempdir(), f"extract_text_error_{timestamp}.txt")
-
-                error_content = f"""# Text Extraction Error
-# Time: {time.strftime('%Y-%m-%d %H:%M:%S')}
-# Image: {file_path}
-# Error: Script failed with exit code {result.returncode}
-{'=' * 80}
-
-YOU NEED TO RUN LLAMA
-
-{'=' * 80}
-Error details:
-{result.stderr if result.stderr else 'No error details available'}
-"""
-                open_with_emacs(temp_file, error_content)
-
-        except subprocess.CalledProcessError as e:
-            print(f"Error running script on {file_path}: {e}")
-
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            temp_file = os.path.join(tempfile.gettempdir(), f"extract_text_error_{timestamp}.txt")
-
-            error_content = f"""# Text Extraction Error
-# Time: {time.strftime('%Y-%m-%d %H:%M:%S')}
-# Image: {file_path}
-# Error: {str(e)}
-{'=' * 80}
-
-YOU NEED TO RUN LLAMA
-"""
-            open_with_emacs(temp_file, error_content)
         except Exception as e:
             print(f"Unexpected error: {e}")
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            temp_file = os.path.join(tempfile.gettempdir(), f"extract_text_error_{timestamp}.txt")
-
+            temp_file = os.path.join(
+                tempfile.gettempdir(), f"extract_text_error_{timestamp}.txt"
+            )
             error_content = f"""# Text Extraction Error
 # Time: {time.strftime('%Y-%m-%d %H:%M:%S')}
 # Image: {file_path}

@@ -1,13 +1,62 @@
 #!/usr/bin/env python3
 """
-Image Captioning Script for llama.cpp using llama-server
-Processes a single image or all images in a directory via persistent API server
-Usage:
-    First, start the server:
-        llama-server -m /path/to/model.gguf --mmproj /path/to/mmproj.gguf -c 8192 -ngl 999
+llamacpp_caption_images.py
 
-    Then run this script:
-        python3 caption_server.py [input_path] [--prompt LABEL] [--append TEXT] [--max-tokens N] [--word-limit W]
+Caption images using a llama.cpp server (persistent API).
+
+Input can be a single image file or a directory of images. It comes from
+the IMAGE_PATH variable, or from a single optional positional argument
+that overrides it. If neither is set, the script prompts interactively
+for a path.
+
+Each image is sent to the server with a prompt drawn from PROMPTS, chosen
+by DEFAULT_PROMPT_LABEL (overridden per-run by --prompt / -p). The prompt
+can be further modified by APPEND_TEXT and WORD_LIMIT before being sent.
+
+Output:
+
+  - File output is always produced, unless PRINT_ONLY is True.
+  - The output path is chosen as follows:
+      1. If OUTPUT_FILE is non-empty: use it verbatim.
+      2. Else: derive from the input.
+         - Single image: "<image_stem>_caption.txt" next to the image.
+         - Directory:    "captions_<dir_name>.txt" inside the directory.
+  - The caption is also printed to the console (unless, for directories,
+    only per-image previews are shown).
+
+Behavior is controlled by variables in the CONFIGURABLE SETTINGS block:
+
+  - IMAGE_PATH:           Default input path.
+  - DEFAULT_PROMPT_LABEL: Which PROMPTS entry to use by default.
+  - APPEND_TEXT:          Extra text appended to the prompt.
+  - WORD_LIMIT:           Soft word limit appended to the prompt, or None.
+  - MAX_TOKENS:           Server-side max tokens to generate.
+  - OUTPUT_FILE:          Explicit output path. Empty = derive from input.
+  - PRINT_ONLY:           If True, skip file output (single image only).
+  - SERVER_URL, TEMP, TIMEOUT, HEALTH_CHECK_TIMEOUT: server settings.
+  - EXTENSIONS:           Image extensions to look for in directories.
+
+The only command-line flag is --prompt / -p, which overrides
+DEFAULT_PROMPT_LABEL.
+
+Usage:
+    python3 llamacpp_caption_images.py [input_path] [--prompt LABEL]
+
+Before running, start the server (see print_server_instructions()):
+    llama-server -m model.gguf --mmproj mmproj.gguf -c 8192 -ngl 999 ...
+
+Examples:
+    # Use IMAGE_PATH
+    python3 llamacpp_caption_images.py
+
+    # Override with a file
+    python3 llamacpp_caption_images.py /path/to/image.jpg
+
+    # Override with a directory
+    python3 llamacpp_caption_images.py /path/to/images/
+
+    # Custom prompt label
+    python3 llamacpp_caption_images.py image.jpg --prompt "Art Critic"
 """
 
 import os
@@ -21,13 +70,43 @@ from datetime import datetime
 from typing import List, Tuple
 
 # ============================================
-# CONFIGURATION (EDIT THESE)
+# CONFIGURABLE SETTINGS
 # ============================================
 
+# Default input path. Overridden by the optional positional argument.
+IMAGE_PATH = ""                      # e.g. "/path/to/image.jpg" or "/path/to/images/"
+
+# Which PROMPTS entry to use by default (overridden per-run by --prompt / -p)
+DEFAULT_PROMPT_LABEL = "e621 tag list"
+# Other options:
+#   "Descriptive", "Descriptive (Casual)", "Straightforward",
+#   "Stable Diffusion Prompt", "Danbooru tag list", "Booru-like tag list",
+#   "Art Critic", "Product Listing", "Social Media Post",
+#   "Explicit Adult (NSFW)", "Text Extractor", "Questionary",
+#   "Interpretation", "LLM"
+
+# Prompt modifiers (appended to the prompt text before sending)
+APPEND_TEXT = ""                     # Extra text appended to the prompt, or ""
+WORD_LIMIT = None                    # Soft word limit (int), or None
+
+# Server request settings
+MAX_TOKENS = 300                     # Server-side max tokens to generate
+TEMP = 0.2                           # Sampling temperature
+TIMEOUT = 120                        # Request timeout in seconds
+
+# Output settings
+OUTPUT_FILE = ""                     # Explicit output path. Empty = derive from input.
+PRINT_ONLY = False                   # If True, skip file output (single image only)
+
+# Server configuration
 SERVER_URL = "http://127.0.0.1:6006/v1/chat/completions"
+HEALTH_CHECK_TIMEOUT = 5             # Seconds
+
+# Directory scanning
+EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']
 
 # ============================================
-# PROMPT MAPPING - LONG TEXTS (YOU FILL THESE IN)
+# PROMPT MAPPING - LONG TEXTS
 # ============================================
 
 PROMPTS = {
@@ -35,11 +114,8 @@ PROMPTS = {
     "Descriptive (Casual)": "Write a long descriptive caption for this image in a casual tone.",
     "Straightforward": "Write a long straightforward caption for this image. Begin with the main subject and medium. Mention pivotal elements—people, objects, scenery—using confident, definite language. Focus on concrete details like color, shape, texture, and spatial relationships. Show how elements interact. Omit mood and speculative wording. If text is present, quote it exactly. Note any watermarks, signatures, or compression artifacts. Never mention what's absent, resolution, or unobservable details. Vary your sentence structure and keep the description concise, without starting with “This image is...” or similar phrasing.",
     "Stable Diffusion Prompt": "Output a long stable diffusion prompt that is indistinguishable from a real stable diffusion prompt.",
-    # "Danbooru tag list": "Generate only comma-separated Danbooru tags (lowercase_underscores). Strict order: `artist:`, `copyright:`, `character:`, `meta:`, then general tags. Include counts (1girl), appearance, clothing, accessories, pose, expression, actions, background. Use precise Danbooru syntax. No extra text. long length.",
     "Danbooru tag list": "Generate a comma-separated list of Danbooru tags for this image. Tags must be lowercase_with_underscores. Place a space after each comma. Do NOT include any prefixes like 'artist:', 'copyright:', 'character:', or 'meta:'. Only output the raw tags. Start with character count (e.g., 1girl, 2boys), then appearance, clothing, accessories, pose, expression, actions, background. Use standard Danbooru syntax. No extra text, no line breaks. Output 20-40 tags. Example: 1girl, solo, long_hair, blue_eyes, sitting, smile, nurse, hat",
-    # "e621 tag list": "Write a long comma-separated list of e621 tags in alphabetical order for this image. Start with the artist, copyright, character, species, meta, and lore tags (if any), prefixed by 'artist:', 'copyright:', 'character:', 'species:', 'meta:', and 'lore:'. Then all the general tags.",
     "e621 tag list": "Write a comma-separated list of e621 tags for this image. Do NOT include prefixes like 'general:', 'meta:', or 'lore:'. Do NOT put each tag on a new line. Output as a simple comma-separated list. Example: 1boy, solo, blue_eyes, blonde_hair, sitting",
-    # "Booru-like tag list": "Write a long list of Booru-like tags for this image.",
     "Booru-like tag list": "Output only a comma-separated list of tags for this image. Place a space after each comma. Do not include any introductory text, explanations, markdown formatting, line breaks, or section headers. Do not use labels like 'Character & Appearance:', 'Action & Scene:', or 'Art Style & Detailing:'. Just the raw tags. Example: nurse, catgirl, fox girl, anime, female, black hair, white uniform, blush, smile, cute, medical, fetish",
     "Art Critic": "Analyze this image like an art critic would with information about its composition, style, symbolism, the use of color, light, any artistic movement it might belong to, etc. Keep it long.",
     "Product Listing": "Write a long caption for this image as though it were a product listing.",
@@ -50,38 +126,6 @@ PROMPTS = {
     "Interpretation": "You are an analytical image Q&A system. Answer the user's question about this image with clear, direct statements. Use evidence visible in the image to support your answer. Provide brief explanations when helpful. Use complete but concise sentences. If the answer involves ambiguity or artistic interpretation, acknowledge it briefly. If the requested information is not visible, state 'not visible' and suggest what might be inferred. Answer the question directly before adding any explanation.",
     "LLM": "You are describing this image to another language model that cannot see it. Your goal is to convey enough visual and contextual information so the other LLM understands the scene as if it had seen it. Focus on: the relationship between any text present (speech bubbles, signs, labels) and the visual elements. Explain abstract situations, implied actions, emotional tone, narrative tension, and any subtext that can be inferred. Describe character expressions, body language, spatial relationships, and environmental details. Connect the dots between what is seen and what it means. Assume the other LLM is intelligent but blind to the image. Be thorough but concise. Use natural language.",
 }
-
-# ============================================
-# DEFAULT PROMPT - UNCOMMENT THE ONE YOU WANT
-# ============================================
-
-# DEFAULT_PROMPT_LABEL = "Descriptive"
-# DEFAULT_PROMPT_LABEL = "Descriptive (Casual)"
-# DEFAULT_PROMPT_LABEL = "Straightforward"
-# DEFAULT_PROMPT_LABEL = "Stable Diffusion Prompt"
-# DEFAULT_PROMPT_LABEL = "Danbooru tag list"
-DEFAULT_PROMPT_LABEL = "e621 tag list"
-# DEFAULT_PROMPT_LABEL = "Booru-like tag list"
-# DEFAULT_PROMPT_LABEL = "Art Critic"
-# DEFAULT_PROMPT_LABEL = "Product Listing"
-# DEFAULT_PROMPT_LABEL = "Social Media Post"
-# DEFAULT_PROMPT_LABEL = "Explicit Adult (NSFW)"
-# DEFAULT_PROMPT_LABEL = "Text Extractor"
-# DEFAULT_PROMPT_LABEL = "Questionary"
-# DEFAULT_PROMPT_LABEL = "Interpretation"
-# DEFAULT_PROMPT_LABEL = "LLM"
-
-# ============================================
-# OPTIONAL SETTINGS
-# ============================================
-
-EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']
-TEMP = 0.2
-DEFAULT_MAX_TOKENS = 300
-TIMEOUT = 120
-
-# Server health check settings
-HEALTH_CHECK_TIMEOUT = 5
 
 # ============================================
 # SERVER FUNCTIONS
@@ -124,9 +168,12 @@ def get_mime_type(image_path: str) -> str:
 def caption_image_via_server(image_path: str, prompt_text: str,
                               server_url: str = SERVER_URL,
                               temp: float = TEMP,
-                              max_tokens: int = DEFAULT_MAX_TOKENS,
+                              max_tokens: int = None,
                               timeout: int = TIMEOUT) -> str:
     """Send image to llama-server and return caption"""
+
+    if max_tokens is None:
+        max_tokens = MAX_TOKENS
 
     # Validate image exists
     if not os.path.exists(image_path):
@@ -196,11 +243,14 @@ def is_image_file(filepath: str) -> bool:
 
 
 def process_single_image(image_path: str, prompt_text: str,
-                         output_path: str = None, print_only: bool = False,
+                         output_path: str = None,
                          prompt_label: str = None,
-                         max_tokens: int = DEFAULT_MAX_TOKENS) -> str:
+                         max_tokens: int = None) -> str:
     """Process a single image and return/save the caption"""
     filename = Path(image_path).name
+
+    if max_tokens is None:
+        max_tokens = MAX_TOKENS
 
     # Use provided prompt_label or default
     label = prompt_label if prompt_label else DEFAULT_PROMPT_LABEL
@@ -208,7 +258,7 @@ def process_single_image(image_path: str, prompt_text: str,
     print(f"Processing: {filename}")
     caption = caption_image_via_server(image_path, prompt_text, max_tokens=max_tokens)
 
-    if print_only:
+    if PRINT_ONLY:
         print("\n" + "=" * 50)
         print("CAPTION:")
         print("=" * 50)
@@ -244,8 +294,11 @@ def process_single_image(image_path: str, prompt_text: str,
 
 def process_directory(input_dir: str, prompt_text: str, output_path: str,
                       prompt_label: str = None,
-                      max_tokens: int = DEFAULT_MAX_TOKENS) -> Tuple[int, int]:
+                      max_tokens: int = None) -> Tuple[int, int]:
     """Process all images in a directory"""
+    if max_tokens is None:
+        max_tokens = MAX_TOKENS
+
     # Use provided prompt_label or default
     label = prompt_label if prompt_label else DEFAULT_PROMPT_LABEL
 
@@ -334,84 +387,83 @@ def print_server_instructions():
     print("=" * 60)
 
 
+def build_prompt_text(prompt_label: str) -> str:
+    """
+    Resolve the prompt text for a given label and apply APPEND_TEXT and
+    WORD_LIMIT.
+    """
+    prompt_text = get_prompt_text(prompt_label)
+    if not prompt_text:
+        return ""
+
+    if APPEND_TEXT:
+        prompt_text = f"{prompt_text}\n\n{APPEND_TEXT}"
+
+    if WORD_LIMIT:
+        prompt_text = f"{prompt_text} Keep your response under {WORD_LIMIT} words."
+
+    return prompt_text
+
+
+def derive_output_path(input_path: str) -> str:
+    """
+    Derive the output path from the input path.
+
+    Single image -> "<image_stem>_caption.txt" next to the image.
+    Directory    -> "captions_<dir_name>.txt" inside the directory.
+    """
+    if os.path.isfile(input_path) and is_image_file(input_path):
+        image_dir = os.path.dirname(input_path)
+        image_name = Path(input_path).stem
+        return os.path.join(image_dir, f"{image_name}_caption.txt")
+    else:
+        return os.path.join(input_path, f"captions_{Path(input_path).name}.txt")
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Caption images using llama-server (persistent API)',
+        description='Caption images using llama-server (persistent API). '
+                    'Configure via variables in the script; the only flag is '
+                    '--prompt / -p, and the only positional overrides IMAGE_PATH.',
         epilog='Examples:\n'
-               '  python3 caption_server.py /path/to/image.jpg\n'
-               '  python3 caption_server.py /path/to/image.jpg --prompt "Art Critic"\n'
-               '  python3 caption_server.py /path/to/image.jpg --prompt "Art Critic" --append "Focus on colors"\n'
-               '  python3 caption_server.py /path/to/image.jpg --prompt "Art Critic" --word-limit 200\n'
-               '  python3 caption_server.py /path/to/image.jpg --prompt "Art Critic" --max-tokens 500\n'
-               '  python3 caption_server.py /path/to/image.jpg --prompt "Art Critic" --word-limit 200 --max-tokens 500\n'
-               '  python3 caption_server.py /path/to/images/\n'
-               '  python3 caption_server.py /path/to/images/ --prompt "Danbooru tag list"\n'
-               '  python3 caption_server.py --status'
+               '  python3 llamacpp_caption_images.py\n'
+               '  python3 llamacpp_caption_images.py /path/to/image.jpg\n'
+               '  python3 llamacpp_caption_images.py /path/to/image.jpg --prompt "Art Critic"\n'
+               '  python3 llamacpp_caption_images.py /path/to/images/\n'
+               '  python3 llamacpp_caption_images.py /path/to/images/ --prompt "Danbooru tag list"'
     )
     parser.add_argument('input_path', nargs='?', default=None,
-                        help='Image file or directory containing images')
+                        help='Image file or directory containing images. '
+                             'Overrides IMAGE_PATH variable.')
     parser.add_argument('--prompt', '-p', type=str, default=None,
                         help=f'Prompt label (default: {DEFAULT_PROMPT_LABEL})')
-    parser.add_argument('--append', '-a', type=str, default=None,
-                        help='Additional text to append to the prompt (e.g., "Focus on the background")')
-    parser.add_argument('--word-limit', '-w', type=int, default=None,
-                        help='Keep response under specified number of words (e.g., -w 200)')
-    parser.add_argument('--output', '-o', type=str, default=None,
-                        help='Output file path (default: auto-generated based on input)')
-    parser.add_argument('--print-only', action='store_true',
-                        help='Print caption to console only (don\'t save to file)')
-    parser.add_argument('--status', '-s', action='store_true',
-                        help='Check if server is running and exit')
-    parser.add_argument('--max-tokens', '-n', type=int, default=None,
-                        help=f'Maximum tokens to generate (default: {DEFAULT_MAX_TOKENS})')
-
     args = parser.parse_args()
-
-    # Determine max_tokens
-    max_tokens = args.max_tokens if args.max_tokens is not None else DEFAULT_MAX_TOKENS
-
-    # Status check mode
-    if args.status:
-        if check_server_health():
-            print("✓ llama-server is running and healthy")
-            return 0
-        else:
-            print("✗ llama-server is not running")
-            print_server_instructions()
-            return 1
 
     # Check if server is running before proceeding
     if not check_server_health():
         print_server_instructions()
         return 1
 
-    # Determine prompt label and text
+    # Determine prompt label and build prompt text
     prompt_label = args.prompt if args.prompt is not None else DEFAULT_PROMPT_LABEL
-    prompt_text = get_prompt_text(prompt_label)
+    prompt_text = build_prompt_text(prompt_label)
 
     if not prompt_text:
         print(f"ERROR: No prompt text found for label '{prompt_label}'.")
         return 1
 
-    # Append additional text if provided
-    if args.append:
-        prompt_text = f"{prompt_text}\n\n{args.append}"
+    # Resolve the input path: positional overrides IMAGE_PATH
+    raw_path = args.input_path or IMAGE_PATH
 
-    # Add word limit instruction if provided
-    if args.word_limit:
-        word_instruction = f" Keep your response under {args.word_limit} words."
-        prompt_text = f"{prompt_text}{word_instruction}"
-
-    # Handle no input path (interactive single image mode)
-    if args.input_path is None:
+    # If still nothing, prompt interactively
+    if not raw_path:
         print("No input provided. Enter image path: ", end='')
-        image_path = input().strip()
-        if not image_path:
+        raw_path = input().strip()
+        if not raw_path:
             print("ERROR: No image path provided.")
             return 1
-        args.input_path = image_path
 
-    input_path = os.path.abspath(args.input_path)
+    input_path = os.path.abspath(raw_path)
 
     if not os.path.exists(input_path):
         print(f"ERROR: Path not found: {input_path}")
@@ -422,12 +474,12 @@ def main():
     print(f"Server: {SERVER_URL}")
     print(f"Input Path: {input_path}")
     print(f"Prompt Label: {prompt_label}")
-    if args.append:
-        print(f"Appended Text: {args.append}")
-    if args.word_limit:
-        print(f"Word Limit: {args.word_limit}")
+    if APPEND_TEXT:
+        print(f"Appended Text: {APPEND_TEXT}")
+    if WORD_LIMIT:
+        print(f"Word Limit: {WORD_LIMIT}")
     print(f"Temperature: {TEMP}")
-    print(f"Max Tokens: {max_tokens}")
+    print(f"Max Tokens: {MAX_TOKENS}")
     print("=" * 60)
     print()
 
@@ -436,17 +488,15 @@ def main():
 
     if single_image:
         # Determine output path
-        if args.print_only:
+        if PRINT_ONLY:
             output_path = None
-        elif args.output:
-            output_path = args.output
+        elif OUTPUT_FILE.strip():
+            output_path = OUTPUT_FILE
         else:
-            image_dir = os.path.dirname(input_path)
-            image_name = Path(input_path).stem
-            output_path = os.path.join(image_dir, f"{image_name}_caption.txt")
+            output_path = derive_output_path(input_path)
 
-        process_single_image(input_path, prompt_text, output_path, args.print_only,
-                            prompt_label, max_tokens)
+        process_single_image(input_path, prompt_text, output_path,
+                            prompt_label, MAX_TOKENS)
 
     else:
         # It's a directory (or should be treated as one)
@@ -454,17 +504,17 @@ def main():
             print(f"ERROR: Path is not a directory: {input_path}")
             return 1
 
-        if args.print_only:
-            print("ERROR: --print-only not supported for directories")
+        if PRINT_ONLY:
+            print("ERROR: PRINT_ONLY is not supported for directories")
             return 1
 
-        if args.output:
-            output_path = args.output
+        if OUTPUT_FILE.strip():
+            output_path = OUTPUT_FILE
         else:
-            output_path = os.path.join(input_path, f"captions_{Path(input_path).name}.txt")
+            output_path = derive_output_path(input_path)
 
         success, failed = process_directory(input_path, prompt_text, output_path,
-                                           prompt_label, max_tokens)
+                                           prompt_label, MAX_TOKENS)
 
         print("\n" + "=" * 50)
         print("COMPLETE!")

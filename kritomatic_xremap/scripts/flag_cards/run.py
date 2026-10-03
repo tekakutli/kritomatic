@@ -17,7 +17,7 @@ from pathlib import Path
 from paths import PIPELINE_ROOT
 
 # ===== CONFIGURATION =====
-VENV_PATH = Path("/home/tekakutli/code/kritomatic-auxiliary")
+VENV_PATH = Path(__file__).resolve().parents[3] / ".venv"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 SCRIPTS = [

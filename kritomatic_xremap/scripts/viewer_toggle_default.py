@@ -1,12 +1,61 @@
 #!/usr/bin/env python3
 """
-Toggle default image viewer between Krita and imv for PNG and JPG files
+viewer_toggle_default.py
+
+Toggle the default image viewer between Krita and imv for PNG and JPG files.
+
+The script reads the current default handler for image/png via xdg-mime and
+switches it to the other application. If the current default is neither
+Krita nor imv, it asks interactively which one to set.
+
+Custom .desktop files are created under ~/.local/share/applications/ when
+needed, and the desktop database is refreshed afterward.
+
+Configuration is via variables in the CONFIGURABLE SETTINGS block below.
+There are no command-line flags or positional arguments.
+
+Usage:
+    python viewer_toggle_default.py
 """
 
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+# ===== CONFIGURABLE SETTINGS =====
+# MIME types to switch
+MIME_TYPES = ["image/png", "image/jpeg"]
+
+# Krita .desktop entry
+KRITA_DESKTOP_NAME = "userapp-krita-custom.desktop"
+KRITA_DESKTOP_CONTENT = """[Desktop Entry]
+Type=Application
+Name=Krita (Custom)
+Exec=/usr/local/bin/krita %F
+Icon=krita
+MimeType=image/png;image/jpeg;
+Categories=Graphics;2DGraphics;RasterGraphics;
+Terminal=false
+StartupNotify=true
+"""
+
+# imv .desktop entry (used only if no standard imv.desktop is found)
+IMV_DESKTOP_NAME = "imv.desktop"
+IMV_DESKTOP_CONTENT = """[Desktop Entry]
+Type=Application
+Name=imv
+Exec=imv %F
+Icon=imv
+MimeType=image/png;image/jpeg;image/gif;
+Categories=Graphics;Viewer;
+Terminal=false
+StartupNotify=false
+"""
+
+# Where user .desktop files live
+DESKTOP_DIR = Path.home() / ".local/share/applications"
+# =================================
 
 def run_command(cmd):
     """Run a shell command and return output"""
@@ -39,23 +88,11 @@ def get_current_app():
 
 def create_krita_desktop_file():
     """Create custom .desktop file for Krita"""
-    desktop_dir = Path.home() / ".local/share/applications"
+    desktop_dir = DESKTOP_DIR
     desktop_dir.mkdir(parents=True, exist_ok=True)
 
-    desktop_file = desktop_dir / "userapp-krita-custom.desktop"
-
-    content = """[Desktop Entry]
-Type=Application
-Name=Krita (Custom)
-Exec=/usr/local/bin/krita %F
-Icon=krita
-MimeType=image/png;image/jpeg;
-Categories=Graphics;2DGraphics;RasterGraphics;
-Terminal=false
-StartupNotify=true
-"""
-
-    desktop_file.write_text(content)
+    desktop_file = desktop_dir / KRITA_DESKTOP_NAME
+    desktop_file.write_text(KRITA_DESKTOP_CONTENT)
     os.chmod(desktop_file, 0o644)
     return str(desktop_file)
 
@@ -63,30 +100,18 @@ def create_imv_desktop_file():
     """Create custom .desktop file for imv if needed"""
     standard_paths = [
         Path("/usr/share/applications/imv.desktop"),
-        Path.home() / ".local/share/applications/imv.desktop"
+        DESKTOP_DIR / "imv.desktop"
     ]
 
     for path in standard_paths:
         if path.exists():
             return str(path)
 
-    desktop_dir = Path.home() / ".local/share/applications"
+    desktop_dir = DESKTOP_DIR
     desktop_dir.mkdir(parents=True, exist_ok=True)
 
-    desktop_file = desktop_dir / "imv.desktop"
-
-    content = """[Desktop Entry]
-Type=Application
-Name=imv
-Exec=imv %F
-Icon=imv
-MimeType=image/png;image/jpeg;image/gif;
-Categories=Graphics;Viewer;
-Terminal=false
-StartupNotify=false
-"""
-
-    desktop_file.write_text(content)
+    desktop_file = desktop_dir / IMV_DESKTOP_NAME
+    desktop_file.write_text(IMV_DESKTOP_CONTENT)
     os.chmod(desktop_file, 0o644)
     return str(desktop_file)
 
@@ -102,7 +127,7 @@ def set_default_app(desktop_file, mime_types):
     run_command("update-desktop-database ~/.local/share/applications/ 2>/dev/null")
 
 def main():
-    mime_types = ["image/png", "image/jpeg"]
+    mime_types = MIME_TYPES
 
     current_app = get_current_app()
     print(f"Current default for PNG: {current_app}")

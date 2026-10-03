@@ -1,28 +1,81 @@
 #!/usr/bin/env python3
 """
+imgs2pattern_interleaved.py
+
 Create an interleaved repeating pattern from 3 input images.
-- Row 1 (and odd rows): Interleaves Image 1 and Image 2
-- Row 2 (and even rows): Interleaves Image 1 and Image 3, but OFFSET by one position
-- Row 2 has Image 1 aligned below Image 2 from Row 1 (centered)
-- All images are shrunk to the height of the smallest image
-- Supports vertical and horizontal overlapping/gaps as percentages
-- Supports continuous row offset with seamless wrapping
 
-Pattern alternates between these two row types:
-Row 1: [Img1] [Img2] [Img1] [Img2] ...
-Row 2: [Img3] [Img1] [Img3] [Img1] ... (offset by 1)
-Row 3: [Img1] [Img2] [Img1] [Img2] ... (same as Row 1)
-Row 4: [Img3] [Img1] [Img3] [Img1] ... (same as Row 2)
-...
+Row layout alternates between two types:
 
-The images are placed without gaps (tight grid).
+  Row 1 (and odd rows):  [Img1] [Img2] [Img1] [Img2] ...
+  Row 2 (and even rows): [Img3] [Img1] [Img3] [Img1] ...  (offset by 1)
+
+This makes Img1 in row 2 align below Img2 in row 1 (centered). All images
+are shrunk to the height of the smallest image, so the grid is tight. The
+pattern supports vertical and horizontal overlapping/gaps as percentages,
+and a continuous row offset with seamless wrapping.
+
+The output is always written next to image 1, with a "_pattern_interleaved"
+suffix (e.g. img1.png -> img1_pattern_interleaved.png).
+
+All behavior is configured through variables in the CONFIGURABLE SETTINGS
+block below. The only command-line flag is --help; the three optional
+positional arguments are the input image paths, each overriding its
+corresponding variable.
+
+Usage:
+    python imgs2pattern_interleaved.py [img1] [img2] [img3]
+
+Examples:
+    # Use the three IMAGE*_PATH variables
+    python imgs2pattern_interleaved.py
+
+    # Override all three
+    python imgs2pattern_interleaved.py a.png b.png c.png
+
+    # Override just image 1 (images 2 and 3 still come from variables)
+    python imgs2pattern_interleaved.py a.png
 """
 
 import sys
 import argparse
+from pathlib import Path
 from wand.image import Image
 from wand.color import Color
 import math
+
+# ===== CONFIGURABLE SETTINGS =====
+# Input images; each is overridden by its corresponding positional argument
+IMAGE1_PATH = "path/to/image1.png"   # Appears in every row
+IMAGE2_PATH = "path/to/image2.png"   # Appears in odd rows
+IMAGE3_PATH = "path/to/image3.png"   # Appears in even rows, offset
+
+# Number of repeats
+REPEAT_X = 4
+REPEAT_Y = 4
+
+# Tile dimensions. None = auto (uses max image dimension).
+TILE_WIDTH = None
+TILE_HEIGHT = None
+
+# Shrink percentage (1-100). 100 = full size.
+SHRINK_PERCENT = 100
+
+# Rotation angle in degrees (0-360)
+ROTATION = 0
+
+# Background color: hex ("#FFFFFF" or "FFFFFF") or common color name
+# (e.g. "white", "black", "red"). None = transparent.
+BACKGROUND_COLOR = None
+
+# Spacing as percentage of tile dimension (-100 to 100).
+# Positive = overlap, negative = gap.
+VERTICAL_OVERLAP = 0.0
+HORIZONTAL_OVERLAP = 0.0
+
+# Horizontal offset per row, in pixels. Positive shifts right, negative
+# shifts left. Continuous with seamless wrapping.
+OFFSET = 0
+# =================================
 
 # Common color names mapping to hex values
 COMMON_COLORS = {
@@ -439,82 +492,61 @@ def create_interleaved_pattern(img1_path, img2_path, img3_path, output_path,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Create interleaved repeating pattern from 3 images.\n'
-                   'Row 1 (odd): [Img1][Img2][Img1][Img2]...\n'
-                   'Row 2 (even): [Img3][Img1][Img3][Img1]... (offset by 1)\n'
-                   'This makes Img1 in row 2 align below Img2 in row 1.\n'
-                   'All images are shrunk to the height of the smallest image.\n'
-                   'Supports vertical and horizontal overlapping/gaps.\n'
-                   'Positive values = overlap, Negative values = gaps.\n'
-                   'Supports continuous row offset with seamless wrapping.',
+        description='Create interleaved repeating pattern from 3 images. '
+                    'Configure via variables in the script; positional '
+                    'arguments override the IMAGE*_PATH variables.',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument('--image1', required=True, help='First image path (appears in every row)')
-    parser.add_argument('--image2', required=True, help='Second image path (appears in odd rows)')
-    parser.add_argument('--image3', required=True, help='Third image path (appears in even rows, offset)')
-    parser.add_argument('--output', required=True, help='Output image path')
-    parser.add_argument('--repeat-x', type=int, default=4,
-                       help='Number of repeats horizontally (default: 4)')
-    parser.add_argument('--repeat-y', type=int, default=4,
-                       help='Number of repeats vertically (default: 4)')
-    parser.add_argument('--tile-width', type=int, default=None,
-                       help='Fixed tile width (if not specified, uses max image width)')
-    parser.add_argument('--tile-height', type=int, default=None,
-                       help='Fixed tile height (if not specified, uses max image height)')
-    parser.add_argument('--shrink', type=int, default=100,
-                       help='Shrink percentage (1-100). 100 = full size (default: 100)')
-    parser.add_argument('--rotation', type=float, default=0,
-                       help='Rotation angle in degrees (0-360) (default: 0)')
-    parser.add_argument('--background-color', type=str, default=None,
-                       help='Background color: hex (e.g., #FFFFFF or FFFFFF) or '
-                            'color name (e.g., white, black, red, blue, etc.). '
-                            'If not provided, uses transparent background.')
-    parser.add_argument('--vertical-overlap', type=float, default=0.0,
-                       help='Vertical spacing as percentage of tile height (-100 to 100). '
-                            'Positive = overlap, Negative = gap (default: 0)')
-    parser.add_argument('--horizontal-overlap', type=float, default=0.0,
-                       help='Horizontal spacing as percentage of tile width (-100 to 100). '
-                            'Positive = overlap, Negative = gap (default: 0)')
-    parser.add_argument('--offset', type=int, default=0,
-                       help='Horizontal offset per row (pixels). Positive shifts right, '
-                            'negative shifts left. Continuous with seamless wrapping. '
-                            '(default: 0)')
-
+    parser.add_argument('image1', nargs='?', default=None,
+                        help='First image path (overrides IMAGE1_PATH)')
+    parser.add_argument('image2', nargs='?', default=None,
+                        help='Second image path (overrides IMAGE2_PATH)')
+    parser.add_argument('image3', nargs='?', default=None,
+                        help='Third image path (overrides IMAGE3_PATH)')
     args = parser.parse_args()
 
+    # Resolve input paths: positional overrides variable, per image
+    img1_path = args.image1 or IMAGE1_PATH
+    img2_path = args.image2 or IMAGE2_PATH
+    img3_path = args.image3 or IMAGE3_PATH
+
     # Validate shrink percentage
-    if args.shrink < 1 or args.shrink > 100:
-        print("Error: Shrink percentage must be between 1 and 100")
+    if SHRINK_PERCENT < 1 or SHRINK_PERCENT > 100:
+        print(f"Error: SHRINK_PERCENT must be between 1 and 100, got {SHRINK_PERCENT}")
         sys.exit(1)
 
     # Validate rotation
-    if args.rotation < 0 or args.rotation >= 360:
-        print("Error: Rotation must be between 0 and 360")
+    if ROTATION < 0 or ROTATION >= 360:
+        print(f"Error: ROTATION must be between 0 and 360, got {ROTATION}")
         sys.exit(1)
 
     # Validate overlap percentages (allow negative for gaps)
-    if args.vertical_overlap < -100 or args.vertical_overlap > 100:
-        print("Error: Vertical overlap must be between -100 and 100")
+    if VERTICAL_OVERLAP < -100 or VERTICAL_OVERLAP > 100:
+        print(f"Error: VERTICAL_OVERLAP must be between -100 and 100, got {VERTICAL_OVERLAP}")
         sys.exit(1)
 
-    if args.horizontal_overlap < -100 or args.horizontal_overlap > 100:
-        print("Error: Horizontal overlap must be between -100 and 100")
+    if HORIZONTAL_OVERLAP < -100 or HORIZONTAL_OVERLAP > 100:
+        print(f"Error: HORIZONTAL_OVERLAP must be between -100 and 100, got {HORIZONTAL_OVERLAP}")
         sys.exit(1)
+
+    # Output next to image 1, with "_pattern_interleaved" suffix
+    img1_file = Path(img1_path)
+    output_path = img1_file.parent / f"{img1_file.stem}_pattern_interleaved{img1_file.suffix}"
 
     try:
         create_interleaved_pattern(
-            args.image1, args.image2, args.image3,
-            args.output,
-            repeat_x=args.repeat_x,
-            repeat_y=args.repeat_y,
-            shrink_percent=args.shrink,
-            rotation=args.rotation,
-            tile_width=args.tile_width,
-            tile_height=args.tile_height,
-            background_color=args.background_color,
-            vertical_overlap=args.vertical_overlap,
-            horizontal_overlap=args.horizontal_overlap,
-            offset=args.offset
+            img1_path, img2_path, img3_path,
+            str(output_path),
+            repeat_x=REPEAT_X,
+            repeat_y=REPEAT_Y,
+            shrink_percent=SHRINK_PERCENT,
+            rotation=ROTATION,
+            tile_width=TILE_WIDTH,
+            tile_height=TILE_HEIGHT,
+            background_color=BACKGROUND_COLOR,
+            vertical_overlap=VERTICAL_OVERLAP,
+            horizontal_overlap=HORIZONTAL_OVERLAP,
+            offset=OFFSET
         )
     except Exception as e:
         print(f"Error: {e}")

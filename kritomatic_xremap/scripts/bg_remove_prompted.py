@@ -1,6 +1,37 @@
-#!/home/tekakutli/code/kritomatic-auxiliary/bin/python
+#!/usr/bin/env python3
 """
-Remove background from image using ComfyUI RMBG with text prompt
+bg_remove_prompted.py
+
+Remove the background from an image using a ComfyUI RMBG workflow with a
+text prompt for guided segmentation.
+
+This script:
+  1. Uploads the input image to a running ComfyUI instance.
+  2. Loads a prompted RMBG workflow (comfy_workflow_rmbg_prompt.json next to
+     this script) and selects the segmentation pipeline based on DEFAULT_MODE.
+  3. Queues the workflow, waits for completion, and downloads the result(s).
+  4. Saves outputs next to the input with a "_nobg" suffix (and _v1/_v2 in
+     "both" mode).
+
+By default, the image path is taken from the IMAGE_PATH variable below.
+If a positional argument is given on the command line, it overrides
+IMAGE_PATH.
+
+The segmentation mode is set only via the DEFAULT_MODE variable below; there
+is no command-line flag for it.
+
+Usage:
+    python bg_remove_prompted.py [image_path] [--prompt TEXT]
+
+Examples:
+    # Use IMAGE_PATH variable and default prompt/mode
+    python bg_remove_prompted.py
+
+    # Override image path
+    python bg_remove_prompted.py photo.png
+
+    # Custom prompt (mode still comes from DEFAULT_MODE)
+    python bg_remove_prompted.py photo.png --prompt "a dog"
 """
 
 import subprocess
@@ -17,8 +48,9 @@ from collections import Counter
 from PIL import Image
 
 # ===== CONFIGURABLE SETTINGS =====
-DEFAULT_PROMPT = "person"  # Default text prompt if none provided
-DEFAULT_MODE = "v2"        # Default mode: "v2" or "v1" or "both"
+IMAGE_PATH = "path/to/image.png"  # Default input image; overridden by positional arg
+DEFAULT_PROMPT = "person"         # Default text prompt if none provided
+DEFAULT_MODE = "v2"               # Segmentation mode: "v2", "v1", or "both"
 # =================================
 
 # ComfyUI configuration
@@ -201,10 +233,10 @@ def process_image(image_path, text_prompt=None, mode=None):
         text_prompt = DEFAULT_PROMPT
         print(f"Using default prompt: '{text_prompt}'")
 
-    # Use default mode if none provided
+    # Mode always comes from the DEFAULT_MODE variable
     if mode is None:
         mode = DEFAULT_MODE
-        print(f"Using default mode: '{mode}'")
+        print(f"Using mode from DEFAULT_MODE: '{mode}'")
 
     # Remove background
     print(f"Removing background from: {image_path}")
@@ -222,25 +254,24 @@ def process_image(image_path, text_prompt=None, mode=None):
 
 def print_usage():
     """Print usage information"""
-    print("Usage: bg_remove_prompted.py --image <image_path> [--prompt <text>] [--mode <v1|v2|both>]")
+    print("Usage: bg_remove_prompted.py [image_path] [--prompt <text>]")
     print("\nThis script will:")
     print("  1. Remove background using ComfyUI RMBG with text prompt")
     print("  2. Return resulting image(s) with '_nobg' suffix")
-    print(f"\nDefault prompt: '{DEFAULT_PROMPT}'")
-    print(f"Default mode: '{DEFAULT_MODE}'")
-    print("\nModes:")
+    print(f"\nIf no image_path is given, the IMAGE_PATH variable in the script is used.")
+    print(f"Default prompt: '{DEFAULT_PROMPT}'")
+    print(f"Mode (set via DEFAULT_MODE variable in the script): '{DEFAULT_MODE}'")
+    print("\nModes (edit DEFAULT_MODE in the script to change):")
     print("  v2   - Use only Segmentation V2 (faster, better quality)")
     print("  v1   - Use only Segmentation V1 (older algorithm)")
     print("  both - Use both versions and return both results")
     print("\nExamples:")
-    print(f"  # Use default prompt and mode")
-    print("  bg_remove_prompted.py --image image.png")
-    print("\n  # Use custom prompt")
-    print("  bg_remove_prompted.py --image image.png --prompt 'a person standing'")
-    print("\n  # Use V1 mode only")
-    print("  bg_remove_prompted.py --image image.png --mode v1")
-    print("\n  # Use both versions")
-    print("  bg_remove_prompted.py --image image.png --mode both --prompt dog")
+    print("  # Use IMAGE_PATH variable and defaults")
+    print("  bg_remove_prompted.py")
+    print("\n  # Override image path")
+    print("  bg_remove_prompted.py image.png")
+    print("\n  # Custom prompt")
+    print("  bg_remove_prompted.py image.png --prompt 'a person standing'")
 
 def main():
     # Set up argument parser
@@ -250,15 +281,10 @@ def main():
     )
 
     # Define arguments
-    parser.add_argument('--image', '-i',
-                       help='Path to the input image',
-                       required=True)
+    parser.add_argument('image_path', nargs='?', default=None,
+                       help='Path to the input image (overrides IMAGE_PATH variable)')
     parser.add_argument('--prompt', '-p',
                        help=f'Text prompt for segmentation (default: "{DEFAULT_PROMPT}")',
-                       default=None)
-    parser.add_argument('--mode', '-m',
-                       choices=['v1', 'v2', 'both'],
-                       help=f'Mode: v1, v2, or both (default: "{DEFAULT_MODE}")',
                        default=None)
     parser.add_argument('--help', '-h',
                        action='help',
@@ -272,8 +298,11 @@ def main():
         print_usage()
         sys.exit(1)
 
-    # Process the image
-    output_paths = process_image(args.image, args.prompt, args.mode)
+    # Use positional argument if provided, otherwise fall back to IMAGE_PATH
+    image_path = args.image_path if args.image_path else IMAGE_PATH
+
+    # Process the image (mode comes from DEFAULT_MODE inside process_image)
+    output_paths = process_image(image_path, args.prompt)
 
     if output_paths:
         sys.exit(0)

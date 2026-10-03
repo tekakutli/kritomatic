@@ -1,11 +1,53 @@
-#!/home/tekakutli/code/kritomatic-auxiliary/bin/python
+#!/usr/bin/env python3
 """
-Remove background from image, then place on expanded canvas with original background color
+fg2canvas_rmbg.py
+
+Remove an image's background, then place the foreground on a canvas painted
+with the image's original background color (or a custom color).
+
+The script:
+  1. Removes the background using a ComfyUI RMBG workflow (the file set in
+     DEFAULT_WORKFLOW, next to this script). The intermediate result is
+     written next to the input with a "_fg" suffix.
+  2. Determines the background color: either detects it from the edges of the
+     original image, or uses CUSTOM_HEX_COLOR if set.
+  3. Either expands the canvas around the foreground (default) or just fills
+     the background in place (if SKIP_EXPANSION is True).
+  4. Composites the foreground onto the result.
+
+The final output is written next to the input, with a suffix derived from the
+chosen operation ("_expanded.png" or "_filled.png").
+
+By default, the input image path is taken from the IMAGE_PATH variable below.
+If a positional argument is given on the command line, it overrides
+IMAGE_PATH.
+
+The only flag is --color / -c, which overrides CUSTOM_HEX_COLOR.
+
+Usage:
+    python fg2canvas_rmbg.py [image_path] [--color HEX]
+
+Examples:
+    # Use IMAGE_PATH, auto-detected color, expansion on
+    python fg2canvas_rmbg.py
+
+    # Override input path
+    python fg2canvas_rmbg.py photo.png
+
+    # Custom background color (overrides CUSTOM_HEX_COLOR)
+    python fg2canvas_rmbg.py photo.png --color ff0000
 """
 
 # ===== CONFIGURABLE SETTINGS =====
+# Default input image; overridden by the positional argument
+IMAGE_PATH = "path/to/image.png"
 
-SKIP_EXPANSION = False  # Set to True to skip canvas expansion and just change background color
+# Custom background color (hex). If empty, the original background color is
+# detected from the image edges. Can be overridden per-run with --color.
+CUSTOM_HEX_COLOR = ""
+
+# Set to True to skip canvas expansion and just change the background color
+SKIP_EXPANSION = False
 
 # Expansion proportion relative to image dimensions (0 to 1)
 EXPAND_PROPORTION = 0.5  # Add this much extra space around the image
@@ -20,8 +62,6 @@ EDGE_THICKNESS = 10
 
 # Enable debug output
 DEBUG = False
-
-
 # =================================
 
 import subprocess
@@ -133,9 +173,9 @@ def remove_background(image_path):
         print("Error: No output images generated")
         return None
 
-    # Save output next to input with "_output" suffix
+    # Save intermediate output next to input with "_fg" suffix
     input_path = Path(image_path)
-    output_path = input_path.parent / f"{input_path.stem}_output.png"
+    output_path = input_path.parent / f"{input_path.stem}_fg.png"
 
     # Download and save
     if download_image(images[0], output_path):
@@ -226,8 +266,13 @@ def change_background_color(foreground_path, hex_color):
         # Composite foreground onto canvas
         canvas.paste(foreground, (0, 0), foreground if foreground.mode == 'RGBA' else None)
 
-        # Save output
-        output_path = foreground_path.replace('_output.png', '_filled.png')
+        # Save output. Derive the filename from the original input stem by
+        # stripping the intermediate "_fg" suffix, so an input named e.g.
+        # "photo_output.png" produces "photo_output_filled.png" rather than
+        # colliding with the substring "_output".
+        p = Path(foreground_path)
+        stem = p.stem[:-len("_fg")] if p.stem.endswith("_fg") else p.stem
+        output_path = str(p.with_name(f"{stem}_filled{p.suffix}"))
         canvas.save(output_path, 'PNG')
 
         print(f"✓ Changed background color to {hex_color} (no expansion)")
@@ -284,8 +329,10 @@ def expand_and_composite(original_path, foreground_path, hex_color, skip_expansi
         # Composite foreground onto canvas
         canvas.paste(foreground, (x_offset, y_offset), foreground if foreground.mode == 'RGBA' else None)
 
-        # Save output
-        output_path = foreground_path.replace('_output.png', '_expanded.png')
+        # Save output. Same stem-derivation as change_background_color.
+        p = Path(foreground_path)
+        stem = p.stem[:-len("_fg")] if p.stem.endswith("_fg") else p.stem
+        output_path = str(p.with_name(f"{stem}_expanded{p.suffix}"))
         canvas.save(output_path, 'PNG')
 
         print(f"✓ Expanded canvas from {width}x{height} to {new_width}x{new_height}")
@@ -299,12 +346,8 @@ def expand_and_composite(original_path, foreground_path, hex_color, skip_expansi
         print(f"Error in expand_and_composite: {e}")
         return None
 
-def process_image(image_path, custom_hex_color=None, skip_expansion=None):
+def process_image(image_path, custom_hex_color=None):
     """Main function: remove background, detect color (or use custom), expand canvas, composite"""
-    # Use provided skip_expansion or fall back to global setting
-    if skip_expansion is None:
-        skip_expansion = SKIP_EXPANSION
-
     # Check if input file exists
     if not os.path.exists(image_path):
         print(f"Error: Input file not found: {image_path}")
@@ -334,9 +377,9 @@ def process_image(image_path, custom_hex_color=None, skip_expansion=None):
         hex_color = detect_background_color(image_path, EDGE_THICKNESS)
         print(f"Detected background color: {hex_color}")
 
-    # Step 3: Handle based on skip_expansion setting
-    print(f"\nStep 3: {'Skipping expansion, changing background color only' if skip_expansion else 'Expanding canvas and compositing foreground'}")
-    output_path = expand_and_composite(image_path, foreground_path, hex_color, skip_expansion)
+    # Step 3: Handle based on SKIP_EXPANSION setting
+    print(f"\nStep 3: {'Skipping expansion, changing background color only' if SKIP_EXPANSION else 'Expanding canvas and compositing foreground'}")
+    output_path = expand_and_composite(image_path, foreground_path, hex_color, SKIP_EXPANSION)
 
     if output_path:
         return True, output_path, hex_color
@@ -345,35 +388,36 @@ def process_image(image_path, custom_hex_color=None, skip_expansion=None):
 
 def print_usage():
     """Print usage information"""
-    print("Usage: fg2canvas_rmbg.py [OPTIONS]")
+    print("Usage: fg2canvas_rmbg.py [image_path] [--color HEX]")
     print("\nThis script will:")
     print("  1. Remove background using ComfyUI RMBG")
     print("  2. Detect original background color (or use custom if provided)")
-    print("  3. Create an expanded canvas with that color (or just change background if --skip-expansion is used)")
+    print("  3. Create an expanded canvas with that color, or just change the")
+    print("     background if SKIP_EXPANSION is True")
     print("  4. Composite the foreground object onto it")
+    print("\nArguments:")
+    print("  image_path                 Optional input image (overrides IMAGE_PATH variable)")
     print("\nOptions:")
-    print("  -i, --image PATH           Path to the input image (required)")
-    print("  -c, --color HEX            Custom background color in hex format")
+    print("  -c, --color HEX            Custom background color (overrides CUSTOM_HEX_COLOR)")
     print("                             Examples: #e78c14, e78c14, #FFF, FFF")
-    print("  -s, --skip-expansion       Skip canvas expansion, just change background color")
     print("  -h, --help                 Show this help message")
     print("\nConfigurable settings at the top of the script:")
+    print(f"  IMAGE_PATH = {IMAGE_PATH}")
+    print(f"  CUSTOM_HEX_COLOR = {CUSTOM_HEX_COLOR!r}")
+    print(f"  SKIP_EXPANSION = {SKIP_EXPANSION}")
     print(f"  EXPAND_PROPORTION = {EXPAND_PROPORTION}")
     print(f"  EXPAND_BOTH_DIMENSIONS = {EXPAND_BOTH_DIMENSIONS}")
     if not EXPAND_BOTH_DIMENSIONS:
         print(f"  EXPAND_WIDTH_PROPORTION = {EXPAND_WIDTH_PROPORTION}")
         print(f"  EXPAND_HEIGHT_PROPORTION = {EXPAND_HEIGHT_PROPORTION}")
-    print(f"  SKIP_EXPANSION = {SKIP_EXPANSION} (overridden by --skip-expansion)")
     print("\nExamples:")
     print("  # Auto-detect background color with expansion")
-    print("  fg2canvas_rmbg.py -i image.png")
+    print("  fg2canvas_rmbg.py image.png")
     print("\n  # Use custom background color with expansion")
-    print("  fg2canvas_rmbg.py -i image.png -c #ff0000")
-    print("  fg2canvas_rmbg.py -i image.png --color ff0000")
-    print("\n  # Skip expansion and just change background color")
-    print("  fg2canvas_rmbg.py -i image.png --skip-expansion")
-    print("\n  # Custom color without expansion")
-    print("  fg2canvas_rmbg.py -i image.png -c #f00 --skip-expansion")
+    print("  fg2canvas_rmbg.py image.png --color '#ff0000'")
+    print("  fg2canvas_rmbg.py image.png -c ff0000")
+    print("\n  # Skip expansion (edit SKIP_EXPANSION in the script)")
+    print("  fg2canvas_rmbg.py image.png")
 
 def main():
     # Set up argument parser
@@ -382,13 +426,10 @@ def main():
         add_help=False  # We'll handle help manually
     )
 
-    parser.add_argument('-i', '--image',
-                        help='Path to the input image (required)')
+    parser.add_argument('image_path', nargs='?', default=None,
+                        help='Optional input image path (overrides IMAGE_PATH variable)')
     parser.add_argument('-c', '--color',
-                        help='Custom background color in hex format (e.g., #e78c14, e78c14, #FFF, FFF)')
-    parser.add_argument('-s', '--skip-expansion',
-                        action='store_true',
-                        help='Skip canvas expansion, just change background color')
+                        help='Custom background color in hex format (overrides CUSTOM_HEX_COLOR)')
     parser.add_argument('-h', '--help',
                         action='store_true',
                         help='Show this help message')
@@ -396,23 +437,23 @@ def main():
     # Parse arguments
     args = parser.parse_args()
 
-    # Show help if requested or no arguments
-    if args.help or len(sys.argv) == 1:
+    # Show help if explicitly requested. (Bare invocation falls through to
+    # IMAGE_PATH below, so the router's neutralized sys.argv — which is
+    # just [script_path] — reaches process_image and runs the tool.)
+    if args.help:
         print_usage()
         sys.exit(0)
 
-    # Check if image is provided
-    if not args.image:
-        print("Error: --image argument is required")
-        print_usage()
-        sys.exit(1)
+    # Resolve the input image path:
+    #   1. positional argument
+    #   2. IMAGE_PATH variable
+    image_path = args.image_path or IMAGE_PATH
+
+    # Resolve the custom color: CLI flag overrides the variable
+    custom_hex_color = args.color if args.color else CUSTOM_HEX_COLOR
 
     # Process the image
-    success, final_output_path, hex_color = process_image(
-        args.image,
-        args.color,
-        args.skip_expansion
-    )
+    success, final_output_path, hex_color = process_image(image_path, custom_hex_color)
 
     if success:
         print(f"\n✓ Successfully processed!")

@@ -1,7 +1,52 @@
 #!/usr/bin/env python3
 """
-Capture image from clipboard and process it with caption script,
-saving output to a temporary file and opening with emacsclient
+clipboard2caption.py
+
+Caption an image and open the result in Emacs.
+
+The input image can come from either a file path or the system clipboard:
+
+  - File path: pass it as a positional argument, or set the IMAGE_PATH
+    variable. The path is checked for existence and file-ness; a leading ~
+    is expanded.
+  - Clipboard: if no file path is given (positional argument absent and
+    IMAGE_PATH empty), the image is read from the clipboard via
+    xclip/wl-paste and written to a temporary PNG for processing.
+
+The script then:
+  1. Runs a caption script (llamacpp_caption_images.py next to this file)
+     on the image.
+  2. Saves the caption to OUTPUT_DIR and optionally copies it to the
+     clipboard.
+  3. Opens the output file with emacsclient (or falls back to emacs).
+  4. If the image came from the clipboard, optionally cleans up the
+     temporary PNG (see CLEANUP_TEMP_IMAGE).
+
+Behavior is controlled by variables in the CONFIGURABLE SETTINGS block:
+
+  - IMAGE_PATH:          Default input image path (overridden by positional arg).
+  - DEFAULT_PROMPT:      Prompt mode passed to the caption script.
+  - OUTPUT_DIR:          Where caption output files are written.
+  - COPY_TO_CLIPBOARD:   If True, copy the generated caption back to the clipboard.
+  - OPEN_EDITOR:         If True, open the output file in Emacs.
+  - CLEANUP_TEMP_IMAGE:  If True, delete the temp clipboard image after a short
+                         delay. Only relevant when the image came from the
+                         clipboard. Defaults to False, so the temp PNG is kept.
+
+The only command-line flag is --prompt / -p, which overrides DEFAULT_PROMPT.
+
+Usage:
+    python clipboard2caption.py [image_path] [--prompt TEXT]
+
+Examples:
+    # Read from clipboard (default)
+    python clipboard2caption.py
+
+    # Caption a file path
+    python clipboard2caption.py photo.png
+
+    # Custom prompt
+    python clipboard2caption.py photo.png --prompt "Text Extractor"
 """
 
 import subprocess
@@ -12,11 +57,17 @@ import time
 import threading
 from pathlib import Path
 import shutil
+import argparse
 
-# Configuration
+# ===== CONFIGURABLE SETTINGS =====
+IMAGE_PATH = ""                    # Optional input image path. If empty, reads from clipboard.
 CAPTION_SCRIPT_PATH = str(Path(__file__).parent / "llamacpp_caption_images.py")
 DEFAULT_PROMPT = "Text Extractor"
 OUTPUT_DIR = "/tmp/clipboard_captions"
+COPY_TO_CLIPBOARD = True           # Copy the caption text back to the clipboard
+OPEN_EDITOR = True                 # Open the output file in Emacs
+CLEANUP_TEMP_IMAGE = False         # Delete the temp clipboard image after captioning (default: keep it)
+# =================================
 
 def ensure_output_dir():
     """Create output directory if it doesn't exist"""
@@ -101,8 +152,10 @@ def run_caption_on_image(image_path, prompt=None):
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     output_file = os.path.join(OUTPUT_DIR, f"caption_{timestamp}.txt")
 
-    # Build command
-    cmd = [CAPTION_SCRIPT_PATH, image_path]
+    # Build command. Use sys.executable so the caption script runs under
+    # the same interpreter that is running this script, which inherits the
+    # venv's site-packages (llamacpp_caption_images.py needs `requests`).
+    cmd = [sys.executable, CAPTION_SCRIPT_PATH, image_path]
 
     if prompt:
         cmd.extend(['-p', prompt])
@@ -144,17 +197,18 @@ def run_caption_on_image(image_path, prompt=None):
         print(f"\n✅ Output saved to: {output_file}")
 
         # Optionally copy to primary clipboard for easy pasting
-        try:
-            # Copy to clipboard (X11)
-            if result.stdout:
-                subprocess.run(['xclip', '-selection', 'clipboard'],
-                              input=result.stdout, text=True, check=False)
-                # Also to primary selection
-                subprocess.run(['xclip', '-selection', 'primary'],
-                              input=result.stdout, text=True, check=False)
-                print("📋 Text also copied to clipboard")
-        except FileNotFoundError:
-            pass  # xclip not available
+        if COPY_TO_CLIPBOARD:
+            try:
+                # Copy to clipboard (X11)
+                if result.stdout:
+                    subprocess.run(['xclip', '-selection', 'clipboard'],
+                                  input=result.stdout, text=True, check=False)
+                    # Also to primary selection
+                    subprocess.run(['xclip', '-selection', 'primary'],
+                                  input=result.stdout, text=True, check=False)
+                    print("📋 Text also copied to clipboard")
+            except FileNotFoundError:
+                pass  # xclip not available
 
         return result.returncode == 0, output_file
 
@@ -170,7 +224,7 @@ def show_notification(message, is_error=False, output_file=None):
     """Show desktop notification"""
     try:
         icon = 'dialog-error' if is_error else 'dialog-information'
-        title = 'Clipboard Captioner'
+        title = 'Captioner'
 
         # Add output file path to notification if available
         if output_file and not is_error:
@@ -188,60 +242,94 @@ def show_notification(message, is_error=False, output_file=None):
 
 def main():
     # Parse command line arguments
-    import argparse
-    parser = argparse.ArgumentParser(description='Caption clipboard image')
+    parser = argparse.ArgumentParser(
+        description='Caption an image from a file path or from the clipboard'
+    )
+    parser.add_argument('image_path', nargs='?', default=None,
+                        help='Optional input image path (overrides IMAGE_PATH variable; '
+                             'if unset, reads from clipboard)')
     parser.add_argument('-p', '--prompt', default=DEFAULT_PROMPT,
-                       help=f'Prompt mode for caption script (default: {DEFAULT_PROMPT})')
-    parser.add_argument('--no-cleanup', action='store_true',
-                       help='Don\'t delete temporary image file')
-    parser.add_argument('--no-clipboard-copy', action='store_true',
-                       help='Don\'t copy text to clipboard')
-    parser.add_argument('--no-editor', action='store_true',
-                       help='Don\'t open editor automatically')
+                        help=f'Prompt mode for caption script (default: {DEFAULT_PROMPT})')
     args = parser.parse_args()
 
-    # Get image from clipboard
-    print("📋 Reading image from clipboard...")
-    image_data = get_clipboard_image()
+    # Resolve the input source:
+    #   1. positional argument
+    #   2. IMAGE_PATH variable
+    #   3. None -> read from clipboard
+    raw_path = args.image_path or IMAGE_PATH or None
+    tmp_path = None  # track for cleanup (only set on the clipboard path)
 
-    if not image_data:
-        msg = "No image found in clipboard"
-        print(f"❌ {msg}")
-        show_notification(msg, is_error=True)
-        sys.exit(1)
+    if raw_path:
+        # --- File path branch ---
+        image_path = os.path.expanduser(raw_path)  # expand ~
 
-    print(f"✅ Captured {len(image_data)} bytes of image data")
+        if not os.path.exists(image_path):
+            msg = f"Image file not found: {image_path}"
+            print(f"❌ {msg}")
+            show_notification(msg, is_error=True)
+            sys.exit(1)
 
-    # Create temporary file for image
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    with tempfile.NamedTemporaryFile(
-        suffix='.png',
-        delete=False,
-        prefix=f'clipboard_caption_{timestamp}_'
-    ) as tmp_file:
-        tmp_file.write(image_data)
-        tmp_path = tmp_file.name
+        if not os.path.isfile(image_path):
+            msg = f"Path is not a file: {image_path}"
+            print(f"❌ {msg}")
+            show_notification(msg, is_error=True)
+            sys.exit(1)
 
-    print(f"📁 Saved image to: {tmp_path}")
+        print(f"📁 Processing image: {image_path}")
+
+        # Warn on suspiciously small files
+        try:
+            file_size = os.path.getsize(image_path)
+            if file_size < 100:
+                print(f"⚠️ Warning: Image file is very small ({file_size} bytes)")
+        except Exception as e:
+            print(f"⚠️ Warning: Could not read file size: {e}")
+
+    else:
+        # --- Clipboard branch ---
+        print("📋 Reading image from clipboard...")
+        image_data = get_clipboard_image()
+
+        if not image_data:
+            msg = "No image found in clipboard"
+            print(f"❌ {msg}")
+            show_notification(msg, is_error=True)
+            sys.exit(1)
+
+        print(f"✅ Captured {len(image_data)} bytes of image data")
+
+        # Create temporary file for image
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        with tempfile.NamedTemporaryFile(
+            suffix='.png',
+            delete=False,
+            prefix=f'clipboard_caption_{timestamp}_'
+        ) as tmp_file:
+            tmp_file.write(image_data)
+            tmp_path = tmp_file.name
+
+        print(f"📁 Saved image to: {tmp_path}")
+        image_path = tmp_path
 
     # Run caption script on the image
-    success, output_file = run_caption_on_image(tmp_path, args.prompt)
+    success, output_file = run_caption_on_image(image_path, args.prompt)
 
     if success:
         show_notification(f"Caption generated with prompt: {args.prompt}",
-                         is_error=False, output_file=output_file)
+                          is_error=False, output_file=output_file)
 
         # Open with emacsclient
-        if not args.no_editor and output_file and os.path.exists(output_file):
+        if OPEN_EDITOR and output_file and os.path.exists(output_file):
             open_with_emacs(output_file)
     else:
         show_notification("Failed to caption image", is_error=True)
 
-    # Cleanup image temp file
-    if not args.no_cleanup:
-        cleanup_temp_file(tmp_path)
-    else:
-        print(f"📁 Keeping temporary image: {tmp_path}")
+    # Cleanup temp file (only if we created one from the clipboard)
+    if tmp_path:
+        if CLEANUP_TEMP_IMAGE:
+            cleanup_temp_file(tmp_path)
+        else:
+            print(f"📁 Keeping temporary image: {tmp_path}")
 
     sys.exit(0 if success else 1)
 

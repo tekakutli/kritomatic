@@ -1,6 +1,23 @@
-#!/home/tekakutli/code/kritomatic-auxiliary/bin/python
+#!/usr/bin/env python3
 """
-Remove background from image using ComfyUI RMBG
+bg_remove.py
+
+Remove the background from an image using a ComfyUI RMBG workflow.
+
+This script:
+  1. Uploads the input image to a running ComfyUI instance.
+  2. Loads a RMBG workflow (comfy_workflow_rmbg.json next to this script).
+  3. Queues the workflow, waits for completion, and downloads the result.
+  4. Saves the output next to the input with a "_nobg" suffix.
+
+By default, the image path is taken from the IMAGE_PATH variable below.
+If a single positional argument is given on the command line, it overrides
+IMAGE_PATH.
+
+Usage:
+    python bg_remove.py [image_path]
+
+This script does not use flags.
 """
 
 import subprocess
@@ -19,6 +36,11 @@ from PIL import Image
 COMFYUI_URL = "http://127.0.0.1:8188"
 SCRIPT_DIR = Path(__file__).parent
 DEFAULT_WORKFLOW = SCRIPT_DIR / "comfy_workflow_rmbg.json"
+
+# === DEFAULT INPUT ===
+IMAGE_PATH = "path/to/image.png"  # <-- change this to your default image file
+# =====================
+
 
 def upload_image(file_path):
     """Upload an image to ComfyUI's server and return the filename."""
@@ -143,19 +165,21 @@ def process_image(image_path):
 
 def print_usage():
     """Print usage information"""
-    print("Usage: bg_remove.py <image_path>")
+    print("Usage: bg_remove.py [image_path]")
     print("\nThis script will:")
     print("  1. Remove background using ComfyUI RMBG")
     print("  2. Return the resulting image with '_nobg' suffix")
+    print("\nIf no image_path is given, the IMAGE_PATH variable in the script is used.")
     print("\nExample:")
     print("  bg_remove.py image.png")
 
 def main():
-    if len(sys.argv) < 2:
+    if len(sys.argv) > 2:
         print_usage()
         sys.exit(1)
 
-    image_path = sys.argv[1]
+    # Use positional argument if provided, otherwise fall back to IMAGE_PATH
+    image_path = sys.argv[1] if len(sys.argv) == 2 else IMAGE_PATH
 
     # Process the image
     output_path = process_image(image_path)

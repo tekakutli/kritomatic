@@ -1,10 +1,39 @@
 #!/usr/bin/env python3
 """
-Crop the clipboard image (proportional or fixed center crop)
-and save the result into STORAGE_DIR.
+clipboard2cropped.py
+
+Crop an image (proportional or fixed center crop) and save the result into
+STORAGE_DIR.
+
+By default, the input image is read from the system clipboard. Alternatively,
+the input can be an image file on disk, specified either by the IMAGE_PATH
+variable below or by a positional argument on the command line (which
+overrides IMAGE_PATH). If neither is set, the clipboard is used.
+
+Cropping behavior is controlled by variables in the CONFIGURABLE SETTINGS
+block:
+
+  - If HORIZONTAL_KEEP_RATIO or VERTICAL_KEEP_RATIO is < 1.0, a proportional
+    center crop is performed using those ratios.
+  - If BOTH ratios are 1.0, a fixed CROP_WIDTH x CROP_HEIGHT center crop is
+    performed instead.
+  - The result is written to STORAGE_DIR with a timestamped filename.
+
+Usage:
+    python clipboard2cropped.py [image_path]
+
+Examples:
+    # Read from clipboard
+    python clipboard2cropped.py
+
+    # Override with a file path
+    python clipboard2cropped.py photo.png
 """
 
 # ===== CONFIGURABLE SETTINGS =====
+# Optional input image path. If empty, reads from clipboard.
+IMAGE_PATH = ""
+
 # Set to values between 0 and 1 to keep a proportional slice from the center
 # Set to 1.0 to use CROP_WIDTH and CROP_HEIGHT instead
 HORIZONTAL_KEEP_RATIO = 0.3333   # Keep this proportion of width from center (e.g., 0.3333 = middle 1/3)
@@ -138,7 +167,7 @@ def process_clipboard_image(image_data):
         print(f"Original image saved to: {original_path}")
     except Exception as e:
         print(f"Error saving original image: {e}")
-        return False
+        return False, None
 
     # Generate output path in STORAGE_DIR
     timestamp = int(time.time())
@@ -165,6 +194,26 @@ def process_clipboard_image(image_data):
         # Clean up original if cropping failed
         cleanup_temp_file(original_path, delay=1)
         return False, crop_description
+
+def process_input_file(image_path):
+    """Read an input image file from disk, then crop and store it.
+
+    Unlike the clipboard path, this does not create or clean up a temp file;
+    it works directly on the given file.
+    """
+    if not os.path.exists(image_path):
+        print(f"Error: Input file not found: {image_path}")
+        return False, None
+
+    # Read bytes so the downstream path is identical to the clipboard flow
+    try:
+        with open(image_path, 'rb') as f:
+            image_data = f.read()
+    except Exception as e:
+        print(f"Error reading input file: {e}")
+        return False, None
+
+    return process_clipboard_image(image_data)
 
 def cleanup_temp_file(tmp_path, delay=10):
     """Delete temp file after delay"""
@@ -195,6 +244,14 @@ def show_notification(message, is_error=True):
         print(message)
 
 def main():
+    # Parse command line arguments
+    import argparse
+    parser = argparse.ArgumentParser(description='Crop clipboard image or a file')
+    parser.add_argument('image_path', nargs='?', default=None,
+                       help='Optional input image path (overrides IMAGE_PATH variable; '
+                            'if unset, reads from clipboard)')
+    args = parser.parse_args()
+
     # Validate ratios
     if not (0 < HORIZONTAL_KEEP_RATIO <= 1.0):
         print(f"Error: HORIZONTAL_KEEP_RATIO must be between 0 and 1, got {HORIZONTAL_KEEP_RATIO}")
@@ -204,15 +261,26 @@ def main():
         print(f"Error: VERTICAL_KEEP_RATIO must be between 0 and 1, got {VERTICAL_KEEP_RATIO}")
         sys.exit(1)
 
-    # Get image from clipboard
-    image_data = get_clipboard_image()
+    # Resolve the input image path:
+    #   1. positional argument
+    #   2. IMAGE_PATH variable
+    #   3. None -> read from clipboard
+    image_path = args.image_path or IMAGE_PATH or None
 
-    if not image_data:
-        show_notification("No image found in clipboard")
-        sys.exit(1)
+    if image_path:
+        print(f"📁 Using input image file: {image_path}")
+        success, crop_description = process_input_file(image_path)
+    else:
+        # Get image from clipboard
+        print("📋 Reading image from clipboard...")
+        image_data = get_clipboard_image()
 
-    # Process the image (save, crop, store)
-    success, crop_description = process_clipboard_image(image_data)
+        if not image_data:
+            show_notification("No image found in clipboard")
+            sys.exit(1)
+
+        # Process the image (save, crop, store)
+        success, crop_description = process_clipboard_image(image_data)
 
     if success:
         if (HORIZONTAL_KEEP_RATIO < 1.0) or (VERTICAL_KEEP_RATIO < 1.0):

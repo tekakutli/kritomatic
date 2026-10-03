@@ -1,7 +1,30 @@
 #!/usr/bin/env python3
 """
-ComfyUI img2img CLI tool - Barebones version
-Usage: python comfy_img2img.py <input_image_path>
+comfy_img2img.py
+
+ComfyUI img2img CLI tool (barebones).
+
+Uploads an input image to a running ComfyUI instance, loads a workflow JSON
+(the file set in DEFAULT_WORKFLOW, next to this script), sets the image on
+its LoadImage node, queues the workflow, waits for completion, and saves the
+first output next to the input with an "_output" suffix.
+
+By default, the input image path is taken from the IMAGE_PATH variable below.
+If a positional argument is given on the command line, it overrides
+IMAGE_PATH.
+
+The resolved output path is printed to stdout (so a bash wrapper can capture
+it).
+
+Usage:
+    python comfy_img2img.py [input_image_path]
+
+Examples:
+    # Use IMAGE_PATH variable
+    python comfy_img2img.py
+
+    # Override with a file path
+    python comfy_img2img.py photo.png
 """
 
 import json
@@ -10,6 +33,10 @@ import os
 import sys
 import time
 from pathlib import Path
+
+# ===== CONFIGURABLE SETTINGS =====
+IMAGE_PATH = "path/to/image.png"   # Default input image; overridden by positional arg
+# =================================
 
 # --- Configuration ---
 COMFYUI_URL = "http://127.0.0.1:8188"
@@ -72,11 +99,15 @@ def download_image(image_info, save_path):
     return False
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python comfy_img2img.py <input_image_path>", file=sys.stderr)
-        sys.exit(1)
+    # Parse command line arguments
+    import argparse
+    parser = argparse.ArgumentParser(description='ComfyUI img2img CLI tool')
+    parser.add_argument('image_path', nargs='?', default=None,
+                       help='Optional input image path (overrides IMAGE_PATH variable)')
+    args = parser.parse_args()
 
-    input_image_path = sys.argv[1]
+    # Use positional argument if provided, otherwise fall back to IMAGE_PATH
+    input_image_path = args.image_path or IMAGE_PATH
 
     # Check if input file exists
     if not os.path.exists(input_image_path):

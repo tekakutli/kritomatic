@@ -1,22 +1,74 @@
 #!/usr/bin/env python3
 """
-Create a repeating pattern from an input image with line offset, shrink, and rotation.
-The pattern wraps around properly with no empty spaces on the left.
-All transformations maintain the final image dimensions.
-The rotated image is NOT cropped - it's fully visible within the tile.
+img2pattern.py
 
-Two modes available:
-- Fixed: Uses the specified tile dimensions (original behavior)
-- Adaptive: Adjusts tile dimensions based on image aspect ratio for tighter grids
-  --adaptive-height: Adjusts tile height based on image aspect ratio
-  --adaptive-width: Adjusts tile width based on image aspect ratio (uses image width)
+Create a repeating pattern from an input image with line offset, shrink, and
+rotation. The pattern wraps around properly with no empty spaces on the left,
+and all transformations maintain the final image dimensions. The rotated
+image is NOT cropped — it's fully visible within the tile.
+
+Two tile-sizing modes are available, controlled by ADAPTIVE_HEIGHT and
+ADAPTIVE_WIDTH:
+
+  - Fixed (both False): uses TILE_WIDTH x TILE_HEIGHT as specified.
+  - Adaptive height: ADAPTIVE_HEIGHT adjusts tile height to the image height
+    (eliminates vertical gaps).
+  - Adaptive width: ADAPTIVE_WIDTH adjusts tile width to the image width.
+
+The output is always written next to the input image, with a "_pattern"
+suffix (e.g. photo.png -> photo_pattern.png).
+
+All behavior is configured through variables in the CONFIGURABLE SETTINGS
+block below. The only command-line flag is --help; the only positional
+argument is the input image path, which overrides IMAGE_PATH.
+
+Usage:
+    python img2pattern.py [image_path]
+
+Examples:
+    # Use IMAGE_PATH variable
+    python img2pattern.py
+
+    # Override with a file path
+    python img2pattern.py photo.png
 """
 
 import sys
 import argparse
+from pathlib import Path
 from wand.image import Image
 from wand.color import Color
 import math
+
+# ===== CONFIGURABLE SETTINGS =====
+# Default input image; overridden by the positional argument
+IMAGE_PATH = "path/to/image.png"
+
+# Tile dimensions
+TILE_WIDTH = 200
+TILE_HEIGHT = 200
+
+# Number of repeats
+REPEAT_X = 4
+REPEAT_Y = 4
+
+# Horizontal offset per row (pixels)
+OFFSET = 50
+
+# Shrink percentage (1-100). 100 = full size.
+SHRINK_PERCENT = 100
+
+# Rotation angle in degrees (0-360)
+ROTATION = 0
+
+# Adaptive tile dimensions (see docstring)
+ADAPTIVE_HEIGHT = False
+ADAPTIVE_WIDTH = False
+
+# Background color: hex ("#FFFFFF" or "FFFFFF") or common color name
+# (e.g. "white", "black", "red"). None = transparent.
+BACKGROUND_COLOR = None
+# =================================
 
 # Common color names mapping to hex values
 COMMON_COLORS = {
@@ -309,51 +361,40 @@ def create_pattern_full_rotation(input_path, output_path, tile_width, tile_heigh
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Create repeating pattern with offset, shrink, and rotation (no cropping)'
+        description='Create repeating pattern from an image. '
+                    'Configure via variables in the script; the only positional '
+                    'argument overrides IMAGE_PATH.'
     )
-    parser.add_argument('--input', required=True, help='Input image path')
-    parser.add_argument('--output', required=True, help='Output image path')
-    parser.add_argument('--tile-width', type=int, required=True, help='Width of each tile')
-    parser.add_argument('--tile-height', type=int, required=True, help='Height of each tile')
-    parser.add_argument('--offset', type=int, required=True, help='Horizontal offset per row (pixels)')
-    parser.add_argument('--repeat-x', type=int, default=4,
-                       help='Number of repeats horizontally (default: 4)')
-    parser.add_argument('--repeat-y', type=int, default=4,
-                       help='Number of repeats vertically (default: 4)')
-    parser.add_argument('--shrink', type=int, default=100,
-                       help='Shrink percentage (1-100). 100 = full size (default: 100)')
-    parser.add_argument('--rotation', type=float, default=0,
-                       help='Rotation angle in degrees (0-360) (default: 0)')
-    parser.add_argument('--adaptive-height', action='store_true',
-                       help='Enable adaptive tile height (uses image height, eliminates vertical gaps)')
-    parser.add_argument('--adaptive-width', action='store_true',
-                       help='Enable adaptive tile width (uses image width)')
-    parser.add_argument('--background-color', type=str, default=None,
-                       help='Background color: hex (e.g., #FFFFFF or FFFFFF) or '
-                            'color name (e.g., white, black, red, blue, etc.). '
-                            'If not provided, uses transparent background.')
-
+    parser.add_argument('image_path', nargs='?', default=None,
+                        help='Input image path (overrides IMAGE_PATH variable)')
     args = parser.parse_args()
 
+    # Use positional argument if provided, otherwise fall back to IMAGE_PATH
+    input_path = args.image_path or IMAGE_PATH
+
     # Validate shrink percentage
-    if args.shrink < 1 or args.shrink > 100:
-        print("Error: Shrink percentage must be between 1 and 100")
+    if SHRINK_PERCENT < 1 or SHRINK_PERCENT > 100:
+        print(f"Error: SHRINK_PERCENT must be between 1 and 100, got {SHRINK_PERCENT}")
         sys.exit(1)
 
     # Validate rotation
-    if args.rotation < 0 or args.rotation >= 360:
-        print("Error: Rotation must be between 0 and 360")
+    if ROTATION < 0 or ROTATION >= 360:
+        print(f"Error: ROTATION must be between 0 and 360, got {ROTATION}")
         sys.exit(1)
+
+    # Output next to input, with "_pattern" suffix
+    input_file = Path(input_path)
+    output_path = input_file.parent / f"{input_file.stem}_pattern{input_file.suffix}"
 
     try:
         create_pattern_full_rotation(
-            args.input, args.output,
-            args.tile_width, args.tile_height,
-            args.offset, args.repeat_x, args.repeat_y,
-            args.shrink, args.rotation,
-            adaptive_height=args.adaptive_height,
-            adaptive_width=args.adaptive_width,
-            background_color=args.background_color
+            input_path, str(output_path),
+            TILE_WIDTH, TILE_HEIGHT,
+            OFFSET, REPEAT_X, REPEAT_Y,
+            SHRINK_PERCENT, ROTATION,
+            adaptive_height=ADAPTIVE_HEIGHT,
+            adaptive_width=ADAPTIVE_WIDTH,
+            background_color=BACKGROUND_COLOR
         )
     except Exception as e:
         print(f"Error: {e}")

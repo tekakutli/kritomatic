@@ -1,9 +1,31 @@
 #!/usr/bin/env python3
 """
-Font Preview Merger - Fast version using Pillow
-Loops through all fonts in ~/.local/share/fonts/, generates preview images,
-adds font name and path labels, and merges them vertically.
-Also outputs a text file with all font paths.
+fonts2preview.py
+
+Generate a font preview collage from a directory of fonts.
+
+The script:
+  1. Scans FONT_DIR for .ttf, .otf, and .ttc files.
+  2. Renders TEXT_TO_RENDER in each font using Pillow.
+  3. Optionally adds a font name label and a path label under each sample
+     (controlled by ENABLE_LABELS and the LABEL_* / PATH_LABEL_* variables).
+  4. Merges all samples vertically into OUTPUT_FILE.
+  5. Optionally writes a companion .txt listing font names and paths
+     (controlled by SAVE_FONT_PATHS).
+
+All behavior is configured through variables in the CONFIGURABLE SETTINGS
+block below. The only command-line flag is --help; the only positional
+argument is the text to render, which overrides TEXT_TO_RENDER.
+
+Usage:
+    python fonts2preview.py [text]
+
+Examples:
+    # Use TEXT_TO_RENDER variable and all other variable defaults
+    python fonts2preview.py
+
+    # Override the rendered text
+    python fonts2preview.py "Hello, world!"
 """
 
 import os
@@ -14,22 +36,40 @@ from PIL import Image, ImageDraw, ImageFont
 import argparse
 import re
 
-# Configuration
+# ===== CONFIGURABLE SETTINGS =====
+# Font scanning
+FONT_DIR = os.path.expanduser("~/.local/share/fonts/")
+
+# Text rendering (TEXT_TO_RENDER is overridden by the positional argument)
 TEXT_TO_RENDER = "The quick brown fox jumps over the lazy dog"
 FONT_SIZE = 60
 TEXT_COLOR = "black"
 BG_COLOR = "white"
-OUTPUT_FILE = "font_preview_merged.png"
-FONT_DIR = os.path.expanduser("~/.local/share/fonts/")
+
+# Output
+OUTPUT_FILE = "fonts2preview.png"
+SAVE_FONT_PATHS = True   # Also write a .txt next to the output with font names/paths
+
+# Name/path labels under each preview
+ENABLE_LABELS = True
 LABEL_FONT_SIZE = 24
 LABEL_COLOR = "#2c3e50"
 LABEL_BG_COLOR = "#f0f0f0"
 PATH_LABEL_FONT_SIZE = 16
 PATH_LABEL_COLOR = "#666666"
-ENABLE_LABELS = True
+
+# Font subset selection (useful for testing or resuming)
+MAX_FONTS = None         # Process at most this many fonts (None = all)
+FONT_FILTER = None       # Only include fonts whose name contains this substring (case insensitive)
+START_FROM = 1           # Start at this font index (1-based)
+
+# Test mode: render a single font and print details instead of merging
+TEST_MODE = False
+TEST_FONT = None         # Substring of the font name to test (None = first font)
+# =================================
 
 def get_all_fonts():
-    """Get list of all installed fonts from ~/.local/share/fonts/."""
+    """Get list of all installed fonts from FONT_DIR."""
     fonts = []
 
     font_dir = Path(FONT_DIR)
@@ -208,7 +248,7 @@ def add_font_label(image, font_name, font_path, label_font_size=24,
 
     return new_img
 
-def generate_font_preview(font_info):
+def generate_font_preview(font_info, text_to_render):
     """Generate a preview image for a single font using Pillow."""
     font_name = font_info['name']
     font_path = font_info['path']
@@ -216,7 +256,7 @@ def generate_font_preview(font_info):
     # Create the text image
     img = create_text_preview(
         font_path,
-        TEXT_TO_RENDER,
+        text_to_render,
         FONT_SIZE,
         TEXT_COLOR,
         BG_COLOR
@@ -287,7 +327,7 @@ def save_font_paths(fonts, output_path):
         print(f"Error saving font paths: {e}")
         return False
 
-def test_single_font(font_info):
+def test_single_font(font_info, text_to_render):
     """Test generating a preview for a single font."""
     font_name = font_info['name']
     font_path = font_info['path']
@@ -295,7 +335,7 @@ def test_single_font(font_info):
     print(f"\nTesting font: {font_name}")
     print(f"Font path: {font_path}")
 
-    img = generate_font_preview(font_info)
+    img = generate_font_preview(font_info, text_to_render)
 
     if img:
         # Save to a temporary file for viewing
@@ -309,44 +349,18 @@ def test_single_font(font_info):
         return False
 
 def main():
-    global TEXT_TO_RENDER, FONT_SIZE, TEXT_COLOR, BG_COLOR, OUTPUT_FILE, FONT_DIR
-    global LABEL_FONT_SIZE, LABEL_COLOR, LABEL_BG_COLOR, ENABLE_LABELS
-    global PATH_LABEL_FONT_SIZE, PATH_LABEL_COLOR
-
-    parser = argparse.ArgumentParser(description='Generate font preview collage from ~/.local/share/fonts/')
-    parser.add_argument('--text', default=TEXT_TO_RENDER, help='Text to render in each font')
-    parser.add_argument('--font-size', type=int, default=FONT_SIZE, help='Font size (default: 60)')
-    parser.add_argument('--text-color', default=TEXT_COLOR, help='Text color (default: black)')
-    parser.add_argument('--bg-color', default=BG_COLOR, help='Background color (default: white)')
-    parser.add_argument('--output', default=OUTPUT_FILE, help='Output filename (e.g., preview.png)')
-    parser.add_argument('--max-fonts', type=int, default=None, help='Maximum number of fonts to process (for testing)')
-    parser.add_argument('--font-filter', default=None, help='Filter fonts by this substring (case insensitive)')
-    parser.add_argument('--start-from', type=int, default=1, help='Start processing from this font index (for resuming)')
-    parser.add_argument('--test', action='store_true', help='Test with a single font and show detailed output')
-    parser.add_argument('--test-font', default=None, help='Test a specific font name (with --test)')
-    parser.add_argument('--font-dir', default=FONT_DIR, help=f'Font directory to scan (default: {FONT_DIR})')
-    parser.add_argument('--label-font-size', type=int, default=LABEL_FONT_SIZE, help='Font size for name labels (default: 24)')
-    parser.add_argument('--label-color', default=LABEL_COLOR, help='Color for font name labels (default: #2c3e50)')
-    parser.add_argument('--label-bg', default=LABEL_BG_COLOR, help='Background color for label area (default: #f0f0f0)')
-    parser.add_argument('--path-label-size', type=int, default=PATH_LABEL_FONT_SIZE, help='Font size for path labels (default: 16)')
-    parser.add_argument('--path-label-color', default=PATH_LABEL_COLOR, help='Color for path labels (default: #666666)')
-    parser.add_argument('--no-labels', action='store_true', help='Disable font name labels')
-    parser.add_argument('--no-txt', action='store_true', help='Disable text file output with font paths')
+    # Minimal argument parser; the only positional is the text to render.
+    parser = argparse.ArgumentParser(
+        description='Generate font preview collage from a font directory. '
+                    'Configure via variables in the script; the only positional '
+                    'argument overrides TEXT_TO_RENDER.'
+    )
+    parser.add_argument('text', nargs='?', default=None,
+                        help='Text to render (overrides TEXT_TO_RENDER variable)')
     args = parser.parse_args()
 
-    # Update global config
-    TEXT_TO_RENDER = args.text
-    FONT_SIZE = args.font_size
-    TEXT_COLOR = args.text_color
-    BG_COLOR = args.bg_color
-    OUTPUT_FILE = args.output
-    FONT_DIR = args.font_dir
-    LABEL_FONT_SIZE = args.label_font_size
-    LABEL_COLOR = args.label_color
-    LABEL_BG_COLOR = args.label_bg
-    PATH_LABEL_FONT_SIZE = args.path_label_size
-    PATH_LABEL_COLOR = args.path_label_color
-    ENABLE_LABELS = not args.no_labels
+    # Use positional argument if provided, otherwise fall back to TEXT_TO_RENDER
+    text_to_render = args.text if args.text else TEXT_TO_RENDER
 
     if ENABLE_LABELS:
         print(f"Font name labels enabled (font size: {LABEL_FONT_SIZE}, left-aligned)")
@@ -354,41 +368,43 @@ def main():
     else:
         print("Labels disabled")
 
+    print(f"Rendering text: {text_to_render!r}")
+
     print(f"Fetching fonts from: {FONT_DIR}")
     fonts = get_all_fonts()
 
     if not fonts:
-        print("No fonts found in ~/.local/share/fonts/!")
+        print(f"No fonts found in {FONT_DIR}!")
         return
 
     # If test mode, test a single font
-    if args.test:
-        if args.test_font:
+    if TEST_MODE:
+        if TEST_FONT:
             test_font = None
             for font in fonts:
-                if args.test_font.lower() in font['name'].lower():
+                if TEST_FONT.lower() in font['name'].lower():
                     test_font = font
                     break
             if test_font:
-                test_single_font(test_font)
+                test_single_font(test_font, text_to_render)
             else:
-                print(f"Font '{args.test_font}' not found")
+                print(f"Font '{TEST_FONT}' not found")
         else:
-            test_single_font(fonts[0])
+            test_single_font(fonts[0], text_to_render)
         return
 
     # Filter fonts if requested
-    if args.font_filter:
-        filter_lower = args.font_filter.lower()
+    if FONT_FILTER:
+        filter_lower = FONT_FILTER.lower()
         fonts = [f for f in fonts if filter_lower in f['name'].lower()]
-        print(f"Filtered to {len(fonts)} fonts matching '{args.font_filter}'")
+        print(f"Filtered to {len(fonts)} fonts matching '{FONT_FILTER}'")
 
-    if args.max_fonts:
-        fonts = fonts[:args.max_fonts]
+    if MAX_FONTS:
+        fonts = fonts[:MAX_FONTS]
 
-    if args.start_from > 1:
-        fonts = fonts[args.start_from - 1:]
-        print(f"Starting from font index {args.start_from}")
+    if START_FROM > 1:
+        fonts = fonts[START_FROM - 1:]
+        print(f"Starting from font index {START_FROM}")
 
     print(f"Processing {len(fonts)} fonts.\n")
 
@@ -403,7 +419,7 @@ def main():
         print(f"[{i}/{len(fonts)}]: {font_name}")
 
         # Generate preview
-        img = generate_font_preview(font_info)
+        img = generate_font_preview(font_info, text_to_render)
 
         if img:
             preview_images.append(img)
@@ -425,14 +441,14 @@ def main():
 
     # Save the merged image
     print(f"\nMerging {len(preview_images)} images vertically...")
-    merge_images_vertically(preview_images, args.output)
+    merge_images_vertically(preview_images, OUTPUT_FILE)
 
     # Save the text file with font paths (unless disabled)
-    if not args.no_txt:
+    if SAVE_FONT_PATHS:
         print(f"\nSaving font paths to text file...")
-        save_font_paths(fonts, args.output)
+        save_font_paths(fonts, OUTPUT_FILE)
 
-    print(f"\nDone! Output: {args.output}")
+    print(f"\nDone! Output: {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()

@@ -1,6 +1,30 @@
 #!/usr/bin/env python3
 """
-Create a new Krita document from clipboard image
+clipboard2krita.py
+
+Create a new Krita document from an image.
+
+By default, the input image is read from the system clipboard. Alternatively,
+the input can be an image file on disk, specified either by the IMAGE_PATH
+variable below or by a positional argument on the command line (which
+overrides IMAGE_PATH). If neither is set, the clipboard is used.
+
+The script:
+  1. Gets the input image (from a file, or from the clipboard via xclip/wl-paste).
+  2. Writes it to a temporary PNG file.
+  3. Launches Krita with `--template <temp.png>` so it opens a new document
+     based on the image.
+  4. Cleans up the temp file after a short delay.
+
+Usage:
+    python clipboard2krita.py [image_path]
+
+Examples:
+    # Read from clipboard
+    python clipboard2krita.py
+
+    # Override with a file path
+    python clipboard2krita.py photo.png
 """
 
 import subprocess
@@ -9,6 +33,10 @@ import os
 import sys
 import time
 import threading
+
+# ===== CONFIGURABLE SETTINGS =====
+IMAGE_PATH = ""   # Optional input image path. If empty, reads from clipboard.
+# =================================
 
 def get_clipboard_image():
     """Extract image from clipboard using available Linux tools"""
@@ -90,12 +118,42 @@ def show_notification(message, is_error=True):
         print(message)
 
 def main():
-    # Get image from clipboard
-    image_data = get_clipboard_image()
+    # Parse command line arguments
+    import argparse
+    parser = argparse.ArgumentParser(description='Open an image in Krita')
+    parser.add_argument('image_path', nargs='?', default=None,
+                       help='Optional input image path (overrides IMAGE_PATH variable; '
+                            'if unset, reads from clipboard)')
+    args = parser.parse_args()
 
-    if not image_data:
-        show_notification("No image found in clipboard")
-        sys.exit(1)
+    # Resolve the input image path:
+    #   1. positional argument
+    #   2. IMAGE_PATH variable
+    #   3. None -> read from clipboard
+    image_path = args.image_path or IMAGE_PATH or None
+
+    if image_path:
+        if not os.path.exists(image_path):
+            msg = f"Input file not found: {image_path}"
+            print(f"❌ {msg}")
+            show_notification(msg)
+            sys.exit(1)
+        print(f"📁 Using input image file: {image_path}")
+        try:
+            with open(image_path, 'rb') as f:
+                image_data = f.read()
+        except Exception as e:
+            print(f"Error reading input file: {e}")
+            show_notification(f"Error reading input file: {e}")
+            sys.exit(1)
+    else:
+        # Get image from clipboard
+        print("📋 Reading image from clipboard...")
+        image_data = get_clipboard_image()
+
+        if not image_data:
+            show_notification("No image found in clipboard")
+            sys.exit(1)
 
     # Launch Krita with the image
     if launch_krita_with_image(image_data):

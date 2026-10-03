@@ -1,27 +1,91 @@
 #!/usr/bin/env python3
 """
-Create a repeating pattern from a single input image with line offset, shrink, and rotation.
-The pattern wraps around properly with no empty spaces on the left.
-All transformations maintain the final image dimensions.
-The rotated image is cropped to maintain the original dimensions.
+img2pattern_variations.py
 
-Two modes available:
-- Fixed: Uses the specified tile height (original behavior)
-- Adaptive: Adjusts tile height based on image aspect ratio for tighter grids
+Create a repeating pattern from a single image using rotated variations of
+that image. The pattern wraps around properly with no empty spaces on the
+left, and all transformations maintain the final image dimensions. Rotated
+variations are cropped to maintain the original dimensions.
+
+Two tile-height modes are available, controlled by ADAPTIVE_HEIGHT:
+
+  - Fixed (ADAPTIVE_HEIGHT = False): uses TILE_HEIGHT as specified.
+  - Adaptive (ADAPTIVE_HEIGHT = True): adjusts tile height based on the
+    image aspect ratio for tighter grids on wide images.
 
 Variation modes:
-- Single image with N variations rotated at equal intervals
-- The original image is included as the first variation (0° rotation)
-- Additional variations are rotated by multiples of 360/N degrees
-- Images are cropped after rotation to maintain the same dimensions
+
+  - NUM_VARIATIONS = 1: just the original image.
+  - NUM_VARIATIONS = N: the original (0°) plus N-1 additional variations
+    rotated by multiples of 360/N degrees.
+  - IMAGE_MODE controls how variations are chosen per tile:
+      'sequential' — cycle through variations in order.
+      'random'     — pick a variation at random per tile (use SEED for
+                     reproducibility).
+
+The output is always written next to the input image, with a
+"_pattern_variations" suffix (e.g. photo.png -> photo_pattern_variations.png).
+
+All behavior is configured through variables in the CONFIGURABLE SETTINGS
+block below. The only command-line flag is --help; the only positional
+argument is the input image path, which overrides IMAGE_PATH.
+
+Usage:
+    python img2pattern_variations.py [image_path]
+
+Examples:
+    # Use IMAGE_PATH variable
+    python img2pattern_variations.py
+
+    # Override with a file path
+    python img2pattern_variations.py photo.png
 """
 
 import sys
 import argparse
+from pathlib import Path
 from wand.image import Image
 from wand.color import Color
 import math
 import random
+
+# ===== CONFIGURABLE SETTINGS =====
+# Default input image; overridden by the positional argument
+IMAGE_PATH = "path/to/image.png"
+
+# Tile dimensions
+TILE_WIDTH = 200
+TILE_HEIGHT = 200
+
+# Number of repeats
+REPEAT_X = 4
+REPEAT_Y = 4
+
+# Horizontal offset per row (pixels)
+OFFSET = 50
+
+# Shrink percentage (1-100). 100 = full size.
+SHRINK_PERCENT = 100
+
+# Base rotation angle in degrees (0-360)
+ROTATION = 0
+
+# Adaptive tile height (see docstring)
+ADAPTIVE_HEIGHT = False
+
+# Number of rotated variations (1 = original only)
+NUM_VARIATIONS = 1
+
+# Variation selection mode: 'sequential' or 'random'
+IMAGE_MODE = 'sequential'
+
+# Random seed for reproducibility (only used when IMAGE_MODE = 'random')
+SEED = None
+
+# Background color: hex ("#FFFFFF" or "FFFFFF") or common color name
+# (e.g. "white", "black", "red"). None = transparent.
+BACKGROUND_COLOR = None
+# =================================
 
 # Common color names mapping to hex values
 COMMON_COLORS = {
@@ -366,73 +430,47 @@ def create_pattern_with_variations(input_path, output_path, tile_width, tile_hei
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Create repeating pattern with rotated variations of a single image'
+        description='Create repeating pattern with rotated variations of a single image. '
+                    'Configure via variables in the script; the only positional '
+                    'argument overrides IMAGE_PATH.'
     )
-    parser.add_argument('--input', required=True, help='Input image path')
-    parser.add_argument('--output', required=True, help='Output image path')
-    parser.add_argument('--tile-width', type=int, required=True, help='Width of each tile')
-    parser.add_argument('--tile-height', type=int, required=True, help='Height of each tile')
-    parser.add_argument('--offset', type=int, required=True, help='Horizontal offset per row (pixels)')
-    parser.add_argument('--repeat-x', type=int, default=4,
-                       help='Number of repeats horizontally (default: 4)')
-    parser.add_argument('--repeat-y', type=int, default=4,
-                       help='Number of repeats vertically (default: 4)')
-    parser.add_argument('--shrink', type=int, default=100,
-                       help='Shrink percentage (1-100). 100 = full size (default: 100)')
-    parser.add_argument('--rotation', type=float, default=0,
-                       help='Base rotation angle in degrees (0-360) (default: 0)')
-    parser.add_argument('--adaptive-height', action='store_true',
-                       help='Enable adaptive tile height for tighter grids on wide images')
-    parser.add_argument('--fixed-height', action='store_true',
-                       help='Use fixed tile height (default behavior)')
-    parser.add_argument('--background-color', type=str, default=None,
-                       help='Background color: hex (e.g., #FFFFFF or FFFFFF) or '
-                            'color name (e.g., white, black, red, blue, etc.). '
-                            'If not provided, uses transparent background.')
-    parser.add_argument('--variations', type=int, default=1,
-                       help='Number of rotated variations (1=original only, 2=original+180°, '
-                            '4=original+90°+180°+270°, etc.) (default: 1)')
-    parser.add_argument('--image-mode', choices=['sequential', 'random'], default='sequential',
-                       help='Image selection mode: sequential (cycle through variations) or random (default: sequential)')
-    parser.add_argument('--seed', type=int, default=None,
-                       help='Random seed for reproducibility (only used with --image-mode random)')
-
+    parser.add_argument('image_path', nargs='?', default=None,
+                        help='Input image path (overrides IMAGE_PATH variable)')
     args = parser.parse_args()
 
-    # Determine height mode
-    if args.adaptive_height:
-        adaptive_mode = True
-    elif args.fixed_height:
-        adaptive_mode = False
-    else:
-        adaptive_mode = False
+    # Use positional argument if provided, otherwise fall back to IMAGE_PATH
+    input_path = args.image_path or IMAGE_PATH
 
     # Validate shrink percentage
-    if args.shrink < 1 or args.shrink > 100:
-        print("Error: Shrink percentage must be between 1 and 100")
+    if SHRINK_PERCENT < 1 or SHRINK_PERCENT > 100:
+        print(f"Error: SHRINK_PERCENT must be between 1 and 100, got {SHRINK_PERCENT}")
         sys.exit(1)
 
     # Validate rotation
-    if args.rotation < 0 or args.rotation >= 360:
-        print("Error: Base rotation must be between 0 and 360")
+    if ROTATION < 0 or ROTATION >= 360:
+        print(f"Error: ROTATION must be between 0 and 360, got {ROTATION}")
         sys.exit(1)
 
     # Validate variations
-    if args.variations < 1:
-        print("Error: Number of variations must be at least 1")
+    if NUM_VARIATIONS < 1:
+        print(f"Error: NUM_VARIATIONS must be at least 1, got {NUM_VARIATIONS}")
         sys.exit(1)
+
+    # Output next to input, with "_pattern_variations" suffix
+    input_file = Path(input_path)
+    output_path = input_file.parent / f"{input_file.stem}_pattern_variations{input_file.suffix}"
 
     try:
         create_pattern_with_variations(
-            args.input, args.output,
-            args.tile_width, args.tile_height,
-            args.offset, args.repeat_x, args.repeat_y,
-            args.shrink, args.rotation,
-            adaptive_height=adaptive_mode,
-            background_color=args.background_color,
-            num_variations=args.variations,
-            image_mode=args.image_mode,
-            seed=args.seed
+            input_path, str(output_path),
+            TILE_WIDTH, TILE_HEIGHT,
+            OFFSET, REPEAT_X, REPEAT_Y,
+            SHRINK_PERCENT, ROTATION,
+            adaptive_height=ADAPTIVE_HEIGHT,
+            background_color=BACKGROUND_COLOR,
+            num_variations=NUM_VARIATIONS,
+            image_mode=IMAGE_MODE,
+            seed=SEED
         )
     except Exception as e:
         print(f"Error: {e}")

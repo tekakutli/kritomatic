@@ -6,6 +6,7 @@ import sys
 from datetime import datetime
 
 from kritomatic.decorators import get_client
+from kritomatic.helpful_argparse import HelpfulArgumentParser
 from .executor import DiffusionPresetExecutor
 
 
@@ -59,7 +60,7 @@ def run_preset_command():
     """Run the diffusion preset subcommand with proper argparse help"""
 
     # Create a parser for preset subcommands
-    preset_parser = argparse.ArgumentParser(
+    preset_parser = HelpfulArgumentParser(
         prog='kritomatic diffusion preset',
         description='Diffusion preset management - save/load diffusion settings'
     )

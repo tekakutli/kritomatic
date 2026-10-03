@@ -120,11 +120,11 @@ class CommandRegistry:
 
     def _build_parser(self):
         """Build argparse parser from registry schema"""
-        import argparse
+        from kritomatic.helpful_argparse import HelpfulArgumentParser
 
         registry = self.get_registry()
 
-        parser = argparse.ArgumentParser(
+        parser = HelpfulArgumentParser(
             prog='kritomatic',
             description='Kritomatic - Control Krita from the command line',
             epilog='Examples:\n'

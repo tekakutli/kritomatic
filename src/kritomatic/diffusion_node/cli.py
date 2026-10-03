@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 
+from kritomatic.helpful_argparse import HelpfulArgumentParser
 from .executor import DiffusionNodeExecutor
 
 
@@ -11,7 +12,7 @@ def run_node_command():
     """Run the diffusion node subcommand"""
 
     # Create a parser for node subcommands
-    node_parser = argparse.ArgumentParser(
+    node_parser = HelpfulArgumentParser(
         prog='kritomatic diffusion node',
         description='Diffusion node operations - control ComfyUI nodes via mute-bypass extension'
     )

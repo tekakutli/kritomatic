@@ -7,3 +7,4 @@ Wand
 pyinotify
 colortrans
 cairosvg
+img2pdf

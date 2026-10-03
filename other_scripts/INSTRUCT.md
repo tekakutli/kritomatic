@@ -477,6 +477,25 @@ RULE — PATHS
     - If the human mentions neither, omit both — the tool's defaults
       will be used.
 
+RULE — TARGET SIZE MODE
+    grid2pdf can be driven either by a fixed C×R grid or by a target
+    printed long side in centimetres. The two modes are selected by
+    USE_GRID_FOR_SIZE_BY_DEFAULT:
+
+        * When the human names a desired printed size for a grid2pdf
+          poster ("a 100 cm poster", "make it 50 cm long", "target
+          30 cm", "give me a 1 metre print"), emit BOTH
+          GRID_FOR_SIZE_CM=<value in cm> and
+          USE_GRID_FOR_SIZE_BY_DEFAULT=true. Do NOT emit C or R — the
+          script computes them from the target.
+        * When the human names a fixed C×R grid instead (or says
+          nothing about printed size), do NOT emit either of the two
+          target-size params. Emit C and R as usual.
+
+    The two params are a pair: USE_GRID_FOR_SIZE_BY_DEFAULT activates
+    GRID_FOR_SIZE_CM; GRID_FOR_SIZE_CM alone (without the flag) has no
+    effect. Never emit one without the other.
+
 RULE — DO NOT INVENT
     Do not add params the human did not ask for. Do not guess absolute
     paths. Do not translate "make it nicer" or other aesthetic language
@@ -532,7 +551,7 @@ Human: "print these three labels in a grid with cell borders: Cables,
      BOOLEAN FLAGS: "with cell borders" -> SHOW_CELL_BOUNDARIES=true.)
 
 Human: "split vacation.jpg into a 2 by 3 grid poster, save as big.pdf,
-        with 30 pixels of overlap"
+        with 1.5 cm of overlap"
 
     {
       "tool": "grid2pdf",
@@ -541,7 +560,7 @@ Human: "split vacation.jpg into a 2 by 3 grid poster, save as big.pdf,
         "OUTPUT_PDF": "big.pdf",
         "C": 2,
         "R": 3,
-        "OVERLAP_DELTA": 30
+        "OVERLAP_DELTA_CM": 1.5
       }
     }
 
@@ -551,7 +570,10 @@ Human: "split vacation.jpg into a 2 by 3 grid poster, save as big.pdf,
      PATHS: both paths given verbatim.
      "2 by 3" -> C=2 (columns), R=3 (rows), following the convention
          "C columns by R rows".
-     "30 pixels of overlap" -> OVERLAP_DELTA=30.)
+     "1.5 cm of overlap" -> OVERLAP_DELTA_CM=1.5.
+     TARGET SIZE MODE: not triggered — the human names a fixed grid,
+         not a target size, so USE_GRID_FOR_SIZE_BY_DEFAULT and
+         GRID_FOR_SIZE_CM are omitted.)
 
 Human: "print this image as a poster across 4 columns by 2 rows, no
         overlap"
@@ -561,7 +583,7 @@ Human: "print this image as a poster across 4 columns by 2 rows, no
       "params": {
         "C": 4,
         "R": 2,
-        "OVERLAP_DELTA": 0
+        "OVERLAP_DELTA_CM": 0
       }
     }
 
@@ -569,7 +591,44 @@ Human: "print this image as a poster across 4 columns by 2 rows, no
          instruction names ONE image being tiled, not a folder being
          paginated, so imgs2pdf is disqualified by its not_for.
      "4 columns by 2 rows" -> C=4, R=2.
-     "no overlap" -> OVERLAP_DELTA=0.)
+     "no overlap" -> OVERLAP_DELTA_CM=0. Note the value is 0, not a
+         boolean — the param is a float, and the "no …" phrasing maps
+         to a numeric zero.
+     TARGET SIZE MODE: not triggered — the human names a fixed grid.)
+
+Human: "make a 100 cm poster from vacation.jpg, save it as poster.pdf"
+
+    {
+      "tool": "grid2pdf",
+      "params": {
+        "INPUT_IMAGE": "vacation.jpg",
+        "OUTPUT_PDF": "poster.pdf",
+        "GRID_FOR_SIZE_CM": 100,
+        "USE_GRID_FOR_SIZE_BY_DEFAULT": true
+      }
+    }
+
+    (TOOL SELECTION: "poster" made from one named image -> grid2pdf.
+     TARGET SIZE MODE: the human names a printed long-side size
+         directly, so both GRID_FOR_SIZE_CM and
+         USE_GRID_FOR_SIZE_BY_DEFAULT are emitted as a pair. C and R
+         are intentionally omitted — the script computes them.
+     PATHS: both paths given verbatim.)
+
+Human: "split vacation.jpg into a grid and outline the tiles"
+
+    {
+      "tool": "grid2pdf",
+      "params": {
+        "INPUT_IMAGE": "vacation.jpg",
+        "OUTLINE_TILES": true
+      }
+    }
+
+    (TOOL SELECTION: "split ... into a grid", single image -> grid2pdf.
+     BOOLEAN FLAGS: "outline the tiles" -> OUTLINE_TILES=true.
+     C and R are omitted — the human did not name a grid, so the
+         script's defaults apply.)
 
 Human: "make a contact sheet of the photos in ~/shoots, 4 by 5,
         numbered"
@@ -753,7 +812,9 @@ imgs2pdf
     for a sheet of text cells, use labels2grid. Does not caption a
     single image — for that, use captionize. Does not split a single
     image into a C×R grid of print tiles for reassembly into a larger
-    poster — for that, use grid2pdf.
+    poster — for that, use grid2pdf. Does not place a single image
+    onto a single page at a chosen centimetre size — for that, use
+    solo2pdf.
 
   params:
     INPUT_DIR                str   default "/tmp/"
@@ -856,7 +917,8 @@ grid2pdf
     Splits a single image into a C-columns by R-rows grid of tiles and
     writes each tile to its own US Letter page in a PDF, so the printed
     sheets can be trimmed and reassembled into a larger poster of the
-    original image.
+    original image. The grid can either be set explicitly via C and R,
+    or chosen automatically from a target printed long-side size.
 
   use_case:
     The human has ONE image and wants it printed larger than a single
@@ -866,15 +928,19 @@ grid2pdf
     multi-page PDF of this one image", "tile this image across pages",
     "enlarge this image onto several sheets", "make a poster from this
     image", "grid layout of this single picture", "cut this image into
-    pieces for printing".
+    pieces for printing", "make me a 100 cm poster", "target a 50 cm
+    long side".
 
   objective:
     Take one source image, scale it to fill a C×R grid of US Letter
-    live areas, slice the result into C*R tiles, and place each tile on
-    its own portrait page with per-edge margins. The printed pages,
-    trimmed and assembled, reproduce the source image at a larger
-    physical size. An intentional pixel overlap can be added to the
-    inner edges of each tile so adjacent sheets align when reassembled.
+    live areas (or choose C and R from a target printed long side),
+    slice the result into C*R tiles, and place each tile on its own
+    portrait page with per-edge margins. The printed pages, trimmed
+    and assembled, reproduce the source image at a larger physical
+    size. An intentional overlap, specified in centimetres, can be
+    added to the inner edges of each tile so adjacent sheets align
+    when reassembled. A thin black outline can be drawn around the
+    actual image content inside each tile, to guide trimming.
 
   outputs:
     One PDF file. Default name "output.pdf" (written to the current
@@ -891,7 +957,9 @@ grid2pdf
     not a directory. Does not lay multiple distinct images onto one
     page; each output page is one tile of the same source image. Not a
     slideshow maker. Not a contact-sheet maker — for a grid of many
-    distinct images per page, use imgs2grid.
+    distinct images per page, use imgs2grid. Does not place a single
+    image, whole, onto one page at a chosen centimetre size — for
+    that, use solo2pdf.
 
   params:
     INPUT_IMAGE    str   default "image.jpg"
@@ -907,25 +975,66 @@ grid2pdf
 
     C              int   default 2
                    Number of COLUMNS in the grid — how many tiles wide
-                   the assembled poster is. spoken as: "N columns",
-                   "N wide", "N across", "across N", "N by ..." (the
-                   first number of a "C by R" phrase maps here).
+                   the assembled poster is. Ignored when target-size
+                   mode is active (USE_GRID_FOR_SIZE_BY_DEFAULT is
+                   true): the script computes C from the target and
+                   overwrites whatever is passed. spoken as:
+                   "N columns", "N wide", "N across", "across N",
+                   "N by ..." (the first number of a "C by R" phrase
+                   maps here).
 
     R              int   default 3
                    Number of ROWS in the grid — how many tiles tall
-                   the assembled poster is. spoken as: "N rows",
+                   the assembled poster is. Ignored when target-size
+                   mode is active, exactly like C. spoken as: "N rows",
                    "N tall", "N high", "... by N" (the second number
                    of a "C by R" phrase maps here).
 
-    OVERLAP_DELTA  int   default 50
-                   Pixels of intentional duplicated content added to
-                   the inner edges of each tile, so adjacent printed
+    OVERLAP_DELTA_CM  float default 0.5
+                   Centimetres of intentional duplicated content added
+                   to the inner edges of each tile, so adjacent printed
                    sheets overlap slightly and can be aligned before
-                   trimming. spoken as: "overlap", "with overlap",
-                   "overlap of N pixels", "N pixels of overlap",
-                   "duplicate the edges for alignment" -> N;
-                   "no overlap", "zero overlap", "without overlap",
-                   "don't overlap" -> 0.
+                   trimming. This is a length in cm, not a pixel count
+                   and not a boolean — "no overlap" means the value 0.
+                   spoken as: "overlap", "with overlap", "overlap of
+                   N cm", "N cm of overlap", "duplicate the edges for
+                   alignment" -> N; "no overlap", "zero overlap",
+                   "without overlap", "don't overlap" -> 0.
+
+    OUTLINE_TILES  bool  default false
+                   If true, draw a thin black outline around the
+                   actual image content inside each tile, to guide
+                   trimming. Does not affect the printed image size.
+                   spoken as: "with outline", "outline the tiles",
+                   "draw an outline around the image", "outline the
+                   content", "show the outline" -> true; "no outline",
+                   "without outline", "don't outline" -> false.
+
+    GRID_FOR_SIZE_CM  float  default 100.0
+                   Target printed long side, in centimetres. Only
+                   takes effect when USE_GRID_FOR_SIZE_BY_DEFAULT is
+                   true — the router has no CLI channel for the
+                   script's --grid-for-size flag, so this variable is
+                   the router-side path into target-size mode. In that
+                   mode the script finds the smallest C×R grid whose
+                   contain-fit already reaches this size, then scales
+                   the image so the printed long side equals it. C and
+                   R are computed, not given. spoken as: "N cm
+                   poster", "target N cm", "make it N cm long",
+                   "printed long side N cm", "a N cm print", "poster
+                   of N cm".
+
+    USE_GRID_FOR_SIZE_BY_DEFAULT  bool  default false
+                   Activates target-size mode. When true, C and R are
+                   ignored and GRID_FOR_SIZE_CM is used as the target
+                   printed long side. Emit this together with
+                   GRID_FOR_SIZE_CM when the human names a printed
+                   size; leave both unemitted when the human names a
+                   fixed C×R grid instead. spoken as: "target size",
+                   "size it to N cm", "use a target long side", "I
+                   want a N cm print", "compute the grid for N cm"
+                   -> true; "keep the fixed grid", "use C by R",
+                   "don't auto-size" -> false.
 
 imgs2grid
   file: imgs2grid.py
@@ -967,7 +1076,8 @@ imgs2grid
     Not a caption tool — for embedding text into a single image, use
     captionize. Does not recurse into subdirectories — only top-level
     files of INPUT_DIR are read. Does not lay out a single image
-    across pages.
+    across pages. Does not place a single image, whole, onto one
+    Letter page at a chosen centimetre size — for that, use solo2pdf.
 
   params:
     INPUT_DIR      str   default "/tmp/"
@@ -1010,3 +1120,72 @@ imgs2grid
                    Number of image ROWS per page. spoken as: "N rows",
                    "N tall", "N high", "... by N" (the second number
                    of a "C by R" phrase maps here).
+
+solo2pdf
+  file: solo2pdf.py
+
+  description:
+    Places ONE image, whole, at the top-left corner of a single US
+    Letter PDF page, inside per-edge margins, with the image's
+    primary dimension specified in centimetres.
+
+  use_case:
+    The human has a single image and wants a one-page US Letter PDF
+    with that image placed in the corner of the page, sized to a
+    specific number of centimetres. Typical phrasings: "put this
+    image on a letter page", "make a one-page PDF of this picture",
+    "place the image at the top left", "size the image to 12 cm
+    wide", "give me a letter-size PDF with this picture 15 cm tall",
+    "print this single photo on a Letter sheet at 9 cm wide", "fit
+    this picture onto one page in cm".
+
+  objective:
+    Turn ONE source image into a single-page US Letter PDF with the
+    image pasted at the top-left of the live area (the page minus the
+    per-edge margins). The image's primary dimension is given in
+    centimetres; the other dimension is derived from the aspect
+    ratio. If the resolved size does not fit inside the live area it
+    is scaled down to fit, with a warning.
+
+  outputs:
+    One PDF file, single page, US Letter at 300 DPI, portrait. The
+    output filename is fixed to the script's default ("output.pdf" in
+    the current working directory) — this tool does not expose
+    OUTPUT_PDF to the router. Also prints a progress log to stdout,
+    including printing instructions.
+
+  not_for:
+    Not an album maker — for a folder of images paginated one- or
+    two-per-page, use imgs2pdf. Not a contact sheet — for a grid of
+    many images per page, use imgs2grid. Not a poster splitter — for
+    one image tiled across a C×R grid of pages for reassembly, use
+    grid2pdf. Not a caption tool — for embedding text into a single
+    image, use captionize. Not a text-label sheet — for a grid of
+    text cells, use labels2grid. Places exactly ONE image on ONE
+    page; does not arrange multiple images, does not tile an image
+    across pages, does not add labels or captions.
+
+  params:
+    INPUT_IMAGE        str   default "image.jpg"
+                       Path to the source image. spoken as: "the
+                       image", "this picture", "the photo file", "the
+                       input image", "the picture to place".
+
+    IMAGE_WIDTH_CM     float default 9.0
+                       The image's primary dimension, in centimetres.
+                       Whether it means a width or a height is chosen
+                       by FLIP_WIDTH_HEIGHT (default: a width).
+                       spoken as: "N cm", "N cm wide", "N cm width",
+                       "N cm tall", "N cm high", "N cm in height",
+                       "size it N cm", "make it N cm", "N centimetres".
+
+    FLIP_WIDTH_HEIGHT  bool  default false
+                       Chooses how IMAGE_WIDTH_CM is read. false: it
+                       is the image's WIDTH and the height is derived
+                       from the aspect ratio. true: it is the image's
+                       HEIGHT and the width is derived from the aspect
+                       ratio. spoken as: "wide", "width", "as a
+                       width", "the value is the width" -> false;
+                       "tall", "high", "height", "as a height",
+                       "the value is the height", "treat it as the
+                       height" -> true.

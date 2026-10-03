@@ -249,6 +249,7 @@ UX over that interface.
 """
 
 import ast
+import importlib.util
 import json
 import re
 import select
@@ -322,7 +323,10 @@ TOOLS = {
             "OUTPUT_PDF",
             "C",
             "R",
-            "OVERLAP_DELTA",
+            "OVERLAP_DELTA_CM",
+            "OUTLINE_TILES",
+            "GRID_FOR_SIZE_CM",
+            "USE_GRID_FOR_SIZE_BY_DEFAULT",
         ],
     },
     "imgs2grid": {
@@ -335,6 +339,15 @@ TOOLS = {
             "NUMBER_IMAGES",
             "GRID_COLS",
             "GRID_ROWS",
+        ],
+    },
+    "solo2pdf": {
+        "file": "solo2pdf.py",
+        "entry": "main",
+        "params": [
+            "INPUT_IMAGE",
+            "IMAGE_WIDTH_CM",
+            "FLIP_WIDTH_HEIGHT",
         ],
     },
     # ── Add more tools here, following the three-key shape above. ──
@@ -452,23 +465,63 @@ def run_tool(tool_name, params):
     if not script_path.is_file():
         raise SystemExit(f"Tool file not found: {script_path}")
 
+    # --- Load the tool as a REAL, importable module. ---
+    #
+    # The tool is loaded under its filename stem (e.g. "grid2pdf") and
+    # registered in sys.modules, with its directory appended to
+    # sys.path. This matters for any tool that uses multiprocessing:
+    # under the forkserver / spawn start methods (forkserver is the
+    # default on Linux from Python 3.14 onward), a worker process is a
+    # fresh interpreter that reconstructs the pickled worker function
+    # by *importing its module by name*. A module that exists only as
+    # an exec() namespace — as it would if we exec'd the source under
+    # a synthetic name like "_tool_grid2pdf" — cannot be reimported,
+    # and the parent fails to pickle the worker function with
+    # "No module named '_tool_grid2pdf'".
+    #
+    # Registering the module under its natural name fixes that: the
+    # parent pickles "grid2pdf._tile_init", the child imports
+    # "grid2pdf" from the tool directory (which the child inherits on
+    # sys.path from the spawn preparation data), and the function is
+    # found.
+    #
+    # NOTE: the child reimports the tool from *disk*, so a worker that
+    # reads a top-level variable will see that variable's in-file
+    # default, not the value patched here. A tool that needs a patched
+    # value available inside a worker must pass it explicitly through
+    # the multiprocessing args (e.g. Pool(initializer=...,
+    # initargs=...)) rather than reading a module global from the
+    # worker body. grid2pdf already does this — its tile context tuple
+    # carries every value the workers need.
+    tool_dir = str(script_path.parent)
+    if tool_dir not in sys.path:
+        sys.path.append(tool_dir)
+
+    mod_name = script_path.stem
+    module = sys.modules.get(mod_name)
+    if module is None or getattr(module, "__file__", None) != str(script_path):
+        spec_obj = importlib.util.spec_from_file_location(mod_name, script_path)
+        if spec_obj is None or spec_obj.loader is None:
+            raise SystemExit(f"Could not load tool module: {script_path}")
+        module = importlib.util.module_from_spec(spec_obj)
+        sys.modules[mod_name] = module
+
+    # Read, patch, compile.
     source = script_path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(script_path))
     _patch_tree(tree, params)
     ast.fix_missing_locations(tree)
-
     code = compile(tree, filename=str(script_path), mode="exec")
 
-    # Exec with __name__ != "__main__" so the tool's own
+    # Exec into the module's own namespace, with __name__ set to the
+    # real module name (not "__main__") so the tool's own
     # `if __name__ == "__main__": main()` guard stays silent. We invoke
     # the entry point ourselves, deliberately.
-    namespace = {
-        "__name__": f"_tool_{tool_name}",
-        "__file__": str(script_path),
-    }
-    exec(code, namespace)
+    module.__dict__["__name__"] = mod_name
+    module.__dict__["__file__"] = str(script_path)
+    exec(code, module.__dict__)
 
-    entry = namespace.get(spec["entry"])
+    entry = module.__dict__.get(spec["entry"])
     if entry is None or not callable(entry):
         raise SystemExit(
             f"Entry point {spec['entry']!r} not found (or not callable) "

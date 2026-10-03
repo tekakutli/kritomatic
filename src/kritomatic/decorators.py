@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import argparse
 from kritomatic.client import KritaClient
 
 _command_registry = {}

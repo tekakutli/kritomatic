@@ -42,7 +42,7 @@ class LayerHandler:
         elif cmd_type in ['fill_layer', 'fill_selection']:
             return self.fill.execute(cmd_type, params)
 
-        # Fill operations
+        # Blend operations
         elif cmd_type in ['create_blend_layer']:
             return self.blend.execute(cmd_type, params)
 

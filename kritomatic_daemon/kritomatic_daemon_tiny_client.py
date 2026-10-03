@@ -1,91 +1,92 @@
 #!/usr/bin/env python3
 """
-Simple client to send JSON commands to Kritomatic Daemon (Krita Socket Server)
-The daemon listens on port 12346 and accepts the same JSON format.
+Minimal CLI client for the Kritomatic daemon.
 
-The daemon now speaks NDJSON: every response is one JSON object followed
-by a newline. Batches stream one `progress` line per command, then a final
-`batch_complete` summary line. This client reads them as they arrive.
+Sends a bundled payload (or a single command) to the daemon and prints
+the streamed progress lines and the final summary as they arrive.
+
+For the full CLI, use the `kritomatic` command instead. This script is
+a direct socket-level escape hatch for cases where the schema layer is
+in the way, or where you want to poke at the raw protocol without a
+schema cache.
+
+Usage:
+    kritomatic_daemon_tiny_client.py <path-to-json>
+    kritomatic_daemon_tiny_client.py          # runs a small default batch
+
+The JSON file must be either:
+  - a bundled payload: {"id": ..., "commands": [{"type": ...}, ...]}
+  - a single command:  {"type": "<command_name>", ...args}
 """
 
-import socket
 import json
 import sys
+from pathlib import Path
+
+# Make `kritomatic` importable when this script is run from a checkout.
+# The repo layout is:
+#     <repo>/kritomatic_daemon/kritomatic_daemon_tiny_client.py
+#     <repo>/src/kritomatic/client.py
+# so we climb two levels from this file and descend into src/.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SRC = _REPO_ROOT / 'src'
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from kritomatic.client import KritaClient
 
 
-def send_json_to_kritomatic(json_data, host='localhost', port=12346):
-    """Send JSON to Kritomatic daemon and return the final response."""
+DEFAULT_BATCH = {
+    "id": "tiny_client_default",
+    "commands": [
+        {"type": "set_brush_opacity", "value": 37},
+        {"type": "set_brush_size", "value": 33},
+        {"type": "get_state"},
+        {"type": "list_layers"},
+    ],
+}
+
+
+def _print_progress(index, result):
+    icon = '✓' if result.get('status') == 'success' else '✗'
+    cmd = result.get('command', '?')
+    msg = result.get('message', '')
+    print(f"  {icon} [{index + 1}] {cmd}: {msg}")
+
+
+def main():
+    if len(sys.argv) > 1:
+        with open(sys.argv[1], 'r') as f:
+            payload = json.load(f)
+    else:
+        payload = DEFAULT_BATCH
+
+    client = KritaClient()
+    if not client.connect():
+        print(f"❌ Cannot connect to the Kritomatic daemon at "
+              f"{client.host}:{client.port}")
+        print("   Make sure Krita is running and the plugin is enabled.")
+        return 1
+
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((host, port))
+        if isinstance(payload, dict) and 'commands' in payload:
+            summary = client.send_batch(payload, on_progress=_print_progress)
+        else:
+            # Single-command path. Strip 'type' before it goes into the
+            # kwargs of client.execute, which re-adds it.
+            cmd_type = payload.get('type')
+            if not cmd_type:
+                print("❌ Payload has no 'type' key and no 'commands' list.")
+                return 2
+            kwargs = {k: v for k, v in payload.items() if k != 'type'}
+            summary = client.execute(cmd_type, **kwargs)
 
-        if isinstance(json_data, dict):
-            json_data = json.dumps(json_data)
-
-        sock.send((json_data + '\n').encode('utf-8'))
-
-        buffer = b''
-        final = None
-        while final is None:
-            if b'\n' not in buffer:
-                try:
-                    chunk = sock.recv(65536)
-                except Exception as e:
-                    print(f"❌ Error: {e}")
-                    break
-                if not chunk:
-                    break
-                buffer += chunk
-                continue
-
-            line, buffer = buffer.split(b'\n', 1)
-            if not line.strip():
-                continue
-            try:
-                msg = json.loads(line.decode('utf-8'))
-            except Exception:
-                continue
-
-            if msg.get('type') == 'progress':
-                result = msg.get('result', {})
-                icon = '✓' if result.get('status') == 'success' else '✗'
-                idx = msg.get('index', 0)
-                total = msg.get('total', '?')
-                print(f"  {icon} [{idx + 1}/{total}] "
-                      f"{result.get('command')}: {result.get('message', '')}")
-            else:
-                final = msg
-
-        sock.close()
-        return final
-
-    except ConnectionRefusedError:
-        print(f"❌ Cannot connect to Kritomatic daemon at {host}:{port}")
-        print("   Make sure Krita is running and the Kritomatic Daemon plugin is enabled.")
-        return None
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        return None
+        if summary:
+            print(json.dumps(summary, indent=2))
+        return 0
+    finally:
+        client.close()
 
 
 if __name__ == "__main__":
-    # Example usage
-    if len(sys.argv) > 1:
-        # Read from file
-        with open(sys.argv[1], 'r') as f:
-            json_data = json.load(f)
-    else:
-        # Default test commands (using new command names)
-        json_data = {
-            "id": 1,
-            "commands": [
-                {"type": "set_brush_opacity", "value": 37},
-                {"type": "set_brush_size", "value": 33},
-                {"type": "get_state"},
-                {"type": "list_layers"}
-            ]
-        }
-
-    response = send_json_to_kritomatic(json_data)
-    if response:
-        print(json.dumps(response, indent=2))
+    sys.exit(main())

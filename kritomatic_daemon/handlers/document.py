@@ -45,7 +45,7 @@ class DocumentHandler:
             return {
                 'success': True,
                 'message': f'Current document: {width}x{height} @ {resolution} DPI',
-                '--data': {
+                'data': {
                     'width': width,
                     'height': height,
                     'resolution': resolution,

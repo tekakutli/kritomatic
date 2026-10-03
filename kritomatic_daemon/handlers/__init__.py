@@ -3,5 +3,4 @@ from .brush import BrushHandler
 from .layer import LayerHandler
 from .palette import PaletteHandler
 from .mask import MaskHandler
-from .transform import TransformHandler
 from .diffusion import DiffusionHandler

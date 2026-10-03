@@ -2,6 +2,7 @@
 
 import re
 import json
+import shlex
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 
@@ -25,7 +26,18 @@ class BashConverter:
                 continue
 
             cmd_line = match.group(1)
-            parts = cmd_line.split()
+
+            # shlex.split respects quoting and is what the shell would have
+            # done when the human typed the line. A naive .split() on
+            # whitespace breaks on quoted values that contain spaces
+            # (--name "My Layer" would produce the arg value "My" and an
+            # orphan token "Layer\"" that gets dropped with a warning).
+            try:
+                parts = shlex.split(cmd_line)
+            except ValueError as e:
+                print(f"⚠️ Warning: malformed quoting in command, skipping: "
+                      f"{cmd_line!r} ({e})")
+                continue
 
             if len(parts) < 2:
                 continue
@@ -39,7 +51,7 @@ class BashConverter:
                 for i in range(2, len(parts)):
                     arg = parts[i]
                     if not arg.startswith('--'):
-                        batch_name = arg.strip("'\"")
+                        batch_name = arg
                         break
                 if batch_name:
                     commands.append({'type': 'include', 'batch': batch_name})
@@ -57,7 +69,7 @@ class BashConverter:
                     arg_name = arg[2:].replace('-', '_')
                     if i + 1 < len(parts) and not parts[i+1].startswith('--'):
                         # Flag with value
-                        value = parts[i + 1].strip("'\"")
+                        value = parts[i + 1]
                         value = self._convert_value(value)
                         json_cmd[arg_name] = value
                         i += 2
@@ -103,4 +115,4 @@ class BashConverter:
             return int(value)
         if value.replace('.', '', 1).isdigit():
             return float(value)
-        return value.strip("'\"")
+        return value

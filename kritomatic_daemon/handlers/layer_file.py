@@ -1,4 +1,9 @@
 import os
+import random
+import string
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from PyQt5.QtWidgets import QApplication
 from krita import Krita
 from ..decorators import command
 
@@ -45,7 +50,6 @@ class LayerFileHandler:
             file_layer = doc.createFileLayer(name, file_path, scaling_method, scaling_filter)
             doc.rootNode().addChildNode(file_layer, None)
 
-            from PyQt5.QtWidgets import QApplication
             QApplication.processEvents()
 
             # If no transform needed, just return
@@ -86,7 +90,6 @@ class LayerFileHandler:
             file_layer.addChildNode(transform_mask, None)
             QApplication.processEvents()
 
-            import xml.etree.ElementTree as ET
             xml_str = transform_mask.toXML()
             root = ET.fromstring(xml_str)
 
@@ -159,14 +162,11 @@ class LayerFileHandler:
                     break
 
             # Generate random hash (8 characters, no date)
-            import random
-            import string
             random_hash = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
 
             # Generate output path if not provided
+            export_dir = None
             if not output_path:
-                from pathlib import Path
-
                 doc_path = doc.fileName()
                 if doc_path:
                     doc_dir = Path(doc_path).parent
@@ -239,7 +239,7 @@ class LayerFileHandler:
                     'file_layer_name': random_hash,
                     'random_hash': random_hash,
                     'output_path': output_path,
-                    'export_dir': str(export_dir) if 'export_dir' in dir() else None,
+                    'export_dir': str(export_dir) if export_dir else None,
                     'position': original_position
                 }
             }

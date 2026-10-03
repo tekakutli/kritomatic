@@ -77,7 +77,13 @@ class BrushHandler:
         category='brush',
         help_text='Set brush blending mode',
         args={
-            '--value': {'type': 'str', 'required': True, 'help': 'Blending mode (normal, multiply, screen, etc.)'}
+            '--value': {
+                'type': 'str', 'required': True,
+                'choices': ['normal', 'multiply', 'screen', 'overlay', 'darken', 'lighten',
+                            'color_dodge', 'color_burn', 'hard_light', 'soft_light',
+                            'difference', 'exclusion', 'hue', 'saturation', 'color', 'luminosity'],
+                'help': 'Blending mode'
+            }
         }
     )
     def set_brush_blending_mode(self, mode):

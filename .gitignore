@@ -167,3 +167,5 @@ data/diffusion/*
 data/workflows/*
 !data/workflows/.gitkeep
 .aider*
+
+command_reference.md

@@ -1,7 +1,5 @@
-import os
 import random
 import string
-from datetime import datetime
 from pathlib import Path
 from krita import Krita
 from ..decorators import command
@@ -16,7 +14,7 @@ class LayerExportHandler:
 
     @command(
         category='layer',
-        help_text='Move a layer to its own new document',
+        help_text='Duplicate a layer into its own new document',
         args={
             '--layer_name': {'type': 'str', 'required': True, 'help': 'Name of the layer to move'},
             '--new_doc_name': {'type': 'str', 'required': False, 'help': 'Name for the new document (defaults to layer name)'}

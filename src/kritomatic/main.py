@@ -4,7 +4,6 @@ Kritomatic - Command-line interface for Krita
 """
 
 import sys
-import argparse
 import json
 from pathlib import Path
 
@@ -23,6 +22,11 @@ def is_suppress_command():
     # batch translate
     if len(sys.argv) >= 3 and sys.argv[1] == 'batch' and sys.argv[2] == 'translate':
         return True
+
+    # batch validate --json (output must be pure JSON)
+    if len(sys.argv) >= 3 and sys.argv[1] == 'batch' and sys.argv[2] == 'validate':
+        if '--json' in sys.argv:
+            return True
 
     # diffusion export_params (when piping JSON)
     if len(sys.argv) >= 3 and sys.argv[1] == 'diffusion' and sys.argv[2] == 'export_params':
@@ -122,46 +126,18 @@ def main():
     args = parser.parse_args()
 
     # Handle management commands
-    if args.command == 'compile':
-        if not suppress_output:
-            print("⚠️ 'compile' command is deprecated. Use '--refresh' to update schema from daemon.")
-            print("   The daemon is now the source of truth for commands.")
-        return
-
-    elif args.command == 'import':
-        from compiler import CommandCompiler
-        compiler = CommandCompiler()
-        compiler.import_bundle(args.bundle_file)
-        registry_mgr.invalidate_cache()
-        if not suppress_output:
-            print("⚠️ Imported bundle. Run 'kritomatic --refresh' to update schema from daemon.")
-        return
-
-    elif args.command == 'export':
-        from compiler import CommandCompiler
-        compiler = CommandCompiler()
-        compiler.export_bundle(args.output, args.category, args.command)
-        return
-
-    elif args.command == 'export-all':
-        from compiler import CommandCompiler
-        compiler = CommandCompiler()
-        compiler.export_bundle(args.output, None, None)
-        return
-
-    elif args.command == 'export-schema':
-        from compiler import CommandCompiler
-        compiler = CommandCompiler()
-        compiler.export_batch_schema(args.output)
-        return
-
-    elif args.command == 'remove':
-        from compiler import CommandCompiler
-        compiler = CommandCompiler()
-        compiler.remove_command(args.category, args.command)
-        registry_mgr.invalidate_cache()
-        if not suppress_output:
-            print("⚠️ Command removed. Run 'kritomatic --refresh' to update schema from daemon.")
+    if args.command == 'export-manual':
+        output = getattr(args, 'output', None)
+        category = getattr(args, 'category', None)
+        version = registry_mgr._get_cached_version()
+        md = registry_mgr.to_markdown(version=version, category=category)
+        if output:
+            with open(output, 'w') as f:
+                f.write(md)
+            if not suppress_output:
+                print(f"✓ Wrote command reference to {output}")
+        else:
+            print(md)
         return
 
     elif args.command == 'list':
@@ -173,30 +149,37 @@ def main():
             )
         return
 
-    elif args.command == 'clear':
-        from compiler import CommandCompiler
-        compiler = CommandCompiler()
-        compiler.clear_all_commands()
-        registry_mgr.invalidate_cache()
-        if not suppress_output:
-            print("⚠️ All commands cleared. Run 'kritomatic --refresh' to update schema from daemon.")
-        return
-
-    elif args.command == 'clear-category':
-        from compiler import CommandCompiler
-        compiler = CommandCompiler()
-        compiler.clear_category(args.category)
-        registry_mgr.invalidate_cache()
-        if not suppress_output:
-            print("⚠️ Category cleared. Run 'kritomatic --refresh' to update schema from daemon.")
-        return
-
     # Handle batch commands
     elif args.command == 'batch':
         if args.batch_command == 'run':
+            json_string = args.json_string
+
+            if json_string is None:
+                # No JSON given on the command line. Enter interactive
+                # mode: paste JSON, blank line to parse, Ctrl-D to
+                # cancel. See src/kritomatic/prompt.py for the loop and
+                # its tolerance rules.
+                from prompt import prompt_for_json
+                if not suppress_output:
+                    print("Interactive mode. Paste JSON; blank line to parse; Ctrl-D to cancel.")
+                try:
+                    parsed = prompt_for_json()
+                except json.JSONDecodeError as e:
+                    if not suppress_output:
+                        print(f"❌ Invalid JSON: {e}")
+                    return
+                if parsed is None:
+                    # User typed nothing before EOF, or forced an empty
+                    # parse. Clean abort — no error, no batch run.
+                    return
+                # The executor already knows how to consume a JSON
+                # string, so re-serialize rather than growing its
+                # interface with a second entry point.
+                json_string = json.dumps(parsed)
+
             executor = BatchExecutor()
             try:
-                results = executor.execute_from_json(args.json_string)
+                results = executor.execute_from_json(json_string)
                 successful = sum(1 for r in results if r['status'] == 'success')
                 failed = sum(1 for r in results if r['status'] == 'error')
                 if not suppress_output:
@@ -317,6 +300,81 @@ def main():
                 if not suppress_output:
                     print(f"❌ Batch '{args.name}' not found")
             return
+
+        elif args.batch_command == 'validate':
+            from batch.validate import validate_bundle
+            from batch.library import BatchLibrary
+
+            # Exactly one source must be provided.
+            sources_provided = [
+                args.json_string is not None,
+                args.file is not None,
+                args.saved is not None,
+            ]
+            if sum(sources_provided) != 1:
+                print("❌ Provide exactly one of: <json_string>, --file, --saved")
+                sys.exit(2)
+
+            library = BatchLibrary()
+
+            # Load the bundle from the chosen source.
+            try:
+                if args.json_string is not None:
+                    bundle = json.loads(args.json_string)
+                    source_label = '<inline>'
+                elif args.file is not None:
+                    with open(args.file, 'r') as f:
+                        bundle = json.load(f)
+                    source_label = args.file
+                else:
+                    loaded = library.load(args.saved)
+                    if loaded is None:
+                        print(f"❌ Saved batch '{args.saved}' not found")
+                        sys.exit(2)
+                    bundle = loaded
+                    source_label = f"saved:{args.saved}"
+            except json.JSONDecodeError as e:
+                print(f"❌ Invalid JSON: {e}")
+                sys.exit(2)
+            except FileNotFoundError:
+                print(f"❌ File not found: {args.file}")
+                sys.exit(2)
+
+            # Schema must be available in the cache.
+            schema = registry_mgr.get_registry()
+            if not schema:
+                print("❌ No schema available. Run 'kritomatic --refresh' first.")
+                sys.exit(2)
+
+            findings = validate_bundle(bundle, schema, library=library)
+            errors = [f for f in findings if f.level == 'error']
+            warnings = [f for f in findings if f.level == 'warning']
+            cmd_count = len(bundle.get('commands', [])) if isinstance(bundle, dict) else 0
+
+            if args.json:
+                print(json.dumps({
+                    'source': source_label,
+                    'command_count': cmd_count,
+                    'valid': not errors,
+                    'error_count': len(errors),
+                    'warning_count': len(warnings),
+                    'findings': [f.to_dict() for f in findings],
+                }, indent=2))
+            else:
+                plural = '' if cmd_count == 1 else 's'
+                print(f"Bundle: {source_label} ({cmd_count} command{plural})")
+                if not findings:
+                    print("✓ Valid")
+                else:
+                    for f in errors:
+                        print(f"  ✗ {f}")
+                    for f in warnings:
+                        print(f"  ⚠ {f}")
+                    print(f"\n{len(errors)} error(s), {len(warnings)} warning(s)")
+                    if not errors:
+                        print("✓ No errors (warnings only)")
+
+            sys.exit(1 if errors else 0)
 
         elif args.batch_command == 'translate':
             converter = BashConverter()

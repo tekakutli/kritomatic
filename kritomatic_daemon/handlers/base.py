@@ -4,7 +4,6 @@ from .brush import BrushHandler
 from .layer import LayerHandler
 from .palette import PaletteHandler
 from .mask import MaskHandler
-from .transform import TransformHandler
 from .document import DocumentHandler
 from .view import ViewHandler
 from .window import WindowHandler
@@ -18,7 +17,6 @@ class CommandHandler:
             'layer': LayerHandler(),
             'palette': PaletteHandler(),
             'mask': MaskHandler(),
-            'transform': TransformHandler(),
             'document': DocumentHandler(),
             'view': ViewHandler(),
             'window': WindowHandler(),
@@ -110,10 +108,6 @@ class CommandHandler:
         cmd_type = command.get('type')
 
         if cmd_type == 'get_schema':
-            import hashlib
-            import json
-            from ..registry import get_command_registry
-
             registry = get_command_registry()
             registry_str = json.dumps(registry, sort_keys=True)
             version = hashlib.md5(registry_str.encode()).hexdigest()[:8]
@@ -153,10 +147,6 @@ class CommandHandler:
         # Mask commands
         elif cmd_type in ['add_selection_mask', 'add_selection_mask_to_active']:
             return self.handlers['mask'].execute(cmd_type, command)
-
-        # Transform commands
-        elif cmd_type in ['create_transform_mask', 'transform_mask', 'fit_to_canvas']:
-            return self.handlers['transform'].execute(cmd_type, command)
 
         # Document commands
         elif cmd_type in ['get_current_dimensions', 'create_new_from_current',

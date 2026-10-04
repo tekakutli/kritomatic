@@ -27,7 +27,8 @@ class LayerTextHandler:
             '--x': {'type': 'float', 'default': 0, 'help': 'X position in pixels'},
             '--y': {'type': 'float', 'default': 0, 'help': 'Y position in pixels'},
             '--color': {'type': 'str', 'default': '#000000', 'help': 'Hex color (e.g., #ff0000)'},
-            '--alignment': {'type': 'str', 'default': 'left', 'choices': ['left', 'center', 'right'], 'help': 'Text alignment'}
+            '--alignment': {'type': 'str', 'default': 'left', 'choices': ['left', 'center', 'right'], 'help': 'Text alignment'},
+            '--rotation': {'type': 'float', 'default': 0, 'help': 'Rotation in degrees around (x, y); positive is clockwise'}
         }
     )
     def add_vector_text(self, params):
@@ -45,6 +46,7 @@ class LayerTextHandler:
             y = params.get('y', 0)
             color = params.get('color', '#000000')
             alignment = params.get('alignment', 'left')
+            rotation = params.get('rotation', 0)
 
             target_layer = doc.nodeByName(layer_name)
             if not target_layer:
@@ -68,14 +70,21 @@ class LayerTextHandler:
             if not color.startswith('#'):
                 color = '#' + color
 
+            # SVG uses a y-down coordinate system, so a positive rotation
+            # angle is clockwise. Rotation -90 makes horizontal text read
+            # bottom-to-top, which is what a left-edge label needs.
+            transform_attr = ""
+            if rotation:
+                transform_attr = f' transform="rotate({rotation} {x} {y})"'
+
             svg = f'''<svg width="{canvas_width}" height="{canvas_height}" xmlns="http://www.w3.org/2000/svg">
-      <text font-family="{font_family}" font-size="{font_size}" fill="{color}" x="{x}" y="{y}"{text_align}>{text}</text>
+      <text font-family="{font_family}" font-size="{font_size}" fill="{color}" x="{x}" y="{y}"{text_align}{transform_attr}>{text}</text>
     </svg>'''
 
             target_layer.addShapesFromSvg(svg)
             doc.refreshProjection()
 
-            return {'success': True, 'message': f'Added text to "{layer_name}"', 'data': {'text': text, 'font': font_family, 'size': font_size, 'position': (x, y), 'canvas': (canvas_width, canvas_height)}}
+            return {'success': True, 'message': f'Added text to "{layer_name}"', 'data': {'text': text, 'font': font_family, 'size': font_size, 'position': (x, y), 'rotation': rotation, 'canvas': (canvas_width, canvas_height)}}
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
@@ -117,7 +126,6 @@ class LayerTextHandler:
                 if old_text in svg:
                     shape_to_remove = shape
                     original_svg = svg
-                    # Capture transform
                     if hasattr(shape, 'transformation'):
                         transform = shape.transformation()
                     break
@@ -125,7 +133,6 @@ class LayerTextHandler:
             if shape_to_remove is None:
                 return {'success': False, 'message': f'Text "{old_text}" not found on layer "{layer_name}"'}
 
-            # Replace text content
             new_svg = original_svg.replace(old_text, new_text)
             complete_svg = f'''<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">
       {new_svg}
@@ -134,7 +141,6 @@ class LayerTextHandler:
             shape_to_remove.remove()
             target_layer.addShapesFromSvg(complete_svg)
 
-            # Apply transform to the newly added shape
             if transform:
                 all_shapes = list(target_layer.shapes())
                 if all_shapes:
@@ -223,12 +229,11 @@ class LayerTextHandler:
 
             for layer in vector_layers:
                 replacements_in_layer = 0
-                shapes_data = []  # Store (svg, transform) pairs
+                shapes_data = []
 
                 for shape in layer.shapes():
                     svg = shape.toSvg()
                     if old_text in svg:
-                        # Get the transform if it exists
                         transform = None
                         if hasattr(shape, 'transformation'):
                             transform = shape.transformation()
@@ -238,20 +243,16 @@ class LayerTextHandler:
                         replacements_in_layer += 1
 
                 if replacements_in_layer > 0:
-                    # Remove all shapes from this layer
                     for shape in list(layer.shapes()):
                         shape.remove()
 
-                    # Add new shapes with preserved transforms
                     for svg, transform in shapes_data:
                         complete_svg = f'''<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">
       {svg}
     </svg>'''
                         layer.addShapesFromSvg(complete_svg)
 
-                        # Apply transform to the newly added shape
                         if transform:
-                            # Get the most recently added shape
                             all_shapes = list(layer.shapes())
                             if all_shapes:
                                 new_shape = all_shapes[-1]
@@ -297,7 +298,6 @@ class LayerTextHandler:
             layer_name = params.get('layer_name', None)
             output_file = params.get('output', None)
 
-            # Find all vector layers
             vector_layers = []
 
             def find_vector_layers(node):
@@ -307,7 +307,6 @@ class LayerTextHandler:
                     find_vector_layers(child)
 
             if layer_name:
-                # Find specific layer
                 target = doc.nodeByName(layer_name)
                 if not target:
                     return {'success': False, 'message': f'Layer "{layer_name}" not found'}
@@ -316,13 +315,11 @@ class LayerTextHandler:
                 else:
                     return {'success': False, 'message': f'Layer "{layer_name}" is not a vector layer'}
             else:
-                # Get all vector layers
                 find_vector_layers(doc.rootNode())
 
             if not vector_layers:
                 return {'success': False, 'message': 'No vector layers found'}
 
-            # Extract text from all shapes
             import re
             results = []
             total_text_objects = 0
@@ -331,12 +328,10 @@ class LayerTextHandler:
                 layer_texts = []
                 for shape in layer.shapes():
                     svg = shape.toSvg()
-                    # Extract text content from SVG
-                    # Pattern matches text between > and <, but not empty
                     text_matches = re.findall(r'>([^<]+)<', svg)
                     if text_matches:
                         for text in text_matches:
-                            if text.strip():  # Skip empty text
+                            if text.strip():
                                 layer_texts.append(text.strip())
                                 total_text_objects += 1
 
@@ -347,7 +342,6 @@ class LayerTextHandler:
                         'count': len(layer_texts)
                     })
 
-            # Format output
             output_lines = []
             output_lines.append(f"Document: {doc.fileName() if doc.fileName() else 'Untitled'}")
             output_lines.append(f"Total text objects found: {total_text_objects}")
@@ -362,7 +356,6 @@ class LayerTextHandler:
 
             output_text = "\n".join(output_lines)
 
-            # Save to file or print
             if output_file:
                 with open(output_file, 'w', encoding='utf-8') as f:
                     f.write(output_text)

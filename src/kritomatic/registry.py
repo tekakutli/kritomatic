@@ -38,6 +38,20 @@ class CommandRegistry:
         self._registry = None
         self._cached_version = None
 
+    @staticmethod
+    def default_manual_path() -> Path:
+        """
+        Where `kritomatic export-manual` writes when no --output is
+        given: `command_reference.md` at the repo root, next to
+        BATCH_MANUAL.md.
+
+        registry.py lives at <repo>/src/kritomatic/registry.py, so three
+        parents up is the repo root. This is stable regardless of the
+        caller's cwd, and stable across editable installs because
+        pipx/pip -e resolves __file__ back to the checkout.
+        """
+        return Path(__file__).resolve().parent.parent.parent / 'command_reference.md'
+
     def _get_cached_version(self) -> Optional[str]:
         """Get version from cached schema"""
         if self.cache_path.exists():
@@ -150,7 +164,7 @@ class CommandRegistry:
                    '  kritomatic batch run \'{"commands": [...]}\'\n'
                    '  kritomatic batch validate \'{"commands": [...]}\'\n'
                    '  kritomatic --refresh\n'
-                   '  kritomatic export-manual > command_reference.md'
+                   '  kritomatic export-manual'
         )
 
         subparsers = parser.add_subparsers(
@@ -173,7 +187,12 @@ class CommandRegistry:
         )
         export_manual_parser.add_argument(
             '-o', '--output',
-            help='Output file path (prints to stdout if not specified)'
+            help='Output file path. Defaults to command_reference.md at '
+                 'the repo root, next to BATCH_MANUAL.md.'
+        )
+        export_manual_parser.add_argument(
+            '--stdout', action='store_true',
+            help='Print to stdout instead of writing a file.'
         )
         export_manual_parser.add_argument(
             '--category',
@@ -331,7 +350,7 @@ class CommandRegistry:
         lines.append('> Do not hand-edit — regenerate with:')
         lines.append('>')
         lines.append('> ```')
-        lines.append('> kritomatic export-manual -o command_reference.md')
+        lines.append('> kritomatic export-manual')
         lines.append('> ```')
         lines.append('>')
         lines.append('> Interpretive notes — disambiguation between commands,')

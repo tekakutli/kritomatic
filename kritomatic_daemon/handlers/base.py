@@ -8,6 +8,8 @@ from .document import DocumentHandler
 from .view import ViewHandler
 from .window import WindowHandler
 from .diffusion import DiffusionHandler
+from .introspect import IntrospectHandler
+from .daemon import DaemonHandler
 from ..registry import get_command_registry
 
 class CommandHandler:
@@ -20,7 +22,9 @@ class CommandHandler:
             'document': DocumentHandler(),
             'view': ViewHandler(),
             'window': WindowHandler(),
-            'diffusion': DiffusionHandler()
+            'diffusion': DiffusionHandler(),
+            'introspect': IntrospectHandler(),
+            'daemon': DaemonHandler()
         }
 
     def _send_line(self, client_socket, payload):
@@ -41,8 +45,6 @@ class CommandHandler:
                 for i, cmd in enumerate(commands):
                     cmd_type = cmd.get('type')
 
-                    # Per-command isolation: a handler exception must not
-                    # abort the whole batch. It becomes a single error entry.
                     try:
                         result = self._dispatch(cmd)
                         ok = bool(result.get('success'))
@@ -64,7 +66,6 @@ class CommandHandler:
 
                     results.append(entry)
 
-                    # Stream this command's result to the client immediately.
                     self._send_line(client_socket, {
                         'type': 'progress',
                         'index': i,
@@ -130,6 +131,7 @@ class CommandHandler:
         elif cmd_type in ['create_layer', 'list_layers', 'set_active_layer', 'rename_active_layer',
                           'rename_layer_by_name', 'move_layer_to_group', 'move_active_layer_to_group',
                           'create_file_layer', 'convert_to_file_layer', 'create_blend_layer',
+                          'embed_image_as_layer', 'import_kra_as_group',
                           'fill_layer', 'fill_selection', 'move_layer_to_new_document',
                           'export_layer_to_file', 'apply_color_to_alpha', 'add_color_to_alpha_mask',
                           'create_transform_mask', 'transform_mask', 'fit_to_canvas']:
@@ -150,7 +152,9 @@ class CommandHandler:
 
         # Document commands
         elif cmd_type in ['get_current_dimensions', 'create_new_from_current',
-                          'create_new_with_dimensions', 'get_all_documents', 'save_document']:
+                          'create_new_with_dimensions', 'get_all_documents', 'save_document',
+                          'open_document', 'close_document', 'export_document',
+                          'export_file_to_image', 'rotate_document', 'rotate_kra_file']:
             return self.handlers['document'].execute(cmd_type, command)
 
         # View commands
@@ -166,6 +170,15 @@ class CommandHandler:
         # Diffusion commands
         elif cmd_type in ['list_workflows', 'switch_workflow', 'get_params', 'set_param', 'generate', 'export_params', 'import_params']:
             return self.handlers['diffusion'].execute(cmd_type, command)
+
+        # Introspect commands
+        elif cmd_type in ['list_actions', 'list_filters', 'list_resources',
+                          'list_dockers', 'describe_active', 'list_extensions']:
+            return self.handlers['introspect'].execute(cmd_type, command)
+
+        # Daemon meta-commands
+        elif cmd_type in ['reload_daemon']:
+            return self.handlers['daemon'].execute(cmd_type, command)
 
         else:
             return {'success': False, 'message': f'Unknown command type: {cmd_type}'}

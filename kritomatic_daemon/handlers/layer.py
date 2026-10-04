@@ -27,7 +27,8 @@ class LayerHandler:
             return self.basic.execute(cmd_type, params)
 
         # File layer operations
-        elif cmd_type in ['create_file_layer', 'convert_to_file_layer']:
+        elif cmd_type in ['create_file_layer', 'convert_to_file_layer',
+                          'embed_image_as_layer', 'import_kra_as_group']:
             return self.file.execute(cmd_type, params)
 
         # Transform mask operations

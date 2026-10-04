@@ -129,15 +129,20 @@ def main():
     if args.command == 'export-manual':
         output = getattr(args, 'output', None)
         category = getattr(args, 'category', None)
+        to_stdout = getattr(args, 'stdout', False)
         version = registry_mgr._get_cached_version()
         md = registry_mgr.to_markdown(version=version, category=category)
-        if output:
-            with open(output, 'w') as f:
-                f.write(md)
-            if not suppress_output:
-                print(f"✓ Wrote command reference to {output}")
-        else:
+
+        if to_stdout:
             print(md)
+        else:
+            if output:
+                target = Path(output).expanduser()
+            else:
+                target = registry_mgr.default_manual_path()
+            target.write_text(md)
+            if not suppress_output:
+                print(f"✓ Wrote command reference to {target}")
         return
 
     elif args.command == 'list':

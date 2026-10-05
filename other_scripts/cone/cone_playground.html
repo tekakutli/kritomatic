@@ -1,0 +1,1337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Cone interior — viewer</title>
+<style>
+  html, body {
+    margin:0; padding:0; height:100%; overflow:hidden;
+    background:#0a0e14; color:#dce6f2;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas',
+                 'SF Mono', monospace;
+  }
+
+  #ui {
+    position:absolute; top:12px; left:12px; z-index:10;
+    background:#0b1018;
+    padding:12px 14px;
+    border:1px solid #1e2836;
+    border-radius:3px;
+    box-shadow:0 6px 28px rgba(0,0,0,0.65);
+    font-size:11px; color:#a8b5c4;
+    user-select:none;
+    width:288px; box-sizing:border-box;
+  }
+  #ui.collapsed { display:none; }
+
+  #ui h3 {
+    display:flex; align-items:center; gap:6px;
+    margin:0 0 10px; padding:0 0 8px;
+    border-bottom:1px solid #1e2836;
+    font-size:11px; font-weight:700;
+    letter-spacing:0.16em; text-transform:uppercase;
+    color:#dce6f2;
+  }
+
+  #ui .field { display:flex; align-items:center; gap:8px; margin:7px 0; }
+  #ui .field label {
+    flex:0 0 78px;
+    font-size:9px; color:#5a6774;
+    letter-spacing:0.14em; text-transform:uppercase;
+    font-weight:700;
+  }
+  #ui .field input[type=range] {
+    flex:1 1 auto; min-width:0;
+    accent-color:#00e5ff;
+  }
+  #ui .field .val {
+    flex:0 0 44px;
+    font-size:11px; color:#00e5ff;
+    text-align:right; font-weight:700;
+    font-variant-numeric: tabular-nums;
+  }
+
+  #ui .row { display:flex; gap:6px; margin:6px 0; }
+  #ui .row button { flex:1 1 auto; }
+
+  #ui button {
+    padding:5px 10px; cursor:pointer;
+    border:1px solid #223040; background:transparent;
+    color:#b8c4d2; border-radius:2px;
+    font-family:inherit; font-size:10px;
+    letter-spacing:0.10em; text-transform:uppercase;
+    font-weight:700;
+    transition: background 0.08s ease, border-color 0.08s ease;
+  }
+  #ui button:hover {
+    border-color:#34445a; color:#dce6f2;
+    background:rgba(220,230,242,0.03);
+  }
+  #ui button:active { background:rgba(220,230,242,0.07); }
+
+  #ui hr { border:0; border-top:1px solid #1e2836; margin:10px 0; }
+
+  /* ---- patch list ------------------------------------------------ */
+  .quadList {
+    display:flex; flex-direction:column;
+    gap:3px; margin:6px 0 0;
+    max-height:180px; overflow-y:auto;
+  }
+  .quadList::-webkit-scrollbar { width:6px; }
+  .quadList::-webkit-scrollbar-thumb {
+    background:#1e2836; border-radius:3px;
+  }
+  .quadList .empty {
+    font-size:10px; color:#3d4756;
+    font-style:italic; padding:3px 4px;
+  }
+  .quadRow {
+    display:flex; align-items:center; gap:7px;
+    padding:3px 6px;
+    border:1px solid #223040;
+    border-radius:2px;
+    cursor:pointer;
+    font-size:10px;
+    color:#a8b5c4;
+    letter-spacing:0.04em;
+    flex:0 0 auto;
+  }
+  .quadRow:hover {
+    border-color:#34445a; color:#dce6f2;
+    background:rgba(220,230,242,0.03);
+  }
+  .quadRow.selected {
+    border-color:rgba(255,180,60,0.65);
+    color:#ffc966;
+    background:rgba(255,180,60,0.06);
+  }
+  .quadSwatch {
+    width:9px; height:9px;
+    background:rgba(255,200,90,0.55);
+    border:1px solid rgba(255,200,90,0.85);
+    border-radius:1px;
+    flex:0 0 auto;
+  }
+  .quadRow.selected .quadSwatch {
+    background:rgba(255,200,90,0.95);
+    border-color:#ffc966;
+  }
+  .quadLabel {
+    flex:1 1 auto; font-weight:700;
+    font-variant-numeric: tabular-nums;
+  }
+  .quadDel {
+    width:auto !important;
+    padding:1px 6px !important;
+    font-size:12px !important;
+    line-height:1 !important;
+    border-color:#4a2830 !important;
+    color:#d48590 !important;
+    letter-spacing:0 !important;
+  }
+  .quadDel:hover {
+    background:rgba(212,133,144,0.10) !important;
+    border-color:#7a3e4a !important;
+    color:#e8a0a8 !important;
+  }
+
+  #status {
+    margin-top:10px; padding-top:8px;
+    border-top:1px solid #1e2836;
+    font-size:10px; color:#7b8794;
+    min-height:14px;
+    font-variant-numeric: tabular-nums;
+    overflow-wrap:anywhere; line-height:1.5;
+  }
+  #status.ok   { color:#00e5ff; }
+  #status.bad  { color:#d48590; }
+  #status.warn { color:#ffe600; }
+
+  canvas { display:block; touch-action:none; background:#0a0e14; }
+
+  #restoreBtn {
+    position:absolute; top:12px; left:12px; z-index:10;
+    display:none;
+    padding:6px 12px; cursor:pointer;
+    border:1px solid #1e2836; background:#0b1018;
+    border-radius:3px; box-shadow:0 6px 28px rgba(0,0,0,0.65);
+    font-family:inherit;
+    font-size:10px; font-weight:700; letter-spacing:0.10em;
+    text-transform:uppercase; color:#a8b5c4;
+  }
+  #restoreBtn:hover { border-color:#34445a; color:#dce6f2; }
+  #restoreBtn.visible { display:block; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <h3>Cone interior
+    <button id="collapseBtn" title="Collapse (H)"
+      style="margin-left:auto; width:auto; padding:0 6px;
+             height:20px; font-size:11px; line-height:1;">−</button>
+  </h3>
+
+  <div class="field">
+    <label>Depth</label>
+    <input type="range" id="depthSlider"
+           min="3" max="40" step="0.5" value="15">
+    <span class="val" id="depthVal">15.0</span>
+  </div>
+  <div class="field">
+    <label>Half-angle</label>
+    <input type="range" id="angleSlider"
+           min="10" max="60" step="1" value="30">
+    <span class="val" id="angleVal">30°</span>
+  </div>
+  <div class="field">
+    <label>Rings</label>
+    <input type="range" id="ringsSlider"
+           min="4" max="40" step="1" value="14">
+    <span class="val" id="ringsVal">14</span>
+  </div>
+  <div class="field">
+    <label>Meridians</label>
+    <input type="range" id="meridiansSlider"
+           min="4" max="48" step="1" value="24">
+    <span class="val" id="meridiansVal">24</span>
+  </div>
+
+  <hr>
+
+  <div class="field" style="margin-bottom:2px;">
+    <label>Patches</label>
+    <button id="addQuadBtn" style="flex:1 1 auto;">+ Add patch</button>
+  </div>
+  <div id="quadList" class="quadList"></div>
+
+  <hr>
+
+  <div class="row">
+    <button id="resetBtn">Reset</button>
+    <button id="centerBtn">Center apex</button>
+  </div>
+
+  <div id="status">drag apex to tilt · scroll to change depth · drag patches in either view</div>
+</div>
+
+<button id="restoreBtn" title="Show panel (H)">☰ Show panel</button>
+
+<canvas id="c"></canvas>
+<script>
+"use strict";
+
+/* ==========================================================================
+   CANVAS
+   ========================================================================== */
+
+const canvas = document.getElementById("c");
+const ctx    = canvas.getContext("2d");
+let dpr = window.devicePixelRatio || 1;
+
+/* ==========================================================================
+   LAYOUT
+   ========================================================================== */
+
+const layout = {
+  coneH:     0,
+  dividerY:  0,
+  reservedY: 0,
+  reservedH: 0,
+};
+
+/* ==========================================================================
+   VIEW
+   ========================================================================== */
+
+const view = {
+  scale: 20, tx: 0, ty: 0,
+  zoom: 1, panX: 0, panY: 0,
+};
+
+function w2s(x, y) { return [x * view.scale + view.tx,
+                             -y * view.scale + view.ty]; }
+function s2w(sx, sy) { return [(sx - view.tx) / view.scale,
+                               -(sy - view.ty) / view.scale]; }
+
+/* ==========================================================================
+   CONE
+   ========================================================================== */
+
+const cone = {
+  ax: 0, ay: 0,
+  depth: 15,
+  halfAngle: Math.PI / 6,
+  ringCount: 14,
+  meridianCount: 24,
+};
+
+function clampApex() {
+  const R = cone.depth * Math.tan(cone.halfAngle);
+  const maxR = R * 0.98;
+  const dr = Math.hypot(cone.ax, cone.ay);
+  if (dr > maxR && dr > 1e-9) {
+    const s = maxR / dr;
+    cone.ax *= s;
+    cone.ay *= s;
+  }
+}
+
+function coneR() { return cone.depth * Math.tan(cone.halfAngle); }
+
+function surfacePoint(phi, s) {
+  const R = coneR();
+  const r = (1 - s) * R;
+  return [s * cone.ax + r * Math.cos(phi),
+          s * cone.ay + r * Math.sin(phi)];
+}
+
+/* ==========================================================================
+   PATCH MODEL — rectangles in (phi, s) parameter space
+   ==========================================================================
+   Every patch is stored as four numbers:
+
+       phi0, phi1    angular bounds,  phi0 < phi1
+       s0,   s1      axial bounds,    s0   < s1
+
+   The four corners, in the fixed order every renderer and hit test
+   uses:
+
+       index 0   (phi0, s1)   top-left       near apex
+       index 1   (phi1, s1)   top-right      near apex
+       index 2   (phi1, s0)   bottom-right   near base
+       index 3   (phi0, s0)   bottom-left    near base
+
+   The lateral edges are the phi = phi0 and phi = phi1 edges.  In 3D
+   those lie on meridians, and every meridian ends at the apex, so
+   the two lateral edges point straight at the peak.  The top edge is
+   clamped below s = 1 (S_MAX < 1) so a patch aims at the apex but
+   never touches it — matching the user's "going toward the peak,
+   without stretching into it" reading. */
+
+const S_MIN = 0.00;
+const S_MAX = 0.90;
+
+const quads = [];
+let nextQuadId = 1;
+let selectedQuad = -1;
+
+function quadCorners(q) {
+  return [
+    { phi: q.phi0, s: q.s1 },
+    { phi: q.phi1, s: q.s1 },
+    { phi: q.phi1, s: q.s0 },
+    { phi: q.phi0, s: q.s0 },
+  ];
+}
+
+/* A new patch: a wide-ish trapezoid near the apex of the surface,
+   landing at successive angular slots so a stack fans out around the
+   cone rather than piling on one meridian.  phiCenter wraps into
+   [0, 2*pi] and nudges inward if the wrap would push either bound
+   outside the flat view's phi range. */
+function addQuad() {
+  const id  = nextQuadId++;
+  const idx = quads.length;
+  const dPhi = 0.36;
+
+  let phiCenter = Math.PI / 2 + idx * 0.70;
+  phiCenter = ((phiCenter % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+  if (phiCenter - dPhi < 0)           phiCenter = dPhi;
+  if (phiCenter + dPhi > 2 * Math.PI) phiCenter = 2 * Math.PI - dPhi;
+
+  quads.push({
+    id, name: "Q" + id,
+    phi0: phiCenter - dPhi,
+    phi1: phiCenter + dPhi,
+    s0: 0.22,
+    s1: 0.72,
+  });
+  selectedQuad = quads.length - 1;
+  syncQuadList();
+  draw();
+}
+
+function deleteQuad(idx) {
+  if (idx < 0 || idx >= quads.length) return;
+  quads.splice(idx, 1);
+  if (selectedQuad >= quads.length) selectedQuad = quads.length - 1;
+  syncQuadList();
+  draw();
+}
+
+/* ==========================================================================
+   INVERSE PROJECTION — cursor world point → (phi, s) on the surface
+   ==========================================================================
+   For a fixed s the closest surface point to a world point T is on
+   the ring at that s, and its squared distance is
+
+       A·s² + B·s + C = 0
+       A = |apex|² − R²
+       B = −2 · (apex·T − R²)
+       C = |T|² − R²
+
+   Two real roots mean the ray through T crosses the surface twice;
+   the one nearer the vertex's current s wins, so a drag across the
+   surface stays stable.  No real root (T inside the "hole" or outside
+   the base ring) falls back to a forty-step sample of the surface
+   distance function. */
+function projectToConeSurface(wx, wy, currentS) {
+  const Px = cone.ax, Py = cone.ay;
+  const R  = coneR();
+  const R2 = R * R;
+  const p2 = Px * Px + Py * Py;
+  const t2 = wx * wx + wy * wy;
+  const pt = Px * wx + Py * wy;
+
+  const A = p2 - R2;
+  const B = -2 * (pt - R2);
+  const C = t2 - R2;
+
+  const roots = [];
+  if (Math.abs(A) < 1e-6) {
+    if (Math.abs(B) > 1e-9) roots.push(-C / B);
+  } else {
+    const disc = B * B - 4 * A * C;
+    if (disc >= 0) {
+      const sq = Math.sqrt(disc);
+      roots.push((-B - sq) / (2 * A));
+      roots.push((-B + sq) / (2 * A));
+    }
+  }
+
+  let bestS = null, bestDelta = Infinity;
+  for (const s of roots) {
+    if (s < S_MIN - 0.01 || s > S_MAX + 0.01) continue;
+    const c = Math.max(S_MIN, Math.min(S_MAX, s));
+    const d = Math.abs(c - currentS);
+    if (d < bestDelta) { bestDelta = d; bestS = c; }
+  }
+
+  if (bestS === null) {
+    bestDelta = Infinity;
+    for (let i = 0; i <= 40; i++) {
+      const s = S_MIN + (S_MAX - S_MIN) * i / 40;
+      const cx = s * Px, cy = s * Py;
+      const r  = (1 - s) * R;
+      const d  = Math.abs(Math.hypot(wx - cx, wy - cy) - r);
+      if (d < bestDelta) { bestDelta = d; bestS = s; }
+    }
+    if (bestS === null) bestS = Math.max(S_MIN, Math.min(S_MAX, currentS));
+  }
+
+  const cx = bestS * Px, cy = bestS * Py;
+  const dx = wx - cx, dy = wy - cy;
+  const phi = (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9)
+              ? 0 : Math.atan2(dy, dx);
+  return { phi, s: bestS };
+}
+
+/* ==========================================================================
+   TRANSIENT STATE
+   ========================================================================== */
+
+const state = {
+  dragApex:       null,
+  dragQuadVertex: null,
+  flatDrag:       null,
+  mouse: { sx: 0, sy: 0, inside: false },
+};
+
+/* ==========================================================================
+   RESIZE / FIT
+   ========================================================================== */
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
+
+  canvas.width  = Math.round(cw * dpr);
+  canvas.height = Math.round(ch * dpr);
+  canvas.style.width  = cw + "px";
+  canvas.style.height = ch + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  layout.coneH     = Math.round(ch * 0.58);
+  layout.dividerY  = layout.coneH;
+  layout.reservedY = layout.coneH + 4;
+  layout.reservedH = ch - layout.reservedY;
+
+  fitView();
+  draw();
+}
+window.addEventListener("resize", resize);
+
+function fitView() {
+  view.scale = 20 * view.zoom;
+  view.tx = window.innerWidth / 2 + view.panX;
+  view.ty = layout.coneH / 2 + view.panY;
+}
+
+function resetView() {
+  view.zoom = 1; view.panX = 0; view.panY = 0;
+  cone.ax = 0; cone.ay = 0;
+  cone.depth = 15;
+  cone.halfAngle = Math.PI / 6;
+  cone.ringCount = 14;
+  cone.meridianCount = 24;
+  syncPanelSliders();
+  fitView();
+  draw();
+}
+
+/* ==========================================================================
+   CONE RENDERER
+   ========================================================================== */
+
+function drawConeView() {
+  const cw = window.innerWidth;
+  const ch = layout.coneH;
+
+  const R_world = cone.depth * Math.tan(cone.halfAngle);
+  const [Bx, By] = w2s(0, 0);
+  const [Ax, Ay] = w2s(cone.ax, cone.ay);
+  const Rs = R_world * view.scale;
+
+  /* depth gradient */
+  const apexDist  = Math.hypot(Ax - Bx, Ay - By);
+  const gradientR = Math.max(apexDist + Rs, 40);
+  const bg = ctx.createRadialGradient(Ax, Ay, 0, Ax, Ay, gradientR);
+  bg.addColorStop(0.00, "#05080c");
+  bg.addColorStop(0.32, "#070c12");
+  bg.addColorStop(0.68, "#0a1018");
+  bg.addColorStop(1.00, "#0e1622");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, cw, ch);
+
+  /* meridians */
+  const M = cone.meridianCount;
+  ctx.lineCap = "round";
+  for (let i = 0; i < M; i++) {
+    const phi = i * 2 * Math.PI / M;
+    const [ex, ey] = w2s(R_world * Math.cos(phi),
+                         R_world * Math.sin(phi));
+    const lg = ctx.createLinearGradient(Ax, Ay, ex, ey);
+    lg.addColorStop(0.00, "rgba(0, 229, 255, 0.00)");
+    lg.addColorStop(0.10, "rgba(0, 229, 255, 0.09)");
+    lg.addColorStop(0.60, "rgba(0, 229, 255, 0.20)");
+    lg.addColorStop(1.00, "rgba(0, 229, 255, 0.40)");
+    ctx.beginPath(); ctx.moveTo(Ax, Ay); ctx.lineTo(ex, ey);
+    ctx.strokeStyle = lg; ctx.lineWidth = 0.9; ctx.stroke();
+  }
+
+  /* rings */
+  const N = cone.ringCount;
+  for (let k = 0; k <= N; k++) {
+    const s = k / N;
+    const [cx, cy] = w2s(s * cone.ax, s * cone.ay);
+    const rs = (1 - s) * R_world * view.scale;
+    if (rs < 0.5) continue;
+    const u = 1 - s;
+    const alpha = 0.10 + 0.55 * u * u;
+    ctx.beginPath(); ctx.arc(cx, cy, rs, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(0, 229, 255, " + alpha.toFixed(3) + ")";
+    ctx.lineWidth = (k === 0) ? 2.0 : 0.9; ctx.stroke();
+  }
+
+  /* axis */
+  if (apexDist > 6) {
+    ctx.save();
+    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = "rgba(255, 43, 214, 0.45)";
+    ctx.lineWidth = 1.0;
+    ctx.beginPath(); ctx.moveTo(Bx, By); ctx.lineTo(Ax, Ay); ctx.stroke();
+    ctx.restore();
+  }
+
+  /* base tick */
+  if (Rs > 20) {
+    ctx.beginPath();
+    ctx.arc(Bx, By, Rs, -Math.PI / 2 - 0.15, -Math.PI / 2 + 0.15);
+    ctx.strokeStyle = "rgba(255, 43, 214, 0.9)";
+    ctx.lineWidth = 2.4; ctx.stroke();
+  }
+
+  /* base centre dot */
+  ctx.beginPath(); ctx.arc(Bx, By, 2.2, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(220, 230, 242, 0.55)"; ctx.fill();
+
+  /* patches — unselected first, selected on top */
+  for (let i = 0; i < quads.length; i++) {
+    if (i === selectedQuad) continue;
+    drawQuadPatch(quads[i], false);
+  }
+  if (selectedQuad >= 0 && selectedQuad < quads.length) {
+    drawQuadPatch(quads[selectedQuad], true);
+  }
+
+  /* apex marker */
+  const haloR = 22;
+  const halo = ctx.createRadialGradient(Ax, Ay, 0, Ax, Ay, haloR);
+  halo.addColorStop(0.0, "rgba(255, 230, 0, 0.34)");
+  halo.addColorStop(1.0, "rgba(255, 230, 0, 0.00)");
+  ctx.fillStyle = halo;
+  ctx.beginPath(); ctx.arc(Ax, Ay, haloR, 0, Math.PI * 2); ctx.fill();
+
+  ctx.beginPath(); ctx.arc(Ax, Ay, 5.5, 0, Math.PI * 2);
+  ctx.fillStyle = "#ffe600"; ctx.fill();
+  ctx.strokeStyle = "#0a0e14"; ctx.lineWidth = 2; ctx.stroke();
+
+  /* corner caption */
+  ctx.save();
+  ctx.font = "700 10px 'JetBrains Mono', 'Fira Code', monospace";
+  ctx.fillStyle = "#5a6774";
+  ctx.textAlign = "left"; ctx.textBaseline = "top";
+  const halfDeg = Math.round(cone.halfAngle * 180 / Math.PI);
+  const tiltDeg = Math.atan2(Math.hypot(cone.ax, cone.ay), cone.depth)
+                  * 180 / Math.PI;
+  ctx.fillText(
+    "APEX (" + cone.ax.toFixed(1) + ", " + cone.ay.toFixed(1) + ")" +
+    "   TILT " + tiltDeg.toFixed(1) + "\u00B0" +
+    "   DEPTH " + cone.depth.toFixed(1) +
+    "   HALF-ANGLE " + halfDeg + "\u00B0" +
+    "   PATCHES " + quads.length,
+    14, 14);
+  ctx.restore();
+}
+
+function drawQuadPatch(q, selected) {
+  const pts = quadCorners(q).map(c => {
+    const [wx, wy] = surfacePoint(c.phi, c.s);
+    return w2s(wx, wy);
+  });
+
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.closePath();
+  ctx.fillStyle = selected
+    ? "rgba(255, 200, 90, 0.22)"
+    : "rgba(255, 200, 90, 0.08)";
+  ctx.fill();
+
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = selected
+    ? "rgba(255, 220, 130, 1.00)"
+    : "rgba(255, 200, 90, 0.68)";
+  ctx.lineWidth = selected ? 2.0 : 1.3;
+  ctx.stroke();
+
+  const rDot = selected ? 5.2 : 3.0;
+  for (const [sx, sy] of pts) {
+    ctx.beginPath(); ctx.arc(sx, sy, rDot, 0, Math.PI * 2);
+    ctx.fillStyle = selected ? "#ffe680" : "rgba(255, 210, 100, 0.80)";
+    ctx.fill();
+    ctx.strokeStyle = "#0a0e14"; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+}
+
+/* ==========================================================================
+   FLAT VIEW
+   ========================================================================== */
+
+const FLAT_PHI_MIN = 0;
+const FLAT_PHI_MAX = 2 * Math.PI;
+const FLAT_S_MIN   = 0;
+const FLAT_S_MAX   = 1;
+
+const QUAD_MIN_SIZE_PHI = 0.06;
+const QUAD_MIN_SIZE_S   = 0.04;
+
+/* ---- Rect / transforms ------------------------------------------ */
+
+function flatRect() {
+  const W = window.innerWidth;
+  const H = layout.reservedH;
+  const MARGIN_X = 44;
+  const TOP_PAD  = 26;
+  const BOT_PAD  = 26;
+  const maxW = W - 2 * MARGIN_X;
+  const maxH = H - TOP_PAD - BOT_PAD - 4;
+
+  /* Aspect target of 2.5:1 keeps the parameter rectangle
+     recognisably a landscape strip rather than a square, which
+     matches the mental image of an unrolled cone. */
+  const w = Math.min(maxW, maxH * 2.5);
+  const h = Math.min(maxH, w / 2.5);
+  const x0 = (W - w) / 2;
+  const y0 = layout.reservedY + TOP_PAD + (maxH - h) / 2;
+  return { x0, y0, w, h };
+}
+
+function flatToScreen(phi, s) {
+  const r = flatRect();
+  const u = (phi - FLAT_PHI_MIN) / (FLAT_PHI_MAX - FLAT_PHI_MIN);
+  const v = s;
+  return [r.x0 + u * r.w, r.y0 + (1 - v) * r.h];
+}
+
+function screenToFlat(sx, sy) {
+  const r = flatRect();
+  return {
+    phi: FLAT_PHI_MIN +
+         (sx - r.x0) / r.w * (FLAT_PHI_MAX - FLAT_PHI_MIN),
+    s:   1 - (sy - r.y0) / r.h,
+  };
+}
+
+/* ---- Drawing ---------------------------------------------------- */
+
+function drawFlatView() {
+  const cw = window.innerWidth;
+  ctx.fillStyle = "#060a10";
+  ctx.fillRect(0, layout.reservedY, cw, layout.reservedH);
+
+  const r = flatRect();
+
+  /* reference grid — rings then meridians */
+  ctx.save();
+  const N_RINGS = 6;
+  for (let k = 1; k < N_RINGS; k++) {
+    const s = k / N_RINGS;
+    const [sx0, sy] = flatToScreen(FLAT_PHI_MIN, s);
+    const [sx1]     = flatToScreen(FLAT_PHI_MAX, s);
+    ctx.strokeStyle = "rgba(0, 229, 255, " + (0.03 + s * 0.09) + ")";
+    ctx.lineWidth = 0.7;
+    ctx.beginPath(); ctx.moveTo(sx0, sy); ctx.lineTo(sx1, sy); ctx.stroke();
+  }
+  const N_MERID = 12;
+  for (let k = 0; k <= N_MERID; k++) {
+    const phi = FLAT_PHI_MIN +
+                (FLAT_PHI_MAX - FLAT_PHI_MIN) * k / N_MERID;
+    const [sx, sy0] = flatToScreen(phi, FLAT_S_MAX);
+    const [,   sy1] = flatToScreen(phi, FLAT_S_MIN);
+    ctx.strokeStyle = "rgba(0, 229, 255, 0.05)";
+    ctx.lineWidth = 0.7;
+    ctx.beginPath(); ctx.moveTo(sx, sy0); ctx.lineTo(sx, sy1); ctx.stroke();
+  }
+
+  /* frame */
+  ctx.strokeStyle = "#1e2836";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(r.x0 + 0.5, r.y0 + 0.5, r.w - 1, r.h - 1);
+
+  /* apex line at s = 1 */
+  {
+    const [sx0, sy] = flatToScreen(FLAT_PHI_MIN, 1);
+    const [sx1]     = flatToScreen(FLAT_PHI_MAX, 1);
+    ctx.strokeStyle = "rgba(255, 43, 214, 0.55)";
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(sx0, sy); ctx.lineTo(sx1, sy); ctx.stroke();
+  }
+
+  /* seam markers at phi = 0 and phi = 2π */
+  {
+    const [sxL, sy0] = flatToScreen(FLAT_PHI_MIN, FLAT_S_MAX);
+    const [,   sy1]  = flatToScreen(FLAT_PHI_MIN, FLAT_S_MIN);
+    const [sxR]      = flatToScreen(FLAT_PHI_MAX, 0);
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = "rgba(255, 43, 214, 0.30)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(sxL, sy0); ctx.lineTo(sxL, sy1);
+    ctx.moveTo(sxR, sy0); ctx.lineTo(sxR, sy1);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.restore();
+
+  /* captions */
+  ctx.save();
+  ctx.font = "700 9px 'JetBrains Mono', 'Fira Code', monospace";
+
+  ctx.fillStyle = "#3d4756";
+  ctx.textAlign = "left"; ctx.textBaseline = "top";
+  ctx.fillText("UNFOLDED CONE  \u00B7  PARAMETER SPACE",
+               r.x0, r.y0 - 16);
+
+  ctx.textAlign = "right"; ctx.fillStyle = "#5a6774";
+  ctx.fillText("\u03C6 = 0", r.x0 - 6, r.y0);
+  ctx.textAlign = "left";
+  ctx.fillText("\u03C6 = 2\u03C0", r.x0 + r.w + 6, r.y0);
+
+  ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+  ctx.fillStyle = "#3d4756";
+  ctx.fillText("s = 0  \u00B7  base", r.x0, r.y0 + r.h + 14);
+
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "rgba(255, 43, 214, 0.75)";
+  ctx.fillText("s = 1  \u00B7  apex", r.x0, r.y0 + 4);
+  ctx.restore();
+
+  /* patches, unselected first */
+  for (let i = 0; i < quads.length; i++) {
+    if (i === selectedQuad) continue;
+    drawFlatQuad(quads[i], false);
+  }
+  if (selectedQuad >= 0 && selectedQuad < quads.length) {
+    drawFlatQuad(quads[selectedQuad], true);
+  }
+}
+
+function drawFlatQuad(q, selected) {
+  const pts = quadCorners(q).map(c => flatToScreen(c.phi, c.s));
+
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.closePath();
+  ctx.fillStyle = selected
+    ? "rgba(255, 200, 90, 0.18)"
+    : "rgba(255, 200, 90, 0.07)";
+  ctx.fill();
+
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = selected
+    ? "rgba(255, 220, 130, 1.00)"
+    : "rgba(255, 200, 90, 0.55)";
+  ctx.lineWidth = selected ? 2.0 : 1.3;
+  ctx.stroke();
+
+  const rDot = selected ? 5.0 : 2.5;
+  for (const [sx, sy] of pts) {
+    ctx.beginPath(); ctx.arc(sx, sy, rDot, 0, Math.PI * 2);
+    ctx.fillStyle = selected ? "#ffe680" : "rgba(255, 210, 100, 0.75)";
+    ctx.fill();
+    ctx.strokeStyle = "#0a0e14"; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+}
+
+/* ---- Hit testing ------------------------------------------------ */
+
+const FLAT_HANDLE_R = 10;
+const FLAT_EDGE_R   = 6;
+
+function _flatPtSegDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const l2 = dx * dx + dy * dy;
+  if (l2 < 1e-9) return Math.hypot(px - ax, py - ay);
+  let t = ((px - ax) * dx + (py - ay) * dy) / l2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+function _flatPtInQuad(px, py, c) {
+  let inside = false;
+  for (let i = 0, j = 3; i < 4; j = i++) {
+    const xi = c[i][0], yi = c[i][1];
+    const xj = c[j][0], yj = c[j][1];
+    if (((yi > py) !== (yj > py)) &&
+        (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function flatHitTest(sx, sy) {
+  const order = [];
+  if (selectedQuad >= 0 && selectedQuad < quads.length) {
+    order.push(selectedQuad);
+  }
+  for (let i = 0; i < quads.length; i++) {
+    if (i !== selectedQuad) order.push(i);
+  }
+
+  for (const qi of order) {
+    const corners = quadCorners(quads[qi]).map(c =>
+      flatToScreen(c.phi, c.s));
+
+    for (let ci = 0; ci < 4; ci++) {
+      const [csx, csy] = corners[ci];
+      if (Math.hypot(sx - csx, sy - csy) < FLAT_HANDLE_R) {
+        return { kind: "corner", quadIdx: qi, cornerIdx: ci };
+      }
+    }
+
+    const edges = [
+      { name: "top",    a: corners[0], b: corners[1] },
+      { name: "right",  a: corners[1], b: corners[2] },
+      { name: "bottom", a: corners[2], b: corners[3] },
+      { name: "left",   a: corners[3], b: corners[0] },
+    ];
+    let bestEdge = null, bestD = FLAT_EDGE_R;
+    for (const e of edges) {
+      const d = _flatPtSegDist(sx, sy, e.a[0], e.a[1], e.b[0], e.b[1]);
+      if (d < bestD) { bestD = d; bestEdge = e.name; }
+    }
+    if (bestEdge) return { kind: "edge", quadIdx: qi, edge: bestEdge };
+
+    if (_flatPtInQuad(sx, sy, corners)) {
+      return { kind: "body", quadIdx: qi };
+    }
+  }
+  return null;
+}
+
+/* ---- Drag application ------------------------------------------- */
+
+function flatMoveCorner(q, cornerIdx, phi, s) {
+  if (cornerIdx === 0) {
+    q.phi0 = Math.max(FLAT_PHI_MIN,
+                      Math.min(phi, q.phi1 - QUAD_MIN_SIZE_PHI));
+    q.s1   = Math.min(FLAT_S_MAX,
+                      Math.max(s, q.s0 + QUAD_MIN_SIZE_S));
+  } else if (cornerIdx === 1) {
+    q.phi1 = Math.min(FLAT_PHI_MAX,
+                      Math.max(phi, q.phi0 + QUAD_MIN_SIZE_PHI));
+    q.s1   = Math.min(FLAT_S_MAX,
+                      Math.max(s, q.s0 + QUAD_MIN_SIZE_S));
+  } else if (cornerIdx === 2) {
+    q.phi1 = Math.min(FLAT_PHI_MAX,
+                      Math.max(phi, q.phi0 + QUAD_MIN_SIZE_PHI));
+    q.s0   = Math.max(FLAT_S_MIN,
+                      Math.min(s, q.s1 - QUAD_MIN_SIZE_S));
+  } else if (cornerIdx === 3) {
+    q.phi0 = Math.max(FLAT_PHI_MIN,
+                      Math.min(phi, q.phi1 - QUAD_MIN_SIZE_PHI));
+    q.s0   = Math.max(FLAT_S_MIN,
+                      Math.min(s, q.s1 - QUAD_MIN_SIZE_S));
+  }
+}
+
+function flatMoveEdge(q, edge, phi, s) {
+  if (edge === "top") {
+    q.s1 = Math.min(FLAT_S_MAX, Math.max(s, q.s0 + QUAD_MIN_SIZE_S));
+  } else if (edge === "bottom") {
+    q.s0 = Math.max(FLAT_S_MIN, Math.min(s, q.s1 - QUAD_MIN_SIZE_S));
+  } else if (edge === "left") {
+    q.phi0 = Math.max(FLAT_PHI_MIN,
+                      Math.min(phi, q.phi1 - QUAD_MIN_SIZE_PHI));
+  } else if (edge === "right") {
+    q.phi1 = Math.min(FLAT_PHI_MAX,
+                      Math.max(phi, q.phi0 + QUAD_MIN_SIZE_PHI));
+  }
+}
+
+function flatMoveBody(q, dPhi, dS) {
+  let np0 = q.phi0 + dPhi, np1 = q.phi1 + dPhi;
+  if (np0 < FLAT_PHI_MIN) { np1 += FLAT_PHI_MIN - np0; np0 = FLAT_PHI_MIN; }
+  if (np1 > FLAT_PHI_MAX) { np0 -= np1 - FLAT_PHI_MAX; np1 = FLAT_PHI_MAX; }
+  if (np0 < FLAT_PHI_MIN) np0 = FLAT_PHI_MIN;
+
+  let ns0 = q.s0 + dS, ns1 = q.s1 + dS;
+  if (ns0 < FLAT_S_MIN) { ns1 += FLAT_S_MIN - ns0; ns0 = FLAT_S_MIN; }
+  if (ns1 > FLAT_S_MAX) { ns0 -= ns1 - FLAT_S_MAX; ns1 = FLAT_S_MAX; }
+  if (ns0 < FLAT_S_MIN) ns0 = FLAT_S_MIN;
+
+  q.phi0 = np0; q.phi1 = np1;
+  q.s0 = ns0;   q.s1 = ns1;
+}
+
+/* ==========================================================================
+   SLIDER SYNC
+   ========================================================================== */
+
+function syncPanelSliders() {
+  const d = document.getElementById("depthSlider");
+  const a = document.getElementById("angleSlider");
+  const r = document.getElementById("ringsSlider");
+  const m = document.getElementById("meridiansSlider");
+  if (d) d.value = cone.depth;
+  if (a) a.value = Math.round(cone.halfAngle * 180 / Math.PI);
+  if (r) r.value = cone.ringCount;
+  if (m) m.value = cone.meridianCount;
+  updatePanelLabels();
+}
+
+function updatePanelLabels() {
+  const dv = document.getElementById("depthVal");
+  const av = document.getElementById("angleVal");
+  const rv = document.getElementById("ringsVal");
+  const mv = document.getElementById("meridiansVal");
+  if (dv) dv.textContent = cone.depth.toFixed(1);
+  if (av) av.textContent =
+    Math.round(cone.halfAngle * 180 / Math.PI) + "\u00B0";
+  if (rv) rv.textContent = String(cone.ringCount);
+  if (mv) mv.textContent = String(cone.meridianCount);
+}
+
+/* ==========================================================================
+   PATCH LIST
+   ==========================================================================
+   Rebuild the panel list from the quads array.  Called on add,
+   delete, select, and after a vertex drag that changes which patch
+   is active.  Rebuilding rather than mutating keeps the row / array
+   index correspondence trivially correct — the list is short enough
+   that the cost is invisible. */
+
+function syncQuadList() {
+  const list = document.getElementById("quadList");
+  if (!list) return;
+  list.innerHTML = "";
+
+  if (quads.length === 0) {
+    const e = document.createElement("div");
+    e.className = "empty";
+    e.textContent = "no patches yet";
+    list.appendChild(e);
+    return;
+  }
+
+  for (let i = 0; i < quads.length; i++) {
+    const q   = quads[i];
+    const row = document.createElement("div");
+    row.className = "quadRow" + (i === selectedQuad ? " selected" : "");
+    row.dataset.idx = String(i);
+
+    const sw = document.createElement("span");
+    sw.className = "quadSwatch";
+    row.appendChild(sw);
+
+    const lb = document.createElement("span");
+    lb.className = "quadLabel";
+    lb.textContent = q.name;
+    row.appendChild(lb);
+
+    const del = document.createElement("button");
+    del.className = "quadDel";
+    del.textContent = "\u00D7";
+    del.title = "Delete patch";
+    del.addEventListener("click", (e) => {
+      e.stopPropagation();
+      deleteQuad(i);
+    });
+    row.appendChild(del);
+
+    row.addEventListener("click", () => {
+      selectedQuad = i;
+      syncQuadList();
+      draw();
+    });
+
+    list.appendChild(row);
+  }
+}
+
+/* ==========================================================================
+   BINDINGS
+   ========================================================================== */
+
+(function installPanel() {
+  const d = document.getElementById("depthSlider");
+  const a = document.getElementById("angleSlider");
+  const r = document.getElementById("ringsSlider");
+  const m = document.getElementById("meridiansSlider");
+  const resetBtn  = document.getElementById("resetBtn");
+  const centerBtn = document.getElementById("centerBtn");
+  const addBtn    = document.getElementById("addQuadBtn");
+
+  /* Depth and half-angle both drive R_world, so both re-clamp the
+     apex: shrinking the cone with the apex near the base ring would
+     otherwise push the apex outside the new disk and invert the
+     shear on the affected rings.  The patches, being bound to
+     (phi, s), follow the surface automatically — their screen
+     positions change but their binding does not. */
+  if (d) d.addEventListener("input", () => {
+    cone.depth = parseFloat(d.value);
+    clampApex();
+    updatePanelLabels();
+    draw();
+  });
+
+  if (a) a.addEventListener("input", () => {
+    cone.halfAngle = parseFloat(a.value) * Math.PI / 180;
+    clampApex();
+    updatePanelLabels();
+    draw();
+  });
+
+  if (r) r.addEventListener("input", () => {
+    cone.ringCount = parseInt(r.value, 10);
+    updatePanelLabels();
+    draw();
+  });
+
+  if (m) m.addEventListener("input", () => {
+    cone.meridianCount = parseInt(m.value, 10);
+    updatePanelLabels();
+    draw();
+  });
+
+  if (resetBtn)  resetBtn.addEventListener("click", resetView);
+  if (centerBtn) centerBtn.addEventListener("click", () => {
+    cone.ax = 0;
+    cone.ay = 0;
+    draw();
+  });
+
+  if (addBtn) addBtn.addEventListener("click", addQuad);
+})();
+
+/* ==========================================================================
+   DRAW
+   ========================================================================== */
+
+function draw() {
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#0a0e14";
+  ctx.fillRect(0, 0, cw, ch);
+
+  /* cone band */
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, 0, cw, layout.coneH); ctx.clip();
+  drawConeView();
+  ctx.restore();
+
+  /* divider */
+  ctx.fillStyle = "#dce6f2";
+  ctx.fillRect(0, layout.dividerY,     cw, 1);
+  ctx.fillStyle = "#1e2836";
+  ctx.fillRect(0, layout.dividerY + 2, cw, 1);
+
+  /* flat (parameter-space) view */
+  drawFlatView();
+
+  /* sheet frame */
+  const M = 6;
+  ctx.strokeStyle = "#1e2836";
+  ctx.lineWidth = 0.8;
+  ctx.strokeRect(M + 0.5, M + 0.5, cw - 2 * M - 1, ch - 2 * M - 1);
+
+  updateStatus();
+}
+
+/* ==========================================================================
+   STATUS
+   ========================================================================== */
+
+function updateStatus() {
+  const el = document.getElementById("status");
+  if (!el) return;
+
+  if (!state.mouse.inside) {
+    el.textContent =
+      "drag apex to tilt \u00B7 scroll to change depth \u00B7 " +
+      "drag patches in either view";
+    el.className = "";
+    return;
+  }
+
+  if (state.mouse.sy >= layout.dividerY) {
+    const p = screenToFlat(state.mouse.sx, state.mouse.sy);
+    el.textContent =
+      "flat   \u03C6 = " + p.phi.toFixed(2) +
+      "   s = " + p.s.toFixed(3);
+    el.className = "ok";
+    return;
+  }
+
+  const [wx, wy] = s2w(state.mouse.sx, state.mouse.sy);
+  const tiltDeg = Math.atan2(Math.hypot(cone.ax, cone.ay), cone.depth)
+                  * 180 / Math.PI;
+  const drag = state.dragQuadVertex
+    ? "   \u00B7  shaping " + quads[state.dragQuadVertex.quadIdx].name
+    : "";
+  el.textContent =
+    "cursor (" + wx.toFixed(1) + ", " + wy.toFixed(1) + ")" +
+    "   apex (" + cone.ax.toFixed(1) + ", " + cone.ay.toFixed(1) + ")" +
+    "   tilt " + tiltDeg.toFixed(1) + "\u00B0" +
+    "   depth " + cone.depth.toFixed(1) +
+    drag;
+  el.className = "ok";
+}
+
+/* ==========================================================================
+   HIT TEST — 3D corner
+   ========================================================================== */
+
+function findQuadVertexAt(sx, sy) {
+  const R_HIT = 12;
+  let best = null, bestD = R_HIT;
+
+  const order = [];
+  if (selectedQuad >= 0 && selectedQuad < quads.length) {
+    order.push(selectedQuad);
+  }
+  for (let i = 0; i < quads.length; i++) {
+    if (i !== selectedQuad) order.push(i);
+  }
+
+  for (const qi of order) {
+    const corners = quadCorners(quads[qi]);
+    for (let ci = 0; ci < 4; ci++) {
+      const c = corners[ci];
+      const [wx, wy]   = surfacePoint(c.phi, c.s);
+      const [vsx, vsy] = w2s(wx, wy);
+      const d = Math.hypot(sx - vsx, sy - vsy);
+      if (d < bestD) {
+        bestD = d;
+        best = { quadIdx: qi, cornerIdx: ci };
+      }
+    }
+  }
+  return best;
+}
+
+/* ==========================================================================
+   EVENTS
+   ==========================================================================
+   Priority on mousedown:
+
+     1. a patch corner within 12 px              → drag that corner
+     2. the cone band, anywhere else             → drag the apex
+     3. flat band, corner handle                 → drag that corner
+     4. flat band, edge                          → drag that edge
+     5. flat band, patch interior                → move the whole patch
+     6. flat band, empty                         → deselect */
+
+canvas.addEventListener("mousedown", (e) => {
+  if (e.button !== 0) return;
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+
+  if (sy < layout.dividerY) {
+    const vHit = findQuadVertexAt(sx, sy);
+    if (vHit) {
+      if (vHit.quadIdx !== selectedQuad) {
+        selectedQuad = vHit.quadIdx;
+        syncQuadList();
+      }
+      state.dragQuadVertex = vHit;
+      canvas.style.cursor = "grabbing";
+      draw();
+      return;
+    }
+    state.dragApex = {
+      startSx: sx, startSy: sy,
+      startAx: cone.ax, startAy: cone.ay,
+    };
+    canvas.style.cursor = "grabbing";
+    return;
+  }
+
+  const hHit = flatHitTest(sx, sy);
+  if (!hHit) {
+    selectedQuad = -1;
+    syncQuadList();
+    draw();
+    return;
+  }
+  if (hHit.quadIdx !== selectedQuad) {
+    selectedQuad = hHit.quadIdx;
+    syncQuadList();
+  }
+  if (hHit.kind === "corner") {
+    state.flatDrag = {
+      mode: "corner", quadIdx: hHit.quadIdx,
+      cornerIdx: hHit.cornerIdx,
+    };
+  } else if (hHit.kind === "edge") {
+    state.flatDrag = {
+      mode: "edge", quadIdx: hHit.quadIdx, edge: hHit.edge,
+    };
+  } else {
+    const p = screenToFlat(sx, sy);
+    state.flatDrag = {
+      mode: "body", quadIdx: hHit.quadIdx,
+      lastPhi: p.phi, lastS: p.s,
+    };
+  }
+  canvas.style.cursor = "grabbing";
+  draw();
+});
+
+window.addEventListener("mousemove", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+  state.mouse.sx = sx; state.mouse.sy = sy;
+  state.mouse.inside = (sx >= 0 && sy >= 0 &&
+                        sx < window.innerWidth &&
+                        sy < window.innerHeight);
+
+  if (state.dragQuadVertex) {
+    /* 3D corner drag.  Cursor → world → nearest (phi, s).  The
+       result feeds flatMoveCorner, so the same clamping that
+       guards a flat-view drag also guards a cone-view drag. */
+    const { quadIdx, cornerIdx } = state.dragQuadVertex;
+    const q = quads[quadIdx];
+    const corner = quadCorners(q)[cornerIdx];
+    const [wx, wy] = s2w(sx, sy);
+    const np = projectToConeSurface(wx, wy, corner.s);
+    flatMoveCorner(q, cornerIdx, np.phi, np.s);
+  } else if (state.dragApex) {
+    const dSx = sx - state.dragApex.startSx;
+    const dSy = sy - state.dragApex.startSy;
+    cone.ax = state.dragApex.startAx + dSx / view.scale;
+    cone.ay = state.dragApex.startAy - dSy / view.scale;
+    clampApex();
+  } else if (state.flatDrag) {
+    const fd = state.flatDrag;
+    const q  = quads[fd.quadIdx];
+    const p  = screenToFlat(sx, sy);
+    if (fd.mode === "corner") {
+      flatMoveCorner(q, fd.cornerIdx, p.phi, p.s);
+    } else if (fd.mode === "edge") {
+      flatMoveEdge(q, fd.edge, p.phi, p.s);
+    } else if (fd.mode === "body") {
+      flatMoveBody(q, p.phi - fd.lastPhi, p.s - fd.lastS);
+      fd.lastPhi = p.phi;
+      fd.lastS   = p.s;
+    }
+  }
+  draw();
+});
+
+window.addEventListener("mouseup", () => {
+  if (state.dragQuadVertex || state.dragApex || state.flatDrag) {
+    state.dragQuadVertex = null;
+    state.dragApex       = null;
+    state.flatDrag       = null;
+    canvas.style.cursor  = "crosshair";
+  }
+});
+
+canvas.addEventListener("wheel", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const sy = e.clientY - rect.top;
+  if (sy >= layout.dividerY) return;
+  e.preventDefault();
+  const factor = e.deltaY < 0 ? 1.08 : 1 / 1.08;
+  cone.depth = Math.max(3, Math.min(40, cone.depth * factor));
+  clampApex();
+  syncPanelSliders();
+  draw();
+}, { passive: false });
+
+canvas.style.cursor = "crosshair";
+
+(function installShellControls() {
+  const ui          = document.getElementById("ui");
+  const restoreBtn  = document.getElementById("restoreBtn");
+  const collapseBtn = document.getElementById("collapseBtn");
+
+  const collapse = () => {
+    ui.classList.add("collapsed");
+    restoreBtn.classList.add("visible");
+  };
+  const restore = () => {
+    ui.classList.remove("collapsed");
+    restoreBtn.classList.remove("visible");
+  };
+
+  collapseBtn.addEventListener("click", collapse);
+  restoreBtn.addEventListener("click", restore);
+
+  window.addEventListener("keydown", (e) => {
+    const t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+    if (e.key === "h" || e.key === "H") {
+      if (ui.classList.contains("collapsed")) restore();
+      else                                     collapse();
+    }
+  });
+})();
+
+syncPanelSliders();
+syncQuadList();
+resize();
+</script>
+</body>
+</html>

@@ -1,4 +1,14 @@
-"""pg_panel.py — panel bindings, including the patch list."""
+"""
+pg_panel.py — panel bindings.
+
+Four sliders, two buttons, the patch list, and the + Square action.
+Depth and half-angle both drive R_world, so both re-clamp the apex
+after writing state; patches bound to (phi, s) follow the surface
+automatically and are not touched here.
+
+Delete removes the selected floating square.  Patches are removed
+through their row's own × button.
+"""
 
 PANEL_JS = r"""
 /* ==========================================================================
@@ -31,12 +41,7 @@ function updatePanelLabels() {
 
 /* ==========================================================================
    PATCH LIST
-   ==========================================================================
-   Rebuild the panel list from the quads array.  Called on add,
-   delete, select, and after a vertex drag that changes which patch
-   is active.  Rebuilding rather than mutating keeps the row / array
-   index correspondence trivially correct — the list is short enough
-   that the cost is invisible. */
+   ========================================================================== */
 
 function syncQuadList() {
   const list = document.getElementById("quadList");
@@ -98,13 +103,8 @@ function syncQuadList() {
   const resetBtn  = document.getElementById("resetBtn");
   const centerBtn = document.getElementById("centerBtn");
   const addBtn    = document.getElementById("addQuadBtn");
+  const addSqBtn  = document.getElementById("addSquareBtn");
 
-  /* Depth and half-angle both drive R_world, so both re-clamp the
-     apex: shrinking the cone with the apex near the base ring would
-     otherwise push the apex outside the new disk and invert the
-     shear on the affected rings.  The patches, being bound to
-     (phi, s), follow the surface automatically — their screen
-     positions change but their binding does not. */
   if (d) d.addEventListener("input", () => {
     cone.depth = parseFloat(d.value);
     clampApex();
@@ -138,6 +138,26 @@ function syncQuadList() {
     draw();
   });
 
-  if (addBtn) addBtn.addEventListener("click", addQuad);
+  if (addBtn)   addBtn.addEventListener("click", addQuad);
+  if (addSqBtn) addSqBtn.addEventListener("click", () => {
+    if (selectedQuad < 0 || selectedQuad >= quads.length) return;
+    addSquareAtCenter(selectedQuad);
+    syncQuadList();
+    draw();
+  });
+
+  /* Delete removes the selected floating square.  Patches are
+     removed through their row's own × button, so this key never
+     deletes a patch. */
+  window.addEventListener("keydown", (e) => {
+    const t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+    if (e.key === "Delete" || e.key === "Backspace") {
+      if (selectedSquare >= 0) {
+        e.preventDefault();
+        deleteSquare(selectedSquare);
+      }
+    }
+  });
 })();
 """

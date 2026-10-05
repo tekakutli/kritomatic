@@ -2,34 +2,43 @@
 pg_view_flat.py — the parameter-space view of the cone's lateral
 surface.
 
-The cone's lateral surface is parameterised by (phi, s):
+The cone's lateral surface is parameterised by (phi, s).  Drawing the
+parameter rectangle flat gives the "2D view".  A patch — being
+[phi0, phi1] × [s0, s1] in the model — shows up here as an actual
+rectangle, and back on the cone as a curved trapezoid narrowing
+toward the apex.
 
-    phi ∈ [0, 2π)   angular position around the axis
-    s   ∈ [0, 1]    axial position, 0 = base ring, 1 = apex
+SQUARES IN THE FLAT VIEW
+========================
+A square lives on the patch's plane, not on the cone surface, so it
+has no intrinsic (phi, s) footprint.  When a patch is active — its
+row is selected in the panel, or one of its squares is — every
+square of that patch is projected into the flat view by the linear
+correspondence (u, v) → (phi, s) that keeps the patch's own corners
+at the patch's own phi/s bounds:
 
-Drawing that parameter rectangle as a flat sheet gives the "2D view"
-of the cone.  A patch — being [phi0, phi1] × [s0, s1] in the model —
-shows up here as an actual rectangle.  Back on the cone it becomes
-whatever the surface function maps that rectangle to: a curved
-trapezoid narrowing toward the apex along its two meridian edges.
-That is the constraint the user asked for, and it falls out of the
-data model rather than needing to be enforced separately — the flat
-rectangle and the cone trapezoid are the same four numbers read
-through two different projections.
+    phi = phiC + (u / uLen) · (phi1 − phi0)
+    s   = sC   + (v / vLen) · (s1   − s0)
+
+Under this mapping the horizon falls at s = 1 — the flat view's
+existing apex line — so a square shrinks to zero height exactly
+where its cone-view twin shrinks to zero size.  The two views
+agree about where "the horizon" is.
+
+Squares are editable from this band: the selected one carries a
+brighter stroke and four corner handles, and pg_dispatch routes a
+click on a handle or the interior into flatResizeSquareFromCorner /
+flatMoveSquareBody.
 
 Interaction on this band:
 
-    corner drag     picks a corner handle → edits the two bounds
-                    that corner touches
-    edge drag       picks an edge       → edits the one bound that
-                    edge is on
-    body drag       picks the interior   → translates all four
-                    bounds together
+    corner drag     edits the two bounds that corner touches
+    edge drag       edits the one bound that edge is on
+    body drag       translates all four bounds together
 
-Every mutation runs through flatMoveCorner / flatMoveEdge /
-flatMoveBody, which clamp so a rectangle can never invert and stays
-inside the flat view's (phi, s) range.  The 3D renderer reads the
-same bounds through quadCorners, so both views are always in sync.
+    plus, for a floating square:
+    corner drag     resizes that square
+    body drag       moves that square
 """
 
 
@@ -46,8 +55,6 @@ const FLAT_S_MAX   = 1;
 const QUAD_MIN_SIZE_PHI = 0.06;
 const QUAD_MIN_SIZE_S   = 0.04;
 
-/* ---- Rect / transforms ------------------------------------------ */
-
 function flatRect() {
   const W = window.innerWidth;
   const H = layout.reservedH;
@@ -57,9 +64,6 @@ function flatRect() {
   const maxW = W - 2 * MARGIN_X;
   const maxH = H - TOP_PAD - BOT_PAD - 4;
 
-  /* Aspect target of 2.5:1 keeps the parameter rectangle
-     recognisably a landscape strip rather than a square, which
-     matches the mental image of an unrolled cone. */
   const w = Math.min(maxW, maxH * 2.5);
   const h = Math.min(maxH, w / 2.5);
   const x0 = (W - w) / 2;
@@ -83,8 +87,6 @@ function screenToFlat(sx, sy) {
   };
 }
 
-/* ---- Drawing ---------------------------------------------------- */
-
 function drawFlatView() {
   const cw = window.innerWidth;
   ctx.fillStyle = "#060a10";
@@ -92,8 +94,9 @@ function drawFlatView() {
 
   const r = flatRect();
 
-  /* reference grid — rings then meridians */
   ctx.save();
+
+  /* reference grid — rings */
   const N_RINGS = 6;
   for (let k = 1; k < N_RINGS; k++) {
     const s = k / N_RINGS;
@@ -103,6 +106,8 @@ function drawFlatView() {
     ctx.lineWidth = 0.7;
     ctx.beginPath(); ctx.moveTo(sx0, sy); ctx.lineTo(sx1, sy); ctx.stroke();
   }
+
+  /* reference grid — meridians */
   const N_MERID = 12;
   for (let k = 0; k <= N_MERID; k++) {
     const phi = FLAT_PHI_MIN +
@@ -167,13 +172,77 @@ function drawFlatView() {
   ctx.fillText("s = 1  \u00B7  apex", r.x0, r.y0 + 4);
   ctx.restore();
 
-  /* patches, unselected first */
+  /* patches, unselected first, selected on top */
   for (let i = 0; i < quads.length; i++) {
     if (i === selectedQuad) continue;
     drawFlatQuad(quads[i], false);
   }
   if (selectedQuad >= 0 && selectedQuad < quads.length) {
     drawFlatQuad(quads[selectedQuad], true);
+  }
+
+  /* squares of the active patch, projected into parameter space
+     ============================================================
+     squareFlatRect maps a square's physical size and position on
+     the patch's plane into the flat view's (phi, s).  Clipped to
+     the parameter rectangle so a square near the phi seam does not
+     draw off the sheet.
+
+     Squares are editable from this band: the selected one carries
+     a brighter stroke and four corner handles. */
+
+  if (selectedQuad >= 0 && selectedQuad < quads.length) {
+    const activeQ = quads[selectedQuad];
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(r.x0, r.y0, r.w, r.h);
+    ctx.clip();
+
+    for (let i = 0; i < floatSquares.length; i++) {
+      const sq = floatSquares[i];
+      if (sq.quadId !== activeQ.id) continue;
+      const fr = squareFlatRect(sq);
+      if (!fr) continue;
+
+      const [sx0, syTop] = flatToScreen(fr.phi0, fr.s1);
+      const [sx1, syBot] = flatToScreen(fr.phi1, fr.s0);
+      const w = sx1 - sx0;
+      const hgt = syBot - syTop;
+      if (w <= 0.4 || hgt <= 0.4) continue;
+
+      const isSel = (i === selectedSquare);
+
+      ctx.fillStyle = isSel
+        ? "rgba(120, 220, 255, 0.30)"
+        : "rgba(120, 220, 255, 0.16)";
+      ctx.fillRect(sx0, syTop, w, hgt);
+
+      ctx.strokeStyle = isSel
+        ? "rgba(180, 240, 255, 1.00)"
+        : "rgba(140, 225, 255, 0.78)";
+      ctx.lineWidth = isSel ? 1.8 : 1.2;
+      ctx.strokeRect(sx0 + 0.5, syTop + 0.5, w - 1, hgt - 1);
+
+      if (isSel) {
+        const handles = [
+          [sx0, syTop],
+          [sx1, syTop],
+          [sx1, syBot],
+          [sx0, syBot],
+        ];
+        for (const [hx, hy] of handles) {
+          ctx.beginPath();
+          ctx.arc(hx, hy, 4.2, 0, Math.PI * 2);
+          ctx.fillStyle = "#b8ecff";
+          ctx.fill();
+          ctx.strokeStyle = "#0a0e14";
+          ctx.lineWidth = 1.4;
+          ctx.stroke();
+        }
+      }
+    }
+    ctx.restore();
   }
 }
 
@@ -182,7 +251,7 @@ function drawFlatQuad(q, selected) {
 
   ctx.beginPath();
   ctx.moveTo(pts[0][0], pts[0][1]);
-  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  for (let i = 1; i < 4; i++) ctx.lineTo(pts[i][0], pts[i][1]);
   ctx.closePath();
   ctx.fillStyle = selected
     ? "rgba(255, 200, 90, 0.18)"

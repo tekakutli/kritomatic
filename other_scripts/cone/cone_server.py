@@ -1,7 +1,7 @@
 """
 cone_server.py — the same tiny threaded server the cable playground
 uses, minus the /save and /optimize-leaders endpoints this project
-does not need. Serves the current working directory.
+does not need.  Serves the current working directory.
 """
 
 import os

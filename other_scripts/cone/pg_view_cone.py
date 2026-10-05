@@ -1,10 +1,21 @@
-"""pg_view_cone.py — the interior of the cone, with patches."""
+"""
+pg_view_cone.py — the interior of the cone.
+
+Layers, back to front:
+
+    1.  radial depth gradient centred on the apex
+    2.  meridians from apex to base ring, low-alpha cyan
+    3.  rings on the axis, radius (1 − s) · R_world, opacity ∝ (1 − s)²
+    4.  dashed magenta axis line when the apex is off-centre
+    5.  base direction tick on the outer ring
+    6.  small ink dot at the base centre
+    7.  patch quads — trapezoids on the surface
+    8.  floating squares — bound to each patch's plane
+    9.  apex marker
+   10.  corner caption
+"""
 
 CONE_VIEW_JS = r"""
-/* ==========================================================================
-   CONE RENDERER
-   ========================================================================== */
-
 function drawConeView() {
   const cw = window.innerWidth;
   const ch = layout.coneH;
@@ -52,7 +63,8 @@ function drawConeView() {
     const alpha = 0.10 + 0.55 * u * u;
     ctx.beginPath(); ctx.arc(cx, cy, rs, 0, Math.PI * 2);
     ctx.strokeStyle = "rgba(0, 229, 255, " + alpha.toFixed(3) + ")";
-    ctx.lineWidth = (k === 0) ? 2.0 : 0.9; ctx.stroke();
+    ctx.lineWidth = (k === 0) ? 2.0 : 0.9;
+    ctx.stroke();
   }
 
   /* axis */
@@ -65,7 +77,7 @@ function drawConeView() {
     ctx.restore();
   }
 
-  /* base tick */
+  /* base direction tick */
   if (Rs > 20) {
     ctx.beginPath();
     ctx.arc(Bx, By, Rs, -Math.PI / 2 - 0.15, -Math.PI / 2 + 0.15);
@@ -85,6 +97,9 @@ function drawConeView() {
   if (selectedQuad >= 0 && selectedQuad < quads.length) {
     drawQuadPatch(quads[selectedQuad], true);
   }
+
+  /* floating squares on the patches' planes */
+  drawFloatSquares();
 
   /* apex marker */
   const haloR = 22;
@@ -111,7 +126,8 @@ function drawConeView() {
     "   TILT " + tiltDeg.toFixed(1) + "\u00B0" +
     "   DEPTH " + cone.depth.toFixed(1) +
     "   HALF-ANGLE " + halfDeg + "\u00B0" +
-    "   PATCHES " + quads.length,
+    "   PATCHES " + quads.length +
+    "   SQUARES " + floatSquares.length,
     14, 14);
   ctx.restore();
 }

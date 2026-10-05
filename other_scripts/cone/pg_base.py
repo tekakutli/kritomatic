@@ -1,4 +1,11 @@
-"""pg_base.py — palette, stylesheet, HTML head, bootstrap."""
+"""
+pg_base.py — palette, stylesheet, HTML head, bootstrap.
+
+The visual idiom is the dark "printed form" theme: near-black paper,
+cyan transit accent, magenta depth markers, yellow apex.  Panel
+chrome is outlined fields, uppercase mono micro-labels, ruled section
+breaks.
+"""
 
 HTML_HEAD = r"""<!DOCTYPE html>
 <html lang="en">
@@ -203,9 +210,18 @@ HTML_HEAD = r"""<!DOCTYPE html>
 
   <div class="field" style="margin-bottom:2px;">
     <label>Patches</label>
-    <button id="addQuadBtn" style="flex:1 1 auto;">+ Add patch</button>
+    <button id="addQuadBtn" style="flex:1 1 auto;">+ Patch</button>
   </div>
   <div id="quadList" class="quadList"></div>
+
+  <div class="field" style="margin-top:8px; margin-bottom:2px;">
+    <label>Squares</label>
+    <button id="addSquareBtn" style="flex:1 1 auto;">+ Square</button>
+  </div>
+  <div style="font-size:9px; color:#5a6774;
+              padding:2px 0; letter-spacing:0.06em;">
+    shift+click a patch to drop one there
+  </div>
 
   <hr>
 
@@ -214,7 +230,7 @@ HTML_HEAD = r"""<!DOCTYPE html>
     <button id="centerBtn">Center apex</button>
   </div>
 
-  <div id="status">drag apex to tilt · scroll to change depth · drag patches in either view</div>
+  <div id="status">drag apex to tilt · scroll to change depth</div>
 </div>
 
 <button id="restoreBtn" title="Show panel (H)">☰ Show panel</button>

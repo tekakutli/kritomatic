@@ -1,4 +1,19 @@
-"""pg_core.py — canvas, layout, view, cone state, patch model."""
+"""
+pg_core.py — canvas, layout, view, cone state, patch model.
+
+Two coordinate systems and one surface parameterisation:
+
+    view      orthographic world → screen, y flipped
+    (phi, s)  the cone's lateral surface: phi angular, s axial
+              s = 0 at the base ring, s = 1 at the apex
+
+A patch is four numbers — [phi0, phi1] × [s0, s1] — a rectangle in
+parameter space.  quadCorners is the single reader; every renderer
+and hit test asks through it, so corner order is defined once.
+
+A floating square is { quadId, u, v, scale } in its patch's local
+frame; the frame derivation lives in pg_view_squares.
+"""
 
 CORE_JS = r"""
 /* ==========================================================================
@@ -67,27 +82,18 @@ function surfacePoint(phi, s) {
 }
 
 /* ==========================================================================
-   PATCH MODEL — rectangles in (phi, s) parameter space
+   PATCH MODEL
    ==========================================================================
-   Every patch is stored as four numbers:
+   Every patch:  [phi0, phi1] × [s0, s1].  Corner order:
 
-       phi0, phi1    angular bounds,  phi0 < phi1
-       s0,   s1      axial bounds,    s0   < s1
+       0   (phi0, s1)   top-left    near apex
+       1   (phi1, s1)   top-right   near apex
+       2   (phi1, s0)   bottom-right near base
+       3   (phi0, s0)   bottom-left  near base
 
-   The four corners, in the fixed order every renderer and hit test
-   uses:
-
-       index 0   (phi0, s1)   top-left       near apex
-       index 1   (phi1, s1)   top-right      near apex
-       index 2   (phi1, s0)   bottom-right   near base
-       index 3   (phi0, s0)   bottom-left    near base
-
-   The lateral edges are the phi = phi0 and phi = phi1 edges.  In 3D
-   those lie on meridians, and every meridian ends at the apex, so
-   the two lateral edges point straight at the peak.  The top edge is
-   clamped below s = 1 (S_MAX < 1) so a patch aims at the apex but
-   never touches it — matching the user's "going toward the peak,
-   without stretching into it" reading. */
+   The lateral edges lie on meridians; every meridian ends at the
+   apex, so both lateral edges point at the peak.  S_MAX < 1 keeps a
+   patch from collapsing into the apex. */
 
 const S_MIN = 0.00;
 const S_MAX = 0.90;
@@ -105,11 +111,6 @@ function quadCorners(q) {
   ];
 }
 
-/* A new patch: a wide-ish trapezoid near the apex of the surface,
-   landing at successive angular slots so a stack fans out around the
-   cone rather than piling on one meridian.  phiCenter wraps into
-   [0, 2*pi] and nudges inward if the wrap would push either bound
-   outside the flat view's phi range. */
 function addQuad() {
   const id  = nextQuadId++;
   const idx = quads.length;
@@ -134,7 +135,10 @@ function addQuad() {
 
 function deleteQuad(idx) {
   if (idx < 0 || idx >= quads.length) return;
-  quads.splice(idx, 1);
+  const removed = quads.splice(idx, 1)[0];
+  if (typeof deleteSquaresForQuad === "function") {
+    deleteSquaresForQuad(removed.id);
+  }
   if (selectedQuad >= quads.length) selectedQuad = quads.length - 1;
   syncQuadList();
   draw();
@@ -143,19 +147,17 @@ function deleteQuad(idx) {
 /* ==========================================================================
    INVERSE PROJECTION — cursor world point → (phi, s) on the surface
    ==========================================================================
-   For a fixed s the closest surface point to a world point T is on
-   the ring at that s, and its squared distance is
+   For fixed s, the closest surface point to T is on the ring at that
+   s, with squared distance expressed as a quadratic in s:
 
        A·s² + B·s + C = 0
        A = |apex|² − R²
        B = −2 · (apex·T − R²)
        C = |T|² − R²
 
-   Two real roots mean the ray through T crosses the surface twice;
-   the one nearer the vertex's current s wins, so a drag across the
-   surface stays stable.  No real root (T inside the "hole" or outside
-   the base ring) falls back to a forty-step sample of the surface
-   distance function. */
+   Two real roots: the one nearer the caller's current s wins, so a
+   drag stays on one branch of the surface.  No real root: forty-step
+   sample over [S_MIN, S_MAX]. */
 function projectToConeSurface(wx, wy, currentS) {
   const Px = cone.ax, Py = cone.ay;
   const R  = coneR();
@@ -209,12 +211,21 @@ function projectToConeSurface(wx, wy, currentS) {
 
 /* ==========================================================================
    TRANSIENT STATE
-   ========================================================================== */
+   ==========================================================================
+   Five drag modes, mutually exclusive at any moment:
+
+       dragApex        apex tilt / depth pull from the cone band
+       dragQuadVertex  a patch's corner, either band
+       dragSquare      a floating square from the cone band
+       flatDrag        a patch's corner/edge/body from the flat band
+       flatSquareDrag  a floating square from the flat band */
 
 const state = {
   dragApex:       null,
   dragQuadVertex: null,
+  dragSquare:     null,
   flatDrag:       null,
+  flatSquareDrag: null,
   mouse: { sx: 0, sy: 0, inside: false },
 };
 

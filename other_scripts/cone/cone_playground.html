@@ -310,9 +310,31 @@
 
   <hr>
 
+  <div class="field">
+    <label>Square W</label>
+    <input type="text" id="squareWVal" class="scrubInput"
+           value="&#8212;" autocomplete="off" spellcheck="false"
+           disabled>
+  </div>
+  <div class="field">
+    <label>Square H</label>
+    <input type="text" id="squareHVal" class="scrubInput"
+           value="&#8212;" autocomplete="off" spellcheck="false"
+           disabled>
+  </div>
+  <div class="field">
+    <label>Slope</label>
+    <input type="text" id="squareSlopeVal" class="scrubInput"
+           value="&#8212;" autocomplete="off" spellcheck="false"
+           disabled>
+  </div>
+
+  <hr>
+
   <div class="field" style="margin-bottom:2px;">
     <label>Patches</label>
     <button id="addQuadBtn" style="flex:1 1 auto;">+ Patch</button>
+    <button id="cloneQuadBtn" style="flex:1 1 auto;">+ Clone</button>
   </div>
   <div id="quadList" class="quadList"></div>
 
@@ -333,11 +355,12 @@
     to jump
   </div>
   <div class="hintLine">
-    hold <span class="kbd">Shift</span> while dragging a patch to snap
+    hold <span class="kbd">Shift</span> while dragging a patch or a
+    square to slide along the centre&rarr;apex axis only
   </div>
   <div class="hintLine">
-    drag patch &phi;/s to scrub &middot;
-    <span class="kbd">Shift</span> to snap &phi;
+    drag patch &phi;/s, square W/H, or slope to scrub &middot;
+    <span class="kbd">Shift</span> to snap
   </div>
 
   <hr>
@@ -482,6 +505,51 @@ function addQuad() {
     s1: 0.72,
   });
   selectedQuad = quads.length - 1;
+  syncQuadList();
+  draw();
+}
+
+/* Duplicate a patch, together with every square that lives on it.
+   The clone gets a fresh id and default name; its squares likewise.
+   The clone is placed one patch-width to the right in φ so it does
+   not sit on top of the source.  φ wraps harmlessly, so pushing past
+   2π is fine.  Square (u, v, scaleU, scaleV, θ, slope) are copied
+   as-is, so the clone's squares sit in the same spot on the new
+   patch as they did on the old. */
+function cloneQuad(idx) {
+  if (idx < 0 || idx >= quads.length) return;
+  const src = quads[idx];
+  const id  = nextQuadId++;
+  const dPhi = src.phi1 - src.phi0;
+
+  quads.push({
+    id,
+    name: "Q" + id,
+    phi0: src.phi0 + dPhi,
+    phi1: src.phi1 + dPhi,
+    s0:   src.s0,
+    s1:   src.s1,
+  });
+
+  for (let i = 0; i < floatSquares.length; i++) {
+    const sq = floatSquares[i];
+    if (sq.quadId !== src.id) continue;
+    const newSqId = nextSquareId++;
+    floatSquares.push({
+      id:     newSqId,
+      name:   "S" + newSqId,
+      quadId: id,
+      u:      sq.u,
+      v:      sq.v,
+      scaleU: sq.scaleU,
+      scaleV: sq.scaleV,
+      theta:  sq.theta || 0,
+      slope:  sq.slope || 0,
+    });
+  }
+
+  selectedQuad   = quads.length - 1;
+  selectedSquare = -1;
   syncQuadList();
   draw();
 }
@@ -1192,20 +1260,20 @@ function _reclampShapesOnPatch(q) {
 }
 
 /* ---- Patch drag -------------------------------------------------
-   Start-anchored, with the Shift-held step snap on phi ONLY.
+   Start-anchored, with the Shift-held constraint to the patch's
+   centre→apex axis.
 
-   The snap is a rotation-like gesture: quantizing phi advances the
-   patch around the cone in fixed angular steps, matching how the
-   meridian grid reads.  Movement along the near-apex axis (s) is
-   left continuous on purpose — the user's mental model of "sliding
-   toward the apex" wants fine control, not steps, and stepping it
-   would fight that.
+   On the cone's lateral surface, the direction from a patch's
+   centre toward the apex is the meridian: φ stays put, only s
+   moves.  Constraining the drag to that axis therefore drops the φ
+   component of the delta and lets s move freely in both directions
+   — the axis is fixed, the sign is not.
 
    Both the cone view's drag handler and the flat view's route
-   through this same function, so a snapped patch drag behaves
+   through this same function, so a constrained patch drag behaves
    identically in both bands. */
 
-function applyPatchDragFromStart(q, dp, curPhi, curS, snap) {
+function applyPatchDragFromStart(q, dp, curPhi, curS, constrain) {
   let rawPhi = curPhi - dp.startPhi;
   while (rawPhi >  Math.PI) rawPhi -= 2 * Math.PI;
   while (rawPhi < -Math.PI) rawPhi += 2 * Math.PI;
@@ -1214,8 +1282,13 @@ function applyPatchDragFromStart(q, dp, curPhi, curS, snap) {
   let dPhi = rawPhi;
   const dS = rawS;
 
-  if (snap) {
-    dPhi = Math.round(rawPhi / PATCH_SNAP_PHI) * PATCH_SNAP_PHI;
+  /* Shift held: the drag is constrained to the direction from the
+     patch's centre toward the apex.  On the cone surface that is
+     the meridian — φ stays put, only s moves.  Both directions
+     along the meridian are allowed; the axis is fixed, not the
+     sign. */
+  if (constrain) {
+    dPhi = 0;
   }
 
   q.phi0 = dp.startPhi0 + dPhi;
@@ -1306,68 +1379,104 @@ let selectedSquare = -1;
 /* ==========================================================================
    SHAPE DIMENSIONS
    ==========================================================================
-   The shape's width and height in the flat view's coordinate system.
-   Two pure-size knobs (see the module docstring):
+   A shape is a square in a REFERENCE frame.  The reference
+   half-extents are
 
-       SHAPE_W_PHI    width,  as a fraction of a full turn (2π)
-       SHAPE_H_S      height, as a fraction of the axial height (1)
+       refHW = SHAPE_REL_SIZE / 2 · scaleU
+       refHH = SHAPE_REL_SIZE / 2 · scaleV · depthScale
 
-   For a fresh shape to be a pixel square in the unfolded-cone view,
-   keep SHAPE_W_PHI / SHAPE_H_S == 0.4, matching the flat rectangle's
-   own 2.5:1 aspect. */
+   The reference offset (du, dv) maps to the patch's (û, v̂) through
+   a per-patch diagonal (Ku, Kv), then to local (u, v) through
+   (uLen, vLen).  See the module docstring, "SHAPE DIMENSIONS —
+   REFERENCE FRAME". */
 
-const SHAPE_W_PHI = 0.08;   // width,  as a fraction of a full turn
-const SHAPE_H_S   = 0.20;   // height, as a fraction of the axial height
+/* The reference square's side, in world units.  Because
+   SHAPE_CONE_SQUARE is off (Ku = Kv = 1), the shape's world side
+   along U is exactly SHAPE_REL_SIZE · scaleU, and along V is
+   SHAPE_REL_SIZE · scaleV · depthScale — independent of where the
+   patch sits.  This is now the sole control on the shape's size;
+   tune it up or down to taste. */
+const SHAPE_REL_SIZE = 2.0;
 
-/* Per-shape multipliers on the two dimensions above.  Set to 1.0 for
-   the default size; corner-drag resizes move them. */
+/* Per-shape multipliers on the two reference axes.  Set to 1.0 for
+   a reference square; corner-drag resizes move them. */
 const SHAPE_DEFAULT_SCALE = 1.0;
 const SHAPE_MIN_SCALE     = 0.03;
-const SHAPE_MAX_SCALE     = 3.00;
+const SHAPE_MAX_SCALE     = 10.00;
+
+/* ==========================================================================
+   SHAPE SLOPE
+   ==========================================================================
+   How far a shape may tilt out of the patch plane, about its own
+   reference U axis.  Zero leaves the shape flat on the patch.
+   Positive slope tips the +v edge (the one that points toward the
+   apex) INTO the cavity of the cone; negative slope tips the −v
+   edge.  See the SLOPE section in the module docstring.
+
+   ±85° is the hard bound.  At ±90° the shape would be edge-on to
+   the patch plane, the projection would collapse to a line, and
+   the corner/rotate handle offsets would become singular. */
+
+const SHAPE_SLOPE_MIN = -85 * Math.PI / 180;
+const SHAPE_SLOPE_MAX =  85 * Math.PI / 180;
+
+/* ==========================================================================
+   SHAPE ASPECT CORRECTION
+   ==========================================================================
+   When true, Ku = S / uLen and Kv = S / vLen with S = max(uLen,
+   vLen): the cone view draws a world square, but the shape's world
+   size then rides on the patch's aspect.  As the patch slides
+   toward the apex uLen shrinks, Ku = S / uLen grows, and the
+   shape's drawn u-extent grows with it — the "shape grows sideways
+   when pulled forward" behaviour.  Contiguity across patch
+   translation also weakens by roughly SHAPE_REL_SIZE · (1 − Ku) ·
+   uLen per step.
+
+   When false, Ku = Kv = 1: the shape is a fixed world-size square
+   of side SHAPE_REL_SIZE (times scaleU / scaleV · depthScale), the
+   shape's drawn size no longer changes with the patch's position,
+   and contiguity is exact at every patch position.  The perspective
+   taper still draws the near-apex edge narrower than the base edge
+   — the shape reads as a fixed-size trapezoid.
+
+   Default is false: the bug report was "shapes grow sideways when
+   moved toward the apex", which is exactly the Ku drift.  Flip to
+   true only if you want world-square shapes and can live with the
+   size drift. */
+const SHAPE_CONE_SQUARE = false;
+
+function _shapeAspectScales(f) {
+  if (!SHAPE_CONE_SQUARE || !f || f.uLen <= 0 || f.vLen <= 0) {
+    return { Ku: 1, Kv: 1 };
+  }
+  const S = Math.max(f.uLen, f.vLen);
+  return { Ku: S / f.uLen, Kv: S / f.vLen };
+}
 
 /* ==========================================================================
    SHAPE DEPTH — ONE PER VIEW
    ==========================================================================
-   Two independent depth multipliers, one per view.
+   Two independent depth multipliers, one per view.  The panel's
+   "Shape depth" slider drives SHAPE_DEPTH_CONE only; the flat view
+   reads SHAPE_DEPTH_FLAT, a fixed constant.
 
-   The shape as an object is a rectangle in the patch's own (u, v)
-   plane.  Each view renders that rectangle through its own
-   projection, and the two projections scale the plane's v-axis
-   differently:
+   The unit is 1.00: at the default slider position the two bands
+   agree exactly and edge-to-edge contiguity holds across bands.
+   Any other slider value deliberately opens a gap between the
+   bands' drawn heights. */
 
-       flat view   the plane laid out as (phi, s) — the rectangle's
-                   drawn height is  SHAPE_H_S · scaleV ·
-                   SHAPE_DEPTH_FLAT.
-       cone view   the perspective projection onto the cone — the
-                   drawn height is  SHAPE_H_S · scaleV ·
-                   effectiveConeDepth().
-
-   These were once a single SHAPE_DEPTH, which coupled the two views:
-   tuning the cone view's apparent squareness also moved the flat
-   view's.  They are untangled now.  The panel's "Shape depth" slider
-   drives SHAPE_DEPTH_CONE only, and SHAPE_DEPTH_FLAT stays at 1.00
-   so the flat view's square footprint is unchanged.
-
-   The slider value is normalized: the cone view's actual height
-   scale is the slider value times SHAPE_DEPTH_CONE_UNIT.  The unit
-   holds the raw multiplier that used to live on the panel, so the
-   default slider position of 1.00 renders identically to the old
-   raw 0.50.  Only the number on the panel changed. */
-
-const SHAPE_DEPTH_CONE_UNIT = 0.50;
+const SHAPE_DEPTH_CONE_UNIT = 1.00;
 let   SHAPE_DEPTH_CONE      = 1.00;
 const SHAPE_DEPTH_FLAT      = 1.00;
 
-/* The cone view's effective height scale: the panel's normalized
-   value times the reference unit.  All cone-view geometry — render,
-   hit test, and corner drag — reads this rather than the raw panel
-   value, so the panel can be renumbered without moving the drawing. */
 function effectiveConeDepth() {
   return SHAPE_DEPTH_CONE * SHAPE_DEPTH_CONE_UNIT;
 }
 
 const WEDGE_BASE_REACH = 2.50;
 
+/* ROTATE_HANDLE_OFFSET is in REFERENCE units — the handle sits this
+   far past the reference square's +v̂ edge. */
 const ROTATE_HANDLE_OFFSET = 0.25;
 const ROTATE_HANDLE_R      = 10;
 
@@ -1377,18 +1486,7 @@ const U_LIMIT = 3.0;
 
 /* ==========================================================================
    PATCH HUE PALETTE
-   ==========================================================================
-   See the module docstring's section on hue.  Three accessors:
-
-       patchHue(q)          the hue object for a patch
-       _huergb(h, a)        the hue at an arbitrary alpha
-       _huergbLight(h)      the hue mixed 30% toward white, for
-                            handles and other small accents where the
-                            base hue would be too dark to read
-
-   The palette is deliberately quiet: seven of the eight hues are
-   muted enough that a canvas with several patches still reads as a
-   drafting sheet, not as a diagram of colored boxes. */
+   ========================================================================== */
 
 const PATCH_HUES = [
   { r: 255, g: 200, b:  90 },   // amber
@@ -1477,6 +1575,21 @@ function quadIdxById(id) {
   return -1;
 }
 
+/* The direction that the patch's outward surface normal projects to,
+   in the cone view, is the radial direction at the patch's angular
+   centre.  When the apex is off-centre the axis is not vertical,
+   but the projection of "outward" is still radial in the xy plane,
+   so this is the correct screen direction to slide the tilted shape
+   along.  Returned in world φ (radians, [0, 2π)). */
+function _patchNormalPhi(qi) {
+  if (qi < 0 || qi >= quads.length) return 0;
+  const q = quads[qi];
+  const TAU = 2 * Math.PI;
+  let phi = (q.phi0 + q.phi1) / 2;
+  phi = ((phi % TAU) + TAU) % TAU;
+  return phi;
+}
+
 /* ==========================================================================
    PATCH CORNERS IN LOCAL FRAME — [TL, TR, BR, BL]
    ========================================================================== */
@@ -1540,15 +1653,7 @@ function shapeVMax(sq) {
 /* ==========================================================================
    HORIZON CLIP
    ==========================================================================
-   A shape's corner at local v greater than vMaxLocal = h.vHat · vLen
-   has a negative shape-relative factor; its projection crosses through
-   the apex and the polygon folds.  Instead of folding, the polygon is
-   clipped to v ≤ vMaxLocal in the shape's OWN local (u, v)
-   coordinates, and the clipped polygon is projected.
-
-   Sutherland-Hodgman against the half-plane v ≤ vMaxLocal.  The
-   input is a convex polygon; the output is convex, may have 0, 3, 4,
-   or 5 vertices, and is in the same order. */
+   Sutherland-Hodgman against the half-plane v ≤ vMaxLocal. */
 
 function _clipPolygonToVMax(corners, vMaxLocal) {
   const out = [];
@@ -1569,18 +1674,7 @@ function _clipPolygonToVMax(corners, vMaxLocal) {
 
 /* ==========================================================================
    CLAMP — v only
-   ==========================================================================
-   The v coordinate is bounded on both sides:
-
-       lower  -WEDGE_BASE_REACH
-       upper   h.vHat + WEDGE_BASE_REACH
-
-   The lower bound is the base-reach line: below it, a shape is well
-   past the visible band on the wide side.  The upper bound is the
-   horizon plus the same margin: a shape's CENTRE can travel past the
-   horizon, and the horizon clip takes care of the visual.  If the
-   upper bound were h.vHat, the shape would push against the horizon
-   instead of sliding through it. */
+   ========================================================================== */
 
 function clampCloneV(qi, vHat) {
   const h = horizonLocal(qi);
@@ -1593,15 +1687,18 @@ function clampCloneV(qi, vHat) {
 
 /* ==========================================================================
    SHAPE V-EXTENT (preserved, not on the render path)
-   ========================================================================== */
+   ==========================================================================
+   Reports the shape's half-extent along v̂, in NORMALIZED v̂ units,
+   accounting for the rotation and the aspect correction.  The slope
+   is not folded in here: this is the footprint the shape would have
+   if it were flat on the patch plane. */
 
 function _vExtentNormFromDims(f, dims, theta) {
-  const hw = dims.w / 2;
-  const hh = dims.h / 2;
+  const hwHat = (dims.w / 2) / f.uLen;
+  const hhHat = (dims.h / 2) / f.vLen;
   const cosT = Math.abs(Math.cos(theta || 0));
   const sinT = Math.abs(Math.sin(theta || 0));
-  const extentV = hw * sinT + hh * cosT;
-  return extentV / f.vLen;
+  return hwHat * sinT + hhHat * cosT;
 }
 
 function shapeVExtentNorm(sq) {
@@ -1653,6 +1750,7 @@ function addSquareAt(quadIdx, uLocal, vLocal) {
     scaleU: SHAPE_DEFAULT_SCALE,
     scaleV: SHAPE_DEFAULT_SCALE,
     theta: 0,
+    slope: 0,
   });
   selectedSquare = floatSquares.length - 1;
   syncQuadList();
@@ -1690,25 +1788,20 @@ function clampShapeScales(sq) {
 /* ==========================================================================
    GEOMETRY
    ==========================================================================
-   The shape's dimensions in the patch's world-local (u, v) units.
-   Derived from the two flat-view extents above and the patch's own
-   geometry, so the shape's on-screen footprint in each view is what
-   that view's constants say it is, regardless of the patch's size.
+   A shape's drawn dimensions in the patch's world-local (u, v) units.
 
-       flat phi extent  =  SHAPE_W_PHI · scaleU        (fraction of 2π)
-       flat s   extent  =  SHAPE_H_S   · scaleV        (fraction of 1)
+   The shape is a square in a REFERENCE frame, with half-extents
 
-   The patch's own phi extent dPhi covers its uLen in world-local u,
-   so a phi extent of P·2π maps to a world-local u extent of
-   P·2π·uLen / dPhi.  Symmetrically for s.  A per-view depth factor
-   multiplies the height on top of SHAPE_H_S: the cone view passes
-   effectiveConeDepth(), the flat view SHAPE_DEPTH_FLAT.
+       refHW = SHAPE_REL_SIZE / 2 · scaleU
+       refHH = SHAPE_REL_SIZE / 2 · scaleV · depthScale
+
+   The reference offset (du, dv) maps to the patch's (û, v̂) through
+   the per-patch diagonal (Ku, Kv), then to local (u, v) through
+   (uLen, vLen).  See _shapeAspectScales for Ku and Kv.
 
    squareDims / squareCornersLocal / squareRotateHandleLocal are the
    FLAT-view variants (SHAPE_DEPTH_FLAT); the ...Cone siblings are
-   the CONE-view variants (effectiveConeDepth()).  Both share the
-   squareDimsWith / squareCornersLocalWith / squareRotateHandleLocalWith
-   implementations below, which take the depth factor explicitly. */
+   the CONE-view variants (effectiveConeDepth()). */
 
 function squareDims(sq) {
   return squareDimsWith(sq, SHAPE_DEPTH_FLAT);
@@ -1725,16 +1818,33 @@ function squareDimsWith(sq, depthScale) {
   if (!q) return { w: 0, h: 0 };
   const f = patchFrame(qi);
   if (!f) return { w: 0, h: 0 };
-  const dPhi = q.phi1 - q.phi0;
-  const dS   = q.s1   - q.s0;
-  if (Math.abs(dPhi) < 1e-9 || Math.abs(dS) < 1e-9) {
-    return { w: 0, h: 0 };
-  }
-  const TWO_PI = 2 * Math.PI;
+  const { Ku, Kv } = _shapeAspectScales(f);
   return {
-    w: SHAPE_W_PHI * TWO_PI * f.uLen / dPhi * sq.scaleU,
-    h: SHAPE_H_S   * f.vLen / dS * sq.scaleV * depthScale,
+    w: SHAPE_REL_SIZE * f.uLen * sq.scaleU * Ku,
+    h: SHAPE_REL_SIZE * f.vLen * sq.scaleV * depthScale * Kv,
   };
+}
+
+/* Intrinsic world extents — the shape's own size, without the
+   per-view depth multiplier.  These are what the panel's Square W /
+   Square H fields read and write; see pg_panel.py. */
+
+function squareWorldWidth(sq) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return 0;
+  const f = patchFrame(qi);
+  if (!f) return 0;
+  const { Ku } = _shapeAspectScales(f);
+  return SHAPE_REL_SIZE * sq.scaleU * Ku;
+}
+
+function squareWorldHeight(sq) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return 0;
+  const f = patchFrame(qi);
+  if (!f) return 0;
+  const { Kv } = _shapeAspectScales(f);
+  return SHAPE_REL_SIZE * sq.scaleV * Kv;
 }
 
 function squareCenterLocal(sq) {
@@ -1744,6 +1854,19 @@ function squareCenterLocal(sq) {
   if (!f) return null;
   return [sq.u * f.uLen, sq.v * f.vLen];
 }
+
+/* The shape's four corners in the patch's local (u, v) frame.
+
+   Rotation happens in the REFERENCE frame, where the shape is a
+   square (at scaleU = scaleV = 1).  The reference offset is then
+   mapped to (û, v̂) through (Ku, Kv) and to local through
+   (uLen, vLen).  Because that map does not depend on θ, a 90°
+   rotation in the reference frame is a 90° rotation of the drawn
+   shape, so the set of local corners is the same at θ = 0° and 90°.
+
+   Slope is not applied here.  The flat view (via these local
+   corners) sees the un-tilted footprint; the cone view applies the
+   tilt later, in projectShapePoint. */
 
 function squareCornersLocal(sq) {
   return squareCornersLocalWith(sq, SHAPE_DEPTH_FLAT);
@@ -1758,20 +1881,26 @@ function squareCornersLocalWith(sq, depthScale) {
   if (qi < 0) return null;
   const f = patchFrame(qi);
   if (!f) return null;
-  const uC = sq.u * f.uLen;
-  const vC = sq.v * f.vLen;
-  const dims = squareDimsWith(sq, depthScale);
-  const hw = dims.w / 2;
-  const hh = dims.h / 2;
+
+  /* Reference half-extents. */
+  const refHW = SHAPE_REL_SIZE / 2 * sq.scaleU;
+  const refHH = SHAPE_REL_SIZE / 2 * sq.scaleV * depthScale;
+
   const cosT = Math.cos(sq.theta || 0);
   const sinT = Math.sin(sq.theta || 0);
-  const raw = [
-    [-hw, +hh], [+hw, +hh], [+hw, -hh], [-hw, -hh],
+
+  const rawCorners = [
+    [-refHW, +refHH], [+refHW, +refHH], [+refHW, -refHH], [-refHW, -refHH],
   ];
-  return raw.map(([dx, dy]) => {
-    const rx = dx * cosT - dy * sinT;
-    const ry = dx * sinT + dy * cosT;
-    return [uC + rx, vC + ry];
+
+  const { Ku, Kv } = _shapeAspectScales(f);
+
+  return rawCorners.map(([du, dv]) => {
+    const duR = du * cosT - dv * sinT;
+    const dvR = du * sinT + dv * cosT;
+    const uHat = sq.u + (duR * Ku) / f.uLen;
+    const vHat = sq.v + (dvR * Kv) / f.vLen;
+    return [uHat * f.uLen, vHat * f.vLen];
   });
 }
 
@@ -1799,31 +1928,84 @@ function squareRotateHandleLocalCone(sq) {
   return squareRotateHandleLocalWith(sq, effectiveConeDepth());
 }
 
+/* The rotate handle sits on the shape's +v̂ axis in the REFERENCE
+   frame, at reference offset (0, refHH + ROTATE_HANDLE_OFFSET).  It
+   rotates with the shape and maps through the same (Ku, Kv). */
+
 function squareRotateHandleLocalWith(sq, depthScale) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const f = patchFrame(qi);
   if (!f) return null;
-  const uC = sq.u * f.uLen;
-  const vC = sq.v * f.vLen;
-  const dims = squareDimsWith(sq, depthScale);
-  const k = dims.h / 2 + ROTATE_HANDLE_OFFSET * f.vLen;
+
+  const refHH = SHAPE_REL_SIZE / 2 * sq.scaleV * depthScale;
+  const k = refHH + ROTATE_HANDLE_OFFSET;
   const cosT = Math.cos(sq.theta || 0);
   const sinT = Math.sin(sq.theta || 0);
-  return [uC + (-k * sinT), vC + (+k * cosT)];
+
+  const duR = -k * sinT;
+  const dvR =  k * cosT;
+
+  const { Ku, Kv } = _shapeAspectScales(f);
+  const uHat = sq.u + (duR * Ku) / f.uLen;
+  const vHat = sq.v + (dvR * Kv) / f.vLen;
+  return [uHat * f.uLen, vHat * f.vLen];
 }
 
 /* ==========================================================================
-   PROJECTION — shape-relative taper
-   ========================================================================== */
+   PROJECTION — shape-relative taper, WITH SLOPE
+   ==========================================================================
+   The single place slope is realised.  Given a point's local (u, v)
+   on the patch plane, the projection proceeds in three steps:
 
-function projectShapePoint(f, qi, uLocal, vLocal, vC, pC, vMax) {
-  const [wx, wy] = frameToWorld(f, uLocal, vLocal);
+     1.  Decompose the point's offset from the shape's centre along
+         the reference V axis into an in-plane part and an
+         out-of-plane part:
+
+             dv          = vLocal - vC
+             vInPlane    = vC + dv · cos(slope)
+             hOut        =   - dv · sin(slope)
+
+     2.  Project the in-plane point through the usual shape-relative
+         perspective taper:
+
+             p = pC - (vInPlane - vC) / vMax
+
+     3.  Add the out-of-plane part as a screen-space offset along
+         the direction the patch's outward surface normal projects
+         to.  That direction is the radial direction at the patch's
+         angular centre φc:  in screen space it is
+         ( cos φc , -sin φc ), because screen y is flipped.
+
+             px += hOut ·  cos(φc) · view.scale
+             py += hOut · -sin(φc) · view.scale
+
+   Positive slope drops the +v side (dv > 0) INTO the cone — the
+   outward normal points away from the axis, so hOut < 0 for dv > 0
+   moves the point toward the axis. */
+
+function projectShapePoint(f, qi, uLocal, vLocal, vC, pC, vMax,
+                           phiC, slope) {
+  const dv   = vLocal - vC;
+  const cosS = Math.cos(slope || 0);
+  const sinS = Math.sin(slope || 0);
+
+  const vInPlane = vC + dv * cosS;
+
+  const [wx, wy] = frameToWorld(f, uLocal, vInPlane);
   const [sx, sy] = w2s(wx, wy);
   const [ax, ay] = w2s(cone.ax, cone.ay);
-  const dv = vLocal - vC;
-  const p = pC - dv / vMax;
-  return [ax + p * (sx - ax), ay + p * (sy - ay)];
+  const p  = pC - (vInPlane - vC) / vMax;
+  let px = ax + p * (sx - ax);
+  let py = ay + p * (sy - ay);
+
+  const hN = -dv * sinS;
+  if (hN !== 0) {
+    px += hN *  Math.cos(phiC) * view.scale;
+    py += hN * -Math.sin(phiC) * view.scale;
+  }
+
+  return [px, py];
 }
 
 function squareCornersScreen(sq) {
@@ -1840,14 +2022,16 @@ function squareCornersScreen(sq) {
   const clipped = _clipPolygonToVMax(local, vMaxLocal);
   if (clipped.length < 3) return null;
 
-  const vC = sq.v * f.vLen;
-  const pC = shapePerspCentre(sq);
-  const vMax = shapeVMax(sq);
+  const vC    = sq.v * f.vLen;
+  const pC    = shapePerspCentre(sq);
+  const vMax  = shapeVMax(sq);
+  const phiC  = _patchNormalPhi(qi);
+  const slope = sq.slope || 0;
+
   return clipped.map(([u, v]) =>
-    projectShapePoint(f, qi, u, v, vC, pC, vMax));
+    projectShapePoint(f, qi, u, v, vC, pC, vMax, phiC, slope));
 }
 
-/* The handle is hidden when its own local v is past the horizon. */
 function squareRotateHandleScreen(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
@@ -1866,10 +2050,13 @@ function squareRotateHandleScreen(sq) {
   const HANDLE_GAP = 0.02 * f.vLen;
   const hv = Math.min(hl[1], vMaxLocal - HANDLE_GAP);
 
-  const vC = sq.v * f.vLen;
-  const pC = shapePerspCentre(sq);
-  const vMax = shapeVMax(sq);
-  return projectShapePoint(f, qi, hl[0], hv, vC, pC, vMax);
+  const vC    = sq.v * f.vLen;
+  const pC    = shapePerspCentre(sq);
+  const vMax  = shapeVMax(sq);
+  const phiC  = _patchNormalPhi(qi);
+  const slope = sq.slope || 0;
+
+  return projectShapePoint(f, qi, hl[0], hv, vC, pC, vMax, phiC, slope);
 }
 
 /* ==========================================================================
@@ -2073,7 +2260,11 @@ function findPatchAtScreen(sx, sy) {
 
 /* ==========================================================================
    INVERSE #1 — shape-relative taper, EXACT (quadratic)
-   ========================================================================== */
+   ==========================================================================
+   These solvers assume the shape is FLAT on the patch plane.  A
+   tilted shape's corner drag therefore lands the corner at the
+   un-tilted (u, v) of the cursor.  Reset slope to 0 for precise
+   corner editing in the cone view. */
 
 function cursorToLocalShapeRelativeExactWith(f, qi, vC, pC, vMax,
                                              sx, sy) {
@@ -2264,18 +2455,27 @@ function cursorToLocalWithPersp(f, qi, sq, sx, sy) {
    SHARED EDIT OPERATIONS
    ========================================================================== */
 
-/* Corner resize.  The cursor's local (u, v) offsets give the new w
-   and h directly; the scales are then the ratios of those to the
-   base dimensions, so scaleU = scaleV = 1.0 recovers the default
-   size and the whole scale range [SHAPE_MIN_SCALE, SHAPE_MAX_SCALE]
-   maps onto a fixed multiple of it, independent of the patch.
+/* Corner resize.  The cursor's offset from the shape's centre is
+   mapped to the REFERENCE frame by inverting the same map the
+   renderer applies:
 
-   depthScale is the multiplier the base dimensions are divided by —
-   effectiveConeDepth() when the drag came from the cone band,
-   SHAPE_DEPTH_FLAT when it came from the flat band.  Passing the
-   band's own factor makes the corner follow the cursor in THAT band;
-   the other band simply renders the new scaleV through its own
-   factor. */
+       local_u_offset = duR · Ku
+       local_v_offset = dvR · Kv
+
+   so duR = local_u_offset / Ku and dvR = local_v_offset / Kv.  The
+   resulting duR, dvR are un-rotated to recover the reference half-
+   extents, hence the new scaleU / scaleV.
+
+   NOTE — the earlier version divided by uLen / vLen *in addition*
+   to Ku / Kv, which made the computed half-extent 1/uLen (resp.
+   1/vLen) of the correct value and collapsed the shape to a
+   fraction of its size the moment a corner was grabbed.
+
+   depthScale is the multiplier the height is drawn at:
+   effectiveConeDepth() from the cone band, SHAPE_DEPTH_FLAT from the
+   flat band.  It enters only through the reference height's
+   normalizer, so the corner follows the cursor in the band the drag
+   came from. */
 
 function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale) {
   const qi = quadIdxById(sq.quadId);
@@ -2284,40 +2484,51 @@ function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale) {
   if (!q) return;
   const f = patchFrame(qi);
   if (!f) return;
-  const dPhi = q.phi1 - q.phi0;
-  const dS   = q.s1   - q.s0;
-  if (Math.abs(dPhi) < 1e-9 || Math.abs(dS) < 1e-9) return;
 
-  const c = squareCenterLocal(sq);
-  if (!c) return;
-  const [uC, vC] = c;
-  const ox = cu - uC;
-  const oy = cv - vC;
+  /* Cursor offset from the shape centre, in local (u, v). */
+  const dx = cu - sq.u * f.uLen;
+  const dy = cv - sq.v * f.vLen;
+
+  /* Local → reference, via the inverse of (duR · Ku, dvR · Kv). */
+  const { Ku, Kv } = _shapeAspectScales(f);
+  const ox = dx / Ku;
+  const oy = dy / Kv;
+
+  /* Un-rotate, in the reference frame. */
   const cosT = Math.cos(sq.theta || 0);
   const sinT = Math.sin(sq.theta || 0);
   const ux = ox * cosT + oy * sinT;
-  const uy = -ox * sinT + oy * cosT;
+  const uy = oy * cosT - ox * sinT;
+
   const signs = [[-1, +1], [+1, +1], [+1, -1], [-1, -1]][cornerIdx];
   const sx = signs[0], sy = signs[1];
 
-  const TWO_PI = 2 * Math.PI;
-  const baseW = SHAPE_W_PHI * TWO_PI * f.uLen / dPhi;
-  const baseH = SHAPE_H_S   * f.vLen / dS * depthScale;
-  const wMin  = SHAPE_MIN_SCALE * baseW;
-  const hMin  = SHAPE_MIN_SCALE * baseH;
-  const w = Math.max(2 * sx * ux, wMin);
-  const h = Math.max(2 * sy * uy, hMin);
-  sq.scaleU = w / baseW;
-  sq.scaleV = h / baseH;
+  const refHWmin = SHAPE_MIN_SCALE * SHAPE_REL_SIZE / 2;
+  const refHHmin = SHAPE_MIN_SCALE * SHAPE_REL_SIZE / 2 * depthScale;
+
+  const refHW = Math.max(sx * ux, refHWmin);
+  const refHH = Math.max(sy * uy, refHHmin);
+
+  sq.scaleU = refHW / (SHAPE_REL_SIZE / 2);
+  sq.scaleV = refHH / (SHAPE_REL_SIZE / 2 * depthScale);
   clampShapeScales(sq);
 }
 
+/* Rotate-handle tracking.  The cursor's offset from the shape centre
+   is mapped to the REFERENCE frame; the handle sits on the reference
+   +v̂ axis, so the raw angle is atan2(−ox_ref, oy_ref). */
+
 function setShapeRotationFromCursorLocal(sq, cu, cv, snap, startTheta) {
-  const c = squareCenterLocal(sq);
-  if (!c) return;
-  const ox = cu - c[0];
-  const oy = cv - c[1];
-  if (Math.abs(ox) < 1e-6 && Math.abs(oy) < 1e-6) return;
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return;
+  const f = patchFrame(qi);
+  if (!f) return;
+
+  const { Ku, Kv } = _shapeAspectScales(f);
+  const ox = (cu / f.uLen - sq.u) / Ku;
+  const oy = (cv / f.vLen - sq.v) / Kv;
+
+  if (Math.abs(ox) < 1e-9 && Math.abs(oy) < 1e-9) return;
 
   const thetaRaw = Math.atan2(-ox, oy);
 
@@ -2366,7 +2577,8 @@ function resizeSquareFromCorner(sq, cornerIdx, cursorWX, cursorWY) {
   if (!f) return;
   const [sx, sy] = w2s(cursorWX, cursorWY);
   const lc = cursorToLocalShapeRelativeExact(f, qi, sq, sx, sy);
-  setShapeFromCornerLocal(sq, cornerIdx, lc.u, lc.v, effectiveConeDepth());
+  setShapeFromCornerLocal(sq, cornerIdx, lc.u, lc.v,
+                          effectiveConeDepth());
 }
 
 function rotateSquareToCursor(sq, cursorWX, cursorWY, snap, startTheta) {
@@ -2381,7 +2593,9 @@ function rotateSquareToCursor(sq, cursorWX, cursorWY, snap, startTheta) {
 
 /* ==========================================================================
    FLAT-VIEW PROJECTION
-   ========================================================================== */
+   ==========================================================================
+   The flat view ignores slope: it draws the shape's un-tilted (φ, s)
+   footprint, so editing in that band stays exact. */
 
 function squareFlatCorners(sq) {
   const qi = quadIdxById(sq.quadId);
@@ -2424,8 +2638,6 @@ function squareFlatRotateHandleScreen(sq, shift) {
 
   let s = sC + (hl[1] / f.vLen) * dS;
 
-  /* Stay on the sheet.  s = 1 is the apex line, the top of the
-     flat rectangle. */
   const S_MAX = 1 - 0.02;
   if (s > S_MAX) s = S_MAX;
 
@@ -2674,7 +2886,7 @@ function _worldSideLengths(pts) {
 
 function buildVisualStateExport() {
   const out = {
-    schemaVersion: 5,
+    schemaVersion: 6,
     generatedAt:   new Date().toISOString(),
 
     cone: {
@@ -2767,6 +2979,8 @@ function buildVisualStateExport() {
       scaleV: _round3(sq.scaleV),
       thetaRad: _round3(sq.theta || 0),
       thetaDeg: _round3((sq.theta || 0) * 180 / Math.PI),
+      slopeRad: _round3(sq.slope || 0),
+      slopeDeg: _round3((sq.slope || 0) * 180 / Math.PI),
     };
 
     if (!f) {
@@ -2845,10 +3059,72 @@ function exportVisualStateJSON() {
    SCRUB RATES
    ========================================================================== */
 
-const PATCH_PHI_SCRUB_RATE = 0.008;
+/* Scrub rates for the two patch-position scrub inputs.  The φ rate
+   is expressed in display units per pixel (see the φ-display note in
+   the module docstring); one display unit is π radians, so this
+   matches the previous 0.008 rad/px physical rate.  The s rate is
+   still in s units (fraction of the axial height) per pixel. */
+
+const PATCH_PHI_SCRUB_RATE = 0.008 / Math.PI;
 const PATCH_S_SCRUB_RATE   = 0.0015;
 
+/* The φ display snap step with Shift held: one meridian (15°), which
+   in display units is 1/12.  Both +1 and -1 are top, so a snap that
+   lands on either is the same physical position. */
+
+const PATCH_SNAP_PHI_NORM = 1 / 12;
+
+/* Square width / height scrub rates.  Rate is the change in the
+   shape's intrinsic world extent along U (or V) per pixel of
+   horizontal drag; 0.005 means a 100-pixel drag moves W or H by
+   0.5.  Snap step with Shift held is 0.25 world units, a quarter of
+   the reference square's side at default scale. */
+
+const SQUARE_SIZE_SCRUB_RATE = 0.005;
+const SQUARE_SIZE_SNAP_STEP  = 0.25;
+
+/* Slope scrub rate: 0.5° per pixel of horizontal drag, so a
+   100-px drag swings the shape 50°.  Snap step with Shift held is
+   one meridian (15°).  Values are stored in radians in the model
+   and shown in degrees in the field. */
+const SLOPE_SCRUB_RATE_DEG_PER_PX = 0.5;
+const SLOPE_SNAP_STEP_DEG         = 15;
+
 const SCRUB_DRAG_THRESHOLD = 3;
+
+/* ==========================================================================
+   PHI DISPLAY CONVERSION
+   ==========================================================================
+   The patch's angular centre is stored in radians in the model; the
+   panel shows and accepts it in display units where the range is
+   [-1, 1] and the endpoints identify.  Zero sits at the visually-
+   bottom direction of the cone view; increasing values run clockwise
+   on screen (bottom → right → top), decreasing values run the other
+   way (bottom → left → top).  +1 and -1 are the same physical
+   direction, the top of the cone view.
+
+   These two functions are the only place the two unit systems meet.
+   Everything else in the codebase — the cone projection, the flat
+   view, the drag handlers, the export, the scene file — works in
+   radians. */
+
+const _TAU = 2 * Math.PI;
+
+function _phiToDisplay(phi) {
+  let d = (phi + Math.PI / 2) / Math.PI;
+  while (d >  1) d -= 2;
+  while (d < -1) d += 2;
+  return d;
+}
+
+function _displayToPhi(display) {
+  let d = display;
+  while (d >  1) d -= 2;
+  while (d < -1) d += 2;
+  let phi = d * Math.PI - Math.PI / 2;
+  phi = ((phi % _TAU) + _TAU) % _TAU;
+  return phi;
+}
 
 /* ==========================================================================
    SLIDER SYNC
@@ -2886,8 +3162,6 @@ function updatePanelLabels() {
    PATCH-POSITION SETTERS
    ========================================================================== */
 
-const _TAU = 2 * Math.PI;
-
 function _patchPhiCenter(q) {
   let c = (q.phi0 + q.phi1) / 2;
   c = ((c % _TAU) + _TAU) % _TAU;
@@ -2908,6 +3182,10 @@ function _setPatchPhiCenter(q, target) {
   _reclampShapesOnPatch(q);
 }
 
+/* The patch's s-centre.  Symmetric bounds inset by halfSpan, so
+   neither edge of the patch can leave [FLAT_S_MIN, FLAT_S_MAX].
+   For a default patch (halfSpan 0.25) the centre is confined to
+   [0.25, 0.75]. */
 function _setPatchSCenter(q, target) {
   const cur = _patchSCenter(q);
   const halfSpan = (q.s1 - q.s0) / 2;
@@ -2926,33 +3204,115 @@ function _setPatchSCenter(q, target) {
 }
 
 /* ==========================================================================
+   SQUARE-SIZE SETTERS
+   ==========================================================================
+   The panel's W / H fields speak in the shape's intrinsic world
+   extents along U and V (see the module docstring).  The setters
+   invert squareWorldWidth / squareWorldHeight to recover the
+   underlying scaleU / scaleV and clamp them to the same
+   SHAPE_MIN_SCALE .. SHAPE_MAX_SCALE bounds the corner-drag resize
+   uses, so a typed value cannot produce a shape that a drag could
+   not. */
+
+function _setSquareWidth(sq, target) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return;
+  const f = patchFrame(qi);
+  if (!f) return;
+  const { Ku } = _shapeAspectScales(f);
+  if (Ku <= 0) return;
+  const sU = target / (SHAPE_REL_SIZE * Ku);
+  sq.scaleU = Math.max(SHAPE_MIN_SCALE,
+              Math.min(SHAPE_MAX_SCALE, sU));
+}
+
+function _setSquareHeight(sq, target) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return;
+  const f = patchFrame(qi);
+  if (!f) return;
+  const { Kv } = _shapeAspectScales(f);
+  if (Kv <= 0) return;
+  const sV = target / (SHAPE_REL_SIZE * Kv);
+  sq.scaleV = Math.max(SHAPE_MIN_SCALE,
+              Math.min(SHAPE_MAX_SCALE, sV));
+}
+
+/* ==========================================================================
    PATCH-POSITION FIELDS
    ========================================================================== */
 
 function _syncPatchCoordInputs() {
   const phiInput = document.getElementById("patchPhiVal");
   const sInput   = document.getElementById("patchSVal");
-  if (!phiInput || !sInput) return;
 
-  const q = (selectedQuad >= 0 && selectedQuad < quads.length)
-    ? quads[selectedQuad] : null;
+  if (phiInput && sInput) {
+    const q = (selectedQuad >= 0 && selectedQuad < quads.length)
+      ? quads[selectedQuad] : null;
 
-  if (!q) {
-    phiInput.disabled = true;
-    sInput.disabled   = true;
-    if (document.activeElement !== phiInput) phiInput.value = "\u2014";
-    if (document.activeElement !== sInput)   sInput.value   = "\u2014";
+    if (!q) {
+      phiInput.disabled = true;
+      sInput.disabled   = true;
+      if (document.activeElement !== phiInput) phiInput.value = "\u2014";
+      if (document.activeElement !== sInput)   sInput.value   = "\u2014";
+    } else {
+      phiInput.disabled = false;
+      sInput.disabled   = false;
+
+      /* φ is displayed in normalized units on [-1, 1] (see the
+         module docstring); s is displayed as a fraction of the
+         axial height, unchanged. */
+      if (document.activeElement !== phiInput) {
+        phiInput.value = _phiToDisplay(_patchPhiCenter(q)).toFixed(3);
+      }
+      if (document.activeElement !== sInput) {
+        sInput.value = _patchSCenter(q).toFixed(3);
+      }
+    }
+  }
+
+  _syncSquareSizeInputs();
+}
+
+/* ==========================================================================
+   SQUARE-SIZE FIELDS
+   ==========================================================================
+   The W / H fields show the shape's intrinsic world extents along
+   the patch's U and V axes.  The Slope field shows the shape's
+   pseudo-3D tilt in degrees.  All three are disabled until a square
+   is selected. */
+
+function _syncSquareSizeInputs() {
+  const wInput = document.getElementById("squareWVal");
+  const hInput = document.getElementById("squareHVal");
+  const sInput = document.getElementById("squareSlopeVal");
+  if (!wInput || !hInput || !sInput) return;
+
+  const sq = (selectedSquare >= 0 && selectedSquare < floatSquares.length)
+    ? floatSquares[selectedSquare] : null;
+
+  if (!sq) {
+    wInput.disabled = true;
+    hInput.disabled = true;
+    sInput.disabled = true;
+    if (document.activeElement !== wInput) wInput.value = "\u2014";
+    if (document.activeElement !== hInput) hInput.value = "\u2014";
+    if (document.activeElement !== sInput) sInput.value = "\u2014";
     return;
   }
 
-  phiInput.disabled = false;
-  sInput.disabled   = false;
+  wInput.disabled = false;
+  hInput.disabled = false;
+  sInput.disabled = false;
 
-  if (document.activeElement !== phiInput) {
-    phiInput.value = _patchPhiCenter(q).toFixed(3);
+  if (document.activeElement !== wInput) {
+    wInput.value = squareWorldWidth(sq).toFixed(3);
+  }
+  if (document.activeElement !== hInput) {
+    hInput.value = squareWorldHeight(sq).toFixed(3);
   }
   if (document.activeElement !== sInput) {
-    sInput.value = _patchSCenter(q).toFixed(3);
+    sInput.value = ((sq.slope || 0) * 180 / Math.PI).toFixed(1);
   }
 }
 
@@ -3217,6 +3577,7 @@ function flashStatus(msg, cls) {
   const resetBtn     = document.getElementById("resetBtn");
   const centerBtn    = document.getElementById("centerBtn");
   const addBtn       = document.getElementById("addQuadBtn");
+  const cloneBtn     = document.getElementById("cloneQuadBtn");
   const addSqBtn     = document.getElementById("addSquareBtn");
   const exportBtn    = document.getElementById("exportBtn");
   const saveSceneBtn = document.getElementById("saveSceneBtn");
@@ -3250,21 +3611,24 @@ function flashStatus(msg, cls) {
     draw();
   });
 
-  /* ---- patch-position scrub inputs ------------------------------- */
+  /* ---- patch-position scrub inputs -------------------------------
+     The φ field reads and writes in display units (see the module
+     docstring); the s field reads and writes in fraction-of-height
+     units, unchanged. */
 
   const phiInput = document.getElementById("patchPhiVal");
   const sInput   = document.getElementById("patchSVal");
 
   if (phiInput) _installScrubInput(phiInput, {
     rate: PATCH_PHI_SCRUB_RATE,
-    snapStep: PATCH_SNAP_PHI,
+    snapStep: PATCH_SNAP_PHI_NORM,
     read: () => {
       if (selectedQuad < 0 || selectedQuad >= quads.length) return 0;
-      return _patchPhiCenter(quads[selectedQuad]);
+      return _phiToDisplay(_patchPhiCenter(quads[selectedQuad]));
     },
     write: (raw) => {
       if (selectedQuad < 0 || selectedQuad >= quads.length) return;
-      _setPatchPhiCenter(quads[selectedQuad], raw);
+      _setPatchPhiCenter(quads[selectedQuad], _displayToPhi(raw));
     },
   });
 
@@ -3280,6 +3644,63 @@ function flashStatus(msg, cls) {
     },
   });
 
+  /* ---- square-size scrub inputs ---------------------------------
+     The two fields read and write the shape's intrinsic world
+     extent along the patch's U and V axes (see the module
+     docstring).  Both are disabled until a square is selected. */
+
+  const wInput = document.getElementById("squareWVal");
+  const hInput = document.getElementById("squareHVal");
+
+  if (wInput) _installScrubInput(wInput, {
+    rate: SQUARE_SIZE_SCRUB_RATE,
+    snapStep: SQUARE_SIZE_SNAP_STEP,
+    read: () => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return 0;
+      return squareWorldWidth(floatSquares[selectedSquare]);
+    },
+    write: (raw) => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return;
+      _setSquareWidth(floatSquares[selectedSquare], raw);
+    },
+  });
+
+  if (hInput) _installScrubInput(hInput, {
+    rate: SQUARE_SIZE_SCRUB_RATE,
+    snapStep: SQUARE_SIZE_SNAP_STEP,
+    read: () => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return 0;
+      return squareWorldHeight(floatSquares[selectedSquare]);
+    },
+    write: (raw) => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return;
+      _setSquareHeight(floatSquares[selectedSquare], raw);
+    },
+  });
+
+  /* ---- slope scrub input ----------------------------------------
+     The field reads and writes the shape's pseudo-3D tilt.  The
+     model speaks radians; the field speaks degrees (see the SLOPE
+     note in the module docstring).  The rate and snap step are
+     converted from degrees to radians here so the installer's
+     radian-per-pixel contract is honoured. */
+
+  const slopeInput = document.getElementById("squareSlopeVal");
+
+  if (slopeInput) _installScrubInput(slopeInput, {
+    rate: SLOPE_SCRUB_RATE_DEG_PER_PX * Math.PI / 180,
+    snapStep: SLOPE_SNAP_STEP_DEG * Math.PI / 180,
+    read: () => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return 0;
+      return floatSquares[selectedSquare].slope || 0;
+    },
+    write: (raw) => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return;
+      const s = Math.max(SHAPE_SLOPE_MIN, Math.min(SHAPE_SLOPE_MAX, raw));
+      floatSquares[selectedSquare].slope = s;
+    },
+  });
+
   /* ---- buttons and lists ----------------------------------------- */
 
   if (resetBtn)     resetBtn.addEventListener("click", resetView);
@@ -3289,6 +3710,13 @@ function flashStatus(msg, cls) {
     draw();
   });
   if (addBtn)       addBtn.addEventListener("click", addQuad);
+  if (cloneBtn)     cloneBtn.addEventListener("click", () => {
+    if (selectedQuad < 0 || selectedQuad >= quads.length) {
+      flashStatus("No patch selected", "warn");
+      return;
+    }
+    cloneQuad(selectedQuad);
+  });
   if (addSqBtn)     addSqBtn.addEventListener("click", () => {
     if (selectedQuad < 0 || selectedQuad >= quads.length) return;
     addSquareAtCenter(selectedQuad);
@@ -3369,6 +3797,7 @@ function buildSceneJSON() {
       scaleU: sq.scaleU,
       scaleV: sq.scaleV,
       theta:  sq.theta || 0,
+      slope:  sq.slope || 0,
     })),
   };
 }
@@ -3494,6 +3923,7 @@ function applySceneJSON(data) {
       scaleV: (typeof s.scaleV === "number")
                 ? s.scaleV : SHAPE_DEFAULT_SCALE,
       theta:  (typeof s.theta === "number") ? s.theta : 0,
+      slope:  (typeof s.slope === "number") ? s.slope : 0,
     });
   }
 
@@ -3672,10 +4102,12 @@ function updateStatus() {
     if (sq) {
       const dims = squareDims(sq);
       const deg  = Math.round((sq.theta || 0) * 180 / Math.PI);
+      const slp  = Math.round((sq.slope || 0) * 180 / Math.PI);
       drag = "   \u00B7  shape #" + sq.id +
              "  W " + dims.w.toFixed(2) +
              "  H " + dims.h.toFixed(2) +
-             "  \u2220 " + deg + "\u00B0";
+             "  \u2220 " + deg + "\u00B0" +
+             "  \u2197 " + slp + "\u00B0";
     }
   } else if (state.dragPatchBody) {
     drag = "   \u00B7  moving " +
@@ -3978,6 +4410,11 @@ window.addEventListener("mousemove", (e) => {
           let dU = lc.u - ds.startCursorU;
           let dV = lc.v - ds.startCursorV;
 
+          /* Shift held: constrain to the patch's V axis, which
+             points from the patch's base midpoint toward the apex.
+             Both directions along that axis remain free. */
+          if (e.shiftKey) dU = 0;
+
           const maxDU = BODY_DRAG_MAX_DU * f.uLen;
           const maxDV = BODY_DRAG_MAX_DV * f.vLen;
           if (dU >  maxDU) dU =  maxDU;
@@ -4027,6 +4464,11 @@ window.addEventListener("mousemove", (e) => {
           if (f) {
             let dU = lc.u - fsd.startCursorU;
             let dV = lc.v - fsd.startCursorV;
+
+            /* Shift held: constrain to the patch's V axis, which
+               points from the patch's base midpoint toward the
+               apex.  Both directions along that axis remain free. */
+            if (e.shiftKey) dU = 0;
 
             const maxDU = BODY_DRAG_MAX_DU * f.uLen;
             const maxDV = BODY_DRAG_MAX_DV * f.vLen;

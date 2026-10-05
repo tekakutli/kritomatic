@@ -6,7 +6,8 @@ The scene is the complete editable state of the workspace:
     cone state      ax, ay, depth, halfAngle, ringCount, meridianCount
     shapeDepthCone  the cone view's SHAPE_DEPTH_CONE multiplier
     patches         id, name, phi0, phi1, s0, s1
-    squares         id, name, quadId, u, v, scaleU, scaleV, theta
+    squares         id, name, quadId, u, v, scaleU, scaleV, theta,
+                    slope
     id counters     nextQuadId, nextSquareId
 
 The save and the load both speak the same JSON shape.  Saving writes
@@ -51,6 +52,13 @@ Only the cone view's depth multiplier is persisted.  `SHAPE_DEPTH_FLAT`
 is a fixed const in pg_view_squares.py and is not written; a scene
 loaded on a build with a different flat-view constant will not shift
 the flat view's footprint.
+
+SLOPE
+=====
+The per-square `slope` field is persisted alongside `theta`.  Files
+written before slope existed simply omit it; the loader defaults a
+missing value to 0 (shape flat on its patch), so old scenes load
+unchanged.
 """
 
 
@@ -101,6 +109,7 @@ function buildSceneJSON() {
       scaleU: sq.scaleU,
       scaleV: sq.scaleV,
       theta:  sq.theta || 0,
+      slope:  sq.slope || 0,
     })),
   };
 }
@@ -226,6 +235,7 @@ function applySceneJSON(data) {
       scaleV: (typeof s.scaleV === "number")
                 ? s.scaleV : SHAPE_DEFAULT_SCALE,
       theta:  (typeof s.theta === "number") ? s.theta : 0,
+      slope:  (typeof s.slope === "number") ? s.slope : 0,
     });
   }
 

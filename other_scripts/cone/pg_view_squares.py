@@ -7,14 +7,17 @@ unit length but generally not perpendicular.
 THE MODEL
 =========
 A shape is a rectangle in the patch's own (u, v) plane, rotated by
-an angle, with independent width and height multipliers:
+an angle, with independent width and height multipliers, and
+optionally tilted out of the patch plane:
 
-    { id, name, quadId, u, v, scaleU, scaleV, theta }
+    { id, name, quadId, u, v, scaleU, scaleV, theta, slope }
 
     u, v      centre in NORMALIZED patch coordinates
     scaleU    width multiplier (reference frame)
     scaleV    height multiplier (reference frame)
     theta     rotation angle, radians, in the REFERENCE frame
+    slope     tilt out of the patch plane, radians, about the
+              reference U axis (see SLOPE below)
     name      user-editable label, rendered as a pill at the centre
 
 SHAPE DIMENSIONS — REFERENCE FRAME
@@ -109,6 +112,39 @@ value deliberately breaks that agreement — a v̂-adjacent pair that
 touches in one band leaves a gap of  h_v̂ · vLen · (1 − DEPTH)  in
 the other.  See the panel module for the slider semantics.
 
+SLOPE
+=====
+Each shape carries a `slope` angle (radians).  Zero leaves the
+shape flat on the patch plane — the historic behaviour.  Non-zero
+tilts the shape out of the plane about its own reference U axis,
+using a lightweight pseudo-3D model that only the CONE view reads:
+
+    A point at local v = vC + dv moves to
+
+        in-plane   v  = vC + dv · cos(slope)
+        out-plane  h  = -dv · sin(slope)
+
+    along the OUTWARD surface normal at the patch centre.
+
+The in-plane part (v · cos) goes through the usual perspective
+taper.  The out-of-plane part becomes a screen-space offset along
+the direction the patch's outward normal projects to in the cone
+view, which is the radial direction at the patch's angular centre:
+
+    screen Δ = h · ( cos φ_c , -sin φ_c ) · view.scale
+
+So a positive slope tips the +v edge (the one pointing toward the
+apex) INTO the cone's cavity; the −v edge swings outward by the
+same amount.  Slope is clamped to ±85° to avoid the degenerate
+edge-on case.
+
+The flat (unfolded-cone) view deliberately IGNORES slope: the
+shape's (φ, s) footprint there is the un-tilted one, so editing
+corners and rotating in that band behaves exactly as before.  The
+inverse solvers below also ignore slope; to edit a tilted shape's
+corners by dragging in the cone view, set its slope back to 0
+first.
+
 THE PERSPECTIVE — SHAPE-RELATIVE TAPER
 ======================================
 The cone band is a perspective projection of the patch's plane.  A
@@ -160,6 +196,12 @@ INVERSION — SOLVERS, PRESERVED SIDE BY SIDE
     cursorToLocalFullPersp               (quadratic, per-vertex)
     cursorToLocalWithPersp               (iterative, shape-relative)
 
+All four read the shape as if it were FLAT on the patch plane: the
+slope is not inverted.  Dragging a corner in the cone view when the
+shape is tilted will therefore land the dragged corner on the
+un-tilted (u, v) of the cursor.  Reset slope to 0 for a precise
+corner drag.
+
 SHAPE POSITION BOUND (u)
 ========================
 setClonePosition clamps the shape's stored u to ±U_LIMIT.  The clamp
@@ -185,6 +227,25 @@ Since the reference shape is a square (at scaleU = scaleV = 1), a
 90° rotation returns the same SET of reference corners; and because
 the map (du, dv) → local is a linear map that does not depend on
 θ, the mapped shape is the same SET of points at 0° and 90°.
+
+PLANE INTERSECTION
+==================
+When a shape is tilted out of its patch plane, the shape's plane
+cuts the patch plane along a line: the pivot axis.  The projection
+tilts about local v = vC (the shape's centre along the patch's V
+axis), so the intersection segment is the chord of the shape's own
+local quad along v = vC.  It is drawn as a faint dashed hint so a
+tilted shape reads as "pivoted about this axis" rather than
+floating arbitrarily.  With slope = 0 the line is not drawn.
+
+CLONING
+=======
+cloneSquare(idx) duplicates a shape at the EXACT same location as
+its source: same quadId, same (u, v), same scaleU / scaleV, same
+theta, same slope.  The clone overlaps its source pixel-for-pixel
+until it is dragged away, so the operation reads as "stamp another
+copy right here".  The clone receives a fresh id and default name
+and becomes the new selection.
 
 LABELS
 ======
@@ -228,6 +289,22 @@ const SHAPE_REL_SIZE = 2.0;
 const SHAPE_DEFAULT_SCALE = 1.0;
 const SHAPE_MIN_SCALE     = 0.03;
 const SHAPE_MAX_SCALE     = 10.00;
+
+/* ==========================================================================
+   SHAPE SLOPE
+   ==========================================================================
+   How far a shape may tilt out of the patch plane, about its own
+   reference U axis.  Zero leaves the shape flat on the patch.
+   Positive slope tips the +v edge (the one that points toward the
+   apex) INTO the cavity of the cone; negative slope tips the −v
+   edge.  See the SLOPE section in the module docstring.
+
+   ±85° is the hard bound.  At ±90° the shape would be edge-on to
+   the patch plane, the projection would collapse to a line, and
+   the corner/rotate handle offsets would become singular. */
+
+const SHAPE_SLOPE_MIN = -85 * Math.PI / 180;
+const SHAPE_SLOPE_MAX =  85 * Math.PI / 180;
 
 /* ==========================================================================
    SHAPE ASPECT CORRECTION
@@ -384,6 +461,21 @@ function quadIdxById(id) {
   return -1;
 }
 
+/* The direction that the patch's outward surface normal projects to,
+   in the cone view, is the radial direction at the patch's angular
+   centre.  When the apex is off-centre the axis is not vertical,
+   but the projection of "outward" is still radial in the xy plane,
+   so this is the correct screen direction to slide the tilted shape
+   along.  Returned in world φ (radians, [0, 2π)). */
+function _patchNormalPhi(qi) {
+  if (qi < 0 || qi >= quads.length) return 0;
+  const q = quads[qi];
+  const TAU = 2 * Math.PI;
+  let phi = (q.phi0 + q.phi1) / 2;
+  phi = ((phi % TAU) + TAU) % TAU;
+  return phi;
+}
+
 /* ==========================================================================
    PATCH CORNERS IN LOCAL FRAME — [TL, TR, BR, BL]
    ========================================================================== */
@@ -483,7 +575,9 @@ function clampCloneV(qi, vHat) {
    SHAPE V-EXTENT (preserved, not on the render path)
    ==========================================================================
    Reports the shape's half-extent along v̂, in NORMALIZED v̂ units,
-   accounting for the rotation and the aspect correction. */
+   accounting for the rotation and the aspect correction.  The slope
+   is not folded in here: this is the footprint the shape would have
+   if it were flat on the patch plane. */
 
 function _vExtentNormFromDims(f, dims, theta) {
   const hwHat = (dims.w / 2) / f.uLen;
@@ -542,6 +636,7 @@ function addSquareAt(quadIdx, uLocal, vLocal) {
     scaleU: SHAPE_DEFAULT_SCALE,
     scaleV: SHAPE_DEFAULT_SCALE,
     theta: 0,
+    slope: 0,
   });
   selectedSquare = floatSquares.length - 1;
   syncQuadList();
@@ -549,6 +644,33 @@ function addSquareAt(quadIdx, uLocal, vLocal) {
 }
 
 function addSquareAtCenter(quadIdx) { addSquareAt(quadIdx, 0, 0); }
+
+/* Duplicate a square at the EXACT same location as its source: same
+   patch (quadId), same normalized (u, v), same scaleU / scaleV,
+   same theta, same slope.  The clone overlaps the source
+   pixel-for-pixel until it is dragged away.  It receives a fresh id
+   and default name, and becomes the new selection. */
+function cloneSquare(idx) {
+  if (idx < 0 || idx >= floatSquares.length) return;
+  const src = floatSquares[idx];
+  if (!src) return;
+
+  const newId = nextSquareId++;
+  floatSquares.push({
+    id:     newId,
+    name:   "S" + newId,
+    quadId: src.quadId,
+    u:      src.u,
+    v:      src.v,
+    scaleU: src.scaleU,
+    scaleV: src.scaleV,
+    theta:  src.theta || 0,
+    slope:  src.slope || 0,
+  });
+  selectedSquare = floatSquares.length - 1;
+  syncQuadList();
+  draw();
+}
 
 function deleteSquare(idx) {
   if (idx < 0 || idx >= floatSquares.length) return;
@@ -653,7 +775,11 @@ function squareCenterLocal(sq) {
    mapped to (û, v̂) through (Ku, Kv) and to local through
    (uLen, vLen).  Because that map does not depend on θ, a 90°
    rotation in the reference frame is a 90° rotation of the drawn
-   shape, so the set of local corners is the same at θ = 0° and 90°. */
+   shape, so the set of local corners is the same at θ = 0° and 90°.
+
+   Slope is not applied here.  The flat view (via these local
+   corners) sees the un-tilted footprint; the cone view applies the
+   tilt later, in projectShapePoint. */
 
 function squareCornersLocal(sq) {
   return squareCornersLocalWith(sq, SHAPE_DEPTH_FLAT);
@@ -740,16 +866,59 @@ function squareRotateHandleLocalWith(sq, depthScale) {
 }
 
 /* ==========================================================================
-   PROJECTION — shape-relative taper
-   ========================================================================== */
+   PROJECTION — shape-relative taper, WITH SLOPE
+   ==========================================================================
+   The single place slope is realised.  Given a point's local (u, v)
+   on the patch plane, the projection proceeds in three steps:
 
-function projectShapePoint(f, qi, uLocal, vLocal, vC, pC, vMax) {
-  const [wx, wy] = frameToWorld(f, uLocal, vLocal);
+     1.  Decompose the point's offset from the shape's centre along
+         the reference V axis into an in-plane part and an
+         out-of-plane part:
+
+             dv          = vLocal - vC
+             vInPlane    = vC + dv · cos(slope)
+             hOut        =   - dv · sin(slope)
+
+     2.  Project the in-plane point through the usual shape-relative
+         perspective taper:
+
+             p = pC - (vInPlane - vC) / vMax
+
+     3.  Add the out-of-plane part as a screen-space offset along
+         the direction the patch's outward surface normal projects
+         to.  That direction is the radial direction at the patch's
+         angular centre φc:  in screen space it is
+         ( cos φc , -sin φc ), because screen y is flipped.
+
+             px += hOut ·  cos(φc) · view.scale
+             py += hOut · -sin(φc) · view.scale
+
+   Positive slope drops the +v side (dv > 0) INTO the cone — the
+   outward normal points away from the axis, so hOut < 0 for dv > 0
+   moves the point toward the axis. */
+
+function projectShapePoint(f, qi, uLocal, vLocal, vC, pC, vMax,
+                           phiC, slope) {
+  const dv   = vLocal - vC;
+  const cosS = Math.cos(slope || 0);
+  const sinS = Math.sin(slope || 0);
+
+  const vInPlane = vC + dv * cosS;
+
+  const [wx, wy] = frameToWorld(f, uLocal, vInPlane);
   const [sx, sy] = w2s(wx, wy);
   const [ax, ay] = w2s(cone.ax, cone.ay);
-  const dv = vLocal - vC;
-  const p = pC - dv / vMax;
-  return [ax + p * (sx - ax), ay + p * (sy - ay)];
+  const p  = pC - (vInPlane - vC) / vMax;
+  let px = ax + p * (sx - ax);
+  let py = ay + p * (sy - ay);
+
+  const hN = -dv * sinS;
+  if (hN !== 0) {
+    px += hN *  Math.cos(phiC) * view.scale;
+    py += hN * -Math.sin(phiC) * view.scale;
+  }
+
+  return [px, py];
 }
 
 function squareCornersScreen(sq) {
@@ -766,11 +935,14 @@ function squareCornersScreen(sq) {
   const clipped = _clipPolygonToVMax(local, vMaxLocal);
   if (clipped.length < 3) return null;
 
-  const vC = sq.v * f.vLen;
-  const pC = shapePerspCentre(sq);
-  const vMax = shapeVMax(sq);
+  const vC    = sq.v * f.vLen;
+  const pC    = shapePerspCentre(sq);
+  const vMax  = shapeVMax(sq);
+  const phiC  = _patchNormalPhi(qi);
+  const slope = sq.slope || 0;
+
   return clipped.map(([u, v]) =>
-    projectShapePoint(f, qi, u, v, vC, pC, vMax));
+    projectShapePoint(f, qi, u, v, vC, pC, vMax, phiC, slope));
 }
 
 function squareRotateHandleScreen(sq) {
@@ -791,10 +963,118 @@ function squareRotateHandleScreen(sq) {
   const HANDLE_GAP = 0.02 * f.vLen;
   const hv = Math.min(hl[1], vMaxLocal - HANDLE_GAP);
 
+  const vC    = sq.v * f.vLen;
+  const pC    = shapePerspCentre(sq);
+  const vMax  = shapeVMax(sq);
+  const phiC  = _patchNormalPhi(qi);
+  const slope = sq.slope || 0;
+
+  return projectShapePoint(f, qi, hl[0], hv, vC, pC, vMax, phiC, slope);
+}
+
+/* ==========================================================================
+   PLANE INTERSECTION
+   ==========================================================================
+   When a shape is tilted out of its patch plane, its plane cuts the
+   patch plane along a line: the pivot axis.  The projection tilts
+   about local v = vC (the shape's centre along the patch's V axis),
+   so the intersection segment is the piece of the line v = vC that
+   lies inside the shape's own local quad.  It is drawn as a faint
+   dashed hint so a tilted shape reads as "pivoted about this axis"
+   rather than floating arbitrarily.  With slope = 0 the line is not
+   drawn. */
+
+function squarePlaneIntersectionLocal(sq) {
+  const slope = sq.slope || 0;
+  if (Math.abs(slope) < 1e-6) return null;
+
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const f = patchFrame(qi);
+  if (!f) return null;
+
+  const corners = squareCornersLocalCone(sq);
+  if (!corners || corners.length < 3) return null;
+
   const vC = sq.v * f.vLen;
-  const pC = shapePerspCentre(sq);
-  const vMax = shapeVMax(sq);
-  return projectShapePoint(f, qi, hl[0], hv, vC, pC, vMax);
+
+  /* Intersect the line v = vC with every edge of the quad. */
+  const pts = [];
+  const n = corners.length;
+  for (let i = 0; i < n; i++) {
+    const A = corners[i];
+    const B = corners[(i + 1) % n];
+    const da = A[1] - vC;
+    const db = B[1] - vC;
+    if (Math.abs(da) < 1e-9) pts.push([A[0], vC]);
+    if (Math.abs(db) < 1e-9) pts.push([B[0], vC]);
+    if (da * db < 0) {
+      const t = da / (da - db);
+      pts.push([A[0] + (B[0] - A[0]) * t, vC]);
+    }
+  }
+
+  if (pts.length < 2) return null;
+
+  /* The two most distant intersections are the chord endpoints. */
+  let best  = [pts[0], pts[1]];
+  let bestD = -1;
+  for (let i = 0; i < pts.length; i++) {
+    for (let j = i + 1; j < pts.length; j++) {
+      const dx = pts[i][0] - pts[j][0];
+      const dy = pts[i][1] - pts[j][1];
+      const d  = dx * dx + dy * dy;
+      if (d > bestD) { bestD = d; best = [pts[i], pts[j]]; }
+    }
+  }
+  return best;
+}
+
+/* Cone-band screen endpoints.  Both lie at local v = vC, so the
+   projection's slope term is zero there and they read as the same
+   line the un-tilted shape would show: exactly the pivot. */
+function squarePlaneIntersectionScreen(sq) {
+  const local = squarePlaneIntersectionLocal(sq);
+  if (!local) return null;
+
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const f = patchFrame(qi);
+  if (!f) return null;
+  const h = horizonLocal(qi);
+  if (!h) return null;
+
+  const vC    = sq.v * f.vLen;
+  const pC    = shapePerspCentre(sq);
+  const vMax  = shapeVMax(sq);
+  const phiC  = _patchNormalPhi(qi);
+  const slope = sq.slope || 0;
+
+  return local.map(([u, v]) =>
+    projectShapePoint(f, qi, u, v, vC, pC, vMax, phiC, slope));
+}
+
+/* Flat-band (phi, s) endpoints, using the same linear (u, v) →
+   (phi, s) correspondence the shape's footprint itself uses. */
+function squarePlaneIntersectionFlat(sq) {
+  const local = squarePlaneIntersectionLocal(sq);
+  if (!local) return null;
+
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const q = quads[qi];
+  const f = patchFrame(qi);
+  if (!f) return null;
+
+  const phiC = (q.phi0 + q.phi1) / 2;
+  const sC   = (q.s0   + q.s1)   / 2;
+  const dPhi = q.phi1 - q.phi0;
+  const dS   = q.s1   - q.s0;
+
+  return local.map(([u, v]) => [
+    phiC + (u / f.uLen) * dPhi,
+    sC   + (v / f.vLen) * dS,
+  ]);
 }
 
 /* ==========================================================================
@@ -895,6 +1175,22 @@ function drawFloatSquare(sq, selected) {
   ctx.strokeStyle = _huergb(hue, selected ? 1.00 : 0.72);
   ctx.lineWidth = selected ? 2.0 : 1.3;
   ctx.stroke();
+
+  /* Intersection with the patch plane, when tilted. */
+  if (sq.slope && Math.abs(sq.slope) > 1e-6) {
+    const isect = squarePlaneIntersectionScreen(sq);
+    if (isect) {
+      ctx.save();
+      ctx.setLineDash([4, 3]);
+      ctx.strokeStyle = _huergb(hue, selected ? 0.65 : 0.42);
+      ctx.lineWidth   = 1.0;
+      ctx.beginPath();
+      ctx.moveTo(isect[0][0], isect[0][1]);
+      ctx.lineTo(isect[1][0], isect[1][1]);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
 
   if (!selected) return;
 
@@ -998,7 +1294,11 @@ function findPatchAtScreen(sx, sy) {
 
 /* ==========================================================================
    INVERSE #1 — shape-relative taper, EXACT (quadratic)
-   ========================================================================== */
+   ==========================================================================
+   These solvers assume the shape is FLAT on the patch plane.  A
+   tilted shape's corner drag therefore lands the corner at the
+   un-tilted (u, v) of the cursor.  Reset slope to 0 for precise
+   corner editing in the cone view. */
 
 function cursorToLocalShapeRelativeExactWith(f, qi, vC, pC, vMax,
                                              sx, sy) {
@@ -1327,7 +1627,9 @@ function rotateSquareToCursor(sq, cursorWX, cursorWY, snap, startTheta) {
 
 /* ==========================================================================
    FLAT-VIEW PROJECTION
-   ========================================================================== */
+   ==========================================================================
+   The flat view ignores slope: it draws the shape's un-tilted (φ, s)
+   footprint, so editing in that band stays exact. */
 
 function squareFlatCorners(sq) {
   const qi = quadIdxById(sq.quadId);

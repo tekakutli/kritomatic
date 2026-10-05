@@ -1,10 +1,11 @@
 """
 pg_panel.py — panel bindings.
 
-Five graphics sliders, four scrub-inputs (the selected patch's φ and
-s, the selected square's width and height), eight buttons (Save
-scene, Load scene, Reset, Center apex, Export visual state,
-+ Patch, + Clone, + Square), two lists, a persistent hint block.
+Five graphics sliders, five scrub-inputs (the selected patch's φ and
+s, the selected square's width, height, and slope), nine buttons
+(Save scene, Load scene, Reset, Center apex, Export visual state,
++ Patch, + Clone, + Square, + Clone), two lists, a persistent hint
+block.
 
 Save scene writes the whole editable workspace — cone state, patch
 and shape data, id counters — to a JSON file.  Load scene opens a
@@ -78,6 +79,33 @@ snap step with Shift held is 0.25 world units.  Typed values are
 clamped to [SHAPE_MIN_SCALE · SHAPE_REL_SIZE · Ku, SHAPE_MAX_SCALE ·
 SHAPE_REL_SIZE · Ku] by the setters, which delegate to the same
 scale bounds the corner-drag resize uses.
+
+SLOPE
+=====
+The "Slope" scrub input shows the selected shape's pseudo-3D tilt
+about its own reference U axis, in degrees.  Zero leaves the shape
+flat on the patch (the historic behaviour); a positive value tips
+the +v edge — the edge that points toward the apex — into the
+cone's cavity, so the shape reads as dipping forward off the plane.
+Negative values tip the −v edge instead.
+
+The rate is 0.5° per pixel of horizontal drag; Shift snaps to 15°
+increments, matching one meridian.  The stored value is in radians
+(the model's convention); the panel converts to and from degrees at
+the field boundary.  Values are clamped to ±85°.
+
+The flat view ignores slope — its footprint is the un-tilted (φ, s)
+projection — so editing in that band stays exact.  Only the cone
+view reads slope.  See the SLOPE section in pg_view_squares.py.
+
+CLONING SQUARES
+===============
+"+ Clone" in the Squares row duplicates the selected square at the
+EXACT same location as its source: same patch (quadId), same
+normalized (u, v), same scaleU / scaleV, same theta, same slope.
+The clone overlaps its source pixel-for-pixel until it is dragged
+away.  The clone receives a fresh id and default name and becomes
+the new selection.
 """
 
 PANEL_JS = r"""
@@ -108,6 +136,13 @@ const PATCH_SNAP_PHI_NORM = 1 / 12;
 
 const SQUARE_SIZE_SCRUB_RATE = 0.005;
 const SQUARE_SIZE_SNAP_STEP  = 0.25;
+
+/* Slope scrub rate: 0.5° per pixel of horizontal drag, so a
+   100-px drag swings the shape 50°.  Snap step with Shift held is
+   one meridian (15°).  Values are stored in radians in the model
+   and shown in degrees in the field. */
+const SLOPE_SCRUB_RATE_DEG_PER_PX = 0.5;
+const SLOPE_SNAP_STEP_DEG         = 15;
 
 const SCRUB_DRAG_THRESHOLD = 3;
 
@@ -295,12 +330,17 @@ function _syncPatchCoordInputs() {
 
 /* ==========================================================================
    SQUARE-SIZE FIELDS
-   ========================================================================== */
+   ==========================================================================
+   The W / H fields show the shape's intrinsic world extents along
+   the patch's U and V axes.  The Slope field shows the shape's
+   pseudo-3D tilt in degrees.  All three are disabled until a square
+   is selected. */
 
 function _syncSquareSizeInputs() {
   const wInput = document.getElementById("squareWVal");
   const hInput = document.getElementById("squareHVal");
-  if (!wInput || !hInput) return;
+  const sInput = document.getElementById("squareSlopeVal");
+  if (!wInput || !hInput || !sInput) return;
 
   const sq = (selectedSquare >= 0 && selectedSquare < floatSquares.length)
     ? floatSquares[selectedSquare] : null;
@@ -308,19 +348,25 @@ function _syncSquareSizeInputs() {
   if (!sq) {
     wInput.disabled = true;
     hInput.disabled = true;
+    sInput.disabled = true;
     if (document.activeElement !== wInput) wInput.value = "\u2014";
     if (document.activeElement !== hInput) hInput.value = "\u2014";
+    if (document.activeElement !== sInput) sInput.value = "\u2014";
     return;
   }
 
   wInput.disabled = false;
   hInput.disabled = false;
+  sInput.disabled = false;
 
   if (document.activeElement !== wInput) {
     wInput.value = squareWorldWidth(sq).toFixed(3);
   }
   if (document.activeElement !== hInput) {
     hInput.value = squareWorldHeight(sq).toFixed(3);
+  }
+  if (document.activeElement !== sInput) {
+    sInput.value = ((sq.slope || 0) * 180 / Math.PI).toFixed(1);
   }
 }
 
@@ -582,14 +628,15 @@ function flashStatus(msg, cls) {
   const m  = document.getElementById("meridiansSlider");
   const sd = document.getElementById("shapeDepthSlider");
 
-  const resetBtn     = document.getElementById("resetBtn");
-  const centerBtn    = document.getElementById("centerBtn");
-  const addBtn       = document.getElementById("addQuadBtn");
-  const cloneBtn     = document.getElementById("cloneQuadBtn");
-  const addSqBtn     = document.getElementById("addSquareBtn");
-  const exportBtn    = document.getElementById("exportBtn");
-  const saveSceneBtn = document.getElementById("saveSceneBtn");
-  const loadSceneBtn = document.getElementById("loadSceneBtn");
+  const resetBtn      = document.getElementById("resetBtn");
+  const centerBtn     = document.getElementById("centerBtn");
+  const addBtn        = document.getElementById("addQuadBtn");
+  const cloneBtn      = document.getElementById("cloneQuadBtn");
+  const addSqBtn      = document.getElementById("addSquareBtn");
+  const cloneSqBtn    = document.getElementById("cloneSquareBtn");
+  const exportBtn     = document.getElementById("exportBtn");
+  const saveSceneBtn  = document.getElementById("saveSceneBtn");
+  const loadSceneBtn  = document.getElementById("loadSceneBtn");
 
   if (d) d.addEventListener("input", () => {
     cone.depth = parseFloat(d.value);
@@ -686,6 +733,29 @@ function flashStatus(msg, cls) {
     },
   });
 
+  /* ---- slope scrub input ----------------------------------------
+     The field reads and writes the shape's pseudo-3D tilt.  The
+     model speaks radians; the field speaks degrees (see the SLOPE
+     note in the module docstring).  The rate and snap step are
+     converted from degrees to radians here so the installer's
+     radian-per-pixel contract is honoured. */
+
+  const slopeInput = document.getElementById("squareSlopeVal");
+
+  if (slopeInput) _installScrubInput(slopeInput, {
+    rate: SLOPE_SCRUB_RATE_DEG_PER_PX * Math.PI / 180,
+    snapStep: SLOPE_SNAP_STEP_DEG * Math.PI / 180,
+    read: () => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return 0;
+      return floatSquares[selectedSquare].slope || 0;
+    },
+    write: (raw) => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return;
+      const s = Math.max(SHAPE_SLOPE_MIN, Math.min(SHAPE_SLOPE_MAX, raw));
+      floatSquares[selectedSquare].slope = s;
+    },
+  });
+
   /* ---- buttons and lists ----------------------------------------- */
 
   if (resetBtn)     resetBtn.addEventListener("click", resetView);
@@ -705,6 +775,13 @@ function flashStatus(msg, cls) {
   if (addSqBtn)     addSqBtn.addEventListener("click", () => {
     if (selectedQuad < 0 || selectedQuad >= quads.length) return;
     addSquareAtCenter(selectedQuad);
+  });
+  if (cloneSqBtn)   cloneSqBtn.addEventListener("click", () => {
+    if (selectedSquare < 0 || selectedSquare >= floatSquares.length) {
+      flashStatus("No square selected", "warn");
+      return;
+    }
+    cloneSquare(selectedSquare);
   });
   if (exportBtn)    exportBtn.addEventListener("click",
                                                exportVisualStateJSON);

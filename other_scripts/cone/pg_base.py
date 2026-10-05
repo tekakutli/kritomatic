@@ -1,11 +1,11 @@
 """
 pg_base.py — palette, stylesheet, HTML head, bootstrap.
 
-The panel carries five graphics sliders, four scrub-inputs (the
-selected patch's φ and s, the selected square's width and height),
-eight buttons (Reset, Center apex, Save scene, Load scene, Export
-visual state, + Patch, + Clone, + Square), two lists, a persistent
-hint block.
+The panel carries five graphics sliders, five scrub-inputs (the
+selected patch's φ and s, the selected square's width, height, and
+slope), nine buttons (Reset, Center apex, Save scene, Load scene,
+Export visual state, + Patch, + Clone, + Square, + Clone), two
+lists, a persistent hint block.
 """
 
 HTML_HEAD = r"""<!DOCTYPE html>
@@ -332,6 +332,12 @@ HTML_HEAD = r"""<!DOCTYPE html>
            value="&#8212;" autocomplete="off" spellcheck="false"
            disabled>
   </div>
+  <div class="field">
+    <label>Slope</label>
+    <input type="text" id="squareSlopeVal" class="scrubInput"
+           value="&#8212;" autocomplete="off" spellcheck="false"
+           disabled>
+  </div>
 
   <hr>
 
@@ -345,6 +351,7 @@ HTML_HEAD = r"""<!DOCTYPE html>
   <div class="field" style="margin-top:8px; margin-bottom:2px;">
     <label>Squares</label>
     <button id="addSquareBtn" style="flex:1 1 auto;">+ Square</button>
+    <button id="cloneSquareBtn" style="flex:1 1 auto;">+ Clone</button>
   </div>
   <div id="squareList" class="quadList"></div>
 
@@ -363,7 +370,7 @@ HTML_HEAD = r"""<!DOCTYPE html>
     square to slide along the centre&rarr;apex axis only
   </div>
   <div class="hintLine">
-    drag patch &phi;/s or square W/H to scrub &middot;
+    drag patch &phi;/s, square W/H, or slope to scrub &middot;
     <span class="kbd">Shift</span> to snap
   </div>
 

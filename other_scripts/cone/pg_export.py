@@ -30,6 +30,15 @@ fixed `SHAPE_DEPTH_FLAT`.  Per-shape, `dims` reports the FLAT-view
 dimensions (the ones the flat renderer reads) and `dimsCone` reports
 the CONE-view dimensions, so the export describes what each band
 actually draws.
+
+Schema v6
+=========
+Each shape now carries a `slopeRad` / `slopeDeg` pair: the pseudo-3D
+tilt of the shape about its own reference U axis.  Positive slope
+tips the +v (apex-facing) edge of the shape into the cone's cavity;
+the flat view ignores slope so its (φ, s) footprint is unaffected.
+The cone-view screen corners reported in `cornersScreenCone` reflect
+the tilt; `cornersFlatParam` / `cornersScreenFlat` do not.
 """
 
 EXPORT_JS = r"""
@@ -61,7 +70,7 @@ function _worldSideLengths(pts) {
 
 function buildVisualStateExport() {
   const out = {
-    schemaVersion: 5,
+    schemaVersion: 6,
     generatedAt:   new Date().toISOString(),
 
     cone: {
@@ -154,6 +163,8 @@ function buildVisualStateExport() {
       scaleV: _round3(sq.scaleV),
       thetaRad: _round3(sq.theta || 0),
       thetaDeg: _round3((sq.theta || 0) * 180 / Math.PI),
+      slopeRad: _round3(sq.slope || 0),
+      slopeDeg: _round3((sq.slope || 0) * 180 / Math.PI),
     };
 
     if (!f) {

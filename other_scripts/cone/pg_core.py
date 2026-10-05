@@ -11,8 +11,10 @@ A patch is four numbers — [phi0, phi1] × [s0, s1] — a rectangle in
 parameter space.  quadCorners is the single reader; every renderer
 and hit test asks through it, so corner order is defined once.
 
-A floating square is { quadId, u, v, scale } in its patch's local
-frame; the frame derivation lives in pg_view_squares.
+A floating square is { quadId, u, v, scaleU, scaleV, theta, slope }
+in its patch's local frame; the frame derivation lives in
+pg_view_squares.  `slope` is a small pseudo-3D tilt out of the
+patch plane; zero leaves the shape flat on the patch.
 
 PATCH SHAPE EDITING
 ===================
@@ -154,9 +156,9 @@ function addQuad() {
    The clone gets a fresh id and default name; its squares likewise.
    The clone is placed one patch-width to the right in φ so it does
    not sit on top of the source.  φ wraps harmlessly, so pushing past
-   2π is fine.  Square (u, v, scaleU, scaleV, θ) are copied as-is, so
-   the clone's squares sit in the same spot on the new patch as they
-   did on the old. */
+   2π is fine.  Square (u, v, scaleU, scaleV, θ, slope) are copied
+   as-is, so the clone's squares sit in the same spot on the new
+   patch as they did on the old. */
 function cloneQuad(idx) {
   if (idx < 0 || idx >= quads.length) return;
   const src = quads[idx];
@@ -185,6 +187,7 @@ function cloneQuad(idx) {
       scaleU: sq.scaleU,
       scaleV: sq.scaleV,
       theta:  sq.theta || 0,
+      slope:  sq.slope || 0,
     });
   }
 

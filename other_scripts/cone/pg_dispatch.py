@@ -89,10 +89,12 @@ function updateStatus() {
     if (sq) {
       const dims = squareDims(sq);
       const deg  = Math.round((sq.theta || 0) * 180 / Math.PI);
+      const slp  = Math.round((sq.slope || 0) * 180 / Math.PI);
       drag = "   \u00B7  shape #" + sq.id +
              "  W " + dims.w.toFixed(2) +
              "  H " + dims.h.toFixed(2) +
-             "  \u2220 " + deg + "\u00B0";
+             "  \u2220 " + deg + "\u00B0" +
+             "  \u2197 " + slp + "\u00B0";
     }
   } else if (state.dragPatchBody) {
     drag = "   \u00B7  moving " +

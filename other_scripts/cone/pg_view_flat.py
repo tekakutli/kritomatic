@@ -81,6 +81,13 @@ sit past the new one.  In the cone view this is handled by the
 horizon clip; in the flat view the shape's sq.v is simply clamped to
 the raw band so it does not fall off the sheet.
 
+PLANE INTERSECTION
+==================
+A tilted shape's plane cuts its patch plane along a line; the
+helpers in pg_view_squares.py (squarePlaneIntersectionFlat) return
+the chord in (phi, s), and the drawing loop here renders it per
+wrapped copy with the same faint dashed style the cone band uses.
+
 LABELS
 ======
 Patch and shape name labels are drawn at the end of drawFlatView,
@@ -309,6 +316,25 @@ function drawFlatView() {
         ctx.strokeStyle = _huergb(activeHue, isSel ? 1.00 : 0.78);
         ctx.lineWidth = isSel ? 1.8 : 1.2;
         ctx.stroke();
+
+        /* Intersection with the patch plane, when tilted.  Drawn
+           per wrapped copy, same as the polygon and its handles. */
+        if (sq.slope && Math.abs(sq.slope) > 1e-6) {
+          const isect = squarePlaneIntersectionFlat(sq);
+          if (isect) {
+            const [p0, p1] = isect.map(([phi, s]) =>
+              flatToScreen(phi + shift, s));
+            ctx.save();
+            ctx.setLineDash([4, 3]);
+            ctx.strokeStyle = _huergb(activeHue, isSel ? 0.65 : 0.42);
+            ctx.lineWidth   = 1.0;
+            ctx.beginPath();
+            ctx.moveTo(p0[0], p0[1]);
+            ctx.lineTo(p1[0], p1[1]);
+            ctx.stroke();
+            ctx.restore();
+          }
+        }
 
         if (!isSel) continue;
 

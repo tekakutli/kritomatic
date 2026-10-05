@@ -57,7 +57,7 @@ DEFAULT_INCLUDE_FILE_SUBSTRINGS = ["cable", "pg", "room"]
 # Filename substrings blacklist: if a filename contains ANY of these
 # (partial match, case-sensitive), the file is skipped.
 # e.g. [".min.", "_test", ".bak"]
-DEFAULT_EXCLUDE_FILE_SUBSTRINGS = ["project_dump"]
+DEFAULT_EXCLUDE_FILE_SUBSTRINGS = ["project_dump", "shrinking"]
 # ---------------------------------------------------------------------------
 
 HEADER = "=" * 70

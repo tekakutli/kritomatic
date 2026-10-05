@@ -395,6 +395,11 @@ window.addEventListener("mousemove", (e) => {
           let dU = lc.u - ds.startCursorU;
           let dV = lc.v - ds.startCursorV;
 
+          /* Shift held: constrain to the patch's V axis, which
+             points from the patch's base midpoint toward the apex.
+             Both directions along that axis remain free. */
+          if (e.shiftKey) dU = 0;
+
           const maxDU = BODY_DRAG_MAX_DU * f.uLen;
           const maxDV = BODY_DRAG_MAX_DV * f.vLen;
           if (dU >  maxDU) dU =  maxDU;
@@ -444,6 +449,11 @@ window.addEventListener("mousemove", (e) => {
           if (f) {
             let dU = lc.u - fsd.startCursorU;
             let dV = lc.v - fsd.startCursorV;
+
+            /* Shift held: constrain to the patch's V axis, which
+               points from the patch's base midpoint toward the
+               apex.  Both directions along that axis remain free. */
+            if (e.shiftKey) dU = 0;
 
             const maxDU = BODY_DRAG_MAX_DU * f.uLen;
             const maxDV = BODY_DRAG_MAX_DV * f.vLen;

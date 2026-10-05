@@ -52,27 +52,19 @@ integer-2π copies.  The polygon is drawn once per copy; the rotate
 handle is drawn once per copy as well, using the same shift that the
 polygon copy used.
 
-PATCH DRAG — START-ANCHORED, WITH SHIFT-SNAP
-============================================
+PATCH DRAG — START-ANCHORED, WITH SHIFT-TO-APEX
+================================================
 A patch drag records the cursor's start position (phi, s), the
 patch's own start bounds (phi0, phi1, s0, s1), and applies the
 delta from drag start on every frame.  The drag handler therefore
 never reads the patch's current position as a source of truth for
 where it should be — the position is always recomputed from the
-start, so a snap or a wrap cannot accumulate error.
+start, so a wrap cannot accumulate error.
 
-With Shift held, the delta is quantized to a fixed step in each axis:
-
-    dPhi = round(rawPhi / PATCH_SNAP_PHI) * PATCH_SNAP_PHI
-    dS   = round(rawS   / PATCH_SNAP_S)   * PATCH_SNAP_S
-
-The step is anchored to the drag start, not to the world grid.  A
-patch whose centre started at phi = 1.37 and s = 0.42, dragged with
-Shift, lands at 1.37 + n·PATCH_SNAP_PHI and 0.42 + m·PATCH_SNAP_S —
-the jumps are relative to where the drag began, so the patch does
-not lurch to a world grid line the moment Shift is pressed.  This
-mirrors the shape-rotation snap in setShapeRotationFromCursorLocal
-(pg_view_squares.py), which anchors the angle step to startTheta.
+With Shift held, the drag is constrained to the direction from the
+patch's centre toward the apex.  On the cone's lateral surface that
+is the meridian, so the constraint drops the φ component of the
+delta and lets s move freely in both directions.
 
 phi is unwrapped into (−π, π] on each frame so a drag across the
 atan2 seam does not add or drop a full turn.  s is bounded to
@@ -100,7 +92,8 @@ Interaction on this band:
     shape corner / rotate / body drag   edit that shape
     patch body drag                     translate the patch
                                         (wraps freely across phi;
-                                        Shift held snaps the step)
+                                        Shift held snaps to the
+                                        centre→apex axis)
     empty space click                   deselect
 """
 
@@ -508,20 +501,20 @@ function _reclampShapesOnPatch(q) {
 }
 
 /* ---- Patch drag -------------------------------------------------
-   Start-anchored, with the Shift-held step snap on phi ONLY.
+   Start-anchored, with the Shift-held constraint to the patch's
+   centre→apex axis.
 
-   The snap is a rotation-like gesture: quantizing phi advances the
-   patch around the cone in fixed angular steps, matching how the
-   meridian grid reads.  Movement along the near-apex axis (s) is
-   left continuous on purpose — the user's mental model of "sliding
-   toward the apex" wants fine control, not steps, and stepping it
-   would fight that.
+   On the cone's lateral surface, the direction from a patch's
+   centre toward the apex is the meridian: φ stays put, only s
+   moves.  Constraining the drag to that axis therefore drops the φ
+   component of the delta and lets s move freely in both directions
+   — the axis is fixed, the sign is not.
 
    Both the cone view's drag handler and the flat view's route
-   through this same function, so a snapped patch drag behaves
+   through this same function, so a constrained patch drag behaves
    identically in both bands. */
 
-function applyPatchDragFromStart(q, dp, curPhi, curS, snap) {
+function applyPatchDragFromStart(q, dp, curPhi, curS, constrain) {
   let rawPhi = curPhi - dp.startPhi;
   while (rawPhi >  Math.PI) rawPhi -= 2 * Math.PI;
   while (rawPhi < -Math.PI) rawPhi += 2 * Math.PI;
@@ -530,8 +523,13 @@ function applyPatchDragFromStart(q, dp, curPhi, curS, snap) {
   let dPhi = rawPhi;
   const dS = rawS;
 
-  if (snap) {
-    dPhi = Math.round(rawPhi / PATCH_SNAP_PHI) * PATCH_SNAP_PHI;
+  /* Shift held: the drag is constrained to the direction from the
+     patch's centre toward the apex.  On the cone surface that is
+     the meridian — φ stays put, only s moves.  Both directions
+     along the meridian are allowed; the axis is fixed, not the
+     sign. */
+  if (constrain) {
+    dPhi = 0;
   }
 
   q.phi0 = dp.startPhi0 + dPhi;

@@ -1,10 +1,11 @@
 """
 pg_base.py — palette, stylesheet, HTML head, bootstrap.
 
-The panel carries five graphics sliders, two scrub-inputs for the
-selected patch's position, six buttons (Reset, Center apex, Save
-scene, Load scene, Export visual state, + Patch, + Square — actually
-seven), two lists, a persistent hint block.
+The panel carries five graphics sliders, four scrub-inputs (the
+selected patch's φ and s, the selected square's width and height),
+eight buttons (Reset, Center apex, Save scene, Load scene, Export
+visual state, + Patch, + Clone, + Square), two lists, a persistent
+hint block.
 """
 
 HTML_HEAD = r"""<!DOCTYPE html>
@@ -319,9 +320,25 @@ HTML_HEAD = r"""<!DOCTYPE html>
 
   <hr>
 
+  <div class="field">
+    <label>Square W</label>
+    <input type="text" id="squareWVal" class="scrubInput"
+           value="&#8212;" autocomplete="off" spellcheck="false"
+           disabled>
+  </div>
+  <div class="field">
+    <label>Square H</label>
+    <input type="text" id="squareHVal" class="scrubInput"
+           value="&#8212;" autocomplete="off" spellcheck="false"
+           disabled>
+  </div>
+
+  <hr>
+
   <div class="field" style="margin-bottom:2px;">
     <label>Patches</label>
     <button id="addQuadBtn" style="flex:1 1 auto;">+ Patch</button>
+    <button id="cloneQuadBtn" style="flex:1 1 auto;">+ Clone</button>
   </div>
   <div id="quadList" class="quadList"></div>
 
@@ -342,11 +359,12 @@ HTML_HEAD = r"""<!DOCTYPE html>
     to jump
   </div>
   <div class="hintLine">
-    hold <span class="kbd">Shift</span> while dragging a patch to snap
+    hold <span class="kbd">Shift</span> while dragging a patch or a
+    square to slide along the centre&rarr;apex axis only
   </div>
   <div class="hintLine">
-    drag patch &phi;/s to scrub &middot;
-    <span class="kbd">Shift</span> to snap &phi;
+    drag patch &phi;/s or square W/H to scrub &middot;
+    <span class="kbd">Shift</span> to snap
   </div>
 
   <hr>

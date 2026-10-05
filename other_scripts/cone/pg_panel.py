@@ -1,10 +1,10 @@
 """
 pg_panel.py — panel bindings.
 
-Five graphics sliders, two scrub-inputs for the selected patch's
-position, six buttons (Save scene, Load scene, Reset, Center apex,
-Export visual state, + Patch, + Square — seven), two lists, a
-persistent hint block.
+Five graphics sliders, four scrub-inputs (the selected patch's φ and
+s, the selected square's width and height), eight buttons (Save
+scene, Load scene, Reset, Center apex, Export visual state,
++ Patch, + Clone, + Square), two lists, a persistent hint block.
 
 Save scene writes the whole editable workspace — cone state, patch
 and shape data, id counters — to a JSON file.  Load scene opens a
@@ -56,6 +56,28 @@ that either edge leaves [FLAT_S_MIN, FLAT_S_MAX].  For a default
 patch (span 0.50, halfSpan 0.25) the centre is confined to
 [0.25, 0.75] — bottom edge at the base on the low end, top edge at
 the apex on the high end.
+
+SQUARE W / H
+============
+The "Square W" and "Square H" scrub inputs show the selected shape's
+intrinsic WORLD extent along the patch's U and V axes:
+
+    W = SHAPE_REL_SIZE · scaleU · Ku
+    H = SHAPE_REL_SIZE · scaleV · Kv
+
+With SHAPE_CONE_SQUARE off (the current default) Ku = Kv = 1, so W
+and H are simply SHAPE_REL_SIZE · scaleU and SHAPE_REL_SIZE ·
+scaleV — the shape's world side along each axis, independent of the
+patch's own uLen / vLen and of the shape's depth multiplier.  The
+flat and cone views therefore agree on the shape's intrinsic size;
+only the cone view applies perspective on top.
+
+Scrub rate is expressed in world units per pixel of horizontal drag,
+so a 100-pixel drag changes W or H by 0.5 at the default rate.  The
+snap step with Shift held is 0.25 world units.  Typed values are
+clamped to [SHAPE_MIN_SCALE · SHAPE_REL_SIZE · Ku, SHAPE_MAX_SCALE ·
+SHAPE_REL_SIZE · Ku] by the setters, which delegate to the same
+scale bounds the corner-drag resize uses.
 """
 
 PANEL_JS = r"""
@@ -77,6 +99,15 @@ const PATCH_S_SCRUB_RATE   = 0.0015;
    lands on either is the same physical position. */
 
 const PATCH_SNAP_PHI_NORM = 1 / 12;
+
+/* Square width / height scrub rates.  Rate is the change in the
+   shape's intrinsic world extent along U (or V) per pixel of
+   horizontal drag; 0.005 means a 100-pixel drag moves W or H by
+   0.5.  Snap step with Shift held is 0.25 world units, a quarter of
+   the reference square's side at default scale. */
+
+const SQUARE_SIZE_SCRUB_RATE = 0.005;
+const SQUARE_SIZE_SNAP_STEP  = 0.25;
 
 const SCRUB_DRAG_THRESHOLD = 3;
 
@@ -192,36 +223,104 @@ function _setPatchSCenter(q, target) {
 }
 
 /* ==========================================================================
+   SQUARE-SIZE SETTERS
+   ==========================================================================
+   The panel's W / H fields speak in the shape's intrinsic world
+   extents along U and V (see the module docstring).  The setters
+   invert squareWorldWidth / squareWorldHeight to recover the
+   underlying scaleU / scaleV and clamp them to the same
+   SHAPE_MIN_SCALE .. SHAPE_MAX_SCALE bounds the corner-drag resize
+   uses, so a typed value cannot produce a shape that a drag could
+   not. */
+
+function _setSquareWidth(sq, target) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return;
+  const f = patchFrame(qi);
+  if (!f) return;
+  const { Ku } = _shapeAspectScales(f);
+  if (Ku <= 0) return;
+  const sU = target / (SHAPE_REL_SIZE * Ku);
+  sq.scaleU = Math.max(SHAPE_MIN_SCALE,
+              Math.min(SHAPE_MAX_SCALE, sU));
+}
+
+function _setSquareHeight(sq, target) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return;
+  const f = patchFrame(qi);
+  if (!f) return;
+  const { Kv } = _shapeAspectScales(f);
+  if (Kv <= 0) return;
+  const sV = target / (SHAPE_REL_SIZE * Kv);
+  sq.scaleV = Math.max(SHAPE_MIN_SCALE,
+              Math.min(SHAPE_MAX_SCALE, sV));
+}
+
+/* ==========================================================================
    PATCH-POSITION FIELDS
    ========================================================================== */
 
 function _syncPatchCoordInputs() {
   const phiInput = document.getElementById("patchPhiVal");
   const sInput   = document.getElementById("patchSVal");
-  if (!phiInput || !sInput) return;
 
-  const q = (selectedQuad >= 0 && selectedQuad < quads.length)
-    ? quads[selectedQuad] : null;
+  if (phiInput && sInput) {
+    const q = (selectedQuad >= 0 && selectedQuad < quads.length)
+      ? quads[selectedQuad] : null;
 
-  if (!q) {
-    phiInput.disabled = true;
-    sInput.disabled   = true;
-    if (document.activeElement !== phiInput) phiInput.value = "\u2014";
-    if (document.activeElement !== sInput)   sInput.value   = "\u2014";
+    if (!q) {
+      phiInput.disabled = true;
+      sInput.disabled   = true;
+      if (document.activeElement !== phiInput) phiInput.value = "\u2014";
+      if (document.activeElement !== sInput)   sInput.value   = "\u2014";
+    } else {
+      phiInput.disabled = false;
+      sInput.disabled   = false;
+
+      /* φ is displayed in normalized units on [-1, 1] (see the
+         module docstring); s is displayed as a fraction of the
+         axial height, unchanged. */
+      if (document.activeElement !== phiInput) {
+        phiInput.value = _phiToDisplay(_patchPhiCenter(q)).toFixed(3);
+      }
+      if (document.activeElement !== sInput) {
+        sInput.value = _patchSCenter(q).toFixed(3);
+      }
+    }
+  }
+
+  _syncSquareSizeInputs();
+}
+
+/* ==========================================================================
+   SQUARE-SIZE FIELDS
+   ========================================================================== */
+
+function _syncSquareSizeInputs() {
+  const wInput = document.getElementById("squareWVal");
+  const hInput = document.getElementById("squareHVal");
+  if (!wInput || !hInput) return;
+
+  const sq = (selectedSquare >= 0 && selectedSquare < floatSquares.length)
+    ? floatSquares[selectedSquare] : null;
+
+  if (!sq) {
+    wInput.disabled = true;
+    hInput.disabled = true;
+    if (document.activeElement !== wInput) wInput.value = "\u2014";
+    if (document.activeElement !== hInput) hInput.value = "\u2014";
     return;
   }
 
-  phiInput.disabled = false;
-  sInput.disabled   = false;
+  wInput.disabled = false;
+  hInput.disabled = false;
 
-  /* φ is displayed in normalized units on [-1, 1] (see the module
-     docstring); s is displayed as a fraction of the axial height,
-     unchanged. */
-  if (document.activeElement !== phiInput) {
-    phiInput.value = _phiToDisplay(_patchPhiCenter(q)).toFixed(3);
+  if (document.activeElement !== wInput) {
+    wInput.value = squareWorldWidth(sq).toFixed(3);
   }
-  if (document.activeElement !== sInput) {
-    sInput.value = _patchSCenter(q).toFixed(3);
+  if (document.activeElement !== hInput) {
+    hInput.value = squareWorldHeight(sq).toFixed(3);
   }
 }
 
@@ -486,6 +585,7 @@ function flashStatus(msg, cls) {
   const resetBtn     = document.getElementById("resetBtn");
   const centerBtn    = document.getElementById("centerBtn");
   const addBtn       = document.getElementById("addQuadBtn");
+  const cloneBtn     = document.getElementById("cloneQuadBtn");
   const addSqBtn     = document.getElementById("addSquareBtn");
   const exportBtn    = document.getElementById("exportBtn");
   const saveSceneBtn = document.getElementById("saveSceneBtn");
@@ -552,6 +652,40 @@ function flashStatus(msg, cls) {
     },
   });
 
+  /* ---- square-size scrub inputs ---------------------------------
+     The two fields read and write the shape's intrinsic world
+     extent along the patch's U and V axes (see the module
+     docstring).  Both are disabled until a square is selected. */
+
+  const wInput = document.getElementById("squareWVal");
+  const hInput = document.getElementById("squareHVal");
+
+  if (wInput) _installScrubInput(wInput, {
+    rate: SQUARE_SIZE_SCRUB_RATE,
+    snapStep: SQUARE_SIZE_SNAP_STEP,
+    read: () => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return 0;
+      return squareWorldWidth(floatSquares[selectedSquare]);
+    },
+    write: (raw) => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return;
+      _setSquareWidth(floatSquares[selectedSquare], raw);
+    },
+  });
+
+  if (hInput) _installScrubInput(hInput, {
+    rate: SQUARE_SIZE_SCRUB_RATE,
+    snapStep: SQUARE_SIZE_SNAP_STEP,
+    read: () => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return 0;
+      return squareWorldHeight(floatSquares[selectedSquare]);
+    },
+    write: (raw) => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return;
+      _setSquareHeight(floatSquares[selectedSquare], raw);
+    },
+  });
+
   /* ---- buttons and lists ----------------------------------------- */
 
   if (resetBtn)     resetBtn.addEventListener("click", resetView);
@@ -561,6 +695,13 @@ function flashStatus(msg, cls) {
     draw();
   });
   if (addBtn)       addBtn.addEventListener("click", addQuad);
+  if (cloneBtn)     cloneBtn.addEventListener("click", () => {
+    if (selectedQuad < 0 || selectedQuad >= quads.length) {
+      flashStatus("No patch selected", "warn");
+      return;
+    }
+    cloneQuad(selectedQuad);
+  });
   if (addSqBtn)     addSqBtn.addEventListener("click", () => {
     if (selectedQuad < 0 || selectedQuad >= quads.length) return;
     addSquareAtCenter(selectedQuad);

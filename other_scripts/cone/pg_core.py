@@ -150,6 +150,50 @@ function addQuad() {
   draw();
 }
 
+/* Duplicate a patch, together with every square that lives on it.
+   The clone gets a fresh id and default name; its squares likewise.
+   The clone is placed one patch-width to the right in φ so it does
+   not sit on top of the source.  φ wraps harmlessly, so pushing past
+   2π is fine.  Square (u, v, scaleU, scaleV, θ) are copied as-is, so
+   the clone's squares sit in the same spot on the new patch as they
+   did on the old. */
+function cloneQuad(idx) {
+  if (idx < 0 || idx >= quads.length) return;
+  const src = quads[idx];
+  const id  = nextQuadId++;
+  const dPhi = src.phi1 - src.phi0;
+
+  quads.push({
+    id,
+    name: "Q" + id,
+    phi0: src.phi0 + dPhi,
+    phi1: src.phi1 + dPhi,
+    s0:   src.s0,
+    s1:   src.s1,
+  });
+
+  for (let i = 0; i < floatSquares.length; i++) {
+    const sq = floatSquares[i];
+    if (sq.quadId !== src.id) continue;
+    const newSqId = nextSquareId++;
+    floatSquares.push({
+      id:     newSqId,
+      name:   "S" + newSqId,
+      quadId: id,
+      u:      sq.u,
+      v:      sq.v,
+      scaleU: sq.scaleU,
+      scaleV: sq.scaleV,
+      theta:  sq.theta || 0,
+    });
+  }
+
+  selectedQuad   = quads.length - 1;
+  selectedSquare = -1;
+  syncQuadList();
+  draw();
+}
+
 function deleteQuad(idx) {
   if (idx < 0 || idx >= quads.length) return;
   const removed = quads.splice(idx, 1)[0];

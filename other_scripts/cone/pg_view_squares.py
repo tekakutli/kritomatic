@@ -12,70 +12,102 @@ an angle, with independent width and height multipliers:
     { id, name, quadId, u, v, scaleU, scaleV, theta }
 
     u, v      centre in NORMALIZED patch coordinates
-    scaleU    width multiplier
-    scaleV    height multiplier
-    theta     rotation angle, radians, in the (û, v̂) plane
+    scaleU    width multiplier (reference frame)
+    scaleV    height multiplier (reference frame)
+    theta     rotation angle, radians, in the REFERENCE frame
     name      user-editable label, rendered as a pill at the centre
 
-SHAPE DIMENSIONS — NORMALIZED SPACE
-===================================
-A shape's UNSCALED half-extents live in the patch's NORMALIZED
-coordinates:
+SHAPE DIMENSIONS — REFERENCE FRAME
+==================================
+A shape is a square in a REFERENCE frame.  When rendering, the
+reference offset (du, dv) is mapped to the patch's actual (û, v̂) by
+a per-patch diagonal (Ku, Kv):
 
-    û = u / uLen           v̂ = v / vLen
+    û_offset = du · Ku        v̂_offset = dv · Kv
 
-with
+and then to local (u, v) via (·uLen, ·vLen).  The reference square's
+half-extents are:
 
-    half-width  in û = SHAPE_REL_SIZE · scaleU / 2
-    half-height in v̂ = SHAPE_REL_SIZE · scaleV · depthScale / 2
+    refHW = SHAPE_REL_SIZE / 2 · scaleU
+    refHH = SHAPE_REL_SIZE / 2 · scaleV · depthScale
 
-At scaleU = scaleV = 1, depthScale = 1 the shape is a SQUARE in
-(û, v̂) — the same normalized space the flat view lays out as its
-own rectangle.  The shape's LOCAL (u, v) extents are that square
-multiplied by (uLen, vLen):
+With SHAPE_CONE_SQUARE enabled, the aspect scales are chosen as
 
-    w_local = SHAPE_REL_SIZE · uLen · scaleU
-    h_local = SHAPE_REL_SIZE · vLen · scaleV · depthScale
+    S  = max(uLen, vLen)
+    Ku = S / uLen
+    Kv = S / vLen
 
-so the shape occupies the SAME fraction of the patch in both
-directions, and every corner scales linearly with uLen along u and
-vLen along v.  Two shapes whose normalized rectangles touch stay
-touching when the patch moves, in both views.
+so that the drawn shape is a world square, but its world size scales
+with the patch's aspect — see "SHAPE ASPECT CORRECTION" below.  With
+the flag off, Ku = Kv = 1 and the shape's world extents are just
+
+    SHAPE_REL_SIZE · scaleU      (along U)
+    SHAPE_REL_SIZE · scaleV · depthScale   (along V)
+
+independent of the patch's current uLen / vLen.
 
 CONTIGUITY
 ==========
-Every renderer projects the shape's NORMALIZED corners through the
-same per-view map:
+Every renderer projects the shape's reference-frame corners through
+the same per-view map:
 
-    cone view   (û, v̂) → local (uLen·û, vLen·v̂) → world (frame)
-    flat view   (û, v̂) → (phi, s) via
-                    phi = phiC + û · dPhi
-                    s   = sC   + v̂ · dS
+    cone view   (du, dv) → (û, v̂) via (Ku, Kv) →
+                (u, v) via (uLen, vLen) → world (frame)
+    flat view   (du, dv) → (û, v̂) via (Ku, Kv) →
+                (phi, s) via (dPhi, dS)
 
-A shared û-edge maps to the same phi-edge regardless of uLen, and a
-shared v̂-edge maps to the same s-edge regardless of vLen.  No gap
-opens as the patch's position — and therefore uLen — changes.
+A shared (û, v̂) edge maps to the same (phi, s) edge regardless of
+uLen and vLen, so two shapes whose stored centres are placed at
+adjacent û / v̂ values touch when the shape's reference half-extent
+matches their û / v̂ spacing.  With Ku = Kv = 1 that is exact for any
+uLen; with the aspect correction on, Ku and Kv depend on uLen/vLen,
+so exact contiguity holds at the patch position where Ku was
+computed and drifts slightly as the patch moves.
 
-THE TRADE-OFF — WHAT YOU GIVE UP
-================================
-Because the shape's world extents scale with (uLen, vLen)
-SEPARATELY, the shape is NOT a world square unless the patch happens
-to have uLen = vLen.  In the cone view (a uniform screen scale) the
-shape is drawn as a rectangle of aspect uLen : vLen.
+SHAPE ASPECT CORRECTION — WHAT IT COSTS
+=======================================
+Two behaviours are available, selected by SHAPE_CONE_SQUARE:
 
-You cannot have all three of: a world square, a normalized square,
-and contiguity as the patch moves.  This module chooses the
-normalized square: contiguity holds, rotation is clean (a square in
-û/v̂ is invariant under 90° rotation, so the SET of corners is the
-same at 0° and 90°), and the flat view shows a shape whose size
-relative to the patch is constant.
+  SHAPE_CONE_SQUARE = false  (current default)
+
+      Ku = Kv = 1.  The shape's world extents are fixed at
+      SHAPE_REL_SIZE · scaleU and SHAPE_REL_SIZE · scaleV ·
+      depthScale.  Translating the patch does not change the shape's
+      drawn size.  The perspective taper still draws the near-apex
+      edge narrower than the base edge, so the shape reads as a
+      trapezoid in the cone view; it is just a fixed-size trapezoid.
+      Contiguity is exact at every patch position.  This is the
+      answer for "the shape is glued to the world, but lives on the
+      patch's plane".
+
+  SHAPE_CONE_SQUARE = true
+
+      S = max(uLen, vLen), Ku = S / uLen, Kv = S / vLen.  The cone
+      view draws a world square, but its world size scales with the
+      patch's aspect: as the patch slides toward the apex, uLen
+      shrinks, so Ku = S / uLen grows, and the shape's drawn
+      u-extent grows with it ("grows sideways when pulled
+      forward").  Sliding the patch back has the opposite effect.
+      Contiguity across patch translation weakens by
+      SHAPE_REL_SIZE · (1 − Ku) · uLen  [approx]  per step.  This is
+      the answer for "the shape is glued to the patch's plane and
+      should scale with the patch", at the cost of the drift.
+
+To make the shape a sticker that scales linearly with the patch
+(glued to the surface, not the world), replace _shapeAspectScales
+with Ku = uLen, Kv = vLen.  Then the drawn world extent is
+SHAPE_REL_SIZE · uLen (along U) and SHAPE_REL_SIZE · vLen (along V)
+— a fixed fraction of the patch.  The cone view then draws a
+rectangle whose aspect is uLen : vLen.
 
 SHAPE DEPTH
 ===========
 The "Shape depth" slider still exists and still multiplies the
 shape's drawn HEIGHT via effectiveConeDepth().  Its reference unit
 is 1.00, so at the default the two bands agree exactly.  Any other
-value deliberately breaks that agreement.
+value deliberately breaks that agreement — a v̂-adjacent pair that
+touches in one band leaves a gap of  h_v̂ · vLen · (1 − DEPTH)  in
+the other.  See the panel module for the slider semantics.
 
 THE PERSPECTIVE — SHAPE-RELATIVE TAPER
 ======================================
@@ -144,18 +176,15 @@ too, including the rotate handle.
 
 ROTATION
 ========
-Rotation is a plain rotation in the shape's own (û, v̂) plane:
+Rotation is a plain rotation in the shape's own REFERENCE frame:
 
-    û' = û·cosθ − v̂·sinθ
-    v̂' = û·sinθ + v̂·cosθ
+    du' = du·cosθ − dv·sinθ
+    dv' = du·sinθ + dv·cosθ
 
-Since the shape is a square in (û, v̂) (at scaleU = scaleV = 1), a
-90° rotation returns the same SET of corners; and because the map
-(û, v̂) → local is a diagonal scaling by (uLen, vLen), which
-commutes with rotation, a 90° rotation in (û, v̂) is a 90° rotation
-in the world.  The corners in world are therefore the same SET at
-0° and 90° — the property you asked for — even though the world
-shape is a rectangle when uLen ≠ vLen.
+Since the reference shape is a square (at scaleU = scaleV = 1), a
+90° rotation returns the same SET of reference corners; and because
+the map (du, dv) → local is a linear map that does not depend on
+θ, the mapped shape is the same SET of points at 0° and 90°.
 
 LABELS
 ======
@@ -175,28 +204,63 @@ let selectedSquare = -1;
 /* ==========================================================================
    SHAPE DIMENSIONS
    ==========================================================================
-   A shape's unscaled half-extents live in the patch's NORMALIZED
-   coordinates (û, v̂):
+   A shape is a square in a REFERENCE frame.  The reference
+   half-extents are
 
-       half-width  in û = SHAPE_REL_SIZE / 2
-       half-height in v̂ = SHAPE_REL_SIZE / 2
+       refHW = SHAPE_REL_SIZE / 2 · scaleU
+       refHH = SHAPE_REL_SIZE / 2 · scaleV · depthScale
 
-   At scaleU = scaleV = 1, depthScale = 1 the shape is a square in
-   (û, v̂) — the same normalized space the flat view lays out as its
-   own rectangle.  The shape's LOCAL (u, v) extents are that square
-   times (uLen, vLen), so its size relative to the patch is CONSTANT
-   in both directions and its corners scale linearly with uLen along
-   u and vLen along v.  See the module docstring, "SHAPE DIMENSIONS
-   — NORMALIZED SPACE" and "CONTIGUITY". */
+   The reference offset (du, dv) maps to the patch's (û, v̂) through
+   a per-patch diagonal (Ku, Kv), then to local (u, v) through
+   (uLen, vLen).  See the module docstring, "SHAPE DIMENSIONS —
+   REFERENCE FRAME". */
 
-const SHAPE_REL_SIZE = 0.50;
+/* The reference square's side, in world units.  Because
+   SHAPE_CONE_SQUARE is off (Ku = Kv = 1), the shape's world side
+   along U is exactly SHAPE_REL_SIZE · scaleU, and along V is
+   SHAPE_REL_SIZE · scaleV · depthScale — independent of where the
+   patch sits.  This is now the sole control on the shape's size;
+   tune it up or down to taste. */
+const SHAPE_REL_SIZE = 2.0;
 
-/* Per-shape multipliers on the two axes.  Set to 1.0 for a square in
-   (û, v̂); corner-drag resizes move them.  When they differ the
-   shape is a rectangle in (û, v̂) as well. */
+/* Per-shape multipliers on the two reference axes.  Set to 1.0 for
+   a reference square; corner-drag resizes move them. */
 const SHAPE_DEFAULT_SCALE = 1.0;
 const SHAPE_MIN_SCALE     = 0.03;
-const SHAPE_MAX_SCALE     = 3.00;
+const SHAPE_MAX_SCALE     = 10.00;
+
+/* ==========================================================================
+   SHAPE ASPECT CORRECTION
+   ==========================================================================
+   When true, Ku = S / uLen and Kv = S / vLen with S = max(uLen,
+   vLen): the cone view draws a world square, but the shape's world
+   size then rides on the patch's aspect.  As the patch slides
+   toward the apex uLen shrinks, Ku = S / uLen grows, and the
+   shape's drawn u-extent grows with it — the "shape grows sideways
+   when pulled forward" behaviour.  Contiguity across patch
+   translation also weakens by roughly SHAPE_REL_SIZE · (1 − Ku) ·
+   uLen per step.
+
+   When false, Ku = Kv = 1: the shape is a fixed world-size square
+   of side SHAPE_REL_SIZE (times scaleU / scaleV · depthScale), the
+   shape's drawn size no longer changes with the patch's position,
+   and contiguity is exact at every patch position.  The perspective
+   taper still draws the near-apex edge narrower than the base edge
+   — the shape reads as a fixed-size trapezoid.
+
+   Default is false: the bug report was "shapes grow sideways when
+   moved toward the apex", which is exactly the Ku drift.  Flip to
+   true only if you want world-square shapes and can live with the
+   size drift. */
+const SHAPE_CONE_SQUARE = false;
+
+function _shapeAspectScales(f) {
+  if (!SHAPE_CONE_SQUARE || !f || f.uLen <= 0 || f.vLen <= 0) {
+    return { Ku: 1, Kv: 1 };
+  }
+  const S = Math.max(f.uLen, f.vLen);
+  return { Ku: S / f.uLen, Kv: S / f.vLen };
+}
 
 /* ==========================================================================
    SHAPE DEPTH — ONE PER VIEW
@@ -220,8 +284,8 @@ function effectiveConeDepth() {
 
 const WEDGE_BASE_REACH = 2.50;
 
-/* ROTATE_HANDLE_OFFSET is in NORMALIZED v̂ units — the handle sits
-   this far past the shape's +v̂ edge, as a fraction of vLen. */
+/* ROTATE_HANDLE_OFFSET is in REFERENCE units — the handle sits this
+   far past the reference square's +v̂ edge. */
 const ROTATE_HANDLE_OFFSET = 0.25;
 const ROTATE_HANDLE_R      = 10;
 
@@ -419,10 +483,9 @@ function clampCloneV(qi, vHat) {
    SHAPE V-EXTENT (preserved, not on the render path)
    ==========================================================================
    Reports the shape's half-extent along v̂, in NORMALIZED v̂ units,
-   accounting for the rotation. */
+   accounting for the rotation and the aspect correction. */
 
 function _vExtentNormFromDims(f, dims, theta) {
-  /* dims.w and dims.h are WORLD lengths.  Convert to normalized. */
   const hwHat = (dims.w / 2) / f.uLen;
   const hhHat = (dims.h / 2) / f.vLen;
   const cosT = Math.abs(Math.cos(theta || 0));
@@ -516,14 +579,16 @@ function clampShapeScales(sq) {
 /* ==========================================================================
    GEOMETRY
    ==========================================================================
-   The shape's dimensions in the patch's world-local (u, v) units.
-   The unscaled side is a fraction of each axis's own extent:
+   A shape's drawn dimensions in the patch's world-local (u, v) units.
 
-       w = SHAPE_REL_SIZE · uLen · scaleU
-       h = SHAPE_REL_SIZE · vLen · scaleV · depthScale
+   The shape is a square in a REFERENCE frame, with half-extents
 
-   so the shape occupies the same FRACTION of the patch in both
-   directions.  w and h are therefore the same only when uLen = vLen.
+       refHW = SHAPE_REL_SIZE / 2 · scaleU
+       refHH = SHAPE_REL_SIZE / 2 · scaleV · depthScale
+
+   The reference offset (du, dv) maps to the patch's (û, v̂) through
+   the per-patch diagonal (Ku, Kv), then to local (u, v) through
+   (uLen, vLen).  See _shapeAspectScales for Ku and Kv.
 
    squareDims / squareCornersLocal / squareRotateHandleLocal are the
    FLAT-view variants (SHAPE_DEPTH_FLAT); the ...Cone siblings are
@@ -544,10 +609,33 @@ function squareDimsWith(sq, depthScale) {
   if (!q) return { w: 0, h: 0 };
   const f = patchFrame(qi);
   if (!f) return { w: 0, h: 0 };
+  const { Ku, Kv } = _shapeAspectScales(f);
   return {
-    w: SHAPE_REL_SIZE * f.uLen * sq.scaleU,
-    h: SHAPE_REL_SIZE * f.vLen * sq.scaleV * depthScale,
+    w: SHAPE_REL_SIZE * f.uLen * sq.scaleU * Ku,
+    h: SHAPE_REL_SIZE * f.vLen * sq.scaleV * depthScale * Kv,
   };
+}
+
+/* Intrinsic world extents — the shape's own size, without the
+   per-view depth multiplier.  These are what the panel's Square W /
+   Square H fields read and write; see pg_panel.py. */
+
+function squareWorldWidth(sq) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return 0;
+  const f = patchFrame(qi);
+  if (!f) return 0;
+  const { Ku } = _shapeAspectScales(f);
+  return SHAPE_REL_SIZE * sq.scaleU * Ku;
+}
+
+function squareWorldHeight(sq) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return 0;
+  const f = patchFrame(qi);
+  if (!f) return 0;
+  const { Kv } = _shapeAspectScales(f);
+  return SHAPE_REL_SIZE * sq.scaleV * Kv;
 }
 
 function squareCenterLocal(sq) {
@@ -560,13 +648,12 @@ function squareCenterLocal(sq) {
 
 /* The shape's four corners in the patch's local (u, v) frame.
 
-   Rotation happens in NORMALIZED (û, v̂) space; the shape's own
-   local half-extents are (±SHAPE_REL_SIZE·scaleU/2,
-   ±SHAPE_REL_SIZE·scaleV·depthScale/2) in û / v̂.  The corners are
-   rotated there, then mapped to local via (·uLen, ·vLen).  Because
-   that final map is a diagonal scaling, it commutes with rotation,
-   so the shape's world corners at θ = 0 and θ = 90° form the same
-   set (a square in û/v̂ is 90°-invariant). */
+   Rotation happens in the REFERENCE frame, where the shape is a
+   square (at scaleU = scaleV = 1).  The reference offset is then
+   mapped to (û, v̂) through (Ku, Kv) and to local through
+   (uLen, vLen).  Because that map does not depend on θ, a 90°
+   rotation in the reference frame is a 90° rotation of the drawn
+   shape, so the set of local corners is the same at θ = 0° and 90°. */
 
 function squareCornersLocal(sq) {
   return squareCornersLocalWith(sq, SHAPE_DEPTH_FLAT);
@@ -581,19 +668,26 @@ function squareCornersLocalWith(sq, depthScale) {
   if (qi < 0) return null;
   const f = patchFrame(qi);
   if (!f) return null;
-  const dims = squareDimsWith(sq, depthScale);
-  const hwHat = (dims.w / 2) / f.uLen;
-  const hhHat = (dims.h / 2) / f.vLen;
+
+  /* Reference half-extents. */
+  const refHW = SHAPE_REL_SIZE / 2 * sq.scaleU;
+  const refHH = SHAPE_REL_SIZE / 2 * sq.scaleV * depthScale;
+
   const cosT = Math.cos(sq.theta || 0);
   const sinT = Math.sin(sq.theta || 0);
 
-  const raw = [
-    [-hwHat, +hhHat], [+hwHat, +hhHat], [+hwHat, -hhHat], [-hwHat, -hhHat],
+  const rawCorners = [
+    [-refHW, +refHH], [+refHW, +refHH], [+refHW, -refHH], [-refHW, -refHH],
   ];
-  return raw.map(([du, dv]) => {
+
+  const { Ku, Kv } = _shapeAspectScales(f);
+
+  return rawCorners.map(([du, dv]) => {
     const duR = du * cosT - dv * sinT;
     const dvR = du * sinT + dv * cosT;
-    return [(sq.u + duR) * f.uLen, (sq.v + dvR) * f.vLen];
+    const uHat = sq.u + (duR * Ku) / f.uLen;
+    const vHat = sq.v + (dvR * Kv) / f.vLen;
+    return [uHat * f.uLen, vHat * f.vLen];
   });
 }
 
@@ -621,24 +715,28 @@ function squareRotateHandleLocalCone(sq) {
   return squareRotateHandleLocalWith(sq, effectiveConeDepth());
 }
 
-/* The rotate handle sits on the shape's +v̂ axis, at a NORMALIZED v̂
-   distance (shape half-height in v̂) + ROTATE_HANDLE_OFFSET from the
-   centre.  Rotation is in (û, v̂). */
+/* The rotate handle sits on the shape's +v̂ axis in the REFERENCE
+   frame, at reference offset (0, refHH + ROTATE_HANDLE_OFFSET).  It
+   rotates with the shape and maps through the same (Ku, Kv). */
 
 function squareRotateHandleLocalWith(sq, depthScale) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const f = patchFrame(qi);
   if (!f) return null;
-  const dims = squareDimsWith(sq, depthScale);
-  const hhHat = (dims.h / 2) / f.vLen;
-  const kHat = hhHat + ROTATE_HANDLE_OFFSET;
+
+  const refHH = SHAPE_REL_SIZE / 2 * sq.scaleV * depthScale;
+  const k = refHH + ROTATE_HANDLE_OFFSET;
   const cosT = Math.cos(sq.theta || 0);
   const sinT = Math.sin(sq.theta || 0);
 
-  const duR = -kHat * sinT;
-  const dvR =  kHat * cosT;
-  return [(sq.u + duR) * f.uLen, (sq.v + dvR) * f.vLen];
+  const duR = -k * sinT;
+  const dvR =  k * cosT;
+
+  const { Ku, Kv } = _shapeAspectScales(f);
+  const uHat = sq.u + (duR * Ku) / f.uLen;
+  const vHat = sq.v + (dvR * Kv) / f.vLen;
+  return [uHat * f.uLen, vHat * f.vLen];
 }
 
 /* ==========================================================================
@@ -1091,17 +1189,27 @@ function cursorToLocalWithPersp(f, qi, sq, sx, sy) {
    SHARED EDIT OPERATIONS
    ========================================================================== */
 
-/* Corner resize.  The cursor's NORMALIZED offsets from the shape's
-   centre are rotated back through the inverse of a PLAIN rotation
-   (in (û, v̂)), giving the cursor's position in the shape's own
-   unrotated (û, v̂) frame.  The two distances then set the new
-   normalized half-extents, which are converted to scaleU / scaleV
-   via the SHAPE_REL_SIZE coefficients.
+/* Corner resize.  The cursor's offset from the shape's centre is
+   mapped to the REFERENCE frame by inverting the same map the
+   renderer applies:
+
+       local_u_offset = duR · Ku
+       local_v_offset = dvR · Kv
+
+   so duR = local_u_offset / Ku and dvR = local_v_offset / Kv.  The
+   resulting duR, dvR are un-rotated to recover the reference half-
+   extents, hence the new scaleU / scaleV.
+
+   NOTE — the earlier version divided by uLen / vLen *in addition*
+   to Ku / Kv, which made the computed half-extent 1/uLen (resp.
+   1/vLen) of the correct value and collapsed the shape to a
+   fraction of its size the moment a corner was grabbed.
 
    depthScale is the multiplier the height is drawn at:
-   effectiveConeDepth() from the cone band, SHAPE_DEPTH_FLAT from
-   the flat band.  It enters only through scaleV's normalizer, so
-   the corner follows the cursor in the band the drag came from. */
+   effectiveConeDepth() from the cone band, SHAPE_DEPTH_FLAT from the
+   flat band.  It enters only through the reference height's
+   normalizer, so the corner follows the cursor in the band the drag
+   came from. */
 
 function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale) {
   const qi = quadIdxById(sq.quadId);
@@ -1111,45 +1219,49 @@ function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale) {
   const f = patchFrame(qi);
   if (!f) return;
 
-  /* Convert cursor from local to NORMALIZED. */
-  const uHatC = sq.u;
-  const vHatC = sq.v;
-  const ux = cu / f.uLen - uHatC;
-  const uy = cv / f.vLen - vHatC;
+  /* Cursor offset from the shape centre, in local (u, v). */
+  const dx = cu - sq.u * f.uLen;
+  const dy = cv - sq.v * f.vLen;
+
+  /* Local → reference, via the inverse of (duR · Ku, dvR · Kv). */
+  const { Ku, Kv } = _shapeAspectScales(f);
+  const ox = dx / Ku;
+  const oy = dy / Kv;
+
+  /* Un-rotate, in the reference frame. */
   const cosT = Math.cos(sq.theta || 0);
   const sinT = Math.sin(sq.theta || 0);
-
-  /* Inverse plain rotation, in (û, v̂). */
-  const uxU = ux * cosT + uy * sinT;
-  const uyU = uy * cosT - ux * sinT;
+  const ux = ox * cosT + oy * sinT;
+  const uy = oy * cosT - ox * sinT;
 
   const signs = [[-1, +1], [+1, +1], [+1, -1], [-1, -1]][cornerIdx];
   const sx = signs[0], sy = signs[1];
 
-  /* New normalized half-extents, in û and v̂. */
-  const wHatMin = SHAPE_MIN_SCALE * SHAPE_REL_SIZE;
-  const hHatMin = SHAPE_MIN_SCALE * SHAPE_REL_SIZE * depthScale;
-  const wHat = Math.max(2 * sx * uxU, wHatMin);
-  const hHat = Math.max(2 * sy * uyU, hHatMin);
+  const refHWmin = SHAPE_MIN_SCALE * SHAPE_REL_SIZE / 2;
+  const refHHmin = SHAPE_MIN_SCALE * SHAPE_REL_SIZE / 2 * depthScale;
 
-  /* Convert back to scaleU, scaleV.  wHat = SHAPE_REL_SIZE·scaleU,
-     hHat = SHAPE_REL_SIZE·scaleV·depthScale. */
-  sq.scaleU = wHat / SHAPE_REL_SIZE;
-  sq.scaleV = hHat / (SHAPE_REL_SIZE * depthScale);
+  const refHW = Math.max(sx * ux, refHWmin);
+  const refHH = Math.max(sy * uy, refHHmin);
+
+  sq.scaleU = refHW / (SHAPE_REL_SIZE / 2);
+  sq.scaleV = refHH / (SHAPE_REL_SIZE / 2 * depthScale);
   clampShapeScales(sq);
 }
 
-/* Rotate-handle tracking.  The handle sits on the shape's +v̂ axis,
-   so the raw angle is  atan2(−û_off, v̂_off)  in the shape's own
-   NORMALIZED plane.  Plain, no metric. */
+/* Rotate-handle tracking.  The cursor's offset from the shape centre
+   is mapped to the REFERENCE frame; the handle sits on the reference
+   +v̂ axis, so the raw angle is atan2(−ox_ref, oy_ref). */
 
 function setShapeRotationFromCursorLocal(sq, cu, cv, snap, startTheta) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const f = patchFrame(qi);
   if (!f) return;
-  const ox = cu / f.uLen - sq.u;
-  const oy = cv / f.vLen - sq.v;
+
+  const { Ku, Kv } = _shapeAspectScales(f);
+  const ox = (cu / f.uLen - sq.u) / Ku;
+  const oy = (cv / f.vLen - sq.v) / Kv;
+
   if (Math.abs(ox) < 1e-9 && Math.abs(oy) < 1e-9) return;
 
   const thetaRaw = Math.atan2(-ox, oy);

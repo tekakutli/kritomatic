@@ -1,10 +1,13 @@
 """
 pg_base.py — palette, stylesheet, HTML head, bootstrap.
 
-The visual idiom is the dark "printed form" theme: near-black paper,
-cyan transit accent, magenta depth markers, yellow apex.  Panel
-chrome is outlined fields, uppercase mono micro-labels, ruled section
-breaks.
+The panel's slider block carries six entries.  The last two are the
+per-view shape-depth multipliers: "Cone shape" controls the cone
+band's rendering of every shape's V extent, "Flat shape" controls
+the flat band's.  They are independent because the two bands render
+V at different scales — the cone band through the per-vertex
+perspective, the flat band through its own phi/s rectangle — and
+what reads as "square" in one need not in the other.
 """
 
 HTML_HEAD = r"""<!DOCTYPE html>
@@ -80,11 +83,10 @@ HTML_HEAD = r"""<!DOCTYPE html>
 
   #ui hr { border:0; border-top:1px solid #1e2836; margin:10px 0; }
 
-  /* ---- patch list ------------------------------------------------ */
   .quadList {
     display:flex; flex-direction:column;
     gap:3px; margin:6px 0 0;
-    max-height:180px; overflow-y:auto;
+    max-height:160px; overflow-y:auto;
   }
   .quadList::-webkit-scrollbar { width:6px; }
   .quadList::-webkit-scrollbar-thumb {
@@ -109,6 +111,7 @@ HTML_HEAD = r"""<!DOCTYPE html>
     border-color:#34445a; color:#dce6f2;
     background:rgba(220,230,242,0.03);
   }
+
   .quadRow.selected {
     border-color:rgba(255,180,60,0.65);
     color:#ffc966;
@@ -125,9 +128,25 @@ HTML_HEAD = r"""<!DOCTYPE html>
     background:rgba(255,200,90,0.95);
     border-color:#ffc966;
   }
+
+  .quadRow.squareRow.selected {
+    border-color:rgba(120,220,255,0.65);
+    color:#b8ecff;
+    background:rgba(120,220,255,0.06);
+  }
+  .quadRow.squareRow .quadSwatch {
+    background:rgba(120,220,255,0.55);
+    border-color:rgba(140,225,255,0.85);
+  }
+  .quadRow.squareRow.selected .quadSwatch {
+    background:rgba(180,240,255,0.95);
+    border-color:#b8ecff;
+  }
+
   .quadLabel {
     flex:1 1 auto; font-weight:700;
     font-variant-numeric: tabular-nums;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
   }
   .quadDel {
     width:auto !important;
@@ -205,6 +224,12 @@ HTML_HEAD = r"""<!DOCTYPE html>
            min="4" max="48" step="1" value="24">
     <span class="val" id="meridiansVal">24</span>
   </div>
+  <div class="field">
+    <label>Shape depth</label>
+    <input type="range" id="shapeDepthSlider"
+           min="0.05" max="2.00" step="0.05" value="0.75">
+    <span class="val" id="shapeDepthVal">0.75</span>
+  </div>
 
   <hr>
 
@@ -218,6 +243,7 @@ HTML_HEAD = r"""<!DOCTYPE html>
     <label>Squares</label>
     <button id="addSquareBtn" style="flex:1 1 auto;">+ Square</button>
   </div>
+  <div id="squareList" class="quadList"></div>
   <div style="font-size:9px; color:#5a6774;
               padding:2px 0; letter-spacing:0.06em;">
     shift+click a patch to drop one there
@@ -228,6 +254,9 @@ HTML_HEAD = r"""<!DOCTYPE html>
   <div class="row">
     <button id="resetBtn">Reset</button>
     <button id="centerBtn">Center apex</button>
+  </div>
+  <div class="row">
+    <button id="exportBtn">Export visual state</button>
   </div>
 
   <div id="status">drag apex to tilt · scroll to change depth</div>

@@ -3,33 +3,40 @@ pg_dispatch.py — draw() and the canvas event listeners.
 
 Priority on mousedown in the cone band:
 
-    1.  shift + click on a patch          → drop a square there
-    2.  hit on a square's corner / body   → resize / move that square
-    3.  hit on a patch corner             → shape the patch
-    4.  anywhere else                     → tilt the apex
+    1.  shift + click on a patch          → drop a shape there
+    2.  rotate handle of a shape          → rotate it
+    3.  corner handle of a shape          → resize it
+    4.  body of a shape                   → translate it
+    5.  patch body                        → translate the patch
+    6.  anywhere else                     → tilt the apex
 
 In the flat band:
 
-    1.  corner / edge / body of a square  → resize / move that square
-    2.  corner / edge / body of a patch   → shape / slide that patch
-    3.  empty space                       → deselect
+    1.  rotate handle of a shape          → rotate it
+    2.  corner handle of a shape          → resize it
+    3.  body of a shape                   → translate it
+    4.  patch body / edge / corner        → translate the patch
+    5.  empty space                       → deselect
 
-Grab-and-drag
-=============
-A body drag records the cursor's local position and the square's
-centre at mousedown, then applies the cursor's DELTA to the centre on
-every mousemove.  The square therefore stays exactly where it was
-when grabbed — no jump to the click — and follows the cursor
-faithfully from there.  The same scheme is used on both bands; the
-only difference is that the cone band's cursor-to-local conversion
-inverts the per-vertex perspective projection, while the flat band's
-is a plain linear map.
+Shapes are rectangles with independent width and height, rotated by
+an angle within the patch's own (u, v) plane.  Corner drags change
+the two dimensions independently; the rotate handle changes the
+angle.  Hold Shift while rotating to snap to 15° increments.
 
-Squares are real squares in the patch's plane: sides along U and
-along V of the patch's local frame.  Side length is scale × uLen,
-constant in world-local coordinates; perspective is applied per
-vertex at draw time, so a square shrinks to zero on the horizon and
-stretches away from it below the patch.
+PERSPECTIVE FREEZE
+==================
+A shape's screen position on the cone band is scaled about the apex
+by one factor — the shape's own centre v̂ — so the whole shape is
+scaled uniformly and rotation in (u, v) is a pure rotation on
+screen.  During a drag the factor is frozen at mousedown: the drag's
+cursor-to-local conversion and its corner / rotate math all use that
+one value, so nothing about the shape shifts between scalings
+mid-gesture.
+
+Each band renders the shape's V extent through its own multiplier —
+SHAPE_DEPTH_CONE in the cone band, SHAPE_DEPTH_FLAT in the flat
+band — so a corner drag in one band un-scales by that band's
+multiplier when writing back to the shape's stored scaleV.
 """
 
 DISPATCH_JS = r"""
@@ -76,8 +83,8 @@ function updateStatus() {
   if (!state.mouse.inside) {
     el.textContent =
       "drag apex to tilt \u00B7 scroll to change depth \u00B7 " +
-      "drag patches in either view \u00B7 shift+click a patch to " +
-      "drop a square";
+      "shift+click a patch to drop a shape \u00B7 " +
+      "drag corners, rotate handle, or interior to edit";
     el.className = "";
     return;
   }
@@ -96,22 +103,32 @@ function updateStatus() {
                   * 180 / Math.PI;
 
   let drag = "";
+  const ds = state.dragSquare || state.flatSquareDrag;
   if (state.dragQuadVertex) {
     drag = "   \u00B7  shaping " + quads[state.dragQuadVertex.quadIdx].name;
-  } else if (state.dragSquare) {
-    const sq = floatSquares[state.dragSquare.squareIdx];
+  } else if (ds) {
+    const sq = floatSquares[ds.squareIdx];
     if (sq) {
-      const side = squareSideLength(sq);
-      drag = "   \u00B7  square #" + sq.id +
-             "  side " + side.toFixed(1);
+      /* Show the dimensions as the ACTIVE band renders them.
+         state.dragSquare is a cone-band drag, so it uses the cone
+         depth; state.flatSquareDrag is a flat-band drag, so it
+         uses the flat depth. */
+      const inFlat = !!state.flatSquareDrag;
+      const depth  = inFlat ? SHAPE_DEPTH_FLAT : SHAPE_DEPTH_CONE;
+      const dims   = squareDims(sq, depth);
+      const deg    = Math.round((sq.theta || 0) * 180 / Math.PI);
+      drag = "   \u00B7  shape #" + sq.id +
+             "  W " + dims.w.toFixed(2) +
+             "  H " + dims.h.toFixed(2) +
+             "  \u2220 " + deg + "\u00B0";
     }
-  } else if (state.flatSquareDrag) {
-    const sq = floatSquares[state.flatSquareDrag.squareIdx];
-    if (sq) {
-      const side = squareSideLength(sq);
-      drag = "   \u00B7  square #" + sq.id + " (flat)" +
-             "  side " + side.toFixed(1);
-    }
+  } else if (state.dragPatchBody) {
+    drag = "   \u00B7  moving " +
+           quads[state.dragPatchBody.quadIdx].name;
+  } else if (state.flatDrag &&
+             state.flatDrag.mode === "body") {
+    drag = "   \u00B7  moving " +
+           quads[state.flatDrag.quadIdx].name;
   }
 
   el.textContent =
@@ -168,7 +185,7 @@ canvas.addEventListener("mousedown", (e) => {
   /* ---- cone band ------------------------------------------------ */
   if (sy < layout.dividerY) {
 
-    /* 1. shift+click drops a square on the patch under the cursor */
+    /* 1. shift+click drops a shape on the patch under the cursor */
     if (e.shiftKey) {
       const patchIdx = findPatchAtScreen(sx, sy);
       if (patchIdx >= 0) {
@@ -186,7 +203,7 @@ canvas.addEventListener("mousedown", (e) => {
       }
     }
 
-    /* 2. square hit — corner for resize, body for grab-and-drag */
+    /* 2. shape hit — rotate / corner / body */
     const sqHit = squareHitTest(sx, sy);
     if (sqHit) {
       const sq = floatSquares[sqHit.squareIdx];
@@ -197,21 +214,31 @@ canvas.addEventListener("mousedown", (e) => {
       }
       selectedSquare = sqHit.squareIdx;
 
-      if (sqHit.kind === "corner") {
+      /* Persp is captured once here and reused for every frame of
+         the gesture.  Without the freeze, the shape's own persp
+         would change mid-drag and the deltas would come out of two
+         different scalings. */
+      const frozenPersp = shapePersp(sq);
+
+      if (sqHit.kind === "rotate") {
+        state.dragSquare = {
+          mode: "rotate",
+          squareIdx: sqHit.squareIdx,
+          persp: frozenPersp,
+        };
+      } else if (sqHit.kind === "corner") {
         state.dragSquare = {
           mode: "corner",
           squareIdx: sqHit.squareIdx,
           cornerIdx: sqHit.cornerIdx,
+          persp: frozenPersp,
         };
       } else {
-        /* Grab-and-drag: record the cursor's start local position
-           and the square's start centre.  Subsequent mousemoves
-           apply the cursor's delta to the centre, so the square
-           does not jump to the click. */
         const f = qi >= 0 ? patchFrame(qi) : null;
         const c = squareCenterLocal(sq);
         if (f && c) {
-          const lc = cursorToLocalWithPersp(f, qi, sx, sy);
+          const lc = cursorToLocalWithShapePersp(
+            f, qi, sx, sy, frozenPersp);
           state.dragSquare = {
             mode: "body",
             squareIdx: sqHit.squareIdx,
@@ -219,6 +246,7 @@ canvas.addEventListener("mousedown", (e) => {
             startCursorV: lc.v,
             startCenterU: c[0],
             startCenterV: c[1],
+            persp: frozenPersp,
           };
         }
       }
@@ -227,21 +255,45 @@ canvas.addEventListener("mousedown", (e) => {
       return;
     }
 
-    /* 3. patch corner — shape the patch */
-    const vHit = findQuadVertexAt(sx, sy);
-    if (vHit) {
-      if (vHit.quadIdx !== selectedQuad) {
-        selectedQuad = vHit.quadIdx;
+    /* 3. patch corner — shape the patch (gated) */
+    if (PATCH_SHAPE_EDIT_ENABLED) {
+      const vHit = findQuadVertexAt(sx, sy);
+      if (vHit) {
+        if (vHit.quadIdx !== selectedQuad) {
+          selectedQuad = vHit.quadIdx;
+          syncQuadList();
+        }
+        selectedSquare = -1;
+        state.dragQuadVertex = vHit;
+        canvas.style.cursor = "grabbing";
+        draw();
+        return;
+      }
+    }
+
+    /* 4. patch body — translate the patch */
+    const patchHit = findPatchAtScreen(sx, sy);
+    if (patchHit >= 0) {
+      const q = quads[patchHit];
+      if (patchHit !== selectedQuad) {
+        selectedQuad = patchHit;
         syncQuadList();
       }
       selectedSquare = -1;
-      state.dragQuadVertex = vHit;
+
+      const [wx, wy] = s2w(sx, sy);
+      const p0 = projectToConeSurface(wx, wy, (q.s0 + q.s1) / 2);
+      state.dragPatchBody = {
+        quadIdx: patchHit,
+        lastPhi: p0.phi,
+        lastS:   p0.s,
+      };
       canvas.style.cursor = "grabbing";
       draw();
       return;
     }
 
-    /* 4. else — tilt the apex */
+    /* 5. else — tilt the apex */
     selectedSquare = -1;
     state.dragApex = {
       startSx: sx, startSy: sy,
@@ -253,8 +305,7 @@ canvas.addEventListener("mousedown", (e) => {
 
   /* ---- flat band ------------------------------------------------ */
 
-  /* 1. Squares first.  They live inside the active patch, so they
-     win any overlap with the patch's own corner / edge / body. */
+  /* 1. shape first */
   const sqFlatHit = squareFlatHitTest(sx, sy);
   if (sqFlatHit) {
     const sq = floatSquares[sqFlatHit.squareIdx];
@@ -265,22 +316,25 @@ canvas.addEventListener("mousedown", (e) => {
     }
     selectedSquare = sqFlatHit.squareIdx;
 
-    if (sqFlatHit.kind === "corner") {
+    if (sqFlatHit.kind === "rotate") {
+      state.flatSquareDrag = {
+        mode: "rotate",
+        squareIdx: sqFlatHit.squareIdx,
+      };
+    } else if (sqFlatHit.kind === "corner") {
       state.flatSquareDrag = {
         mode: "corner",
         squareIdx: sqFlatHit.squareIdx,
         cornerIdx: sqFlatHit.cornerIdx,
       };
     } else {
-      /* Same grab-and-drag idea as the cone band, in (uHat, vHat)
-         coordinates. */
-      const p = flatCursorToSquareLocal(sq, sx, sy);
-      if (p) {
+      const lc = flatCursorToShapeLocal(sq, sx, sy);
+      if (lc) {
         state.flatSquareDrag = {
           mode: "body",
           squareIdx: sqFlatHit.squareIdx,
-          startCursorU: p.uHat,
-          startCursorV: p.vHat,
+          startCursorU: lc.u,
+          startCursorV: lc.v,
           startCenterU: sq.u,
           startCenterV: sq.v,
         };
@@ -291,7 +345,7 @@ canvas.addEventListener("mousedown", (e) => {
     return;
   }
 
-  /* 2. Patch corner / edge / body */
+  /* 2. patch */
   const hHit = flatHitTest(sx, sy);
   if (!hHit) {
     selectedQuad = -1;
@@ -305,22 +359,33 @@ canvas.addEventListener("mousedown", (e) => {
     syncQuadList();
   }
   selectedSquare = -1;
-  if (hHit.kind === "corner") {
-    state.flatDrag = {
-      mode: "corner", quadIdx: hHit.quadIdx,
-      cornerIdx: hHit.cornerIdx,
-    };
-  } else if (hHit.kind === "edge") {
-    state.flatDrag = {
-      mode: "edge", quadIdx: hHit.quadIdx, edge: hHit.edge,
-    };
-  } else {
-    const p = screenToFlat(sx, sy);
-    state.flatDrag = {
-      mode: "body", quadIdx: hHit.quadIdx,
-      lastPhi: p.phi, lastS: p.s,
-    };
+
+  const p = screenToFlat(sx, sy);
+
+  let flatDrag = {
+    mode: "body",
+    quadIdx: hHit.quadIdx,
+    lastPhi: p.phi,
+    lastS: p.s,
+  };
+
+  if (PATCH_SHAPE_EDIT_ENABLED) {
+    if (hHit.kind === "corner") {
+      flatDrag = {
+        mode: "corner",
+        quadIdx: hHit.quadIdx,
+        cornerIdx: hHit.cornerIdx,
+      };
+    } else if (hHit.kind === "edge") {
+      flatDrag = {
+        mode: "edge",
+        quadIdx: hHit.quadIdx,
+        edge: hHit.edge,
+      };
+    }
   }
+
+  state.flatDrag = flatDrag;
   canvas.style.cursor = "grabbing";
   draw();
 });
@@ -351,17 +416,16 @@ window.addEventListener("mousemove", (e) => {
       const f = qi >= 0 ? patchFrame(qi) : null;
       if (f) {
         if (ds.mode === "body") {
-          /* Grab-and-drag: apply the cursor's delta from the
-             mousedown position to the mousedown centre.  The
-             square does not jump when grabbed and follows the
-             cursor faithfully from there. */
-          const lc = cursorToLocalWithPersp(f, qi, sx, sy);
+          const lc = cursorToLocalWithShapePersp(f, qi, sx, sy, ds.persp);
           const newU = ds.startCenterU + (lc.u - ds.startCursorU);
           const newV = ds.startCenterV + (lc.v - ds.startCursorV);
           setClonePosition(sq, newU, newV);
-        } else {
+        } else if (ds.mode === "corner") {
           const [wx, wy] = s2w(sx, sy);
-          resizeSquareFromCorner(sq, ds.cornerIdx, wx, wy);
+          resizeSquareFromCorner(sq, ds.cornerIdx, wx, wy, ds.persp);
+        } else if (ds.mode === "rotate") {
+          const [wx, wy] = s2w(sx, sy);
+          rotateSquareToCursor(sq, wx, wy, e.shiftKey, ds.persp);
         }
       }
     }
@@ -371,6 +435,25 @@ window.addEventListener("mousemove", (e) => {
     cone.ax = state.dragApex.startAx + dSx / view.scale;
     cone.ay = state.dragApex.startAy - dSy / view.scale;
     clampApex();
+  } else if (state.dragPatchBody) {
+    const dp = state.dragPatchBody;
+    const q = quads[dp.quadIdx];
+    if (!q) {
+      state.dragPatchBody = null;
+    } else {
+      const [wx, wy] = s2w(sx, sy);
+      const p = projectToConeSurface(wx, wy, dp.lastS);
+
+      let dPhi = p.phi - dp.lastPhi;
+      if (dPhi >  Math.PI) dPhi -= 2 * Math.PI;
+      if (dPhi < -Math.PI) dPhi += 2 * Math.PI;
+
+      const dS = p.s - dp.lastS;
+
+      flatMoveBody(q, dPhi, dS);
+      dp.lastPhi = p.phi;
+      dp.lastS   = p.s;
+    }
   } else if (state.flatSquareDrag) {
     const fsd = state.flatSquareDrag;
     const sq = floatSquares[fsd.squareIdx];
@@ -378,23 +461,22 @@ window.addEventListener("mousemove", (e) => {
       state.flatSquareDrag = null;
     } else {
       if (fsd.mode === "body") {
-        /* Same grab-and-drag idea, in (uHat, vHat).  The v-bound is
-           applied after the delta so a square pushed past the apex
-           line stops there, exactly as on the cone band. */
-        const p = flatCursorToSquareLocal(sq, sx, sy);
-        if (p) {
+        const lc = flatCursorToShapeLocal(sq, sx, sy);
+        if (lc) {
           const qi = quadIdxById(sq.quadId);
-          const h = qi >= 0 ? horizonLocal(qi) : null;
-          if (h) {
-            sq.u = fsd.startCenterU + (p.uHat - fsd.startCursorU);
-            const vMin = -WEDGE_BASE_REACH;
-            const vMax = h.vHat;
-            sq.v = Math.max(vMin, Math.min(vMax,
-              fsd.startCenterV + (p.vHat - fsd.startCursorV)));
+          const f  = qi >= 0 ? patchFrame(qi) : null;
+          if (f) {
+            const uWorld =
+              fsd.startCenterU * f.uLen + (lc.u - fsd.startCursorU);
+            const vWorld =
+              fsd.startCenterV * f.vLen + (lc.v - fsd.startCursorV);
+            setClonePosition(sq, uWorld, vWorld);
           }
         }
-      } else {
-        flatResizeSquareFromCorner(sq, sx, sy);
+      } else if (fsd.mode === "corner") {
+        flatResizeSquareFromCornerIdx(sq, sx, sy, fsd.cornerIdx);
+      } else if (fsd.mode === "rotate") {
+        flatRotateSquareToCursor(sq, sx, sy, e.shiftKey);
       }
     }
   } else if (state.flatDrag) {
@@ -416,12 +498,14 @@ window.addEventListener("mousemove", (e) => {
 
 window.addEventListener("mouseup", () => {
   if (state.dragQuadVertex || state.dragApex ||
-      state.flatDrag || state.dragSquare || state.flatSquareDrag) {
+      state.flatDrag || state.dragSquare || state.flatSquareDrag ||
+      state.dragPatchBody) {
     state.dragQuadVertex = null;
     state.dragApex       = null;
     state.flatDrag       = null;
     state.dragSquare     = null;
     state.flatSquareDrag = null;
+    state.dragPatchBody  = null;
     canvas.style.cursor  = "crosshair";
   }
 });

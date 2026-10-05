@@ -9,10 +9,13 @@ Layers, back to front:
     4.  dashed magenta axis line when the apex is off-centre
     5.  base direction tick on the outer ring
     6.  small ink dot at the base centre
-    7.  patch quads — trapezoids on the surface
+    7.  patch quads — the planes squares live on, drawn faintly
     8.  floating squares — bound to each patch's plane
     9.  apex marker
    10.  corner caption
+
+Patches are the tool, not the subject: they are drawn faintly, and
+their corner handles appear only when shape editing is enabled.
 """
 
 CONE_VIEW_JS = r"""
@@ -143,16 +146,20 @@ function drawQuadPatch(q, selected) {
   for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
   ctx.closePath();
   ctx.fillStyle = selected
-    ? "rgba(255, 200, 90, 0.22)"
-    : "rgba(255, 200, 90, 0.08)";
+    ? "rgba(255, 200, 90, 0.10)"
+    : "rgba(255, 200, 90, 0.04)";
   ctx.fill();
 
   ctx.lineJoin = "round";
   ctx.strokeStyle = selected
-    ? "rgba(255, 220, 130, 1.00)"
-    : "rgba(255, 200, 90, 0.68)";
-  ctx.lineWidth = selected ? 2.0 : 1.3;
+    ? "rgba(255, 220, 130, 0.60)"
+    : "rgba(255, 200, 90, 0.28)";
+  ctx.lineWidth = selected ? 1.5 : 1.0;
   ctx.stroke();
+
+  /* Corner markers are the visual affordance for a corner drag.
+     They appear only when the drag path behind them is live. */
+  if (!PATCH_SHAPE_EDIT_ENABLED) return;
 
   const rDot = selected ? 5.2 : 3.0;
   for (const [sx, sy] of pts) {

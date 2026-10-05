@@ -13,6 +13,17 @@ and hit test asks through it, so corner order is defined once.
 
 A floating square is { quadId, u, v, scale } in its patch's local
 frame; the frame derivation lives in pg_view_squares.
+
+PATCH SHAPE EDITING
+===================
+Patches are the planes squares live on, not shapes to be edited.  The
+drag paths that would let a corner, edge, or body of a patch be
+moved — flatMoveCorner / flatMoveEdge / flatMoveBody and the cone-
+side corner drag in pg_dispatch — all still exist in the codebase
+and are fully functional; they are simply gated behind one flag.  Set
+it to true to re-enable patch reshaping.  Everything else about the
+patches is unaffected: they still respond to the apex and the depth,
+and shift+click still drops a square on one.
 """
 
 CORE_JS = r"""
@@ -97,6 +108,12 @@ function surfacePoint(phi, s) {
 
 const S_MIN = 0.00;
 const S_MAX = 0.90;
+
+/* Shape editing of patches is locked away.  Set true to re-enable
+   corner / edge / body dragging on patches in either band; the
+   underlying drag math is unaffected by this flag and would take
+   over on the very next click. */
+const PATCH_SHAPE_EDIT_ENABLED = false;
 
 const quads = [];
 let nextQuadId = 1;
@@ -215,9 +232,10 @@ function projectToConeSurface(wx, wy, currentS) {
    Five drag modes, mutually exclusive at any moment:
 
        dragApex        apex tilt / depth pull from the cone band
-       dragQuadVertex  a patch's corner, either band
+       dragQuadVertex  a patch's corner, either band (gated)
        dragSquare      a floating square from the cone band
        flatDrag        a patch's corner/edge/body from the flat band
+                       (gated)
        flatSquareDrag  a floating square from the flat band */
 
 const state = {
@@ -226,6 +244,7 @@ const state = {
   dragSquare:     null,
   flatDrag:       null,
   flatSquareDrag: null,
+  dragPatchBody:  null,
   mouse: { sx: 0, sy: 0, inside: false },
 };
 

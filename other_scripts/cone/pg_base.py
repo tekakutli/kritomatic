@@ -370,6 +370,10 @@ HTML_HEAD = r"""<!DOCTYPE html>
     square to slide along the centre&rarr;apex axis only
   </div>
   <div class="hintLine">
+    hold <span class="kbd">Alt</span> while clicking a square to grab
+    its patch
+  </div>
+  <div class="hintLine">
     drag patch &phi;/s, square W/H, or slope to scrub &middot;
     <span class="kbd">Shift</span> to snap
   </div>

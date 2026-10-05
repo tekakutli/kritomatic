@@ -61,24 +61,26 @@ the apex on the high end.
 SQUARE W / H
 ============
 The "Square W" and "Square H" scrub inputs show the selected shape's
-intrinsic WORLD extent along the patch's U and V axes:
+intrinsic size in REFERENCE units, independent of the patch it sits
+on and of the cone's current depth or half-angle:
 
-    W = SHAPE_REL_SIZE · scaleU · Ku
-    H = SHAPE_REL_SIZE · scaleV · Kv
+    W = SHAPE_REL_SIZE · scaleU
+    H = SHAPE_REL_SIZE · scaleV
 
-With SHAPE_CONE_SQUARE off (the current default) Ku = Kv = 1, so W
-and H are simply SHAPE_REL_SIZE · scaleU and SHAPE_REL_SIZE ·
-scaleV — the shape's world side along each axis, independent of the
-patch's own uLen / vLen and of the shape's depth multiplier.  The
-flat and cone views therefore agree on the shape's intrinsic size;
-only the cone view applies perspective on top.
+The shape's ACTUAL on-patch world size is this times the patch's
+per-view aspect scale (Ku or Kv, which track the patch's own
+uLen / vLen — see pg_view_squares.py).  That is what makes a shape
+cover a fixed fraction of its patch, so patches and their shapes
+scale together whenever the cone depth changes.  The fields report
+the invariant reference value so the displayed number does not
+jump around as you slide the depth or half-angle sliders.
 
-Scrub rate is expressed in world units per pixel of horizontal drag,
-so a 100-pixel drag changes W or H by 0.5 at the default rate.  The
-snap step with Shift held is 0.25 world units.  Typed values are
-clamped to [SHAPE_MIN_SCALE · SHAPE_REL_SIZE · Ku, SHAPE_MAX_SCALE ·
-SHAPE_REL_SIZE · Ku] by the setters, which delegate to the same
-scale bounds the corner-drag resize uses.
+Scrub rate is expressed in reference units per pixel of horizontal
+drag, so a 100-pixel drag changes W or H by 0.5 at the default rate.
+The snap step with Shift held is 0.25 reference units.  Typed values
+are clamped to [SHAPE_MIN_SCALE · SHAPE_REL_SIZE, SHAPE_MAX_SCALE ·
+SHAPE_REL_SIZE] by the setters, which delegate to the same scale
+bounds the corner-drag resize uses.
 
 SLOPE
 =====
@@ -129,10 +131,10 @@ const PATCH_S_SCRUB_RATE   = 0.0015;
 const PATCH_SNAP_PHI_NORM = 1 / 12;
 
 /* Square width / height scrub rates.  Rate is the change in the
-   shape's intrinsic world extent along U (or V) per pixel of
-   horizontal drag; 0.005 means a 100-pixel drag moves W or H by
-   0.5.  Snap step with Shift held is 0.25 world units, a quarter of
-   the reference square's side at default scale. */
+   shape's reference-unit size per pixel of horizontal drag; 0.005
+   means a 100-pixel drag moves W or H by 0.5.  Snap step with Shift
+   held is 0.25 reference units, an eighth of the reference square's
+   side at default scale. */
 
 const SQUARE_SIZE_SCRUB_RATE = 0.005;
 const SQUARE_SIZE_SNAP_STEP  = 0.25;
@@ -260,34 +262,22 @@ function _setPatchSCenter(q, target) {
 /* ==========================================================================
    SQUARE-SIZE SETTERS
    ==========================================================================
-   The panel's W / H fields speak in the shape's intrinsic world
-   extents along U and V (see the module docstring).  The setters
-   invert squareWorldWidth / squareWorldHeight to recover the
-   underlying scaleU / scaleV and clamp them to the same
-   SHAPE_MIN_SCALE .. SHAPE_MAX_SCALE bounds the corner-drag resize
-   uses, so a typed value cannot produce a shape that a drag could
-   not. */
+   The panel's W / H fields speak in the shape's intrinsic REFERENCE
+   size (see the module docstring).  The setters invert
+   squareWorldWidth / squareWorldHeight — which now return
+   SHAPE_REL_SIZE · scaleU / scaleV — and clamp the underlying
+   scaleU / scaleV to the same SHAPE_MIN_SCALE .. SHAPE_MAX_SCALE
+   bounds the corner-drag resize uses, so a typed value cannot
+   produce a shape that a drag could not. */
 
 function _setSquareWidth(sq, target) {
-  const qi = quadIdxById(sq.quadId);
-  if (qi < 0) return;
-  const f = patchFrame(qi);
-  if (!f) return;
-  const { Ku } = _shapeAspectScales(f);
-  if (Ku <= 0) return;
-  const sU = target / (SHAPE_REL_SIZE * Ku);
+  const sU = target / SHAPE_REL_SIZE;
   sq.scaleU = Math.max(SHAPE_MIN_SCALE,
               Math.min(SHAPE_MAX_SCALE, sU));
 }
 
 function _setSquareHeight(sq, target) {
-  const qi = quadIdxById(sq.quadId);
-  if (qi < 0) return;
-  const f = patchFrame(qi);
-  if (!f) return;
-  const { Kv } = _shapeAspectScales(f);
-  if (Kv <= 0) return;
-  const sV = target / (SHAPE_REL_SIZE * Kv);
+  const sV = target / SHAPE_REL_SIZE;
   sq.scaleV = Math.max(SHAPE_MIN_SCALE,
               Math.min(SHAPE_MAX_SCALE, sV));
 }
@@ -331,10 +321,10 @@ function _syncPatchCoordInputs() {
 /* ==========================================================================
    SQUARE-SIZE FIELDS
    ==========================================================================
-   The W / H fields show the shape's intrinsic world extents along
-   the patch's U and V axes.  The Slope field shows the shape's
-   pseudo-3D tilt in degrees.  All three are disabled until a square
-   is selected. */
+   The W / H fields show the shape's reference-unit size, which is
+   independent of the patch it sits on and of the cone's depth /
+   half-angle.  The Slope field shows the shape's pseudo-3D tilt in
+   degrees.  All three are disabled until a square is selected. */
 
 function _syncSquareSizeInputs() {
   const wInput = document.getElementById("squareWVal");
@@ -700,8 +690,8 @@ function flashStatus(msg, cls) {
   });
 
   /* ---- square-size scrub inputs ---------------------------------
-     The two fields read and write the shape's intrinsic world
-     extent along the patch's U and V axes (see the module
+     The two fields read and write the shape's reference-unit size,
+     independent of the patch it sits on (see the module
      docstring).  Both are disabled until a square is selected. */
 
   const wInput = document.getElementById("squareWVal");

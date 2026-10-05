@@ -34,20 +34,65 @@ half-extents are:
     refHW = SHAPE_REL_SIZE / 2 · scaleU
     refHH = SHAPE_REL_SIZE / 2 · scaleV · depthScale
 
-With SHAPE_CONE_SQUARE enabled, the aspect scales are chosen as
+A shape drawn on a patch therefore has
 
-    S  = max(uLen, vLen)
-    Ku = S / uLen
-    Kv = S / vLen
+    world width  = SHAPE_REL_SIZE · scaleU · Ku
+    world height = SHAPE_REL_SIZE · scaleV · depthScale · Kv
 
-so that the drawn shape is a world square, but its world size scales
-with the patch's aspect — see "SHAPE ASPECT CORRECTION" below.  With
-the flag off, Ku = Kv = 1 and the shape's world extents are just
+Contiguity between two shapes placed at adjacent û / v̂ values is
+exact whenever the shape's reference half-extent in û matches their
+û-spacing — independent of any Ku, Kv value, because both shapes
+are mapped through the same (Ku, Kv) and the reference halves cancel
+in the (û, v̂) → (u, v) round trip.  The only requirement is that
+shapes that must butt against each other are placed at adjacent û /
+v̂ values by the same drag.
 
-    SHAPE_REL_SIZE · scaleU      (along U)
-    SHAPE_REL_SIZE · scaleV · depthScale   (along V)
+PATCH-RELATIVE SHAPE SIZE — WHAT Ku, Kv DO
+==========================================
+A patch is defined in the cone's parameter space by [phi0, phi1] ×
+[s0, s1].  Its screen footprint in the CONE view scales with the
+cone's radius R = depth · tan(halfAngle): growing the depth makes
+every patch on the cone grow proportionally.  Its footprint in the
+FLAT view is invariant to depth — the flat view draws in (phi, s),
+which the depth does not touch.
 
-independent of the patch's current uLen / vLen.
+A shape, by contrast, must decide what "its own size" means.  Two
+behaviours are possible, and the choice is made by how Ku, Kv are
+defined:
+
+    world-anchored (historical, SHAPE_CONE_SQUARE = false)
+
+        Ku = Kv = 1.  The shape's world width is SHAPE_REL_SIZE ·
+        scaleU — a fixed number of world units.  On the cone that
+        world size shrinks toward the apex (the perspective taper
+        handles that), and in the flat view the shape's footprint
+        scales as 1 / uLen, so changing the cone depth visibly
+        changes how big the shape looks relative to its patch.
+        This is what produced the "squares change size when the
+        depth changes, unlike patches" report.
+
+    patch-relative (current default)
+
+        Ku = uLen / SHAPE_U_REF, Kv = vLen / SHAPE_V_REF.  The
+        shape's world width is SHAPE_REL_SIZE · scaleU · uLen /
+        SHAPE_U_REF, i.e. a fixed FRACTION SHAPE_REL_SIZE /
+        SHAPE_U_REF of the patch's own U-extent.  The shape is a
+        sticker on the patch: it grows and shrinks with the patch,
+        in both bands, in exact lockstep.  In the flat view, the
+        shape's (φ, s) footprint becomes
+
+            φ-span = SHAPE_REL_SIZE · scaleU · dPhi / SHAPE_U_REF
+
+        which is independent of uLen, hence of depth — matching
+        what patches do.
+
+The reference lengths SHAPE_U_REF, SHAPE_V_REF are the patch's
+typical uLen and vLen at the DEFAULT cone configuration (depth 15,
+half-angle 30°, default patch at s0 = 0.22, s1 = 0.72, φ-span 0.72).
+They are the calibration point: at that configuration Ku = Kv = 1,
+so a fresh scene's shapes look exactly as they did before this
+change.  Moving the depth slider away from 15 now scales both the
+patch and every shape on it, together.
 
 CONTIGUITY
 ==========
@@ -60,48 +105,8 @@ the same per-view map:
                 (phi, s) via (dPhi, dS)
 
 A shared (û, v̂) edge maps to the same (phi, s) edge regardless of
-uLen and vLen, so two shapes whose stored centres are placed at
-adjacent û / v̂ values touch when the shape's reference half-extent
-matches their û / v̂ spacing.  With Ku = Kv = 1 that is exact for any
-uLen; with the aspect correction on, Ku and Kv depend on uLen/vLen,
-so exact contiguity holds at the patch position where Ku was
-computed and drifts slightly as the patch moves.
-
-SHAPE ASPECT CORRECTION — WHAT IT COSTS
-=======================================
-Two behaviours are available, selected by SHAPE_CONE_SQUARE:
-
-  SHAPE_CONE_SQUARE = false  (current default)
-
-      Ku = Kv = 1.  The shape's world extents are fixed at
-      SHAPE_REL_SIZE · scaleU and SHAPE_REL_SIZE · scaleV ·
-      depthScale.  Translating the patch does not change the shape's
-      drawn size.  The perspective taper still draws the near-apex
-      edge narrower than the base edge, so the shape reads as a
-      trapezoid in the cone view; it is just a fixed-size trapezoid.
-      Contiguity is exact at every patch position.  This is the
-      answer for "the shape is glued to the world, but lives on the
-      patch's plane".
-
-  SHAPE_CONE_SQUARE = true
-
-      S = max(uLen, vLen), Ku = S / uLen, Kv = S / vLen.  The cone
-      view draws a world square, but its world size scales with the
-      patch's aspect: as the patch slides toward the apex, uLen
-      shrinks, so Ku = S / uLen grows, and the shape's drawn
-      u-extent grows with it ("grows sideways when pulled
-      forward").  Sliding the patch back has the opposite effect.
-      Contiguity across patch translation weakens by
-      SHAPE_REL_SIZE · (1 − Ku) · uLen  [approx]  per step.  This is
-      the answer for "the shape is glued to the patch's plane and
-      should scale with the patch", at the cost of the drift.
-
-To make the shape a sticker that scales linearly with the patch
-(glued to the surface, not the world), replace _shapeAspectScales
-with Ku = uLen, Kv = vLen.  Then the drawn world extent is
-SHAPE_REL_SIZE · uLen (along U) and SHAPE_REL_SIZE · vLen (along V)
-— a fixed fraction of the patch.  The cone view then draws a
-rectangle whose aspect is uLen : vLen.
+uLen and vLen, so two shapes placed at adjacent û / v̂ values touch
+when the shape's reference half-extent matches their û / v̂ spacing.
 
 SHAPE DEPTH
 ===========
@@ -276,12 +281,12 @@ let selectedSquare = -1;
    (uLen, vLen).  See the module docstring, "SHAPE DIMENSIONS —
    REFERENCE FRAME". */
 
-/* The reference square's side, in world units.  Because
-   SHAPE_CONE_SQUARE is off (Ku = Kv = 1), the shape's world side
-   along U is exactly SHAPE_REL_SIZE · scaleU, and along V is
-   SHAPE_REL_SIZE · scaleV · depthScale — independent of where the
-   patch sits.  This is now the sole control on the shape's size;
-   tune it up or down to taste. */
+/* The reference square's side, in REFERENCE units.  Its world size
+   is this times (scaleU · Ku, scaleV · Kv · depthScale); with the
+   patch-relative aspect scaling defined below, that makes the shape
+   cover a fixed FRACTION SHAPE_REL_SIZE / SHAPE_U_REF of its
+   patch's U-extent (and SHAPE_REL_SIZE / SHAPE_V_REF of its
+   V-extent), independent of the cone's depth or half-angle. */
 const SHAPE_REL_SIZE = 2.0;
 
 /* Per-shape multipliers on the two reference axes.  Set to 1.0 for
@@ -307,36 +312,36 @@ const SHAPE_SLOPE_MIN = -85 * Math.PI / 180;
 const SHAPE_SLOPE_MAX =  85 * Math.PI / 180;
 
 /* ==========================================================================
-   SHAPE ASPECT CORRECTION
+   PATCH-RELATIVE ASPECT SCALING
    ==========================================================================
-   When true, Ku = S / uLen and Kv = S / vLen with S = max(uLen,
-   vLen): the cone view draws a world square, but the shape's world
-   size then rides on the patch's aspect.  As the patch slides
-   toward the apex uLen shrinks, Ku = S / uLen grows, and the
-   shape's drawn u-extent grows with it — the "shape grows sideways
-   when pulled forward" behaviour.  Contiguity across patch
-   translation also weakens by roughly SHAPE_REL_SIZE · (1 − Ku) ·
-   uLen per step.
+   The shape is a sticker on the patch: its size is defined as a
+   fraction of the patch's own U- and V-extents, so that patches and
+   the shapes on them scale together — in both bands — whenever the
+   cone's depth or half-angle changes.
 
-   When false, Ku = Kv = 1: the shape is a fixed world-size square
-   of side SHAPE_REL_SIZE (times scaleU / scaleV · depthScale), the
-   shape's drawn size no longer changes with the patch's position,
-   and contiguity is exact at every patch position.  The perspective
-   taper still draws the near-apex edge narrower than the base edge
-   — the shape reads as a fixed-size trapezoid.
+   The aspect scales are
 
-   Default is false: the bug report was "shapes grow sideways when
-   moved toward the apex", which is exactly the Ku drift.  Flip to
-   true only if you want world-square shapes and can live with the
-   size drift. */
-const SHAPE_CONE_SQUARE = false;
+       Ku = f.uLen / SHAPE_U_REF
+       Kv = f.vLen / SHAPE_V_REF
+
+   The reference lengths SHAPE_U_REF, SHAPE_V_REF are the patch's
+   typical uLen and vLen at the DEFAULT cone configuration (depth
+   15, half-angle 30°, default patch at s0 = 0.22, s1 = 0.72,
+   φ-span 0.72).  At that configuration Ku = Kv = 1, so a fresh
+   scene's shapes look exactly as they did under the previous
+   world-anchored scheme (Ku = Kv = 1 everywhere).  Scaling away
+   from the reference is now coherent: a bigger patch means a
+   bigger shape, always, at the same fraction of the patch.
+
+   Compare the module docstring, "PATCH-RELATIVE SHAPE SIZE". */
+const SHAPE_U_REF = 3.2;
+const SHAPE_V_REF = 4.0;
 
 function _shapeAspectScales(f) {
-  if (!SHAPE_CONE_SQUARE || !f || f.uLen <= 0 || f.vLen <= 0) {
+  if (!f || f.uLen <= 0 || f.vLen <= 0) {
     return { Ku: 1, Kv: 1 };
   }
-  const S = Math.max(f.uLen, f.vLen);
-  return { Ku: S / f.uLen, Kv: S / f.vLen };
+  return { Ku: f.uLen / SHAPE_U_REF, Kv: f.vLen / SHAPE_V_REF };
 }
 
 /* ==========================================================================
@@ -712,6 +717,12 @@ function clampShapeScales(sq) {
    the per-patch diagonal (Ku, Kv), then to local (u, v) through
    (uLen, vLen).  See _shapeAspectScales for Ku and Kv.
 
+   The world extents reported here are the shape's ACTUAL on-patch
+   extents — SHAPE_REL_SIZE · scaleU · Ku in u and SHAPE_REL_SIZE ·
+   scaleV · depthScale · Kv in v — which for the patch-relative
+   aspect scaling is a fixed fraction of the patch's own uLen /
+   vLen.  This is what the cone view draws.
+
    squareDims / squareCornersLocal / squareRotateHandleLocal are the
    FLAT-view variants (SHAPE_DEPTH_FLAT); the ...Cone siblings are
    the CONE-view variants (effectiveConeDepth()). */
@@ -733,31 +744,22 @@ function squareDimsWith(sq, depthScale) {
   if (!f) return { w: 0, h: 0 };
   const { Ku, Kv } = _shapeAspectScales(f);
   return {
-    w: SHAPE_REL_SIZE * f.uLen * sq.scaleU * Ku,
-    h: SHAPE_REL_SIZE * f.vLen * sq.scaleV * depthScale * Kv,
+    w: SHAPE_REL_SIZE * sq.scaleU * Ku,
+    h: SHAPE_REL_SIZE * sq.scaleV * depthScale * Kv,
   };
 }
 
-/* Intrinsic world extents — the shape's own size, without the
-   per-view depth multiplier.  These are what the panel's Square W /
-   Square H fields read and write; see pg_panel.py. */
+/* The shape's intrinsic size in REFERENCE units, independent of the
+   patch it sits on and of the cone's depth / half-angle.  These are
+   what the panel's Square W / Square H fields read and write; see
+   pg_panel.py. */
 
 function squareWorldWidth(sq) {
-  const qi = quadIdxById(sq.quadId);
-  if (qi < 0) return 0;
-  const f = patchFrame(qi);
-  if (!f) return 0;
-  const { Ku } = _shapeAspectScales(f);
-  return SHAPE_REL_SIZE * sq.scaleU * Ku;
+  return SHAPE_REL_SIZE * sq.scaleU;
 }
 
 function squareWorldHeight(sq) {
-  const qi = quadIdxById(sq.quadId);
-  if (qi < 0) return 0;
-  const f = patchFrame(qi);
-  if (!f) return 0;
-  const { Kv } = _shapeAspectScales(f);
-  return SHAPE_REL_SIZE * sq.scaleV * Kv;
+  return SHAPE_REL_SIZE * sq.scaleV;
 }
 
 function squareCenterLocal(sq) {

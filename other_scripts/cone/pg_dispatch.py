@@ -2,6 +2,28 @@
 pg_dispatch.py — draw() and the canvas event listeners.
 
 [unchanged docstring...]
+
+ALT PASS-THROUGH
+================
+Holding Alt while clicking on a square targets the PATCH THAT SQUARE
+BELONGS TO, rather than the square itself.  The patch is identified
+by the hit square's quadId — not by the cursor position — so the
+pass-through works even when the square overhangs its patch (which
+happens easily: a square can be dragged past the patch's u / v
+bounds).  Without that indirection, an alt+click on an overhanging
+part of a square would miss every patch and fall through to the
+apex drag, changing the point of view instead of moving the patch.
+
+When Alt is NOT held, square interaction is unchanged.
+
+Alt also suppresses the Shift+click "drop a square here" action, so
+Alt+Shift+drag on a square behaves as a patch drag constrained to
+the patch's centre→apex axis (Shift's usual meaning for a patch
+drag).
+
+Ctrl is deliberately NOT used for this: on macOS the browser
+translates Ctrl+click into a right-click, so the mouse event arrives
+with e.button !== 0 and the handler bails at the top.
 """
 
 DISPATCH_JS = r"""
@@ -62,7 +84,8 @@ function updateStatus() {
     el.textContent =
       "drag apex to tilt \u00B7 scroll to change depth \u00B7 " +
       "shift+click a patch to drop a shape \u00B7 " +
-      "drag corners, rotate handle, or interior to edit";
+      "drag corners, rotate handle, or interior to edit \u00B7 " +
+      "alt+click a square to grab its patch";
     el.className = "";
     return;
   }
@@ -156,10 +179,51 @@ canvas.addEventListener("mousedown", (e) => {
   const sx = e.clientX - rect.left;
   const sy = e.clientY - rect.top;
 
+  /* Alt is the "grab the patch under the square" modifier.  When
+     held, a click on a square targets the patch that square belongs
+     to (identified by the square's quadId, so the pass-through works
+     even when the square overhangs its patch).  See the module
+     docstring, ALT PASS-THROUGH. */
+  const passThrough = e.altKey;
+
   /* ---- cone band ------------------------------------------------ */
   if (sy < layout.dividerY) {
 
-    if (e.shiftKey) {
+    /* The square hit test always runs, so we know what is under the
+       cursor even when Alt is held.  It is the only reliable way to
+       name the patch that a clicked square belongs to. */
+    const sqHit = squareHitTest(sx, sy);
+
+    if (passThrough && sqHit) {
+      /* Alt + square: target the patch that square lives on. */
+      const sq = floatSquares[sqHit.squareIdx];
+      const qi = sq ? quadIdxById(sq.quadId) : -1;
+      if (qi >= 0) {
+        const q = quads[qi];
+        if (qi !== selectedQuad) {
+          selectedQuad = qi;
+          syncQuadList();
+        }
+        selectedSquare = -1;
+
+        const [wx, wy] = s2w(sx, sy);
+        const p0 = projectToConeSurface(wx, wy, (q.s0 + q.s1) / 2);
+        state.dragPatchBody = {
+          quadIdx:   qi,
+          startPhi:  p0.phi,
+          startS:    p0.s,
+          startPhi0: q.phi0,
+          startPhi1: q.phi1,
+          startS0:   q.s0,
+          startS1:   q.s1,
+        };
+        canvas.style.cursor = "grabbing";
+        draw();
+        return;
+      }
+    }
+
+    if (!passThrough && e.shiftKey) {
       const patchIdx = findPatchAtScreen(sx, sy);
       if (patchIdx >= 0) {
         const f = patchFrame(patchIdx);
@@ -176,8 +240,7 @@ canvas.addEventListener("mousedown", (e) => {
       }
     }
 
-    const sqHit = squareHitTest(sx, sy);
-    if (sqHit) {
+    if (!passThrough && sqHit) {
       const sq = floatSquares[sqHit.squareIdx];
       const qi = quadIdxById(sq.quadId);
       if (qi >= 0 && qi !== selectedQuad) {
@@ -225,7 +288,7 @@ canvas.addEventListener("mousedown", (e) => {
       return;
     }
 
-    if (PATCH_SHAPE_EDIT_ENABLED) {
+    if (!passThrough && PATCH_SHAPE_EDIT_ENABLED) {
       const vHit = findQuadVertexAt(sx, sy);
       if (vHit) {
         if (vHit.quadIdx !== selectedQuad) {
@@ -276,8 +339,40 @@ canvas.addEventListener("mousedown", (e) => {
 
   /* ---- flat band ------------------------------------------------ */
 
+  /* Same shape: run the flat square hit test first, so an alt+click
+     can name the patch by the square's quadId rather than relying
+     on the pointer being over the patch's own quad. */
   const sqFlatHit = squareFlatHitTest(sx, sy);
-  if (sqFlatHit) {
+
+  if (passThrough && sqFlatHit) {
+    const sq = floatSquares[sqFlatHit.squareIdx];
+    const qi = sq ? quadIdxById(sq.quadId) : -1;
+    if (qi >= 0) {
+      const q = quads[qi];
+      if (qi !== selectedQuad) {
+        selectedQuad = qi;
+        syncQuadList();
+      }
+      selectedSquare = -1;
+
+      const p = screenToFlat(sx, sy);
+      state.flatDrag = {
+        mode: "body",
+        quadIdx:   qi,
+        startPhi:  p.phi,
+        startS:    p.s,
+        startPhi0: q.phi0,
+        startPhi1: q.phi1,
+        startS0:   q.s0,
+        startS1:   q.s1,
+      };
+      canvas.style.cursor = "grabbing";
+      draw();
+      return;
+    }
+  }
+
+  if (!passThrough && sqFlatHit) {
     const sq = floatSquares[sqFlatHit.squareIdx];
     const qi = quadIdxById(sq.quadId);
     if (qi >= 0 && qi !== selectedQuad) {
@@ -344,7 +439,7 @@ canvas.addEventListener("mousedown", (e) => {
     startS1:   q.s1,
   };
 
-  if (PATCH_SHAPE_EDIT_ENABLED) {
+  if (!passThrough && PATCH_SHAPE_EDIT_ENABLED) {
     if (hHit.kind === "corner") {
       flatDrag = {
         mode: "corner",

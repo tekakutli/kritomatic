@@ -51,6 +51,39 @@
     font-variant-numeric: tabular-nums;
   }
 
+  #ui .field input.scrubInput {
+    flex:1 1 auto;
+    min-width:0;
+    background:transparent;
+    border:0;
+    border-bottom:1px solid #223040;
+    color:#00e5ff;
+    font-family:inherit;
+    font-size:12px;
+    font-weight:700;
+    font-variant-numeric: tabular-nums;
+    text-align:right;
+    padding:2px 4px;
+    margin:0;
+    outline:none;
+    cursor:ew-resize;
+    user-select:none;
+    transition: border-color 0.1s ease;
+  }
+  #ui .field input.scrubInput:hover {
+    border-bottom-color:#34445a;
+  }
+  #ui .field input.scrubInput:focus {
+    border-bottom-color:#00e5ff;
+    cursor:text;
+    user-select:text;
+  }
+  #ui .field input.scrubInput:disabled {
+    color:#3d4756;
+    border-bottom-color:#1e2836;
+    cursor:not-allowed;
+  }
+
   #ui .row { display:flex; gap:6px; margin:6px 0; }
   #ui .row button { flex:1 1 auto; }
 
@@ -99,7 +132,6 @@
     border-color:#34445a; color:#dce6f2;
     background:rgba(220,230,242,0.03);
   }
-
   .quadRow.selected {
     border-color:rgba(255,180,60,0.65);
     color:#ffc966;
@@ -116,7 +148,6 @@
     background:rgba(255,200,90,0.95);
     border-color:#ffc966;
   }
-
   .quadRow.squareRow.selected {
     border-color:rgba(120,220,255,0.65);
     color:#b8ecff;
@@ -130,12 +161,37 @@
     background:rgba(180,240,255,0.95);
     border-color:#b8ecff;
   }
-
   .quadLabel {
     flex:1 1 auto; font-weight:700;
     font-variant-numeric: tabular-nums;
     overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
   }
+
+  .quadLabelInput {
+    flex:1 1 auto;
+    min-width:0;
+    background:transparent;
+    border:0;
+    border-bottom:1px solid transparent;
+    color:inherit;
+    font-family:inherit;
+    font-size:inherit;
+    font-weight:700;
+    letter-spacing:inherit;
+    padding:0;
+    margin:0;
+    outline:none;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    transition: border-color 0.1s ease;
+  }
+  .quadLabelInput:hover {
+    border-bottom-color:#223040;
+  }
+  .quadLabelInput:focus {
+    border-bottom-color:#00e5ff;
+  }
+
   .quadDel {
     width:auto !important;
     padding:1px 6px !important;
@@ -149,6 +205,24 @@
     background:rgba(212,133,144,0.10) !important;
     border-color:#7a3e4a !important;
     color:#e8a0a8 !important;
+  }
+
+  .hintLine {
+    font-size:9px; color:#5a6774;
+    letter-spacing:0.06em;
+    padding:2px 0;
+    line-height:1.5;
+  }
+  .hintLine .kbd {
+    display:inline-block;
+    padding:0 4px;
+    border:1px solid #223040;
+    border-radius:2px;
+    background:#0e1622;
+    color:#00e5ff;
+    font-family:inherit;
+    font-weight:700;
+    letter-spacing:0.02em;
   }
 
   #status {
@@ -215,8 +289,23 @@
   <div class="field">
     <label>Shape depth</label>
     <input type="range" id="shapeDepthSlider"
-           min="0.05" max="2.00" step="0.05" value="0.75">
-    <span class="val" id="shapeDepthVal">0.75</span>
+           min="0.05" max="2.00" step="0.05" value="1.00">
+    <span class="val" id="shapeDepthVal">1.00</span>
+  </div>
+
+  <hr>
+
+  <div class="field">
+    <label>Patch &phi;</label>
+    <input type="text" id="patchPhiVal" class="scrubInput"
+           value="&#8212;" autocomplete="off" spellcheck="false"
+           disabled>
+  </div>
+  <div class="field">
+    <label>Patch s</label>
+    <input type="text" id="patchSVal" class="scrubInput"
+           value="&#8212;" autocomplete="off" spellcheck="false"
+           disabled>
   </div>
 
   <hr>
@@ -232,13 +321,31 @@
     <button id="addSquareBtn" style="flex:1 1 auto;">+ Square</button>
   </div>
   <div id="squareList" class="quadList"></div>
-  <div style="font-size:9px; color:#5a6774;
-              padding:2px 0; letter-spacing:0.06em;">
+
+  <div class="hintLine">
     shift+click a patch to drop one there
+  </div>
+  <div class="hintLine">
+    <span class="kbd">Shift</span>+<span class="kbd">A</span> align to 45°
+  </div>
+  <div class="hintLine">
+    hold <span class="kbd">Shift</span> while dragging the rotate handle
+    to jump
+  </div>
+  <div class="hintLine">
+    hold <span class="kbd">Shift</span> while dragging a patch to snap
+  </div>
+  <div class="hintLine">
+    drag patch &phi;/s to scrub &middot;
+    <span class="kbd">Shift</span> to snap &phi;
   </div>
 
   <hr>
 
+  <div class="row">
+    <button id="saveSceneBtn">Save scene</button>
+    <button id="loadSceneBtn">Load scene</button>
+  </div>
   <div class="row">
     <button id="resetBtn">Reset</button>
     <button id="centerBtn">Center apex</button>
@@ -602,7 +709,7 @@ function drawConeView() {
     drawQuadPatch(quads[selectedQuad], true);
   }
 
-  /* floating squares on the patches' planes */
+  /* floating shapes on the patches' planes */
   drawFloatSquares();
 
   /* apex marker */
@@ -634,41 +741,53 @@ function drawConeView() {
     "   SQUARES " + floatSquares.length,
     14, 14);
   ctx.restore();
+
+  /* Labels last, so they sit above the patches and shapes. */
+  drawShapeLabelsCone();
 }
 
+/* The patch is the plane a shape sits on.  It gets a DASHED outline,
+   a very faint fill, and no corner or rotate handles.  Everything
+   the eye reads as "an object on the sheet" — solid stroke, handles,
+   a filled body — belongs to the shapes, not to the patches.
+
+   When shape-editing is enabled the patch corners carry small dots,
+   drawn in the patch hue; those dots are the only handle-like
+   feature a patch has, and they are dormant while the flag is off. */
 function drawQuadPatch(q, selected) {
+  const hue = patchHue(q);
   const pts = quadCorners(q).map(c => {
     const [wx, wy] = surfacePoint(c.phi, c.s);
     return w2s(wx, wy);
   });
 
+  ctx.save();
+
   ctx.beginPath();
   ctx.moveTo(pts[0][0], pts[0][1]);
   for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
   ctx.closePath();
-  ctx.fillStyle = selected
-    ? "rgba(255, 200, 90, 0.10)"
-    : "rgba(255, 200, 90, 0.04)";
+  ctx.fillStyle = _huergb(hue, selected ? 0.07 : 0.03);
   ctx.fill();
 
   ctx.lineJoin = "round";
-  ctx.strokeStyle = selected
-    ? "rgba(255, 220, 130, 0.60)"
-    : "rgba(255, 200, 90, 0.28)";
-  ctx.lineWidth = selected ? 1.5 : 1.0;
+  ctx.setLineDash([6, 4]);
+  ctx.strokeStyle = _huergb(hue, selected ? 0.75 : 0.42);
+  ctx.lineWidth = selected ? 1.6 : 1.1;
   ctx.stroke();
+  ctx.setLineDash([]);
 
-  /* Corner markers are the visual affordance for a corner drag.
-     They appear only when the drag path behind them is live. */
-  if (!PATCH_SHAPE_EDIT_ENABLED) return;
-
-  const rDot = selected ? 5.2 : 3.0;
-  for (const [sx, sy] of pts) {
-    ctx.beginPath(); ctx.arc(sx, sy, rDot, 0, Math.PI * 2);
-    ctx.fillStyle = selected ? "#ffe680" : "rgba(255, 210, 100, 0.80)";
-    ctx.fill();
-    ctx.strokeStyle = "#0a0e14"; ctx.lineWidth = 1.5; ctx.stroke();
+  if (PATCH_SHAPE_EDIT_ENABLED) {
+    const rDot = selected ? 5.0 : 2.8;
+    for (const [sx, sy] of pts) {
+      ctx.beginPath(); ctx.arc(sx, sy, rDot, 0, Math.PI * 2);
+      ctx.fillStyle = selected ? _huergbLight(hue) : _huergb(hue, 0.75);
+      ctx.fill();
+      ctx.strokeStyle = "#0a0e14"; ctx.lineWidth = 1.4; ctx.stroke();
+    }
   }
+
+  ctx.restore();
 }
 
 /* ==========================================================================
@@ -683,6 +802,20 @@ const FLAT_S_MAX    = 1;
 
 const QUAD_MIN_SIZE_PHI = 0.06;
 const QUAD_MIN_SIZE_S   = 0.04;
+
+/* ==========================================================================
+   PATCH DRAG SNAP STEPS
+   ==========================================================================
+   PATCH_SNAP_PHI — one fifteenth of a full turn, matching the default
+   meridian spacing of 24 (2π / 24 = 15°).  A patch snapped with
+   Shift advances in meridian-sized increments along phi.
+
+   PATCH_SNAP_S   — one twentieth of the parameter rectangle's height.
+   For a patch whose own s-extent is 0.5, this is one tenth of its
+   own height; the eye reads the jump as "a small but visible step". */
+
+const PATCH_SNAP_PHI = Math.PI / 12;
+const PATCH_SNAP_S   = 0.05;
 
 /* ==========================================================================
    PHI-WRAP HELPERS
@@ -837,6 +970,7 @@ function drawFlatView() {
 
   if (selectedQuad >= 0 && selectedQuad < quads.length) {
     const activeQ = quads[selectedQuad];
+    const activeHue = patchHue(activeQ);
 
     for (let i = 0; i < floatSquares.length; i++) {
       const sq = floatSquares[i];
@@ -859,38 +993,44 @@ function drawFlatView() {
           ctx.lineTo(screen[k][0], screen[k][1]);
         }
         ctx.closePath();
-        ctx.fillStyle = isSel
-          ? "rgba(120, 220, 255, 0.30)"
-          : "rgba(120, 220, 255, 0.16)";
+        ctx.fillStyle = _huergb(activeHue, isSel ? 0.30 : 0.16);
         ctx.fill();
 
         ctx.lineJoin = "round";
-        ctx.strokeStyle = isSel
-          ? "rgba(180, 240, 255, 1.00)"
-          : "rgba(140, 225, 255, 0.78)";
+        ctx.strokeStyle = _huergb(activeHue, isSel ? 1.00 : 0.78);
         ctx.lineWidth = isSel ? 1.8 : 1.2;
         ctx.stroke();
 
-        if (isSel) {
-          for (const [hx, hy] of screen) {
-            ctx.beginPath();
-            ctx.arc(hx, hy, 4.2, 0, Math.PI * 2);
-            ctx.fillStyle = "#b8ecff";
-            ctx.fill();
-            ctx.strokeStyle = "#0a0e14";
-            ctx.lineWidth = 1.4;
-            ctx.stroke();
-          }
-        }
-      }
+        if (!isSel) continue;
 
-      /* Rotate handle drawn once, at the shape's primary position. */
-      if (isSel) {
-        const rh = squareFlatRotateHandleScreen(sq);
+        for (const [hx, hy] of screen) {
+          ctx.beginPath();
+          ctx.arc(hx, hy, 4.2, 0, Math.PI * 2);
+          ctx.fillStyle = _huergbLight(activeHue);
+          ctx.fill();
+          ctx.strokeStyle = "#0a0e14";
+          ctx.lineWidth = 1.4;
+          ctx.stroke();
+        }
+
+        const rh = squareFlatRotateHandleScreen(sq, shift);
         if (rh) {
+          let topIdx = 0;
+          for (let k = 1; k < screen.length; k++) {
+            if (screen[k][1] < screen[topIdx][1]) topIdx = k;
+          }
+          ctx.beginPath();
+          ctx.moveTo(screen[topIdx][0], screen[topIdx][1]);
+          ctx.lineTo(rh[0], rh[1]);
+          ctx.strokeStyle = _huergb(activeHue, 0.45);
+          ctx.lineWidth = 1;
+          ctx.setLineDash([3, 3]);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
           ctx.beginPath();
           ctx.arc(rh[0], rh[1], 6.0, 0, Math.PI * 2);
-          ctx.fillStyle = "#b8ecff";
+          ctx.fillStyle = _huergbLight(activeHue);
           ctx.fill();
           ctx.strokeStyle = "#0a0e14";
           ctx.lineWidth = 1.6;
@@ -906,6 +1046,10 @@ function drawFlatView() {
     }
   }
 
+  /* Labels, drawn inside the clip so a wrapped copy that has drifted
+     past the sheet boundary is trimmed along with everything else. */
+  drawShapeLabelsFlat();
+
   ctx.restore();
 }
 
@@ -916,35 +1060,46 @@ function drawFlatQuad(q, selected) {
   }
 }
 
+/* The patch is the plane a shape sits on.  It gets a DASHED outline,
+   a very faint fill, and no corner or rotate handles.  Everything
+   the eye reads as "an object on the sheet" — solid stroke, handles,
+   a filled body — belongs to the shapes.
+
+   When shape-editing is enabled the patch corners carry small dots
+   drawn in the patch hue; those dots are the only handle-like
+   feature a patch has, and they are dormant while the flag is off. */
 function drawFlatQuadShifted(q, selected, shift) {
+  const hue = patchHue(q);
   const pts = quadCorners(q).map(c =>
     flatToScreen(c.phi + shift, c.s));
+
+  ctx.save();
 
   ctx.beginPath();
   ctx.moveTo(pts[0][0], pts[0][1]);
   for (let i = 1; i < 4; i++) ctx.lineTo(pts[i][0], pts[i][1]);
   ctx.closePath();
-  ctx.fillStyle = selected
-    ? "rgba(255, 200, 90, 0.10)"
-    : "rgba(255, 200, 90, 0.04)";
+  ctx.fillStyle = _huergb(hue, selected ? 0.07 : 0.03);
   ctx.fill();
 
   ctx.lineJoin = "round";
-  ctx.strokeStyle = selected
-    ? "rgba(255, 220, 130, 0.60)"
-    : "rgba(255, 200, 90, 0.28)";
-  ctx.lineWidth = selected ? 1.5 : 1.0;
+  ctx.setLineDash([6, 4]);
+  ctx.strokeStyle = _huergb(hue, selected ? 0.75 : 0.42);
+  ctx.lineWidth = selected ? 1.6 : 1.1;
   ctx.stroke();
+  ctx.setLineDash([]);
 
-  if (!PATCH_SHAPE_EDIT_ENABLED) return;
-
-  const rDot = selected ? 5.0 : 2.5;
-  for (const [sx, sy] of pts) {
-    ctx.beginPath(); ctx.arc(sx, sy, rDot, 0, Math.PI * 2);
-    ctx.fillStyle = selected ? "#ffe680" : "rgba(255, 210, 100, 0.75)";
-    ctx.fill();
-    ctx.strokeStyle = "#0a0e14"; ctx.lineWidth = 1.5; ctx.stroke();
+  if (PATCH_SHAPE_EDIT_ENABLED) {
+    const rDot = selected ? 5.0 : 2.8;
+    for (const [sx, sy] of pts) {
+      ctx.beginPath(); ctx.arc(sx, sy, rDot, 0, Math.PI * 2);
+      ctx.fillStyle = selected ? _huergbLight(hue) : _huergb(hue, 0.75);
+      ctx.fill();
+      ctx.strokeStyle = "#0a0e14"; ctx.lineWidth = 1.4; ctx.stroke();
+    }
   }
+
+  ctx.restore();
 }
 
 /* ---- Hit testing ------------------------------------------------ */
@@ -963,7 +1118,8 @@ function _flatPtSegDist(px, py, ax, ay, bx, by) {
 
 function _flatPtInQuad(px, py, c) {
   let inside = false;
-  for (let i = 0, j = 3; i < 4; j = i++) {
+  const n = c.length;
+  for (let i = 0, j = n - 1; i < n; j = i++) {
     const xi = c[i][0], yi = c[i][1];
     const xj = c[j][0], yj = c[j][1];
     if (((yi > py) !== (yj > py)) &&
@@ -1021,7 +1177,65 @@ function flatHitTest(sx, sy) {
   return null;
 }
 
-/* ---- Drag application ------------------------------------------- */
+/* ---- Shape re-clamp after a patch mutation ---------------------- */
+
+function _reclampShapesOnPatch(q) {
+  if (!q) return;
+  const qi = quadIdxById(q.id);
+  if (qi < 0) return;
+  for (let i = 0; i < floatSquares.length; i++) {
+    const sq = floatSquares[i];
+    if (sq.quadId === q.id) {
+      sq.v = clampCloneV(qi, sq.v);
+    }
+  }
+}
+
+/* ---- Patch drag -------------------------------------------------
+   Start-anchored, with the Shift-held step snap on phi ONLY.
+
+   The snap is a rotation-like gesture: quantizing phi advances the
+   patch around the cone in fixed angular steps, matching how the
+   meridian grid reads.  Movement along the near-apex axis (s) is
+   left continuous on purpose — the user's mental model of "sliding
+   toward the apex" wants fine control, not steps, and stepping it
+   would fight that.
+
+   Both the cone view's drag handler and the flat view's route
+   through this same function, so a snapped patch drag behaves
+   identically in both bands. */
+
+function applyPatchDragFromStart(q, dp, curPhi, curS, snap) {
+  let rawPhi = curPhi - dp.startPhi;
+  while (rawPhi >  Math.PI) rawPhi -= 2 * Math.PI;
+  while (rawPhi < -Math.PI) rawPhi += 2 * Math.PI;
+  const rawS = curS - dp.startS;
+
+  let dPhi = rawPhi;
+  const dS = rawS;
+
+  if (snap) {
+    dPhi = Math.round(rawPhi / PATCH_SNAP_PHI) * PATCH_SNAP_PHI;
+  }
+
+  q.phi0 = dp.startPhi0 + dPhi;
+  q.phi1 = dp.startPhi1 + dPhi;
+
+  let ns0 = dp.startS0 + dS;
+  let ns1 = dp.startS1 + dS;
+  if (ns0 < FLAT_S_MIN) { ns1 += FLAT_S_MIN - ns0; ns0 = FLAT_S_MIN; }
+  if (ns1 > FLAT_S_MAX) { ns0 -= ns1 - FLAT_S_MAX; ns1 = FLAT_S_MAX; }
+  if (ns0 < FLAT_S_MIN) ns0 = FLAT_S_MIN;
+  q.s0 = ns0;
+  q.s1 = ns1;
+
+  _reclampShapesOnPatch(q);
+}
+
+/* ---- Drag application -------------------------------------------
+   The three mutators below are the shape-editing paths for patches.
+   They are unreferenced while PATCH_SHAPE_EDIT_ENABLED is false, but
+   they remain fully functional. */
 
 function flatMoveCorner(q, cornerIdx, phi, s) {
   if (cornerIdx === 0) {
@@ -1045,6 +1259,7 @@ function flatMoveCorner(q, cornerIdx, phi, s) {
     q.s0   = Math.max(FLAT_S_MIN,
                       Math.min(s, q.s1 - QUAD_MIN_SIZE_S));
   }
+  _reclampShapesOnPatch(q);
 }
 
 function flatMoveEdge(q, edge, phi, s) {
@@ -1059,8 +1274,13 @@ function flatMoveEdge(q, edge, phi, s) {
     q.phi1 = Math.min(FLAT_PHI_MAX,
                       Math.max(phi, q.phi0 + QUAD_MIN_SIZE_PHI));
   }
+  _reclampShapesOnPatch(q);
 }
 
+/* Incremental patch translation.  Kept as the low-level mutator and
+   as the reference implementation for the clamp/wrap behaviour that
+   applyPatchDragFromStart mirrors; the drag handlers now use the
+   start-anchored version. */
 function flatMoveBody(q, dPhi, dS) {
   q.phi0 += dPhi;
   q.phi1 += dPhi;
@@ -1071,6 +1291,8 @@ function flatMoveBody(q, dPhi, dS) {
   if (ns0 < FLAT_S_MIN) ns0 = FLAT_S_MIN;
 
   q.s0 = ns0; q.s1 = ns1;
+
+  _reclampShapesOnPatch(q);
 }
 
 /* ==========================================================================
@@ -1081,20 +1303,121 @@ const floatSquares = [];
 let nextSquareId = 1;
 let selectedSquare = -1;
 
-const SHAPE_DEFAULT_SCALE = 0.75;
+/* ==========================================================================
+   SHAPE DIMENSIONS
+   ==========================================================================
+   The shape's width and height in the flat view's coordinate system.
+   Two pure-size knobs (see the module docstring):
+
+       SHAPE_W_PHI    width,  as a fraction of a full turn (2π)
+       SHAPE_H_S      height, as a fraction of the axial height (1)
+
+   For a fresh shape to be a pixel square in the unfolded-cone view,
+   keep SHAPE_W_PHI / SHAPE_H_S == 0.4, matching the flat rectangle's
+   own 2.5:1 aspect. */
+
+const SHAPE_W_PHI = 0.08;   // width,  as a fraction of a full turn
+const SHAPE_H_S   = 0.20;   // height, as a fraction of the axial height
+
+/* Per-shape multipliers on the two dimensions above.  Set to 1.0 for
+   the default size; corner-drag resizes move them. */
+const SHAPE_DEFAULT_SCALE = 1.0;
 const SHAPE_MIN_SCALE     = 0.03;
 const SHAPE_MAX_SCALE     = 3.00;
 
-/* One depth multiplier, both views. */
-let SHAPE_DEPTH = 0.75;
+/* ==========================================================================
+   SHAPE DEPTH — ONE PER VIEW
+   ==========================================================================
+   Two independent depth multipliers, one per view.
 
-/* Full perspective, always. */
-const SHAPE_PERSP_STRENGTH = 1;
+   The shape as an object is a rectangle in the patch's own (u, v)
+   plane.  Each view renders that rectangle through its own
+   projection, and the two projections scale the plane's v-axis
+   differently:
+
+       flat view   the plane laid out as (phi, s) — the rectangle's
+                   drawn height is  SHAPE_H_S · scaleV ·
+                   SHAPE_DEPTH_FLAT.
+       cone view   the perspective projection onto the cone — the
+                   drawn height is  SHAPE_H_S · scaleV ·
+                   effectiveConeDepth().
+
+   These were once a single SHAPE_DEPTH, which coupled the two views:
+   tuning the cone view's apparent squareness also moved the flat
+   view's.  They are untangled now.  The panel's "Shape depth" slider
+   drives SHAPE_DEPTH_CONE only, and SHAPE_DEPTH_FLAT stays at 1.00
+   so the flat view's square footprint is unchanged.
+
+   The slider value is normalized: the cone view's actual height
+   scale is the slider value times SHAPE_DEPTH_CONE_UNIT.  The unit
+   holds the raw multiplier that used to live on the panel, so the
+   default slider position of 1.00 renders identically to the old
+   raw 0.50.  Only the number on the panel changed. */
+
+const SHAPE_DEPTH_CONE_UNIT = 0.50;
+let   SHAPE_DEPTH_CONE      = 1.00;
+const SHAPE_DEPTH_FLAT      = 1.00;
+
+/* The cone view's effective height scale: the panel's normalized
+   value times the reference unit.  All cone-view geometry — render,
+   hit test, and corner drag — reads this rather than the raw panel
+   value, so the panel can be renumbered without moving the drawing. */
+function effectiveConeDepth() {
+  return SHAPE_DEPTH_CONE * SHAPE_DEPTH_CONE_UNIT;
+}
 
 const WEDGE_BASE_REACH = 2.50;
 
 const ROTATE_HANDLE_OFFSET = 0.25;
 const ROTATE_HANDLE_R      = 10;
+
+const ROTATE_JUMP_STEP = Math.PI / 12;
+
+const U_LIMIT = 3.0;
+
+/* ==========================================================================
+   PATCH HUE PALETTE
+   ==========================================================================
+   See the module docstring's section on hue.  Three accessors:
+
+       patchHue(q)          the hue object for a patch
+       _huergb(h, a)        the hue at an arbitrary alpha
+       _huergbLight(h)      the hue mixed 30% toward white, for
+                            handles and other small accents where the
+                            base hue would be too dark to read
+
+   The palette is deliberately quiet: seven of the eight hues are
+   muted enough that a canvas with several patches still reads as a
+   drafting sheet, not as a diagram of colored boxes. */
+
+const PATCH_HUES = [
+  { r: 255, g: 200, b:  90 },   // amber
+  { r: 120, g: 220, b: 255 },   // cyan
+  { r: 255, g: 130, b: 210 },   // magenta
+  { r: 140, g: 225, b: 160 },   // green
+  { r: 180, g: 155, b: 255 },   // violet
+  { r: 255, g: 165, b: 105 },   // orange
+  { r: 110, g: 220, b: 210 },   // teal
+  { r: 220, g: 230, b: 120 },   // lime
+];
+
+function patchHue(q) {
+  if (!q) return PATCH_HUES[0];
+  const n = PATCH_HUES.length;
+  const idx = ((q.id - 1) % n + n) % n;
+  return PATCH_HUES[idx];
+}
+
+function _huergb(h, a) {
+  return "rgba(" + h.r + ", " + h.g + ", " + h.b + ", " + a + ")";
+}
+
+function _huergbLight(h) {
+  const r = Math.round(h.r * 0.7 + 255 * 0.3);
+  const g = Math.round(h.g * 0.7 + 255 * 0.3);
+  const b = Math.round(h.b * 0.7 + 255 * 0.3);
+  return "rgb(" + r + ", " + g + ", " + b + ")";
+}
 
 /* ==========================================================================
    PATCH FRAME
@@ -1195,24 +1518,116 @@ function perspAt(qi, vHat) {
 }
 
 /* ==========================================================================
-   CLAMP — v only
+   SHAPE PERSPECTIVE PARAMETERS
    ========================================================================== */
+
+function shapePerspCentre(sq) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return 1;
+  return perspAt(qi, sq.v);
+}
+
+function shapeVMax(sq) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return 1;
+  const f = patchFrame(qi);
+  if (!f) return 1;
+  const h = horizonLocal(qi);
+  if (!h) return 1;
+  return h.vHat * f.vLen;
+}
+
+/* ==========================================================================
+   HORIZON CLIP
+   ==========================================================================
+   A shape's corner at local v greater than vMaxLocal = h.vHat · vLen
+   has a negative shape-relative factor; its projection crosses through
+   the apex and the polygon folds.  Instead of folding, the polygon is
+   clipped to v ≤ vMaxLocal in the shape's OWN local (u, v)
+   coordinates, and the clipped polygon is projected.
+
+   Sutherland-Hodgman against the half-plane v ≤ vMaxLocal.  The
+   input is a convex polygon; the output is convex, may have 0, 3, 4,
+   or 5 vertices, and is in the same order. */
+
+function _clipPolygonToVMax(corners, vMaxLocal) {
+  const out = [];
+  const n = corners.length;
+  for (let i = 0; i < n; i++) {
+    const A = corners[i];
+    const B = corners[(i + 1) % n];
+    const aIn = A[1] <= vMaxLocal;
+    const bIn = B[1] <= vMaxLocal;
+    if (aIn) out.push(A);
+    if (aIn !== bIn) {
+      const t = (vMaxLocal - A[1]) / (B[1] - A[1]);
+      out.push([A[0] + (B[0] - A[0]) * t, vMaxLocal]);
+    }
+  }
+  return out;
+}
+
+/* ==========================================================================
+   CLAMP — v only
+   ==========================================================================
+   The v coordinate is bounded on both sides:
+
+       lower  -WEDGE_BASE_REACH
+       upper   h.vHat + WEDGE_BASE_REACH
+
+   The lower bound is the base-reach line: below it, a shape is well
+   past the visible band on the wide side.  The upper bound is the
+   horizon plus the same margin: a shape's CENTRE can travel past the
+   horizon, and the horizon clip takes care of the visual.  If the
+   upper bound were h.vHat, the shape would push against the horizon
+   instead of sliding through it. */
 
 function clampCloneV(qi, vHat) {
   const h = horizonLocal(qi);
   if (!h) return vHat;
   const vMin = -WEDGE_BASE_REACH;
-  const vMax = h.vHat;
+  const vMax = h.vHat + WEDGE_BASE_REACH;
   if (vMax <= vMin) return vMin;
   return Math.max(vMin, Math.min(vMax, vHat));
 }
+
+/* ==========================================================================
+   SHAPE V-EXTENT (preserved, not on the render path)
+   ========================================================================== */
+
+function _vExtentNormFromDims(f, dims, theta) {
+  const hw = dims.w / 2;
+  const hh = dims.h / 2;
+  const cosT = Math.abs(Math.cos(theta || 0));
+  const sinT = Math.abs(Math.sin(theta || 0));
+  const extentV = hw * sinT + hh * cosT;
+  return extentV / f.vLen;
+}
+
+function shapeVExtentNorm(sq) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return 0;
+  const f = patchFrame(qi);
+  if (!f) return 0;
+  const dims = squareDims(sq);
+  return _vExtentNormFromDims(f, dims, sq.theta || 0);
+}
+
+/* ==========================================================================
+   SHAPE POSITION
+   ========================================================================== */
 
 function setClonePosition(sq, uLocal, vLocal) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const f = patchFrame(qi);
   if (!f) return;
-  sq.u = uLocal / f.uLen;
+
+  let uHat = uLocal / f.uLen;
+  if (uHat >  U_LIMIT) uHat =  U_LIMIT;
+  if (uHat < -U_LIMIT) uHat = -U_LIMIT;
+
+  sq.u = uHat;
   sq.v = clampCloneV(qi, vLocal / f.vLen);
 }
 
@@ -1225,10 +1640,14 @@ function addSquareAt(quadIdx, uLocal, vLocal) {
   const q = quads[quadIdx];
   const f = patchFrame(quadIdx);
   if (!f) return;
+
   const uHat = uLocal / f.uLen;
   const vHat = clampCloneV(quadIdx, vLocal / f.vLen);
+
+  const id = nextSquareId++;
   floatSquares.push({
-    id: nextSquareId++,
+    id: id,
+    name: "S" + id,
     quadId: q.id,
     u: uHat, v: vHat,
     scaleU: SHAPE_DEFAULT_SCALE,
@@ -1270,15 +1689,52 @@ function clampShapeScales(sq) {
 
 /* ==========================================================================
    GEOMETRY
-   ========================================================================== */
+   ==========================================================================
+   The shape's dimensions in the patch's world-local (u, v) units.
+   Derived from the two flat-view extents above and the patch's own
+   geometry, so the shape's on-screen footprint in each view is what
+   that view's constants say it is, regardless of the patch's size.
+
+       flat phi extent  =  SHAPE_W_PHI · scaleU        (fraction of 2π)
+       flat s   extent  =  SHAPE_H_S   · scaleV        (fraction of 1)
+
+   The patch's own phi extent dPhi covers its uLen in world-local u,
+   so a phi extent of P·2π maps to a world-local u extent of
+   P·2π·uLen / dPhi.  Symmetrically for s.  A per-view depth factor
+   multiplies the height on top of SHAPE_H_S: the cone view passes
+   effectiveConeDepth(), the flat view SHAPE_DEPTH_FLAT.
+
+   squareDims / squareCornersLocal / squareRotateHandleLocal are the
+   FLAT-view variants (SHAPE_DEPTH_FLAT); the ...Cone siblings are
+   the CONE-view variants (effectiveConeDepth()).  Both share the
+   squareDimsWith / squareCornersLocalWith / squareRotateHandleLocalWith
+   implementations below, which take the depth factor explicitly. */
 
 function squareDims(sq) {
+  return squareDimsWith(sq, SHAPE_DEPTH_FLAT);
+}
+
+function squareDimsCone(sq) {
+  return squareDimsWith(sq, effectiveConeDepth());
+}
+
+function squareDimsWith(sq, depthScale) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return { w: 0, h: 0 };
+  const q = quads[qi];
+  if (!q) return { w: 0, h: 0 };
   const f = patchFrame(qi);
   if (!f) return { w: 0, h: 0 };
-  return { w: sq.scaleU * f.uLen,
-           h: sq.scaleV * f.uLen * SHAPE_DEPTH };
+  const dPhi = q.phi1 - q.phi0;
+  const dS   = q.s1   - q.s0;
+  if (Math.abs(dPhi) < 1e-9 || Math.abs(dS) < 1e-9) {
+    return { w: 0, h: 0 };
+  }
+  const TWO_PI = 2 * Math.PI;
+  return {
+    w: SHAPE_W_PHI * TWO_PI * f.uLen / dPhi * sq.scaleU,
+    h: SHAPE_H_S   * f.vLen / dS * sq.scaleV * depthScale,
+  };
 }
 
 function squareCenterLocal(sq) {
@@ -1290,20 +1746,25 @@ function squareCenterLocal(sq) {
 }
 
 function squareCornersLocal(sq) {
+  return squareCornersLocalWith(sq, SHAPE_DEPTH_FLAT);
+}
+
+function squareCornersLocalCone(sq) {
+  return squareCornersLocalWith(sq, effectiveConeDepth());
+}
+
+function squareCornersLocalWith(sq, depthScale) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const f = patchFrame(qi);
   if (!f) return null;
-
   const uC = sq.u * f.uLen;
   const vC = sq.v * f.vLen;
-  const dims = squareDims(sq);
+  const dims = squareDimsWith(sq, depthScale);
   const hw = dims.w / 2;
   const hh = dims.h / 2;
-
   const cosT = Math.cos(sq.theta || 0);
   const sinT = Math.sin(sq.theta || 0);
-
   const raw = [
     [-hw, +hh], [+hw, +hh], [+hw, -hh], [-hw, -hh],
   ];
@@ -1314,7 +1775,7 @@ function squareCornersLocal(sq) {
   });
 }
 
-function squareRotateHandleLocal(sq) {
+function squareCornersLocalUnrotated(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const f = patchFrame(qi);
@@ -1322,47 +1783,93 @@ function squareRotateHandleLocal(sq) {
   const uC = sq.u * f.uLen;
   const vC = sq.v * f.vLen;
   const dims = squareDims(sq);
-  const k = dims.h / 2 + ROTATE_HANDLE_OFFSET * f.uLen;
+  const hw = dims.w / 2;
+  const hh = dims.h / 2;
+  return [
+    [uC - hw, vC + hh], [uC + hw, vC + hh],
+    [uC + hw, vC - hh], [uC - hw, vC - hh],
+  ];
+}
+
+function squareRotateHandleLocal(sq) {
+  return squareRotateHandleLocalWith(sq, SHAPE_DEPTH_FLAT);
+}
+
+function squareRotateHandleLocalCone(sq) {
+  return squareRotateHandleLocalWith(sq, effectiveConeDepth());
+}
+
+function squareRotateHandleLocalWith(sq, depthScale) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const f = patchFrame(qi);
+  if (!f) return null;
+  const uC = sq.u * f.uLen;
+  const vC = sq.v * f.vLen;
+  const dims = squareDimsWith(sq, depthScale);
+  const k = dims.h / 2 + ROTATE_HANDLE_OFFSET * f.vLen;
   const cosT = Math.cos(sq.theta || 0);
   const sinT = Math.sin(sq.theta || 0);
   return [uC + (-k * sinT), vC + (+k * cosT)];
 }
 
 /* ==========================================================================
-   PROJECTION — full per-vertex perspective
+   PROJECTION — shape-relative taper
    ========================================================================== */
 
-function planePointToScreen(f, qi, lu, lv) {
-  const [wx, wy] = frameToWorld(f, lu, lv);
+function projectShapePoint(f, qi, uLocal, vLocal, vC, pC, vMax) {
+  const [wx, wy] = frameToWorld(f, uLocal, vLocal);
   const [sx, sy] = w2s(wx, wy);
   const [ax, ay] = w2s(cone.ax, cone.ay);
-  const vHat = lv / f.vLen;
-  const p = perspAt(qi, vHat);
+  const dv = vLocal - vC;
+  const p = pC - dv / vMax;
   return [ax + p * (sx - ax), ay + p * (sy - ay)];
 }
-
-/* ==========================================================================
-   SHAPE RENDERING — CONE BAND
-   ========================================================================== */
 
 function squareCornersScreen(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const f = patchFrame(qi);
   if (!f) return null;
-  const local = squareCornersLocal(sq);
+  const local = squareCornersLocalCone(sq);
   if (!local) return null;
-  return local.map(([u, v]) => planePointToScreen(f, qi, u, v));
+
+  const h = horizonLocal(qi);
+  if (!h) return null;
+  const vMaxLocal = h.vHat * f.vLen;
+  const clipped = _clipPolygonToVMax(local, vMaxLocal);
+  if (clipped.length < 3) return null;
+
+  const vC = sq.v * f.vLen;
+  const pC = shapePerspCentre(sq);
+  const vMax = shapeVMax(sq);
+  return clipped.map(([u, v]) =>
+    projectShapePoint(f, qi, u, v, vC, pC, vMax));
 }
 
+/* The handle is hidden when its own local v is past the horizon. */
 function squareRotateHandleScreen(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const f = patchFrame(qi);
   if (!f) return null;
-  const hl = squareRotateHandleLocal(sq);
+
+  if (!squareCornersScreen(sq)) return null;
+
+  const hl = squareRotateHandleLocalCone(sq);
   if (!hl) return null;
-  return planePointToScreen(f, qi, hl[0], hl[1]);
+
+  const h = horizonLocal(qi);
+  if (!h) return null;
+
+  const vMaxLocal = h.vHat * f.vLen;
+  const HANDLE_GAP = 0.02 * f.vLen;
+  const hv = Math.min(hl[1], vMaxLocal - HANDLE_GAP);
+
+  const vC = sq.v * f.vLen;
+  const pC = shapePerspCentre(sq);
+  const vMax = shapeVMax(sq);
+  return projectShapePoint(f, qi, hl[0], hv, vC, pC, vMax);
 }
 
 /* ==========================================================================
@@ -1424,10 +1931,10 @@ function drawFloatSquares() {
   }
 }
 
-function _drawRotateHandle(sx, sy) {
+function _drawRotateHandle(sx, sy, hue) {
   ctx.beginPath();
   ctx.arc(sx, sy, 6.0, 0, Math.PI * 2);
-  ctx.fillStyle = "#b8ecff";
+  ctx.fillStyle = _huergbLight(hue);
   ctx.fill();
   ctx.strokeStyle = "#0a0e14";
   ctx.lineWidth = 1.6;
@@ -1442,38 +1949,57 @@ function _drawRotateHandle(sx, sy) {
 function drawFloatSquare(sq, selected) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
+  const q = quads[qi];
+  const hue = patchHue(q);
+
   if (selected) {
     drawHorizon(qi);
     drawBaseReach(qi);
   }
   const pts = squareCornersScreen(sq);
-  if (!pts) return;
+  if (!pts || pts.length < 3) return;
+
   ctx.beginPath();
   ctx.moveTo(pts[0][0], pts[0][1]);
-  for (let i = 1; i < 4; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
   ctx.closePath();
-  ctx.fillStyle = selected
-    ? "rgba(120, 220, 255, 0.30)"
-    : "rgba(120, 220, 255, 0.12)";
+  ctx.fillStyle = _huergb(hue, selected ? 0.30 : 0.12);
   ctx.fill();
+
   ctx.lineJoin = "round";
-  ctx.strokeStyle = selected
-    ? "rgba(180, 240, 255, 1.00)"
-    : "rgba(140, 225, 255, 0.72)";
+  ctx.strokeStyle = _huergb(hue, selected ? 1.00 : 0.72);
   ctx.lineWidth = selected ? 2.0 : 1.3;
   ctx.stroke();
+
   if (!selected) return;
+
   for (const [sx, sy] of pts) {
     ctx.beginPath();
     ctx.arc(sx, sy, 4.5, 0, Math.PI * 2);
-    ctx.fillStyle = "#b8ecff";
+    ctx.fillStyle = _huergbLight(hue);
     ctx.fill();
     ctx.strokeStyle = "#0a0e14";
     ctx.lineWidth = 1.5;
     ctx.stroke();
   }
+
   const rh = squareRotateHandleScreen(sq);
-  if (rh) _drawRotateHandle(rh[0], rh[1]);
+  if (rh) {
+    let topIdx = 0;
+    for (let k = 1; k < pts.length; k++) {
+      if (pts[k][1] < pts[topIdx][1]) topIdx = k;
+    }
+    ctx.beginPath();
+    ctx.moveTo(pts[topIdx][0], pts[topIdx][1]);
+    ctx.lineTo(rh[0], rh[1]);
+    ctx.strokeStyle = _huergb(hue, 0.45);
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    _drawRotateHandle(rh[0], rh[1], hue);
+  }
 }
 
 /* ==========================================================================
@@ -1485,7 +2011,8 @@ const SQUARE_BODY_MIN_R = 8;
 
 function _ptInQuadPx(px, py, poly) {
   let inside = false;
-  for (let i = 0, j = 3; i < 4; j = i++) {
+  const n = poly.length;
+  for (let i = 0, j = n - 1; i < n; j = i++) {
     const xi = poly[i][0], yi = poly[i][1];
     const xj = poly[j][0], yj = poly[j][1];
     if (((yi > py) !== (yj > py)) &&
@@ -1507,19 +2034,24 @@ function squareHitTest(sx, sy) {
   for (const si of order) {
     const sq = floatSquares[si];
     const pts = squareCornersScreen(sq);
-    if (!pts) continue;
+    if (!pts || pts.length < 3) continue;
+
     const rh = squareRotateHandleScreen(sq);
     if (rh && Math.hypot(sx - rh[0], sy - rh[1]) < ROTATE_HANDLE_R) {
       return { kind: "rotate", squareIdx: si };
     }
-    for (let ci = 0; ci < 4; ci++) {
+
+    for (let ci = 0; ci < pts.length; ci++) {
       if (Math.hypot(sx - pts[ci][0], sy - pts[ci][1]) < SQUARE_HANDLE_R) {
         return { kind: "corner", squareIdx: si, cornerIdx: ci };
       }
     }
+
     if (_ptInQuadPx(sx, sy, pts)) return { kind: "body", squareIdx: si };
-    const mx = (pts[0][0] + pts[1][0] + pts[2][0] + pts[3][0]) / 4;
-    const my = (pts[0][1] + pts[1][1] + pts[2][1] + pts[3][1]) / 4;
+
+    let mx = 0, my = 0;
+    for (const [x, y] of pts) { mx += x; my += y; }
+    mx /= pts.length; my /= pts.length;
     if (Math.hypot(sx - mx, sy - my) < SQUARE_BODY_MIN_R) {
       return { kind: "body", squareIdx: si };
     }
@@ -1540,10 +2072,105 @@ function findPatchAtScreen(sx, sy) {
 }
 
 /* ==========================================================================
-   INVERSE OF THE PER-VERTEX PROJECTION
+   INVERSE #1 — shape-relative taper, EXACT (quadratic)
    ========================================================================== */
 
-function cursorToLocalWithPersp(f, qi, sx, sy) {
+function cursorToLocalShapeRelativeExactWith(f, qi, vC, pC, vMax,
+                                             sx, sy) {
+  if (vMax < 1e-6) return screenToFrame(f, sx, sy);
+
+  const A0 = pC + vC / vMax;
+  const B0 = 1 / vMax;
+
+  const [ax, ay] = w2s(cone.ax, cone.ay);
+  const Sx = sx - ax;
+  const Sy = sy - ay;
+
+  const sc = view.scale;
+  const sx0 = sc * f.Cx + view.tx;
+  const sxu = sc * f.Ux;
+  const sxv = sc * f.Vx;
+  const sy0 = -sc * f.Cy + view.ty;
+  const syu = -sc * f.Uy;
+  const syv = -sc * f.Vy;
+
+  const Dx0 = sx0 - ax;
+  const Dxu = sxu;
+  const Dxv = sxv;
+  const Dy0 = sy0 - ay;
+  const Dyu = syu;
+  const Dyv = syv;
+
+  const K  = Dyu * Sx - Dxu * Sy;
+  const M0 = Dyu * Dx0 - Dxu * Dy0;
+  const Mv = Dyu * Dxv - Dxu * Dyv;
+
+  const aQuad = B0 * Mv;
+  const bQuad = B0 * M0 - A0 * Mv;
+  const cQuad = K - A0 * M0;
+
+  let v = null;
+
+  if (Math.abs(aQuad) < 1e-12) {
+    if (Math.abs(bQuad) > 1e-12) v = -cQuad / bQuad;
+  } else {
+    const disc = bQuad * bQuad - 4 * aQuad * cQuad;
+    if (disc >= 0) {
+      const sq2 = Math.sqrt(disc);
+      const r1 = (-bQuad - sq2) / (2 * aQuad);
+      const r2 = (-bQuad + sq2) / (2 * aQuad);
+
+      const valid = (r) => {
+        if (!isFinite(r)) return false;
+        if (r > vMax - 1e-3) return false;
+        if (r < -50 * f.vLen) return false;
+        const q = A0 - B0 * r;
+        if (q <= 1e-6) return false;
+        return true;
+      };
+
+      const r1ok = valid(r1);
+      const r2ok = valid(r2);
+      if (r1ok && r2ok) {
+        v = Math.abs(r1 - vC) < Math.abs(r2 - vC) ? r1 : r2;
+      } else if (r1ok) {
+        v = r1;
+      } else if (r2ok) {
+        v = r2;
+      }
+    }
+  }
+
+  if (v === null || !isFinite(v)) return screenToFrame(f, sx, sy);
+
+  const q = A0 - B0 * v;
+  if (Math.abs(q) < 1e-9) return { u: 0, v };
+
+  let u;
+  if (Math.abs(Dxu) >= Math.abs(Dyu)) {
+    if (Math.abs(Dxu) < 1e-9) return { u: 0, v };
+    u = (Sx / q - Dx0 - Dxv * v) / Dxu;
+  } else {
+    if (Math.abs(Dyu) < 1e-9) return { u: 0, v };
+    u = (Sy / q - Dy0 - Dyv * v) / Dyu;
+  }
+  return { u, v };
+}
+
+function cursorToLocalShapeRelativeExact(f, qi, sq, sx, sy) {
+  const h = horizonLocal(qi);
+  if (!h) return screenToFrame(f, sx, sy);
+  const vMax = shapeVMax(sq);
+  const vC = sq.v * f.vLen;
+  const pC = shapePerspCentre(sq);
+  return cursorToLocalShapeRelativeExactWith(f, qi, vC, pC, vMax, sx, sy);
+}
+
+/* ==========================================================================
+   INVERSE #2 — full per-vertex quadratic (preserved)
+   ========================================================================== */
+
+function cursorToLocalFullPersp(f, qi, sx, sy) {
   const h = horizonLocal(qi);
   if (!h) return screenToFrame(f, sx, sy);
   const vMax = h.vHat * f.vLen;
@@ -1604,14 +2231,63 @@ function cursorToLocalWithPersp(f, qi, sx, sy) {
 }
 
 /* ==========================================================================
+   INVERSE #3 — shape-relative, iterative (preserved)
+   ========================================================================== */
+
+function cursorToLocalWithPersp(f, qi, sq, sx, sy) {
+  const pC = shapePerspCentre(sq);
+  const vMax = shapeVMax(sq);
+  const vC = sq.v * f.vLen;
+  const [ax, ay] = w2s(cone.ax, cone.ay);
+
+  let uCur = sq.u * f.uLen;
+  let vCur = vC;
+
+  for (let iter = 0; iter < 10; iter++) {
+    const dv = vCur - vC;
+    const p = pC - dv / vMax;
+    const pAbs = Math.max(Math.abs(p), 1e-9);
+    const invP = (p >= 0 ? 1 : -1) / pAbs;
+    const unSx = ax + (sx - ax) * invP;
+    const unSy = ay + (sy - ay) * invP;
+    const lc = screenToFrame(f, unSx, unSy);
+    const du = Math.abs(lc.u - uCur);
+    const dvv = Math.abs(lc.v - vCur);
+    uCur = lc.u;
+    vCur = lc.v;
+    if (du < 1e-4 && dvv < 1e-4) break;
+  }
+  return { u: uCur, v: vCur };
+}
+
+/* ==========================================================================
    SHARED EDIT OPERATIONS
    ========================================================================== */
 
-function setShapeFromCornerLocal(sq, cornerIdx, cu, cv) {
+/* Corner resize.  The cursor's local (u, v) offsets give the new w
+   and h directly; the scales are then the ratios of those to the
+   base dimensions, so scaleU = scaleV = 1.0 recovers the default
+   size and the whole scale range [SHAPE_MIN_SCALE, SHAPE_MAX_SCALE]
+   maps onto a fixed multiple of it, independent of the patch.
+
+   depthScale is the multiplier the base dimensions are divided by —
+   effectiveConeDepth() when the drag came from the cone band,
+   SHAPE_DEPTH_FLAT when it came from the flat band.  Passing the
+   band's own factor makes the corner follow the cursor in THAT band;
+   the other band simply renders the new scaleV through its own
+   factor. */
+
+function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
+  const q = quads[qi];
+  if (!q) return;
   const f = patchFrame(qi);
   if (!f) return;
+  const dPhi = q.phi1 - q.phi0;
+  const dS   = q.s1   - q.s0;
+  if (Math.abs(dPhi) < 1e-9 || Math.abs(dS) < 1e-9) return;
+
   const c = squareCenterLocal(sq);
   if (!c) return;
   const [uC, vC] = c;
@@ -1623,27 +2299,60 @@ function setShapeFromCornerLocal(sq, cornerIdx, cu, cv) {
   const uy = -ox * sinT + oy * cosT;
   const signs = [[-1, +1], [+1, +1], [+1, -1], [-1, -1]][cornerIdx];
   const sx = signs[0], sy = signs[1];
-  const wMin = SHAPE_MIN_SCALE * f.uLen;
-  const hMin = SHAPE_MIN_SCALE * f.uLen * SHAPE_DEPTH;
+
+  const TWO_PI = 2 * Math.PI;
+  const baseW = SHAPE_W_PHI * TWO_PI * f.uLen / dPhi;
+  const baseH = SHAPE_H_S   * f.vLen / dS * depthScale;
+  const wMin  = SHAPE_MIN_SCALE * baseW;
+  const hMin  = SHAPE_MIN_SCALE * baseH;
   const w = Math.max(2 * sx * ux, wMin);
   const h = Math.max(2 * sy * uy, hMin);
-  sq.scaleU = w / f.uLen;
-  sq.scaleV = h / (f.uLen * SHAPE_DEPTH);
+  sq.scaleU = w / baseW;
+  sq.scaleV = h / baseH;
   clampShapeScales(sq);
 }
 
-function setShapeRotationFromCursorLocal(sq, cu, cv, snap) {
+function setShapeRotationFromCursorLocal(sq, cu, cv, snap, startTheta) {
   const c = squareCenterLocal(sq);
   if (!c) return;
   const ox = cu - c[0];
   const oy = cv - c[1];
   if (Math.abs(ox) < 1e-6 && Math.abs(oy) < 1e-6) return;
-  let theta = Math.atan2(-ox, oy);
-  if (snap) {
-    const step = Math.PI / 12;
-    theta = Math.round(theta / step) * step;
+
+  const thetaRaw = Math.atan2(-ox, oy);
+
+  if (snap && typeof startTheta === "number") {
+    let delta = thetaRaw - startTheta;
+    while (delta >  Math.PI) delta -= 2 * Math.PI;
+    while (delta < -Math.PI) delta += 2 * Math.PI;
+    sq.theta = startTheta +
+               Math.round(delta / ROTATE_JUMP_STEP) * ROTATE_JUMP_STEP;
+    return;
   }
-  sq.theta = theta;
+
+  sq.theta = thetaRaw;
+}
+
+/* ==========================================================================
+   QUICK-ROTATE OPERATIONS
+   ========================================================================== */
+
+function alignShapeToAxis(sq) {
+  const step = Math.PI / 4;
+  const theta = sq.theta || 0;
+  sq.theta = Math.round(theta / step) * step;
+}
+
+function alignSelectedShapeToAxis() {
+  if (selectedSquare < 0 || selectedSquare >= floatSquares.length) {
+    if (typeof flashStatus === "function") {
+      flashStatus("No shape selected", "warn");
+    }
+    return false;
+  }
+  alignShapeToAxis(floatSquares[selectedSquare]);
+  draw();
+  return true;
 }
 
 /* ==========================================================================
@@ -1656,18 +2365,18 @@ function resizeSquareFromCorner(sq, cornerIdx, cursorWX, cursorWY) {
   const f = patchFrame(qi);
   if (!f) return;
   const [sx, sy] = w2s(cursorWX, cursorWY);
-  const lc = cursorToLocalWithPersp(f, qi, sx, sy);
-  setShapeFromCornerLocal(sq, cornerIdx, lc.u, lc.v);
+  const lc = cursorToLocalShapeRelativeExact(f, qi, sq, sx, sy);
+  setShapeFromCornerLocal(sq, cornerIdx, lc.u, lc.v, effectiveConeDepth());
 }
 
-function rotateSquareToCursor(sq, cursorWX, cursorWY, snap) {
+function rotateSquareToCursor(sq, cursorWX, cursorWY, snap, startTheta) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const f = patchFrame(qi);
   if (!f) return;
   const [sx, sy] = w2s(cursorWX, cursorWY);
-  const lc = cursorToLocalWithPersp(f, qi, sx, sy);
-  setShapeRotationFromCursorLocal(sq, lc.u, lc.v, snap);
+  const lc = cursorToLocalShapeRelativeExact(f, qi, sq, sx, sy);
+  setShapeRotationFromCursorLocal(sq, lc.u, lc.v, snap, startTheta);
 }
 
 /* ==========================================================================
@@ -1698,7 +2407,7 @@ function squareFlatCornersScreen(sq, shift) {
   return corners.map(([phi, s]) => flatToScreen(phi + shift, s));
 }
 
-function squareFlatRotateHandleScreen(sq) {
+function squareFlatRotateHandleScreen(sq, shift) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const q = quads[qi];
@@ -1706,12 +2415,20 @@ function squareFlatRotateHandleScreen(sq) {
   if (!f) return null;
   const hl = squareRotateHandleLocal(sq);
   if (!hl) return null;
+
   const phiC = (q.phi0 + q.phi1) / 2;
   const sC   = (q.s0   + q.s1)   / 2;
   const dPhi = q.phi1 - q.phi0;
   const dS   = q.s1   - q.s0;
-  const phi = phiC + (hl[0] / f.uLen) * dPhi;
-  const s   = sC   + (hl[1] / f.vLen) * dS;
+  const phi  = phiC + (hl[0] / f.uLen) * dPhi + (shift || 0);
+
+  let s = sC + (hl[1] / f.vLen) * dS;
+
+  /* Stay on the sheet.  s = 1 is the apex line, the top of the
+     flat rectangle. */
+  const S_MAX = 1 - 0.02;
+  if (s > S_MAX) s = S_MAX;
+
   return flatToScreen(phi, s);
 }
 
@@ -1740,13 +2457,13 @@ function flatCursorToShapeLocal(sq, sx, sy) {
 function flatResizeSquareFromCornerIdx(sq, sx, sy, cornerIdx) {
   const lc = flatCursorToShapeLocal(sq, sx, sy);
   if (!lc) return;
-  setShapeFromCornerLocal(sq, cornerIdx, lc.u, lc.v);
+  setShapeFromCornerLocal(sq, cornerIdx, lc.u, lc.v, SHAPE_DEPTH_FLAT);
 }
 
-function flatRotateSquareToCursor(sq, sx, sy, snap) {
+function flatRotateSquareToCursor(sq, sx, sy, snap, startTheta) {
   const lc = flatCursorToShapeLocal(sq, sx, sy);
   if (!lc) return;
-  setShapeRotationFromCursorLocal(sq, lc.u, lc.v, snap);
+  setShapeRotationFromCursorLocal(sq, lc.u, lc.v, snap, startTheta);
 }
 
 function flatMoveSquareBody(sq, sx, sy) {
@@ -1767,29 +2484,166 @@ function squareFlatHitTest(sx, sy) {
   for (let i = floatSquares.length - 1; i >= 0; i--) {
     const sq = floatSquares[i];
     if (sq.quadId !== activeQ.id) continue;
-    const rh = squareFlatRotateHandleScreen(sq);
-    if (rh && Math.hypot(sx - rh[0], sy - rh[1]) < ROTATE_HANDLE_R) {
-      return { kind: "rotate", squareIdx: i };
-    }
+
     const corners = squareFlatCorners(sq);
     if (!corners) continue;
     const phis = corners.map(c => c[0]);
     const shifts = _phiCopies(Math.min(...phis), Math.max(...phis));
+
+    for (const shift of shifts) {
+      const rh = squareFlatRotateHandleScreen(sq, shift);
+      if (rh && Math.hypot(sx - rh[0], sy - rh[1]) < ROTATE_HANDLE_R) {
+        return { kind: "rotate", squareIdx: i };
+      }
+    }
+
     for (const shift of shifts) {
       const screen = corners.map(([phi, s]) =>
         flatToScreen(phi + shift, s));
+
       for (let ci = 0; ci < 4; ci++) {
         if (Math.hypot(sx - screen[ci][0], sy - screen[ci][1])
             < FLAT_HANDLE_R) {
           return { kind: "corner", squareIdx: i, cornerIdx: ci };
         }
       }
+
       if (_ptInQuadPx(sx, sy, screen)) {
         return { kind: "body", squareIdx: i };
       }
     }
   }
   return null;
+}
+
+/* ==========================================================================
+   DISPLAY NAMES
+   ========================================================================== */
+
+function squareDisplayName(sq) {
+  return (sq && sq.name) ? sq.name : ("S" + (sq ? sq.id : "?"));
+}
+
+/* ==========================================================================
+   LABEL RENDERING
+   ========================================================================== */
+
+function _drawShapeLabel(sx, sy, text, color) {
+  if (!text) return;
+  ctx.save();
+  ctx.font = "700 10px 'JetBrains Mono', 'Fira Code', monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  const w = ctx.measureText(text).width;
+  const padX = 6;
+  const h = 14;
+
+  ctx.fillStyle = "rgba(10, 14, 20, 0.86)";
+  ctx.fillRect(sx - w / 2 - padX, sy - h / 2, w + 2 * padX, h);
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 0.8;
+  ctx.strokeRect(sx - w / 2 - padX + 0.4, sy - h / 2 + 0.4,
+                 w + 2 * padX - 0.8, h - 0.8);
+
+  ctx.fillStyle = color;
+  ctx.fillText(text, sx, sy + 0.5);
+  ctx.restore();
+}
+
+function _patchCentreScreenCone(q) {
+  const pts = quadCorners(q).map(c => {
+    const [wx, wy] = surfacePoint(c.phi, c.s);
+    return w2s(wx, wy);
+  });
+  let cx = 0, cy = 0;
+  for (const [x, y] of pts) { cx += x; cy += y; }
+  return [cx / 4, cy / 4];
+}
+
+function _shapeCentreScreenCone(sq) {
+  const pts = squareCornersScreen(sq);
+  if (!pts || pts.length < 1) return null;
+  let cx = 0, cy = 0;
+  for (const [x, y] of pts) { cx += x; cy += y; }
+  return [cx / pts.length, cy / pts.length];
+}
+
+function _patchCentreScreenFlat(q, shift) {
+  const pts = quadCorners(q).map(c =>
+    flatToScreen(c.phi + shift, c.s));
+  let cx = 0, cy = 0;
+  for (const [x, y] of pts) { cx += x; cy += y; }
+  return [cx / 4, cy / 4];
+}
+
+function _shapeCentreScreenFlat(sq, shift) {
+  const corners = squareFlatCorners(sq);
+  if (!corners) return null;
+  const pts = corners.map(([phi, s]) => flatToScreen(phi + shift, s));
+  let cx = 0, cy = 0;
+  for (const [x, y] of pts) { cx += x; cy += y; }
+  return [cx / 4, cy / 4];
+}
+
+function drawShapeLabelsCone() {
+  for (let qi = 0; qi < quads.length; qi++) {
+    const q = quads[qi];
+    const hue = patchHue(q);
+    const [cx, cy] = _patchCentreScreenCone(q);
+    _drawShapeLabel(cx, cy, q.name, _huergb(hue, 0.92));
+  }
+
+  for (let i = 0; i < floatSquares.length; i++) {
+    const sq = floatSquares[i];
+    const qi = quadIdxById(sq.quadId);
+    const q = qi >= 0 ? quads[qi] : null;
+    const hue = patchHue(q);
+    const c = _shapeCentreScreenCone(sq);
+    if (!c) continue;
+    _drawShapeLabel(c[0], c[1], squareDisplayName(sq),
+                    _huergb(hue, 0.95));
+  }
+}
+
+function drawShapeLabelsFlat() {
+  for (let qi = 0; qi < quads.length; qi++) {
+    const q = quads[qi];
+    const hue = patchHue(q);
+    const shifts = _phiCopies(q.phi0, q.phi1);
+    for (const shift of shifts) {
+      const [cx, cy] = _patchCentreScreenFlat(q, shift);
+      if (_flatInsideRect(cx, cy)) {
+        _drawShapeLabel(cx, cy, q.name, _huergb(hue, 0.92));
+        break;
+      }
+    }
+  }
+
+  if (selectedQuad < 0 || selectedQuad >= quads.length) return;
+  const activeQ = quads[selectedQuad];
+  const activeHue = patchHue(activeQ);
+
+  for (let i = 0; i < floatSquares.length; i++) {
+    const sq = floatSquares[i];
+    if (sq.quadId !== activeQ.id) continue;
+
+    const corners = squareFlatCorners(sq);
+    if (!corners) continue;
+    const phis = corners.map(c => c[0]);
+    const shifts = _phiCopies(Math.min(...phis), Math.max(...phis));
+
+    for (const shift of shifts) {
+      const c = _shapeCentreScreenFlat(sq, shift);
+      if (!c) continue;
+      if (_flatInsideRect(c[0], c[1])) {
+        _drawShapeLabel(c[0], c[1], squareDisplayName(sq),
+                        _huergb(activeHue, 0.95));
+        break;
+      }
+    }
+  }
 }
 
 /* ==========================================================================
@@ -1820,7 +2674,7 @@ function _worldSideLengths(pts) {
 
 function buildVisualStateExport() {
   const out = {
-    schemaVersion: 2,
+    schemaVersion: 5,
     generatedAt:   new Date().toISOString(),
 
     cone: {
@@ -1834,8 +2688,8 @@ function buildVisualStateExport() {
       R_world:       _round3(coneR()),
     },
 
-    shapeDepth:     SHAPE_DEPTH,
-    perspStrength:  SHAPE_PERSP_STRENGTH,
+    shapeDepthCone: SHAPE_DEPTH_CONE,
+    shapeDepthFlat: SHAPE_DEPTH_FLAT,
 
     view: {
       scale: _round3(view.scale),
@@ -1904,6 +2758,7 @@ function buildVisualStateExport() {
 
     const entry = {
       id:     sq.id,
+      name:   squareDisplayName(sq),
       quadId: sq.quadId,
       index:  i,
       u:      _round3(sq.u),
@@ -1921,21 +2776,26 @@ function buildVisualStateExport() {
 
     entry.uLen = _round3(f.uLen);
     entry.vLen = _round3(f.vLen);
-
-    /* ---- The one array both views read ------------------------ */
+    entry.extentVNorm = _round3(shapeVExtentNorm(sq));
 
     const local = squareCornersLocal(sq);
     const world = local.map(([u, v]) => frameToWorld(f, u, v));
     const dims  = squareDims(sq);
 
-    entry.dims = { w: _round3(dims.w), h: _round3(dims.h) };
+    entry.dims     = { w: _round3(dims.w), h: _round3(dims.h) };
+    entry.dimsCone = (function () {
+      const d = squareDimsCone(sq);
+      return { w: _round3(d.w), h: _round3(d.h) };
+    })();
+
     entry.cornersLocal = local.map(p =>
       [_round3(p[0]), _round3(p[1])]);
     entry.cornersWorld = world.map(p =>
       [_round3(p[0]), _round3(p[1])]);
     entry.worldSideLengths = _worldSideLengths(world);
 
-    /* ---- Cone-band projection --------------------------------- */
+    entry.perspCentre = _round3(shapePerspCentre(sq));
+    entry.vMax        = _round3(shapeVMax(sq));
 
     const screenCone = squareCornersScreen(sq);
     if (screenCone) {
@@ -1943,8 +2803,6 @@ function buildVisualStateExport() {
         [_round3(p[0]), _round3(p[1])]);
       entry.screenSideLengthsCone = _screenSideLengths(screenCone);
     }
-
-    /* ---- Flat-band projection --------------------------------- */
 
     const flatCorners = squareFlatCorners(sq);
     if (flatCorners) {
@@ -1984,6 +2842,15 @@ function exportVisualStateJSON() {
 }
 
 /* ==========================================================================
+   SCRUB RATES
+   ========================================================================== */
+
+const PATCH_PHI_SCRUB_RATE = 0.008;
+const PATCH_S_SCRUB_RATE   = 0.0015;
+
+const SCRUB_DRAG_THRESHOLD = 3;
+
+/* ==========================================================================
    SLIDER SYNC
    ========================================================================== */
 
@@ -1997,7 +2864,7 @@ function syncPanelSliders() {
   if (a)  a.value  = Math.round(cone.halfAngle * 180 / Math.PI);
   if (r)  r.value  = cone.ringCount;
   if (m)  m.value  = cone.meridianCount;
-  if (sd) sd.value = SHAPE_DEPTH;
+  if (sd) sd.value = SHAPE_DEPTH_CONE;
   updatePanelLabels();
 }
 
@@ -2012,7 +2879,150 @@ function updatePanelLabels() {
     Math.round(cone.halfAngle * 180 / Math.PI) + "\u00B0";
   if (rv)  rv.textContent  = String(cone.ringCount);
   if (mv)  mv.textContent  = String(cone.meridianCount);
-  if (sdv) sdv.textContent = SHAPE_DEPTH.toFixed(2);
+  if (sdv) sdv.textContent = SHAPE_DEPTH_CONE.toFixed(2);
+}
+
+/* ==========================================================================
+   PATCH-POSITION SETTERS
+   ========================================================================== */
+
+const _TAU = 2 * Math.PI;
+
+function _patchPhiCenter(q) {
+  let c = (q.phi0 + q.phi1) / 2;
+  c = ((c % _TAU) + _TAU) % _TAU;
+  return c;
+}
+
+function _patchSCenter(q) {
+  return (q.s0 + q.s1) / 2;
+}
+
+function _setPatchPhiCenter(q, target) {
+  const cur = _patchPhiCenter(q);
+  let delta = target - cur;
+  while (delta >  Math.PI) delta -= _TAU;
+  while (delta < -Math.PI) delta += _TAU;
+  q.phi0 += delta;
+  q.phi1 += delta;
+  _reclampShapesOnPatch(q);
+}
+
+function _setPatchSCenter(q, target) {
+  const cur = _patchSCenter(q);
+  const halfSpan = (q.s1 - q.s0) / 2;
+  const lo = FLAT_S_MIN + halfSpan;
+  const hi = FLAT_S_MAX - halfSpan;
+  let t;
+  if (hi < lo) {
+    t = (FLAT_S_MIN + FLAT_S_MAX) / 2;
+  } else {
+    t = Math.max(lo, Math.min(hi, target));
+  }
+  const delta = t - cur;
+  q.s0 += delta;
+  q.s1 += delta;
+  _reclampShapesOnPatch(q);
+}
+
+/* ==========================================================================
+   PATCH-POSITION FIELDS
+   ========================================================================== */
+
+function _syncPatchCoordInputs() {
+  const phiInput = document.getElementById("patchPhiVal");
+  const sInput   = document.getElementById("patchSVal");
+  if (!phiInput || !sInput) return;
+
+  const q = (selectedQuad >= 0 && selectedQuad < quads.length)
+    ? quads[selectedQuad] : null;
+
+  if (!q) {
+    phiInput.disabled = true;
+    sInput.disabled   = true;
+    if (document.activeElement !== phiInput) phiInput.value = "\u2014";
+    if (document.activeElement !== sInput)   sInput.value   = "\u2014";
+    return;
+  }
+
+  phiInput.disabled = false;
+  sInput.disabled   = false;
+
+  if (document.activeElement !== phiInput) {
+    phiInput.value = _patchPhiCenter(q).toFixed(3);
+  }
+  if (document.activeElement !== sInput) {
+    sInput.value = _patchSCenter(q).toFixed(3);
+  }
+}
+
+/* ==========================================================================
+   SCRUB-INPUT INSTALLER
+   ========================================================================== */
+
+function _installScrubInput(el, opts) {
+  let drag = null;
+
+  function onMove(e) {
+    if (!drag) return;
+    const dx = e.clientX - drag.startX;
+    if (!drag.moved) {
+      if (Math.abs(dx) < SCRUB_DRAG_THRESHOLD) return;
+      drag.moved = true;
+    }
+    let raw = drag.startValue + dx * opts.rate;
+    if (opts.snapStep && e.shiftKey) {
+      const delta = raw - drag.startValue;
+      const snapped = Math.round(delta / opts.snapStep) * opts.snapStep;
+      raw = drag.startValue + snapped;
+    }
+    opts.write(raw);
+    draw();
+  }
+  function onUp() {
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", onUp);
+    const wasMoved = drag && drag.moved;
+    drag = null;
+    if (!wasMoved) {
+      el.focus();
+      el.select();
+    }
+  }
+
+  el.addEventListener("mousedown", (e) => {
+    if (el.disabled) return;
+    if (document.activeElement === el) return;
+    e.preventDefault();
+    drag = {
+      startX: e.clientX,
+      startValue: opts.read(),
+      moved: false,
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  });
+
+  el.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const v = parseFloat(el.value);
+      if (isFinite(v)) opts.write(v);
+      el.blur();
+      draw();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      el.blur();
+      _syncPatchCoordInputs();
+    }
+  });
+
+  el.addEventListener("blur", () => {
+    const v = parseFloat(el.value);
+    if (isFinite(v)) opts.write(v);
+    _syncPatchCoordInputs();
+    draw();
+  });
 }
 
 /* ==========================================================================
@@ -2021,6 +3031,8 @@ function updatePanelLabels() {
 
 function syncQuadList() {
   syncSquareList();
+  _syncPatchCoordInputs();
+
   const list = document.getElementById("quadList");
   if (!list) return;
   list.innerHTML = "";
@@ -2033,16 +3045,41 @@ function syncQuadList() {
   }
   for (let i = 0; i < quads.length; i++) {
     const q   = quads[i];
+    const hue = patchHue(q);
+    const isSel = (i === selectedQuad);
     const row = document.createElement("div");
-    row.className = "quadRow" + (i === selectedQuad ? " selected" : "");
+    row.className = "quadRow" + (isSel ? " selected" : "");
     row.dataset.idx = String(i);
+
     const sw = document.createElement("span");
     sw.className = "quadSwatch";
+    sw.style.background  = _huergb(hue, isSel ? 0.95 : 0.55);
+    sw.style.borderColor = _huergb(hue, isSel ? 1.00 : 0.85);
     row.appendChild(sw);
-    const lb = document.createElement("span");
-    lb.className = "quadLabel";
-    lb.textContent = q.name;
+
+    const lb = document.createElement("input");
+    lb.type = "text";
+    lb.className = "quadLabelInput";
+    lb.value = q.name;
+    lb.spellcheck = false;
+    const startName = q.name;
+    lb.addEventListener("mousedown", (ev) => ev.stopPropagation());
+    lb.addEventListener("click",     (ev) => ev.stopPropagation());
+    lb.addEventListener("input", () => {
+      q.name = lb.value;
+      draw();
+    });
+    lb.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); lb.blur(); }
+      if (ev.key === "Escape") {
+        q.name = startName;
+        lb.value = startName;
+        lb.blur();
+        draw();
+      }
+    });
     row.appendChild(lb);
+
     const del = document.createElement("button");
     del.className = "quadDel";
     del.textContent = "\u00D7";
@@ -2052,11 +3089,13 @@ function syncQuadList() {
       deleteQuad(i);
     });
     row.appendChild(del);
+
     row.addEventListener("click", () => {
       selectedQuad = i;
       syncQuadList();
       draw();
     });
+
     list.appendChild(row);
   }
 }
@@ -2077,6 +3116,7 @@ function syncSquareList() {
     return;
   }
   const activeQ = quads[selectedQuad];
+  const activeHue = patchHue(activeQ);
   const rows = [];
   for (let i = 0; i < floatSquares.length; i++) {
     if (floatSquares[i].quadId === activeQ.id) {
@@ -2091,17 +3131,40 @@ function syncSquareList() {
     return;
   }
   for (const { sq, idx } of rows) {
+    const isSel = (idx === selectedSquare);
     const row = document.createElement("div");
-    row.className = "quadRow squareRow"
-                  + (idx === selectedSquare ? " selected" : "");
+    row.className = "quadRow squareRow" + (isSel ? " selected" : "");
     row.dataset.idx = String(idx);
+
     const sw = document.createElement("span");
     sw.className = "quadSwatch";
+    sw.style.background  = _huergb(activeHue, isSel ? 0.95 : 0.55);
+    sw.style.borderColor = _huergb(activeHue, isSel ? 1.00 : 0.85);
     row.appendChild(sw);
-    const lb = document.createElement("span");
-    lb.className = "quadLabel";
-    lb.textContent = "S" + sq.id;
+
+    const lb = document.createElement("input");
+    lb.type = "text";
+    lb.className = "quadLabelInput";
+    lb.value = squareDisplayName(sq);
+    lb.spellcheck = false;
+    const startName = squareDisplayName(sq);
+    lb.addEventListener("mousedown", (ev) => ev.stopPropagation());
+    lb.addEventListener("click",     (ev) => ev.stopPropagation());
+    lb.addEventListener("input", () => {
+      sq.name = lb.value;
+      draw();
+    });
+    lb.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); lb.blur(); }
+      if (ev.key === "Escape") {
+        sq.name = startName;
+        lb.value = startName;
+        lb.blur();
+        draw();
+      }
+    });
     row.appendChild(lb);
+
     const del = document.createElement("button");
     del.className = "quadDel";
     del.textContent = "\u00D7";
@@ -2111,11 +3174,13 @@ function syncSquareList() {
       deleteSquare(idx);
     });
     row.appendChild(del);
+
     row.addEventListener("click", () => {
       selectedSquare = idx;
       syncQuadList();
       draw();
     });
+
     list.appendChild(row);
   }
 }
@@ -2149,11 +3214,13 @@ function flashStatus(msg, cls) {
   const m  = document.getElementById("meridiansSlider");
   const sd = document.getElementById("shapeDepthSlider");
 
-  const resetBtn  = document.getElementById("resetBtn");
-  const centerBtn = document.getElementById("centerBtn");
-  const addBtn    = document.getElementById("addQuadBtn");
-  const addSqBtn  = document.getElementById("addSquareBtn");
-  const exportBtn = document.getElementById("exportBtn");
+  const resetBtn     = document.getElementById("resetBtn");
+  const centerBtn    = document.getElementById("centerBtn");
+  const addBtn       = document.getElementById("addQuadBtn");
+  const addSqBtn     = document.getElementById("addSquareBtn");
+  const exportBtn    = document.getElementById("exportBtn");
+  const saveSceneBtn = document.getElementById("saveSceneBtn");
+  const loadSceneBtn = document.getElementById("loadSceneBtn");
 
   if (d) d.addEventListener("input", () => {
     cone.depth = parseFloat(d.value);
@@ -2178,29 +3245,75 @@ function flashStatus(msg, cls) {
     draw();
   });
   if (sd) sd.addEventListener("input", () => {
-    SHAPE_DEPTH = parseFloat(sd.value);
+    SHAPE_DEPTH_CONE = parseFloat(sd.value);
     updatePanelLabels();
     draw();
   });
 
-  if (resetBtn)  resetBtn.addEventListener("click", resetView);
-  if (centerBtn) centerBtn.addEventListener("click", () => {
+  /* ---- patch-position scrub inputs ------------------------------- */
+
+  const phiInput = document.getElementById("patchPhiVal");
+  const sInput   = document.getElementById("patchSVal");
+
+  if (phiInput) _installScrubInput(phiInput, {
+    rate: PATCH_PHI_SCRUB_RATE,
+    snapStep: PATCH_SNAP_PHI,
+    read: () => {
+      if (selectedQuad < 0 || selectedQuad >= quads.length) return 0;
+      return _patchPhiCenter(quads[selectedQuad]);
+    },
+    write: (raw) => {
+      if (selectedQuad < 0 || selectedQuad >= quads.length) return;
+      _setPatchPhiCenter(quads[selectedQuad], raw);
+    },
+  });
+
+  if (sInput) _installScrubInput(sInput, {
+    rate: PATCH_S_SCRUB_RATE,
+    read: () => {
+      if (selectedQuad < 0 || selectedQuad >= quads.length) return 0;
+      return _patchSCenter(quads[selectedQuad]);
+    },
+    write: (raw) => {
+      if (selectedQuad < 0 || selectedQuad >= quads.length) return;
+      _setPatchSCenter(quads[selectedQuad], raw);
+    },
+  });
+
+  /* ---- buttons and lists ----------------------------------------- */
+
+  if (resetBtn)     resetBtn.addEventListener("click", resetView);
+  if (centerBtn)    centerBtn.addEventListener("click", () => {
     cone.ax = 0;
     cone.ay = 0;
     draw();
   });
-  if (addBtn)   addBtn.addEventListener("click", addQuad);
-  if (addSqBtn) addSqBtn.addEventListener("click", () => {
+  if (addBtn)       addBtn.addEventListener("click", addQuad);
+  if (addSqBtn)     addSqBtn.addEventListener("click", () => {
     if (selectedQuad < 0 || selectedQuad >= quads.length) return;
     addSquareAtCenter(selectedQuad);
   });
-  if (exportBtn) {
-    exportBtn.addEventListener("click", exportVisualStateJSON);
-  }
+  if (exportBtn)    exportBtn.addEventListener("click",
+                                               exportVisualStateJSON);
+  if (saveSceneBtn) saveSceneBtn.addEventListener("click", saveSceneJSON);
+  if (loadSceneBtn) loadSceneBtn.addEventListener("click", promptLoadScene);
 
   window.addEventListener("keydown", (e) => {
     const t = e.target;
     if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+
+    const shiftOnly = e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey;
+    if (shiftOnly) {
+      const k = e.key.toLowerCase();
+      if (k === "a") {
+        e.preventDefault();
+        if (alignSelectedShapeToAxis()) {
+          flashStatus("Aligned to axis", "ok");
+        }
+        return;
+      }
+    }
+
     if (e.key === "Delete" || e.key === "Backspace") {
       if (selectedSquare >= 0) {
         e.preventDefault();
@@ -2209,6 +3322,278 @@ function flashStatus(msg, cls) {
     }
   });
 })();
+
+/* ==========================================================================
+   SCENE SAVE / LOAD
+   ========================================================================== */
+
+const SCENE_VERSION = 1;
+const SCENE_TYPE    = "cone_scene";
+const SCENE_FILE    = "cone_scene.json";
+
+function buildSceneJSON() {
+  return {
+    sceneVersion: SCENE_VERSION,
+    type:         SCENE_TYPE,
+    generatedAt:  new Date().toISOString(),
+
+    cone: {
+      ax:            cone.ax,
+      ay:            cone.ay,
+      depth:         cone.depth,
+      halfAngle:     cone.halfAngle,
+      ringCount:     cone.ringCount,
+      meridianCount: cone.meridianCount,
+    },
+
+    shapeDepthCone: SHAPE_DEPTH_CONE,
+
+    nextQuadId:   nextQuadId,
+    nextSquareId: nextSquareId,
+
+    patches: quads.map(q => ({
+      id:   q.id,
+      name: q.name,
+      phi0: q.phi0,
+      phi1: q.phi1,
+      s0:   q.s0,
+      s1:   q.s1,
+    })),
+
+    squares: floatSquares.map(sq => ({
+      id:     sq.id,
+      name:   sq.name,
+      quadId: sq.quadId,
+      u:      sq.u,
+      v:      sq.v,
+      scaleU: sq.scaleU,
+      scaleV: sq.scaleV,
+      theta:  sq.theta || 0,
+    })),
+  };
+}
+
+function saveSceneJSON() {
+  const text = JSON.stringify(buildSceneJSON(), null, 2);
+  const url  = "data:application/json;charset=utf-8,"
+             + encodeURIComponent(text);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = SCENE_FILE;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  if (typeof flashStatus === "function") {
+    flashStatus("Saved " + quads.length + " patch(es) and "
+                + floatSquares.length + " shape(s)", "ok");
+  }
+}
+
+/* Clear every drag slot on `state` so a load cannot leave a stale
+   index pointing into a cleared array.  Also clears the selection
+   and any in-progress drawing. */
+function _clearTransientState() {
+  state.dragApex       = null;
+  state.dragQuadVertex = null;
+  state.dragSquare     = null;
+  state.flatDrag       = null;
+  state.flatSquareDrag = null;
+  state.dragPatchBody  = null;
+
+  if (state.mouse) {
+    state.mouse.sx     = 0;
+    state.mouse.sy     = 0;
+    state.mouse.inside = false;
+  }
+
+  if (typeof drawing        !== "undefined") drawing        = null;
+  if (typeof drawingPreview !== "undefined") drawingPreview = null;
+
+  selectedQuad   = -1;
+  selectedSquare = -1;
+}
+
+function applySceneJSON(data) {
+  if (!data || typeof data !== "object") {
+    throw new Error("scene: not an object");
+  }
+  if (data.type && data.type !== SCENE_TYPE) {
+    throw new Error("scene: wrong type '" + data.type
+                    + "' (expected '" + SCENE_TYPE + "')");
+  }
+  if (data.sceneVersion !== SCENE_VERSION) {
+    throw new Error("scene: unsupported sceneVersion "
+                    + data.sceneVersion
+                    + " (expected " + SCENE_VERSION + ")");
+  }
+
+  /* ---- cone ---------------------------------------------------- */
+  if (data.cone && typeof data.cone === "object") {
+    const c = data.cone;
+    if (typeof c.ax            === "number") cone.ax            = c.ax;
+    if (typeof c.ay            === "number") cone.ay            = c.ay;
+    if (typeof c.depth         === "number") cone.depth         = c.depth;
+    if (typeof c.halfAngle     === "number") cone.halfAngle     = c.halfAngle;
+    if (typeof c.ringCount     === "number") cone.ringCount     = c.ringCount;
+    if (typeof c.meridianCount === "number") cone.meridianCount = c.meridianCount;
+  }
+
+  if (typeof data.shapeDepthCone === "number") {
+    SHAPE_DEPTH_CONE = data.shapeDepthCone;
+  } else if (typeof data.shapeDepth === "number") {
+    /* Legacy scenes stored a single factor; treat it as the cone
+       view's, since that is the one the panel now drives. */
+    SHAPE_DEPTH_CONE = data.shapeDepth;
+  }
+  /* SHAPE_DEPTH_FLAT is a fixed const and is not restored. */
+
+  /* ---- patches ------------------------------------------------- */
+  const patches = Array.isArray(data.patches) ? data.patches : [];
+  const squares = Array.isArray(data.squares) ? data.squares : [];
+
+  /* quads and floatSquares are `const` bindings; the arrays cannot
+     be reassigned, but their contents can be cleared and refilled
+     in place.  Every module holds the same reference throughout. */
+  quads.length = 0;
+  for (const p of patches) {
+    if (typeof p.id !== "number") continue;
+    quads.push({
+      id:   p.id,
+      name: (typeof p.name === "string" && p.name.length)
+              ? p.name : ("Q" + p.id),
+      phi0: (typeof p.phi0 === "number") ? p.phi0 : 0,
+      phi1: (typeof p.phi1 === "number") ? p.phi1 : Math.PI / 2,
+      s0:   (typeof p.s0   === "number") ? p.s0   : 0.10,
+      s1:   (typeof p.s1   === "number") ? p.s1   : 0.50,
+    });
+  }
+
+  floatSquares.length = 0;
+  for (const s of squares) {
+    if (typeof s.id     !== "number") continue;
+    if (typeof s.quadId !== "number") continue;
+
+    /* Skip a square whose patch is not in the file — it would be
+       an orphan with no plane to live on. */
+    let quadExists = false;
+    for (const q of quads) {
+      if (q.id === s.quadId) { quadExists = true; break; }
+    }
+    if (!quadExists) continue;
+
+    floatSquares.push({
+      id:     s.id,
+      name:   (typeof s.name === "string" && s.name.length)
+                ? s.name : ("S" + s.id),
+      quadId: s.quadId,
+      u:      (typeof s.u === "number") ? s.u : 0,
+      v:      (typeof s.v === "number") ? s.v : 0,
+      scaleU: (typeof s.scaleU === "number")
+                ? s.scaleU : SHAPE_DEFAULT_SCALE,
+      scaleV: (typeof s.scaleV === "number")
+                ? s.scaleV : SHAPE_DEFAULT_SCALE,
+      theta:  (typeof s.theta === "number") ? s.theta : 0,
+    });
+  }
+
+  /* ---- id counters -------------------------------------------- */
+  let maxQuadId   = 0;
+  let maxSquareId = 0;
+  for (const q of quads)        maxQuadId   = Math.max(maxQuadId,   q.id);
+  for (const s of floatSquares) maxSquareId = Math.max(maxSquareId, s.id);
+  nextQuadId   = Math.max(maxQuadId   + 1,
+                          (typeof data.nextQuadId   === "number")
+                            ? data.nextQuadId   : 1);
+  nextSquareId = Math.max(maxSquareId + 1,
+                          (typeof data.nextSquareId === "number")
+                            ? data.nextSquareId : 1);
+
+  /* ---- clean up ----------------------------------------------- */
+  _clearTransientState();
+
+  /* Re-clamp each shape against the new cone: a sq.v that was legal
+     on the old cone may need pulling back on the new one. */
+  for (let i = 0; i < floatSquares.length; i++) {
+    const sq = floatSquares[i];
+    const qi = quadIdxById(sq.quadId);
+    if (qi >= 0) sq.v = clampCloneV(qi, sq.v);
+  }
+
+  /* ---- refresh views and panel -------------------------------- */
+  syncPanelSliders();
+  syncQuadList();
+  draw();
+}
+
+function loadSceneFromText(text) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    if (typeof flashStatus === "function") {
+      flashStatus("Load failed: not valid JSON", "bad");
+    }
+    return false;
+  }
+  try {
+    applySceneJSON(data);
+  } catch (e) {
+    if (typeof flashStatus === "function") {
+      flashStatus("Load failed: " + e.message, "bad");
+    }
+    return false;
+  }
+  if (typeof flashStatus === "function") {
+    flashStatus("Loaded " + quads.length + " patch(es) and "
+                + floatSquares.length + " shape(s)", "ok");
+  }
+  return true;
+}
+
+/* A hidden <input type=file> is created on first use and reused
+   thereafter, so clicking Load does not create a new element per
+   click.  Its value is cleared after each read so the same file can
+   be loaded twice in a row. */
+let _sceneFileInput = null;
+
+function _installSceneFileInput() {
+  if (_sceneFileInput) return _sceneFileInput;
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = "application/json,.json";
+  inp.style.display = "none";
+  inp.addEventListener("change", (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      loadSceneFromText(String(reader.result || ""));
+      inp.value = "";
+    };
+    reader.onerror = () => {
+      if (typeof flashStatus === "function") {
+        flashStatus("Load failed: could not read file", "bad");
+      }
+      inp.value = "";
+    };
+    reader.readAsText(file);
+  });
+  document.body.appendChild(inp);
+  _sceneFileInput = inp;
+  return inp;
+}
+
+function promptLoadScene() {
+  _installSceneFileInput().click();
+}
+
+/* ==========================================================================
+   DRAG DELTA CAPS
+   ========================================================================== */
+
+const BODY_DRAG_MAX_DU = 4.0;
+const BODY_DRAG_MAX_DV = 4.0;
 
 /* ==========================================================================
    DRAW
@@ -2240,6 +3625,12 @@ function draw() {
   ctx.strokeRect(M + 0.5, M + 0.5, cw - 2 * M - 1, ch - 2 * M - 1);
 
   updateStatus();
+
+  /* Panel refresh: the two patch-position scrub fields follow the
+     selected patch's centre.  Called every frame so live drags,
+     apex tilts, and depth changes are all reflected.  A focused
+     field is left alone by the sync function. */
+  _syncPatchCoordInputs();
 }
 
 /* ==========================================================================
@@ -2279,14 +3670,8 @@ function updateStatus() {
   } else if (ds) {
     const sq = floatSquares[ds.squareIdx];
     if (sq) {
-      /* Show the dimensions as the ACTIVE band renders them.
-         state.dragSquare is a cone-band drag, so it uses the cone
-         depth; state.flatSquareDrag is a flat-band drag, so it
-         uses the flat depth. */
-      const inFlat = !!state.flatSquareDrag;
-      const depth  = inFlat ? SHAPE_DEPTH_FLAT : SHAPE_DEPTH_CONE;
-      const dims   = squareDims(sq, depth);
-      const deg    = Math.round((sq.theta || 0) * 180 / Math.PI);
+      const dims = squareDims(sq);
+      const deg  = Math.round((sq.theta || 0) * 180 / Math.PI);
       drag = "   \u00B7  shape #" + sq.id +
              "  W " + dims.w.toFixed(2) +
              "  H " + dims.h.toFixed(2) +
@@ -2355,7 +3740,6 @@ canvas.addEventListener("mousedown", (e) => {
   /* ---- cone band ------------------------------------------------ */
   if (sy < layout.dividerY) {
 
-    /* 1. shift+click drops a shape on the patch under the cursor */
     if (e.shiftKey) {
       const patchIdx = findPatchAtScreen(sx, sy);
       if (patchIdx >= 0) {
@@ -2373,7 +3757,6 @@ canvas.addEventListener("mousedown", (e) => {
       }
     }
 
-    /* 2. shape hit — rotate / corner / body */
     const sqHit = squareHitTest(sx, sy);
     if (sqHit) {
       const sq = floatSquares[sqHit.squareIdx];
@@ -2384,31 +3767,27 @@ canvas.addEventListener("mousedown", (e) => {
       }
       selectedSquare = sqHit.squareIdx;
 
-      /* Persp is captured once here and reused for every frame of
-         the gesture.  Without the freeze, the shape's own persp
-         would change mid-drag and the deltas would come out of two
-         different scalings. */
-      const frozenPersp = shapePersp(sq);
-
       if (sqHit.kind === "rotate") {
         state.dragSquare = {
           mode: "rotate",
           squareIdx: sqHit.squareIdx,
-          persp: frozenPersp,
+          startTheta: sq.theta || 0,
         };
       } else if (sqHit.kind === "corner") {
         state.dragSquare = {
           mode: "corner",
           squareIdx: sqHit.squareIdx,
           cornerIdx: sqHit.cornerIdx,
-          persp: frozenPersp,
         };
       } else {
         const f = qi >= 0 ? patchFrame(qi) : null;
         const c = squareCenterLocal(sq);
         if (f && c) {
-          const lc = cursorToLocalWithShapePersp(
-            f, qi, sx, sy, frozenPersp);
+          const vMax = shapeVMax(sq);
+          const vC   = sq.v * f.vLen;
+          const pC   = shapePerspCentre(sq);
+          const lc   = cursorToLocalShapeRelativeExactWith(
+                           f, qi, vC, pC, vMax, sx, sy);
           state.dragSquare = {
             mode: "body",
             squareIdx: sqHit.squareIdx,
@@ -2416,7 +3795,9 @@ canvas.addEventListener("mousedown", (e) => {
             startCursorV: lc.v,
             startCenterU: c[0],
             startCenterV: c[1],
-            persp: frozenPersp,
+            startVc:      vC,
+            startPc:      pC,
+            startVMax:    vMax,
           };
         }
       }
@@ -2425,7 +3806,6 @@ canvas.addEventListener("mousedown", (e) => {
       return;
     }
 
-    /* 3. patch corner — shape the patch (gated) */
     if (PATCH_SHAPE_EDIT_ENABLED) {
       const vHit = findQuadVertexAt(sx, sy);
       if (vHit) {
@@ -2441,7 +3821,6 @@ canvas.addEventListener("mousedown", (e) => {
       }
     }
 
-    /* 4. patch body — translate the patch */
     const patchHit = findPatchAtScreen(sx, sy);
     if (patchHit >= 0) {
       const q = quads[patchHit];
@@ -2454,16 +3833,19 @@ canvas.addEventListener("mousedown", (e) => {
       const [wx, wy] = s2w(sx, sy);
       const p0 = projectToConeSurface(wx, wy, (q.s0 + q.s1) / 2);
       state.dragPatchBody = {
-        quadIdx: patchHit,
-        lastPhi: p0.phi,
-        lastS:   p0.s,
+        quadIdx:   patchHit,
+        startPhi:  p0.phi,
+        startS:    p0.s,
+        startPhi0: q.phi0,
+        startPhi1: q.phi1,
+        startS0:   q.s0,
+        startS1:   q.s1,
       };
       canvas.style.cursor = "grabbing";
       draw();
       return;
     }
 
-    /* 5. else — tilt the apex */
     selectedSquare = -1;
     state.dragApex = {
       startSx: sx, startSy: sy,
@@ -2475,7 +3857,6 @@ canvas.addEventListener("mousedown", (e) => {
 
   /* ---- flat band ------------------------------------------------ */
 
-  /* 1. shape first */
   const sqFlatHit = squareFlatHitTest(sx, sy);
   if (sqFlatHit) {
     const sq = floatSquares[sqFlatHit.squareIdx];
@@ -2490,6 +3871,7 @@ canvas.addEventListener("mousedown", (e) => {
       state.flatSquareDrag = {
         mode: "rotate",
         squareIdx: sqFlatHit.squareIdx,
+        startTheta: sq.theta || 0,
       };
     } else if (sqFlatHit.kind === "corner") {
       state.flatSquareDrag = {
@@ -2515,7 +3897,6 @@ canvas.addEventListener("mousedown", (e) => {
     return;
   }
 
-  /* 2. patch */
   const hHit = flatHitTest(sx, sy);
   if (!hHit) {
     selectedQuad = -1;
@@ -2531,12 +3912,17 @@ canvas.addEventListener("mousedown", (e) => {
   selectedSquare = -1;
 
   const p = screenToFlat(sx, sy);
+  const q = quads[hHit.quadIdx];
 
   let flatDrag = {
     mode: "body",
-    quadIdx: hHit.quadIdx,
-    lastPhi: p.phi,
-    lastS: p.s,
+    quadIdx:   hHit.quadIdx,
+    startPhi:  p.phi,
+    startS:    p.s,
+    startPhi0: q.phi0,
+    startPhi1: q.phi1,
+    startS0:   q.s0,
+    startS1:   q.s1,
   };
 
   if (PATCH_SHAPE_EDIT_ENABLED) {
@@ -2586,16 +3972,28 @@ window.addEventListener("mousemove", (e) => {
       const f = qi >= 0 ? patchFrame(qi) : null;
       if (f) {
         if (ds.mode === "body") {
-          const lc = cursorToLocalWithShapePersp(f, qi, sx, sy, ds.persp);
-          const newU = ds.startCenterU + (lc.u - ds.startCursorU);
-          const newV = ds.startCenterV + (lc.v - ds.startCursorV);
+          const lc = cursorToLocalShapeRelativeExactWith(
+                       f, qi, ds.startVc, ds.startPc, ds.startVMax,
+                       sx, sy);
+          let dU = lc.u - ds.startCursorU;
+          let dV = lc.v - ds.startCursorV;
+
+          const maxDU = BODY_DRAG_MAX_DU * f.uLen;
+          const maxDV = BODY_DRAG_MAX_DV * f.vLen;
+          if (dU >  maxDU) dU =  maxDU;
+          if (dU < -maxDU) dU = -maxDU;
+          if (dV >  maxDV) dV =  maxDV;
+          if (dV < -maxDV) dV = -maxDV;
+
+          const newU = ds.startCenterU + dU;
+          const newV = ds.startCenterV + dV;
           setClonePosition(sq, newU, newV);
         } else if (ds.mode === "corner") {
           const [wx, wy] = s2w(sx, sy);
-          resizeSquareFromCorner(sq, ds.cornerIdx, wx, wy, ds.persp);
+          resizeSquareFromCorner(sq, ds.cornerIdx, wx, wy);
         } else if (ds.mode === "rotate") {
           const [wx, wy] = s2w(sx, sy);
-          rotateSquareToCursor(sq, wx, wy, e.shiftKey, ds.persp);
+          rotateSquareToCursor(sq, wx, wy, e.shiftKey, ds.startTheta);
         }
       }
     }
@@ -2612,17 +4010,8 @@ window.addEventListener("mousemove", (e) => {
       state.dragPatchBody = null;
     } else {
       const [wx, wy] = s2w(sx, sy);
-      const p = projectToConeSurface(wx, wy, dp.lastS);
-
-      let dPhi = p.phi - dp.lastPhi;
-      if (dPhi >  Math.PI) dPhi -= 2 * Math.PI;
-      if (dPhi < -Math.PI) dPhi += 2 * Math.PI;
-
-      const dS = p.s - dp.lastS;
-
-      flatMoveBody(q, dPhi, dS);
-      dp.lastPhi = p.phi;
-      dp.lastS   = p.s;
+      const p = projectToConeSurface(wx, wy, dp.startS);
+      applyPatchDragFromStart(q, dp, p.phi, p.s, e.shiftKey);
     }
   } else if (state.flatSquareDrag) {
     const fsd = state.flatSquareDrag;
@@ -2636,17 +4025,25 @@ window.addEventListener("mousemove", (e) => {
           const qi = quadIdxById(sq.quadId);
           const f  = qi >= 0 ? patchFrame(qi) : null;
           if (f) {
-            const uWorld =
-              fsd.startCenterU * f.uLen + (lc.u - fsd.startCursorU);
-            const vWorld =
-              fsd.startCenterV * f.vLen + (lc.v - fsd.startCursorV);
+            let dU = lc.u - fsd.startCursorU;
+            let dV = lc.v - fsd.startCursorV;
+
+            const maxDU = BODY_DRAG_MAX_DU * f.uLen;
+            const maxDV = BODY_DRAG_MAX_DV * f.vLen;
+            if (dU >  maxDU) dU =  maxDU;
+            if (dU < -maxDU) dU = -maxDU;
+            if (dV >  maxDV) dV =  maxDV;
+            if (dV < -maxDV) dV = -maxDV;
+
+            const uWorld = fsd.startCenterU * f.uLen + dU;
+            const vWorld = fsd.startCenterV * f.vLen + dV;
             setClonePosition(sq, uWorld, vWorld);
           }
         }
       } else if (fsd.mode === "corner") {
         flatResizeSquareFromCornerIdx(sq, sx, sy, fsd.cornerIdx);
       } else if (fsd.mode === "rotate") {
-        flatRotateSquareToCursor(sq, sx, sy, e.shiftKey);
+        flatRotateSquareToCursor(sq, sx, sy, e.shiftKey, fsd.startTheta);
       }
     }
   } else if (state.flatDrag) {
@@ -2658,9 +4055,7 @@ window.addEventListener("mousemove", (e) => {
     } else if (fd.mode === "edge") {
       flatMoveEdge(q, fd.edge, p.phi, p.s);
     } else if (fd.mode === "body") {
-      flatMoveBody(q, p.phi - fd.lastPhi, p.s - fd.lastS);
-      fd.lastPhi = p.phi;
-      fd.lastS   = p.s;
+      applyPatchDragFromStart(q, fd, p.phi, p.s, e.shiftKey);
     }
   }
   draw();

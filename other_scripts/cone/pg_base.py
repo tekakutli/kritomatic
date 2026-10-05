@@ -1,13 +1,10 @@
 """
 pg_base.py — palette, stylesheet, HTML head, bootstrap.
 
-The panel's slider block carries six entries.  The last two are the
-per-view shape-depth multipliers: "Cone shape" controls the cone
-band's rendering of every shape's V extent, "Flat shape" controls
-the flat band's.  They are independent because the two bands render
-V at different scales — the cone band through the per-vertex
-perspective, the flat band through its own phi/s rectangle — and
-what reads as "square" in one need not in the other.
+The panel carries five graphics sliders, two scrub-inputs for the
+selected patch's position, six buttons (Reset, Center apex, Save
+scene, Load scene, Export visual state, + Patch, + Square — actually
+seven), two lists, a persistent hint block.
 """
 
 HTML_HEAD = r"""<!DOCTYPE html>
@@ -63,6 +60,39 @@ HTML_HEAD = r"""<!DOCTYPE html>
     font-variant-numeric: tabular-nums;
   }
 
+  #ui .field input.scrubInput {
+    flex:1 1 auto;
+    min-width:0;
+    background:transparent;
+    border:0;
+    border-bottom:1px solid #223040;
+    color:#00e5ff;
+    font-family:inherit;
+    font-size:12px;
+    font-weight:700;
+    font-variant-numeric: tabular-nums;
+    text-align:right;
+    padding:2px 4px;
+    margin:0;
+    outline:none;
+    cursor:ew-resize;
+    user-select:none;
+    transition: border-color 0.1s ease;
+  }
+  #ui .field input.scrubInput:hover {
+    border-bottom-color:#34445a;
+  }
+  #ui .field input.scrubInput:focus {
+    border-bottom-color:#00e5ff;
+    cursor:text;
+    user-select:text;
+  }
+  #ui .field input.scrubInput:disabled {
+    color:#3d4756;
+    border-bottom-color:#1e2836;
+    cursor:not-allowed;
+  }
+
   #ui .row { display:flex; gap:6px; margin:6px 0; }
   #ui .row button { flex:1 1 auto; }
 
@@ -111,7 +141,6 @@ HTML_HEAD = r"""<!DOCTYPE html>
     border-color:#34445a; color:#dce6f2;
     background:rgba(220,230,242,0.03);
   }
-
   .quadRow.selected {
     border-color:rgba(255,180,60,0.65);
     color:#ffc966;
@@ -128,7 +157,6 @@ HTML_HEAD = r"""<!DOCTYPE html>
     background:rgba(255,200,90,0.95);
     border-color:#ffc966;
   }
-
   .quadRow.squareRow.selected {
     border-color:rgba(120,220,255,0.65);
     color:#b8ecff;
@@ -142,12 +170,37 @@ HTML_HEAD = r"""<!DOCTYPE html>
     background:rgba(180,240,255,0.95);
     border-color:#b8ecff;
   }
-
   .quadLabel {
     flex:1 1 auto; font-weight:700;
     font-variant-numeric: tabular-nums;
     overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
   }
+
+  .quadLabelInput {
+    flex:1 1 auto;
+    min-width:0;
+    background:transparent;
+    border:0;
+    border-bottom:1px solid transparent;
+    color:inherit;
+    font-family:inherit;
+    font-size:inherit;
+    font-weight:700;
+    letter-spacing:inherit;
+    padding:0;
+    margin:0;
+    outline:none;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    transition: border-color 0.1s ease;
+  }
+  .quadLabelInput:hover {
+    border-bottom-color:#223040;
+  }
+  .quadLabelInput:focus {
+    border-bottom-color:#00e5ff;
+  }
+
   .quadDel {
     width:auto !important;
     padding:1px 6px !important;
@@ -161,6 +214,24 @@ HTML_HEAD = r"""<!DOCTYPE html>
     background:rgba(212,133,144,0.10) !important;
     border-color:#7a3e4a !important;
     color:#e8a0a8 !important;
+  }
+
+  .hintLine {
+    font-size:9px; color:#5a6774;
+    letter-spacing:0.06em;
+    padding:2px 0;
+    line-height:1.5;
+  }
+  .hintLine .kbd {
+    display:inline-block;
+    padding:0 4px;
+    border:1px solid #223040;
+    border-radius:2px;
+    background:#0e1622;
+    color:#00e5ff;
+    font-family:inherit;
+    font-weight:700;
+    letter-spacing:0.02em;
   }
 
   #status {
@@ -227,8 +298,23 @@ HTML_HEAD = r"""<!DOCTYPE html>
   <div class="field">
     <label>Shape depth</label>
     <input type="range" id="shapeDepthSlider"
-           min="0.05" max="2.00" step="0.05" value="0.75">
-    <span class="val" id="shapeDepthVal">0.75</span>
+           min="0.05" max="2.00" step="0.05" value="1.00">
+    <span class="val" id="shapeDepthVal">1.00</span>
+  </div>
+
+  <hr>
+
+  <div class="field">
+    <label>Patch &phi;</label>
+    <input type="text" id="patchPhiVal" class="scrubInput"
+           value="&#8212;" autocomplete="off" spellcheck="false"
+           disabled>
+  </div>
+  <div class="field">
+    <label>Patch s</label>
+    <input type="text" id="patchSVal" class="scrubInput"
+           value="&#8212;" autocomplete="off" spellcheck="false"
+           disabled>
   </div>
 
   <hr>
@@ -244,13 +330,31 @@ HTML_HEAD = r"""<!DOCTYPE html>
     <button id="addSquareBtn" style="flex:1 1 auto;">+ Square</button>
   </div>
   <div id="squareList" class="quadList"></div>
-  <div style="font-size:9px; color:#5a6774;
-              padding:2px 0; letter-spacing:0.06em;">
+
+  <div class="hintLine">
     shift+click a patch to drop one there
+  </div>
+  <div class="hintLine">
+    <span class="kbd">Shift</span>+<span class="kbd">A</span> align to 45°
+  </div>
+  <div class="hintLine">
+    hold <span class="kbd">Shift</span> while dragging the rotate handle
+    to jump
+  </div>
+  <div class="hintLine">
+    hold <span class="kbd">Shift</span> while dragging a patch to snap
+  </div>
+  <div class="hintLine">
+    drag patch &phi;/s to scrub &middot;
+    <span class="kbd">Shift</span> to snap &phi;
   </div>
 
   <hr>
 
+  <div class="row">
+    <button id="saveSceneBtn">Save scene</button>
+    <button id="loadSceneBtn">Load scene</button>
+  </div>
   <div class="row">
     <button id="resetBtn">Reset</button>
     <button id="centerBtn">Center apex</button>

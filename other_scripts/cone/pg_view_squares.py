@@ -6,23 +6,76 @@ unit length but generally not perpendicular.
 
 THE MODEL
 =========
-A shape is a rectangle of independent width and height, rotated by an
-angle within the patch's own (u, v) plane:
+A shape is a rectangle in the patch's own (u, v) plane, rotated by
+an angle, with independent width and height multipliers:
 
-    { id, quadId, u, v, scaleU, scaleV, theta }
+    { id, name, quadId, u, v, scaleU, scaleV, theta }
 
-    u, v      centre in normalized patch coordinates
-    scaleU    width,  as a fraction of the patch's U-midline length
-    scaleV    height, as a fraction of the same U-midline length
-    theta     rotation angle, radians, in the (u, v) plane
+    u, v      centre in NORMALIZED patch coordinates
+    scaleU    width multiplier
+    scaleV    height multiplier
+    theta     rotation angle, radians, in the (û, v̂) plane
+    name      user-editable label, rendered as a pill at the centre
 
-World-local dimensions:
+SHAPE DIMENSIONS — NORMALIZED SPACE
+===================================
+A shape's UNSCALED half-extents live in the patch's NORMALIZED
+coordinates:
 
-    w = scaleU · uLen
-    h = scaleV · uLen · SHAPE_DEPTH
+    û = u / uLen           v̂ = v / vLen
 
-SHAPE_DEPTH defaults to 1.0.  A shape with scaleU == scaleV is
-therefore a true square in (u, v).
+with
+
+    half-width  in û = SHAPE_REL_SIZE · scaleU / 2
+    half-height in v̂ = SHAPE_REL_SIZE · scaleV · depthScale / 2
+
+At scaleU = scaleV = 1, depthScale = 1 the shape is a SQUARE in
+(û, v̂) — the same normalized space the flat view lays out as its
+own rectangle.  The shape's LOCAL (u, v) extents are that square
+multiplied by (uLen, vLen):
+
+    w_local = SHAPE_REL_SIZE · uLen · scaleU
+    h_local = SHAPE_REL_SIZE · vLen · scaleV · depthScale
+
+so the shape occupies the SAME fraction of the patch in both
+directions, and every corner scales linearly with uLen along u and
+vLen along v.  Two shapes whose normalized rectangles touch stay
+touching when the patch moves, in both views.
+
+CONTIGUITY
+==========
+Every renderer projects the shape's NORMALIZED corners through the
+same per-view map:
+
+    cone view   (û, v̂) → local (uLen·û, vLen·v̂) → world (frame)
+    flat view   (û, v̂) → (phi, s) via
+                    phi = phiC + û · dPhi
+                    s   = sC   + v̂ · dS
+
+A shared û-edge maps to the same phi-edge regardless of uLen, and a
+shared v̂-edge maps to the same s-edge regardless of vLen.  No gap
+opens as the patch's position — and therefore uLen — changes.
+
+THE TRADE-OFF — WHAT YOU GIVE UP
+================================
+Because the shape's world extents scale with (uLen, vLen)
+SEPARATELY, the shape is NOT a world square unless the patch happens
+to have uLen = vLen.  In the cone view (a uniform screen scale) the
+shape is drawn as a rectangle of aspect uLen : vLen.
+
+You cannot have all three of: a world square, a normalized square,
+and contiguity as the patch moves.  This module chooses the
+normalized square: contiguity holds, rotation is clean (a square in
+û/v̂ is invariant under 90° rotation, so the SET of corners is the
+same at 0° and 90°), and the flat view shows a shape whose size
+relative to the patch is constant.
+
+SHAPE DEPTH
+===========
+The "Shape depth" slider still exists and still multiplies the
+shape's drawn HEIGHT via effectiveConeDepth().  Its reference unit
+is 1.00, so at the default the two bands agree exactly.  Any other
+value deliberately breaks that agreement.
 
 THE PERSPECTIVE — SHAPE-RELATIVE TAPER
 ======================================
@@ -33,14 +86,11 @@ horizon factor
     persp(v̂) = (v̂_A − v̂) / v̂_A
 
 The FULLY PER-VERTEX model evaluates each corner's factor at that
-corner's own v̂.  That is physically correct, and it produced the taper
-a rectangle on a tilted plane would have — but it also meant that
-rotating the shape in place changed the four factors, because
-rotation moves corners to different world v̂.  A square rotated 90°
-rendered as a different quadrilateral, not as a rotated square.
+corner's own v̂.  That is physically correct, but it also meant that
+rotating the shape in place changed the four factors.
 
-This module keeps the taper but makes it SHAPE-RELATIVE.  For a
-shape whose centre is at local v_C and whose centre's factor is
+This module keeps the taper but makes it SHAPE-RELATIVE.  For a shape
+whose centre is at local v_C and whose centre's factor is
 
     p_C = persp(v̂_C)
 
@@ -49,62 +99,67 @@ a corner at local v = v_C + dv gets the factor
     p(dv) = p_C − dv / vMax
 
 with vMax = v̂_A · vLen.  This is the first-order Taylor expansion of
-the true horizon factor around the shape's own centre, evaluated in
-the shape's OWN local V — not in world v̂.  Consequences:
+the true horizon factor around the shape's own centre.  Because the
+horizon factor is linear in v̂, the expansion is exact.
 
-    • A shape still tapers: corners with positive dv (nearer the
-      apex, in the shape's own frame) get a slightly smaller p,
-      corners with negative dv slightly larger.  On a tilted plane
-      this is what makes a rectangle look like it lies on the
-      surface.
+THE HORIZON CLIPS, IT DOES NOT PUSH
+===================================
+A corner at local v greater than vMaxLocal = h.vHat · vLen has a
+negative shape-relative factor; its projection crosses through the
+apex and the polygon folds.  Rather than clamping the shape's centre
+to keep every corner inside the band, the shape is allowed to travel
+through the horizon and the polygon is CLIPPED to v ≤ vMaxLocal in
+the shape's OWN local (u, v) coordinates.
 
-    • The taper is anchored to the shape and its own axes.
-      Rotating the shape rotates the taper with it, so its screen
-      footprint is a rigid rotation of its unrotated footprint, up
-      to the second-order terms the linearization drops.
+_clipPolygonToVMax performs the Sutherland-Hodgman pass.  Its output
+may have 0, 3, 4, or 5 vertices depending on how the shape straddles
+the line.  Every consumer — the renderer, the hit test, the centre
+computation — iterates the clipped vertex list rather than assuming
+four corners.
 
-    • For a true square (w == h), the linearization is exact under
-      rotation: the corner dv's are ±h/2 in the shape's own frame
-      and they stay ±h/2 for every θ.
+INVERSION — SOLVERS, PRESERVED SIDE BY SIDE
+===========================================
 
-    • Two shapes at different v̂ still get different p_C, so the
-      plane's perspective gradient across the patch is preserved — a
-      shape nearer the base is drawn larger.
+    cursorToLocalShapeRelativeExactWith  (quadratic, shape-relative,
+                                          explicit parameters)
+    cursorToLocalShapeRelativeExact      (quadratic, shape-relative,
+                                          parameters read from the
+                                          shape)
+    cursorToLocalFullPersp               (quadratic, per-vertex)
+    cursorToLocalWithPersp               (iterative, shape-relative)
 
-The projection is, for a point at local (u, v):
-
-    screen = apex_screen + p(dv) · (w2s(world) − apex_screen)
-
-INVERTING THE PROJECTION
+SHAPE POSITION BOUND (u)
 ========================
-The map is nonlinear in (u, v) because p depends on v, but linear in
-the shape's own frame once p is fixed.  The inverse used by the drag
-handlers iterates:
+setClonePosition clamps the shape's stored u to ±U_LIMIT.  The clamp
+exists because the inverse solvers can return an arbitrarily large
+|u| when the cursor sits near the horizon or when the root picker
+lands on the far branch.
 
-    1.  start with v_guess = v_C (the shape's own centre's v);
-    2.  p = p_C − (v_guess − v_C)/vMax;
-    3.  unproject the cursor's screen point linearly with that p:
-            unS = apex_screen + (screen − apex_screen) / p
-    4.  v_new = screenToFrame(f, unS).v;
-    5.  if |v_new − v_guess| is small, stop; otherwise v_guess = v_new
-        and repeat from (2).
+PHI WRAP AND THE FLAT VIEW
+==========================
+The flat-view coordinates are (phi, s), and phi is a circle.  A patch
+that drifts past the seam draws its wrapped copies via _phiCopies,
+and the shapes on it have to be drawn and hit-tested at every copy
+too, including the rotate handle.
 
-Convergence is fast: the linearization error is second-order in
-dv/vMax, and dv is at most the shape's half-extent, so three or four
-iterations put the residual under a pixel at any reasonable shape
-size.
-
-The full per-vertex quadratic solver used by earlier revisions is
-kept as `cursorToLocalFullPersp` below.  It is not on the drag path,
-but it is preserved because it implements a different and
-independently useful inversion.
-
-PHI WRAP
+ROTATION
 ========
-The flat-view editing functions read the cursor's phi, which is
-unclamped in the flat view's coordinate system.  flatCursorToShapeLocal
-projects the cursor's phi into the patch's reference frame via
-_phiShiftForPatch (defined in pg_view_flat.py).
+Rotation is a plain rotation in the shape's own (û, v̂) plane:
+
+    û' = û·cosθ − v̂·sinθ
+    v̂' = û·sinθ + v̂·cosθ
+
+Since the shape is a square in (û, v̂) (at scaleU = scaleV = 1), a
+90° rotation returns the same SET of corners; and because the map
+(û, v̂) → local is a diagonal scaling by (uLen, vLen), which
+commutes with rotation, a 90° rotation in (û, v̂) is a 90° rotation
+in the world.  The corners in world are therefore the same SET at
+0° and 90° — the property you asked for — even though the world
+shape is a rectangle when uLen ≠ vLen.
+
+LABELS
+======
+Every patch and every shape carries a user-editable name.
 """
 
 
@@ -117,18 +172,95 @@ const floatSquares = [];
 let nextSquareId = 1;
 let selectedSquare = -1;
 
-const SHAPE_DEFAULT_SCALE = 0.75;
+/* ==========================================================================
+   SHAPE DIMENSIONS
+   ==========================================================================
+   A shape's unscaled half-extents live in the patch's NORMALIZED
+   coordinates (û, v̂):
+
+       half-width  in û = SHAPE_REL_SIZE / 2
+       half-height in v̂ = SHAPE_REL_SIZE / 2
+
+   At scaleU = scaleV = 1, depthScale = 1 the shape is a square in
+   (û, v̂) — the same normalized space the flat view lays out as its
+   own rectangle.  The shape's LOCAL (u, v) extents are that square
+   times (uLen, vLen), so its size relative to the patch is CONSTANT
+   in both directions and its corners scale linearly with uLen along
+   u and vLen along v.  See the module docstring, "SHAPE DIMENSIONS
+   — NORMALIZED SPACE" and "CONTIGUITY". */
+
+const SHAPE_REL_SIZE = 0.50;
+
+/* Per-shape multipliers on the two axes.  Set to 1.0 for a square in
+   (û, v̂); corner-drag resizes move them.  When they differ the
+   shape is a rectangle in (û, v̂) as well. */
+const SHAPE_DEFAULT_SCALE = 1.0;
 const SHAPE_MIN_SCALE     = 0.03;
 const SHAPE_MAX_SCALE     = 3.00;
 
-/* One depth multiplier, both views.  Default 1.0 makes a shape with
-   scaleU == scaleV a true square in (u, v). */
-let SHAPE_DEPTH = 1.00;
+/* ==========================================================================
+   SHAPE DEPTH — ONE PER VIEW
+   ==========================================================================
+   Two independent depth multipliers, one per view.  The panel's
+   "Shape depth" slider drives SHAPE_DEPTH_CONE only; the flat view
+   reads SHAPE_DEPTH_FLAT, a fixed constant.
+
+   The unit is 1.00: at the default slider position the two bands
+   agree exactly and edge-to-edge contiguity holds across bands.
+   Any other slider value deliberately opens a gap between the
+   bands' drawn heights. */
+
+const SHAPE_DEPTH_CONE_UNIT = 1.00;
+let   SHAPE_DEPTH_CONE      = 1.00;
+const SHAPE_DEPTH_FLAT      = 1.00;
+
+function effectiveConeDepth() {
+  return SHAPE_DEPTH_CONE * SHAPE_DEPTH_CONE_UNIT;
+}
 
 const WEDGE_BASE_REACH = 2.50;
 
+/* ROTATE_HANDLE_OFFSET is in NORMALIZED v̂ units — the handle sits
+   this far past the shape's +v̂ edge, as a fraction of vLen. */
 const ROTATE_HANDLE_OFFSET = 0.25;
 const ROTATE_HANDLE_R      = 10;
+
+const ROTATE_JUMP_STEP = Math.PI / 12;
+
+const U_LIMIT = 3.0;
+
+/* ==========================================================================
+   PATCH HUE PALETTE
+   ========================================================================== */
+
+const PATCH_HUES = [
+  { r: 255, g: 200, b:  90 },   // amber
+  { r: 120, g: 220, b: 255 },   // cyan
+  { r: 255, g: 130, b: 210 },   // magenta
+  { r: 140, g: 225, b: 160 },   // green
+  { r: 180, g: 155, b: 255 },   // violet
+  { r: 255, g: 165, b: 105 },   // orange
+  { r: 110, g: 220, b: 210 },   // teal
+  { r: 220, g: 230, b: 120 },   // lime
+];
+
+function patchHue(q) {
+  if (!q) return PATCH_HUES[0];
+  const n = PATCH_HUES.length;
+  const idx = ((q.id - 1) % n + n) % n;
+  return PATCH_HUES[idx];
+}
+
+function _huergb(h, a) {
+  return "rgba(" + h.r + ", " + h.g + ", " + h.b + ", " + a + ")";
+}
+
+function _huergbLight(h) {
+  const r = Math.round(h.r * 0.7 + 255 * 0.3);
+  const g = Math.round(h.g * 0.7 + 255 * 0.3);
+  const b = Math.round(h.b * 0.7 + 255 * 0.3);
+  return "rgb(" + r + ", " + g + ", " + b + ")";
+}
 
 /* ==========================================================================
    PATCH FRAME
@@ -230,10 +362,7 @@ function perspAt(qi, vHat) {
 
 /* ==========================================================================
    SHAPE PERSPECTIVE PARAMETERS
-   ==========================================================================
-   pC   the horizon factor at the shape's own centre
-   vMax v̂_A · vLen — the scaling constant that converts a local dv
-        into a change in perspective factor */
+   ========================================================================== */
 
 function shapePerspCentre(sq) {
   const qi = quadIdxById(sq.quadId);
@@ -252,6 +381,28 @@ function shapeVMax(sq) {
 }
 
 /* ==========================================================================
+   HORIZON CLIP
+   ==========================================================================
+   Sutherland-Hodgman against the half-plane v ≤ vMaxLocal. */
+
+function _clipPolygonToVMax(corners, vMaxLocal) {
+  const out = [];
+  const n = corners.length;
+  for (let i = 0; i < n; i++) {
+    const A = corners[i];
+    const B = corners[(i + 1) % n];
+    const aIn = A[1] <= vMaxLocal;
+    const bIn = B[1] <= vMaxLocal;
+    if (aIn) out.push(A);
+    if (aIn !== bIn) {
+      const t = (vMaxLocal - A[1]) / (B[1] - A[1]);
+      out.push([A[0] + (B[0] - A[0]) * t, vMaxLocal]);
+    }
+  }
+  return out;
+}
+
+/* ==========================================================================
    CLAMP — v only
    ========================================================================== */
 
@@ -259,17 +410,50 @@ function clampCloneV(qi, vHat) {
   const h = horizonLocal(qi);
   if (!h) return vHat;
   const vMin = -WEDGE_BASE_REACH;
-  const vMax = h.vHat;
+  const vMax = h.vHat + WEDGE_BASE_REACH;
   if (vMax <= vMin) return vMin;
   return Math.max(vMin, Math.min(vMax, vHat));
 }
+
+/* ==========================================================================
+   SHAPE V-EXTENT (preserved, not on the render path)
+   ==========================================================================
+   Reports the shape's half-extent along v̂, in NORMALIZED v̂ units,
+   accounting for the rotation. */
+
+function _vExtentNormFromDims(f, dims, theta) {
+  /* dims.w and dims.h are WORLD lengths.  Convert to normalized. */
+  const hwHat = (dims.w / 2) / f.uLen;
+  const hhHat = (dims.h / 2) / f.vLen;
+  const cosT = Math.abs(Math.cos(theta || 0));
+  const sinT = Math.abs(Math.sin(theta || 0));
+  return hwHat * sinT + hhHat * cosT;
+}
+
+function shapeVExtentNorm(sq) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return 0;
+  const f = patchFrame(qi);
+  if (!f) return 0;
+  const dims = squareDims(sq);
+  return _vExtentNormFromDims(f, dims, sq.theta || 0);
+}
+
+/* ==========================================================================
+   SHAPE POSITION
+   ========================================================================== */
 
 function setClonePosition(sq, uLocal, vLocal) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const f = patchFrame(qi);
   if (!f) return;
-  sq.u = uLocal / f.uLen;
+
+  let uHat = uLocal / f.uLen;
+  if (uHat >  U_LIMIT) uHat =  U_LIMIT;
+  if (uHat < -U_LIMIT) uHat = -U_LIMIT;
+
+  sq.u = uHat;
   sq.v = clampCloneV(qi, vLocal / f.vLen);
 }
 
@@ -282,10 +466,14 @@ function addSquareAt(quadIdx, uLocal, vLocal) {
   const q = quads[quadIdx];
   const f = patchFrame(quadIdx);
   if (!f) return;
+
   const uHat = uLocal / f.uLen;
   const vHat = clampCloneV(quadIdx, vLocal / f.vLen);
+
+  const id = nextSquareId++;
   floatSquares.push({
-    id: nextSquareId++,
+    id: id,
+    name: "S" + id,
     quadId: q.id,
     u: uHat, v: vHat,
     scaleU: SHAPE_DEFAULT_SCALE,
@@ -327,15 +515,39 @@ function clampShapeScales(sq) {
 
 /* ==========================================================================
    GEOMETRY
-   ========================================================================== */
+   ==========================================================================
+   The shape's dimensions in the patch's world-local (u, v) units.
+   The unscaled side is a fraction of each axis's own extent:
+
+       w = SHAPE_REL_SIZE · uLen · scaleU
+       h = SHAPE_REL_SIZE · vLen · scaleV · depthScale
+
+   so the shape occupies the same FRACTION of the patch in both
+   directions.  w and h are therefore the same only when uLen = vLen.
+
+   squareDims / squareCornersLocal / squareRotateHandleLocal are the
+   FLAT-view variants (SHAPE_DEPTH_FLAT); the ...Cone siblings are
+   the CONE-view variants (effectiveConeDepth()). */
 
 function squareDims(sq) {
+  return squareDimsWith(sq, SHAPE_DEPTH_FLAT);
+}
+
+function squareDimsCone(sq) {
+  return squareDimsWith(sq, effectiveConeDepth());
+}
+
+function squareDimsWith(sq, depthScale) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return { w: 0, h: 0 };
+  const q = quads[qi];
+  if (!q) return { w: 0, h: 0 };
   const f = patchFrame(qi);
   if (!f) return { w: 0, h: 0 };
-  return { w: sq.scaleU * f.uLen,
-           h: sq.scaleV * f.uLen * SHAPE_DEPTH };
+  return {
+    w: SHAPE_REL_SIZE * f.uLen * sq.scaleU,
+    h: SHAPE_REL_SIZE * f.vLen * sq.scaleV * depthScale,
+  };
 }
 
 function squareCenterLocal(sq) {
@@ -346,34 +558,45 @@ function squareCenterLocal(sq) {
   return [sq.u * f.uLen, sq.v * f.vLen];
 }
 
-/* Rotated corners, in world-local (u, v). */
+/* The shape's four corners in the patch's local (u, v) frame.
+
+   Rotation happens in NORMALIZED (û, v̂) space; the shape's own
+   local half-extents are (±SHAPE_REL_SIZE·scaleU/2,
+   ±SHAPE_REL_SIZE·scaleV·depthScale/2) in û / v̂.  The corners are
+   rotated there, then mapped to local via (·uLen, ·vLen).  Because
+   that final map is a diagonal scaling, it commutes with rotation,
+   so the shape's world corners at θ = 0 and θ = 90° form the same
+   set (a square in û/v̂ is 90°-invariant). */
+
 function squareCornersLocal(sq) {
+  return squareCornersLocalWith(sq, SHAPE_DEPTH_FLAT);
+}
+
+function squareCornersLocalCone(sq) {
+  return squareCornersLocalWith(sq, effectiveConeDepth());
+}
+
+function squareCornersLocalWith(sq, depthScale) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const f = patchFrame(qi);
   if (!f) return null;
-
-  const uC = sq.u * f.uLen;
-  const vC = sq.v * f.vLen;
-  const dims = squareDims(sq);
-  const hw = dims.w / 2;
-  const hh = dims.h / 2;
-
+  const dims = squareDimsWith(sq, depthScale);
+  const hwHat = (dims.w / 2) / f.uLen;
+  const hhHat = (dims.h / 2) / f.vLen;
   const cosT = Math.cos(sq.theta || 0);
   const sinT = Math.sin(sq.theta || 0);
 
   const raw = [
-    [-hw, +hh], [+hw, +hh], [+hw, -hh], [-hw, -hh],
+    [-hwHat, +hhHat], [+hwHat, +hhHat], [+hwHat, -hhHat], [-hwHat, -hhHat],
   ];
-  return raw.map(([dx, dy]) => {
-    const rx = dx * cosT - dy * sinT;
-    const ry = dx * sinT + dy * cosT;
-    return [uC + rx, vC + ry];
+  return raw.map(([du, dv]) => {
+    const duR = du * cosT - dv * sinT;
+    const dvR = du * sinT + dv * cosT;
+    return [(sq.u + duR) * f.uLen, (sq.v + dvR) * f.vLen];
   });
 }
 
-/* Unrotated corners, in world-local (u, v).  Kept for reference and
-   for callers that want the shape's base configuration. */
 function squareCornersLocalUnrotated(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
@@ -391,17 +614,31 @@ function squareCornersLocalUnrotated(sq) {
 }
 
 function squareRotateHandleLocal(sq) {
+  return squareRotateHandleLocalWith(sq, SHAPE_DEPTH_FLAT);
+}
+
+function squareRotateHandleLocalCone(sq) {
+  return squareRotateHandleLocalWith(sq, effectiveConeDepth());
+}
+
+/* The rotate handle sits on the shape's +v̂ axis, at a NORMALIZED v̂
+   distance (shape half-height in v̂) + ROTATE_HANDLE_OFFSET from the
+   centre.  Rotation is in (û, v̂). */
+
+function squareRotateHandleLocalWith(sq, depthScale) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const f = patchFrame(qi);
   if (!f) return null;
-  const uC = sq.u * f.uLen;
-  const vC = sq.v * f.vLen;
-  const dims = squareDims(sq);
-  const k = dims.h / 2 + ROTATE_HANDLE_OFFSET * f.uLen;
+  const dims = squareDimsWith(sq, depthScale);
+  const hhHat = (dims.h / 2) / f.vLen;
+  const kHat = hhHat + ROTATE_HANDLE_OFFSET;
   const cosT = Math.cos(sq.theta || 0);
   const sinT = Math.sin(sq.theta || 0);
-  return [uC + (-k * sinT), vC + (+k * cosT)];
+
+  const duR = -kHat * sinT;
+  const dvR =  kHat * cosT;
+  return [(sq.u + duR) * f.uLen, (sq.v + dvR) * f.vLen];
 }
 
 /* ==========================================================================
@@ -422,12 +659,19 @@ function squareCornersScreen(sq) {
   if (qi < 0) return null;
   const f = patchFrame(qi);
   if (!f) return null;
-  const local = squareCornersLocal(sq);
+  const local = squareCornersLocalCone(sq);
   if (!local) return null;
+
+  const h = horizonLocal(qi);
+  if (!h) return null;
+  const vMaxLocal = h.vHat * f.vLen;
+  const clipped = _clipPolygonToVMax(local, vMaxLocal);
+  if (clipped.length < 3) return null;
+
   const vC = sq.v * f.vLen;
   const pC = shapePerspCentre(sq);
   const vMax = shapeVMax(sq);
-  return local.map(([u, v]) =>
+  return clipped.map(([u, v]) =>
     projectShapePoint(f, qi, u, v, vC, pC, vMax));
 }
 
@@ -436,12 +680,23 @@ function squareRotateHandleScreen(sq) {
   if (qi < 0) return null;
   const f = patchFrame(qi);
   if (!f) return null;
-  const hl = squareRotateHandleLocal(sq);
+
+  if (!squareCornersScreen(sq)) return null;
+
+  const hl = squareRotateHandleLocalCone(sq);
   if (!hl) return null;
+
+  const h = horizonLocal(qi);
+  if (!h) return null;
+
+  const vMaxLocal = h.vHat * f.vLen;
+  const HANDLE_GAP = 0.02 * f.vLen;
+  const hv = Math.min(hl[1], vMaxLocal - HANDLE_GAP);
+
   const vC = sq.v * f.vLen;
   const pC = shapePerspCentre(sq);
   const vMax = shapeVMax(sq);
-  return projectShapePoint(f, qi, hl[0], hl[1], vC, pC, vMax);
+  return projectShapePoint(f, qi, hl[0], hv, vC, pC, vMax);
 }
 
 /* ==========================================================================
@@ -503,10 +758,10 @@ function drawFloatSquares() {
   }
 }
 
-function _drawRotateHandle(sx, sy) {
+function _drawRotateHandle(sx, sy, hue) {
   ctx.beginPath();
   ctx.arc(sx, sy, 6.0, 0, Math.PI * 2);
-  ctx.fillStyle = "#b8ecff";
+  ctx.fillStyle = _huergbLight(hue);
   ctx.fill();
   ctx.strokeStyle = "#0a0e14";
   ctx.lineWidth = 1.6;
@@ -521,38 +776,57 @@ function _drawRotateHandle(sx, sy) {
 function drawFloatSquare(sq, selected) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
+  const q = quads[qi];
+  const hue = patchHue(q);
+
   if (selected) {
     drawHorizon(qi);
     drawBaseReach(qi);
   }
   const pts = squareCornersScreen(sq);
-  if (!pts) return;
+  if (!pts || pts.length < 3) return;
+
   ctx.beginPath();
   ctx.moveTo(pts[0][0], pts[0][1]);
-  for (let i = 1; i < 4; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
   ctx.closePath();
-  ctx.fillStyle = selected
-    ? "rgba(120, 220, 255, 0.30)"
-    : "rgba(120, 220, 255, 0.12)";
+  ctx.fillStyle = _huergb(hue, selected ? 0.30 : 0.12);
   ctx.fill();
+
   ctx.lineJoin = "round";
-  ctx.strokeStyle = selected
-    ? "rgba(180, 240, 255, 1.00)"
-    : "rgba(140, 225, 255, 0.72)";
+  ctx.strokeStyle = _huergb(hue, selected ? 1.00 : 0.72);
   ctx.lineWidth = selected ? 2.0 : 1.3;
   ctx.stroke();
+
   if (!selected) return;
+
   for (const [sx, sy] of pts) {
     ctx.beginPath();
     ctx.arc(sx, sy, 4.5, 0, Math.PI * 2);
-    ctx.fillStyle = "#b8ecff";
+    ctx.fillStyle = _huergbLight(hue);
     ctx.fill();
     ctx.strokeStyle = "#0a0e14";
     ctx.lineWidth = 1.5;
     ctx.stroke();
   }
+
   const rh = squareRotateHandleScreen(sq);
-  if (rh) _drawRotateHandle(rh[0], rh[1]);
+  if (rh) {
+    let topIdx = 0;
+    for (let k = 1; k < pts.length; k++) {
+      if (pts[k][1] < pts[topIdx][1]) topIdx = k;
+    }
+    ctx.beginPath();
+    ctx.moveTo(pts[topIdx][0], pts[topIdx][1]);
+    ctx.lineTo(rh[0], rh[1]);
+    ctx.strokeStyle = _huergb(hue, 0.45);
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    _drawRotateHandle(rh[0], rh[1], hue);
+  }
 }
 
 /* ==========================================================================
@@ -564,7 +838,8 @@ const SQUARE_BODY_MIN_R = 8;
 
 function _ptInQuadPx(px, py, poly) {
   let inside = false;
-  for (let i = 0, j = 3; i < 4; j = i++) {
+  const n = poly.length;
+  for (let i = 0, j = n - 1; i < n; j = i++) {
     const xi = poly[i][0], yi = poly[i][1];
     const xj = poly[j][0], yj = poly[j][1];
     if (((yi > py) !== (yj > py)) &&
@@ -586,19 +861,24 @@ function squareHitTest(sx, sy) {
   for (const si of order) {
     const sq = floatSquares[si];
     const pts = squareCornersScreen(sq);
-    if (!pts) continue;
+    if (!pts || pts.length < 3) continue;
+
     const rh = squareRotateHandleScreen(sq);
     if (rh && Math.hypot(sx - rh[0], sy - rh[1]) < ROTATE_HANDLE_R) {
       return { kind: "rotate", squareIdx: si };
     }
-    for (let ci = 0; ci < 4; ci++) {
+
+    for (let ci = 0; ci < pts.length; ci++) {
       if (Math.hypot(sx - pts[ci][0], sy - pts[ci][1]) < SQUARE_HANDLE_R) {
         return { kind: "corner", squareIdx: si, cornerIdx: ci };
       }
     }
+
     if (_ptInQuadPx(sx, sy, pts)) return { kind: "body", squareIdx: si };
-    const mx = (pts[0][0] + pts[1][0] + pts[2][0] + pts[3][0]) / 4;
-    const my = (pts[0][1] + pts[1][1] + pts[2][1] + pts[3][1]) / 4;
+
+    let mx = 0, my = 0;
+    for (const [x, y] of pts) { mx += x; my += y; }
+    mx /= pts.length; my /= pts.length;
     if (Math.hypot(sx - mx, sy - my) < SQUARE_BODY_MIN_R) {
       return { kind: "body", squareIdx: si };
     }
@@ -619,42 +899,103 @@ function findPatchAtScreen(sx, sy) {
 }
 
 /* ==========================================================================
-   INVERSE — iterative, shape-relative
+   INVERSE #1 — shape-relative taper, EXACT (quadratic)
    ========================================================================== */
 
-function cursorToLocalWithPersp(f, qi, sq, sx, sy) {
-  const pC = shapePerspCentre(sq);
+function cursorToLocalShapeRelativeExactWith(f, qi, vC, pC, vMax,
+                                             sx, sy) {
+  if (vMax < 1e-6) return screenToFrame(f, sx, sy);
+
+  const A0 = pC + vC / vMax;
+  const B0 = 1 / vMax;
+
+  const [ax, ay] = w2s(cone.ax, cone.ay);
+  const Sx = sx - ax;
+  const Sy = sy - ay;
+
+  const sc = view.scale;
+  const sx0 = sc * f.Cx + view.tx;
+  const sxu = sc * f.Ux;
+  const sxv = sc * f.Vx;
+  const sy0 = -sc * f.Cy + view.ty;
+  const syu = -sc * f.Uy;
+  const syv = -sc * f.Vy;
+
+  const Dx0 = sx0 - ax;
+  const Dxu = sxu;
+  const Dxv = sxv;
+  const Dy0 = sy0 - ay;
+  const Dyu = syu;
+  const Dyv = syv;
+
+  const K  = Dyu * Sx - Dxu * Sy;
+  const M0 = Dyu * Dx0 - Dxu * Dy0;
+  const Mv = Dyu * Dxv - Dxu * Dyv;
+
+  const aQuad = B0 * Mv;
+  const bQuad = B0 * M0 - A0 * Mv;
+  const cQuad = K - A0 * M0;
+
+  let v = null;
+
+  if (Math.abs(aQuad) < 1e-12) {
+    if (Math.abs(bQuad) > 1e-12) v = -cQuad / bQuad;
+  } else {
+    const disc = bQuad * bQuad - 4 * aQuad * cQuad;
+    if (disc >= 0) {
+      const sq2 = Math.sqrt(disc);
+      const r1 = (-bQuad - sq2) / (2 * aQuad);
+      const r2 = (-bQuad + sq2) / (2 * aQuad);
+
+      const valid = (r) => {
+        if (!isFinite(r)) return false;
+        if (r > vMax - 1e-3) return false;
+        if (r < -50 * f.vLen) return false;
+        const q = A0 - B0 * r;
+        if (q <= 1e-6) return false;
+        return true;
+      };
+
+      const r1ok = valid(r1);
+      const r2ok = valid(r2);
+      if (r1ok && r2ok) {
+        v = Math.abs(r1 - vC) < Math.abs(r2 - vC) ? r1 : r2;
+      } else if (r1ok) {
+        v = r1;
+      } else if (r2ok) {
+        v = r2;
+      }
+    }
+  }
+
+  if (v === null || !isFinite(v)) return screenToFrame(f, sx, sy);
+
+  const q = A0 - B0 * v;
+  if (Math.abs(q) < 1e-9) return { u: 0, v };
+
+  let u;
+  if (Math.abs(Dxu) >= Math.abs(Dyu)) {
+    if (Math.abs(Dxu) < 1e-9) return { u: 0, v };
+    u = (Sx / q - Dx0 - Dxv * v) / Dxu;
+  } else {
+    if (Math.abs(Dyu) < 1e-9) return { u: 0, v };
+    u = (Sy / q - Dy0 - Dyv * v) / Dyu;
+  }
+  return { u, v };
+}
+
+function cursorToLocalShapeRelativeExact(f, qi, sq, sx, sy) {
+  const h = horizonLocal(qi);
+  if (!h) return screenToFrame(f, sx, sy);
   const vMax = shapeVMax(sq);
   const vC = sq.v * f.vLen;
-  const [ax, ay] = w2s(cone.ax, cone.ay);
-
-  let uCur = sq.u * f.uLen;
-  let vCur = vC;
-
-  for (let iter = 0; iter < 10; iter++) {
-    const dv = vCur - vC;
-    const p = pC - dv / vMax;
-    const pAbs = Math.max(Math.abs(p), 1e-9);
-    const invP = (p >= 0 ? 1 : -1) / pAbs;
-    const unSx = ax + (sx - ax) * invP;
-    const unSy = ay + (sy - ay) * invP;
-    const lc = screenToFrame(f, unSx, unSy);
-    const du = Math.abs(lc.u - uCur);
-    const dvv = Math.abs(lc.v - vCur);
-    uCur = lc.u;
-    vCur = lc.v;
-    if (du < 1e-4 && dvv < 1e-4) break;
-  }
-  return { u: uCur, v: vCur };
+  const pC = shapePerspCentre(sq);
+  return cursorToLocalShapeRelativeExactWith(f, qi, vC, pC, vMax, sx, sy);
 }
 
 /* ==========================================================================
-   INVERSE — full per-vertex quadratic (preserved)
-   ==========================================================================
-   Inverts the PER-VERTEX projection, where each corner's factor is
-   evaluated at that corner's own world v̂.  Not on the drag path any
-   more; kept because it implements a different and independently
-   useful inversion. */
+   INVERSE #2 — full per-vertex quadratic (preserved)
+   ========================================================================== */
 
 function cursorToLocalFullPersp(f, qi, sx, sy) {
   const h = horizonLocal(qi);
@@ -717,46 +1058,134 @@ function cursorToLocalFullPersp(f, qi, sx, sy) {
 }
 
 /* ==========================================================================
+   INVERSE #3 — shape-relative, iterative (preserved)
+   ========================================================================== */
+
+function cursorToLocalWithPersp(f, qi, sq, sx, sy) {
+  const pC = shapePerspCentre(sq);
+  const vMax = shapeVMax(sq);
+  const vC = sq.v * f.vLen;
+  const [ax, ay] = w2s(cone.ax, cone.ay);
+
+  let uCur = sq.u * f.uLen;
+  let vCur = vC;
+
+  for (let iter = 0; iter < 10; iter++) {
+    const dv = vCur - vC;
+    const p = pC - dv / vMax;
+    const pAbs = Math.max(Math.abs(p), 1e-9);
+    const invP = (p >= 0 ? 1 : -1) / pAbs;
+    const unSx = ax + (sx - ax) * invP;
+    const unSy = ay + (sy - ay) * invP;
+    const lc = screenToFrame(f, unSx, unSy);
+    const du = Math.abs(lc.u - uCur);
+    const dvv = Math.abs(lc.v - vCur);
+    uCur = lc.u;
+    vCur = lc.v;
+    if (du < 1e-4 && dvv < 1e-4) break;
+  }
+  return { u: uCur, v: vCur };
+}
+
+/* ==========================================================================
    SHARED EDIT OPERATIONS
    ========================================================================== */
 
-function setShapeFromCornerLocal(sq, cornerIdx, cu, cv) {
+/* Corner resize.  The cursor's NORMALIZED offsets from the shape's
+   centre are rotated back through the inverse of a PLAIN rotation
+   (in (û, v̂)), giving the cursor's position in the shape's own
+   unrotated (û, v̂) frame.  The two distances then set the new
+   normalized half-extents, which are converted to scaleU / scaleV
+   via the SHAPE_REL_SIZE coefficients.
+
+   depthScale is the multiplier the height is drawn at:
+   effectiveConeDepth() from the cone band, SHAPE_DEPTH_FLAT from
+   the flat band.  It enters only through scaleV's normalizer, so
+   the corner follows the cursor in the band the drag came from. */
+
+function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return;
+  const q = quads[qi];
+  if (!q) return;
+  const f = patchFrame(qi);
+  if (!f) return;
+
+  /* Convert cursor from local to NORMALIZED. */
+  const uHatC = sq.u;
+  const vHatC = sq.v;
+  const ux = cu / f.uLen - uHatC;
+  const uy = cv / f.vLen - vHatC;
+  const cosT = Math.cos(sq.theta || 0);
+  const sinT = Math.sin(sq.theta || 0);
+
+  /* Inverse plain rotation, in (û, v̂). */
+  const uxU = ux * cosT + uy * sinT;
+  const uyU = uy * cosT - ux * sinT;
+
+  const signs = [[-1, +1], [+1, +1], [+1, -1], [-1, -1]][cornerIdx];
+  const sx = signs[0], sy = signs[1];
+
+  /* New normalized half-extents, in û and v̂. */
+  const wHatMin = SHAPE_MIN_SCALE * SHAPE_REL_SIZE;
+  const hHatMin = SHAPE_MIN_SCALE * SHAPE_REL_SIZE * depthScale;
+  const wHat = Math.max(2 * sx * uxU, wHatMin);
+  const hHat = Math.max(2 * sy * uyU, hHatMin);
+
+  /* Convert back to scaleU, scaleV.  wHat = SHAPE_REL_SIZE·scaleU,
+     hHat = SHAPE_REL_SIZE·scaleV·depthScale. */
+  sq.scaleU = wHat / SHAPE_REL_SIZE;
+  sq.scaleV = hHat / (SHAPE_REL_SIZE * depthScale);
+  clampShapeScales(sq);
+}
+
+/* Rotate-handle tracking.  The handle sits on the shape's +v̂ axis,
+   so the raw angle is  atan2(−û_off, v̂_off)  in the shape's own
+   NORMALIZED plane.  Plain, no metric. */
+
+function setShapeRotationFromCursorLocal(sq, cu, cv, snap, startTheta) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const f = patchFrame(qi);
   if (!f) return;
-  const c = squareCenterLocal(sq);
-  if (!c) return;
-  const [uC, vC] = c;
-  const ox = cu - uC;
-  const oy = cv - vC;
-  const cosT = Math.cos(sq.theta || 0);
-  const sinT = Math.sin(sq.theta || 0);
-  const ux = ox * cosT + oy * sinT;
-  const uy = -ox * sinT + oy * cosT;
-  const signs = [[-1, +1], [+1, +1], [+1, -1], [-1, -1]][cornerIdx];
-  const sx = signs[0], sy = signs[1];
-  const wMin = SHAPE_MIN_SCALE * f.uLen;
-  const hMin = SHAPE_MIN_SCALE * f.uLen * SHAPE_DEPTH;
-  const w = Math.max(2 * sx * ux, wMin);
-  const h = Math.max(2 * sy * uy, hMin);
-  sq.scaleU = w / f.uLen;
-  sq.scaleV = h / (f.uLen * SHAPE_DEPTH);
-  clampShapeScales(sq);
+  const ox = cu / f.uLen - sq.u;
+  const oy = cv / f.vLen - sq.v;
+  if (Math.abs(ox) < 1e-9 && Math.abs(oy) < 1e-9) return;
+
+  const thetaRaw = Math.atan2(-ox, oy);
+
+  if (snap && typeof startTheta === "number") {
+    let delta = thetaRaw - startTheta;
+    while (delta >  Math.PI) delta -= 2 * Math.PI;
+    while (delta < -Math.PI) delta += 2 * Math.PI;
+    sq.theta = startTheta +
+               Math.round(delta / ROTATE_JUMP_STEP) * ROTATE_JUMP_STEP;
+    return;
+  }
+
+  sq.theta = thetaRaw;
 }
 
-function setShapeRotationFromCursorLocal(sq, cu, cv, snap) {
-  const c = squareCenterLocal(sq);
-  if (!c) return;
-  const ox = cu - c[0];
-  const oy = cv - c[1];
-  if (Math.abs(ox) < 1e-6 && Math.abs(oy) < 1e-6) return;
-  let theta = Math.atan2(-ox, oy);
-  if (snap) {
-    const step = Math.PI / 12;
-    theta = Math.round(theta / step) * step;
+/* ==========================================================================
+   QUICK-ROTATE OPERATIONS
+   ========================================================================== */
+
+function alignShapeToAxis(sq) {
+  const step = Math.PI / 4;
+  const theta = sq.theta || 0;
+  sq.theta = Math.round(theta / step) * step;
+}
+
+function alignSelectedShapeToAxis() {
+  if (selectedSquare < 0 || selectedSquare >= floatSquares.length) {
+    if (typeof flashStatus === "function") {
+      flashStatus("No shape selected", "warn");
+    }
+    return false;
   }
-  sq.theta = theta;
+  alignShapeToAxis(floatSquares[selectedSquare]);
+  draw();
+  return true;
 }
 
 /* ==========================================================================
@@ -769,27 +1198,24 @@ function resizeSquareFromCorner(sq, cornerIdx, cursorWX, cursorWY) {
   const f = patchFrame(qi);
   if (!f) return;
   const [sx, sy] = w2s(cursorWX, cursorWY);
-  const lc = cursorToLocalWithPersp(f, qi, sq, sx, sy);
-  setShapeFromCornerLocal(sq, cornerIdx, lc.u, lc.v);
+  const lc = cursorToLocalShapeRelativeExact(f, qi, sq, sx, sy);
+  setShapeFromCornerLocal(sq, cornerIdx, lc.u, lc.v,
+                          effectiveConeDepth());
 }
 
-function rotateSquareToCursor(sq, cursorWX, cursorWY, snap) {
+function rotateSquareToCursor(sq, cursorWX, cursorWY, snap, startTheta) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const f = patchFrame(qi);
   if (!f) return;
   const [sx, sy] = w2s(cursorWX, cursorWY);
-  const lc = cursorToLocalWithPersp(f, qi, sq, sx, sy);
-  setShapeRotationFromCursorLocal(sq, lc.u, lc.v, snap);
+  const lc = cursorToLocalShapeRelativeExact(f, qi, sq, sx, sy);
+  setShapeRotationFromCursorLocal(sq, lc.u, lc.v, snap, startTheta);
 }
 
 /* ==========================================================================
    FLAT-VIEW PROJECTION
-   ==========================================================================
-   Same squareCornersLocal array, mapped through the linear
-   (u, v) → (phi, s) correspondence.  The flat band has no
-   perspective; the mapping is the same linear map the patch
-   rectangle uses. */
+   ========================================================================== */
 
 function squareFlatCorners(sq) {
   const qi = quadIdxById(sq.quadId);
@@ -815,7 +1241,7 @@ function squareFlatCornersScreen(sq, shift) {
   return corners.map(([phi, s]) => flatToScreen(phi + shift, s));
 }
 
-function squareFlatRotateHandleScreen(sq) {
+function squareFlatRotateHandleScreen(sq, shift) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const q = quads[qi];
@@ -823,12 +1249,18 @@ function squareFlatRotateHandleScreen(sq) {
   if (!f) return null;
   const hl = squareRotateHandleLocal(sq);
   if (!hl) return null;
+
   const phiC = (q.phi0 + q.phi1) / 2;
   const sC   = (q.s0   + q.s1)   / 2;
   const dPhi = q.phi1 - q.phi0;
   const dS   = q.s1   - q.s0;
-  const phi = phiC + (hl[0] / f.uLen) * dPhi;
-  const s   = sC   + (hl[1] / f.vLen) * dS;
+  const phi  = phiC + (hl[0] / f.uLen) * dPhi + (shift || 0);
+
+  let s = sC + (hl[1] / f.vLen) * dS;
+
+  const S_MAX = 1 - 0.02;
+  if (s > S_MAX) s = S_MAX;
+
   return flatToScreen(phi, s);
 }
 
@@ -857,13 +1289,13 @@ function flatCursorToShapeLocal(sq, sx, sy) {
 function flatResizeSquareFromCornerIdx(sq, sx, sy, cornerIdx) {
   const lc = flatCursorToShapeLocal(sq, sx, sy);
   if (!lc) return;
-  setShapeFromCornerLocal(sq, cornerIdx, lc.u, lc.v);
+  setShapeFromCornerLocal(sq, cornerIdx, lc.u, lc.v, SHAPE_DEPTH_FLAT);
 }
 
-function flatRotateSquareToCursor(sq, sx, sy, snap) {
+function flatRotateSquareToCursor(sq, sx, sy, snap, startTheta) {
   const lc = flatCursorToShapeLocal(sq, sx, sy);
   if (!lc) return;
-  setShapeRotationFromCursorLocal(sq, lc.u, lc.v, snap);
+  setShapeRotationFromCursorLocal(sq, lc.u, lc.v, snap, startTheta);
 }
 
 function flatMoveSquareBody(sq, sx, sy) {
@@ -884,28 +1316,165 @@ function squareFlatHitTest(sx, sy) {
   for (let i = floatSquares.length - 1; i >= 0; i--) {
     const sq = floatSquares[i];
     if (sq.quadId !== activeQ.id) continue;
-    const rh = squareFlatRotateHandleScreen(sq);
-    if (rh && Math.hypot(sx - rh[0], sy - rh[1]) < ROTATE_HANDLE_R) {
-      return { kind: "rotate", squareIdx: i };
-    }
+
     const corners = squareFlatCorners(sq);
     if (!corners) continue;
     const phis = corners.map(c => c[0]);
     const shifts = _phiCopies(Math.min(...phis), Math.max(...phis));
+
+    for (const shift of shifts) {
+      const rh = squareFlatRotateHandleScreen(sq, shift);
+      if (rh && Math.hypot(sx - rh[0], sy - rh[1]) < ROTATE_HANDLE_R) {
+        return { kind: "rotate", squareIdx: i };
+      }
+    }
+
     for (const shift of shifts) {
       const screen = corners.map(([phi, s]) =>
         flatToScreen(phi + shift, s));
+
       for (let ci = 0; ci < 4; ci++) {
         if (Math.hypot(sx - screen[ci][0], sy - screen[ci][1])
             < FLAT_HANDLE_R) {
           return { kind: "corner", squareIdx: i, cornerIdx: ci };
         }
       }
+
       if (_ptInQuadPx(sx, sy, screen)) {
         return { kind: "body", squareIdx: i };
       }
     }
   }
   return null;
+}
+
+/* ==========================================================================
+   DISPLAY NAMES
+   ========================================================================== */
+
+function squareDisplayName(sq) {
+  return (sq && sq.name) ? sq.name : ("S" + (sq ? sq.id : "?"));
+}
+
+/* ==========================================================================
+   LABEL RENDERING
+   ========================================================================== */
+
+function _drawShapeLabel(sx, sy, text, color) {
+  if (!text) return;
+  ctx.save();
+  ctx.font = "700 10px 'JetBrains Mono', 'Fira Code', monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  const w = ctx.measureText(text).width;
+  const padX = 6;
+  const h = 14;
+
+  ctx.fillStyle = "rgba(10, 14, 20, 0.86)";
+  ctx.fillRect(sx - w / 2 - padX, sy - h / 2, w + 2 * padX, h);
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 0.8;
+  ctx.strokeRect(sx - w / 2 - padX + 0.4, sy - h / 2 + 0.4,
+                 w + 2 * padX - 0.8, h - 0.8);
+
+  ctx.fillStyle = color;
+  ctx.fillText(text, sx, sy + 0.5);
+  ctx.restore();
+}
+
+function _patchCentreScreenCone(q) {
+  const pts = quadCorners(q).map(c => {
+    const [wx, wy] = surfacePoint(c.phi, c.s);
+    return w2s(wx, wy);
+  });
+  let cx = 0, cy = 0;
+  for (const [x, y] of pts) { cx += x; cy += y; }
+  return [cx / 4, cy / 4];
+}
+
+function _shapeCentreScreenCone(sq) {
+  const pts = squareCornersScreen(sq);
+  if (!pts || pts.length < 1) return null;
+  let cx = 0, cy = 0;
+  for (const [x, y] of pts) { cx += x; cy += y; }
+  return [cx / pts.length, cy / pts.length];
+}
+
+function _patchCentreScreenFlat(q, shift) {
+  const pts = quadCorners(q).map(c =>
+    flatToScreen(c.phi + shift, c.s));
+  let cx = 0, cy = 0;
+  for (const [x, y] of pts) { cx += x; cy += y; }
+  return [cx / 4, cy / 4];
+}
+
+function _shapeCentreScreenFlat(sq, shift) {
+  const corners = squareFlatCorners(sq);
+  if (!corners) return null;
+  const pts = corners.map(([phi, s]) => flatToScreen(phi + shift, s));
+  let cx = 0, cy = 0;
+  for (const [x, y] of pts) { cx += x; cy += y; }
+  return [cx / 4, cy / 4];
+}
+
+function drawShapeLabelsCone() {
+  for (let qi = 0; qi < quads.length; qi++) {
+    const q = quads[qi];
+    const hue = patchHue(q);
+    const [cx, cy] = _patchCentreScreenCone(q);
+    _drawShapeLabel(cx, cy, q.name, _huergb(hue, 0.92));
+  }
+
+  for (let i = 0; i < floatSquares.length; i++) {
+    const sq = floatSquares[i];
+    const qi = quadIdxById(sq.quadId);
+    const q = qi >= 0 ? quads[qi] : null;
+    const hue = patchHue(q);
+    const c = _shapeCentreScreenCone(sq);
+    if (!c) continue;
+    _drawShapeLabel(c[0], c[1], squareDisplayName(sq),
+                    _huergb(hue, 0.95));
+  }
+}
+
+function drawShapeLabelsFlat() {
+  for (let qi = 0; qi < quads.length; qi++) {
+    const q = quads[qi];
+    const hue = patchHue(q);
+    const shifts = _phiCopies(q.phi0, q.phi1);
+    for (const shift of shifts) {
+      const [cx, cy] = _patchCentreScreenFlat(q, shift);
+      if (_flatInsideRect(cx, cy)) {
+        _drawShapeLabel(cx, cy, q.name, _huergb(hue, 0.92));
+        break;
+      }
+    }
+  }
+
+  if (selectedQuad < 0 || selectedQuad >= quads.length) return;
+  const activeQ = quads[selectedQuad];
+  const activeHue = patchHue(activeQ);
+
+  for (let i = 0; i < floatSquares.length; i++) {
+    const sq = floatSquares[i];
+    if (sq.quadId !== activeQ.id) continue;
+
+    const corners = squareFlatCorners(sq);
+    if (!corners) continue;
+    const phis = corners.map(c => c[0]);
+    const shifts = _phiCopies(Math.min(...phis), Math.max(...phis));
+
+    for (const shift of shifts) {
+      const c = _shapeCentreScreenFlat(sq, shift);
+      if (!c) continue;
+      if (_flatInsideRect(c[0], c[1])) {
+        _drawShapeLabel(c[0], c[1], squareDisplayName(sq),
+                        _huergb(activeHue, 0.95));
+        break;
+      }
+    }
+  }
 }
 """

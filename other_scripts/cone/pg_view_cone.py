@@ -9,13 +9,26 @@ Layers, back to front:
     4.  dashed magenta axis line when the apex is off-centre
     5.  base direction tick on the outer ring
     6.  small ink dot at the base centre
-    7.  patch quads — the planes squares live on, drawn faintly
-    8.  floating squares — bound to each patch's plane
+    7.  patch quads — dashed outlines, faint fills, the planes the
+        shapes live on
+    8.  floating shapes — solid outlines, low-alpha fills
     9.  apex marker
    10.  corner caption
+   11.  patch and shape name labels — drawn last, on top of everything
 
-Patches are the tool, not the subject: they are drawn faintly, and
-their corner handles appear only when shape editing is enabled.
+PATCH VERSUS SHAPE
+==================
+Both a patch and a shape are quadrilaterals in the patch's own (u, v)
+frame, both are tinted by the patch's hue, and both carry a name
+label.  What distinguishes them is the STROKE:
+
+    patch   dashed outline, very faint fill
+    shape   solid outline, thicker when selected, corner handles and
+            a rotate handle when selected, filled at low alpha
+
+The dashed stroke is the drafting idiom for "this is the surface, not
+an object on it".  It reads as a reference line, a construction
+guide, or a ruling — which is exactly what a patch is now.
 """
 
 CONE_VIEW_JS = r"""
@@ -101,7 +114,7 @@ function drawConeView() {
     drawQuadPatch(quads[selectedQuad], true);
   }
 
-  /* floating squares on the patches' planes */
+  /* floating shapes on the patches' planes */
   drawFloatSquares();
 
   /* apex marker */
@@ -133,40 +146,52 @@ function drawConeView() {
     "   SQUARES " + floatSquares.length,
     14, 14);
   ctx.restore();
+
+  /* Labels last, so they sit above the patches and shapes. */
+  drawShapeLabelsCone();
 }
 
+/* The patch is the plane a shape sits on.  It gets a DASHED outline,
+   a very faint fill, and no corner or rotate handles.  Everything
+   the eye reads as "an object on the sheet" — solid stroke, handles,
+   a filled body — belongs to the shapes, not to the patches.
+
+   When shape-editing is enabled the patch corners carry small dots,
+   drawn in the patch hue; those dots are the only handle-like
+   feature a patch has, and they are dormant while the flag is off. */
 function drawQuadPatch(q, selected) {
+  const hue = patchHue(q);
   const pts = quadCorners(q).map(c => {
     const [wx, wy] = surfacePoint(c.phi, c.s);
     return w2s(wx, wy);
   });
 
+  ctx.save();
+
   ctx.beginPath();
   ctx.moveTo(pts[0][0], pts[0][1]);
   for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
   ctx.closePath();
-  ctx.fillStyle = selected
-    ? "rgba(255, 200, 90, 0.10)"
-    : "rgba(255, 200, 90, 0.04)";
+  ctx.fillStyle = _huergb(hue, selected ? 0.07 : 0.03);
   ctx.fill();
 
   ctx.lineJoin = "round";
-  ctx.strokeStyle = selected
-    ? "rgba(255, 220, 130, 0.60)"
-    : "rgba(255, 200, 90, 0.28)";
-  ctx.lineWidth = selected ? 1.5 : 1.0;
+  ctx.setLineDash([6, 4]);
+  ctx.strokeStyle = _huergb(hue, selected ? 0.75 : 0.42);
+  ctx.lineWidth = selected ? 1.6 : 1.1;
   ctx.stroke();
+  ctx.setLineDash([]);
 
-  /* Corner markers are the visual affordance for a corner drag.
-     They appear only when the drag path behind them is live. */
-  if (!PATCH_SHAPE_EDIT_ENABLED) return;
-
-  const rDot = selected ? 5.2 : 3.0;
-  for (const [sx, sy] of pts) {
-    ctx.beginPath(); ctx.arc(sx, sy, rDot, 0, Math.PI * 2);
-    ctx.fillStyle = selected ? "#ffe680" : "rgba(255, 210, 100, 0.80)";
-    ctx.fill();
-    ctx.strokeStyle = "#0a0e14"; ctx.lineWidth = 1.5; ctx.stroke();
+  if (PATCH_SHAPE_EDIT_ENABLED) {
+    const rDot = selected ? 5.0 : 2.8;
+    for (const [sx, sy] of pts) {
+      ctx.beginPath(); ctx.arc(sx, sy, rDot, 0, Math.PI * 2);
+      ctx.fillStyle = selected ? _huergbLight(hue) : _huergb(hue, 0.75);
+      ctx.fill();
+      ctx.strokeStyle = "#0a0e14"; ctx.lineWidth = 1.4; ctx.stroke();
+    }
   }
+
+  ctx.restore();
 }
 """

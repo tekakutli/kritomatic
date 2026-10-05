@@ -173,6 +173,9 @@ command_reference.md
 # Rust build artifacts
 other_scripts/room/leader_optimizer/target/
 
+
+other_scripts/cone/cone_playground.html
+
 # Other (second project)
 other_scripts/room/cable_playground.html
 other_scripts/room/boxes_playground.html

@@ -1,31 +1,35 @@
 """
 pg_export.py — JSON export of the current visual state.
 
-Dumps everything a person would need to compare the two views: the
-cone state, the single SHAPE_DEPTH multiplier, the transform, and for
-every patch and every shape the raw stored fields plus the fully-
-derived screen positions in BOTH views.
+For each shape, dumps the raw stored fields, the single array both
+views read (cornersLocal, rotated and depth-scaled in (u, v)), and
+the derived screen positions and side lengths in BOTH views.
 
-The design goal is diffability.  For each shape:
+Diagnostic use: if screenSideLengthsCone for a rotated shape is a
+permutation of the unrotated shape's screenSideLengthsCone, the two
+render as the same screen polygon turned by θ.
 
-    cornersLocal         world-local (u, v), rotated by θ, with the
-                         single SHAPE_DEPTH multiplier applied.  This
-                         is the ONE array both views read.
+Schema v4
+=========
+Removed `perspStrength` (the panel no longer exposes that toggle;
+the constant was removed from pg_view_squares.py).  Added per-shape
+`dimsSource` describing whether the shape's height is anchored to
+the patch's uLen or vLen (currently vLen — see the note in
+pg_view_squares.py), and `extentVNorm`, the shape's half-extent
+along the patch's V axis in normalized coordinates.  Both fields
+exist for diagnosing the horizon-clamp behaviour; nothing else reads
+them.
 
-    cornersWorld         cornersLocal mapped to world coordinates
-    cornersScreenCone    projected to screen with per-vertex
-                         perspective
-    cornersFlatParam     mapped to the flat view's (phi, s)
-    cornersScreenFlat    screen position in the flat band
-
-    screenSideLengthsCone  four side lengths, in screen pixels
-    screenSideLengthsFlat  four side lengths, in screen pixels
-
-If the four side lengths of a shape are all equal in a given view,
-that shape appears as a screen square in that view.  If they are not,
-they are what tell you by how much.
-
-The export is a data: URL the browser downloads.  No server involved.
+Schema v5
+=========
+The single `shapeDepth` field is replaced by `shapeDepthCone` and
+`shapeDepthFlat`.  The two views now scale the shape's height
+independently: the cone view through `SHAPE_DEPTH_CONE` (driven by
+the panel's "Shape depth" slider) and the flat view through the
+fixed `SHAPE_DEPTH_FLAT`.  Per-shape, `dims` reports the FLAT-view
+dimensions (the ones the flat renderer reads) and `dimsCone` reports
+the CONE-view dimensions, so the export describes what each band
+actually draws.
 """
 
 EXPORT_JS = r"""
@@ -57,7 +61,7 @@ function _worldSideLengths(pts) {
 
 function buildVisualStateExport() {
   const out = {
-    schemaVersion: 2,
+    schemaVersion: 5,
     generatedAt:   new Date().toISOString(),
 
     cone: {
@@ -71,8 +75,8 @@ function buildVisualStateExport() {
       R_world:       _round3(coneR()),
     },
 
-    shapeDepth:     SHAPE_DEPTH,
-    perspStrength:  SHAPE_PERSP_STRENGTH,
+    shapeDepthCone: SHAPE_DEPTH_CONE,
+    shapeDepthFlat: SHAPE_DEPTH_FLAT,
 
     view: {
       scale: _round3(view.scale),
@@ -141,6 +145,7 @@ function buildVisualStateExport() {
 
     const entry = {
       id:     sq.id,
+      name:   squareDisplayName(sq),
       quadId: sq.quadId,
       index:  i,
       u:      _round3(sq.u),
@@ -158,21 +163,26 @@ function buildVisualStateExport() {
 
     entry.uLen = _round3(f.uLen);
     entry.vLen = _round3(f.vLen);
-
-    /* ---- The one array both views read ------------------------ */
+    entry.extentVNorm = _round3(shapeVExtentNorm(sq));
 
     const local = squareCornersLocal(sq);
     const world = local.map(([u, v]) => frameToWorld(f, u, v));
     const dims  = squareDims(sq);
 
-    entry.dims = { w: _round3(dims.w), h: _round3(dims.h) };
+    entry.dims     = { w: _round3(dims.w), h: _round3(dims.h) };
+    entry.dimsCone = (function () {
+      const d = squareDimsCone(sq);
+      return { w: _round3(d.w), h: _round3(d.h) };
+    })();
+
     entry.cornersLocal = local.map(p =>
       [_round3(p[0]), _round3(p[1])]);
     entry.cornersWorld = world.map(p =>
       [_round3(p[0]), _round3(p[1])]);
     entry.worldSideLengths = _worldSideLengths(world);
 
-    /* ---- Cone-band projection --------------------------------- */
+    entry.perspCentre = _round3(shapePerspCentre(sq));
+    entry.vMax        = _round3(shapeVMax(sq));
 
     const screenCone = squareCornersScreen(sq);
     if (screenCone) {
@@ -180,8 +190,6 @@ function buildVisualStateExport() {
         [_round3(p[0]), _round3(p[1])]);
       entry.screenSideLengthsCone = _screenSideLengths(screenCone);
     }
-
-    /* ---- Flat-band projection --------------------------------- */
 
     const flatCorners = squareFlatCorners(sq);
     if (flatCorners) {

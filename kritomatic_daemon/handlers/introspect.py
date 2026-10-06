@@ -32,6 +32,8 @@ class IntrospectHandler:
             return self.describe_active(params)
         elif cmd_type == 'list_extensions':
             return self.list_extensions()
+        elif cmd_type == 'get_node_xml':
+            return self.get_node_xml(params)
         return {'success': False, 'message': f'Unknown introspect command: {cmd_type}'}
 
     # ------------------------------------------------------------------
@@ -309,6 +311,42 @@ class IntrospectHandler:
                 'success': True,
                 'message': f'{len(result)} extension(s)',
                 'data': {'extensions': result}
+            }
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    # ------------------------------------------------------------------
+    #  Node XML dump
+    # ------------------------------------------------------------------
+
+    @command(
+        category='introspect',
+        help_text='Get the raw XML of any node (layer or mask) by name',
+        args={
+            '--node_name': {'type': 'str', 'required': True,
+                            'help': 'Name of the layer or mask to dump'},
+        }
+    )
+    def get_node_xml(self, params):
+        try:
+            doc = Krita.instance().activeDocument()
+            if not doc:
+                return {'success': False, 'message': 'No active document'}
+
+            node_name = params.get('node_name', '')
+            node = doc.nodeByName(node_name)
+            if not node:
+                return {'success': False,
+                        'message': f'Node "{node_name}" not found'}
+
+            return {
+                'success': True,
+                'message': f'Got XML for "{node_name}"',
+                'data': {
+                    'name': node.name(),
+                    'type': node.type(),
+                    'xml': node.toXML(),
+                },
             }
         except Exception as e:
             return {'success': False, 'message': str(e)}

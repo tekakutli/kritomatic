@@ -28,7 +28,6 @@ class CommandHandler:
         }
 
     def _send_line(self, client_socket, payload):
-        """Send a single JSON object followed by a newline (NDJSON framing)."""
         try:
             client_socket.send((json.dumps(payload) + '\n').encode('utf-8'))
         except Exception:
@@ -105,7 +104,6 @@ class CommandHandler:
             })
 
     def _dispatch(self, command):
-        """Route command to appropriate handler"""
         cmd_type = command.get('type')
 
         if cmd_type == 'get_schema':
@@ -134,7 +132,8 @@ class CommandHandler:
                           'embed_image_as_layer', 'import_kra_as_group',
                           'fill_layer', 'fill_selection', 'move_layer_to_new_document',
                           'export_layer_to_file', 'apply_color_to_alpha', 'add_color_to_alpha_mask',
-                          'create_transform_mask', 'transform_mask', 'fit_to_canvas']:
+                          'create_transform_mask', 'transform_mask',
+                          'set_perspective_transform_mask', 'fit_to_canvas']:
             return self.handlers['layer'].execute(cmd_type, command)
 
         # Vector shapes: text and polygons
@@ -174,7 +173,8 @@ class CommandHandler:
 
         # Introspect commands
         elif cmd_type in ['list_actions', 'list_filters', 'list_resources',
-                          'list_dockers', 'describe_active', 'list_extensions']:
+                          'list_dockers', 'describe_active', 'list_extensions',
+                          'get_node_xml']:
             return self.handlers['introspect'].execute(cmd_type, command)
 
         # Daemon meta-commands

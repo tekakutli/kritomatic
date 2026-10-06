@@ -33,6 +33,10 @@ class LayerBasicHandler:
     def _insert_layer_at_position(self, new_layer, position_type, current_layer, reference_layer_name, doc):
         if position_type == 'above_current' and current_layer:
             current_layer.parentNode().addChildNode(new_layer, current_layer)
+        elif position_type == 'inside_active' and current_layer:
+            if current_layer.type() != "grouplayer":
+                return False
+            current_layer.addChildNode(new_layer, None)
         elif position_type == 'below_current' and current_layer:
             parent = current_layer.parentNode()
             children = parent.childNodes()
@@ -80,7 +84,14 @@ class LayerBasicHandler:
         args={
             '--name': {'type': 'str', 'required': True, 'help': 'Layer name'},
             '--layer_type': {'type': 'str', 'default': 'paintlayer', 'choices': ['paintlayer', 'grouplayer', 'selectionmask', 'vectorlayer', 'filterlayer'], 'help': 'Layer type'},
-            '--position': {'type': 'str', 'default': 'above_current', 'choices': ['above_current', 'below_current', 'above_named', 'below_named', 'top', 'bottom'], 'help': 'Where to place the layer'},
+            '--position': {'type': 'str', 'default': 'above_current',
+                           'choices': ['above_current', 'below_current',
+                                       'inside_active',
+                                       'above_named', 'below_named',
+                                       'top', 'bottom'],
+                           'help': 'Where to place the layer.  inside_active '
+                                   'places it as the last child of the currently '
+                                   'active group layer.'},
             '--reference': {'type': 'str', 'required': False, 'help': 'Reference layer name for above_named/below_named'}
         }
     )

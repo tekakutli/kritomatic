@@ -1,32 +1,39 @@
 """
 cone_kra.py — turn the cone playground's floating squares into a .kra
-full of polygon shapes, each carrying its own label.
+full of perspective-projected rectangles with rotated labels.
 
 The playground runs in the browser; the only way it can reach Krita
 is the local HTTP server in cone_server.py, which forwards to this
 module.  This module then talks to the Kritomatic daemon via the same
 client the CLI uses, exactly as captionize_krita.py does.
 
-Mapping
-=======
-Each shape arrives with two payloads:
+Structure per shape
+===================
+Each floating square becomes one group in the .kra:
 
-    points   the shape's cone-view quadrilateral, in the cone band's
-             own canvas pixels (perspective-tapered, horizon-clipped,
-             slope-offset — the same polygon the cone band draws).
+    group <name>
+        vector layer <name>_content
+            rectangle  (W × H) at the origin
+            horizontal-in-the-flat-frame text at the rectangle's
+            centre, rotated by `flat_rotation`
+        transform mask <name>_persp
+            a 4-point perspective homography mapping the rectangle's
+            four corners onto the shape's four projected corners
 
-    label    the shape's display name, the polygon's centroid, a
-             font size in screen pixels, and a rotation in degrees.
+The rectangle and the text are laid out on a clean, axis-aligned
+plane.  The text's rotation in that plane is not zero: it is chosen
+by the caller (see pg_kra.py's _shapeLabelFlatRotationDeg) so that,
+after the perspective transform, the text runs along the shape's
+longer projected side and reads floor-is-down.
 
-The union of every shape's corner points is used as a bounding box,
-and that box is mapped onto a fixed canvas with a uniform scale and
-a small margin.  The polygon points, the label position, and the
-label font size are all run through the same transform, so the
-labels scale with the shapes and stay inside them.
+Correspondence
+==============
+The flat rectangle's corners are laid out as
 
-Each shape becomes ONE vector layer holding two SVG shapes: the
-polygon (fill + stroke), then the text (centred on the polygon's
-centroid, rotated to the shape's own axis).
+    (0, 0), (W, 0), (W, H), (0, H)
+
+in the order TL, TR, BR, BL — matching the JS side's corner order
+for the destination points.
 """
 
 import json
@@ -36,7 +43,6 @@ from typing import Any, Dict, List, Tuple
 
 
 def _find_repo_src() -> Path:
-    """Walk up from this file to the directory containing src/kritomatic."""
     p = Path(__file__).resolve().parent
     for _ in range(10):
         cand = p / "src"
@@ -63,6 +69,7 @@ DEFAULT_RESOLUTION = 72
 BACKGROUND_COLOR = "#0a0e14"
 FIT_MARGIN = 60
 DEFAULT_FONT_FAMILY = "sans-serif"
+FONT_FRACTION = 0.40
 
 
 def _bbox_of(shapes: List[Dict[str, Any]]) -> Tuple[float, float, float, float]:
@@ -122,23 +129,37 @@ def build_bundle(shapes: List[Dict[str, Any]],
     ]
 
     for sh in shapes:
-        pts = [_apply(p, scale, tx, ty) for p in sh["points"]]
-        points_json = json.dumps(
-            [[round(x, 3), round(y, 3)] for x, y in pts]
-        )
-
         layer_name = sh["name"]
+        content_name = layer_name + "_content"
+        mask_name = layer_name + "_persp"
 
+        fitted = [_apply(p, scale, tx, ty) for p in sh["points"]]
+        W = max(1.0, sh["natural_w"] * scale)
+        H = max(1.0, sh["natural_h"] * scale)
+        font_px = max(6, int(round(min(W, H) * FONT_FRACTION)))
+
+        # 1. Group
         commands.append({
             "type": "create_layer",
             "name": layer_name,
-            "layer_type": "vectorlayer",
+            "layer_type": "grouplayer",
             "position": "top",
         })
+
+        # 2. Vector layer inside the group
+        commands.append({
+            "type": "create_layer",
+            "name": content_name,
+            "layer_type": "vectorlayer",
+            "position": "inside_active",
+        })
+
+        # 3. Flat rectangle at the origin
+        rect_pts = [[0.0, 0.0], [W, 0.0], [W, H], [0.0, H]]
         commands.append({
             "type": "add_vector_polygon",
-            "layer_name": layer_name,
-            "points": points_json,
+            "layer_name": content_name,
+            "points": json.dumps(rect_pts),
             "fill": sh.get("fill", "#ffffff"),
             "fill_opacity": sh.get("fill_opacity", 0.40),
             "stroke": sh.get("stroke", "#ffffff"),
@@ -146,57 +167,46 @@ def build_bundle(shapes: List[Dict[str, Any]],
             "stroke_opacity": sh.get("stroke_opacity", 1.0),
         })
 
-        label = sh.get("label")
-        if label and label.get("text"):
-            lx, ly = _apply((label["x"], label["y"]), scale, tx, ty)
-            font_px = max(6, int(round(label["font_px"] * scale)))
+        # 4. Text at the rectangle's centre, pre-rotated by
+        #    `flat_rotation` so that after the perspective transform
+        #    its baseline lies along the shape's longer projected
+        #    side and its reading sense is floor-is-down.
+        commands.append({
+            "type": "add_vector_text",
+            "layer_name": content_name,
+            "text": layer_name,
+            "font_family": DEFAULT_FONT_FAMILY,
+            "font_size": font_px,
+            "x": W / 2.0,
+            "y": H / 2.0,
+            "color": sh.get("text_color", "#ffffff"),
+            "alignment": "center",
+            "rotation": float(sh.get("flat_rotation", 0.0)),
+        })
 
-            commands.append({
-                "type": "add_vector_text",
-                "layer_name": layer_name,
-                "text": str(label["text"]),
-                "font_family": label.get("font_family", DEFAULT_FONT_FAMILY),
-                "font_size": font_px,
-                "x": lx,
-                "y": ly,
-                "color": label.get("color", "#ffffff"),
-                "alignment": "center",
-                "rotation": float(label.get("rotation", 0.0)),
-            })
+        # 5. Transform mask on the group
+        commands.append({
+            "type": "create_transform_mask",
+            "layer_name": layer_name,
+            "mask_name": mask_name,
+        })
+
+        # 6. Perspective homography from the flat rectangle's corners
+        #    to the projected corners on the canvas.
+        src_pts = rect_pts
+        dst_pts = [[round(x, 3), round(y, 3)] for x, y in fitted]
+        commands.append({
+            "type": "set_perspective_transform_mask",
+            "mask_name": mask_name,
+            "src_points": json.dumps(src_pts),
+            "dst_points": json.dumps(dst_pts),
+        })
 
     return {"id": "cone_export", "commands": commands}
 
 
 def generate(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Entry point called by cone_server's POST handler.
-
-    Expected payload:
-
-        {
-          "doc_name":    "Cone Scene",
-          "output_path": "/abs/path/out.kra",
-          "shapes": [
-            {
-              "name":           "S1",
-              "points":         [[x0,y0],[x1,y1],[x2,y2],[x3,y3]],
-              "fill":           "#ffc85a",
-              "fill_opacity":   0.40,
-              "stroke":         "#ffc85a",
-              "stroke_width":   2.0,
-              "stroke_opacity": 1.0,
-              "label": {
-                "text":     "S1",
-                "x":        512.0,
-                "y":        300.0,
-                "font_px":  24.0,
-                "rotation": -30.0,
-                "color":    "#ffd9a0"
-              }
-            },
-            ...
-          ]
-        }
-    """
+    """Entry point called by cone_server's POST handler."""
     shapes = payload.get("shapes", [])
     doc_name = payload.get("doc_name", "Cone Scene")
     output_path = payload.get("output_path")

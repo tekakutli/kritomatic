@@ -6,6 +6,18 @@ frame in which the TEXT reads horizontally.  When the user picks
 "top-left", they mean the corner that is top-left in that frame —
 the same frame that determined the text's baseline.
 
+Point of view
+=============
+The exported .kra reproduces what the user is currently seeing in
+the cone band: the same canvas dimensions, the same positions, the
+same apparent sizes.  The shape corners that buildKraShapes sends
+are already in the cone band's screen coordinates — projectShapePoint
+runs everything through w2s, which uses view.scale, view.tx, and
+view.ty — so all of the current depth, half-angle, shape depth, pan,
+and zoom are already baked in.  The payload also carries the cone
+band's pixel dimensions; the daemon sizes the Krita canvas to match,
+and everything lines up 1:1 without any additional transform.
+
 Meta-options
 ============
 The panel exposes a small set of options that shape how the .kra is
@@ -25,11 +37,6 @@ the daemon, where cone_kra.py applies them:
     text_color_mode    "color" (default) uses the shape's patch hue
                        as the text color; "black" forces pure black
                        on every label.
-
-These options are also saved and loaded with the scene, via
-pg_scene.py, which calls readKraOptionsFromDOM and
-applyKraOptionsToDOM — the two functions below are the single point
-of truth for what the options are and how they map to DOM controls.
 
 Computing the text anchor
 =========================
@@ -52,9 +59,6 @@ are unambiguous:
 Once the flat corner that plays each visual role is identified, the
 anchor is placed in the flat rectangle near that corner, offset
 toward the flat center by padding plus half the text's own extent.
-
-Do NOT use squareFlatCorners here — that returns the unfolded-cone
-footprint, which loses the perspective.
 """
 
 KRA_JS = r"""
@@ -312,9 +316,6 @@ function buildKraShapes(options) {
     const hex = _hueToHex(hue);
     const hexLight = _hueToHexLight(hue);
 
-    /* Text color.  "color" keeps the light-tinted patch hue that
-       has been the default; "black" replaces it with pure black.
-       The rectangle keeps the patch hue in both modes. */
     const textColor = (colorMode === "black") ? "#000000" : hexLight;
 
     const flatRotation = _shapeLabelFlatRotationDeg(sq, corners);
@@ -347,13 +348,25 @@ function buildKraShapes(options) {
 }
 
 /* ==========================================================================
+   POINT OF VIEW
+   ==========================================================================
+   The cone band's pixel dimensions, so the daemon can size the .kra
+   canvas to match what the user is currently looking at.  The shape
+   corners in the payload are already in this coordinate space, so no
+   further fitting is needed. */
+function _coneBandDimensions() {
+  const w = Math.max(1, Math.round(window.innerWidth));
+  const h = Math.max(1, Math.round(layout.coneH));
+  return { width: w, height: h };
+}
+
+/* ==========================================================================
    META-OPTIONS
    ==========================================================================
-   The two functions below are the SINGLE POINT OF TRUTH for what the
-   KRA-export options are.  pg_scene.py calls them when saving and
-   loading a scene, so adding a new option here is enough to have it
-   persisted with scenes as well — no changes needed in pg_scene.py.
-   ========================================================================== */
+   readKraOptionsFromDOM / applyKraOptionsToDOM are the SINGLE POINT
+   OF TRUTH for what the KRA-export options are; pg_scene.py calls
+   them when saving and loading a scene, so adding a new option here
+   is enough to have it persisted with scenes as well. */
 
 function readKraOptionsFromDOM() {
   const posEl  = document.getElementById("kraTextPos");
@@ -420,6 +433,8 @@ async function generateKraFromScene() {
     return;
   }
 
+  const coneBand = _coneBandDimensions();
+
   const defaultPath = "/tmp/cone_scene.kra";
   const outputPath = window.prompt("Output .kra path:", defaultPath);
   if (!outputPath) return;
@@ -436,6 +451,7 @@ async function generateKraFromScene() {
         doc_name:    "Cone Scene",
         output_path: outputPath,
         options:     options,
+        cone_band:   coneBand,
         shapes:      shapes,
       }),
     });

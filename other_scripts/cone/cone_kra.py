@@ -2,17 +2,23 @@
 cone_kra.py — turn the cone playground's floating squares into a .kra
 full of perspective-projected rectangles and/or labels.
 
-The frame of reference for label placement is VISUAL.  The JS side
-determines, from the shape's projected corners, which flat corner
-corresponds to the requested visual position and sends the resulting
-anchor in flat rectangle coordinates as `text_anchor` on each shape.
-This module consumes it and scales it by the fit factor.
+The .kra reproduces the cone playground's NORMAL view: the same canvas
+dimensions as the visible cone band, the same shape positions, the
+same apparent sizes.  The shape corners in the payload are already in
+the cone band's pixel coordinates — the JS side computes them through
+projectShapePoint, which uses the current view transform — so the
+daemon sizes the canvas to match the cone band and uses those
+coordinates verbatim.  No fit transform, and no extra outer transform:
+both the cone band and the Krita canvas share the same origin at the
+top-left and the same y-down axis, so the mapping is identity.
+
+If the user changes the cone depth, the half-angle, the shape depth
+slider, or pans, all of those effects are already baked into the
+coordinates the JS side sends.  The .kra always reflects the current
+point of view.
 
 Structure per export
 ====================
-Everything the export produces ends up inside one outer group at the
-top of the document:
-
     group <EXPORT_GROUP_NAME>
         group <name>                       (one per shape)
             vector layer <name>_content
@@ -24,10 +30,9 @@ top of the document:
         group <name> ...
         ...
 
-No background layer is created.  The output contains only the
-shapes the user authored; opening the .kra over an existing document
-does not silently paint over it, and the transparent canvas shows
-whatever the user places underneath.
+No background layer is created.  The output contains only the shapes
+the user authored; opening the .kra over an existing document does not
+silently paint over it.
 
 LAYER PLACEMENT
 ===============
@@ -51,7 +56,7 @@ An `options` object travels in the payload:
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 
 def _find_repo_src() -> Path:
@@ -75,10 +80,12 @@ if str(_SRC) not in sys.path:
 from kritomatic.batch import BatchExecutor  # noqa: E402
 
 
-CANVAS_W = 2048
-CANVAS_H = 1024
+# Fallback canvas dimensions, used only if the payload arrives without
+# a `cone_band` field (an older browser tab, or a hand-crafted payload).
+DEFAULT_CANVAS_W = 1920
+DEFAULT_CANVAS_H = 1080
+
 DEFAULT_RESOLUTION = 72
-FIT_MARGIN = 60
 DEFAULT_FONT_FAMILY = "sans-serif"
 FONT_FRACTION = 0.40
 
@@ -88,39 +95,8 @@ FONT_FRACTION = 0.40
 EXPORT_GROUP_NAME = "Export"
 
 
-def _bbox_of(shapes: List[Dict[str, Any]]) -> Tuple[float, float, float, float]:
-    xs: List[float] = []
-    ys: List[float] = []
-    for s in shapes:
-        for p in s["points"]:
-            xs.append(float(p[0]))
-            ys.append(float(p[1]))
-    return (min(xs), min(ys), max(xs), max(ys))
-
-
-def _fit_transform(bbox, canvas_w, canvas_h, margin):
-    x0, y0, x1, y1 = bbox
-    bw = x1 - x0
-    bh = y1 - y0
-    if bw <= 1e-9 or bh <= 1e-9:
-        return (1.0, canvas_w / 2.0, canvas_h / 2.0)
-    avail_w = canvas_w - 2 * margin
-    avail_h = canvas_h - 2 * margin
-    scale = min(avail_w / bw, avail_h / bh)
-    cx = (x0 + x1) / 2.0
-    cy = (y0 + y1) / 2.0
-    tx = canvas_w / 2.0 - cx * scale
-    ty = canvas_h / 2.0 - cy * scale
-    return (scale, tx, ty)
-
-
-def _apply(p, scale, tx, ty):
-    return (p[0] * scale + tx, p[1] * scale + ty)
-
-
 def _fallback_anchor(W, H):
-    """Used only if a shape arrives without a `text_anchor` field —
-    e.g. a payload from an older version of the playground."""
+    """Used only if a shape arrives without a `text_anchor` field."""
     return {"x": W / 2.0, "y": H / 2.0, "alignment": "center"}
 
 
@@ -133,20 +109,41 @@ def _normalize_options(raw):
     return {"draw_rectangles": draw}
 
 
+def _normalize_cone_band(raw):
+    """Pull canvas dimensions out of the payload's `cone_band` field,
+    with safe fallbacks for anything missing or malformed."""
+    if not isinstance(raw, dict):
+        return {"width": DEFAULT_CANVAS_W, "height": DEFAULT_CANVAS_H}
+    w = raw.get("width", DEFAULT_CANVAS_W)
+    h = raw.get("height", DEFAULT_CANVAS_H)
+    try:
+        w = int(round(float(w)))
+    except (TypeError, ValueError):
+        w = DEFAULT_CANVAS_W
+    try:
+        h = int(round(float(h)))
+    except (TypeError, ValueError):
+        h = DEFAULT_CANVAS_H
+    if w < 1:
+        w = DEFAULT_CANVAS_W
+    if h < 1:
+        h = DEFAULT_CANVAS_H
+    return {"width": w, "height": h}
+
+
 def build_bundle(shapes: List[Dict[str, Any]],
                  options: Dict[str, Any] = None,
+                 cone_band: Dict[str, Any] = None,
                  doc_name: str = "Cone Scene") -> Dict[str, Any]:
     opts = _normalize_options(options)
-
-    bbox = _bbox_of(shapes)
-    scale, tx, ty = _fit_transform(bbox, CANVAS_W, CANVAS_H, FIT_MARGIN)
+    band = _normalize_cone_band(cone_band)
 
     commands: List[Dict[str, Any]] = [
         {
             "type": "create_new_with_dimensions",
             "name": doc_name,
-            "width": CANVAS_W,
-            "height": CANVAS_H,
+            "width": band["width"],
+            "height": band["height"],
             "resolution": DEFAULT_RESOLUTION,
         },
         # Outer group: every shape goes inside this.
@@ -163,14 +160,19 @@ def build_bundle(shapes: List[Dict[str, Any]],
         content_name = layer_name + "_content"
         mask_name = layer_name + "_persp"
 
-        fitted = [_apply(p, scale, tx, ty) for p in sh["points"]]
-        W = max(1.0, sh["natural_w"] * scale)
-        H = max(1.0, sh["natural_h"] * scale)
+        # Shape corners, in cone-band screen pixels.  Used verbatim:
+        # the canvas is the same size as the cone band, so these are
+        # also the shape corners on the canvas.
+        dst_pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
+                   for p in sh["points"]]
+
+        W = max(1.0, float(sh["natural_w"]))
+        H = max(1.0, float(sh["natural_h"]))
         font_px = max(6, int(round(min(W, H) * FONT_FRACTION)))
 
         anchor = sh.get("text_anchor") or _fallback_anchor(W, H)
-        text_x = anchor.get("x", W / 2.0) * scale
-        text_y = anchor.get("y", H / 2.0) * scale
+        text_x = float(anchor.get("x", W / 2.0))
+        text_y = float(anchor.get("y", H / 2.0))
         text_align = anchor.get("alignment", "center")
 
         # 1. Shape group, inside the outer group.
@@ -226,7 +228,6 @@ def build_bundle(shapes: List[Dict[str, Any]],
 
         # 6. Perspective homography from the flat rectangle's corners
         #    to the projected corners on the canvas.
-        dst_pts = [[round(x, 3), round(y, 3)] for x, y in fitted]
         commands.append({
             "type": "set_perspective_transform_mask",
             "mask_name": mask_name,
@@ -241,6 +242,7 @@ def generate(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Entry point called by cone_server's POST handler."""
     shapes = payload.get("shapes", [])
     options = payload.get("options", {})
+    cone_band = payload.get("cone_band", {})
     doc_name = payload.get("doc_name", "Cone Scene")
     output_path = payload.get("output_path")
 
@@ -253,7 +255,7 @@ def generate(payload: Dict[str, Any]) -> Dict[str, Any]:
     if out.suffix.lower() != ".kra":
         out = out.with_suffix(".kra")
 
-    bundle = build_bundle(shapes, options, doc_name)
+    bundle = build_bundle(shapes, options, cone_band, doc_name)
     bundle["commands"].append({
         "type": "save_document",
         "file_path": str(out),

@@ -6,7 +6,8 @@ selected patch's φ and s, the selected square's width, height, and
 slope), ten buttons (Reset, Center apex, Save scene, Load scene,
 Export visual state, Generate .kra, + Patch, + Clone, + Square,
 + Clone), a KRA-export options block (text position, text padding,
-rectangle on/off, text color), two lists, a persistent hint block.
+text warp mode, rectangle on/off, text color), two lists, a
+persistent hint block.
 """
 
 HTML_HEAD = r"""<!DOCTYPE html>
@@ -452,6 +453,13 @@ HTML_HEAD = r"""<!DOCTYPE html>
     <select id="kraTextColor">
       <option value="color">patch hue</option>
       <option value="black">black</option>
+    </select>
+  </div>
+  <div class="field">
+    <label>Warp</label>
+    <select id="kraTextWarp">
+      <option value="square">per-square</option>
+      <option value="patch">per-patch</option>
     </select>
   </div>
   <div class="field">

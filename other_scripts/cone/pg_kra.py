@@ -1,44 +1,57 @@
 """
 pg_kra.py — panel-side glue for the "Generate .kra" button.
 
-For each floating square, three things are captured:
+The frame of reference is VISUAL, not flat, and specifically the
+frame in which the TEXT reads horizontally.  When the user picks
+"top-left", they mean the corner that is top-left in that frame —
+the same frame that determined the text's baseline.
 
-  1. the four projected corners of the shape, from
-     _unclippedProjectedCorners;
+Meta-options
+============
+The panel exposes a small set of options that shape how the .kra is
+built.  They are read at export time and travel in the payload to
+the daemon, where cone_kra.py applies them:
 
-  2. the natural width and height of the shape, as the average of
-     the two "U-direction" projected edges and the two
-     "V-direction" projected edges;
+    text_position      where in the visual frame the text anchor
+                       sits (center, tl, tr, bl, br, top, bottom,
+                       left, right)
 
-  3. a flat-frame rotation for the text, so that when the transform
-     mask projects the whole group, the text's baseline lands along
-     the shape's longer projected side and reads floor-is-down.
+    text_padding       a fraction of min(W, H), how far the anchor
+                       sits from the edge it is attached to
 
-FLAT-FRAME TEXT ROTATION
-========================
-The .kra builds each shape as a flat rectangle with horizontal text
-inside its own group, and lets a perspective transform mask do the
-projection.  The rectangle's four corners map onto the shape's four
-projected corners, in TL, TR, BR, BL order.  Consequently:
+    draw_rectangles    if false, the rectangle polygon is not added
+                       to the .kra; only the text is drawn.
 
-    flat +X axis   projects to   the projected U direction
-                                 (TL to TR of the shape)
-    flat +Y axis   projects to   the projected V direction
-                                 (TL to BL of the shape)
+    text_color_mode    "color" (default) uses the shape's patch hue
+                       as the text color; "black" forces pure black
+                       on every label.
 
-The text is drawn at a flat rotation R ∈ {0, 90, 180, 270}.  In
-SVG's y-down convention, that reads:
+These options are also saved and loaded with the scene, via
+pg_scene.py, which calls readKraOptionsFromDOM and
+applyKraOptionsToDOM — the two functions below are the single point
+of truth for what the options are and how they map to DOM controls.
 
-    R = 0     baseline along flat +X   →  screen angle of U
-    R = 90    baseline along flat +Y   →  screen angle of V
-    R = 180   baseline along flat -X   →  screen angle of U + 180
-    R = 270   baseline along flat -Y   →  screen angle of V + 180
+Computing the text anchor
+=========================
+For each shape, the four projected corners are already available
+(_unclippedProjectedCorners).  The text's reading direction on
+screen is the longest projected edge, with a floor-is-down flip
+(see _shapeLabelScreenAngleDeg).  That direction defines a frame:
 
-We already know the correct final screen angle for the text — it is
-what _shapeLabelRotationDeg returns, i.e. the longest-edge direction
-with the floor-is-down flip applied.  So the correct pre-rotation is
-whichever of those four candidates projects to a screen angle
-closest to that target.
+    X axis = reading direction (bx, by)
+    Y axis = (-by, bx)          (text-down, screen y is down)
+
+Project the four corners into this frame.  In it, the corner roles
+are unambiguous:
+
+    top-left      min(X + Y)
+    top-right     max(X - Y)
+    bottom-right  max(X + Y)
+    bottom-left   min(X - Y)
+
+Once the flat corner that plays each visual role is identified, the
+anchor is placed in the flat rectangle near that corner, offset
+toward the flat center by padding plus half the text's own extent.
 
 Do NOT use squareFlatCorners here — that returns the unfolded-cone
 footprint, which loses the perspective.
@@ -78,17 +91,6 @@ function _polygonArea(pts) {
   return Math.abs(area) / 2;
 }
 
-/* ==========================================================================
-   UNCLIPPED PROJECTED CORNERS
-   ==========================================================================
-   squareCornersScreen runs the four local corners through
-   projectShapePoint AND then clips against the horizon.  Clipping
-   can replace a real edge with a clip-created one, and the longest
-   edge of the clipped polygon may then not be an edge of the shape
-   proper.
-
-   For choosing the label's baseline we want the shape's OWN edges,
-   so we re-project the four local corners without clipping. */
 function _unclippedProjectedCorners(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
@@ -126,22 +128,6 @@ function _longestEdgeDir(pts) {
   return [bx, by];
 }
 
-/* ==========================================================================
-   TARGET SCREEN ANGLE — longest side is the base, floor is down
-   ==========================================================================
-   The reading direction the text should end up with, in final
-   screen coordinates.  Two rules:
-
-     LONGEST-SIDE-IS-THE-BASE
-       Baseline along the direction of the shape's longest projected
-       edge.
-
-     FLOOR-IS-DOWN
-       Given that baseline direction there are two reading senses,
-       differing by 180°.  The one whose text-up vector has a
-       positive component along screen up, (0, -1), is the correct
-       one.  With text-up = (by, -bx) and screen up = (0, -1), the
-       condition reduces to bx > 0. */
 function _shapeLabelScreenAngleDeg(sq, screenPts) {
   const corners = _unclippedProjectedCorners(sq);
   if (!corners || corners.length < 3) return 0;
@@ -156,23 +142,13 @@ function _shapeLabelScreenAngleDeg(sq, screenPts) {
   return Math.atan2(by, bx) * 180 / Math.PI;
 }
 
-/* ==========================================================================
-   FLAT-FRAME TEXT ROTATION
-   ==========================================================================
-   See the module docstring for the derivation.  Returns a rotation
-   in {0, 90, 180, 270} — the flat-frame text rotation that, after
-   the perspective transform, produces the target screen angle. */
 function _shapeLabelFlatRotationDeg(sq, screenPts) {
   const corners = _unclippedProjectedCorners(sq);
   if (!corners || corners.length < 4) return 0;
 
-  /* Projected direction of the flat rectangle's +X axis: TL to TR. */
   const ux = corners[1][0] - corners[0][0];
   const uy = corners[1][1] - corners[0][1];
 
-  /* Projected direction of the flat rectangle's +Y axis: TL to BL.
-     (This is the reference-frame -V direction, but for our purposes
-     it only matters that it is the flat frame's +Y.) */
   const vx = corners[3][0] - corners[0][0];
   const vy = corners[3][1] - corners[0][1];
 
@@ -181,10 +157,6 @@ function _shapeLabelFlatRotationDeg(sq, screenPts) {
 
   const target = _shapeLabelScreenAngleDeg(sq, screenPts);
 
-  /* SVG rotate() is clockwise in a y-down frame, so a flat rotation
-     of R places the text's baseline along the flat direction
-     (cos R, sin R).  For R in {0, 90, 180, 270} the projected
-     screen direction is exactly ±U or ±V. */
   const candidates = [
     { r:   0, projected: angleU },
     { r:  90, projected: angleV },
@@ -208,7 +180,109 @@ function _shapeLabelFlatRotationDeg(sq, screenPts) {
   return best.r;
 }
 
-function buildKraShapes() {
+function _classifyCornersInReadingFrame(visualPts, readingAngleDeg) {
+  const rad = readingAngleDeg * Math.PI / 180;
+  const bx = Math.cos(rad);
+  const by = Math.sin(rad);
+  const dx = -by;
+  const dy = bx;
+
+  const coords = [];
+  for (let i = 0; i < 4; i++) {
+    const px = visualPts[i][0];
+    const py = visualPts[i][1];
+    coords.push({
+      X: px * bx + py * by,
+      Y: px * dx + py * dy,
+    });
+  }
+
+  let tlI = 0, trI = 0, brI = 0, blI = 0;
+  let bestTL = Infinity, bestTR = -Infinity;
+  let bestBR = -Infinity, bestBL = Infinity;
+  for (let i = 0; i < 4; i++) {
+    const X = coords[i].X, Y = coords[i].Y;
+    const sTL = X + Y;
+    const sTR = X - Y;
+    const sBR = X + Y;
+    const sBL = X - Y;
+
+    if (sTL < bestTL) { bestTL = sTL; tlI = i; }
+    if (sTR > bestTR) { bestTR = sTR; trI = i; }
+    if (sBR > bestBR) { bestBR = sBR; brI = i; }
+    if (sBL < bestBL) { bestBL = sBL; blI = i; }
+  }
+
+  return { tl: tlI, tr: trI, br: brI, bl: blI };
+}
+
+function _flatAnchorFromVisual(visualPts, W, H, position,
+                               padFrac, fontSize, textLen,
+                               readingAngleDeg, flatRotationDeg) {
+  if (!position || position === "center" ||
+      !visualPts || visualPts.length < 4) {
+    return { x: W / 2, y: H / 2 };
+  }
+
+  const pad = padFrac * Math.min(W, H);
+
+  const textPixelLen = textLen * fontSize * 0.55;
+  const textPixelH = fontSize;
+  let textHalfW, textHalfH;
+  if (flatRotationDeg === 90 || flatRotationDeg === 270) {
+    textHalfW = textPixelH / 2;
+    textHalfH = textPixelLen / 2;
+  } else {
+    textHalfW = textPixelLen / 2;
+    textHalfH = textPixelH / 2;
+  }
+
+  const roles = _classifyCornersInReadingFrame(visualPts, readingAngleDeg);
+
+  const flatCorners = [[0, 0], [W, 0], [W, H], [0, H]];
+
+  function anchorForCorner(idx) {
+    const fx = flatCorners[idx][0];
+    const fy = flatCorners[idx][1];
+    const dirX = (fx < W / 2) ? 1 : ((fx > W / 2) ? -1 : 0);
+    const dirY = (fy < H / 2) ? 1 : ((fy > H / 2) ? -1 : 0);
+    return {
+      x: fx + dirX * (pad + textHalfW),
+      y: fy + dirY * (pad + textHalfH),
+    };
+  }
+
+  const aTL = anchorForCorner(roles.tl);
+  const aTR = anchorForCorner(roles.tr);
+  const aBR = anchorForCorner(roles.br);
+  const aBL = anchorForCorner(roles.bl);
+
+  if (position === "tl") return aTL;
+  if (position === "tr") return aTR;
+  if (position === "br") return aBR;
+  if (position === "bl") return aBL;
+  if (position === "top") {
+    return { x: (aTL.x + aTR.x) / 2, y: (aTL.y + aTR.y) / 2 };
+  }
+  if (position === "bottom") {
+    return { x: (aBL.x + aBR.x) / 2, y: (aBL.y + aBR.y) / 2 };
+  }
+  if (position === "left") {
+    return { x: (aTL.x + aBL.x) / 2, y: (aTL.y + aBL.y) / 2 };
+  }
+  if (position === "right") {
+    return { x: (aTR.x + aBR.x) / 2, y: (aTR.y + aBR.y) / 2 };
+  }
+  return { x: W / 2, y: H / 2 };
+}
+
+function buildKraShapes(options) {
+  options = options || {};
+  const textPos = options.text_position || "center";
+  const padFrac = (typeof options.text_padding === "number")
+                    ? options.text_padding : 0.06;
+  const colorMode = options.text_color_mode || "color";
+
   const shapes = [];
   for (let i = 0; i < floatSquares.length; i++) {
     const sq = floatSquares[i];
@@ -220,9 +294,6 @@ function buildKraShapes() {
     const corners = _unclippedProjectedCorners(sq);
     if (!corners || corners.length < 4) continue;
 
-    /* Side lengths in projected order: sides 0 and 2 are U, sides 1
-       and 3 are V.  The averages give the natural W and H of the
-       flat rectangle that will be laid out inside the group. */
     const lens = (function () {
       const n = corners.length;
       const s = [];
@@ -241,26 +312,95 @@ function buildKraShapes() {
     const hex = _hueToHex(hue);
     const hexLight = _hueToHexLight(hue);
 
-    /* Pre-rotation of the text in the flat frame, so that after the
-       perspective transform its baseline lands along the longer
-       projected side and reads floor-is-down. */
+    /* Text color.  "color" keeps the light-tinted patch hue that
+       has been the default; "black" replaces it with pure black.
+       The rectangle keeps the patch hue in both modes. */
+    const textColor = (colorMode === "black") ? "#000000" : hexLight;
+
     const flatRotation = _shapeLabelFlatRotationDeg(sq, corners);
+    const readingAngle  = _shapeLabelScreenAngleDeg(sq, corners);
+
+    const name = squareDisplayName(sq);
+    const fontNat = Math.min(W, H) * 0.40;
+
+    const anchor = _flatAnchorFromVisual(
+      corners, W, H, textPos, padFrac, fontNat, name.length,
+      readingAngle, flatRotation
+    );
 
     shapes.push({
-      name:            squareDisplayName(sq),
+      name:            name,
       points:          corners.map(([x, y]) => [x, y]),
       natural_w:       W,
       natural_h:       H,
       flat_rotation:   flatRotation,
+      text_anchor:     anchor,
       fill:            hex,
       fill_opacity:    0.40,
       stroke:          hex,
       stroke_width:    2.0,
       stroke_opacity:  1.0,
-      text_color:      hexLight,
+      text_color:      textColor,
     });
   }
   return shapes;
+}
+
+/* ==========================================================================
+   META-OPTIONS
+   ==========================================================================
+   The two functions below are the SINGLE POINT OF TRUTH for what the
+   KRA-export options are.  pg_scene.py calls them when saving and
+   loading a scene, so adding a new option here is enough to have it
+   persisted with scenes as well — no changes needed in pg_scene.py.
+   ========================================================================== */
+
+function readKraOptionsFromDOM() {
+  const posEl  = document.getElementById("kraTextPos");
+  const padEl  = document.getElementById("kraTextPad");
+  const rectEl = document.getElementById("kraDrawRects");
+  const colEl  = document.getElementById("kraTextColor");
+
+  const text_position = posEl ? posEl.value : "center";
+
+  let text_padding = padEl ? parseFloat(padEl.value) : 0.06;
+  if (!isFinite(text_padding) || text_padding < 0) text_padding = 0.06;
+
+  const draw_rectangles = rectEl ? !!rectEl.checked : true;
+
+  let text_color_mode = colEl ? colEl.value : "color";
+  if (text_color_mode !== "color" && text_color_mode !== "black") {
+    text_color_mode = "color";
+  }
+
+  return {
+    text_position:   text_position,
+    text_padding:    text_padding,
+    draw_rectangles: draw_rectangles,
+    text_color_mode: text_color_mode,
+  };
+}
+
+function applyKraOptionsToDOM(opts) {
+  if (!opts || typeof opts !== "object") return;
+
+  const posEl  = document.getElementById("kraTextPos");
+  const padEl  = document.getElementById("kraTextPad");
+  const rectEl = document.getElementById("kraDrawRects");
+  const colEl  = document.getElementById("kraTextColor");
+
+  if (posEl && typeof opts.text_position === "string") {
+    posEl.value = opts.text_position;
+  }
+  if (padEl && typeof opts.text_padding === "number") {
+    padEl.value = String(opts.text_padding);
+  }
+  if (rectEl && typeof opts.draw_rectangles === "boolean") {
+    rectEl.checked = opts.draw_rectangles;
+  }
+  if (colEl && typeof opts.text_color_mode === "string") {
+    colEl.value = opts.text_color_mode;
+  }
 }
 
 async function generateKraFromScene() {
@@ -271,7 +411,8 @@ async function generateKraFromScene() {
     return;
   }
 
-  const shapes = buildKraShapes();
+  const options = readKraOptionsFromDOM();
+  const shapes = buildKraShapes(options);
   if (shapes.length === 0) {
     if (typeof flashStatus === "function") {
       flashStatus("No exportable shapes", "warn");
@@ -294,6 +435,7 @@ async function generateKraFromScene() {
       body: JSON.stringify({
         doc_name:    "Cone Scene",
         output_path: outputPath,
+        options:     options,
         shapes:      shapes,
       }),
     });

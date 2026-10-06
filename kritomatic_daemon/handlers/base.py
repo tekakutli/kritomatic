@@ -1,5 +1,8 @@
 import json
 import hashlib
+
+from krita import Krita
+
 from .brush import BrushHandler
 from .layer import LayerHandler
 from .palette import PaletteHandler
@@ -11,6 +14,7 @@ from .diffusion import DiffusionHandler
 from .introspect import IntrospectHandler
 from .daemon import DaemonHandler
 from ..registry import get_command_registry
+from ..utils.refresh import begin_defer, end_defer
 
 class CommandHandler:
     def __init__(self):
@@ -28,12 +32,86 @@ class CommandHandler:
         }
 
     def _send_line(self, client_socket, payload):
+        """Send one NDJSON line, guaranteeing full delivery.
+
+        The socket carries a 0.5-second timeout set by the receive
+        loop in socket_server.py.  That timeout applies to sends too,
+        and sendall obeys it: if the peer's receive buffer is
+        momentarily full, sendall raises socket.timeout after half a
+        second and abandons the rest of the payload.  With a large
+        summary — the per-command data of a full batch — this happens
+        often enough to be the failure mode.
+
+        Lift the timeout for the duration of this send.  Also log on
+        failure: the previous version swallowed the exception, so a
+        failed send looked identical to a successful one.
+        """
         try:
-            client_socket.send((json.dumps(payload) + '\n').encode('utf-8'))
+            data = (json.dumps(payload) + '\n').encode('utf-8')
+        except Exception as e:
+            print(f"[kritomatic] _send_line: json encode failed: {e}",
+                  flush=True)
+            return
+
+        try:
+            prev_timeout = client_socket.gettimeout()
+        except Exception:
+            prev_timeout = None
+
+        try:
+            try:
+                client_socket.settimeout(None)
+            except Exception:
+                pass
+
+            client_socket.sendall(data)
+        except Exception as e:
+            print(f"[kritomatic] _send_line: sendall failed "
+                  f"({type(e).__name__}: {e}); {len(data)} bytes pending",
+                  flush=True)
+        finally:
+            try:
+                client_socket.settimeout(prev_timeout)
+            except Exception:
+                pass
+
+    def _enter_batchmode_for_active_doc(self, seen):
+        doc = Krita.instance().activeDocument()
+        if doc is None:
+            return
+        key = id(doc)
+        if key in seen:
+            try:
+                doc.setBatchmode(True)
+            except Exception:
+                pass
+            return
+        try:
+            prev = doc.batchmode()
+        except Exception:
+            prev = False
+        seen[key] = (doc, prev)
+        try:
+            doc.setBatchmode(True)
         except Exception:
             pass
 
+    def _slim_results(self, results):
+        """Return a copy of `results` with per-command `data` removed.
+
+        The client uses `results` from the summary only as a fallback
+        when no progress lines arrived; in the normal case it has
+        already consumed the data on the progress stream.  Dropping
+        `data` takes the summary from ~100 KB to a few KB.
+        """
+        return [
+            {k: v for k, v in r.items() if k != 'data'}
+            for r in results
+        ]
+
     def handle_command(self, command, client_socket):
+        print(f"[kritomatic] handle_command: {command.get('type', 'batch')}",
+              flush=True)
         try:
             if 'commands' in command:
                 batch_id = command.get('id', None)
@@ -41,48 +119,80 @@ class CommandHandler:
                 total = len(commands)
                 results = []
 
-                for i, cmd in enumerate(commands):
-                    cmd_type = cmd.get('type')
+                begin_defer()
+                seen_docs = {}
+                summary_sent = False
+                try:
+                    for i, cmd in enumerate(commands):
+                        self._enter_batchmode_for_active_doc(seen_docs)
 
-                    try:
-                        result = self._dispatch(cmd)
-                        ok = bool(result.get('success'))
-                        entry = {
+                        cmd_type = cmd.get('type')
+
+                        try:
+                            result = self._dispatch(cmd)
+                            ok = bool(result.get('success'))
+                            entry = {
+                                'index': i,
+                                'command': cmd_type,
+                                'status': 'success' if ok else 'error',
+                                'message': result.get('message', ''),
+                                'data': result.get('data', None),
+                            }
+                        except Exception as e:
+                            entry = {
+                                'index': i,
+                                'command': cmd_type,
+                                'status': 'error',
+                                'message': f'Processing error: {e}',
+                                'data': None,
+                            }
+
+                        results.append(entry)
+
+                        self._send_line(client_socket, {
+                            'type': 'progress',
                             'index': i,
-                            'command': cmd_type,
-                            'status': 'success' if ok else 'error',
-                            'message': result.get('message', ''),
-                            'data': result.get('data', None),
-                        }
-                    except Exception as e:
-                        entry = {
-                            'index': i,
-                            'command': cmd_type,
-                            'status': 'error',
-                            'message': f'Processing error: {e}',
-                            'data': None,
-                        }
+                            'total': total,
+                            'result': entry,
+                        })
 
-                    results.append(entry)
-
-                    self._send_line(client_socket, {
-                        'type': 'progress',
-                        'index': i,
+                    summary = {
+                        'type': 'batch_complete',
+                        'status': 'batch_complete',
                         'total': total,
-                        'result': entry,
-                    })
+                        'successful': sum(1 for r in results if r['status'] == 'success'),
+                        'failed': sum(1 for r in results if r['status'] == 'error'),
+                        'results': self._slim_results(results),
+                    }
+                    if batch_id:
+                        summary['id'] = batch_id
+                    self._send_line(client_socket, summary)
+                    summary_sent = True
+                    print(f"[kritomatic] batch_complete sent for {batch_id}",
+                          flush=True)
+                finally:
+                    try:
+                        end_defer()
+                    except Exception as e:
+                        print(f"[kritomatic] end_defer failed: {e}",
+                              flush=True)
 
-                summary = {
-                    'type': 'batch_complete',
-                    'status': 'batch_complete',
-                    'total': total,
-                    'successful': sum(1 for r in results if r['status'] == 'success'),
-                    'failed': sum(1 for r in results if r['status'] == 'error'),
-                    'results': results,
-                }
-                if batch_id:
-                    summary['id'] = batch_id
-                self._send_line(client_socket, summary)
+                    for doc, prev in seen_docs.values():
+                        try:
+                            doc.setBatchmode(prev)
+                        except Exception:
+                            pass
+
+                    if not summary_sent:
+                        self._send_line(client_socket, {
+                            'type': 'batch_complete',
+                            'status': 'batch_complete',
+                            'total': total,
+                            'successful': sum(1 for r in results if r['status'] == 'success'),
+                            'failed': sum(1 for r in results if r['status'] == 'error'),
+                            'results': self._slim_results(results),
+                            'error': 'Batch loop aborted before completion',
+                        })
 
             else:
                 cmd_type = command.get('type')

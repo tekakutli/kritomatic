@@ -1,5 +1,6 @@
 from krita import Krita
 from ..decorators import command
+from ..utils.refresh import refresh
 
 class LayerBasicHandler:
     def execute(self, cmd_type, params):
@@ -89,10 +90,16 @@ class LayerBasicHandler:
                                        'inside_active',
                                        'above_named', 'below_named',
                                        'top', 'bottom'],
-                           'help': 'Where to place the layer.  inside_active '
-                                   'places it as the last child of the currently '
-                                   'active group layer.'},
-            '--reference': {'type': 'str', 'required': False, 'help': 'Reference layer name for above_named/below_named'}
+                           'help': 'Where to place the layer.  Ignored if '
+                                   '`parent` is given.'},
+            '--parent': {'type': 'str', 'required': False,
+                         'help': 'Parent group name.  If given, the new '
+                                 'layer is appended as the last child of '
+                                 'the named group.  Overrides `position` '
+                                 'and does not depend on the active node.'},
+            '--reference': {'type': 'str', 'required': False,
+                            'help': 'Reference layer name for '
+                                    'above_named/below_named'}
         }
     )
     def create_layer(self, params):
@@ -104,6 +111,7 @@ class LayerBasicHandler:
             name = params.get('name', 'New Layer')
             layer_type = params.get('layer_type', 'paintlayer')
             position = params.get('position', 'above_current')
+            parent_name = params.get('parent', None)
             reference = params.get('reference', None)
             current = doc.activeNode()
 
@@ -120,11 +128,25 @@ class LayerBasicHandler:
             else:
                 new_layer = doc.createNode(name, layer_type)
 
-            if not self._insert_layer_at_position(new_layer, position, current, reference, doc):
-                return {'success': False, 'message': f'Failed to insert layer'}
+            if parent_name:
+                # Explicit-parent path.  Looks the parent up by name
+                # every time, never reads the active node, so it cannot
+                # be affected by however Krita chose to settle the
+                # active-node state after the previous command.
+                parent = doc.nodeByName(parent_name)
+                if not parent:
+                    return {'success': False,
+                            'message': f'Parent "{parent_name}" not found'}
+                if parent.type() != "grouplayer":
+                    return {'success': False,
+                            'message': f'Parent "{parent_name}" is not a group'}
+                parent.addChildNode(new_layer, None)
+            else:
+                if not self._insert_layer_at_position(new_layer, position, current, reference, doc):
+                    return {'success': False, 'message': f'Failed to insert layer'}
 
             doc.setActiveNode(new_layer)
-            doc.refreshProjection()
+            refresh(doc)
             return {'success': True, 'message': f'Created {layer_type} "{name}"'}
         except Exception as e:
             return {'success': False, 'message': str(e)}
@@ -169,7 +191,7 @@ class LayerBasicHandler:
             if not layer:
                 return {'success': False, 'message': f'Layer "{name}" not found'}
             doc.setActiveNode(layer)
-            doc.refreshProjection()
+            refresh(doc)
             return {'success': True, 'message': f'Active layer set to "{name}"'}
         except Exception as e:
             return {'success': False, 'message': str(e)}
@@ -192,7 +214,7 @@ class LayerBasicHandler:
                 return {'success': False, 'message': 'No active layer'}
             old = active.name()
             active.setName(new_name)
-            doc.refreshProjection()
+            refresh(doc)
             return {'success': True, 'message': f'Renamed from "{old}" to "{new_name}"'}
         except Exception as e:
             return {'success': False, 'message': str(e)}
@@ -216,7 +238,7 @@ class LayerBasicHandler:
             if not layer:
                 return {'success': False, 'message': f'Layer "{old_name}" not found'}
             layer.setName(new_name)
-            doc.refreshProjection()
+            refresh(doc)
             return {'success': True, 'message': f'Renamed "{old_name}" to "{new_name}"'}
         except Exception as e:
             return {'success': False, 'message': str(e)}
@@ -264,7 +286,7 @@ class LayerBasicHandler:
                     old_parent.addChildNode(moved, None)
 
             to_move.remove()
-            doc.refreshProjection()
+            refresh(doc)
             return {'success': True, 'message': f'Moved "{layer_name}" to "{group_name}"'}
         except Exception as e:
             return {'success': False, 'message': str(e)}

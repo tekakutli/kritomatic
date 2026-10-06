@@ -1,4 +1,5 @@
 from krita import Krita
+from ..utils.refresh import refresh
 from ..decorators import command
 
 class LayerFillHandler:
@@ -74,7 +75,7 @@ class LayerFillHandler:
 
             view.setForeGroundColor(original_foreground)
             doc.setActiveNode(original_active)
-            doc.refreshProjection()
+            refresh(doc)
 
             color_desc = color_hex or ('foreground' if use_foreground else 'background')
             return {'success': True, 'message': f'Filled layer "{layer_name}" with {color_desc}'}
@@ -131,7 +132,7 @@ class LayerFillHandler:
                 fill_action.trigger()
 
             view.setForeGroundColor(original_foreground)
-            doc.refreshProjection()
+            refresh(doc)
 
             color_desc = color_hex or ('foreground' if use_foreground else 'background')
             return {'success': True, 'message': f'Filled selection with {color_desc}'}

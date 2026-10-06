@@ -1,6 +1,7 @@
 import os
 from krita import *
 from ..decorators import command
+from ..utils.refresh import refresh
 from ..utils.krita_actions import find_rotate_action
 
 class DocumentHandler:
@@ -376,7 +377,7 @@ class DocumentHandler:
             action_name = action.objectName() or action.text() or '<unnamed>'
             action.trigger()
 
-            doc.refreshProjection()
+            refresh(doc)
             return {
                 'success': True,
                 'message': f'Rotated document {direction} via {action_name} '
@@ -438,7 +439,7 @@ class DocumentHandler:
                                        f'rotate to see what is available.'}
                 action_name = action.objectName() or action.text() or '<unnamed>'
                 action.trigger()
-                doc.refreshProjection()
+                refresh(doc)
                 new_w = doc.width()
                 new_h = doc.height()
                 doc.saveAs(output_path)

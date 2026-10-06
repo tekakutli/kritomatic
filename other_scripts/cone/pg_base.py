@@ -5,7 +5,8 @@ The panel carries five graphics sliders, five scrub-inputs (the
 selected patch's φ and s, the selected square's width, height, and
 slope), ten buttons (Reset, Center apex, Save scene, Load scene,
 Export visual state, Generate .kra, + Patch, + Clone, + Square,
-+ Clone), two lists, a persistent hint block.
++ Clone), a KRA-export options block (text position, text padding,
+rectangle on/off, text color), two lists, a persistent hint block.
 """
 
 HTML_HEAD = r"""<!DOCTYPE html>
@@ -54,6 +55,13 @@ HTML_HEAD = r"""<!DOCTYPE html>
     flex:1 1 auto; min-width:0;
     accent-color:#00e5ff;
   }
+  #ui .field input[type=checkbox] {
+    flex:0 0 auto;
+    margin-left:auto;
+    accent-color:#00e5ff;
+    cursor:pointer;
+    width:14px; height:14px;
+  }
   #ui .field .val {
     flex:0 0 44px;
     font-size:11px; color:#00e5ff;
@@ -92,6 +100,27 @@ HTML_HEAD = r"""<!DOCTYPE html>
     color:#3d4756;
     border-bottom-color:#1e2836;
     cursor:not-allowed;
+  }
+
+  #ui .field select {
+    flex:1 1 auto;
+    min-width:0;
+    background:#0e1622;
+    color:#b8c4d2;
+    border:1px solid #223040;
+    font-family:inherit;
+    font-size:11px;
+    padding:2px 4px;
+    border-radius:2px;
+    outline:none;
+    cursor:pointer;
+  }
+  #ui .field select:hover {
+    border-color:#34445a;
+    color:#dce6f2;
+  }
+  #ui .field select:focus {
+    border-color:#00e5ff;
   }
 
   #ui .row { display:flex; gap:6px; margin:6px 0; }
@@ -395,6 +424,39 @@ HTML_HEAD = r"""<!DOCTYPE html>
   <div class="row">
     <button id="exportBtn">Export visual state</button>
     <button id="generateKraBtn">Generate .kra</button>
+  </div>
+
+  <hr>
+
+  <div class="field" style="margin-bottom:2px;">
+    <label>KRA text</label>
+    <select id="kraTextPos">
+      <option value="center">center</option>
+      <option value="tl">top-left</option>
+      <option value="tr">top-right</option>
+      <option value="bl">bottom-left</option>
+      <option value="br">bottom-right</option>
+      <option value="top">top edge</option>
+      <option value="bottom">bottom edge</option>
+      <option value="left">left edge</option>
+      <option value="right">right edge</option>
+    </select>
+  </div>
+  <div class="field">
+    <label>Padding</label>
+    <input type="text" id="kraTextPad" class="scrubInput"
+           value="0.06" autocomplete="off" spellcheck="false">
+  </div>
+  <div class="field">
+    <label>Text color</label>
+    <select id="kraTextColor">
+      <option value="color">patch hue</option>
+      <option value="black">black</option>
+    </select>
+  </div>
+  <div class="field">
+    <label>Rectangles</label>
+    <input type="checkbox" id="kraDrawRects" checked>
   </div>
 
   <div id="status">drag apex to tilt · scroll to change depth</div>

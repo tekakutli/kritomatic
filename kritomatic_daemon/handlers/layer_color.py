@@ -1,4 +1,5 @@
 from krita import Krita
+from ..utils.refresh import refresh
 from ..decorators import command
 
 class LayerColorHandler:
@@ -56,7 +57,7 @@ class LayerColorHandler:
             color_filter.setConfiguration(config)
 
             color_filter.apply(dup_layer, 0, 0, doc.width(), doc.height())
-            doc.refreshProjection()
+            refresh(doc)
 
             return {
                 'success': True,
@@ -119,7 +120,7 @@ class LayerColorHandler:
 
             target_layer.addChildNode(filter_mask, None)
             doc.setActiveNode(filter_mask)
-            doc.refreshProjection()
+            refresh(doc)
 
             return {
                 'success': True,

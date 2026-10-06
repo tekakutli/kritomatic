@@ -1,6 +1,7 @@
 import json
 import re
 from krita import Krita
+from ..utils.refresh import refresh
 from ..decorators import command
 
 class LayerTextHandler:
@@ -85,7 +86,7 @@ class LayerTextHandler:
     </svg>'''
 
             target_layer.addShapesFromSvg(svg)
-            doc.refreshProjection()
+            refresh(doc)
 
             return {'success': True, 'message': f'Added text to "{layer_name}"', 'data': {'text': text, 'font': font_family, 'size': font_size, 'position': (x, y), 'rotation': rotation, 'canvas': (canvas_width, canvas_height)}}
         except Exception as e:
@@ -164,7 +165,7 @@ class LayerTextHandler:
             )
 
             target_layer.addShapesFromSvg(svg)
-            doc.refreshProjection()
+            refresh(doc)
 
             return {
                 'success': True,
@@ -235,7 +236,7 @@ class LayerTextHandler:
                     if hasattr(new_shape, 'setTransformation'):
                         new_shape.setTransformation(transform)
 
-            doc.refreshProjection()
+            refresh(doc)
 
             return {'success': True, 'message': f'Updated text from "{old_text}" to "{new_text}" on "{layer_name}"'}
 
@@ -350,7 +351,7 @@ class LayerTextHandler:
                     layers_modified += 1
                     print(f"  ✓ Updated {replacements_in_layer} text(s) in layer '{layer.name()}'")
 
-            doc.refreshProjection()
+            refresh(doc)
 
             return {
                 'success': True,

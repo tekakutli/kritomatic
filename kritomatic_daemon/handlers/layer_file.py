@@ -7,6 +7,7 @@ from PyQt5.QtWidgets import QApplication
 from PyQt5.QtGui import QImage
 from PyQt5.QtCore import Qt
 from krita import Krita
+from ..utils.refresh import refresh
 from ..decorators import command
 
 class LayerFileHandler:
@@ -58,7 +59,7 @@ class LayerFileHandler:
             QApplication.processEvents()
 
             if not (width or height or x != 0 or y != 0):
-                doc.refreshProjection()
+                refresh(doc)
                 return {'success': True, 'message': f'Created file layer "{name}"',
                         'data': {'name': name, 'file_path': file_path}}
 
@@ -104,7 +105,7 @@ class LayerFileHandler:
             QApplication.processEvents()
 
             doc.setActiveNode(transform_mask)
-            doc.refreshProjection()
+            refresh(doc)
             QApplication.processEvents()
 
             return {
@@ -177,7 +178,7 @@ class LayerFileHandler:
             layer.setPixelData(raw, x, y, iw, ih)
 
             doc.setActiveNode(layer)
-            doc.refreshProjection()
+            refresh(doc)
 
             return {
                 'success': True,
@@ -239,7 +240,7 @@ class LayerFileHandler:
 
                 target_doc.rootNode().addChildNode(group, None)
                 target_doc.setActiveNode(group)
-                target_doc.refreshProjection()
+                target_refresh(doc)
             finally:
                 src_doc.setBatchmode(src_batch_was)
                 src_doc.close()
@@ -317,7 +318,7 @@ class LayerFileHandler:
 
             duplicated_layer = src_layer.duplicate()
             temp_doc.rootNode().addChildNode(duplicated_layer, None)
-            temp_doc.refreshProjection()
+            temp_refresh(doc)
             temp_doc.saveAs(output_path)
             temp_doc.close()
 
@@ -337,7 +338,7 @@ class LayerFileHandler:
                 original_parent.addChildNode(group_layer, None)
 
             doc.setActiveNode(group_layer)
-            doc.refreshProjection()
+            refresh(doc)
 
             return {
                 'success': True,

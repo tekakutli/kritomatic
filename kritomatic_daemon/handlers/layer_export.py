@@ -2,6 +2,7 @@ import random
 import string
 from pathlib import Path
 from krita import Krita
+from ..utils.refresh import refresh
 from ..decorators import command
 
 class LayerExportHandler:
@@ -49,7 +50,7 @@ class LayerExportHandler:
             duplicated_layer = src_layer.duplicate()
             dst_doc.rootNode().addChildNode(duplicated_layer, None)
             app.activeWindow().addView(dst_doc)
-            dst_doc.refreshProjection()
+            dst_refresh(doc)
 
             return {
                 'success': True,
@@ -113,7 +114,7 @@ class LayerExportHandler:
             temp_doc = app.createDocument(width, height, "__temp_export__", src_doc.colorModel(), src_doc.colorDepth(), src_doc.colorProfile(), src_doc.resolution())
             duplicated_layer = src_layer.duplicate()
             temp_doc.rootNode().addChildNode(duplicated_layer, None)
-            temp_doc.refreshProjection()
+            temp_refresh(doc)
             temp_doc.saveAs(output_path)
             temp_doc.close()
 
@@ -129,7 +130,7 @@ class LayerExportHandler:
             else:
                 original_parent.addChildNode(file_layer, None)
 
-            src_doc.refreshProjection()
+            src_refresh(doc)
 
             return {
                 'success': True,

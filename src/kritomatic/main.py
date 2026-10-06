@@ -433,6 +433,18 @@ def main():
                 # Normal output - print the whole response
                 print(json.dumps(response, indent=2))
 
+            # A successful daemon reload swaps the handler tree on the
+            # server; if the edit changed the schema (new command, new
+            # arg, changed choices), the CLI's cached schema is now
+            # stale.  Refresh it here so the next `kritomatic ...`
+            # invocation picks up the new shape without a separate
+            # `kritomatic --refresh`.  If the schema did not actually
+            # change, this is a single round trip and no disk write.
+            if cmd_type == 'reload_daemon' and response.get('status') == 'success':
+                if not suppress_output:
+                    print()
+                registry_mgr.refresh_from_daemon(client)
+
         client.close()
 
     else:

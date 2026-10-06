@@ -3,6 +3,7 @@ import math
 import re
 import xml.etree.ElementTree as ET
 from krita import Krita
+from ..utils.refresh import refresh
 from ..decorators import command
 
 
@@ -185,7 +186,7 @@ class LayerTransformHandler:
             mask = doc.createTransformMask(mask_name)
             target.addChildNode(mask, None)
             doc.setActiveNode(mask)
-            doc.refreshProjection()
+            refresh(doc)
 
             return {
                 'success': True,
@@ -279,7 +280,7 @@ class LayerTransformHandler:
             sy_e.set('value', str(sy))
 
             mask.fromXML(_serialize_transform_xml(root))
-            doc.refreshProjection()
+            refresh(doc)
 
             return {
                 'success': True,
@@ -385,7 +386,7 @@ class LayerTransformHandler:
             sy_e.set('value', '1')
 
             mask.fromXML(_serialize_transform_xml(root))
-            doc.refreshProjection()
+            refresh(doc)
 
             return {
                 'success': True,
@@ -485,7 +486,7 @@ class LayerTransformHandler:
             transform_mask.fromXML(_serialize_transform_xml(root))
 
             doc.setActiveNode(transform_mask)
-            doc.refreshProjection()
+            refresh(doc)
 
             return {
                 'success': True,

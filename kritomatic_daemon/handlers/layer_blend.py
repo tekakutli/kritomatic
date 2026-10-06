@@ -1,4 +1,5 @@
 from krita import Krita
+from ..utils.refresh import refresh
 from ..decorators import command
 
 class LayerBlendHandler:
@@ -42,7 +43,7 @@ class LayerBlendHandler:
 
             # Make it active
             doc.setActiveNode(new_layer)
-            doc.refreshProjection()
+            refresh(doc)
 
             return {
                 'success': True,

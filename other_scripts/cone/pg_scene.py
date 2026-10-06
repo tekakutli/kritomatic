@@ -9,10 +9,27 @@ The scene is the complete editable state of the workspace:
     squares         id, name, quadId, u, v, scaleU, scaleV, theta,
                     slope
     id counters     nextQuadId, nextSquareId
+    kraOptions      the KRA-export meta-options block
 
 The save and the load both speak the same JSON shape.  Saving writes
 a data URL and triggers a download; loading opens a file picker, reads
 the file, and applies it in place.
+
+KRA options
+===========
+The KRA-export meta-options (text position, text padding, draw
+rectangles, text color) are saved alongside the geometry, so a scene
+reloaded later produces the same .kra without the user re-setting
+every dropdown.
+
+The functions readKraOptionsFromDOM and applyKraOptionsToDOM live in
+pg_kra.py and are the single point of truth for what the options
+are.  This module simply calls them: adding a new option in pg_kra
+automatically makes it part of the scene, with no change here.
+
+The `kraOptions` field is optional on load: a scene file from before
+the field existed simply does not restore the panel's option
+controls, leaving them at whatever the current session already had.
 
 File shape
 ==========
@@ -25,7 +42,8 @@ File shape
       "nextQuadId":   3,
       "nextSquareId": 5,
       "patches":      [ ... ],
-      "squares":      [ ... ]
+      "squares":      [ ... ],
+      "kraOptions":   { ... }
     }
 
 The "type" field is a plain string tag so a scene file can be
@@ -111,6 +129,14 @@ function buildSceneJSON() {
       theta:  sq.theta || 0,
       slope:  sq.slope || 0,
     })),
+
+    /* KRA-export meta-options.  The mapping between DOM controls
+       and this object is defined entirely inside pg_kra.py, via
+       readKraOptionsFromDOM / applyKraOptionsToDOM.  Adding a new
+       option there makes it automatically part of the scene. */
+    kraOptions: (typeof readKraOptionsFromDOM === "function")
+                  ? readKraOptionsFromDOM()
+                  : undefined,
   };
 }
 
@@ -188,6 +214,14 @@ function applySceneJSON(data) {
     SHAPE_DEPTH_CONE = data.shapeDepth;
   }
   /* SHAPE_DEPTH_FLAT is a fixed const and is not restored. */
+
+  /* ---- KRA meta-options --------------------------------------- */
+  /* The DOM ⇄ object mapping lives in pg_kra.py.  Older scenes
+     without this field simply leave the panel's option controls
+     at whatever the current session already has. */
+  if (data.kraOptions && typeof applyKraOptionsToDOM === "function") {
+    applyKraOptionsToDOM(data.kraOptions);
+  }
 
   /* ---- patches ------------------------------------------------- */
   const patches = Array.isArray(data.patches) ? data.patches : [];

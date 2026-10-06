@@ -51,8 +51,24 @@ class BatchExecutor:
         if cmd_type == 'include':
             return processed
 
-        # Fields that contain names we want to prefix
-        name_fields = ['name', 'layer_name', 'mask_name', 'group_name', 'reference']
+        # Fields that contain names we want to prefix.
+        #
+        # `name`          the layer being created
+        # `layer_name`    the layer a command targets
+        # `mask_name`     a transform/selection/filter mask by name
+        # `group_name`    the destination of a move-to-group
+        # `reference`     the above_named / below_named anchor
+        # `parent`        the explicit parent group of a create_layer
+        #
+        # Every one of these is a name that refers to a node inside the
+        # document, and the daemon will look it up after the prefix has
+        # been applied to the name it was created with.  The list must
+        # include any argument that carries a node name, or the lookup
+        # uses the bare name and finds nothing.
+        name_fields = [
+            'name', 'layer_name', 'mask_name', 'group_name',
+            'reference', 'parent',
+        ]
 
         for field in name_fields:
             if field in processed and processed[field]:

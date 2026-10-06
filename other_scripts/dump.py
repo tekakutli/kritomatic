@@ -52,7 +52,8 @@ DEFAULT_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules", 
 # filename contains AT LEAST ONE of these substrings (partial match,
 # case-sensitive). Leave empty ([]) to disable this filter entirely.
 # e.g. ["_config", "settings"] to only dump config-like files.
-DEFAULT_INCLUDE_FILE_SUBSTRINGS = ["cable", "pg", "room"]
+# DEFAULT_INCLUDE_FILE_SUBSTRINGS = ["cable", "pg", "room"]
+DEFAULT_INCLUDE_FILE_SUBSTRINGS = []
 
 # Filename substrings blacklist: if a filename contains ANY of these
 # (partial match, case-sensitive), the file is skipped.

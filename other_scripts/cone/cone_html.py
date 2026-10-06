@@ -8,6 +8,7 @@ Concatenation order:
     FLAT_VIEW_JS        drawFlatView — the parameter-space view
     FLOAT_SQUARES_JS    shapes on each patch's plane
     EXPORT_JS           the visual-state JSON export
+    KRA_JS              the .kra export (polygons via the daemon)
     PANEL_JS            slider + list + button bindings
     SCENE_JS            scene save / load
     DISPATCH_JS         draw() orchestrator + canvas event listeners
@@ -20,6 +21,7 @@ from pg_view_cone    import CONE_VIEW_JS
 from pg_view_flat    import FLAT_VIEW_JS
 from pg_view_squares import FLOAT_SQUARES_JS
 from pg_export       import EXPORT_JS
+from pg_kra          import KRA_JS
 from pg_panel        import PANEL_JS
 from pg_scene        import SCENE_JS
 from pg_dispatch     import DISPATCH_JS
@@ -35,6 +37,7 @@ def render():
         + FLAT_VIEW_JS
         + FLOAT_SQUARES_JS
         + EXPORT_JS
+        + KRA_JS
         + PANEL_JS
         + SCENE_JS
         + DISPATCH_JS

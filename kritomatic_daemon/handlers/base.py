@@ -137,8 +137,9 @@ class CommandHandler:
                           'create_transform_mask', 'transform_mask', 'fit_to_canvas']:
             return self.handlers['layer'].execute(cmd_type, command)
 
-        # Text commands
-        elif cmd_type in ['add_vector_text', 'update_vector_text', 'list_shapes', 'replace_all_text',
+        # Vector shapes: text and polygons
+        elif cmd_type in ['add_vector_text', 'add_vector_polygon',
+                          'update_vector_text', 'list_shapes', 'replace_all_text',
                           'extract_all_text']:
             return self.handlers['layer'].execute(cmd_type, command)
 

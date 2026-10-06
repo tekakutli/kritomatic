@@ -1,3 +1,4 @@
+import json
 import re
 from krita import Krita
 from ..decorators import command
@@ -6,6 +7,8 @@ class LayerTextHandler:
     def execute(self, cmd_type, params):
         if cmd_type == 'add_vector_text':
             return self.add_vector_text(params)
+        elif cmd_type == 'add_vector_polygon':
+            return self.add_vector_polygon(params)
         elif cmd_type == 'update_vector_text':
             return self.update_vector_text(params)
         elif cmd_type == 'list_shapes':
@@ -85,6 +88,90 @@ class LayerTextHandler:
             doc.refreshProjection()
 
             return {'success': True, 'message': f'Added text to "{layer_name}"', 'data': {'text': text, 'font': font_family, 'size': font_size, 'position': (x, y), 'rotation': rotation, 'canvas': (canvas_width, canvas_height)}}
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    @command(
+        category='layer',
+        help_text='Add a polygon to a vector layer',
+        args={
+            '--layer_name': {'type': 'str', 'required': True,
+                             'help': 'Name of the target vector layer'},
+            '--points': {'type': 'str', 'required': True,
+                         'help': 'JSON list of [x, y] coordinate pairs, e.g. '
+                                 '"[[10,20],[30,20],[30,40],[10,40]]"'},
+            '--fill': {'type': 'str', 'default': '#ffffff',
+                       'help': 'Fill color (hex), or "none"'},
+            '--fill_opacity': {'type': 'float', 'default': 1.0,
+                               'help': 'Fill opacity (0.0 - 1.0)'},
+            '--stroke': {'type': 'str', 'default': 'none',
+                         'help': 'Stroke color (hex), or "none"'},
+            '--stroke_width': {'type': 'float', 'default': 2.0,
+                               'help': 'Stroke width in pixels'},
+            '--stroke_opacity': {'type': 'float', 'default': 1.0,
+                                 'help': 'Stroke opacity (0.0 - 1.0)'},
+        }
+    )
+    def add_vector_polygon(self, params):
+        try:
+            app = Krita.instance()
+            doc = app.activeDocument()
+            if not doc:
+                return {'success': False, 'message': 'No active document'}
+
+            layer_name    = params.get('layer_name', '')
+            points_raw    = params.get('points', '')
+            fill          = params.get('fill', '#ffffff')
+            fill_opacity  = float(params.get('fill_opacity', 1.0))
+            stroke        = params.get('stroke', 'none')
+            stroke_width  = float(params.get('stroke_width', 2.0))
+            stroke_opacity = float(params.get('stroke_opacity', 1.0))
+
+            target_layer = doc.nodeByName(layer_name)
+            if not target_layer:
+                return {'success': False,
+                        'message': f'Layer "{layer_name}" not found'}
+            if target_layer.type() != 'vectorlayer':
+                return {'success': False,
+                        'message': f'Layer "{layer_name}" is not a vector layer'}
+
+            # The points arrive either as a JSON string (CLI form) or as a
+            # list of pairs (direct batch form); normalise both.
+            if isinstance(points_raw, str):
+                pts = json.loads(points_raw)
+            else:
+                pts = points_raw
+
+            if not pts or len(pts) < 3:
+                return {'success': False,
+                        'message': 'At least 3 points required'}
+
+            points_attr = ' '.join(
+                f'{float(p[0])},{float(p[1])}' for p in pts
+            )
+
+            canvas_width  = doc.width()
+            canvas_height = doc.height()
+
+            svg = (
+                f'<svg width="{canvas_width}" height="{canvas_height}" '
+                f'xmlns="http://www.w3.org/2000/svg">'
+                f'<polygon points="{points_attr}" '
+                f'fill="{fill}" fill-opacity="{fill_opacity}" '
+                f'stroke="{stroke}" stroke-width="{stroke_width}" '
+                f'stroke-opacity="{stroke_opacity}"/>'
+                f'</svg>'
+            )
+
+            target_layer.addShapesFromSvg(svg)
+            doc.refreshProjection()
+
+            return {
+                'success': True,
+                'message': f'Added polygon ({len(pts)} points) to '
+                           f'"{layer_name}"',
+                'data': {'layer_name': layer_name, 'point_count': len(pts)},
+            }
         except Exception as e:
             return {'success': False, 'message': str(e)}
 

@@ -3,9 +3,9 @@ pg_base.py — palette, stylesheet, HTML head, bootstrap.
 
 The panel carries five graphics sliders, five scrub-inputs (the
 selected patch's φ and s, the selected square's width, height, and
-slope), nine buttons (Reset, Center apex, Save scene, Load scene,
-Export visual state, + Patch, + Clone, + Square, + Clone), two
-lists, a persistent hint block.
+slope), ten buttons (Reset, Center apex, Save scene, Load scene,
+Export visual state, Generate .kra, + Patch, + Clone, + Square,
++ Clone), two lists, a persistent hint block.
 """
 
 HTML_HEAD = r"""<!DOCTYPE html>
@@ -377,6 +377,10 @@ HTML_HEAD = r"""<!DOCTYPE html>
     drag patch &phi;/s, square W/H, or slope to scrub &middot;
     <span class="kbd">Shift</span> to snap
   </div>
+  <div class="hintLine">
+    <span class="kbd">Generate .kra</span> writes one vector-text layer
+    per square, laid out in the flat view
+  </div>
 
   <hr>
 
@@ -390,6 +394,7 @@ HTML_HEAD = r"""<!DOCTYPE html>
   </div>
   <div class="row">
     <button id="exportBtn">Export visual state</button>
+    <button id="generateKraBtn">Generate .kra</button>
   </div>
 
   <div id="status">drag apex to tilt · scroll to change depth</div>

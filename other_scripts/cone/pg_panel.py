@@ -2,15 +2,19 @@
 pg_panel.py — panel bindings.
 
 Five graphics sliders, five scrub-inputs (the selected patch's φ and
-s, the selected square's width, height, and slope), nine buttons
+s, the selected square's width, height, and slope), ten buttons
 (Save scene, Load scene, Reset, Center apex, Export visual state,
-+ Patch, + Clone, + Square, + Clone), two lists, a persistent hint
-block.
+Generate .kra, + Patch, + Clone, + Square, + Clone), two lists, a
+persistent hint block.
 
 Save scene writes the whole editable workspace — cone state, patch
 and shape data, id counters — to a JSON file.  Load scene opens a
 file picker and applies the file in place.  Both buttons delegate to
 pg_scene.py.
+
+Generate .kra POSTs the current scene's shapes to the local HTTP
+server, which forwards them to the Kritomatic daemon as a batch of
+vector-text creation commands.  See cone_kra.py and pg_kra.py.
 
 The scrub-input mechanics, patch-position setters, and list sync are
 unchanged from the previous revision; see that module for the details.
@@ -108,6 +112,14 @@ normalized (u, v), same scaleU / scaleV, same theta, same slope.
 The clone overlaps its source pixel-for-pixel until it is dragged
 away.  The clone receives a fresh id and default name and becomes
 the new selection.
+
+GENERATE .KRA
+=============
+The "Generate .kra" button walks floatSquares, packages each shape
+as a flat-view item, and POSTs the list to /generate-kra on the
+local server.  The server forwards to cone_kra.py, which builds a
+Kritomatic batch and sends it to the Krita daemon.  The output is a
+.kra with one vector-text layer per shape.
 """
 
 PANEL_JS = r"""
@@ -618,15 +630,16 @@ function flashStatus(msg, cls) {
   const m  = document.getElementById("meridiansSlider");
   const sd = document.getElementById("shapeDepthSlider");
 
-  const resetBtn      = document.getElementById("resetBtn");
-  const centerBtn     = document.getElementById("centerBtn");
-  const addBtn        = document.getElementById("addQuadBtn");
-  const cloneBtn      = document.getElementById("cloneQuadBtn");
-  const addSqBtn      = document.getElementById("addSquareBtn");
-  const cloneSqBtn    = document.getElementById("cloneSquareBtn");
-  const exportBtn     = document.getElementById("exportBtn");
-  const saveSceneBtn  = document.getElementById("saveSceneBtn");
-  const loadSceneBtn  = document.getElementById("loadSceneBtn");
+  const resetBtn       = document.getElementById("resetBtn");
+  const centerBtn      = document.getElementById("centerBtn");
+  const addBtn         = document.getElementById("addQuadBtn");
+  const cloneBtn       = document.getElementById("cloneQuadBtn");
+  const addSqBtn       = document.getElementById("addSquareBtn");
+  const cloneSqBtn     = document.getElementById("cloneSquareBtn");
+  const exportBtn      = document.getElementById("exportBtn");
+  const generateKraBtn = document.getElementById("generateKraBtn");
+  const saveSceneBtn   = document.getElementById("saveSceneBtn");
+  const loadSceneBtn   = document.getElementById("loadSceneBtn");
 
   if (d) d.addEventListener("input", () => {
     cone.depth = parseFloat(d.value);
@@ -748,35 +761,37 @@ function flashStatus(msg, cls) {
 
   /* ---- buttons and lists ----------------------------------------- */
 
-  if (resetBtn)     resetBtn.addEventListener("click", resetView);
-  if (centerBtn)    centerBtn.addEventListener("click", () => {
+  if (resetBtn)       resetBtn.addEventListener("click", resetView);
+  if (centerBtn)      centerBtn.addEventListener("click", () => {
     cone.ax = 0;
     cone.ay = 0;
     draw();
   });
-  if (addBtn)       addBtn.addEventListener("click", addQuad);
-  if (cloneBtn)     cloneBtn.addEventListener("click", () => {
+  if (addBtn)         addBtn.addEventListener("click", addQuad);
+  if (cloneBtn)       cloneBtn.addEventListener("click", () => {
     if (selectedQuad < 0 || selectedQuad >= quads.length) {
       flashStatus("No patch selected", "warn");
       return;
     }
     cloneQuad(selectedQuad);
   });
-  if (addSqBtn)     addSqBtn.addEventListener("click", () => {
+  if (addSqBtn)       addSqBtn.addEventListener("click", () => {
     if (selectedQuad < 0 || selectedQuad >= quads.length) return;
     addSquareAtCenter(selectedQuad);
   });
-  if (cloneSqBtn)   cloneSqBtn.addEventListener("click", () => {
+  if (cloneSqBtn)     cloneSqBtn.addEventListener("click", () => {
     if (selectedSquare < 0 || selectedSquare >= floatSquares.length) {
       flashStatus("No square selected", "warn");
       return;
     }
     cloneSquare(selectedSquare);
   });
-  if (exportBtn)    exportBtn.addEventListener("click",
-                                               exportVisualStateJSON);
-  if (saveSceneBtn) saveSceneBtn.addEventListener("click", saveSceneJSON);
-  if (loadSceneBtn) loadSceneBtn.addEventListener("click", promptLoadScene);
+  if (exportBtn)      exportBtn.addEventListener("click",
+                                                 exportVisualStateJSON);
+  if (generateKraBtn) generateKraBtn.addEventListener("click",
+                                                 generateKraFromScene);
+  if (saveSceneBtn)   saveSceneBtn.addEventListener("click", saveSceneJSON);
+  if (loadSceneBtn)   loadSceneBtn.addEventListener("click", promptLoadScene);
 
   window.addEventListener("keydown", (e) => {
     const t = e.target;

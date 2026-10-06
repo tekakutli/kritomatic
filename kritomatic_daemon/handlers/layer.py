@@ -35,8 +35,10 @@ class LayerHandler:
         elif cmd_type in ['create_transform_mask', 'transform_mask', 'fit_to_canvas']:
             return self.transform.execute(cmd_type, params)
 
-        # Text operations
-        elif cmd_type in ['add_vector_text', 'update_vector_text', 'list_shapes', 'replace_all_text', 'extract_all_text']:
+        # Vector shapes: text and polygons
+        elif cmd_type in ['add_vector_text', 'add_vector_polygon',
+                          'update_vector_text', 'list_shapes',
+                          'replace_all_text', 'extract_all_text']:
             return self.text.execute(cmd_type, params)
 
         # Fill operations

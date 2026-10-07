@@ -163,6 +163,8 @@ class CommandRegistry:
                    '  kritomatic layer create "My Layer"\n'
                    '  kritomatic batch run \'{"commands": [...]}\'\n'
                    '  kritomatic batch validate \'{"commands": [...]}\'\n'
+                   '  kritomatic text dump --output labels.json\n'
+                   '  kritomatic text load --input labels.json\n'
                    '  kritomatic --refresh\n'
                    '  kritomatic export-manual'
         )
@@ -203,6 +205,42 @@ class CommandRegistry:
         list_parser.add_argument('--verbose', '-v', action='store_true', help='Show detailed information')
         list_parser.add_argument('--tree', action='store_true', help='Show hierarchical view')
         list_parser.add_argument('--category', help='Show only commands in this category')
+
+        # Text viewer / editor.  The actual dispatch is client-side (see
+        # main.py), but the parser needs to know about the command so that
+        # `kritomatic --help` lists it and `kritomatic text` alone prints
+        # its own subcommand menu.  Both --help paths must stay in sync
+        # with text/cli.py's own HelpfulArgumentParser.
+        text_parser = subparsers.add_parser(
+            'text',
+            help='View and edit vector text layers in the running Krita'
+        )
+        text_sub = text_parser.add_subparsers(
+            dest='text_command', metavar='TEXT_COMMAND', required=True,
+            help='Text subcommands'
+        )
+
+        text_dump = text_sub.add_parser(
+            'dump',
+            help='Emit full metadata for every text layer'
+        )
+        text_dump.add_argument(
+            '--pattern', default=None,
+            help='Only layers matching this glob'
+        )
+        text_dump.add_argument(
+            '--output', '-o', default=None,
+            help='Write JSON to this file (default: stdout)'
+        )
+
+        text_load = text_sub.add_parser(
+            'load',
+            help='Push records from JSON back into Krita'
+        )
+        text_load.add_argument(
+            '--input', '-i', default=None,
+            help='Read JSON from this file (default: stdin)'
+        )
 
         # Batch commands
         batch_parser = subparsers.add_parser('batch', help='Batch operations')

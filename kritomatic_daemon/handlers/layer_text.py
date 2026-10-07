@@ -1,9 +1,135 @@
 import json
+import math
 import re
 from krita import Krita
 from PyQt5.QtGui import QTransform
 from ..decorators import command
 from ..utils.refresh import refresh
+
+
+# ==========================================================================
+# SVG parsing helpers
+# ==========================================================================
+
+_TEXT_BODY_RE = re.compile(r'<text[^>]*>([^<]*)</text>')
+_ATTR_RE = re.compile(r'\b([a-zA-Z-]+)="([^"]*)"')
+_STYLE_RE = re.compile(r'style="([^"]*)"')
+_STYLE_PROP_RE = re.compile(r'([a-zA-Z-]+)\s*:\s*([^;]+)')
+
+
+def _parse_text_svg(svg):
+    """Extract everything we can from a text shape's SVG.
+
+    Returns a dict with any of: text, x, y, color, font_family,
+    font_size, alignment.  Missing fields are simply absent, so the
+    caller can test for their presence.
+    """
+    out = {}
+
+    m = _TEXT_BODY_RE.search(svg)
+    if m:
+        out['text'] = m.group(1)
+
+    attrs = dict(_ATTR_RE.findall(svg))
+
+    style_props = {}
+    sm = _STYLE_RE.search(svg)
+    if sm:
+        style_props = {k.strip(): v.strip()
+                       for k, v in _STYLE_PROP_RE.findall(sm.group(1))}
+
+    for key in ('x', 'y'):
+        raw = attrs.get(key)
+        if raw is not None:
+            try:
+                out[key] = float(raw)
+            except ValueError:
+                pass
+
+    if 'fill' in attrs:
+        out['color'] = attrs['fill']
+
+    ff = attrs.get('font-family') or style_props.get('font-family')
+    if ff:
+        out['font_family'] = ff.strip("'\"")
+
+    fs = attrs.get('font-size') or style_props.get('font-size')
+    if fs:
+        try:
+            out['font_size'] = float(fs)
+        except ValueError:
+            pass
+
+    anchor = attrs.get('text-anchor', '')
+    if anchor == 'middle':
+        out['alignment'] = 'center'
+    elif anchor == 'end':
+        out['alignment'] = 'right'
+    else:
+        out['alignment'] = 'left'
+
+    return out
+
+
+def _apply_rotation(shape, x, y, rotation_deg):
+    """Apply a rotation around (x, y) to a text shape, then nudge
+    Krita into recomputing its cached bounds.
+
+    A rotated text shape's cached bounds do not account for the
+    rotated glyph extents until a layout refresh occurs; without one
+    the glyphs render clipped.  Editing the text in Krita's vector
+    editor triggers that refresh; the calls below are the programmatic
+    equivalents, tried in order of likelihood.
+    """
+    if not rotation_deg:
+        return
+    if not hasattr(shape, 'setTransformation'):
+        return
+
+    t = QTransform()
+    t.translate(x, y)
+    t.rotate(rotation_deg)
+    t.translate(-x, -y)
+    shape.setTransformation(t)
+
+    for method_name, args in (
+        ('update', ()),
+        ('updateAbsoluteGeometry', ()),
+        ('setShapeChanged', (True,)),
+    ):
+        if hasattr(shape, method_name):
+            try:
+                getattr(shape, method_name)(*args)
+                return
+            except Exception:
+                continue
+
+
+def _find_text_shape(layer):
+    """Return the first text shape in a vector layer, or None."""
+    try:
+        for s in layer.shapes():
+            try:
+                if '<text' in s.toSvg():
+                    return s
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _collect_vector_layers(doc):
+    found = []
+
+    def walk(node):
+        if node.type() == 'vectorlayer':
+            found.append(node)
+        for child in node.childNodes():
+            walk(child)
+
+    walk(doc.rootNode())
+    return found
 
 
 class LayerTextHandler:
@@ -20,7 +146,17 @@ class LayerTextHandler:
             return self.replace_all_text(params)
         elif cmd_type == 'extract_all_text':
             return self.extract_all_text(params)
+        elif cmd_type == 'list_text_layers':
+            return self.list_text_layers(params)
+        elif cmd_type == 'get_layer_text_metadata':
+            return self.get_layer_text_metadata(params)
+        elif cmd_type == 'patch_layer_text':
+            return self.patch_layer_text(params)
         return {'success': False, 'message': f'Unknown text command: {cmd_type}'}
+
+    # ------------------------------------------------------------------
+    # add_vector_text
+    # ------------------------------------------------------------------
 
     @command(
         category='layer',
@@ -67,33 +203,24 @@ class LayerTextHandler:
                 x = canvas_width / 2
                 y = canvas_height / 2
 
+            # Every alignment gets dominant-baseline="middle" so the
+            # y-coordinate always means the vertical center of the
+            # text, regardless of horizontal alignment.  Without this,
+            # center-aligned text has its y at the visual middle, but
+            # left- and right-aligned text have y at the baseline,
+            # which is a different vertical position by roughly half a
+            # line height.
             text_align = ""
             if alignment == "center":
                 text_align = ' text-anchor="middle" dominant-baseline="middle"'
+            elif alignment == "left":
+                text_align = ' text-anchor="start" dominant-baseline="middle"'
             elif alignment == "right":
-                text_align = ' text-anchor="end"'
+                text_align = ' text-anchor="end" dominant-baseline="middle"'
 
             if not color.startswith('#'):
                 color = '#' + color
 
-            # The text is always added WITHOUT rotation in the SVG,
-            # so Krita produces a plain TextShape that the text editor
-            # can open.  Rotation is applied afterwards via
-            # setTransformation, then a layout refresh is forced.
-            #
-            # Why not put the rotation in the SVG:
-            #   - `transform=` on <text>: silently dropped by Krita's
-            #     parser, text ends up un-rotated.
-            #   - `<g transform=...><text/></g>`: rotation preserved,
-            #     bounds correct — but Krita wraps the result in a
-            #     GroupShape, and the TextShape inside it is not
-            #     directly editable from the canvas.
-            #   - `setTransformation` alone: rotation stored, but the
-            #     shape's cached bounds don't account for the rotated
-            #     extents, so the glyphs get clipped.  Editing the
-            #     text in the vector editor fixes it because that
-            #     triggers a relayout; we call the same underlying
-            #     update here.
             svg = (
                 f'<svg width="{canvas_width}" height="{canvas_height}" '
                 f'xmlns="http://www.w3.org/2000/svg">'
@@ -107,12 +234,6 @@ class LayerTextHandler:
             shapes_after = list(target_layer.shapes())
 
             if rotation and shapes_after:
-                # The newly added shape is the one whose text content
-                # matches.  Identify by SVG content rather than by
-                # object identity: Krita's SIP bindings create a
-                # fresh Python wrapper every time shapes() is called,
-                # so id-based matching across two calls silently
-                # picks the oldest shape.
                 marker = f'>{text}<'
                 new_shape = None
                 for s in shapes_after:
@@ -124,30 +245,7 @@ class LayerTextHandler:
                         continue
                 if new_shape is None:
                     new_shape = shapes_after[-1]
-
-                if hasattr(new_shape, 'setTransformation'):
-                    t = QTransform()
-                    t.translate(x, y)
-                    t.rotate(rotation)
-                    t.translate(-x, -y)
-                    new_shape.setTransformation(t)
-
-                    # Force a layout / bounds recompute.  Try each of
-                    # the plausible method names in turn; different
-                    # Krita builds expose different sets of them, and
-                    # one of these is what the text editor's delete
-                    # keypress ends up triggering under the hood.
-                    for method_name, args in (
-                        ('update', ()),
-                        ('updateAbsoluteGeometry', ()),
-                        ('setShapeChanged', (True,)),
-                    ):
-                        if hasattr(new_shape, method_name):
-                            try:
-                                getattr(new_shape, method_name)(*args)
-                                break
-                            except Exception:
-                                continue
+                _apply_rotation(new_shape, x, y, rotation)
 
             refresh(doc)
 
@@ -162,6 +260,10 @@ class LayerTextHandler:
             }
         except Exception as e:
             return {'success': False, 'message': str(e)}
+
+    # ------------------------------------------------------------------
+    # add_vector_polygon
+    # ------------------------------------------------------------------
 
     @command(
         category='layer',
@@ -245,6 +347,10 @@ class LayerTextHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    # ------------------------------------------------------------------
+    # update_vector_text
+    # ------------------------------------------------------------------
+
     @command(
         category='layer',
         help_text='Update existing text on a vector layer',
@@ -312,6 +418,10 @@ class LayerTextHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    # ------------------------------------------------------------------
+    # list_shapes
+    # ------------------------------------------------------------------
+
     @command(
         category='layer',
         help_text='List all shapes on a vector layer (for debugging)',
@@ -337,6 +447,10 @@ class LayerTextHandler:
             return {'success': True, 'message': f'Found {len(shapes)} shapes', 'data': {'shapes': shapes}}
         except Exception as e:
             return {'success': False, 'message': str(e)}
+
+    # ------------------------------------------------------------------
+    # replace_all_text
+    # ------------------------------------------------------------------
 
     @command(
         category='layer',
@@ -436,6 +550,10 @@ class LayerTextHandler:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
+    # ------------------------------------------------------------------
+    # extract_all_text
+    # ------------------------------------------------------------------
+
     @command(
         category='layer',
         help_text='Extract all text from vector text objects in the document',
@@ -477,7 +595,6 @@ class LayerTextHandler:
             if not vector_layers:
                 return {'success': False, 'message': 'No vector layers found'}
 
-            import re
             results = []
             total_text_objects = 0
 
@@ -537,5 +654,232 @@ class LayerTextHandler:
                     }
                 }
 
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    # ------------------------------------------------------------------
+    # list_text_layers
+    # ------------------------------------------------------------------
+
+    @command(
+        category='layer',
+        help_text='List the names of every vector layer that contains at '
+                  'least one text shape',
+        args={}
+    )
+    def list_text_layers(self, params):
+        try:
+            doc = Krita.instance().activeDocument()
+            if not doc:
+                return {'success': False, 'message': 'No active document'}
+
+            names = []
+            for layer in _collect_vector_layers(doc):
+                if _find_text_shape(layer) is not None:
+                    names.append(layer.name())
+
+            return {
+                'success': True,
+                'message': f'{len(names)} text layer(s)',
+                'data': {'layers': names},
+            }
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    # ------------------------------------------------------------------
+    # get_layer_text_metadata
+    # ------------------------------------------------------------------
+
+    @command(
+        category='layer',
+        help_text='Return the full record of a layer\'s text shape: its '
+                  'content, font, size, color, position, alignment, and '
+                  'rotation, drawn from the shape\'s SVG and its transform.',
+        args={
+            '--layer_name': {'type': 'str', 'required': True,
+                             'help': 'Name of the vector layer'},
+        }
+    )
+    def get_layer_text_metadata(self, params):
+        try:
+            doc = Krita.instance().activeDocument()
+            if not doc:
+                return {'success': False, 'message': 'No active document'}
+
+            layer_name = params.get('layer_name', '')
+            layer = doc.nodeByName(layer_name)
+            if not layer:
+                return {'success': False,
+                        'message': f'Layer "{layer_name}" not found'}
+            if layer.type() != 'vectorlayer':
+                return {'success': False,
+                        'message': f'Layer "{layer_name}" is not a vector layer'}
+
+            shape = _find_text_shape(layer)
+            if shape is None:
+                return {'success': False,
+                        'message': f'Layer "{layer_name}" has no text shape'}
+
+            svg = shape.toSvg()
+            record = {'layer_name': layer_name}
+            record.update(_parse_text_svg(svg))
+
+            if hasattr(shape, 'transformation'):
+                try:
+                    t = shape.transformation()
+                    if t is not None:
+                        record['rotation_deg'] = math.degrees(
+                            math.atan2(t.m12(), t.m11())
+                        )
+                        record['transform'] = [
+                            t.m11(), t.m12(), t.m13(),
+                            t.m21(), t.m22(), t.m23(),
+                            t.m31(), t.m32(), t.m33(),
+                        ]
+                except Exception:
+                    pass
+
+            return {
+                'success': True,
+                'message': f'Metadata for "{layer_name}"',
+                'data': record,
+            }
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    # ------------------------------------------------------------------
+    # patch_layer_text
+    # ------------------------------------------------------------------
+
+    @command(
+        category='layer',
+        help_text='Patch some fields of a layer\'s text shape.  Any field '
+                  'omitted from the patch is preserved from the shape\'s '
+                  'current state.  Fields: text, font_family, font_size, '
+                  'color, x, y, alignment, rotation_deg.',
+        args={
+            '--layer_name': {'type': 'str', 'required': True,
+                             'help': 'Name of the vector layer'},
+            '--patch': {'type': 'str', 'required': True,
+                        'help': 'JSON object with the fields to change'},
+        }
+    )
+    def patch_layer_text(self, params):
+        try:
+            doc = Krita.instance().activeDocument()
+            if not doc:
+                return {'success': False, 'message': 'No active document'}
+
+            layer_name = params.get('layer_name', '')
+            patch_raw = params.get('patch', '{}')
+            if isinstance(patch_raw, str):
+                patch = json.loads(patch_raw)
+            else:
+                patch = patch_raw
+            if not isinstance(patch, dict):
+                return {'success': False,
+                        'message': 'patch must be a JSON object'}
+
+            layer = doc.nodeByName(layer_name)
+            if not layer:
+                return {'success': False,
+                        'message': f'Layer "{layer_name}" not found'}
+            if layer.type() != 'vectorlayer':
+                return {'success': False,
+                        'message': f'Layer "{layer_name}" is not a vector layer'}
+
+            shape = _find_text_shape(layer)
+            if shape is None:
+                return {'success': False,
+                        'message': f'Layer "{layer_name}" has no text shape'}
+
+            # Current state, from the shape's SVG and its transform.
+            current = _parse_text_svg(shape.toSvg())
+            old_transform = None
+            if hasattr(shape, 'transformation'):
+                try:
+                    old_transform = shape.transformation()
+                except Exception:
+                    old_transform = None
+
+            def merged(key, default):
+                if key in patch:
+                    return patch[key]
+                return current.get(key, default)
+
+            text        = merged('text', '')
+            font_family = merged('font_family', 'sans-serif')
+            font_size   = merged('font_size', 12)
+            color       = merged('color', '#000000')
+            x           = merged('x', 0)
+            y           = merged('y', 0)
+            alignment   = merged('alignment', 'left')
+
+            if isinstance(color, str) and not color.startswith('#'):
+                color = '#' + color
+
+            text_align = ''
+            if alignment == 'center':
+                text_align = ' text-anchor="middle" dominant-baseline="middle"'
+            elif alignment == 'left':
+                text_align = ' text-anchor="start" dominant-baseline="middle"'
+            elif alignment == 'right':
+                text_align = ' text-anchor="end" dominant-baseline="middle"'
+
+            # Rotation: explicit patch field wins; else derive from the
+            # shape's existing transform.
+            if 'rotation_deg' in patch:
+                rotation_deg = float(patch['rotation_deg'])
+            elif old_transform is not None:
+                rotation_deg = math.degrees(
+                    math.atan2(old_transform.m12(), old_transform.m11())
+                )
+            else:
+                rotation_deg = 0
+
+            W = doc.width()
+            H = doc.height()
+
+            # Remove the old shape and add the new one.
+            shape.remove()
+
+            svg = (
+                f'<svg width="{W}" height="{H}" '
+                f'xmlns="http://www.w3.org/2000/svg">'
+                f'<text font-family="{font_family}" '
+                f'font-size="{font_size}" fill="{color}" '
+                f'x="{x}" y="{y}"{text_align}>{text}</text>'
+                f'</svg>'
+            )
+            layer.addShapesFromSvg(svg)
+
+            # Identify the newly added shape and re-apply the rotation.
+            marker = f'>{text}<'
+            new_shape = None
+            for s in layer.shapes():
+                try:
+                    if marker in s.toSvg():
+                        new_shape = s
+                        break
+                except Exception:
+                    continue
+            if new_shape is None:
+                all_shapes = list(layer.shapes())
+                if all_shapes:
+                    new_shape = all_shapes[-1]
+
+            if new_shape is not None:
+                _apply_rotation(new_shape, x, y, rotation_deg)
+
+            refresh(doc)
+
+            return {
+                'success': True,
+                'message': f'Patched "{layer_name}"',
+                'data': {
+                    'layer_name': layer_name,
+                    'applied': sorted(patch.keys()),
+                },
+            }
         except Exception as e:
             return {'success': False, 'message': str(e)}

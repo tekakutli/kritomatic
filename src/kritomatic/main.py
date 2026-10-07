@@ -64,6 +64,19 @@ def main():
         run_node_command()
         return
 
+    # ========== HANDLE text subcommands (client-side only) ==========
+    #
+    # Fires whenever the first positional is `text`, with or without
+    # anything after it.  run_text_command() passes sys.argv[2:] to its
+    # parser; if that is empty, the parser's required-subcommand error
+    # is intercepted by HelpfulArgumentParser, which prints the text
+    # subcommand's own help menu.  Same behavior as `kritomatic layer`
+    # and the rest of the CLI's subcommand groups.
+    if len(sys.argv) >= 2 and sys.argv[1] == 'text':
+        from text import run_text_command
+        run_text_command()
+        return
+
 
     # ========== NORMAL COMMAND EXECUTION ==========
     registry_mgr = get_registry_manager()

@@ -3515,6 +3515,34 @@ function _flatAnchorFromVisual(visualPts, W, H, position,
 }
 
 /* ==========================================================================
+   LEFT-ALIGNED ANCHOR CONVERSION
+   ==========================================================================
+   _flatAnchorFromVisual returns the anchor of the text's CENTER — the
+   point where a center-aligned text would sit.  When the export uses
+   left alignment instead (so that editing the text grows it in one
+   direction only), the anchor must be moved to the text's START.
+
+   In SVG, a left-aligned text extends from its anchor in the reading
+   direction, which in the flat frame is (cos R, sin R) for a rotation
+   of R degrees.  The text's visual center is half a text length along
+   that direction from the start.  So the start is the center shifted
+   backward by half the text's length:
+
+       start = center − (textLen / 2) · (cos R, sin R)
+
+   The returned object carries alignment: "left" so that the payload
+   tells the daemon which anchoring to use. */
+function _convertToLeftAnchor(anchorCenter, flatRotation, textLen, fontSize) {
+    const rad = flatRotation * Math.PI / 180;
+    const halfLen = (textLen * fontSize * 0.55) / 2;
+    return {
+        x: anchorCenter.x - halfLen * Math.cos(rad),
+        y: anchorCenter.y - halfLen * Math.sin(rad),
+        alignment: "left",
+    };
+}
+
+/* ==========================================================================
    SQUARE MODE
    ========================================================================== */
 
@@ -3563,9 +3591,12 @@ function buildKraShapes(options) {
     const name = squareDisplayName(sq);
     const fontNat = Math.min(W, H) * 0.40;
 
-    const anchor = _flatAnchorFromVisual(
+    const anchorCenter = _flatAnchorFromVisual(
       screenCorners, W, H, textPos, padFrac, fontNat, name.length,
       readingAngle, flatRotation
+    );
+    const anchor = _convertToLeftAnchor(
+      anchorCenter, flatRotation, name.length, fontNat
     );
 
     shapes.push({
@@ -3806,10 +3837,13 @@ function buildKraPatches(options) {
       const sqScreenCorners = squareCornersScreen(sq) || sqCorners;
       const flatRotSq = _shapeLabelFlatRotationDeg(sq, sqScreenCorners);
       const readAngSq = _shapeLabelScreenAngleDeg(sq, sqScreenCorners);
-      const anchorSq = _flatAnchorFromVisual(
+      const anchorSqCenter = _flatAnchorFromVisual(
         sqScreenCorners, W_sq, H_sq, textPos, padFrac,
         Math.min(W_sq, H_sq) * 0.40, name.length,
         readAngSq, flatRotSq
+      );
+      const anchorSq = _convertToLeftAnchor(
+        anchorSqCenter, flatRotSq, name.length, Math.min(W_sq, H_sq) * 0.40
       );
 
       let tx = null, ty = null;
@@ -3921,7 +3955,7 @@ function buildKraPatches(options) {
    TEXT MODE — one group + one mask per text, mask = square mask
    ==========================================================================
    Each text is placed inside its own group.  The group's mask is a
-   copy of the geometry that SQUARE MODE uses: source = [0, W]×[0, H]
+   copy of the geometry that SQUARE MODE uses: source = [0, W]x[0, H]
    of the square's flat rectangle; destination = the square's four
    projected corners.  Since that geometry is known to place text
    correctly, and since each text sits inside a group whose only
@@ -3993,10 +4027,13 @@ function buildKraTexts(options) {
     const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
     const fontNat = Math.min(W_sq, H_sq) * 0.40;
 
-    const anchor = _flatAnchorFromVisual(
+    const anchorCenter = _flatAnchorFromVisual(
       screenCorners, W_sq, H_sq, textPos, padFrac,
       fontNat, name.length,
       readingAngle, flatRotation
+    );
+    const anchor = _convertToLeftAnchor(
+      anchorCenter, flatRotation, name.length, fontNat
     );
 
     const srcPts = [
@@ -4015,6 +4052,7 @@ function buildKraTexts(options) {
       text_y: anchor.y,
       font_px: Math.max(6, fontNat),
       rotation: flatRotation,
+      alignment: anchor.alignment,
       color: textColor,
       src_pts: srcPts,
       dst_pts: dstPts,
@@ -4029,12 +4067,8 @@ function buildKraTexts(options) {
 
 function _coneBandDimensions() {
   const w = Math.max(1, Math.round(window.innerWidth));
-  const h = Math.max(1, Math.round(coneH_px()));
+  const h = Math.max(1, Math.round(layout.coneH));
   return { width: w, height: h };
-}
-
-function coneH_px() {
-  return layout.coneH;
 }
 
 /* ==========================================================================

@@ -16,7 +16,7 @@ Three export modes:
 
     text_warp_mode = "text"
         One group + one mask per TEXT.  Each text's mask is a copy
-        of the SQUARE'S OWN mask (same source rect, same destination
+        of the SQUARE'S own mask (same source rect, same destination
         quad).  In effect, each text lives alone inside a group whose
         mask projects the full flat rectangle of its square onto the
         square's projected corners — exactly the geometry that square
@@ -26,6 +26,18 @@ Three export modes:
         This is what produces correct placement, correct rotation,
         correct size, and no clipping: it reuses the geometry that
         is already known to work in square mode.
+
+POSITION-AWARE ALIGNMENT
+========================
+The text's visual anchor is computed in the flat square's frame by
+_flatAnchorFromVisual, which returns the CENTER of the text's visual
+box for the requested position.  The alignment sent to the daemon is
+chosen from that same requested position — a top-right anchor uses
+right alignment, a top-left anchor uses left, a top or center anchor
+uses center — so that editing a label later grows it away from the
+side it is attached to, rather than half in each direction from its
+center.  _anchorForPosition shifts the anchor along the reading
+direction by the amount appropriate to that alignment.
 
 Do NOT use squareFlatCorners here — that returns the unfolded-cone
 footprint, which loses the perspective.
@@ -249,6 +261,70 @@ function _flatAnchorFromVisual(visualPts, W, H, position,
 }
 
 /* ==========================================================================
+   POSITION-AWARE ALIGNMENT
+   ==========================================================================
+   _flatAnchorFromVisual returns the anchor of the text's visual CENTER
+   for the requested position.  The alignment the daemon writes then
+   determines where, along the reading direction, that anchor sits
+   relative to the text's visual box:
+
+       left    anchor at the box's -half-length end (start)
+       center  anchor at the box's middle
+       right   anchor at the box's +half-length end
+
+   So the visual box keeps the same center regardless of alignment,
+   and the anchor shifts along the reading direction by:
+
+       left    -halfLen * (cos R, sin R)
+       center   0
+       right   +halfLen * (cos R, sin R)
+
+   The alignment is chosen from the requested visual position: a text
+   anchored at a right-hand corner or edge uses right alignment; at a
+   left-hand corner or edge uses left; at the top, bottom, or center
+   uses center.  This makes editing a label grow it away from its
+   anchoring side — a top-right label grows leftward and downward
+   from its top-right corner, a top-left label grows rightward and
+   downward from its top-left corner, and so on.
+
+   The approximate text half-length (textLen * fontSize * 0.55 / 2) is
+   the same estimate used by _flatAnchorFromVisual; it is accurate to
+   a few percent of the true width for the sans-serif default and is
+   only used to place the anchor, not to set the font size. */
+
+function _alignmentForPosition(position) {
+    if (position === "tr" || position === "br" || position === "right") {
+        return "right";
+    }
+    if (position === "top" || position === "bottom" || position === "center") {
+        return "center";
+    }
+    return "left";
+}
+
+function _anchorForPosition(anchorCenter, flatRotation, textLen, fontSize,
+                            position) {
+    const alignment = _alignmentForPosition(position);
+    const rad = flatRotation * Math.PI / 180;
+    const halfLen = (textLen * fontSize * 0.55) / 2;
+
+    let dx = 0, dy = 0;
+    if (alignment === "left") {
+        dx = -halfLen * Math.cos(rad);
+        dy = -halfLen * Math.sin(rad);
+    } else if (alignment === "right") {
+        dx = halfLen * Math.cos(rad);
+        dy = halfLen * Math.sin(rad);
+    }
+
+    return {
+        x: anchorCenter.x + dx,
+        y: anchorCenter.y + dy,
+        alignment: alignment,
+    };
+}
+
+/* ==========================================================================
    SQUARE MODE
    ========================================================================== */
 
@@ -297,9 +373,12 @@ function buildKraShapes(options) {
     const name = squareDisplayName(sq);
     const fontNat = Math.min(W, H) * 0.40;
 
-    const anchor = _flatAnchorFromVisual(
+    const anchorCenter = _flatAnchorFromVisual(
       screenCorners, W, H, textPos, padFrac, fontNat, name.length,
       readingAngle, flatRotation
+    );
+    const anchor = _anchorForPosition(
+      anchorCenter, flatRotation, name.length, fontNat, textPos
     );
 
     shapes.push({
@@ -540,10 +619,14 @@ function buildKraPatches(options) {
       const sqScreenCorners = squareCornersScreen(sq) || sqCorners;
       const flatRotSq = _shapeLabelFlatRotationDeg(sq, sqScreenCorners);
       const readAngSq = _shapeLabelScreenAngleDeg(sq, sqScreenCorners);
-      const anchorSq = _flatAnchorFromVisual(
+      const anchorSqCenter = _flatAnchorFromVisual(
         sqScreenCorners, W_sq, H_sq, textPos, padFrac,
         Math.min(W_sq, H_sq) * 0.40, name.length,
         readAngSq, flatRotSq
+      );
+      const anchorSq = _anchorForPosition(
+        anchorSqCenter, flatRotSq, name.length,
+        Math.min(W_sq, H_sq) * 0.40, textPos
       );
 
       let tx = null, ty = null;
@@ -614,6 +697,7 @@ function buildKraPatches(options) {
         font_px:       font_px,
         color:         textColor,
         flat_rotation: flatRotation,
+        alignment:     anchorSq.alignment,
       });
 
       if (drawRects) {
@@ -655,7 +739,7 @@ function buildKraPatches(options) {
    TEXT MODE — one group + one mask per text, mask = square mask
    ==========================================================================
    Each text is placed inside its own group.  The group's mask is a
-   copy of the geometry that SQUARE MODE uses: source = [0, W]×[0, H]
+   copy of the geometry that SQUARE MODE uses: source = [0, W]x[0, H]
    of the square's flat rectangle; destination = the square's four
    projected corners.  Since that geometry is known to place text
    correctly, and since each text sits inside a group whose only
@@ -727,10 +811,13 @@ function buildKraTexts(options) {
     const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
     const fontNat = Math.min(W_sq, H_sq) * 0.40;
 
-    const anchor = _flatAnchorFromVisual(
+    const anchorCenter = _flatAnchorFromVisual(
       screenCorners, W_sq, H_sq, textPos, padFrac,
       fontNat, name.length,
       readingAngle, flatRotation
+    );
+    const anchor = _anchorForPosition(
+      anchorCenter, flatRotation, name.length, fontNat, textPos
     );
 
     const srcPts = [
@@ -749,6 +836,7 @@ function buildKraTexts(options) {
       text_y: anchor.y,
       font_px: Math.max(6, fontNat),
       rotation: flatRotation,
+      alignment: anchor.alignment,
       color: textColor,
       src_pts: srcPts,
       dst_pts: dstPts,
@@ -763,12 +851,8 @@ function buildKraTexts(options) {
 
 function _coneBandDimensions() {
   const w = Math.max(1, Math.round(window.innerWidth));
-  const h = Math.max(1, Math.round(coneH_px()));
+  const h = Math.max(1, Math.round(layout.coneH));
   return { width: w, height: h };
-}
-
-function coneH_px() {
-  return layout.coneH;
 }
 
 /* ==========================================================================

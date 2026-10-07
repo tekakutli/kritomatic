@@ -39,7 +39,10 @@ class LayerHandler:
         # Vector shapes: text and polygons
         elif cmd_type in ['add_vector_text', 'add_vector_polygon',
                           'update_vector_text', 'list_shapes',
-                          'replace_all_text', 'extract_all_text']:
+                          'replace_all_text', 'extract_all_text',
+                          'list_text_layers',
+                          'get_layer_text_metadata',
+                          'patch_layer_text']:
             return self.text.execute(cmd_type, params)
 
         # Fill operations

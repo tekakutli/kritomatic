@@ -18,30 +18,13 @@ Three export modes, selected by options.text_warp_mode:
         patch's mask.
 
     "text"
-        One group + one transform mask per text.  Each mask's source
-        rectangle is a small box centered on the text's flat position
-        inside the square's own frame; the destination quad is that
-        box projected through the square's own homography.  Tight
-        sources cannot clip; the local projective Jacobian gives
-        exact size and rotation.  Rectangles, when enabled, are
-        emitted as direct polygons in the export group, before the
-        text groups so they render below.
-
-The .kra reproduces the cone playground's NORMAL view: same canvas
-dimensions as the visible cone band, same positions, same apparent
-sizes.
-
-Structure (text mode)
-=====================
-    group <EXPORT_GROUP_NAME>
-        vector layer <name>_rect            (direct, no mask)
-        ...
-        group <name>_text_grp               (masked)
-            vector layer <name>_text_content
-                text at (P, P), rotated by flat_rotation
-            transform mask <name>_text_mask
-                maps (0,0)-(2P,2P) to the projected quad
-        ...
+        One group + one transform mask per text.  Each text's mask
+        is a copy of the SQUARE'S own mask — source = the square's
+        full flat rectangle, destination = the square's projected
+        corners.  This is the same geometry square mode uses, but
+        with a text-only vector layer inside the group instead of
+        rectangle-plus-text.  Rectangles, when enabled, are emitted
+        as direct polygons in the export group.
 
 No background layer is created in any mode.
 """
@@ -351,7 +334,7 @@ def _build_text_mode(texts, rects, opts, band, doc_name):
             "x": float(t["text_x"]),
             "y": float(t["text_y"]),
             "color": t.get("color", "#ffffff"),
-            "alignment": "center",
+            "alignment": t.get("alignment", "center"),
             "rotation": float(t.get("rotation", 0.0)),
         })
         commands.append({
@@ -401,43 +384,6 @@ def generate(payload: Dict[str, Any]) -> Dict[str, Any]:
     cone_band = payload.get("cone_band", {})
     doc_name = payload.get("doc_name", "Cone Scene")
     output_path = payload.get("output_path")
-
-    # Diagnostic dump of everything the JS computed for each text.
-    # Runs before the batch so it lands in the terminal even if the
-    # daemon later fails.
-    debug = payload.get("debug", [])
-    if debug:
-        print("=" * 78)
-        print("KRITOMATIC EXPORT DEBUG")
-        print("=" * 78)
-        for d in debug:
-            name = d.get("name", "?")
-            pc = d.get("polyCenter", [0, 0])
-            apex = d.get("apex", [0, 0])
-            bounds = d.get("polyBounds", [0, 0, 0, 0])
-            print(f"\n[{name}]")
-            print(f"  polygon center (screen): ({pc[0]:.1f}, {pc[1]:.1f})")
-            print(f"  polygon bounds (screen): x {bounds[0]:.1f}..{bounds[2]:.1f}   "
-                  f"y {bounds[1]:.1f}..{bounds[3]:.1f}")
-            print(f"  apex (screen):           ({apex[0]:.1f}, {apex[1]:.1f})")
-            print(f"  apex direction from poly center: "
-                  f"{d.get('apexDirDeg', 0):.1f}°")
-            print(f"  reading direction chosen:        "
-                  f"{d.get('readingAngleDeg', 0):.1f}°")
-            print(f"  diff (reading - apex):           "
-                  f"{d.get('readingAngleDeg', 0) - d.get('apexDirDeg', 0):.1f}°")
-            print(f"  anchor in flat square frame: ({d['anchorFlat'][0]:.2f}, "
-                  f"{d['anchorFlat'][1]:.2f})")
-            print(f"  P (half source box): {d['P']:.2f}")
-            print(f"  font_px: {d['font_px']:.2f}   local scale: {d['localScale']:.4f}")
-            print(f"  flat rotation: {d['chosenRotationDeg']:.2f}°")
-            print(f"  source corners:")
-            for i, p in enumerate(d.get("srcCorners", [])):
-                print(f"    {i}: ({p[0]:.1f}, {p[1]:.1f})")
-            print(f"  destination corners:")
-            for i, p in enumerate(d.get("dstCorners", [])):
-                print(f"    {i}: ({p[0]:.1f}, {p[1]:.1f})")
-        print()
 
     opts = _normalize_options(options)
     if opts["text_warp_mode"] == "text":

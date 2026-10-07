@@ -440,7 +440,7 @@ function drawFlatCardinalMarkers() {
   const r     = flatRect();
   const yBase = r.y0 + r.h;
 
-  const R_PIN = 7;
+  const R_PIN = 9;
   const yPin  = yBase - R_PIN - 3;
 
   const cards = [
@@ -451,7 +451,7 @@ function drawFlatCardinalMarkers() {
   ];
 
   ctx.save();
-  ctx.font = "700 9px 'JetBrains Mono', 'Fira Code', monospace";
+  ctx.font = "700 11px 'JetBrains Mono', 'Fira Code', monospace";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
 
@@ -462,7 +462,7 @@ function drawFlatCardinalMarkers() {
        reads as "anchored here on the s = 0 edge". */
     ctx.beginPath();
     ctx.moveTo(sx, yBase);
-    ctx.lineTo(sx, yBase - 3);
+    ctx.lineTo(sx, yBase - 4);
     ctx.strokeStyle = "rgba(255, 200, 90, 0.35)";
     ctx.lineWidth = 1.0;
     ctx.stroke();

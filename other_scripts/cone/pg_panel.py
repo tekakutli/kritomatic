@@ -148,6 +148,16 @@ as a flat-view item, and POSTs the list to /generate-kra on the
 local server.  The server forwards to cone_kra.py, which builds a
 Kritomatic batch and sends it to the Krita daemon.  The output is a
 .kra with one vector-text layer per shape.
+
+SHIFT-HELD CORNER RESIZE
+========================
+Holding Shift while dragging a shape's corner vertex anchors the
+DIAGONALLY OPPOSITE corner and resizes only along the two edges
+that meet at the dragged corner.  Without Shift, the corner drag
+resizes about the shape's centre, moving all four sides
+symmetrically.  The behaviour itself lives in pg_view_squares.py;
+the drag-state anchor is captured in pg_dispatch.py at mousedown
+time.  The help popup's "Squares" section documents this modifier.
 """
 
 PANEL_JS = r"""
@@ -327,6 +337,9 @@ const HELP_HTML = `<!DOCTYPE html>
 <div class="section">Squares</div>
 <div class="hint">hold <span class="kbd">Alt</span> while clicking a square to grab
   its <strong>patch</strong> instead</div>
+<div class="hint">hold <span class="kbd">Shift</span> while dragging a
+  <strong>corner</strong> to anchor the <em>opposite corner</em> in place \u2014
+  only the two edges that meet at that corner move</div>
 <div class="hint">hold <span class="kbd">Shift</span> while dragging the
   rotate handle to jump in 15&deg; steps</div>
 <div class="hint"><span class="kbd">Shift</span>+<span class="kbd">A</span>

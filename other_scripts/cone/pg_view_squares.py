@@ -108,6 +108,48 @@ A shared (û, v̂) edge maps to the same (phi, s) edge regardless of
 uLen and vLen, so two shapes placed at adjacent û / v̂ values touch
 when the shape's reference half-extent matches their û / v̂ spacing.
 
+ANCHORED RESIZE (SHIFT-HELD)
+============================
+By default a corner drag resizes the shape about its own centre:
+all four sides move symmetrically, the centre stays where it was,
+and the shape's stored (u, v) does not change.
+
+Holding Shift while dragging a corner switches to an ANCHORED
+resize.  The corner DIAGONALLY OPPOSITE the one being dragged stays
+fixed in place, and only the two edges that meet at the dragged
+corner move.  The shape's centre therefore shifts: it ends up at
+the midpoint between the fixed anchor and the cursor.
+
+The anchor is captured at the moment the drag begins, from the
+shape's pre-drag state, and it does not move for the duration of
+the drag.  Both the cone-band and the flat-band corner drags use
+the same anchor; the difference between them is which depth
+multiplier (effectiveConeDepth() vs SHAPE_DEPTH_FLAT) is folded
+into the anchor's v-extent.
+
+The math is the same linear map the renderer uses, just solved for
+the new centre and half-extents given one fixed corner and one
+moving corner:
+
+    pu = (cursor_u − anchor_u) / (2 · Ku)
+    pv = (cursor_v − anchor_v) / (2 · Kv)
+
+    refHW = |pu · cos θ + pv · sin θ|
+    refHH = |pv · cos θ − pu · sin θ|
+
+    centre = anchor + R(θ) · (sx · refHW, sy · refHH)
+
+with (sx, sy) the reference sign pair of the DRAGGED corner.  Both
+half-extents are clamped to SHAPE_MIN_SCALE and the centre is
+recomputed from the clamped half-extents and the fixed anchor, so
+the anchor stays exactly put even when the cursor is dragged onto
+it.
+
+If Shift is pressed or released mid-drag, the next motion event
+switches resize modes; the anchor is not re-captured, so a later
+switch back to anchored mode may jump slightly.  This mirrors how
+Shift is handled by the other drags (body, rotate, patch).
+
 SHAPE DEPTH
 ===========
 The "Shape depth" slider still exists and still multiplies the
@@ -819,6 +861,21 @@ function squareCornersLocalWith(sq, depthScale) {
   });
 }
 
+/* The local (u, v) of the corner DIAGONALLY OPPOSITE the given
+   corner — the anchor a Shift-held corner drag keeps fixed.  Same
+   math as squareCornersLocalWith but at the opposite sign pair.
+   Corners are ordered [TL, TR, BR, BL], so the opposite of corner
+   i is corner (i + 2) % 4.  depthScale is folded into the
+   reference v half-extent, matching squareCornersLocalWith; pass
+   effectiveConeDepth() from the cone band and SHAPE_DEPTH_FLAT
+   from the flat band. */
+function squareAnchorCornerLocal(sq, cornerIdx, depthScale) {
+  const corners = squareCornersLocalWith(sq, depthScale);
+  if (!corners || corners.length < 4) return null;
+  const anchorIdx = (cornerIdx + 2) % 4;
+  return corners[anchorIdx];
+}
+
 function squareCornersLocalUnrotated(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
@@ -1511,9 +1568,20 @@ function cursorToLocalWithPersp(f, qi, sq, sx, sy) {
    effectiveConeDepth() from the cone band, SHAPE_DEPTH_FLAT from the
    flat band.  It enters only through the reference height's
    normalizer, so the corner follows the cursor in the band the drag
-   came from. */
+   came from.
 
-function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale) {
+   ANCHORED BRANCH — when anchorU / anchorV are supplied, the drag
+   switches to the Shift-held anchored resize: the OPPOSITE corner
+   stays fixed in place at (anchorU, anchorV) and only the two edges
+   meeting at the dragged corner move.  The shape's centre shifts to
+   the midpoint between the anchor and the cursor.  Both half-extents
+   are clamped to SHAPE_MIN_SCALE, then the centre is recomputed from
+   the clamped half-extents and the fixed anchor so the anchor stays
+   exactly put even when the cursor lands on it.  See the module
+   docstring, ANCHORED RESIZE (SHIFT-HELD), for the derivation. */
+
+function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale,
+                                 anchorU, anchorV) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const q = quads[qi];
@@ -1533,14 +1601,68 @@ function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale) {
   /* Un-rotate, in the reference frame. */
   const cosT = Math.cos(sq.theta || 0);
   const sinT = Math.sin(sq.theta || 0);
-  const ux = ox * cosT + oy * sinT;
-  const uy = oy * cosT - ox * sinT;
 
   const signs = [[-1, +1], [+1, +1], [+1, -1], [-1, -1]][cornerIdx];
   const sx = signs[0], sy = signs[1];
 
   const refHWmin = SHAPE_MIN_SCALE * SHAPE_REL_SIZE / 2;
   const refHHmin = SHAPE_MIN_SCALE * SHAPE_REL_SIZE / 2 * depthScale;
+
+  /* ---- anchored branch (Shift-held) ----------------------------
+     The anchor is the OPPOSITE corner's local position, captured
+     at drag start.  We solve for the new half-extents and centre
+     from the anchor and the cursor alone; the shape's own rotation
+     and the patch's (Ku, Kv) are the same maps the renderer uses,
+     so the anchor stays exactly put.
+
+     Derivation (theta = the shape's own theta, unchanged):
+
+         pu = (cursor_u - anchor_u) / (2 * Ku)
+         pv = (cursor_v - anchor_v) / (2 * Kv)
+
+         sx*refHW = pu*cosT + pv*sinT
+         sy*refHH = pv*cosT - pu*sinT
+
+     so |. | gives the two positive half-extents.  The new centre
+     is the midpoint of anchor and cursor in local coordinates. */
+
+  if (anchorU !== undefined && anchorV !== undefined) {
+    const midU = (anchorU + cu) / 2;
+    const midV = (anchorV + cv) / 2;
+
+    const pu = (cu - anchorU) / (2 * Ku);
+    const pv = (cv - anchorV) / (2 * Kv);
+
+    let refHW = pu * cosT + pv * sinT;
+    let refHH = pv * cosT - pu * sinT;
+
+    refHW = Math.max(Math.abs(refHW), refHWmin);
+    refHH = Math.max(Math.abs(refHH), refHHmin);
+
+    sq.scaleU = refHW / (SHAPE_REL_SIZE / 2);
+    sq.scaleV = refHH / (SHAPE_REL_SIZE / 2 * depthScale);
+    clampShapeScales(sq);
+
+    /* Recompute the centre from the anchor using the (possibly
+       clamped) half-extents and the dragged corner's reference
+       sign pair, so the anchor stays exactly fixed even when a
+       half-extent has been clamped to its minimum. */
+    const duR = sx * refHW * cosT - sy * refHH * sinT;
+    const dvR = sx * refHW * sinT + sy * refHH * cosT;
+    const uHat = (anchorU + duR * Ku) / f.uLen;
+    const vHat = (anchorV + dvR * Kv) / f.vLen;
+    sq.u = uHat;
+    sq.v = clampCloneV(qi, vHat);
+    return;
+  }
+
+  /* ---- default branch: resize about the FIXED centre -----------
+     The cursor's offset from the shape's centre sets the new
+     reference half-extents; the centre is not moved, so all four
+     sides move symmetrically. */
+
+  const ux = ox * cosT + oy * sinT;
+  const uy = oy * cosT - ox * sinT;
 
   const refHW = Math.max(sx * ux, refHWmin);
   const refHH = Math.max(sy * uy, refHHmin);
@@ -1604,17 +1726,28 @@ function alignSelectedShapeToAxis() {
 
 /* ==========================================================================
    CONE-BAND EDIT WRAPPERS
-   ========================================================================== */
+   ==========================================================================
+   resizeSquareFromCorner takes an optional anchor.  When both
+   anchorU and anchorV are supplied, the resize is anchored on that
+   fixed local point (the opposite corner) instead of on the shape's
+   centre.  pg_dispatch reads Shift at each move event and passes the
+   drag-start anchor when Shift is held. */
 
-function resizeSquareFromCorner(sq, cornerIdx, cursorWX, cursorWY) {
+function resizeSquareFromCorner(sq, cornerIdx, cursorWX, cursorWY,
+                                 anchorU, anchorV) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const f = patchFrame(qi);
   if (!f) return;
   const [sx, sy] = w2s(cursorWX, cursorWY);
   const lc = cursorToLocalShapeRelativeExact(f, qi, sq, sx, sy);
-  setShapeFromCornerLocal(sq, cornerIdx, lc.u, lc.v,
-                          effectiveConeDepth());
+  if (anchorU !== undefined && anchorV !== undefined) {
+    setShapeFromCornerLocal(sq, cornerIdx, lc.u, lc.v,
+                             effectiveConeDepth(), anchorU, anchorV);
+  } else {
+    setShapeFromCornerLocal(sq, cornerIdx, lc.u, lc.v,
+                             effectiveConeDepth());
+  }
 }
 
 function rotateSquareToCursor(sq, cursorWX, cursorWY, snap, startTheta) {
@@ -1682,7 +1815,13 @@ function squareFlatRotateHandleScreen(sq, shift) {
 
 /* ==========================================================================
    FLAT-VIEW EDIT WRAPPERS
-   ========================================================================== */
+   ==========================================================================
+   flatResizeSquareFromCornerIdx mirrors resizeSquareFromCorner: when
+   anchorU / anchorV are supplied the resize is anchored on that
+   fixed local point (the opposite corner); otherwise the shape
+   resizes about its own centre.  The flat band uses SHAPE_DEPTH_FLAT
+   for the depth multiplier, so the anchor is captured and used at
+   the same scale. */
 
 function flatCursorToShapeLocal(sq, sx, sy) {
   const qi = quadIdxById(sq.quadId);
@@ -1702,10 +1841,16 @@ function flatCursorToShapeLocal(sq, sx, sy) {
   return { u: uHat * f.uLen, v: vHat * f.vLen };
 }
 
-function flatResizeSquareFromCornerIdx(sq, sx, sy, cornerIdx) {
+function flatResizeSquareFromCornerIdx(sq, sx, sy, cornerIdx,
+                                        anchorU, anchorV) {
   const lc = flatCursorToShapeLocal(sq, sx, sy);
   if (!lc) return;
-  setShapeFromCornerLocal(sq, cornerIdx, lc.u, lc.v, SHAPE_DEPTH_FLAT);
+  if (anchorU !== undefined && anchorV !== undefined) {
+    setShapeFromCornerLocal(sq, cornerIdx, lc.u, lc.v, SHAPE_DEPTH_FLAT,
+                             anchorU, anchorV);
+  } else {
+    setShapeFromCornerLocal(sq, cornerIdx, lc.u, lc.v, SHAPE_DEPTH_FLAT);
+  }
 }
 
 function flatRotateSquareToCursor(sq, sx, sy, snap, startTheta) {

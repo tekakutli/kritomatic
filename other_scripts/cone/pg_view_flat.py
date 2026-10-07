@@ -21,6 +21,34 @@ Everything drawn inside the sheet — patches, their corner markers,
 the floating shapes, their handles — is clipped to the parameter
 rectangle.
 
+CARDINAL DIRECTION MARKERS
+==========================
+The four letters E, N, W, S are pinned just above the base line
+(s = 0), at the four φ values that correspond to the world +x, +y,
+−x, −y directions of the cone view:
+
+    E   φ = 0          world +x     (screen right in the cone view)
+    N   φ = π/2        world +y     (screen up    in the cone view)
+    W   φ = π          world −x     (screen left  in the cone view)
+    S   φ = 3π/2       world −y     (screen down  in the cone view)
+
+Their positions are fixed: the base ring is centred at the origin
+with radius coneR(), and the four cardinal points sit at (R, 0),
+(0, R), (−R, 0), (0, −R) respectively, independent of where the
+apex is dragged.  The apex moves the meridians (which all converge
+on the apex) but it does not move the base ring, so the markers stay
+put as the cone is tilted.
+
+The markers exist to answer a specific question: "I am looking at
+the flat parameter sheet, but I know the shape I care about is
+oriented a particular way in the cone view — which way is that on
+the sheet?"  The meridian line at each of the four labelled φ
+values runs straight up from the labelled base point to the apex,
+and it is the line along which the corresponding visual direction
+lives.  Any intermediate direction (NE, SSW, and so on) is read off
+the same φ axis: the meridian at a given φ has world angle φ on
+the base ring, which is its visual direction in the cone view.
+
 SHAPES IN THE FLAT VIEW
 =======================
 A shape lives on the patch's plane, not on the cone surface, so it
@@ -384,6 +412,74 @@ function drawFlatView() {
   /* Labels, drawn inside the clip so a wrapped copy that has drifted
      past the sheet boundary is trimmed along with everything else. */
   drawShapeLabelsFlat();
+
+  /* Cardinal direction markers, drawn last so they sit above
+     everything on the sheet.  See the module docstring,
+     CARDINAL DIRECTION MARKERS. */
+  drawFlatCardinalMarkers();
+
+  ctx.restore();
+}
+
+/* ==========================================================================
+   CARDINAL DIRECTION MARKERS
+   ==========================================================================
+   Small pins at the base line, at φ = 0, π/2, π, 3π/2.  Each pin is
+   a dark disc with an amber ring and a single letter, E / N / W / S,
+   sitting just above the s = 0 line.
+
+   The four base points are fixed at (R, 0), (0, R), (−R, 0), (0, −R)
+   in world coordinates, where R = coneR().  The apex can be dragged
+   anywhere within the cone's own reach limit, but it does not move
+   the base ring, so the pins never move.
+
+   Drawn without a save/restore of its own — it inherits the clip
+   and the coordinate system of drawFlatView. */
+
+function drawFlatCardinalMarkers() {
+  const r     = flatRect();
+  const yBase = r.y0 + r.h;
+
+  const R_PIN = 7;
+  const yPin  = yBase - R_PIN - 3;
+
+  const cards = [
+    { key: "E", phi: 0               },
+    { key: "N", phi: Math.PI / 2     },
+    { key: "W", phi: Math.PI         },
+    { key: "S", phi: 3 * Math.PI / 2 },
+  ];
+
+  ctx.save();
+  ctx.font = "700 9px 'JetBrains Mono', 'Fira Code', monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  for (const c of cards) {
+    const [sx] = flatToScreen(c.phi, 0);
+
+    /* Short stem connecting the pin to the base line, so the pin
+       reads as "anchored here on the s = 0 edge". */
+    ctx.beginPath();
+    ctx.moveTo(sx, yBase);
+    ctx.lineTo(sx, yBase - 3);
+    ctx.strokeStyle = "rgba(255, 200, 90, 0.35)";
+    ctx.lineWidth = 1.0;
+    ctx.stroke();
+
+    /* Pin: dark fill so it reads over any underlying shape, amber
+       ring and letter for the marker itself. */
+    ctx.beginPath();
+    ctx.arc(sx, yPin, R_PIN, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(11, 16, 24, 0.88)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255, 200, 90, 0.85)";
+    ctx.lineWidth = 1.3;
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(255, 200, 90, 0.95)";
+    ctx.fillText(c.key, sx, yPin + 0.5);
+  }
 
   ctx.restore();
 }

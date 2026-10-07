@@ -8,6 +8,17 @@ Export visual state, Generate .kra, + Patch, + Clone, + Square,
 + Clone), a KRA-export options block (text position, text padding,
 text warp mode, rectangle on/off, text color), two lists, a
 persistent hint block.
+
+CHANGES FROM THE PREVIOUS REVISION
+==================================
+The persistent hint block that used to live inline in the panel
+has been moved into a separate help popup subwindow, opened by a
+"?" button in the panel's title bar.  The panel now also carries a
+"Draw fit" select, a "No rotate" checkbox, and a "Draw Quad"
+button, which drive the four-corner fitting tool (see pg_core.py,
+DRAW TOOL).  The help card in the popup documents both fit modes
+and the rotation lock; the panel itself carries no inline hint
+text any more.
 """
 
 HTML_HEAD = r"""<!DOCTYPE html>
@@ -247,24 +258,6 @@ HTML_HEAD = r"""<!DOCTYPE html>
     color:#e8a0a8 !important;
   }
 
-  .hintLine {
-    font-size:9px; color:#5a6774;
-    letter-spacing:0.06em;
-    padding:2px 0;
-    line-height:1.5;
-  }
-  .hintLine .kbd {
-    display:inline-block;
-    padding:0 4px;
-    border:1px solid #223040;
-    border-radius:2px;
-    background:#0e1622;
-    color:#00e5ff;
-    font-family:inherit;
-    font-weight:700;
-    letter-spacing:0.02em;
-  }
-
   #status {
     margin-top:10px; padding-top:8px;
     border-top:1px solid #1e2836;
@@ -297,8 +290,11 @@ HTML_HEAD = r"""<!DOCTYPE html>
 
 <div id="ui">
   <h3>Cone interior
-    <button id="collapseBtn" title="Collapse (H)"
+    <button id="helpBtn" title="Help (opens a separate window)"
       style="margin-left:auto; width:auto; padding:0 6px;
+             height:20px; font-size:11px; line-height:1;">?</button>
+    <button id="collapseBtn" title="Collapse (H)"
+      style="width:auto; padding:0 6px;
              height:20px; font-size:11px; line-height:1;">−</button>
   </h3>
 
@@ -385,31 +381,19 @@ HTML_HEAD = r"""<!DOCTYPE html>
   </div>
   <div id="squareList" class="quadList"></div>
 
-  <div class="hintLine">
-    shift+click a patch to drop one there
+  <div class="field">
+    <label>Draw fit</label>
+    <select id="drawFitMode">
+      <option value="shape-first" selected>shape &rarr; patch</option>
+      <option value="patch-first">patch &rarr; shape</option>
+    </select>
   </div>
-  <div class="hintLine">
-    <span class="kbd">Shift</span>+<span class="kbd">A</span> align to 45°
+  <div class="field">
+    <label>No rotate</label>
+    <input type="checkbox" id="drawNoRotate">
   </div>
-  <div class="hintLine">
-    hold <span class="kbd">Shift</span> while dragging the rotate handle
-    to jump
-  </div>
-  <div class="hintLine">
-    hold <span class="kbd">Shift</span> while dragging a patch or a
-    square to slide along the centre&rarr;apex axis only
-  </div>
-  <div class="hintLine">
-    hold <span class="kbd">Alt</span> while clicking a square to grab
-    its patch
-  </div>
-  <div class="hintLine">
-    drag patch &phi;/s, square W/H, or slope to scrub &middot;
-    <span class="kbd">Shift</span> to snap
-  </div>
-  <div class="hintLine">
-    <span class="kbd">Generate .kra</span> writes one vector-text layer
-    per square, laid out in the flat view
+  <div class="row" style="margin-top:-2px;">
+    <button id="drawQuadBtn">Draw Quad</button>
   </div>
 
   <hr>

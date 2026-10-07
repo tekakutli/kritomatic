@@ -24,6 +24,21 @@ drag).
 Ctrl is deliberately NOT used for this: on macOS the browser
 translates Ctrl+click into a right-click, so the mouse event arrives
 with e.button !== 0 and the handler bails at the top.
+
+DRAW TOOL INTERCEPTION
+======================
+While the Draw Quad tool is active, every canvas interaction is
+routed to the draw tool first:
+
+    mousedown   accumulates a corner point (button 0 only),
+    mousemove   updates the live preview,
+    mouseup     swallowed,
+    wheel       swallowed.
+
+Pressing Escape cancels the tool (the keydown handler lives in
+pg_panel.py).  On the fourth click, finishDrawTool fits the patch
+and rectangle, clears the transient points, and returns the canvas
+to its ordinary behaviour.
 """
 
 DISPATCH_JS = r"""
@@ -65,6 +80,40 @@ function draw() {
 
   updateStatus();
 
+  /* Draw tool preview: the click chain so far, plus a rubber-band
+     segment to the current hover position when the tool is active
+     and fewer than four corners have been committed. */
+  if (drawTool.active) {
+    ctx.save();
+    ctx.strokeStyle = "#00e5ff";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([5, 3]);
+    const pts = drawTool.points;
+    if (pts.length > 0) {
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+      if (drawTool.hover && pts.length < 4) {
+        ctx.lineTo(drawTool.hover[0], drawTool.hover[1]);
+      }
+      ctx.stroke();
+
+      for (const [x, y] of pts) {
+        ctx.beginPath();
+        ctx.arc(x, y, 4, 0, Math.PI * 2);
+        ctx.fillStyle = "#00e5ff";
+        ctx.fill();
+      }
+      if (drawTool.hover && pts.length < 4) {
+        ctx.beginPath();
+        ctx.arc(drawTool.hover[0], drawTool.hover[1], 3, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(0,229,255,0.5)";
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+
   /* Panel refresh: the two patch-position scrub fields follow the
      selected patch's centre.  Called every frame so live drags,
      apex tilts, and depth changes are all reflected.  A focused
@@ -79,6 +128,14 @@ function draw() {
 function updateStatus() {
   const el = document.getElementById("status");
   if (!el) return;
+
+  if (drawTool.active) {
+    const n = drawTool.points.length;
+    el.textContent = "DRAW QUAD \u2014 click corner " + (n + 1)
+                   + " of 4   (Esc to cancel)";
+    el.className = "ok";
+    return;
+  }
 
   if (!state.mouse.inside) {
     el.textContent =
@@ -178,6 +235,13 @@ canvas.addEventListener("mousedown", (e) => {
   const rect = canvas.getBoundingClientRect();
   const sx = e.clientX - rect.left;
   const sy = e.clientY - rect.top;
+
+  /* ---- draw tool intercept ------------------------------------- */
+  if (drawTool.active) {
+    e.preventDefault();
+    addDrawPoint(sx, sy);
+    return;
+  }
 
   /* Alt is the "grab the patch under the square" modifier.  When
      held, a click on a square targets the patch that square belongs
@@ -469,6 +533,13 @@ window.addEventListener("mousemove", (e) => {
                         sx < window.innerWidth &&
                         sy < window.innerHeight);
 
+  /* Draw tool: just track the hover position for the preview. */
+  if (drawTool.active) {
+    drawTool.hover = [sx, sy];
+    draw();
+    return;
+  }
+
   if (state.dragQuadVertex) {
     const { quadIdx, cornerIdx } = state.dragQuadVertex;
     const q = quads[quadIdx];
@@ -586,6 +657,7 @@ window.addEventListener("mousemove", (e) => {
 });
 
 window.addEventListener("mouseup", () => {
+  if (drawTool.active) return;
   if (state.dragQuadVertex || state.dragApex ||
       state.flatDrag || state.dragSquare || state.flatSquareDrag ||
       state.dragPatchBody) {
@@ -600,6 +672,7 @@ window.addEventListener("mouseup", () => {
 });
 
 canvas.addEventListener("wheel", (e) => {
+  if (drawTool.active) return;
   const rect = canvas.getBoundingClientRect();
   const sy = e.clientY - rect.top;
   if (sy >= layout.dividerY) return;

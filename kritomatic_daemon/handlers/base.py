@@ -16,6 +16,7 @@ from .daemon import DaemonHandler
 from ..registry import get_command_registry
 from ..utils.refresh import begin_defer, end_defer
 
+
 class CommandHandler:
     def __init__(self):
         self.handlers = {
@@ -32,48 +33,11 @@ class CommandHandler:
         }
 
     def _send_line(self, client_socket, payload):
-        """Send one NDJSON line, guaranteeing full delivery.
-
-        The socket carries a 0.5-second timeout set by the receive
-        loop in socket_server.py.  That timeout applies to sends too,
-        and sendall obeys it: if the peer's receive buffer is
-        momentarily full, sendall raises socket.timeout after half a
-        second and abandons the rest of the payload.  With a large
-        summary — the per-command data of a full batch — this happens
-        often enough to be the failure mode.
-
-        Lift the timeout for the duration of this send.  Also log on
-        failure: the previous version swallowed the exception, so a
-        failed send looked identical to a successful one.
-        """
         try:
             data = (json.dumps(payload) + '\n').encode('utf-8')
-        except Exception as e:
-            print(f"[kritomatic] _send_line: json encode failed: {e}",
-                  flush=True)
-            return
-
-        try:
-            prev_timeout = client_socket.gettimeout()
-        except Exception:
-            prev_timeout = None
-
-        try:
-            try:
-                client_socket.settimeout(None)
-            except Exception:
-                pass
-
             client_socket.sendall(data)
-        except Exception as e:
-            print(f"[kritomatic] _send_line: sendall failed "
-                  f"({type(e).__name__}: {e}); {len(data)} bytes pending",
-                  flush=True)
-        finally:
-            try:
-                client_socket.settimeout(prev_timeout)
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     def _enter_batchmode_for_active_doc(self, seen):
         doc = Krita.instance().activeDocument()
@@ -97,21 +61,12 @@ class CommandHandler:
             pass
 
     def _slim_results(self, results):
-        """Return a copy of `results` with per-command `data` removed.
-
-        The client uses `results` from the summary only as a fallback
-        when no progress lines arrived; in the normal case it has
-        already consumed the data on the progress stream.  Dropping
-        `data` takes the summary from ~100 KB to a few KB.
-        """
         return [
             {k: v for k, v in r.items() if k != 'data'}
             for r in results
         ]
 
     def handle_command(self, command, client_socket):
-        print(f"[kritomatic] handle_command: {command.get('type', 'batch')}",
-              flush=True)
         try:
             if 'commands' in command:
                 batch_id = command.get('id', None)
@@ -168,14 +123,11 @@ class CommandHandler:
                         summary['id'] = batch_id
                     self._send_line(client_socket, summary)
                     summary_sent = True
-                    print(f"[kritomatic] batch_complete sent for {batch_id}",
-                          flush=True)
                 finally:
                     try:
                         end_defer()
-                    except Exception as e:
-                        print(f"[kritomatic] end_defer failed: {e}",
-                              flush=True)
+                    except Exception:
+                        pass
 
                     for doc, prev in seen_docs.values():
                         try:
@@ -284,7 +236,7 @@ class CommandHandler:
         # Introspect commands
         elif cmd_type in ['list_actions', 'list_filters', 'list_resources',
                           'list_dockers', 'describe_active', 'list_extensions',
-                          'get_node_xml']:
+                          'get_node_xml', 'describe_vector_layer']:
             return self.handlers['introspect'].execute(cmd_type, command)
 
         # Daemon meta-commands

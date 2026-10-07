@@ -1,56 +1,49 @@
 """
-cone_kra.py — turn the cone playground's floating squares into a .kra
-full of perspective-projected rectangles and/or labels.
+cone_kra.py — turn the cone playground into a .kra.
 
-The .kra reproduces the cone playground's NORMAL view: the same canvas
-dimensions as the visible cone band, the same shape positions, the
-same apparent sizes.  The shape corners in the payload are already in
-the cone band's pixel coordinates — the JS side computes them through
-projectShapePoint, which uses the current view transform — so the
-daemon sizes the canvas to match the cone band and uses those
-coordinates verbatim.  No fit transform, and no extra outer transform:
-both the cone band and the Krita canvas share the same origin at the
-top-left and the same y-down axis, so the mapping is identity.
+Three export modes, selected by options.text_warp_mode:
 
-If the user changes the cone depth, the half-angle, the shape depth
-slider, or pans, all of those effects are already baked into the
-coordinates the JS side sends.  The .kra always reflects the current
-point of view.
+    "square" (default)
+        One group + one transform mask per square.  The mask maps
+        the square's flat rectangle to its projected quad on the
+        cone.  Rectangles optionally included.  Texts individually
+        rotated to read along their own square's longest side.
 
-Structure per export
-====================
+    "patch"
+        One group + one transform mask per patch.  All texts on the
+        patch share the patch's mask.  Texts are placed so that
+        after the patch's mask they land at exactly the screen
+        position, rotation, and size they would have had in square
+        mode.  Rectangles exported as direct polygons outside the
+        patch's mask.
+
+    "text"
+        One group + one transform mask per text.  Each mask's source
+        rectangle is a small box centered on the text's flat position
+        inside the square's own frame; the destination quad is that
+        box projected through the square's own homography.  Tight
+        sources cannot clip; the local projective Jacobian gives
+        exact size and rotation.  Rectangles, when enabled, are
+        emitted as direct polygons in the export group, before the
+        text groups so they render below.
+
+The .kra reproduces the cone playground's NORMAL view: same canvas
+dimensions as the visible cone band, same positions, same apparent
+sizes.
+
+Structure (text mode)
+=====================
     group <EXPORT_GROUP_NAME>
-        group <name>                       (one per shape)
-            vector layer <name>_content
-                [optional] rectangle (W × H) at the origin
-                text at sh["text_anchor"], rotated by sh["flat_rotation"]
-            transform mask <name>_persp
-                a 4-point perspective homography mapping the rectangle's
-                corners onto the shape's projected corners
-        group <name> ...
+        vector layer <name>_rect            (direct, no mask)
+        ...
+        group <name>_text_grp               (masked)
+            vector layer <name>_text_content
+                text at (P, P), rotated by flat_rotation
+            transform mask <name>_text_mask
+                maps (0,0)-(2P,2P) to the projected quad
         ...
 
-No background layer is created.  The output contains only the shapes
-the user authored; opening the .kra over an existing document does not
-silently paint over it.
-
-LAYER PLACEMENT
-===============
-Every `create_layer` in this bundle uses the `parent` argument of the
-daemon's create_layer command, naming the group the new layer should
-be added to.  That path looks the parent up by name and never reads
-the document's active node, so it is not affected by however Krita
-settled the active-node state after the previous command.
-
-Options
-=======
-An `options` object travels in the payload:
-
-    text_position    interpreted by the JS side; not read here
-    text_padding     interpreted by the JS side; not read here
-    draw_rectangles  if False, skip the add_vector_polygon command
-                     for every shape.  Default True.
-    text_color_mode  interpreted by the JS side; not read here
+No background layer is created in any mode.
 """
 
 import json
@@ -80,8 +73,6 @@ if str(_SRC) not in sys.path:
 from kritomatic.batch import BatchExecutor  # noqa: E402
 
 
-# Fallback canvas dimensions, used only if the payload arrives without
-# a `cone_band` field (an older browser tab, or a hand-crafted payload).
 DEFAULT_CANVAS_W = 1920
 DEFAULT_CANVAS_H = 1080
 
@@ -89,14 +80,10 @@ DEFAULT_RESOLUTION = 72
 DEFAULT_FONT_FAMILY = "sans-serif"
 FONT_FRACTION = 0.40
 
-# Name of the outer group that holds the whole export.  The daemon's
-# batch executor prefixes it with the batch id, so in the document it
-# appears as something like "0kgc_Export".
 EXPORT_GROUP_NAME = "Export"
 
 
 def _fallback_anchor(W, H):
-    """Used only if a shape arrives without a `text_anchor` field."""
     return {"x": W / 2.0, "y": H / 2.0, "alignment": "center"}
 
 
@@ -106,12 +93,13 @@ def _normalize_options(raw):
     draw = raw.get("draw_rectangles", True)
     if not isinstance(draw, bool):
         draw = bool(draw)
-    return {"draw_rectangles": draw}
+    mode = raw.get("text_warp_mode", "square")
+    if mode not in ("square", "patch", "text"):
+        mode = "square"
+    return {"draw_rectangles": draw, "text_warp_mode": mode}
 
 
 def _normalize_cone_band(raw):
-    """Pull canvas dimensions out of the payload's `cone_band` field,
-    with safe fallbacks for anything missing or malformed."""
     if not isinstance(raw, dict):
         return {"width": DEFAULT_CANVAS_W, "height": DEFAULT_CANVAS_H}
     w = raw.get("width", DEFAULT_CANVAS_W)
@@ -131,14 +119,8 @@ def _normalize_cone_band(raw):
     return {"width": w, "height": h}
 
 
-def build_bundle(shapes: List[Dict[str, Any]],
-                 options: Dict[str, Any] = None,
-                 cone_band: Dict[str, Any] = None,
-                 doc_name: str = "Cone Scene") -> Dict[str, Any]:
-    opts = _normalize_options(options)
-    band = _normalize_cone_band(cone_band)
-
-    commands: List[Dict[str, Any]] = [
+def _common_header(band, doc_name):
+    return [
         {
             "type": "create_new_with_dimensions",
             "name": doc_name,
@@ -146,7 +128,6 @@ def build_bundle(shapes: List[Dict[str, Any]],
             "height": band["height"],
             "resolution": DEFAULT_RESOLUTION,
         },
-        # Outer group: every shape goes inside this.
         {
             "type": "create_layer",
             "name": EXPORT_GROUP_NAME,
@@ -155,14 +136,15 @@ def build_bundle(shapes: List[Dict[str, Any]],
         },
     ]
 
+
+def _build_square_mode(shapes, opts, band, doc_name):
+    commands = _common_header(band, doc_name)
+
     for sh in shapes:
         layer_name = sh["name"]
         content_name = layer_name + "_content"
         mask_name = layer_name + "_persp"
 
-        # Shape corners, in cone-band screen pixels.  Used verbatim:
-        # the canvas is the same size as the cone band, so these are
-        # also the shape corners on the canvas.
         dst_pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
                    for p in sh["points"]]
 
@@ -175,15 +157,12 @@ def build_bundle(shapes: List[Dict[str, Any]],
         text_y = float(anchor.get("y", H / 2.0))
         text_align = anchor.get("alignment", "center")
 
-        # 1. Shape group, inside the outer group.
         commands.append({
             "type": "create_layer",
             "name": layer_name,
             "layer_type": "grouplayer",
             "parent": EXPORT_GROUP_NAME,
         })
-
-        # 2. Vector layer inside the shape group.
         commands.append({
             "type": "create_layer",
             "name": content_name,
@@ -191,7 +170,6 @@ def build_bundle(shapes: List[Dict[str, Any]],
             "parent": layer_name,
         })
 
-        # 3. Flat rectangle at the origin, if requested.
         rect_pts = [[0.0, 0.0], [W, 0.0], [W, H], [0.0, H]]
         if opts["draw_rectangles"]:
             commands.append({
@@ -205,7 +183,6 @@ def build_bundle(shapes: List[Dict[str, Any]],
                 "stroke_opacity": sh.get("stroke_opacity", 1.0),
             })
 
-        # 4. Text at the JS-computed anchor.
         commands.append({
             "type": "add_vector_text",
             "layer_name": content_name,
@@ -219,15 +196,11 @@ def build_bundle(shapes: List[Dict[str, Any]],
             "rotation": float(sh.get("flat_rotation", 0.0)),
         })
 
-        # 5. Transform mask on the shape group.
         commands.append({
             "type": "create_transform_mask",
             "layer_name": layer_name,
             "mask_name": mask_name,
         })
-
-        # 6. Perspective homography from the flat rectangle's corners
-        #    to the projected corners on the canvas.
         commands.append({
             "type": "set_perspective_transform_mask",
             "mask_name": mask_name,
@@ -238,16 +211,244 @@ def build_bundle(shapes: List[Dict[str, Any]],
     return {"id": "cone_export", "commands": commands}
 
 
+def _build_patch_mode(patches, opts, band, doc_name):
+    commands = _common_header(band, doc_name)
+
+    for patch in patches:
+        for rect in patch.get("rects", []):
+            rect_layer = rect["name"] + "_rect"
+            commands.append({
+                "type": "create_layer",
+                "name": rect_layer,
+                "layer_type": "vectorlayer",
+                "parent": EXPORT_GROUP_NAME,
+            })
+            pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
+                   for p in rect["points"]]
+            commands.append({
+                "type": "add_vector_polygon",
+                "layer_name": rect_layer,
+                "points": json.dumps(pts),
+                "fill": rect.get("fill", "#ffffff"),
+                "fill_opacity": rect.get("fill_opacity", 0.40),
+                "stroke": rect.get("stroke", "#ffffff"),
+                "stroke_width": rect.get("stroke_width", 2.0),
+                "stroke_opacity": rect.get("stroke_opacity", 1.0),
+            })
+
+    for patch in patches:
+        layer_name = patch["name"]
+        content_name = layer_name + "_content"
+        mask_name = layer_name + "_persp"
+
+        commands.append({
+            "type": "create_layer",
+            "name": layer_name,
+            "layer_type": "grouplayer",
+            "parent": EXPORT_GROUP_NAME,
+        })
+        commands.append({
+            "type": "create_layer",
+            "name": content_name,
+            "layer_type": "vectorlayer",
+            "parent": layer_name,
+        })
+
+        for txt in patch.get("texts", []):
+            commands.append({
+                "type": "add_vector_text",
+                "layer_name": content_name,
+                "text": str(txt["text"]),
+                "font_family": DEFAULT_FONT_FAMILY,
+                "font_size": max(6, int(round(float(txt["font_px"])))),
+                "x": float(txt["x"]),
+                "y": float(txt["y"]),
+                "color": txt.get("color", "#ffffff"),
+                "alignment": "center",
+                "rotation": float(txt.get("flat_rotation", 0.0)),
+            })
+
+        commands.append({
+            "type": "create_transform_mask",
+            "layer_name": layer_name,
+            "mask_name": mask_name,
+        })
+
+        if "src_pts" in patch and "dst_pts" in patch:
+            src_pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
+                       for p in patch["src_pts"]]
+            dst_pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
+                       for p in patch["dst_pts"]]
+        else:
+            W = max(1.0, float(patch["flat_w"]))
+            H = max(1.0, float(patch["flat_h"]))
+            src_pts = [[0.0, 0.0], [W, 0.0], [W, H], [0.0, H]]
+            dst_pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
+                       for p in patch["corners"]]
+
+        commands.append({
+            "type": "set_perspective_transform_mask",
+            "mask_name": mask_name,
+            "src_points": json.dumps(src_pts),
+            "dst_points": json.dumps(dst_pts),
+        })
+
+    return {"id": "cone_export", "commands": commands}
+
+
+def _build_text_mode(texts, rects, opts, band, doc_name):
+    """One group + one mask per text.  Each text's mask is a copy of
+    the square's own mask: source = the square's full flat rectangle,
+    destination = the square's projected corners.  Rectangles are
+    direct polygons in the export group, emitted first so they render
+    below."""
+    commands = _common_header(band, doc_name)
+
+    for rect in (rects or []):
+        rect_layer = rect["name"] + "_rect"
+        commands.append({
+            "type": "create_layer",
+            "name": rect_layer,
+            "layer_type": "vectorlayer",
+            "parent": EXPORT_GROUP_NAME,
+        })
+        pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
+               for p in rect["points"]]
+        commands.append({
+            "type": "add_vector_polygon",
+            "layer_name": rect_layer,
+            "points": json.dumps(pts),
+            "fill": rect.get("fill", "#ffffff"),
+            "fill_opacity": rect.get("fill_opacity", 0.40),
+            "stroke": rect.get("stroke", "#ffffff"),
+            "stroke_width": rect.get("stroke_width", 2.0),
+            "stroke_opacity": rect.get("stroke_opacity", 1.0),
+        })
+
+    for t in texts:
+        group_name   = t["name"] + "_text_grp"
+        content_name = t["name"] + "_text_content"
+        mask_name    = t["name"] + "_text_mask"
+
+        commands.append({
+            "type": "create_layer",
+            "name": group_name,
+            "layer_type": "grouplayer",
+            "parent": EXPORT_GROUP_NAME,
+        })
+        commands.append({
+            "type": "create_layer",
+            "name": content_name,
+            "layer_type": "vectorlayer",
+            "parent": group_name,
+        })
+        commands.append({
+            "type": "add_vector_text",
+            "layer_name": content_name,
+            "text": str(t["name"]),
+            "font_family": DEFAULT_FONT_FAMILY,
+            "font_size": max(6, int(round(float(t["font_px"])))),
+            "x": float(t["text_x"]),
+            "y": float(t["text_y"]),
+            "color": t.get("color", "#ffffff"),
+            "alignment": "center",
+            "rotation": float(t.get("rotation", 0.0)),
+        })
+        commands.append({
+            "type": "create_transform_mask",
+            "layer_name": group_name,
+            "mask_name": mask_name,
+        })
+        src_pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
+                   for p in t["src_pts"]]
+        dst_pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
+                   for p in t["dst_pts"]]
+        commands.append({
+            "type": "set_perspective_transform_mask",
+            "mask_name": mask_name,
+            "src_points": json.dumps(src_pts),
+            "dst_points": json.dumps(dst_pts),
+        })
+
+    return {"id": "cone_export", "commands": commands}
+
+
+def build_bundle(shapes: List[Dict[str, Any]],
+                 options: Dict[str, Any] = None,
+                 cone_band: Dict[str, Any] = None,
+                 doc_name: str = "Cone Scene",
+                 patches: List[Dict[str, Any]] = None,
+                 texts: List[Dict[str, Any]] = None,
+                 rects: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+    opts = _normalize_options(options)
+    band = _normalize_cone_band(cone_band)
+
+    if opts["text_warp_mode"] == "text":
+        return _build_text_mode(texts or [], rects or [],
+                                opts, band, doc_name)
+    if opts["text_warp_mode"] == "patch":
+        return _build_patch_mode(patches or [], opts, band, doc_name)
+    return _build_square_mode(shapes or [], opts, band, doc_name)
+
+
 def generate(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Entry point called by cone_server's POST handler."""
-    shapes = payload.get("shapes", [])
+    shapes  = payload.get("shapes", [])
+    patches = payload.get("patches", [])
+    texts   = payload.get("texts", [])
+    rects   = payload.get("rects", [])
     options = payload.get("options", {})
     cone_band = payload.get("cone_band", {})
     doc_name = payload.get("doc_name", "Cone Scene")
     output_path = payload.get("output_path")
 
-    if not shapes:
-        return {"success": False, "message": "No shapes to export"}
+    # Diagnostic dump of everything the JS computed for each text.
+    # Runs before the batch so it lands in the terminal even if the
+    # daemon later fails.
+    debug = payload.get("debug", [])
+    if debug:
+        print("=" * 78)
+        print("KRITOMATIC EXPORT DEBUG")
+        print("=" * 78)
+        for d in debug:
+            name = d.get("name", "?")
+            pc = d.get("polyCenter", [0, 0])
+            apex = d.get("apex", [0, 0])
+            bounds = d.get("polyBounds", [0, 0, 0, 0])
+            print(f"\n[{name}]")
+            print(f"  polygon center (screen): ({pc[0]:.1f}, {pc[1]:.1f})")
+            print(f"  polygon bounds (screen): x {bounds[0]:.1f}..{bounds[2]:.1f}   "
+                  f"y {bounds[1]:.1f}..{bounds[3]:.1f}")
+            print(f"  apex (screen):           ({apex[0]:.1f}, {apex[1]:.1f})")
+            print(f"  apex direction from poly center: "
+                  f"{d.get('apexDirDeg', 0):.1f}°")
+            print(f"  reading direction chosen:        "
+                  f"{d.get('readingAngleDeg', 0):.1f}°")
+            print(f"  diff (reading - apex):           "
+                  f"{d.get('readingAngleDeg', 0) - d.get('apexDirDeg', 0):.1f}°")
+            print(f"  anchor in flat square frame: ({d['anchorFlat'][0]:.2f}, "
+                  f"{d['anchorFlat'][1]:.2f})")
+            print(f"  P (half source box): {d['P']:.2f}")
+            print(f"  font_px: {d['font_px']:.2f}   local scale: {d['localScale']:.4f}")
+            print(f"  flat rotation: {d['chosenRotationDeg']:.2f}°")
+            print(f"  source corners:")
+            for i, p in enumerate(d.get("srcCorners", [])):
+                print(f"    {i}: ({p[0]:.1f}, {p[1]:.1f})")
+            print(f"  destination corners:")
+            for i, p in enumerate(d.get("dstCorners", [])):
+                print(f"    {i}: ({p[0]:.1f}, {p[1]:.1f})")
+        print()
+
+    opts = _normalize_options(options)
+    if opts["text_warp_mode"] == "text":
+        if not texts:
+            return {"success": False, "message": "No texts to export"}
+    elif opts["text_warp_mode"] == "patch":
+        if not patches:
+            return {"success": False, "message": "No patches to export"}
+    else:
+        if not shapes:
+            return {"success": False, "message": "No shapes to export"}
     if not output_path:
         return {"success": False, "message": "No output path provided"}
 
@@ -255,7 +456,10 @@ def generate(payload: Dict[str, Any]) -> Dict[str, Any]:
     if out.suffix.lower() != ".kra":
         out = out.with_suffix(".kra")
 
-    bundle = build_bundle(shapes, options, cone_band, doc_name)
+    bundle = build_bundle(
+        shapes=shapes, options=options, cone_band=cone_band,
+        doc_name=doc_name, patches=patches, texts=texts, rects=rects,
+    )
     bundle["commands"].append({
         "type": "save_document",
         "file_path": str(out),
@@ -278,9 +482,15 @@ def generate(payload: Dict[str, Any]) -> Dict[str, Any]:
             "results": results,
         }
 
+    if opts["text_warp_mode"] == "text":
+        count, kind = len(texts), "text(s)"
+    elif opts["text_warp_mode"] == "patch":
+        count, kind = len(patches), "patch(es)"
+    else:
+        count, kind = len(shapes), "shape(s)"
     return {
         "success": True,
-        "message": f"Wrote {out} ({len(shapes)} shape(s))",
+        "message": f"Wrote {out} ({count} {kind})",
         "output_path": str(out),
         "results": results,
     }

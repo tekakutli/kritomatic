@@ -1,8 +1,10 @@
 import json
 import re
 from krita import Krita
-from ..utils.refresh import refresh
+from PyQt5.QtGui import QTransform
 from ..decorators import command
+from ..utils.refresh import refresh
+
 
 class LayerTextHandler:
     def execute(self, cmd_type, params):
@@ -74,21 +76,90 @@ class LayerTextHandler:
             if not color.startswith('#'):
                 color = '#' + color
 
-            # SVG uses a y-down coordinate system, so a positive rotation
-            # angle is clockwise. Rotation -90 makes horizontal text read
-            # bottom-to-top, which is what a left-edge label needs.
-            transform_attr = ""
-            if rotation:
-                transform_attr = f' transform="rotate({rotation} {x} {y})"'
-
-            svg = f'''<svg width="{canvas_width}" height="{canvas_height}" xmlns="http://www.w3.org/2000/svg">
-      <text font-family="{font_family}" font-size="{font_size}" fill="{color}" x="{x}" y="{y}"{text_align}{transform_attr}>{text}</text>
-    </svg>'''
+            # The text is always added WITHOUT rotation in the SVG,
+            # so Krita produces a plain TextShape that the text editor
+            # can open.  Rotation is applied afterwards via
+            # setTransformation, then a layout refresh is forced.
+            #
+            # Why not put the rotation in the SVG:
+            #   - `transform=` on <text>: silently dropped by Krita's
+            #     parser, text ends up un-rotated.
+            #   - `<g transform=...><text/></g>`: rotation preserved,
+            #     bounds correct — but Krita wraps the result in a
+            #     GroupShape, and the TextShape inside it is not
+            #     directly editable from the canvas.
+            #   - `setTransformation` alone: rotation stored, but the
+            #     shape's cached bounds don't account for the rotated
+            #     extents, so the glyphs get clipped.  Editing the
+            #     text in the vector editor fixes it because that
+            #     triggers a relayout; we call the same underlying
+            #     update here.
+            svg = (
+                f'<svg width="{canvas_width}" height="{canvas_height}" '
+                f'xmlns="http://www.w3.org/2000/svg">'
+                f'<text font-family="{font_family}" '
+                f'font-size="{font_size}" fill="{color}" '
+                f'x="{x}" y="{y}"{text_align}>{text}</text>'
+                f'</svg>'
+            )
 
             target_layer.addShapesFromSvg(svg)
+            shapes_after = list(target_layer.shapes())
+
+            if rotation and shapes_after:
+                # The newly added shape is the one whose text content
+                # matches.  Identify by SVG content rather than by
+                # object identity: Krita's SIP bindings create a
+                # fresh Python wrapper every time shapes() is called,
+                # so id-based matching across two calls silently
+                # picks the oldest shape.
+                marker = f'>{text}<'
+                new_shape = None
+                for s in shapes_after:
+                    try:
+                        if marker in s.toSvg():
+                            new_shape = s
+                            break
+                    except Exception:
+                        continue
+                if new_shape is None:
+                    new_shape = shapes_after[-1]
+
+                if hasattr(new_shape, 'setTransformation'):
+                    t = QTransform()
+                    t.translate(x, y)
+                    t.rotate(rotation)
+                    t.translate(-x, -y)
+                    new_shape.setTransformation(t)
+
+                    # Force a layout / bounds recompute.  Try each of
+                    # the plausible method names in turn; different
+                    # Krita builds expose different sets of them, and
+                    # one of these is what the text editor's delete
+                    # keypress ends up triggering under the hood.
+                    for method_name, args in (
+                        ('update', ()),
+                        ('updateAbsoluteGeometry', ()),
+                        ('setShapeChanged', (True,)),
+                    ):
+                        if hasattr(new_shape, method_name):
+                            try:
+                                getattr(new_shape, method_name)(*args)
+                                break
+                            except Exception:
+                                continue
+
             refresh(doc)
 
-            return {'success': True, 'message': f'Added text to "{layer_name}"', 'data': {'text': text, 'font': font_family, 'size': font_size, 'position': (x, y), 'rotation': rotation, 'canvas': (canvas_width, canvas_height)}}
+            return {
+                'success': True,
+                'message': f'Added text to "{layer_name}"',
+                'data': {
+                    'text': text, 'font': font_family, 'size': font_size,
+                    'position': (x, y), 'rotation': rotation,
+                    'canvas': (canvas_width, canvas_height),
+                },
+            }
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
@@ -136,8 +207,6 @@ class LayerTextHandler:
                 return {'success': False,
                         'message': f'Layer "{layer_name}" is not a vector layer'}
 
-            # The points arrive either as a JSON string (CLI form) or as a
-            # list of pairs (direct batch form); normalise both.
             if isinstance(points_raw, str):
                 pts = json.loads(points_raw)
             else:

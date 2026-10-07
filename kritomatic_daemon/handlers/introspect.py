@@ -34,6 +34,8 @@ class IntrospectHandler:
             return self.list_extensions()
         elif cmd_type == 'get_node_xml':
             return self.get_node_xml(params)
+        elif cmd_type == 'describe_vector_layer':
+            return self.describe_vector_layer(params)
         return {'success': False, 'message': f'Unknown introspect command: {cmd_type}'}
 
     # ------------------------------------------------------------------
@@ -346,6 +348,120 @@ class IntrospectHandler:
                     'name': node.name(),
                     'type': node.type(),
                     'xml': node.toXML(),
+                },
+            }
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    # ------------------------------------------------------------------
+    #  Vector layer deep inspection
+    # ------------------------------------------------------------------
+
+    @command(
+        category='introspect',
+        help_text='Dump detailed info about a vector layer: its shapes with '
+                  'full SVGs, the layer bounds, and every ancestor group\'s '
+                  'transform-mask XML.  Used to reason about where a text '
+                  'object ends up after its parent group\'s mask is applied.',
+        args={
+            '--layer_name': {'type': 'str', 'required': True,
+                             'help': 'Name of the vector layer'},
+        }
+    )
+    def describe_vector_layer(self, params):
+        try:
+            doc = Krita.instance().activeDocument()
+            if not doc:
+                return {'success': False, 'message': 'No active document'}
+
+            layer_name = params.get('layer_name', '')
+            layer = doc.nodeByName(layer_name)
+            if not layer:
+                return {'success': False,
+                        'message': f'Layer "{layer_name}" not found'}
+
+            bounds = layer.bounds()
+            layer_info = {
+                'name': layer.name(),
+                'type': layer.type(),
+                'bounds': {
+                    'x': bounds.x(), 'y': bounds.y(),
+                    'width': bounds.width(), 'height': bounds.height(),
+                },
+            }
+
+            shapes_info = []
+            try:
+                for shape in layer.shapes():
+                    entry = {
+                        'type': type(shape).__name__,
+                        'svg': shape.toSvg(),
+                    }
+                    try:
+                        sb = shape.boundingBox()
+                        if sb is not None:
+                            entry['bounds'] = {
+                                'x': sb.x(), 'y': sb.y(),
+                                'width': sb.width(),
+                                'height': sb.height(),
+                            }
+                    except Exception:
+                        pass
+
+                    # Krita stores the shape's own transform on the
+                    # Shape object; toSvg() does not include it.  When
+                    # the SVG `transform=` attribute is dropped by
+                    # Krita's parser and rotation is re-applied via
+                    # setTransformation, this is where you see it.
+                    transforms = {}
+                    for method_name in ('transformation',
+                                        'absoluteTransformation'):
+                        if hasattr(shape, method_name):
+                            try:
+                                t = getattr(shape, method_name)()
+                                if t is not None:
+                                    transforms[method_name] = {
+                                        'm11': t.m11(), 'm12': t.m12(), 'm13': t.m13(),
+                                        'm21': t.m21(), 'm22': t.m22(), 'm23': t.m23(),
+                                        'm31': t.m31(), 'm32': t.m32(), 'm33': t.m33(),
+                                    }
+                            except Exception:
+                                pass
+                    if transforms:
+                        entry['transforms'] = transforms
+
+                    shapes_info.append(entry)
+            except Exception:
+                pass
+
+            ancestors = []
+            node = layer
+            while True:
+                parent = node.parentNode()
+                if parent is None:
+                    break
+                node = parent
+                if node.type() == 'grouplayer':
+                    group_entry = {
+                        'name': node.name(),
+                        'type': node.type(),
+                        'mask': None,
+                    }
+                    for child in node.childNodes():
+                        if child.type() == 'transformmask':
+                            group_entry['mask'] = {
+                                'name': child.name(),
+                                'xml': child.toXML(),
+                            }
+                    ancestors.append(group_entry)
+
+            return {
+                'success': True,
+                'message': f'Details for "{layer_name}"',
+                'data': {
+                    'layer': layer_info,
+                    'shapes': shapes_info,
+                    'ancestors': ancestors,
                 },
             }
         except Exception as e:

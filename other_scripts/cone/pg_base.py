@@ -460,6 +460,7 @@ HTML_HEAD = r"""<!DOCTYPE html>
     <select id="kraTextWarp">
       <option value="square">per-square</option>
       <option value="patch">per-patch</option>
+      <option value="text">per-text</option>
     </select>
   </div>
   <div class="field">

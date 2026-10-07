@@ -3515,30 +3515,66 @@ function _flatAnchorFromVisual(visualPts, W, H, position,
 }
 
 /* ==========================================================================
-   LEFT-ALIGNED ANCHOR CONVERSION
+   POSITION-AWARE ALIGNMENT
    ==========================================================================
-   _flatAnchorFromVisual returns the anchor of the text's CENTER — the
-   point where a center-aligned text would sit.  When the export uses
-   left alignment instead (so that editing the text grows it in one
-   direction only), the anchor must be moved to the text's START.
+   _flatAnchorFromVisual returns the anchor of the text's visual CENTER
+   for the requested position.  The alignment the daemon writes then
+   determines where, along the reading direction, that anchor sits
+   relative to the text's visual box:
 
-   In SVG, a left-aligned text extends from its anchor in the reading
-   direction, which in the flat frame is (cos R, sin R) for a rotation
-   of R degrees.  The text's visual center is half a text length along
-   that direction from the start.  So the start is the center shifted
-   backward by half the text's length:
+       left    anchor at the box's -half-length end (start)
+       center  anchor at the box's middle
+       right   anchor at the box's +half-length end
 
-       start = center − (textLen / 2) · (cos R, sin R)
+   So the visual box keeps the same center regardless of alignment,
+   and the anchor shifts along the reading direction by:
 
-   The returned object carries alignment: "left" so that the payload
-   tells the daemon which anchoring to use. */
-function _convertToLeftAnchor(anchorCenter, flatRotation, textLen, fontSize) {
+       left    -halfLen * (cos R, sin R)
+       center   0
+       right   +halfLen * (cos R, sin R)
+
+   The alignment is chosen from the requested visual position: a text
+   anchored at a right-hand corner or edge uses right alignment; at a
+   left-hand corner or edge uses left; at the top, bottom, or center
+   uses center.  This makes editing a label grow it away from its
+   anchoring side — a top-right label grows leftward and downward
+   from its top-right corner, a top-left label grows rightward and
+   downward from its top-left corner, and so on.
+
+   The approximate text half-length (textLen * fontSize * 0.55 / 2) is
+   the same estimate used by _flatAnchorFromVisual; it is accurate to
+   a few percent of the true width for the sans-serif default and is
+   only used to place the anchor, not to set the font size. */
+
+function _alignmentForPosition(position) {
+    if (position === "tr" || position === "br" || position === "right") {
+        return "right";
+    }
+    if (position === "top" || position === "bottom" || position === "center") {
+        return "center";
+    }
+    return "left";
+}
+
+function _anchorForPosition(anchorCenter, flatRotation, textLen, fontSize,
+                            position) {
+    const alignment = _alignmentForPosition(position);
     const rad = flatRotation * Math.PI / 180;
     const halfLen = (textLen * fontSize * 0.55) / 2;
+
+    let dx = 0, dy = 0;
+    if (alignment === "left") {
+        dx = -halfLen * Math.cos(rad);
+        dy = -halfLen * Math.sin(rad);
+    } else if (alignment === "right") {
+        dx = halfLen * Math.cos(rad);
+        dy = halfLen * Math.sin(rad);
+    }
+
     return {
-        x: anchorCenter.x - halfLen * Math.cos(rad),
-        y: anchorCenter.y - halfLen * Math.sin(rad),
-        alignment: "left",
+        x: anchorCenter.x + dx,
+        y: anchorCenter.y + dy,
+        alignment: alignment,
     };
 }
 
@@ -3595,8 +3631,8 @@ function buildKraShapes(options) {
       screenCorners, W, H, textPos, padFrac, fontNat, name.length,
       readingAngle, flatRotation
     );
-    const anchor = _convertToLeftAnchor(
-      anchorCenter, flatRotation, name.length, fontNat
+    const anchor = _anchorForPosition(
+      anchorCenter, flatRotation, name.length, fontNat, textPos
     );
 
     shapes.push({
@@ -3770,6 +3806,39 @@ function _patchFlatDimensions(projCorners) {
   };
 }
 
+/* ==========================================================================
+   PATCH MODE — one group + one mask per patch
+   ==========================================================================
+   One Krita group per patch, one transform mask per group.  All the
+   texts on that patch live inside the group.  The mask maps an
+   extended flat rectangle to the patch's projected quad, so the
+   texts are warped by the patch's own perspective.
+
+   Position: for each text we compute the exact desired screen anchor
+   using the same logic as square and text mode, then invert the
+   patch's homography at that screen point to get the flat patch
+   coordinate.  The patch mask maps that flat coordinate back to the
+   desired screen point, so the visual result is identical to text
+   mode.
+
+   Size: the mask's local linear scale at the text's flat position is
+   sqrt(|det J|), where J is the projective Jacobian of the patch's
+   homography.  To render at a desired screen size, the flat font
+   size is divided by that scale.
+
+   Rotation: for a desired screen reading direction (cos T, sin T),
+   the flat reading direction must be J^-1 * (cos T, sin T), so the
+   flat rotation is atan2 of that.
+
+   Source rect: the natural patch rectangle is [0, W] x [0, H], but a
+   text whose desired screen point lies outside the projected patch
+   quad has its flat coordinate outside that rectangle.  Krita's
+   transform mask only warps content inside its source rect, so the
+   source is extended to cover every text's flat extent.  The
+   destination corners are computed by the same homography, so the
+   mapping is unchanged where the original rect was; it just covers
+   more area. */
+
 function buildKraPatches(options) {
   options = options || {};
   const colorMode = options.text_color_mode || "color";
@@ -3803,149 +3872,216 @@ function buildKraPatches(options) {
        {x: projCorners[3][0], y: projCorners[3][1]}]
     );
     const patchHinv = _invert3x3(patchH);
+    if (!patchHinv) continue;
 
     const hue = patchHue(q);
-    const hexLight = _hueToHexLight(hue);
     const hex = _hueToHex(hue);
+    const hexLight = _hueToHexLight(hue);
     const textColor = (colorMode === "black") ? "#000000" : hexLight;
 
-    const texts = [];
     const rects = [];
+    const pending = [];
 
+    /* Start the source bbox from the natural patch rectangle so the
+       patch's own outline is covered even if a text ends up placed
+       close to a corner.  Extend from there as we place texts. */
     let bbMinX = 0, bbMinY = 0, bbMaxX = dims.w, bbMaxY = dims.h;
 
     for (const sq of sqsOnPatch) {
-      const sqCorners = _unclippedProjectedCorners(sq);
-      if (!sqCorners || sqCorners.length < 4) continue;
+      const unclipped = _unclippedProjectedCorners(sq);
+      if (!unclipped || unclipped.length < 4) continue;
+      const screenCorners = squareCornersScreen(sq) || unclipped;
 
-      const sqLens = (function () {
-        const n = sqCorners.length;
+      const lens = (function () {
+        const n = unclipped.length;
         const s = [];
         for (let k = 0; k < n; k++) {
-          const a = sqCorners[k];
-          const b = sqCorners[(k + 1) % n];
+          const a = unclipped[k];
+          const b = unclipped[(k + 1) % n];
           s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
         }
         return s;
       })();
-      const W_sq = (sqLens[0] + sqLens[2]) / 2;
-      const H_sq = (sqLens[1] + sqLens[3]) / 2;
-      const desiredScreenPx = Math.min(W_sq, H_sq) * 0.40;
+      const W_sq = (lens[0] + lens[2]) / 2;
+      const H_sq = (lens[1] + lens[3]) / 2;
+      if (W_sq <= 0.5 || H_sq <= 0.5) continue;
 
       const name = squareDisplayName(sq);
 
-      const sqScreenCorners = squareCornersScreen(sq) || sqCorners;
-      const flatRotSq = _shapeLabelFlatRotationDeg(sq, sqScreenCorners);
-      const readAngSq = _shapeLabelScreenAngleDeg(sq, sqScreenCorners);
-      const anchorSqCenter = _flatAnchorFromVisual(
-        sqScreenCorners, W_sq, H_sq, textPos, padFrac,
-        Math.min(W_sq, H_sq) * 0.40, name.length,
-        readAngSq, flatRotSq
-      );
-      const anchorSq = _convertToLeftAnchor(
-        anchorSqCenter, flatRotSq, name.length, Math.min(W_sq, H_sq) * 0.40
-      );
-
-      let tx = null, ty = null;
-      const sqH = _computeHomography(
-        [{x: 0, y: 0}, {x: W_sq, y: 0},
-         {x: W_sq, y: H_sq}, {x: 0, y: H_sq}],
-        [{x: sqCorners[0][0], y: sqCorners[0][1]},
-         {x: sqCorners[1][0], y: sqCorners[1][1]},
-         {x: sqCorners[2][0], y: sqCorners[2][1]},
-         {x: sqCorners[3][0], y: sqCorners[3][1]}]
-      );
-      const targetScreen = _applyHomography(sqH, anchorSq.x, anchorSq.y);
-
-      if (patchHinv && targetScreen &&
-          isFinite(targetScreen.x) && isFinite(targetScreen.y)) {
-        const flatPt = _applyHomography(patchHinv,
-                                        targetScreen.x, targetScreen.y);
-        if (flatPt && isFinite(flatPt.x) && isFinite(flatPt.y)) {
-          tx = flatPt.x;
-          ty = flatPt.y;
-        }
-      }
-
-      if (tx === null || ty === null) {
-        const cornersUV = _squareCornersInPatchUV(sq);
-        const uNorm = anchorSq.x / W_sq;
-        const vNorm = anchorSq.y / H_sq;
-        const uvPatch = _bilinearInterpQuad(cornersUV, uNorm, vNorm);
-        tx = (uvPatch.u + 0.5) * dims.w;
-        ty = (0.5 - uvPatch.v) * dims.h;
-      }
-
-      const J = _patchProjectiveJacobian(patchH, tx, ty);
-
-      let localScale = 1.0;
-      if (J) {
-        const det = J.J11 * J.J22 - J.J12 * J.J21;
-        localScale = Math.sqrt(Math.abs(det));
-        if (localScale < 1e-3) localScale = 1.0;
-      }
-      const font_px = Math.max(6, desiredScreenPx / localScale);
-
-      let flatRotation = 0;
-      if (J) {
-        const Jinv = _invert2x2(J);
-        if (Jinv) {
-          const rad = readAngSq * Math.PI / 180;
-          const cosT = Math.cos(rad);
-          const sinT = Math.sin(rad);
-          const flatDx = Jinv.i11 * cosT + Jinv.i12 * sinT;
-          const flatDy = Jinv.i21 * cosT + Jinv.i22 * sinT;
-          if (Math.abs(flatDx) > 1e-12 || Math.abs(flatDy) > 1e-12) {
-            flatRotation = Math.atan2(flatDy, flatDx) * 180 / Math.PI;
-          }
-        }
-      }
-
-      const pad = font_px * 1.2;
-      bbMinX = Math.min(bbMinX, tx - pad);
-      bbMaxX = Math.max(bbMaxX, tx + pad);
-      bbMinY = Math.min(bbMinY, ty - pad);
-      bbMaxY = Math.max(bbMaxY, ty + pad);
-
-      texts.push({
-        text:          name,
-        x:             tx,
-        y:             ty,
-        font_px:       font_px,
-        color:         textColor,
-        flat_rotation: flatRotation,
-      });
-
       if (drawRects) {
         rects.push({
-          name:           name,
-          points:         sqCorners.map(([x, y]) => [x, y]),
-          fill:           hex,
-          fill_opacity:   0.40,
-          stroke:         hex,
-          stroke_width:   2.0,
+          name: name,
+          points: screenCorners.map(([x, y]) => [x, y]),
+          fill: hex,
+          fill_opacity: 0.40,
+          stroke: hex,
+          stroke_width: 2.0,
           stroke_opacity: 1.0,
         });
       }
+
+      /* Desired screen anchor: identical to square mode's. */
+      const flatRotSq = _shapeLabelFlatRotationDeg(sq, screenCorners);
+      const readAngSq = _shapeLabelScreenAngleDeg(sq, screenCorners);
+      const fontNat = Math.min(W_sq, H_sq) * 0.40;
+
+      const anchorCenterFlatSq = _flatAnchorFromVisual(
+        screenCorners, W_sq, H_sq, textPos, padFrac,
+        fontNat, name.length, readAngSq, flatRotSq
+      );
+      const anchorFlatSq = _anchorForPosition(
+        anchorCenterFlatSq, flatRotSq, name.length, fontNat, textPos
+      );
+
+      /* Square homography: flat square rectangle -> the square's
+         unclipped projected quad.  The same construction the square
+         and text modes use. */
+      const sqH = _computeHomography(
+        [{x: 0, y: 0}, {x: W_sq, y: 0},
+         {x: W_sq, y: H_sq}, {x: 0, y: H_sq}],
+        [{x: unclipped[0][0], y: unclipped[0][1]},
+         {x: unclipped[1][0], y: unclipped[1][1]},
+         {x: unclipped[2][0], y: unclipped[2][1]},
+         {x: unclipped[3][0], y: unclipped[3][1]}]
+      );
+
+      /* Where the anchor should land on screen. */
+      const desiredScreen = _applyHomography(
+        sqH, anchorFlatSq.x, anchorFlatSq.y
+      );
+      if (!desiredScreen ||
+          !isFinite(desiredScreen.x) || !isFinite(desiredScreen.y)) continue;
+
+      /* Flat patch position that the patch mask maps to desiredScreen. */
+      const flatPatch = _applyHomography(
+        patchHinv, desiredScreen.x, desiredScreen.y
+      );
+      if (!flatPatch ||
+          !isFinite(flatPatch.x) || !isFinite(flatPatch.y)) continue;
+
+      const px = flatPatch.x;
+      const py = flatPatch.y;
+
+      /* Local Jacobian of the patch's homography, at the text's
+         position.  Used for size and rotation. */
+      const J = _patchProjectiveJacobian(patchH, px, py);
+      if (!J) continue;
+
+      const det = J.J11 * J.J22 - J.J12 * J.J21;
+      let localScale = Math.sqrt(Math.abs(det));
+      if (localScale < 1e-3) localScale = 1.0;
+
+      /* Flat font size so the on-screen size matches fontNat. */
+      const font_px = Math.max(6, fontNat / localScale);
+
+      /* Flat rotation so the on-screen reading direction matches
+         readAngSq. */
+      let flatRotation = 0;
+      const Jinv = _invert2x2(J);
+      if (Jinv) {
+        const rad = readAngSq * Math.PI / 180;
+        const cosT = Math.cos(rad);
+        const sinT = Math.sin(rad);
+        const flatDx = Jinv.i11 * cosT + Jinv.i12 * sinT;
+        const flatDy = Jinv.i21 * cosT + Jinv.i22 * sinT;
+        if (Math.abs(flatDx) > 1e-12 || Math.abs(flatDy) > 1e-12) {
+          flatRotation = Math.atan2(flatDy, flatDx) * 180 / Math.PI;
+        }
+      }
+
+      pending.push({
+        name: name,
+        px: px,
+        py: py,
+        font_px: font_px,
+        rotation: flatRotation,
+        alignment: anchorFlatSq.alignment,
+      });
+
+      /* Extend the source bbox by the text's flat extent.  The text
+         extends from (px, py) along the reading direction by an
+         amount that depends on its alignment, with a perpendicular
+         half-height of font_px/2. */
+      const rad = flatRotation * Math.PI / 180;
+      const cosR = Math.cos(rad);
+      const sinR = Math.sin(rad);
+      const h2 = font_px / 2;
+      const textLenPx = name.length * font_px * 0.55;
+
+      let extStart, extEnd;
+      if (anchorFlatSq.alignment === "right") {
+        extStart = textLenPx; extEnd = 0;
+      } else if (anchorFlatSq.alignment === "center") {
+        extStart = textLenPx / 2; extEnd = textLenPx / 2;
+      } else {
+        extStart = 0; extEnd = textLenPx;
+      }
+
+      const localCorners = [
+        [-extStart, -h2], [extEnd, -h2],
+        [ extEnd,   h2], [-extStart, h2],
+      ];
+      for (const [lx, ly] of localCorners) {
+        const rx = lx * cosR - ly * sinR;
+        const ry = lx * sinR + ly * cosR;
+        bbMinX = Math.min(bbMinX, px + rx);
+        bbMaxX = Math.max(bbMaxX, px + rx);
+        bbMinY = Math.min(bbMinY, py + ry);
+        bbMaxY = Math.max(bbMaxY, py + ry);
+      }
     }
 
+    if (pending.length === 0) continue;
+
+    /* A small margin so nothing sits right at the edge of the source. */
+    const MARGIN = 4;
+    bbMinX -= MARGIN;
+    bbMinY -= MARGIN;
+    bbMaxX += MARGIN;
+    bbMaxY += MARGIN;
+
+    /* Shift everything to non-negative coordinates.  Krita's vector
+       engine is happier without negative shape positions, and the
+       shift is transparent: it changes only where inside the group
+       the content lives, not where it renders after the mask. */
+    const offX = bbMinX;
+    const offY = bbMinY;
+    const Wshift = bbMaxX - bbMinX;
+    const Hshift = bbMaxY - bbMinY;
+
+    const texts = [];
+    for (const p of pending) {
+      texts.push({
+        text: p.name,
+        x: p.px - offX,
+        y: p.py - offY,
+        font_px: p.font_px,
+        flat_rotation: p.rotation,
+        alignment: p.alignment,
+        color: textColor,
+      });
+    }
+
+    /* Mask source: the shifted bbox.  Destination: the same corners
+       through the patch's homography at their UNSHIFTED positions. */
     const srcPts = [
+      [0, 0], [Wshift, 0], [Wshift, Hshift], [0, Hshift],
+    ];
+    const unshiftedCorners = [
       [bbMinX, bbMinY], [bbMaxX, bbMinY],
       [bbMaxX, bbMaxY], [bbMinX, bbMaxY],
     ];
-    const dstPts = srcPts.map(([sx, sy]) => {
-      const p = _applyHomography(patchH, sx, sy);
+    const dstPts = unshiftedCorners.map(([fx, fy]) => {
+      const p = _applyHomography(patchH, fx, fy);
       return p ? [p.x, p.y] : [0, 0];
     });
 
     patches.push({
-      name:    q.name,
-      flat_w:  dims.w,
-      flat_h:  dims.h,
+      name: q.name,
       src_pts: srcPts,
       dst_pts: dstPts,
-      texts:   texts,
-      rects:   rects,
+      texts: texts,
+      rects: rects,
     });
   }
   return patches;
@@ -4032,8 +4168,8 @@ function buildKraTexts(options) {
       fontNat, name.length,
       readingAngle, flatRotation
     );
-    const anchor = _convertToLeftAnchor(
-      anchorCenter, flatRotation, name.length, fontNat
+    const anchor = _anchorForPosition(
+      anchorCenter, flatRotation, name.length, fontNat, textPos
     );
 
     const srcPts = [

@@ -105,15 +105,22 @@ def _apply_rotation(shape, x, y, rotation_deg):
                 continue
 
 
+def _is_text_shape(shape):
+    """True iff this shape's SVG contains a <text> element."""
+    try:
+        return '<text' in shape.toSvg()
+    except Exception:
+        return False
+
+
 def _find_text_shape(layer):
-    """Return the first text shape in a vector layer, or None."""
+    """Return the first text shape in a vector layer, or None.  Kept
+    for list_text_layers, which only needs to know if a layer has at
+    least one text shape."""
     try:
         for s in layer.shapes():
-            try:
-                if '<text' in s.toSvg():
-                    return s
-            except Exception:
-                continue
+            if _is_text_shape(s):
+                return s
     except Exception:
         pass
     return None
@@ -205,11 +212,7 @@ class LayerTextHandler:
 
             # Every alignment gets dominant-baseline="middle" so the
             # y-coordinate always means the vertical center of the
-            # text, regardless of horizontal alignment.  Without this,
-            # center-aligned text has its y at the visual middle, but
-            # left- and right-aligned text have y at the baseline,
-            # which is a different vertical position by roughly half a
-            # line height.
+            # text, regardless of horizontal alignment.
             text_align = ""
             if alignment == "center":
                 text_align = ' text-anchor="middle" dominant-baseline="middle"'
@@ -692,9 +695,12 @@ class LayerTextHandler:
 
     @command(
         category='layer',
-        help_text='Return the full record of a layer\'s text shape: its '
-                  'content, font, size, color, position, alignment, and '
-                  'rotation, drawn from the shape\'s SVG and its transform.',
+        help_text='Return full records for every text shape in a layer.  '
+                  'Each record carries the shape\'s content, font, size, '
+                  'color, position, alignment, rotation, and transform.  '
+                  'A layer with N text shapes yields N records; each has a '
+                  'text_index field naming the shape\'s position in the '
+                  'layer\'s shapes() list.',
         args={
             '--layer_name': {'type': 'str', 'required': True,
                              'help': 'Name of the vector layer'},
@@ -715,34 +721,44 @@ class LayerTextHandler:
                 return {'success': False,
                         'message': f'Layer "{layer_name}" is not a vector layer'}
 
-            shape = _find_text_shape(layer)
-            if shape is None:
-                return {'success': False,
-                        'message': f'Layer "{layer_name}" has no text shape'}
+            try:
+                shapes = list(layer.shapes())
+            except Exception:
+                shapes = []
 
-            svg = shape.toSvg()
-            record = {'layer_name': layer_name}
-            record.update(_parse_text_svg(svg))
-
-            if hasattr(shape, 'transformation'):
+            records = []
+            for i, shape in enumerate(shapes):
+                if not _is_text_shape(shape):
+                    continue
                 try:
-                    t = shape.transformation()
-                    if t is not None:
-                        record['rotation_deg'] = math.degrees(
-                            math.atan2(t.m12(), t.m11())
-                        )
-                        record['transform'] = [
-                            t.m11(), t.m12(), t.m13(),
-                            t.m21(), t.m22(), t.m23(),
-                            t.m31(), t.m32(), t.m33(),
-                        ]
+                    svg = shape.toSvg()
                 except Exception:
-                    pass
+                    continue
+
+                rec = {'layer_name': layer_name, 'text_index': i}
+                rec.update(_parse_text_svg(svg))
+
+                if hasattr(shape, 'transformation'):
+                    try:
+                        t = shape.transformation()
+                        if t is not None:
+                            rec['rotation_deg'] = math.degrees(
+                                math.atan2(t.m12(), t.m11())
+                            )
+                            rec['transform'] = [
+                                t.m11(), t.m12(), t.m13(),
+                                t.m21(), t.m22(), t.m23(),
+                                t.m31(), t.m32(), t.m33(),
+                            ]
+                    except Exception:
+                        pass
+
+                records.append(rec)
 
             return {
                 'success': True,
-                'message': f'Metadata for "{layer_name}"',
-                'data': record,
+                'message': f'{len(records)} text shape(s) on "{layer_name}"',
+                'data': records,
             }
         except Exception as e:
             return {'success': False, 'message': str(e)}
@@ -753,13 +769,19 @@ class LayerTextHandler:
 
     @command(
         category='layer',
-        help_text='Patch some fields of a layer\'s text shape.  Any field '
-                  'omitted from the patch is preserved from the shape\'s '
-                  'current state.  Fields: text, font_family, font_size, '
-                  'color, x, y, alignment, rotation_deg.',
+        help_text='Patch some fields of one text shape in a layer.  Any '
+                  'field omitted from the patch is preserved from the '
+                  'shape\'s current state.  Fields: text, font_family, '
+                  'font_size, color, x, y, alignment, rotation_deg.',
         args={
             '--layer_name': {'type': 'str', 'required': True,
                              'help': 'Name of the vector layer'},
+            '--text_index': {'type': 'int', 'default': 0,
+                             'help': 'Index of the target shape within the '
+                                     'layer\'s shapes() list.  A layer with '
+                                     'multiple text shapes (per-patch export) '
+                                     'uses this to select which one.  Default '
+                                     '0.'},
             '--patch': {'type': 'str', 'required': True,
                         'help': 'JSON object with the fields to change'},
         }
@@ -771,6 +793,7 @@ class LayerTextHandler:
                 return {'success': False, 'message': 'No active document'}
 
             layer_name = params.get('layer_name', '')
+            text_index = int(params.get('text_index', 0))
             patch_raw = params.get('patch', '{}')
             if isinstance(patch_raw, str):
                 patch = json.loads(patch_raw)
@@ -788,13 +811,27 @@ class LayerTextHandler:
                 return {'success': False,
                         'message': f'Layer "{layer_name}" is not a vector layer'}
 
-            shape = _find_text_shape(layer)
-            if shape is None:
+            try:
+                shapes = list(layer.shapes())
+            except Exception:
+                shapes = []
+            if text_index < 0 or text_index >= len(shapes):
                 return {'success': False,
-                        'message': f'Layer "{layer_name}" has no text shape'}
+                        'message': f'text_index {text_index} out of range '
+                                   f'(layer has {len(shapes)} shape(s))'}
+            shape = shapes[text_index]
 
-            # Current state, from the shape's SVG and its transform.
-            current = _parse_text_svg(shape.toSvg())
+            if not _is_text_shape(shape):
+                return {'success': False,
+                        'message': f'shape at index {text_index} is not a '
+                                   f'text shape'}
+
+            try:
+                svg_current = shape.toSvg()
+            except Exception:
+                svg_current = ''
+
+            current = _parse_text_svg(svg_current)
             old_transform = None
             if hasattr(shape, 'transformation'):
                 try:
@@ -826,8 +863,6 @@ class LayerTextHandler:
             elif alignment == 'right':
                 text_align = ' text-anchor="end" dominant-baseline="middle"'
 
-            # Rotation: explicit patch field wins; else derive from the
-            # shape's existing transform.
             if 'rotation_deg' in patch:
                 rotation_deg = float(patch['rotation_deg'])
             elif old_transform is not None:
@@ -840,7 +875,6 @@ class LayerTextHandler:
             W = doc.width()
             H = doc.height()
 
-            # Remove the old shape and add the new one.
             shape.remove()
 
             svg = (
@@ -853,7 +887,6 @@ class LayerTextHandler:
             )
             layer.addShapesFromSvg(svg)
 
-            # Identify the newly added shape and re-apply the rotation.
             marker = f'>{text}<'
             new_shape = None
             for s in layer.shapes():
@@ -875,9 +908,10 @@ class LayerTextHandler:
 
             return {
                 'success': True,
-                'message': f'Patched "{layer_name}"',
+                'message': f'Patched "{layer_name}" text {text_index}',
                 'data': {
                     'layer_name': layer_name,
+                    'text_index': text_index,
                     'applied': sorted(patch.keys()),
                 },
             }

@@ -195,8 +195,30 @@ def _build_square_mode(shapes, opts, band, doc_name):
 
 
 def _build_patch_mode(patches, opts, band, doc_name):
+    """One group + one mask per patch.
+
+    Structure per patch:
+
+        group <patch_name>               (has a perspective mask)
+            vector layer <patch_name>_content
+                text ... (one per square on the patch)
+            transform mask <patch_name>_persp
+                maps the extended flat rectangle to the projected quad
+
+    Rectangles, when enabled, are emitted first as direct polygons in
+    the export group (outside any mask), using each square's projected
+    corners verbatim.
+
+    Each text carries its own flat position, size, rotation, and
+    alignment, all pre-computed on the JS side so that after the
+    patch's mask the text lands at the same screen position, size,
+    and angle it would have had in square mode.  The mask's source
+    rectangle is extended to cover every text, so Krita's transform
+    actually reaches every glyph.
+    """
     commands = _common_header(band, doc_name)
 
+    # ---- Pass 1: rectangles ----------------------------------------
     for patch in patches:
         for rect in patch.get("rects", []):
             rect_layer = rect["name"] + "_rect"
@@ -219,6 +241,7 @@ def _build_patch_mode(patches, opts, band, doc_name):
                 "stroke_opacity": rect.get("stroke_opacity", 1.0),
             })
 
+    # ---- Pass 2: patch groups with their masks and texts -----------
     for patch in patches:
         layer_name = patch["name"]
         content_name = layer_name + "_content"
@@ -247,7 +270,7 @@ def _build_patch_mode(patches, opts, band, doc_name):
                 "x": float(txt["x"]),
                 "y": float(txt["y"]),
                 "color": txt.get("color", "#ffffff"),
-                "alignment": "center",
+                "alignment": txt.get("alignment", "center"),
                 "rotation": float(txt.get("flat_rotation", 0.0)),
             })
 
@@ -257,18 +280,10 @@ def _build_patch_mode(patches, opts, band, doc_name):
             "mask_name": mask_name,
         })
 
-        if "src_pts" in patch and "dst_pts" in patch:
-            src_pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
-                       for p in patch["src_pts"]]
-            dst_pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
-                       for p in patch["dst_pts"]]
-        else:
-            W = max(1.0, float(patch["flat_w"]))
-            H = max(1.0, float(patch["flat_h"]))
-            src_pts = [[0.0, 0.0], [W, 0.0], [W, H], [0.0, H]]
-            dst_pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
-                       for p in patch["corners"]]
-
+        src_pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
+                   for p in patch["src_pts"]]
+        dst_pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
+                   for p in patch["dst_pts"]]
         commands.append({
             "type": "set_perspective_transform_mask",
             "mask_name": mask_name,

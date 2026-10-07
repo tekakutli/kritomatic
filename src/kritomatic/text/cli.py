@@ -4,15 +4,18 @@ CLI for viewing and editing vector text layers via the daemon.
 Two subcommands:
 
     kritomatic text dump [--pattern GLOB] [--output FILE]
-        Emit a JSON array of full records, one per text layer.
+        Emit a JSON array of full records, one per text shape.
+        A layer with several text shapes yields several records,
+        each distinguished by its text_index field.
 
     kritomatic text load [--input FILE]
         Read a JSON array of records (or a single record) and push
-        each one's fields back to its layer.  Fields omitted from a
-        record are preserved as-is on the layer.
+        each one's fields back to its shape.  Fields omitted from a
+        record are preserved as-is on the shape.  Records are matched
+        to shapes by (layer_name, text_index).
 
-No daemon-side change beyond the three commands the handler now
-exposes: list_text_layers, get_layer_text_metadata, patch_layer_text.
+No daemon-side change beyond the three commands the handler exposes:
+list_text_layers, get_layer_text_metadata, patch_layer_text.
 """
 
 import argparse
@@ -60,10 +63,17 @@ def cmd_dump(client, args):
 
     records = []
     for name in names:
-        rec = _daemon_call(client, 'get_layer_text_metadata',
-                           layer_name=name)
-        if rec is not None:
-            records.append(rec)
+        recs = _daemon_call(client, 'get_layer_text_metadata',
+                            layer_name=name)
+        if recs is None:
+            continue
+        # The daemon returns a list — one record per text shape in the
+        # layer.  Older daemon builds returned a single dict; accept
+        # both so an un-reloaded daemon still produces useful output.
+        if isinstance(recs, list):
+            records.extend(recs)
+        elif isinstance(recs, dict):
+            records.append(recs)
 
     output = json.dumps(records, indent=2)
     if args.output:
@@ -107,23 +117,28 @@ def cmd_load(client, args):
             failed += 1
             continue
 
+        try:
+            text_index = int(rec.get('text_index', 0))
+        except (TypeError, ValueError):
+            text_index = 0
+
         patch = {k: v for k, v in rec.items()
-                 if k != 'layer_name' and k in _PUSHABLE}
+                 if k not in ('layer_name', 'text_index') and k in _PUSHABLE}
         if not patch:
-            # Nothing to change — a record that only carried read-only
-            # fields.  Count as success but do not issue a round trip.
             succeeded += 1
             continue
 
         resp = client.execute('patch_layer_text',
                               layer_name=layer_name,
+                              text_index=text_index,
                               patch=json.dumps(patch))
         if resp and resp.get('status') == 'success':
             succeeded += 1
         else:
             failed += 1
             msg = resp.get('message') if resp else 'no response'
-            print(f"  ✗ {layer_name}: {msg}", file=sys.stderr)
+            print(f"  ✗ {layer_name} [{text_index}]: {msg}",
+                  file=sys.stderr)
 
     print(f"Loaded {succeeded} record(s), {failed} failed", file=sys.stderr)
     return 0 if failed == 0 else 1
@@ -138,7 +153,7 @@ def run_text_command():
                                 required=True)
 
     p_dump = sub.add_parser('dump',
-                            help='Emit full metadata for every text layer')
+                            help='Emit full metadata for every text shape')
     p_dump.add_argument('--pattern', default=None,
                         help='Only layers matching this glob')
     p_dump.add_argument('--output', '-o', default=None,

@@ -461,6 +461,8 @@ HTML_HEAD = r"""<!DOCTYPE html>
       <option value="square">per-square</option>
       <option value="patch">per-patch</option>
       <option value="text">per-text</option>
+      <option value="text-shear">per-text shear</option>
+      <option value="patch-shear">per-patch shear</option>
     </select>
   </div>
   <div class="field">

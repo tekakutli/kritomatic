@@ -1,30 +1,32 @@
 """
 cone_kra.py — turn the cone playground into a .kra.
 
-Three export modes, selected by options.text_warp_mode:
+Five export modes, selected by options.text_warp_mode:
 
     "square" (default)
-        One group + one transform mask per square.  The mask maps
-        the square's flat rectangle to its projected quad on the
-        cone.  Rectangles optionally included.  Texts individually
-        rotated to read along their own square's longest side.
+        One group + one transform mask per square.
 
     "patch"
         One group + one transform mask per patch.  All texts on the
-        patch share the patch's mask.  Texts are placed so that
-        after the patch's mask they land at exactly the screen
-        position, rotation, and size they would have had in square
-        mode.  Rectangles exported as direct polygons outside the
-        patch's mask.
+        patch share the patch's mask.
 
     "text"
         One group + one transform mask per text.  Each text's mask
-        is a copy of the SQUARE'S own mask — source = the square's
-        full flat rectangle, destination = the square's projected
-        corners.  This is the same geometry square mode uses, but
-        with a text-only vector layer inside the group instead of
-        rectangle-plus-text.  Rectangles, when enabled, are emitted
-        as direct polygons in the export group.
+        is a copy of the SQUARE'S own mask.
+
+    "text-shear"
+        No masks.  One direct vector layer per text, carrying a full
+        affine transform (rotation + shear + non-uniform scale)
+        computed on the JS side to reproduce the mask-mode result
+        while keeping the text's on-screen bounding box inside a
+        fontNat × fontNat square.
+
+    "patch-shear"
+        No masks.  One group per patch (no mask on the group); each
+        text on the patch is a direct vector layer inside the group,
+        each with its own affine transform.  The scale normalization
+        matches text-shear's, so both modes render each text at the
+        same size.
 
 No background layer is created in any mode.
 """
@@ -77,7 +79,7 @@ def _normalize_options(raw):
     if not isinstance(draw, bool):
         draw = bool(draw)
     mode = raw.get("text_warp_mode", "square")
-    if mode not in ("square", "patch", "text"):
+    if mode not in ("square", "patch", "text", "text-shear", "patch-shear"):
         mode = "square"
     return {"draw_rectangles": draw, "text_warp_mode": mode}
 
@@ -197,14 +199,6 @@ def _build_square_mode(shapes, opts, band, doc_name):
 def _build_patch_mode(patches, opts, band, doc_name):
     """One group + one mask per patch.
 
-    Structure per patch:
-
-        group <patch_name>               (has a perspective mask)
-            vector layer <patch_name>_content
-                text ... (one per square on the patch)
-            transform mask <patch_name>_persp
-                maps the extended flat rectangle to the projected quad
-
     Rectangles, when enabled, are emitted first as direct polygons in
     the export group (outside any mask), using each square's projected
     corners verbatim.
@@ -218,7 +212,6 @@ def _build_patch_mode(patches, opts, band, doc_name):
     """
     commands = _common_header(band, doc_name)
 
-    # ---- Pass 1: rectangles ----------------------------------------
     for patch in patches:
         for rect in patch.get("rects", []):
             rect_layer = rect["name"] + "_rect"
@@ -241,7 +234,6 @@ def _build_patch_mode(patches, opts, band, doc_name):
                 "stroke_opacity": rect.get("stroke_opacity", 1.0),
             })
 
-    # ---- Pass 2: patch groups with their masks and texts -----------
     for patch in patches:
         layer_name = patch["name"]
         content_name = layer_name + "_content"
@@ -371,6 +363,133 @@ def _build_text_mode(texts, rects, opts, band, doc_name):
     return {"id": "cone_export", "commands": commands}
 
 
+def _build_shear_mode(texts, rects, opts, band, doc_name):
+    """No masks.  One vector layer per text.  Position (x, y), size
+    (font_size), and a full affine transform (rotation + shear +
+    non-uniform scale, scale-normalized so the larger of the two
+    reaches 1) are pre-computed on the JS side to reproduce the mask-
+    based output without using a mask."""
+    commands = _common_header(band, doc_name)
+
+    for rect in (rects or []):
+        rect_layer = rect["name"] + "_rect"
+        commands.append({
+            "type": "create_layer",
+            "name": rect_layer,
+            "layer_type": "vectorlayer",
+            "parent": EXPORT_GROUP_NAME,
+        })
+        pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
+               for p in rect["points"]]
+        commands.append({
+            "type": "add_vector_polygon",
+            "layer_name": rect_layer,
+            "points": json.dumps(pts),
+            "fill": rect.get("fill", "#ffffff"),
+            "fill_opacity": rect.get("fill_opacity", 0.40),
+            "stroke": rect.get("stroke", "#ffffff"),
+            "stroke_width": rect.get("stroke_width", 2.0),
+            "stroke_opacity": rect.get("stroke_opacity", 1.0),
+        })
+
+    for t in texts:
+        layer_name = t["name"] + "_text"
+
+        commands.append({
+            "type": "create_layer",
+            "name": layer_name,
+            "layer_type": "vectorlayer",
+            "parent": EXPORT_GROUP_NAME,
+        })
+        commands.append({
+            "type": "add_vector_text",
+            "layer_name": layer_name,
+            "text": str(t["text"]),
+            "font_family": DEFAULT_FONT_FAMILY,
+            "font_size": max(6, int(round(float(t["font_px"])))),
+            "x": float(t["x"]),
+            "y": float(t["y"]),
+            "color": t.get("color", "#ffffff"),
+            "alignment": t.get("alignment", "center"),
+            "rotation": 0.0,
+            "transform": json.dumps(t["transform"]),
+        })
+
+    return {"id": "cone_export", "commands": commands}
+
+
+def _build_patch_shear_mode(patches, opts, band, doc_name):
+    """No masks.  One group per patch; each text inside its patch's
+    group as a direct vector layer with its own affine transform.
+
+    Rectangles, when enabled, are direct polygons in the export group,
+    emitted first so they render below the texts.
+
+    Group nesting:
+        group <batchid>_Export
+            vector layer <sq>_rect ...
+            group <patch>
+                vector layer <sq>_text ...
+    """
+    commands = _common_header(band, doc_name)
+
+    for patch in patches:
+        for rect in patch.get("rects", []):
+            rect_layer = rect["name"] + "_rect"
+            commands.append({
+                "type": "create_layer",
+                "name": rect_layer,
+                "layer_type": "vectorlayer",
+                "parent": EXPORT_GROUP_NAME,
+            })
+            pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
+                   for p in rect["points"]]
+            commands.append({
+                "type": "add_vector_polygon",
+                "layer_name": rect_layer,
+                "points": json.dumps(pts),
+                "fill": rect.get("fill", "#ffffff"),
+                "fill_opacity": rect.get("fill_opacity", 0.40),
+                "stroke": rect.get("stroke", "#ffffff"),
+                "stroke_width": rect.get("stroke_width", 2.0),
+                "stroke_opacity": rect.get("stroke_opacity", 1.0),
+            })
+
+    for patch in patches:
+        group_name = patch["name"]
+
+        commands.append({
+            "type": "create_layer",
+            "name": group_name,
+            "layer_type": "grouplayer",
+            "parent": EXPORT_GROUP_NAME,
+        })
+
+        for t in patch.get("texts", []):
+            layer_name = t["name"] + "_text"
+            commands.append({
+                "type": "create_layer",
+                "name": layer_name,
+                "layer_type": "vectorlayer",
+                "parent": group_name,
+            })
+            commands.append({
+                "type": "add_vector_text",
+                "layer_name": layer_name,
+                "text": str(t["text"]),
+                "font_family": DEFAULT_FONT_FAMILY,
+                "font_size": max(6, int(round(float(t["font_px"])))),
+                "x": float(t["x"]),
+                "y": float(t["y"]),
+                "color": t.get("color", "#ffffff"),
+                "alignment": t.get("alignment", "center"),
+                "rotation": 0.0,
+                "transform": json.dumps(t["transform"]),
+            })
+
+    return {"id": "cone_export", "commands": commands}
+
+
 def build_bundle(shapes: List[Dict[str, Any]],
                  options: Dict[str, Any] = None,
                  cone_band: Dict[str, Any] = None,
@@ -381,6 +500,11 @@ def build_bundle(shapes: List[Dict[str, Any]],
     opts = _normalize_options(options)
     band = _normalize_cone_band(cone_band)
 
+    if opts["text_warp_mode"] == "patch-shear":
+        return _build_patch_shear_mode(patches or [], opts, band, doc_name)
+    if opts["text_warp_mode"] == "text-shear":
+        return _build_shear_mode(texts or [], rects or [],
+                                 opts, band, doc_name)
     if opts["text_warp_mode"] == "text":
         return _build_text_mode(texts or [], rects or [],
                                 opts, band, doc_name)
@@ -401,7 +525,13 @@ def generate(payload: Dict[str, Any]) -> Dict[str, Any]:
     output_path = payload.get("output_path")
 
     opts = _normalize_options(options)
-    if opts["text_warp_mode"] == "text":
+    if opts["text_warp_mode"] == "patch-shear":
+        if not patches:
+            return {"success": False, "message": "No patches to export"}
+    elif opts["text_warp_mode"] == "text-shear":
+        if not texts:
+            return {"success": False, "message": "No texts to export"}
+    elif opts["text_warp_mode"] == "text":
         if not texts:
             return {"success": False, "message": "No texts to export"}
     elif opts["text_warp_mode"] == "patch":
@@ -443,9 +573,9 @@ def generate(payload: Dict[str, Any]) -> Dict[str, Any]:
             "results": results,
         }
 
-    if opts["text_warp_mode"] == "text":
+    if opts["text_warp_mode"] in ("text", "text-shear"):
         count, kind = len(texts), "text(s)"
-    elif opts["text_warp_mode"] == "patch":
+    elif opts["text_warp_mode"] in ("patch", "patch-shear"):
         count, kind = len(patches), "patch(es)"
     else:
         count, kind = len(shapes), "shape(s)"

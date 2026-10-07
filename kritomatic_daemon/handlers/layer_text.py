@@ -18,12 +18,6 @@ _STYLE_PROP_RE = re.compile(r'([a-zA-Z-]+)\s*:\s*([^;]+)')
 
 
 def _parse_text_svg(svg):
-    """Extract everything we can from a text shape's SVG.
-
-    Returns a dict with any of: text, x, y, color, font_family,
-    font_size, alignment.  Missing fields are simply absent, so the
-    caller can test for their presence.
-    """
     out = {}
 
     m = _TEXT_BODY_RE.search(svg)
@@ -71,26 +65,20 @@ def _parse_text_svg(svg):
     return out
 
 
-def _apply_rotation(shape, x, y, rotation_deg):
-    """Apply a rotation around (x, y) to a text shape, then nudge
-    Krita into recomputing its cached bounds.
+def _apply_transform(shape, qtransform):
+    """Apply an arbitrary QTransform to a shape, then nudge Krita into
+    recomputing its cached bounds.
 
-    A rotated text shape's cached bounds do not account for the
-    rotated glyph extents until a layout refresh occurs; without one
-    the glyphs render clipped.  Editing the text in Krita's vector
-    editor triggers that refresh; the calls below are the programmatic
-    equivalents, tried in order of likelihood.
+    Without the nudge, rotated or sheared text renders clipped: Krita
+    caches the shape's bounds at creation and does not recompute them
+    after setTransformation.  A user editing the text in the vector
+    editor triggers the same relayout this method performs
+    programmatically, which is why the clipping disappears as soon as
+    the text is touched by hand.
     """
-    if not rotation_deg:
-        return
     if not hasattr(shape, 'setTransformation'):
         return
-
-    t = QTransform()
-    t.translate(x, y)
-    t.rotate(rotation_deg)
-    t.translate(-x, -y)
-    shape.setTransformation(t)
+    shape.setTransformation(qtransform)
 
     for method_name, args in (
         ('update', ()),
@@ -106,7 +94,6 @@ def _apply_rotation(shape, x, y, rotation_deg):
 
 
 def _is_text_shape(shape):
-    """True iff this shape's SVG contains a <text> element."""
     try:
         return '<text' in shape.toSvg()
     except Exception:
@@ -114,9 +101,7 @@ def _is_text_shape(shape):
 
 
 def _find_text_shape(layer):
-    """Return the first text shape in a vector layer, or None.  Kept
-    for list_text_layers, which only needs to know if a layer has at
-    least one text shape."""
+    """Return the first text shape in a vector layer, or None."""
     try:
         for s in layer.shapes():
             if _is_text_shape(s):
@@ -177,7 +162,15 @@ class LayerTextHandler:
             '--y': {'type': 'float', 'default': 0, 'help': 'Y position in pixels'},
             '--color': {'type': 'str', 'default': '#000000', 'help': 'Hex color (e.g., #ff0000)'},
             '--alignment': {'type': 'str', 'default': 'left', 'choices': ['left', 'center', 'right'], 'help': 'Text alignment'},
-            '--rotation': {'type': 'float', 'default': 0, 'help': 'Rotation in degrees around (x, y); positive is clockwise'}
+            '--rotation': {'type': 'float', 'default': 0,
+                           'help': 'Rotation in degrees around (x, y); positive is '
+                                   'clockwise.  Ignored when --transform is given.'},
+            '--transform': {'type': 'str', 'required': False,
+                            'help': 'Optional 6-element list [m11, m12, m21, m22, dx, dy] '
+                                    'defining a full affine QTransform (Qt row-vector '
+                                    'convention) to apply to the newly-created shape.  '
+                                    'Replaces --rotation when given.  Accepts either a '
+                                    'JSON string or a native list (batch form).'},
         }
     )
     def add_vector_text(self, params):
@@ -196,6 +189,7 @@ class LayerTextHandler:
             color = params.get('color', '#000000')
             alignment = params.get('alignment', 'left')
             rotation = params.get('rotation', 0)
+            transform_raw = params.get('transform', None)
 
             target_layer = doc.nodeByName(layer_name)
             if not target_layer:
@@ -210,9 +204,6 @@ class LayerTextHandler:
                 x = canvas_width / 2
                 y = canvas_height / 2
 
-            # Every alignment gets dominant-baseline="middle" so the
-            # y-coordinate always means the vertical center of the
-            # text, regardless of horizontal alignment.
             text_align = ""
             if alignment == "center":
                 text_align = ' text-anchor="middle" dominant-baseline="middle"'
@@ -236,19 +227,41 @@ class LayerTextHandler:
             target_layer.addShapesFromSvg(svg)
             shapes_after = list(target_layer.shapes())
 
-            if rotation and shapes_after:
-                marker = f'>{text}<'
-                new_shape = None
-                for s in shapes_after:
+            marker = f'>{text}<'
+            new_shape = None
+            for s in shapes_after:
+                try:
+                    if marker in s.toSvg():
+                        new_shape = s
+                        break
+                except Exception:
+                    continue
+            if new_shape is None and shapes_after:
+                new_shape = shapes_after[-1]
+
+            if new_shape is not None:
+                applied_transform = False
+                if transform_raw:
                     try:
-                        if marker in s.toSvg():
-                            new_shape = s
-                            break
+                        if isinstance(transform_raw, str):
+                            vals = json.loads(transform_raw)
+                        else:
+                            vals = transform_raw
+                        vals = [float(v) for v in vals]
+                        if len(vals) == 6:
+                            m11, m12, m21, m22, dx, dy = vals
+                            t = QTransform(m11, m12, m21, m22, dx, dy)
+                            _apply_transform(new_shape, t)
+                            applied_transform = True
                     except Exception:
-                        continue
-                if new_shape is None:
-                    new_shape = shapes_after[-1]
-                _apply_rotation(new_shape, x, y, rotation)
+                        pass
+
+                if not applied_transform and rotation:
+                    t = QTransform()
+                    t.translate(x, y)
+                    t.rotate(rotation)
+                    t.translate(-x, -y)
+                    _apply_transform(new_shape, t)
 
             refresh(doc)
 
@@ -697,10 +710,7 @@ class LayerTextHandler:
         category='layer',
         help_text='Return full records for every text shape in a layer.  '
                   'Each record carries the shape\'s content, font, size, '
-                  'color, position, alignment, rotation, and transform.  '
-                  'A layer with N text shapes yields N records; each has a '
-                  'text_index field naming the shape\'s position in the '
-                  'layer\'s shapes() list.',
+                  'color, position, alignment, rotation, and transform.',
         args={
             '--layer_name': {'type': 'str', 'required': True,
                              'help': 'Name of the vector layer'},
@@ -771,17 +781,13 @@ class LayerTextHandler:
         category='layer',
         help_text='Patch some fields of one text shape in a layer.  Any '
                   'field omitted from the patch is preserved from the '
-                  'shape\'s current state.  Fields: text, font_family, '
-                  'font_size, color, x, y, alignment, rotation_deg.',
+                  'shape\'s current state.',
         args={
             '--layer_name': {'type': 'str', 'required': True,
                              'help': 'Name of the vector layer'},
             '--text_index': {'type': 'int', 'default': 0,
                              'help': 'Index of the target shape within the '
-                                     'layer\'s shapes() list.  A layer with '
-                                     'multiple text shapes (per-patch export) '
-                                     'uses this to select which one.  Default '
-                                     '0.'},
+                                     'layer\'s shapes() list.'},
             '--patch': {'type': 'str', 'required': True,
                         'help': 'JSON object with the fields to change'},
         }
@@ -901,8 +907,12 @@ class LayerTextHandler:
                 if all_shapes:
                     new_shape = all_shapes[-1]
 
-            if new_shape is not None:
-                _apply_rotation(new_shape, x, y, rotation_deg)
+            if new_shape is not None and rotation_deg:
+                t = QTransform()
+                t.translate(x, y)
+                t.rotate(rotation_deg)
+                t.translate(-x, -y)
+                _apply_transform(new_shape, t)
 
             refresh(doc)
 

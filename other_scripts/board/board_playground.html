@@ -1,0 +1,1351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Board — every open Krita document</title>
+<style>
+  html, body {
+    margin:0; padding:0; height:100%; overflow:hidden;
+    background:#0a0e14; color:#dce6f2;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas',
+                 'SF Mono', monospace;
+  }
+
+  #ui {
+    position:absolute; top:12px; left:12px; z-index:10;
+    background:#0b1018;
+    padding:12px 14px;
+    border:1px solid #1e2836;
+    border-radius:3px;
+    box-shadow:0 6px 28px rgba(0,0,0,0.65);
+    font-size:11px; color:#a8b5c4;
+    user-select:none;
+    width:300px; box-sizing:border-box;
+  }
+  #ui.collapsed { display:none; }
+
+  #ui h3 {
+    display:flex; align-items:center; gap:6px;
+    margin:0 0 10px; padding:0 0 8px;
+    border-bottom:1px solid #1e2836;
+    font-size:11px; font-weight:700;
+    letter-spacing:0.16em; text-transform:uppercase;
+    color:#dce6f2;
+  }
+
+  #ui .field { display:flex; align-items:center; gap:8px; margin:7px 0; }
+  #ui .field label {
+    flex:0 0 88px;
+    font-size:9px; color:#5a6774;
+    letter-spacing:0.14em; text-transform:uppercase;
+    font-weight:700;
+  }
+  #ui .field input[type=range] {
+    flex:1 1 auto; min-width:0;
+    accent-color:#00e5ff;
+  }
+  #ui .field .val {
+    flex:0 0 44px;
+    font-size:11px; color:#00e5ff;
+    text-align:right; font-weight:700;
+    font-variant-numeric: tabular-nums;
+  }
+
+  #ui .row { display:flex; gap:6px; margin:6px 0; }
+  #ui .row button { flex:1 1 auto; }
+
+  #ui button {
+    padding:5px 10px; cursor:pointer;
+    border:1px solid #223040; background:transparent;
+    color:#b8c4d2; border-radius:2px;
+    font-family:inherit; font-size:10px;
+    letter-spacing:0.10em; text-transform:uppercase;
+    font-weight:700;
+    transition: background 0.08s ease, border-color 0.08s ease;
+  }
+  #ui button:hover {
+    border-color:#34445a; color:#dce6f2;
+    background:rgba(220,230,242,0.03);
+  }
+  #ui button:active { background:rgba(220,230,242,0.07); }
+
+  #ui button#refreshBtn {
+    border-color: rgba(0, 229, 255, 0.72);
+    color: #b8ecff;
+  }
+  #ui button#refreshBtn:hover {
+    border-color: rgba(140, 225, 255, 1.00);
+    background: rgba(0, 229, 255, 0.10);
+    color: #d8f4ff;
+  }
+
+  #ui hr { border:0; border-top:1px solid #1e2836; margin:10px 0; }
+
+  .docList {
+    display:flex; flex-direction:column;
+    gap:3px; margin:6px 0 0;
+    max-height:200px; overflow-y:auto;
+  }
+  .docList::-webkit-scrollbar { width:6px; }
+  .docList::-webkit-scrollbar-thumb {
+    background:#1e2836; border-radius:3px;
+  }
+  .docList .empty {
+    font-size:10px; color:#3d4756;
+    font-style:italic; padding:3px 4px;
+  }
+  .docRow {
+    display:flex; align-items:center; gap:7px;
+    padding:3px 6px;
+    border:1px solid #223040;
+    border-radius:2px;
+    cursor:pointer;
+    font-size:10px;
+    color:#a8b5c4;
+    letter-spacing:0.04em;
+    flex:0 0 auto;
+  }
+  .docRow:hover {
+    border-color:#34445a; color:#dce6f2;
+    background:rgba(220,230,242,0.03);
+  }
+  .docRow.selected {
+    border-color:rgba(0, 229, 255, 0.72);
+    color:#b8ecff;
+    background:rgba(0, 229, 255, 0.06);
+  }
+  .docRow.active {
+    box-shadow: inset 0 0 0 1px rgba(255, 200, 90, 0.35);
+  }
+  .docSwatch {
+    width:9px; height:9px;
+    border-radius:1px;
+    flex:0 0 auto;
+  }
+  .docLabel {
+    flex:1 1 auto; font-weight:700;
+    font-variant-numeric: tabular-nums;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .docDot {
+    width:6px; height:6px; border-radius:50%;
+    background:#ffc966;
+    flex:0 0 auto;
+  }
+  .docDot.hidden { display:none; }
+  .docDel {
+    width:auto !important;
+    padding:1px 6px !important;
+    font-size:12px !important;
+    line-height:1 !important;
+    border-color:#4a2830 !important;
+    color:#d48590 !important;
+    letter-spacing:0 !important;
+  }
+  .docDel:hover {
+    background:rgba(212,133,144,0.10) !important;
+    border-color:#7a3e4a !important;
+    color:#e8a0a8 !important;
+  }
+
+  #status {
+    margin-top:10px; padding-top:8px;
+    border-top:1px solid #1e2836;
+    font-size:10px; color:#7b8794;
+    min-height:14px;
+    font-variant-numeric: tabular-nums;
+    overflow-wrap:anywhere; line-height:1.5;
+  }
+  #status.ok   { color:#00e5ff; }
+  #status.bad  { color:#d48590; }
+  #status.warn { color:#ffe600; }
+
+  canvas { display:block; touch-action:none; background:#0a0e14; }
+
+  #restoreBtn {
+    position:absolute; top:12px; left:12px; z-index:10;
+    display:none;
+    padding:6px 12px; cursor:pointer;
+    border:1px solid #1e2836; background:#0b1018;
+    border-radius:3px; box-shadow:0 6px 28px rgba(0,0,0,0.65);
+    font-family:inherit;
+    font-size:10px; font-weight:700; letter-spacing:0.10em;
+    text-transform:uppercase; color:#a8b5c4;
+  }
+  #restoreBtn:hover { border-color:#34445a; color:#dce6f2; }
+  #restoreBtn.visible { display:block; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <h3>Board
+    <button id="collapseBtn" title="Collapse (H)"
+      style="margin-left:auto; width:auto; padding:0 6px;
+             height:20px; font-size:11px; line-height:1;">−</button>
+  </h3>
+
+  <div class="row">
+    <button id="refreshBtn" title="Pull every open document from Krita (R)">
+      Refresh from Krita
+    </button>
+  </div>
+
+  <div class="row">
+    <button id="gridBtn"  title="Rearrange cards into a grid (G)">Arrange grid</button>
+    <button id="fitBtn"   title="Fit every card in view (F)">Fit</button>
+  </div>
+
+  <div class="row">
+    <button id="resetBtn" title="Reset zoom and pan to the origin">Reset view</button>
+  </div>
+
+  <hr>
+
+  <div class="field">
+    <label>Card width</label>
+    <input type="range" id="cardWSlider"
+           min="120" max="720" step="10" value="320"
+           title="Board-space width of every card.  Heights follow
+                  each document's own aspect ratio.">
+    <span class="val" id="cardWVal">320</span>
+  </div>
+
+  <hr>
+
+  <div class="field" style="margin-bottom:2px;">
+    <label>Documents</label>
+    <button id="clearBtn"
+            title="Empty the board.  Does not close the documents in Krita."
+            style="flex:0 0 auto;">Clear</button>
+  </div>
+  <div id="docList" class="docList"></div>
+
+  <hr>
+
+  <div class="row">
+    <button id="saveSceneBtn">Save board</button>
+    <button id="loadSceneBtn">Load board</button>
+  </div>
+
+  <div id="status">connecting to Krita…</div>
+</div>
+
+<button id="restoreBtn" title="Show panel (H)">☰ Show panel</button>
+
+<canvas id="c"></canvas>
+<script>
+"use strict";
+
+/* ==========================================================================
+   CANVAS
+   ========================================================================== */
+
+const canvas = document.getElementById("c");
+const ctx    = canvas.getContext("2d");
+let dpr = window.devicePixelRatio || 1;
+
+/* ==========================================================================
+   VIEW
+   ========================================================================== */
+
+const view = {
+  zoom: 1,
+  panX: 0,
+  panY: 0,
+};
+
+function b2s(bx, by) {
+  return [bx * view.zoom + view.panX,
+          by * view.zoom + view.panY];
+}
+
+function s2b(sx, sy) {
+  return [(sx - view.panX) / view.zoom,
+          (sy - view.panY) / view.zoom];
+}
+
+/* ==========================================================================
+   BOARD STATE
+   ========================================================================== */
+
+const board = {
+  docs:         [],
+  selectedIdx:  -1,
+  gridGap:      24,
+  defaultWidth: 320,
+  palette: [
+    { r: 255, g: 200, b:  90 },   // amber
+    { r: 120, g: 220, b: 255 },   // cyan
+    { r: 255, g: 130, b: 210 },   // magenta
+    { r: 140, g: 225, b: 160 },   // green
+    { r: 180, g: 155, b: 255 },   // violet
+    { r: 255, g: 165, b: 105 },   // orange
+    { r: 110, g: 220, b: 210 },   // teal
+    { r: 220, g: 230, b: 120 },   // lime
+  ],
+};
+
+function _rgba(h, a) {
+  return "rgba(" + h.r + ", " + h.g + ", " + h.b + ", " + a + ")";
+}
+
+function _rgbaLight(h) {
+  const r = Math.round(h.r * 0.7 + 255 * 0.3);
+  const g = Math.round(h.g * 0.7 + 255 * 0.3);
+  const b = Math.round(h.b * 0.7 + 255 * 0.3);
+  return "rgb(" + r + ", " + g + ", " + b + ")";
+}
+
+function _assignColor(doc) {
+  if (doc.color) return;
+  // Colour is keyed by the document name so a doc keeps its hue across
+  // refreshes; two docs that happen to hash to the same slot get
+  // slightly different shades because the palette wraps.
+  let hash = 0;
+  for (let i = 0; i < doc.name.length; i++) {
+    hash = ((hash << 5) - hash + doc.name.charCodeAt(i)) | 0;
+  }
+  const idx = Math.abs(hash) % board.palette.length;
+  doc.color = board.palette[idx];
+}
+
+/* ==========================================================================
+   THUMBNAIL CACHE
+   ==========================================================================
+   Each card's thumbnail is a data URL.  Decoding it once into an
+   Image object and hanging that off the doc avoids re-decoding the
+   PNG on every frame.  A doc whose thumb changes (a fresh pull) gets
+   a new Image. */
+
+function ensureThumbLoaded(doc) {
+  if (!doc.thumb) return null;
+  if (doc.img && doc.imgUrl === doc.thumb) return doc.img;
+  const img = new Image();
+  img.onload  = () => draw();
+  img.onerror = () => draw();
+  img.src = doc.thumb;
+  doc.img = img;
+  doc.imgUrl = doc.thumb;
+  return img;
+}
+
+/* ==========================================================================
+   PLACEMENT
+   ==========================================================================
+   Newly-arrived docs are placed to the right of the current rightmost
+   card.  A more elaborate placement algorithm is not needed: the user
+   can always rearrange by hand or press G to grid everything up. */
+
+function findFreeSlot() {
+  if (board.docs.length === 0) return { x: 0, y: 0 };
+  const gap = board.gridGap;
+  let maxRight = -Infinity;
+  let minTop   =  Infinity;
+  for (const d of board.docs) {
+    maxRight = Math.max(maxRight, d.x + d.w);
+    minTop   = Math.min(minTop,   d.y);
+  }
+  if (minTop === Infinity) minTop = 0;
+  return { x: maxRight + gap, y: minTop };
+}
+
+/* ==========================================================================
+   GRID ARRANGEMENT
+   ========================================================================== */
+
+function arrangeGrid(columns) {
+  if (board.docs.length === 0) return;
+  const gap = board.gridGap;
+  if (!columns) columns = Math.max(1, Math.ceil(Math.sqrt(board.docs.length)));
+
+  let curX = 0, curY = 0, rowH = 0, col = 0;
+  for (const d of board.docs) {
+    d.w = board.defaultWidth;
+    d.h = Math.round(d.w * (d.aspect || 1));
+    if (col >= columns) {
+      curX = 0;
+      curY += rowH + gap;
+      rowH = 0;
+      col  = 0;
+    }
+    d.x = curX;
+    d.y = curY;
+    curX += d.w + gap;
+    rowH = Math.max(rowH, d.h);
+    col++;
+  }
+}
+
+/* ==========================================================================
+   FIT ALL
+   ========================================================================== */
+
+function fitAll() {
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
+
+  if (board.docs.length === 0) {
+    view.zoom = 1;
+    view.panX = cw / 2;
+    view.panY = ch / 2;
+    draw();
+    return;
+  }
+
+  let minX =  Infinity, minY =  Infinity;
+  let maxX = -Infinity, maxY = -Infinity;
+  for (const d of board.docs) {
+    minX = Math.min(minX, d.x);
+    minY = Math.min(minY, d.y);
+    maxX = Math.max(maxX, d.x + d.w);
+    maxY = Math.max(maxY, d.y + d.h);
+  }
+
+  const pad = 60;
+  const bw = (maxX - minX) + pad * 2;
+  const bh = (maxY - minY) + pad * 2;
+
+  const z = Math.min(cw / bw, ch / bh);
+  view.zoom = Math.max(0.05, Math.min(8, z));
+  view.panX = (cw - (maxX + minX) * view.zoom) / 2;
+  view.panY = (ch - (maxY + minY) * view.zoom) / 2;
+  draw();
+}
+
+/* ==========================================================================
+   RESIZE
+   ========================================================================== */
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
+
+  canvas.width  = Math.round(cw * dpr);
+  canvas.height = Math.round(ch * dpr);
+  canvas.style.width  = cw + "px";
+  canvas.style.height = ch + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  draw();
+}
+window.addEventListener("resize", resize);
+
+/* ==========================================================================
+   HIT TEST
+   ========================================================================== */
+
+function docHitTest(sx, sy) {
+  for (let i = board.docs.length - 1; i >= 0; i--) {
+    const d = board.docs[i];
+    const [x, y] = b2s(d.x, d.y);
+    const w = d.w * view.zoom;
+    const h = d.h * view.zoom;
+    if (sx >= x && sx <= x + w && sy >= y && sy <= y + h) return i;
+  }
+  return -1;
+}
+
+/* ==========================================================================
+   BACKGROUND GRID
+   ========================================================================== */
+
+function _drawBoardGrid() {
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
+
+  // Board-space spacing of the base grid.  When zoomed out far enough
+  // that the base spacing would be denser than ~16 screen pixels,
+  // step up by powers of two until the visible grid is legible.
+  let step = 64;
+  while (step * view.zoom < 16) step *= 2;
+  while (step * view.zoom > 160) step /= 2;
+
+  const startBx = Math.floor((-view.panX / view.zoom) / step) * step;
+  const startBy = Math.floor((-view.panY / view.zoom) / step) * step;
+  const endBx   = (cw - view.panX) / view.zoom + step;
+  const endBy   = (ch - view.panY) / view.zoom + step;
+
+  ctx.save();
+  ctx.fillStyle = "rgba(0, 229, 255, 0.10)";
+  for (let bx = startBx; bx < endBx; bx += step) {
+    for (let by = startBy; by < endBy; by += step) {
+      const [sx, sy] = b2s(bx, by);
+      ctx.fillRect(sx, sy, 1.1, 1.1);
+    }
+  }
+  ctx.restore();
+}
+
+/* ==========================================================================
+   CARD
+   ========================================================================== */
+
+function _drawDocCard(doc, isSelected) {
+  const hue = doc.color || board.palette[0];
+
+  const [sx, sy] = b2s(doc.x, doc.y);
+  const sw = doc.w * view.zoom;
+  const sh = doc.h * view.zoom;
+  const RADIUS = 3;
+
+  // Drop shadow.
+  ctx.save();
+  ctx.shadowColor = "rgba(0, 0, 0, 0.55)";
+  ctx.shadowBlur = 18;
+  ctx.shadowOffsetY = 4;
+  ctx.fillStyle = "#0e1622";
+  ctx.beginPath();
+  _roundRect(sx, sy, sw, sh, RADIUS);
+  ctx.fill();
+  ctx.restore();
+
+  // Thumbnail.  Letterbox if the actual thumbnail image and the card
+  // disagree on aspect (only happens if the daemon didn't return
+  // dimensions for a document that's still resolving).
+  const img = ensureThumbLoaded(doc);
+  if (img && img.complete && img.naturalWidth > 0) {
+    ctx.save();
+    ctx.beginPath();
+    _roundRect(sx, sy, sw, sh, RADIUS);
+    ctx.clip();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+
+    const imgAR  = img.naturalWidth / img.naturalHeight;
+    const cardAR = sw / sh;
+    let dx = sx, dy = sy, dw = sw, dh = sh;
+    if (imgAR > cardAR) {
+      dh = sw / imgAR;
+      dy = sy + (sh - dh) / 2;
+    } else {
+      dw = sh * imgAR;
+      dx = sx + (sw - dw) / 2;
+    }
+    ctx.drawImage(img, dx, dy, dw, dh);
+    ctx.restore();
+  } else {
+    // Placeholder for a doc whose thumbnail is decoding (thumb set,
+    // img not yet complete) or was never returned (thumb null).
+    ctx.fillStyle = "#0e1622";
+    ctx.fillRect(sx, sy, sw, sh);
+    if (sw > 60 && sh > 20) {
+      ctx.fillStyle = "#3d4756";
+      ctx.font = "700 11px 'JetBrains Mono', monospace";
+      ctx.textAlign    = "center";
+      ctx.textBaseline = "middle";
+      const msg = doc.thumb ? "loading\u2026" : "no thumbnail";
+      ctx.fillText(msg, sx + sw / 2, sy + sh / 2);
+    }
+  }
+
+  // Border.
+  const strokeAlpha = isSelected ? 1.00 : (doc.active ? 0.85 : 0.55);
+  const strokeW     = isSelected ? 2.4  : 1.4;
+  ctx.strokeStyle = _rgba(hue, strokeAlpha);
+  ctx.lineWidth   = strokeW;
+  ctx.beginPath();
+  _roundRect(sx + 0.5, sy + 0.5, sw - 1, sh - 1, RADIUS);
+  ctx.stroke();
+
+  // Active-document glow.
+  if (doc.active) {
+    ctx.save();
+    ctx.shadowColor = _rgba(hue, 0.85);
+    ctx.shadowBlur = 14;
+    ctx.strokeStyle = _rgba(hue, 0.95);
+    ctx.lineWidth = 2.0;
+    ctx.beginPath();
+    _roundRect(sx + 0.5, sy + 0.5, sw - 1, sh - 1, RADIUS);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Modified dot.
+  if (doc.modified && sw > 30 && sh > 30) {
+    ctx.beginPath();
+    ctx.arc(sx + sw - 10, sy + 10, 4.5, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffc966";
+    ctx.fill();
+    ctx.strokeStyle = "#0a0e14";
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+  }
+
+  // Name label below the card.
+  if (sw > 60) {
+    ctx.save();
+    ctx.font = "700 11px 'JetBrains Mono', 'Fira Code', monospace";
+    ctx.textAlign    = "left";
+    ctx.textBaseline = "top";
+    const label = doc.name;
+    const labelW = ctx.measureText(label).width;
+    const padX = 6;
+    const lh   = 18;
+    const lx   = sx;
+    const ly   = sy + sh + 6;
+
+    ctx.fillStyle = "rgba(10, 14, 20, 0.86)";
+    ctx.fillRect(lx, ly, labelW + 2 * padX, lh);
+    ctx.strokeStyle = _rgba(hue, 0.75);
+    ctx.lineWidth = 0.8;
+    ctx.strokeRect(lx + 0.4, ly + 0.4, labelW + 2 * padX - 0.8, lh - 0.8);
+    ctx.fillStyle = _rgba(hue, 0.95);
+    ctx.fillText(label, lx + padX, ly + 4);
+    ctx.restore();
+  }
+}
+
+function _roundRect(x, y, w, h, r) {
+  if (w <= 2 * r) r = Math.max(0, w / 2 - 0.01);
+  if (h <= 2 * r) r = Math.max(0, h / 2 - 0.01);
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y,     x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x,     y + h, r);
+  ctx.arcTo(x,     y + h, x,     y,     r);
+  ctx.arcTo(x,     y,     x + w, y,     r);
+  ctx.closePath();
+}
+
+/* ==========================================================================
+   VIEW
+   ========================================================================== */
+
+function drawBoardView() {
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
+
+  ctx.fillStyle = "#0a0e14";
+  ctx.fillRect(0, 0, cw, ch);
+
+  _drawBoardGrid();
+
+  // Non-selected first, selected on top.
+  for (let i = 0; i < board.docs.length; i++) {
+    if (i === board.selectedIdx) continue;
+    _drawDocCard(board.docs[i], false);
+  }
+  if (board.selectedIdx >= 0 && board.selectedIdx < board.docs.length) {
+    _drawDocCard(board.docs[board.selectedIdx], true);
+  }
+
+  // Empty-state caption.
+  if (board.docs.length === 0) {
+    ctx.save();
+    ctx.fillStyle = "#5a6774";
+    ctx.font = "700 12px 'JetBrains Mono', monospace";
+    ctx.textAlign    = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("no documents on the board — press R to pull from Krita",
+                 cw / 2, ch / 2);
+    ctx.restore();
+  }
+}
+
+/* ==========================================================================
+   REFRESH
+   ========================================================================== */
+
+let _refreshInFlight = false;
+
+async function refreshFromKrita() {
+  if (_refreshInFlight) return;
+  _refreshInFlight = true;
+
+  const statusEl = document.getElementById("status");
+  if (statusEl) {
+    statusEl.textContent = "pulling thumbnails from Krita…";
+    statusEl.className   = "";
+  }
+
+  let payload;
+  try {
+    const res = await fetch("/krita/documents");
+    payload = await res.json();
+  } catch (err) {
+    if (statusEl) {
+      statusEl.textContent = "Request failed: " + err.message;
+      statusEl.className   = "bad";
+    }
+    _refreshInFlight = false;
+    return;
+  }
+
+  _refreshInFlight = false;
+
+  if (!payload || !payload.success) {
+    if (statusEl) {
+      statusEl.textContent =
+        "Krita: " + (payload && payload.message ? payload.message : "unknown error");
+      statusEl.className = "bad";
+    }
+    return;
+  }
+
+  mergeIncomingDocs(payload.documents || [], payload.active || null);
+
+  if (payload.partial && payload.message && statusEl) {
+    statusEl.textContent = payload.message;
+    statusEl.className   = "warn";
+    setTimeout(updateStatus, 1800);
+  } else if (statusEl) {
+    statusEl.textContent =
+      "refreshed · " + board.docs.length + " doc" +
+      (board.docs.length === 1 ? "" : "s");
+    statusEl.className = "ok";
+    setTimeout(updateStatus, 1200);
+  }
+
+  syncDocList();
+  draw();
+}
+
+/* ==========================================================================
+   MERGE POLICY
+   ==========================================================================
+   Incoming docs are matched to existing ones by name.  A match keeps
+   the existing position and color; a mismatch is removed.  Everything
+   in the incoming list ends up on the board after this call.
+
+   The `active` field on each doc is set from the payload's own
+   `active` marker for the currently-focused document in Krita, and
+   from each doc's own `active` field otherwise (the daemon reports
+   it, so it survives round-trips without the caller having to
+   recompute it). */
+
+function mergeIncomingDocs(incoming, activeName) {
+  const byName = new Map();
+  for (const d of board.docs) byName.set(d.name, d);
+
+  const merged = [];
+  for (const inc of incoming) {
+    const name = inc.name || "(untitled)";
+    const existing = byName.get(name);
+
+    if (existing) {
+      existing.thumb     = inc.data_url || existing.thumb;
+      existing.modified  = !!inc.modified;
+      existing.active    = (activeName === name) || !!inc.active;
+      if (inc.width && inc.height) {
+        existing.aspect = inc.height / inc.width;
+        existing.h      = Math.round(existing.w * existing.aspect);
+      }
+      merged.push(existing);
+      byName.delete(name);
+    } else {
+      const aspect = (inc.height && inc.width)
+        ? (inc.height / inc.width)
+        : 1.0;
+      const doc = {
+        id:        name,
+        name:      name,
+        thumb:     inc.data_url || null,
+        aspect:    aspect,
+        w:         board.defaultWidth,
+        h:         Math.round(board.defaultWidth * aspect),
+        x:         0,
+        y:         0,
+        modified:  !!inc.modified,
+        active:    (activeName === name) || !!inc.active,
+      };
+      _assignColor(doc);
+      const slot = findFreeSlot();
+      doc.x = slot.x;
+      doc.y = slot.y;
+      merged.push(doc);
+    }
+  }
+
+  board.docs = merged;
+  if (board.selectedIdx >= board.docs.length) board.selectedIdx = -1;
+}
+
+/* ==========================================================================
+   ACTIVATE
+   ========================================================================== */
+
+async function activateDocument(doc) {
+  if (!doc) return;
+  const statusEl = document.getElementById("status");
+  if (statusEl) {
+    statusEl.textContent = "activating " + doc.name + "…";
+    statusEl.className   = "";
+  }
+  try {
+    const res = await fetch("/krita/activate", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ name: doc.name }),
+    });
+    const payload = await res.json();
+    if (payload && payload.success) {
+      if (statusEl) {
+        statusEl.textContent = payload.message || ("activated " + doc.name);
+        statusEl.className   = "ok";
+        setTimeout(updateStatus, 1400);
+      }
+    } else {
+      if (statusEl) {
+        statusEl.textContent =
+          "activate failed: " + (payload && payload.message ? payload.message : "unknown");
+        statusEl.className = "bad";
+      }
+    }
+  } catch (err) {
+    if (statusEl) {
+      statusEl.textContent = "activate request failed: " + err.message;
+      statusEl.className   = "bad";
+    }
+  }
+}
+
+/* ==========================================================================
+   SLIDER
+   ========================================================================== */
+
+function syncPanelSliders() {
+  const s = document.getElementById("cardWSlider");
+  if (s) s.value = board.defaultWidth;
+  updatePanelLabels();
+}
+
+function updatePanelLabels() {
+  const v = document.getElementById("cardWVal");
+  if (v) v.textContent = String(board.defaultWidth);
+}
+
+/* ==========================================================================
+   DOC LIST
+   ========================================================================== */
+
+function syncDocList() {
+  const list = document.getElementById("docList");
+  if (!list) return;
+  list.innerHTML = "";
+
+  if (board.docs.length === 0) {
+    const e = document.createElement("div");
+    e.className = "empty";
+    e.textContent = "no documents yet — press Refresh";
+    list.appendChild(e);
+    return;
+  }
+
+  for (let i = 0; i < board.docs.length; i++) {
+    const d = board.docs[i];
+    const isSel = (i === board.selectedIdx);
+
+    const row = document.createElement("div");
+    row.className = "docRow" + (isSel ? " selected" : "") + (d.active ? " active" : "");
+    row.dataset.idx = String(i);
+
+    const sw = document.createElement("span");
+    sw.className = "docSwatch";
+    const hue = d.color || board.palette[0];
+    sw.style.background  = _rgba(hue, isSel ? 0.95 : 0.55);
+    sw.style.border      = "1px solid " + _rgba(hue, isSel ? 1.0 : 0.85);
+    row.appendChild(sw);
+
+    const lb = document.createElement("span");
+    lb.className = "docLabel";
+    lb.textContent = d.name;
+    row.appendChild(lb);
+
+    const dot = document.createElement("span");
+    dot.className = "docDot" + (d.modified ? "" : " hidden");
+    dot.title = "unsaved changes in Krita";
+    row.appendChild(dot);
+
+    const del = document.createElement("button");
+    del.className = "docDel";
+    del.textContent = "×";
+    del.title = "Remove from the board (does not close it in Krita)";
+    del.addEventListener("click", (e) => {
+      e.stopPropagation();
+      removeDoc(i);
+    });
+    row.appendChild(del);
+
+    row.addEventListener("click", () => {
+      board.selectedIdx = i;
+      syncDocList();
+      draw();
+    });
+
+    list.appendChild(row);
+  }
+}
+
+/* ==========================================================================
+   DOC OPERATIONS
+   ========================================================================== */
+
+function removeDoc(idx) {
+  if (idx < 0 || idx >= board.docs.length) return;
+  board.docs.splice(idx, 1);
+  if (board.selectedIdx === idx) board.selectedIdx = -1;
+  else if (board.selectedIdx > idx) board.selectedIdx -= 1;
+  syncDocList();
+  draw();
+}
+
+/* ==========================================================================
+   STATUS FLASH
+   ========================================================================== */
+
+let _statusTimer = null;
+function flashStatus(msg, cls) {
+  const el = document.getElementById("status");
+  if (!el) return;
+  el.textContent = msg;
+  el.className = cls || "";
+  if (_statusTimer) clearTimeout(_statusTimer);
+  _statusTimer = setTimeout(() => {
+    _statusTimer = null;
+    updateStatus();
+  }, 1800);
+}
+
+/* ==========================================================================
+   BINDINGS
+   ========================================================================== */
+
+(function installPanel() {
+  const refreshBtn = document.getElementById("refreshBtn");
+  const gridBtn    = document.getElementById("gridBtn");
+  const fitBtn     = document.getElementById("fitBtn");
+  const resetBtn   = document.getElementById("resetBtn");
+  const clearBtn   = document.getElementById("clearBtn");
+  const saveBtn    = document.getElementById("saveSceneBtn");
+  const loadBtn    = document.getElementById("loadSceneBtn");
+  const slider     = document.getElementById("cardWSlider");
+
+  if (refreshBtn) refreshBtn.addEventListener("click", refreshFromKrita);
+
+  if (gridBtn) gridBtn.addEventListener("click", () => {
+    arrangeGrid();
+    draw();
+    flashStatus("arranged " + board.docs.length + " cards", "ok");
+  });
+
+  if (fitBtn) fitBtn.addEventListener("click", fitAll);
+
+  if (resetBtn) resetBtn.addEventListener("click", () => {
+    view.zoom = 1;
+    view.panX = window.innerWidth  / 2;
+    view.panY = window.innerHeight / 2;
+    draw();
+  });
+
+  if (clearBtn) clearBtn.addEventListener("click", () => {
+    if (board.docs.length === 0) return;
+    board.docs = [];
+    board.selectedIdx = -1;
+    syncDocList();
+    draw();
+    flashStatus("board cleared", "ok");
+  });
+
+  if (saveBtn) saveBtn.addEventListener("click", saveBoardJSON);
+  if (loadBtn) loadBtn.addEventListener("click", promptLoadBoard);
+
+  if (slider) slider.addEventListener("input", () => {
+    const v = parseInt(slider.value, 10);
+    if (!isFinite(v) || v <= 0) return;
+    board.defaultWidth = v;
+    for (const d of board.docs) {
+      d.w = v;
+      d.h = Math.round(v * (d.aspect || 1));
+    }
+    updatePanelLabels();
+    draw();
+  });
+})();
+
+/* ==========================================================================
+   SCENE SAVE / LOAD
+   ========================================================================== */
+
+const SCENE_VERSION = 1;
+const SCENE_TYPE    = "board_scene";
+const SCENE_FILE    = "board_scene.json";
+
+function buildBoardScene() {
+  return {
+    sceneVersion: SCENE_VERSION,
+    type:         SCENE_TYPE,
+    generatedAt:  new Date().toISOString(),
+    board: {
+      defaultWidth: board.defaultWidth,
+      gridGap:      board.gridGap,
+    },
+    view: {
+      zoom: view.zoom,
+      panX: view.panX,
+      panY: view.panY,
+    },
+    docs: board.docs.map(d => ({
+      id:     d.id,
+      name:   d.name,
+      x:      d.x,
+      y:      d.y,
+      w:      d.w,
+      aspect: d.aspect,
+      color:  d.color ? { r: d.color.r, g: d.color.g, b: d.color.b } : null,
+    })),
+  };
+}
+
+function saveBoardJSON() {
+  const text = JSON.stringify(buildBoardScene(), null, 2);
+  const url  = "data:application/json;charset=utf-8,"
+             + encodeURIComponent(text);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = SCENE_FILE;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  flashStatus("saved " + board.docs.length + " card positions", "ok");
+}
+
+function applyBoardScene(data) {
+  if (!data || typeof data !== "object") {
+    throw new Error("board: not an object");
+  }
+  if (data.type && data.type !== SCENE_TYPE) {
+    throw new Error("board: wrong type '" + data.type
+                    + "' (expected '" + SCENE_TYPE + "')");
+  }
+  if (data.sceneVersion !== SCENE_VERSION) {
+    throw new Error("board: unsupported sceneVersion " + data.sceneVersion);
+  }
+
+  if (data.board && typeof data.board === "object") {
+    if (typeof data.board.defaultWidth === "number") {
+      board.defaultWidth = data.board.defaultWidth;
+    }
+    if (typeof data.board.gridGap === "number") {
+      board.gridGap = data.board.gridGap;
+    }
+  }
+
+  if (data.view && typeof data.view === "object") {
+    if (typeof data.view.zoom === "number") view.zoom = data.view.zoom;
+    if (typeof data.view.panX === "number") view.panX = data.view.panX;
+    if (typeof data.view.panY === "number") view.panY = data.view.panY;
+  }
+
+  // Merge the saved layout onto the current docs list.  A saved doc
+  // whose name matches a currently-open document updates that doc's
+  // position and size.  A saved doc whose name does not match any
+  // open document is still placed — the doc is recreated with no
+  // thumbnail, so the layout is preserved even when the document
+  // was not open at load time.
+  const saved = Array.isArray(data.docs) ? data.docs : [];
+  const byName = new Map();
+  for (const d of board.docs) byName.set(d.name, d);
+
+  const next = [];
+  for (const s of saved) {
+    if (!s.name) continue;
+    const existing = byName.get(s.name);
+    if (existing) {
+      existing.x      = (typeof s.x === "number") ? s.x : existing.x;
+      existing.y      = (typeof s.y === "number") ? s.y : existing.y;
+      existing.w      = (typeof s.w === "number") ? s.w : existing.w;
+      existing.aspect = (typeof s.aspect === "number") ? s.aspect : existing.aspect;
+      if (s.color && typeof s.color.r === "number") {
+        existing.color = { r: s.color.r, g: s.color.g, b: s.color.b };
+      }
+      existing.h = Math.round(existing.w * (existing.aspect || 1));
+      next.push(existing);
+      byName.delete(s.name);
+    } else {
+      const aspect = (typeof s.aspect === "number") ? s.aspect : 1.0;
+      const doc = {
+        id:        s.name,
+        name:      s.name,
+        thumb:     null,
+        aspect:    aspect,
+        w:         (typeof s.w === "number") ? s.w : board.defaultWidth,
+        h:         Math.round(((typeof s.w === "number") ? s.w : board.defaultWidth) * aspect),
+        x:         (typeof s.x === "number") ? s.x : 0,
+        y:         (typeof s.y === "number") ? s.y : 0,
+        modified:  false,
+        active:    false,
+        color:     (s.color && typeof s.color.r === "number")
+                     ? { r: s.color.r, g: s.color.g, b: s.color.b }
+                     : null,
+      };
+      _assignColor(doc);
+      next.push(doc);
+    }
+  }
+
+  board.docs = next;
+  board.selectedIdx = -1;
+  syncPanelSliders();
+  syncDocList();
+  draw();
+}
+
+function loadBoardFromText(text) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    flashStatus("Load failed: not valid JSON", "bad");
+    return false;
+  }
+  try {
+    applyBoardScene(data);
+  } catch (e) {
+    flashStatus("Load failed: " + e.message, "bad");
+    return false;
+  }
+  flashStatus("loaded " + board.docs.length + " card positions", "ok");
+  return true;
+}
+
+let _boardFileInput = null;
+function _installBoardFileInput() {
+  if (_boardFileInput) return _boardFileInput;
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = "application/json,.json";
+  inp.style.display = "none";
+  inp.addEventListener("change", (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      loadBoardFromText(String(reader.result || ""));
+      inp.value = "";
+    };
+    reader.onerror = () => {
+      flashStatus("Load failed: could not read file", "bad");
+      inp.value = "";
+    };
+    reader.readAsText(file);
+  });
+  document.body.appendChild(inp);
+  _boardFileInput = inp;
+  return inp;
+}
+
+function promptLoadBoard() {
+  _installBoardFileInput().click();
+}
+
+const DRAG_THRESHOLD = 3;
+
+const state = {
+  dragCanvas: null,   // {startSx, startSy, startPanX, startPanY}
+  dragCard:   null,   // {idx, startSx, startSy, startDocX, startDocY, moved}
+  mouse:      { sx: 0, sy: 0, inside: false },
+};
+
+/* ==========================================================================
+   DRAW
+   ========================================================================== */
+
+function draw() {
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  drawBoardView();
+
+  const M = 6;
+  ctx.strokeStyle = "#1e2836";
+  ctx.lineWidth = 0.8;
+  ctx.strokeRect(M + 0.5, M + 0.5, cw - 2 * M - 1, ch - 2 * M - 1);
+
+  updateStatus();
+}
+
+function updateStatus() {
+  const el = document.getElementById("status");
+  if (!el) return;
+  const parts = [];
+  parts.push(board.docs.length + " doc" + (board.docs.length === 1 ? "" : "s"));
+  parts.push("zoom " + (view.zoom * 100).toFixed(0) + "%");
+  if (board.selectedIdx >= 0 && board.selectedIdx < board.docs.length) {
+    parts.push(board.docs[board.selectedIdx].name);
+  }
+  el.textContent = parts.join("  ·  ");
+  el.className = "";
+}
+
+/* ==========================================================================
+   EVENTS
+   ========================================================================== */
+
+canvas.addEventListener("mousedown", (e) => {
+  if (e.button !== 0) return;
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+
+  const hit = docHitTest(sx, sy);
+  if (hit >= 0) {
+    const wasSelected = (board.selectedIdx === hit);
+    board.selectedIdx = hit;
+
+    const d = board.docs[hit];
+    state.dragCard = {
+      idx:        hit,
+      startSx:    sx,
+      startSy:    sy,
+      startDocX:  d.x,
+      startDocY:  d.y,
+      moved:      false,
+      wasSelected: wasSelected,
+    };
+    canvas.style.cursor = "grabbing";
+    syncDocList();
+    draw();
+    return;
+  }
+
+  // Empty canvas: begin pan.
+  board.selectedIdx = -1;
+  state.dragCanvas = {
+    startSx:   sx,
+    startSy:   sy,
+    startPanX: view.panX,
+    startPanY: view.panY,
+  };
+  canvas.style.cursor = "grabbing";
+  syncDocList();
+  draw();
+});
+
+window.addEventListener("mousemove", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+  state.mouse.sx = sx;
+  state.mouse.sy = sy;
+  state.mouse.inside = (sx >= 0 && sy >= 0 &&
+                        sx < window.innerWidth && sy < window.innerHeight);
+
+  if (state.dragCard) {
+    const dd = state.dragCard;
+    const dx = sx - dd.startSx;
+    const dy = sy - dd.startSy;
+    if (!dd.moved && Math.hypot(dx, dy) > DRAG_THRESHOLD) dd.moved = true;
+    if (dd.moved) {
+      const d = board.docs[dd.idx];
+      d.x = dd.startDocX + dx / view.zoom;
+      d.y = dd.startDocY + dy / view.zoom;
+    }
+  } else if (state.dragCanvas) {
+    const dc = state.dragCanvas;
+    view.panX = dc.startPanX + (sx - dc.startSx);
+    view.panY = dc.startPanY + (sy - dc.startSy);
+  }
+  draw();
+});
+
+window.addEventListener("mouseup", () => {
+  if (state.dragCard) {
+    // A click (no drag) on an already-selected card acts as
+    // "activate in Krita", so a single click both selects and
+    // activates when the user is already looking at that card.
+    if (!state.dragCard.moved && state.dragCard.wasSelected) {
+      const d = board.docs[state.dragCard.idx];
+      if (d) activateDocument(d);
+    }
+  }
+  state.dragCard   = null;
+  state.dragCanvas = null;
+  canvas.style.cursor = "default";
+  draw();
+});
+
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+
+  // Board point under cursor before the zoom change.
+  const [bx, by] = s2b(mx, my);
+
+  const factor  = e.deltaY < 0 ? 1.10 : 1 / 1.10;
+  view.zoom = Math.max(0.05, Math.min(8, view.zoom * factor));
+
+  // Keep (bx, by) under the cursor after the zoom change.
+  view.panX = mx - bx * view.zoom;
+  view.panY = my - by * view.zoom;
+
+  draw();
+}, { passive: false });
+
+canvas.addEventListener("dblclick", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+  const hit = docHitTest(sx, sy);
+  if (hit >= 0) activateDocument(board.docs[hit]);
+});
+
+window.addEventListener("keydown", (e) => {
+  const t = e.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+  const k = e.key.toLowerCase();
+  if (k === "r") { e.preventDefault(); refreshFromKrita(); }
+  else if (k === "g") { e.preventDefault(); arrangeGrid(); draw(); }
+  else if (k === "f") { e.preventDefault(); fitAll(); }
+  else if (k === "delete" || k === "backspace") {
+    if (board.selectedIdx >= 0) {
+      e.preventDefault();
+      removeDoc(board.selectedIdx);
+    }
+  }
+});
+
+canvas.style.cursor = "default";
+
+(function installShellControls() {
+  const ui          = document.getElementById("ui");
+  const restoreBtn  = document.getElementById("restoreBtn");
+  const collapseBtn = document.getElementById("collapseBtn");
+
+  const collapse = () => {
+    ui.classList.add("collapsed");
+    restoreBtn.classList.add("visible");
+  };
+  const restore = () => {
+    ui.classList.remove("collapsed");
+    restoreBtn.classList.remove("visible");
+  };
+
+  collapseBtn.addEventListener("click", collapse);
+  restoreBtn.addEventListener("click", restore);
+
+  window.addEventListener("keydown", (e) => {
+    const t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+    if (e.key === "h" || e.key === "H") {
+      if (ui.classList.contains("collapsed")) restore();
+      else                                     collapse();
+    }
+  });
+})();
+
+syncPanelSliders();
+syncDocList();
+resize();
+
+/* First pull.  If the daemon is reachable the board populates itself;
+   if not, the status line says so and the user can press R later. */
+refreshFromKrita();
+</script>
+</body>
+</html>

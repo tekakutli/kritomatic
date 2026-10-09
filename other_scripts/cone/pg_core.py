@@ -211,6 +211,7 @@ function addQuad() {
     phi1: phiCenter + halfPhi,
     s0: DEFAULT_PATCH_S_CENTER - halfS,
     s1: DEFAULT_PATCH_S_CENTER + halfS,
+    mirror: false,
   });
   selectedQuad = quads.length - 1;
   syncQuadList();
@@ -237,6 +238,7 @@ function cloneQuad(idx) {
     phi1: src.phi1 + dPhi,
     s0:   src.s0,
     s1:   src.s1,
+    mirror: !!src.mirror,
   });
 
   for (let i = 0; i < floatSquares.length; i++) {
@@ -629,6 +631,7 @@ function _pushPatchAndShapeFromParams(params, phiMin, phiMax, sMin, sMax,
     id, name: "Q" + id,
     phi0: phiMin, phi1: phiMax,
     s0:   sMin,   s1:   sMax,
+    mirror: false,
   };
   quads.push(q);
   const qi = quads.length - 1;

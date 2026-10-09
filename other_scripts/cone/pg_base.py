@@ -6,8 +6,8 @@ selected patch's φ and s, the selected square's width, height, and
 slope), ten buttons (Reset, Center apex, Save scene, Load scene,
 Export visual state, Generate .kra, + Patch, + Clone, + Square,
 + Clone), a KRA-export options block (text position, text padding,
-text warp mode, rectangle on/off, text color), two lists, a
-persistent hint block.
+text warp mode, rectangle on/off, text color), a per-patch mirror
+checkbox, two lists, a persistent hint block.
 
 CHANGES FROM THE PREVIOUS REVISION
 ==================================
@@ -19,6 +19,15 @@ button, which drive the four-corner fitting tool (see pg_core.py,
 DRAW TOOL).  The help card in the popup documents both fit modes
 and the rotation lock; the panel itself carries no inline hint
 text any more.
+
+A per-patch "Mirror" checkbox has been added next to the Patch φ
+and Patch s scrub fields.  When checked, every square on the
+selected patch is drawn a second time on the patch's mirror — the
+same patch shifted by π in φ, i.e. on the diametrically opposite
+side of the cone.  The mirror copy is a pure visual clone: it
+shares the square's full local state and is not independently
+editable.  See pg_view_squares.py (MIRROR) for the model and
+helpers.
 """
 
 HTML_HEAD = r"""<!DOCTYPE html>
@@ -342,6 +351,12 @@ HTML_HEAD = r"""<!DOCTYPE html>
     <input type="text" id="patchSVal" class="scrubInput"
            value="&#8212;" autocomplete="off" spellcheck="false"
            disabled>
+  </div>
+  <div class="field">
+    <label>Mirror</label>
+    <input type="checkbox" id="patchMirror"
+           title="Draw a visual clone of every square on this patch
+                  on the diametrically opposite side of the cone">
   </div>
 
   <hr>

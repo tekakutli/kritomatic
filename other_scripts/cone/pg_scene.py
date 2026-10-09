@@ -5,7 +5,7 @@ The scene is the complete editable state of the workspace:
 
     cone state      ax, ay, depth, halfAngle, ringCount, meridianCount
     shapeDepthCone  the cone view's SHAPE_DEPTH_CONE multiplier
-    patches         id, name, phi0, phi1, s0, s1
+    patches         id, name, phi0, phi1, s0, s1, mirror
     squares         id, name, quadId, u, v, scaleU, scaleV, theta,
                     slope
     id counters     nextQuadId, nextSquareId
@@ -77,6 +77,13 @@ The per-square `slope` field is persisted alongside `theta`.  Files
 written before slope existed simply omit it; the loader defaults a
 missing value to 0 (shape flat on its patch), so old scenes load
 unchanged.
+
+MIRROR
+======
+The per-patch `mirror` boolean is persisted alongside the patch's
+φ and s bounds.  Files written before mirror existed simply omit
+it; the loader defaults a missing value to false, so old scenes
+load unchanged.
 """
 
 
@@ -116,6 +123,7 @@ function buildSceneJSON() {
       phi1: q.phi1,
       s0:   q.s0,
       s1:   q.s1,
+      mirror: !!q.mirror,
     })),
 
     squares: floatSquares.map(sq => ({
@@ -241,6 +249,7 @@ function applySceneJSON(data) {
       phi1: (typeof p.phi1 === "number") ? p.phi1 : Math.PI / 2,
       s0:   (typeof p.s0   === "number") ? p.s0   : 0.10,
       s1:   (typeof p.s1   === "number") ? p.s1   : 0.50,
+      mirror: !!p.mirror,
     });
   }
 

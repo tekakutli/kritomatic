@@ -294,6 +294,16 @@ until it is dragged away, so the operation reads as "stamp another
 copy right here".  The clone receives a fresh id and default name
 and becomes the new selection.
 
+MIRROR
+======
+Every patch carries a boolean `mirror`.  When it is true, every
+square on the patch is drawn a second time on the patch's mirror —
+the same patch shifted by π in φ, i.e. on the diametrically
+opposite side of the cone.  The mirror copy shares the square's
+full local state (u, v, theta, scaleU, scaleV, slope): it is a
+pure visual clone, not an independent object.  Dragging or editing
+the original updates both; the mirror itself is not hit-testable.
+
 LABELS
 ======
 Every patch and every shape carries a user-editable name.
@@ -506,6 +516,50 @@ function quadIdxById(id) {
     if (quads[i].id === id) return i;
   }
   return -1;
+}
+
+/* ==========================================================================
+   MIRROR
+   ==========================================================================
+   Every patch carries a boolean `mirror`.  When it is true, every
+   square on the patch is drawn a second time on the patch's mirror —
+   the same patch shifted by π in φ, i.e. on the diametrically
+   opposite side of the cone.  The mirror copy shares the square's
+   full local state (u, v, theta, scaleU, scaleV, slope): it is a
+   pure visual clone, not an independent object.  Dragging or
+   editing the original updates both; the mirror itself is not hit-
+   testable.
+
+   The renderer shifts the patch's φ bounds in place, runs the same
+   drawing routines, then restores them.  Every square geometry
+   function reads the patch through `quads[qi]`, so the shifted
+   patch is what they see; nothing in the per-square math needs to
+   know a mirror is being drawn.  The shift is restored in a
+   `finally`, so an exception cannot leave the model shifted. */
+
+function _withQuadPhiShifted(q, dPhi, fn) {
+  const phi0 = q.phi0, phi1 = q.phi1;
+  q.phi0 = phi0 + dPhi;
+  q.phi1 = phi1 + dPhi;
+  try { fn(); } finally {
+    q.phi0 = phi0;
+    q.phi1 = phi1;
+  }
+}
+
+function _squareHasMirror(sq) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return false;
+  const q = quads[qi];
+  return !!(q && q.mirror);
+}
+
+function _withSquareMirror(sq, fn) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return;
+  const q = quads[qi];
+  if (!q || !q.mirror) return;
+  _withQuadPhiShifted(q, Math.PI, fn);
 }
 
 /* The direction that the patch's outward surface normal projects to,
@@ -1188,10 +1242,14 @@ function drawBaseReach(qi) {
 function drawFloatSquares() {
   for (let i = 0; i < floatSquares.length; i++) {
     if (i === selectedSquare) continue;
-    drawFloatSquare(floatSquares[i], false);
+    const sq = floatSquares[i];
+    drawFloatSquare(sq, false, false);
+    _withSquareMirror(sq, () => drawFloatSquare(sq, false, true));
   }
   if (selectedSquare >= 0 && selectedSquare < floatSquares.length) {
-    drawFloatSquare(floatSquares[selectedSquare], true);
+    const sq = floatSquares[selectedSquare];
+    drawFloatSquare(sq, true, false);
+    _withSquareMirror(sq, () => drawFloatSquare(sq, false, true));
   }
 }
 
@@ -1210,29 +1268,35 @@ function _drawRotateHandle(sx, sy, hue) {
   ctx.stroke();
 }
 
-function drawFloatSquare(sq, selected) {
+function drawFloatSquare(sq, selected, isMirror) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const q = quads[qi];
+  if (!q) return;
   const hue = patchHue(q);
 
-  if (selected) {
+  if (selected && !isMirror) {
     drawHorizon(qi);
     drawBaseReach(qi);
   }
+
   const pts = squareCornersScreen(sq);
   if (!pts || pts.length < 3) return;
+
+  const fillAlpha   = isMirror ? 0.06 : (selected ? 0.30 : 0.12);
+  const strokeAlpha = isMirror ? 0.55 : (selected ? 1.00 : 0.72);
+  const lineW       = isMirror ? 1.0  : (selected ? 2.0  : 1.3);
 
   ctx.beginPath();
   ctx.moveTo(pts[0][0], pts[0][1]);
   for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
   ctx.closePath();
-  ctx.fillStyle = _huergb(hue, selected ? 0.30 : 0.12);
+  ctx.fillStyle = _huergb(hue, fillAlpha);
   ctx.fill();
 
   ctx.lineJoin = "round";
-  ctx.strokeStyle = _huergb(hue, selected ? 1.00 : 0.72);
-  ctx.lineWidth = selected ? 2.0 : 1.3;
+  ctx.strokeStyle = _huergb(hue, strokeAlpha);
+  ctx.lineWidth = lineW;
   ctx.stroke();
 
   /* Intersection with the patch plane, when tilted. */
@@ -1241,7 +1305,8 @@ function drawFloatSquare(sq, selected) {
     if (isect) {
       ctx.save();
       ctx.setLineDash([4, 3]);
-      ctx.strokeStyle = _huergb(hue, selected ? 0.65 : 0.42);
+      ctx.strokeStyle = _huergb(hue,
+        isMirror ? 0.32 : (selected ? 0.65 : 0.42));
       ctx.lineWidth   = 1.0;
       ctx.beginPath();
       ctx.moveTo(isect[0][0], isect[0][1]);
@@ -1251,7 +1316,9 @@ function drawFloatSquare(sq, selected) {
     }
   }
 
-  if (!selected) return;
+  /* The mirror gets no corner or rotate handles — it is a visual
+     clone, not a second editable object. */
+  if (!selected || isMirror) return;
 
   for (const [sx, sy] of pts) {
     ctx.beginPath();

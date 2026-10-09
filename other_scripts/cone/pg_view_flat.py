@@ -122,6 +122,13 @@ Patch and shape name labels are drawn at the end of drawFlatView,
 inside the clip block, so a wrapped copy that has drifted past the
 sheet boundary is trimmed along with everything else.
 
+MIRROR
+======
+A patch whose `mirror` flag is true draws its shapes a second time
+on the patch's mirror — the same patch shifted by π in φ.  The
+mirror copies are drawn dimmed, without handles, and are not hit-
+testable.  See pg_view_squares.py for the mirror helpers.
+
 Interaction on this band:
 
     shape corner / rotate / body drag   edit that shape
@@ -314,97 +321,17 @@ function drawFlatView() {
 
   if (selectedQuad >= 0 && selectedQuad < quads.length) {
     const activeQ = quads[selectedQuad];
-    const activeHue = patchHue(activeQ);
 
     for (let i = 0; i < floatSquares.length; i++) {
       const sq = floatSquares[i];
       if (sq.quadId !== activeQ.id) continue;
-
-      const corners = squareFlatCorners(sq);
-      if (!corners) continue;
-
-      const phis = corners.map(c => c[0]);
-      const shifts = _phiCopies(Math.min(...phis), Math.max(...phis));
       const isSel = (i === selectedSquare);
 
-      for (const shift of shifts) {
-        const screen = corners.map(([phi, s]) =>
-          flatToScreen(phi + shift, s));
+      _drawFlatSquareOne(sq, isSel, false);
 
-        ctx.beginPath();
-        ctx.moveTo(screen[0][0], screen[0][1]);
-        for (let k = 1; k < 4; k++) {
-          ctx.lineTo(screen[k][0], screen[k][1]);
-        }
-        ctx.closePath();
-        ctx.fillStyle = _huergb(activeHue, isSel ? 0.30 : 0.16);
-        ctx.fill();
-
-        ctx.lineJoin = "round";
-        ctx.strokeStyle = _huergb(activeHue, isSel ? 1.00 : 0.78);
-        ctx.lineWidth = isSel ? 1.8 : 1.2;
-        ctx.stroke();
-
-        /* Intersection with the patch plane, when tilted.  Drawn
-           per wrapped copy, same as the polygon and its handles. */
-        if (sq.slope && Math.abs(sq.slope) > 1e-6) {
-          const isect = squarePlaneIntersectionFlat(sq);
-          if (isect) {
-            const [p0, p1] = isect.map(([phi, s]) =>
-              flatToScreen(phi + shift, s));
-            ctx.save();
-            ctx.setLineDash([4, 3]);
-            ctx.strokeStyle = _huergb(activeHue, isSel ? 0.65 : 0.42);
-            ctx.lineWidth   = 1.0;
-            ctx.beginPath();
-            ctx.moveTo(p0[0], p0[1]);
-            ctx.lineTo(p1[0], p1[1]);
-            ctx.stroke();
-            ctx.restore();
-          }
-        }
-
-        if (!isSel) continue;
-
-        for (const [hx, hy] of screen) {
-          ctx.beginPath();
-          ctx.arc(hx, hy, 4.2, 0, Math.PI * 2);
-          ctx.fillStyle = _huergbLight(activeHue);
-          ctx.fill();
-          ctx.strokeStyle = "#0a0e14";
-          ctx.lineWidth = 1.4;
-          ctx.stroke();
-        }
-
-        const rh = squareFlatRotateHandleScreen(sq, shift);
-        if (rh) {
-          let topIdx = 0;
-          for (let k = 1; k < screen.length; k++) {
-            if (screen[k][1] < screen[topIdx][1]) topIdx = k;
-          }
-          ctx.beginPath();
-          ctx.moveTo(screen[topIdx][0], screen[topIdx][1]);
-          ctx.lineTo(rh[0], rh[1]);
-          ctx.strokeStyle = _huergb(activeHue, 0.45);
-          ctx.lineWidth = 1;
-          ctx.setLineDash([3, 3]);
-          ctx.stroke();
-          ctx.setLineDash([]);
-
-          ctx.beginPath();
-          ctx.arc(rh[0], rh[1], 6.0, 0, Math.PI * 2);
-          ctx.fillStyle = _huergbLight(activeHue);
-          ctx.fill();
-          ctx.strokeStyle = "#0a0e14";
-          ctx.lineWidth = 1.6;
-          ctx.stroke();
-
-          ctx.beginPath();
-          ctx.arc(rh[0], rh[1], 3.0, Math.PI * 0.15, Math.PI * 1.85);
-          ctx.strokeStyle = "#0a0e14";
-          ctx.lineWidth = 1.2;
-          ctx.stroke();
-        }
+      if (activeQ.mirror) {
+        _withQuadPhiShifted(activeQ, Math.PI,
+          () => _drawFlatSquareOne(sq, false, true));
       }
     }
   }
@@ -531,6 +458,114 @@ function drawFlatQuadShifted(q, selected, shift) {
   }
 
   ctx.restore();
+}
+
+/* ==========================================================================
+   PER-SQUARE DRAWING IN THE FLAT BAND
+   ==========================================================================
+   Extracted so both the original and the mirror copy can be drawn
+   through the same code.  The mirror copy is dimmed and carries no
+   handles; the original carries handles when it is the selected
+   square.  The wrapping by `_phiCopies` and the intersection hint
+   are the same in both cases. */
+
+function _drawFlatSquareOne(sq, isSel, isMirror) {
+  const corners = squareFlatCorners(sq);
+  if (!corners) return;
+
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return;
+  const q = quads[qi];
+  if (!q) return;
+  const hue = patchHue(q);
+
+  const phis = corners.map(c => c[0]);
+  const shifts = _phiCopies(Math.min(...phis), Math.max(...phis));
+
+  const fillAlpha   = isMirror ? 0.06 : (isSel ? 0.30 : 0.16);
+  const strokeAlpha = isMirror ? 0.55 : (isSel ? 1.00 : 0.78);
+  const lineW       = isMirror ? 1.0  : (isSel ? 1.8  : 1.2);
+
+  for (const shift of shifts) {
+    const screen = corners.map(([phi, s]) =>
+      flatToScreen(phi + shift, s));
+
+    ctx.beginPath();
+    ctx.moveTo(screen[0][0], screen[0][1]);
+    for (let k = 1; k < 4; k++) {
+      ctx.lineTo(screen[k][0], screen[k][1]);
+    }
+    ctx.closePath();
+    ctx.fillStyle = _huergb(hue, fillAlpha);
+    ctx.fill();
+
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = _huergb(hue, strokeAlpha);
+    ctx.lineWidth = lineW;
+    ctx.stroke();
+
+    /* Intersection with the patch plane, when tilted.  Drawn
+       per wrapped copy, same as the polygon and its handles. */
+    if (sq.slope && Math.abs(sq.slope) > 1e-6) {
+      const isect = squarePlaneIntersectionFlat(sq);
+      if (isect) {
+        const [p0, p1] = isect.map(([phi, s]) =>
+          flatToScreen(phi + shift, s));
+        ctx.save();
+        ctx.setLineDash([4, 3]);
+        ctx.strokeStyle = _huergb(hue,
+          isMirror ? 0.32 : (isSel ? 0.65 : 0.42));
+        ctx.lineWidth   = 1.0;
+        ctx.beginPath();
+        ctx.moveTo(p0[0], p0[1]);
+        ctx.lineTo(p1[0], p1[1]);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    if (!isSel || isMirror) continue;
+
+    for (const [hx, hy] of screen) {
+      ctx.beginPath();
+      ctx.arc(hx, hy, 4.2, 0, Math.PI * 2);
+      ctx.fillStyle = _huergbLight(hue);
+      ctx.fill();
+      ctx.strokeStyle = "#0a0e14";
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+    }
+
+    const rh = squareFlatRotateHandleScreen(sq, shift);
+    if (rh) {
+      let topIdx = 0;
+      for (let k = 1; k < screen.length; k++) {
+        if (screen[k][1] < screen[topIdx][1]) topIdx = k;
+      }
+      ctx.beginPath();
+      ctx.moveTo(screen[topIdx][0], screen[topIdx][1]);
+      ctx.lineTo(rh[0], rh[1]);
+      ctx.strokeStyle = _huergb(hue, 0.45);
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.beginPath();
+      ctx.arc(rh[0], rh[1], 6.0, 0, Math.PI * 2);
+      ctx.fillStyle = _huergbLight(hue);
+      ctx.fill();
+      ctx.strokeStyle = "#0a0e14";
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(rh[0], rh[1], 3.0, Math.PI * 0.15, Math.PI * 1.85);
+      ctx.strokeStyle = "#0a0e14";
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+    }
+  }
 }
 
 /* ---- Hit testing ------------------------------------------------ */

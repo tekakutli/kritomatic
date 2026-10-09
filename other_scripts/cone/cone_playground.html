@@ -320,6 +320,12 @@
            value="&#8212;" autocomplete="off" spellcheck="false"
            disabled>
   </div>
+  <div class="field">
+    <label>Mirror</label>
+    <input type="checkbox" id="patchMirror"
+           title="Draw a visual clone of every square on this patch
+                  on the diametrically opposite side of the cone">
+  </div>
 
   <hr>
 
@@ -567,6 +573,7 @@ function addQuad() {
     phi1: phiCenter + halfPhi,
     s0: DEFAULT_PATCH_S_CENTER - halfS,
     s1: DEFAULT_PATCH_S_CENTER + halfS,
+    mirror: false,
   });
   selectedQuad = quads.length - 1;
   syncQuadList();
@@ -593,6 +600,7 @@ function cloneQuad(idx) {
     phi1: src.phi1 + dPhi,
     s0:   src.s0,
     s1:   src.s1,
+    mirror: !!src.mirror,
   });
 
   for (let i = 0; i < floatSquares.length; i++) {
@@ -985,6 +993,7 @@ function _pushPatchAndShapeFromParams(params, phiMin, phiMax, sMin, sMax,
     id, name: "Q" + id,
     phi0: phiMin, phi1: phiMax,
     s0:   sMin,   s1:   sMax,
+    mirror: false,
   };
   quads.push(q);
   const qi = quads.length - 1;
@@ -1558,97 +1567,17 @@ function drawFlatView() {
 
   if (selectedQuad >= 0 && selectedQuad < quads.length) {
     const activeQ = quads[selectedQuad];
-    const activeHue = patchHue(activeQ);
 
     for (let i = 0; i < floatSquares.length; i++) {
       const sq = floatSquares[i];
       if (sq.quadId !== activeQ.id) continue;
-
-      const corners = squareFlatCorners(sq);
-      if (!corners) continue;
-
-      const phis = corners.map(c => c[0]);
-      const shifts = _phiCopies(Math.min(...phis), Math.max(...phis));
       const isSel = (i === selectedSquare);
 
-      for (const shift of shifts) {
-        const screen = corners.map(([phi, s]) =>
-          flatToScreen(phi + shift, s));
+      _drawFlatSquareOne(sq, isSel, false);
 
-        ctx.beginPath();
-        ctx.moveTo(screen[0][0], screen[0][1]);
-        for (let k = 1; k < 4; k++) {
-          ctx.lineTo(screen[k][0], screen[k][1]);
-        }
-        ctx.closePath();
-        ctx.fillStyle = _huergb(activeHue, isSel ? 0.30 : 0.16);
-        ctx.fill();
-
-        ctx.lineJoin = "round";
-        ctx.strokeStyle = _huergb(activeHue, isSel ? 1.00 : 0.78);
-        ctx.lineWidth = isSel ? 1.8 : 1.2;
-        ctx.stroke();
-
-        /* Intersection with the patch plane, when tilted.  Drawn
-           per wrapped copy, same as the polygon and its handles. */
-        if (sq.slope && Math.abs(sq.slope) > 1e-6) {
-          const isect = squarePlaneIntersectionFlat(sq);
-          if (isect) {
-            const [p0, p1] = isect.map(([phi, s]) =>
-              flatToScreen(phi + shift, s));
-            ctx.save();
-            ctx.setLineDash([4, 3]);
-            ctx.strokeStyle = _huergb(activeHue, isSel ? 0.65 : 0.42);
-            ctx.lineWidth   = 1.0;
-            ctx.beginPath();
-            ctx.moveTo(p0[0], p0[1]);
-            ctx.lineTo(p1[0], p1[1]);
-            ctx.stroke();
-            ctx.restore();
-          }
-        }
-
-        if (!isSel) continue;
-
-        for (const [hx, hy] of screen) {
-          ctx.beginPath();
-          ctx.arc(hx, hy, 4.2, 0, Math.PI * 2);
-          ctx.fillStyle = _huergbLight(activeHue);
-          ctx.fill();
-          ctx.strokeStyle = "#0a0e14";
-          ctx.lineWidth = 1.4;
-          ctx.stroke();
-        }
-
-        const rh = squareFlatRotateHandleScreen(sq, shift);
-        if (rh) {
-          let topIdx = 0;
-          for (let k = 1; k < screen.length; k++) {
-            if (screen[k][1] < screen[topIdx][1]) topIdx = k;
-          }
-          ctx.beginPath();
-          ctx.moveTo(screen[topIdx][0], screen[topIdx][1]);
-          ctx.lineTo(rh[0], rh[1]);
-          ctx.strokeStyle = _huergb(activeHue, 0.45);
-          ctx.lineWidth = 1;
-          ctx.setLineDash([3, 3]);
-          ctx.stroke();
-          ctx.setLineDash([]);
-
-          ctx.beginPath();
-          ctx.arc(rh[0], rh[1], 6.0, 0, Math.PI * 2);
-          ctx.fillStyle = _huergbLight(activeHue);
-          ctx.fill();
-          ctx.strokeStyle = "#0a0e14";
-          ctx.lineWidth = 1.6;
-          ctx.stroke();
-
-          ctx.beginPath();
-          ctx.arc(rh[0], rh[1], 3.0, Math.PI * 0.15, Math.PI * 1.85);
-          ctx.strokeStyle = "#0a0e14";
-          ctx.lineWidth = 1.2;
-          ctx.stroke();
-        }
+      if (activeQ.mirror) {
+        _withQuadPhiShifted(activeQ, Math.PI,
+          () => _drawFlatSquareOne(sq, false, true));
       }
     }
   }
@@ -1775,6 +1704,114 @@ function drawFlatQuadShifted(q, selected, shift) {
   }
 
   ctx.restore();
+}
+
+/* ==========================================================================
+   PER-SQUARE DRAWING IN THE FLAT BAND
+   ==========================================================================
+   Extracted so both the original and the mirror copy can be drawn
+   through the same code.  The mirror copy is dimmed and carries no
+   handles; the original carries handles when it is the selected
+   square.  The wrapping by `_phiCopies` and the intersection hint
+   are the same in both cases. */
+
+function _drawFlatSquareOne(sq, isSel, isMirror) {
+  const corners = squareFlatCorners(sq);
+  if (!corners) return;
+
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return;
+  const q = quads[qi];
+  if (!q) return;
+  const hue = patchHue(q);
+
+  const phis = corners.map(c => c[0]);
+  const shifts = _phiCopies(Math.min(...phis), Math.max(...phis));
+
+  const fillAlpha   = isMirror ? 0.06 : (isSel ? 0.30 : 0.16);
+  const strokeAlpha = isMirror ? 0.55 : (isSel ? 1.00 : 0.78);
+  const lineW       = isMirror ? 1.0  : (isSel ? 1.8  : 1.2);
+
+  for (const shift of shifts) {
+    const screen = corners.map(([phi, s]) =>
+      flatToScreen(phi + shift, s));
+
+    ctx.beginPath();
+    ctx.moveTo(screen[0][0], screen[0][1]);
+    for (let k = 1; k < 4; k++) {
+      ctx.lineTo(screen[k][0], screen[k][1]);
+    }
+    ctx.closePath();
+    ctx.fillStyle = _huergb(hue, fillAlpha);
+    ctx.fill();
+
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = _huergb(hue, strokeAlpha);
+    ctx.lineWidth = lineW;
+    ctx.stroke();
+
+    /* Intersection with the patch plane, when tilted.  Drawn
+       per wrapped copy, same as the polygon and its handles. */
+    if (sq.slope && Math.abs(sq.slope) > 1e-6) {
+      const isect = squarePlaneIntersectionFlat(sq);
+      if (isect) {
+        const [p0, p1] = isect.map(([phi, s]) =>
+          flatToScreen(phi + shift, s));
+        ctx.save();
+        ctx.setLineDash([4, 3]);
+        ctx.strokeStyle = _huergb(hue,
+          isMirror ? 0.32 : (isSel ? 0.65 : 0.42));
+        ctx.lineWidth   = 1.0;
+        ctx.beginPath();
+        ctx.moveTo(p0[0], p0[1]);
+        ctx.lineTo(p1[0], p1[1]);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    if (!isSel || isMirror) continue;
+
+    for (const [hx, hy] of screen) {
+      ctx.beginPath();
+      ctx.arc(hx, hy, 4.2, 0, Math.PI * 2);
+      ctx.fillStyle = _huergbLight(hue);
+      ctx.fill();
+      ctx.strokeStyle = "#0a0e14";
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+    }
+
+    const rh = squareFlatRotateHandleScreen(sq, shift);
+    if (rh) {
+      let topIdx = 0;
+      for (let k = 1; k < screen.length; k++) {
+        if (screen[k][1] < screen[topIdx][1]) topIdx = k;
+      }
+      ctx.beginPath();
+      ctx.moveTo(screen[topIdx][0], screen[topIdx][1]);
+      ctx.lineTo(rh[0], rh[1]);
+      ctx.strokeStyle = _huergb(hue, 0.45);
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.beginPath();
+      ctx.arc(rh[0], rh[1], 6.0, 0, Math.PI * 2);
+      ctx.fillStyle = _huergbLight(hue);
+      ctx.fill();
+      ctx.strokeStyle = "#0a0e14";
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(rh[0], rh[1], 3.0, Math.PI * 0.15, Math.PI * 1.85);
+      ctx.strokeStyle = "#0a0e14";
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+    }
+  }
 }
 
 /* ---- Hit testing ------------------------------------------------ */
@@ -2180,6 +2217,50 @@ function quadIdxById(id) {
     if (quads[i].id === id) return i;
   }
   return -1;
+}
+
+/* ==========================================================================
+   MIRROR
+   ==========================================================================
+   Every patch carries a boolean `mirror`.  When it is true, every
+   square on the patch is drawn a second time on the patch's mirror —
+   the same patch shifted by π in φ, i.e. on the diametrically
+   opposite side of the cone.  The mirror copy shares the square's
+   full local state (u, v, theta, scaleU, scaleV, slope): it is a
+   pure visual clone, not an independent object.  Dragging or
+   editing the original updates both; the mirror itself is not hit-
+   testable.
+
+   The renderer shifts the patch's φ bounds in place, runs the same
+   drawing routines, then restores them.  Every square geometry
+   function reads the patch through `quads[qi]`, so the shifted
+   patch is what they see; nothing in the per-square math needs to
+   know a mirror is being drawn.  The shift is restored in a
+   `finally`, so an exception cannot leave the model shifted. */
+
+function _withQuadPhiShifted(q, dPhi, fn) {
+  const phi0 = q.phi0, phi1 = q.phi1;
+  q.phi0 = phi0 + dPhi;
+  q.phi1 = phi1 + dPhi;
+  try { fn(); } finally {
+    q.phi0 = phi0;
+    q.phi1 = phi1;
+  }
+}
+
+function _squareHasMirror(sq) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return false;
+  const q = quads[qi];
+  return !!(q && q.mirror);
+}
+
+function _withSquareMirror(sq, fn) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return;
+  const q = quads[qi];
+  if (!q || !q.mirror) return;
+  _withQuadPhiShifted(q, Math.PI, fn);
 }
 
 /* The direction that the patch's outward surface normal projects to,
@@ -2862,10 +2943,14 @@ function drawBaseReach(qi) {
 function drawFloatSquares() {
   for (let i = 0; i < floatSquares.length; i++) {
     if (i === selectedSquare) continue;
-    drawFloatSquare(floatSquares[i], false);
+    const sq = floatSquares[i];
+    drawFloatSquare(sq, false, false);
+    _withSquareMirror(sq, () => drawFloatSquare(sq, false, true));
   }
   if (selectedSquare >= 0 && selectedSquare < floatSquares.length) {
-    drawFloatSquare(floatSquares[selectedSquare], true);
+    const sq = floatSquares[selectedSquare];
+    drawFloatSquare(sq, true, false);
+    _withSquareMirror(sq, () => drawFloatSquare(sq, false, true));
   }
 }
 
@@ -2884,29 +2969,35 @@ function _drawRotateHandle(sx, sy, hue) {
   ctx.stroke();
 }
 
-function drawFloatSquare(sq, selected) {
+function drawFloatSquare(sq, selected, isMirror) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const q = quads[qi];
+  if (!q) return;
   const hue = patchHue(q);
 
-  if (selected) {
+  if (selected && !isMirror) {
     drawHorizon(qi);
     drawBaseReach(qi);
   }
+
   const pts = squareCornersScreen(sq);
   if (!pts || pts.length < 3) return;
+
+  const fillAlpha   = isMirror ? 0.06 : (selected ? 0.30 : 0.12);
+  const strokeAlpha = isMirror ? 0.55 : (selected ? 1.00 : 0.72);
+  const lineW       = isMirror ? 1.0  : (selected ? 2.0  : 1.3);
 
   ctx.beginPath();
   ctx.moveTo(pts[0][0], pts[0][1]);
   for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
   ctx.closePath();
-  ctx.fillStyle = _huergb(hue, selected ? 0.30 : 0.12);
+  ctx.fillStyle = _huergb(hue, fillAlpha);
   ctx.fill();
 
   ctx.lineJoin = "round";
-  ctx.strokeStyle = _huergb(hue, selected ? 1.00 : 0.72);
-  ctx.lineWidth = selected ? 2.0 : 1.3;
+  ctx.strokeStyle = _huergb(hue, strokeAlpha);
+  ctx.lineWidth = lineW;
   ctx.stroke();
 
   /* Intersection with the patch plane, when tilted. */
@@ -2915,7 +3006,8 @@ function drawFloatSquare(sq, selected) {
     if (isect) {
       ctx.save();
       ctx.setLineDash([4, 3]);
-      ctx.strokeStyle = _huergb(hue, selected ? 0.65 : 0.42);
+      ctx.strokeStyle = _huergb(hue,
+        isMirror ? 0.32 : (selected ? 0.65 : 0.42));
       ctx.lineWidth   = 1.0;
       ctx.beginPath();
       ctx.moveTo(isect[0][0], isect[0][1]);
@@ -2925,7 +3017,9 @@ function drawFloatSquare(sq, selected) {
     }
   }
 
-  if (!selected) return;
+  /* The mirror gets no corner or rotate handles — it is a visual
+     clone, not a second editable object. */
+  if (!selected || isMirror) return;
 
   for (const [sx, sy] of pts) {
     ctx.beginPath();
@@ -4227,72 +4321,83 @@ function _decomposeAffineLocal(M00, M01, M10, M11) {
    SQUARE MODE
    ========================================================================== */
 
-function buildKraShapes(options) {
-  options = options || {};
-  const textPos = options.text_position || "center";
-  const padFrac = (typeof options.text_padding === "number")
-                    ? options.text_padding : 0.06;
+function _kraShapeEntry(sq, options) {
+  const textPos   = options.text_position || "center";
+  const padFrac   = (typeof options.text_padding === "number")
+                      ? options.text_padding : 0.06;
   const colorMode = options.text_color_mode || "color";
 
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const q = quads[qi];
+  if (!q) return null;
+
+  const corners = _unclippedProjectedCorners(sq);
+  if (!corners || corners.length < 4) return null;
+
+  const lens = (function () {
+    const n = corners.length;
+    const s = [];
+    for (let k = 0; k < n; k++) {
+      const a = corners[k];
+      const b = corners[(k + 1) % n];
+      s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
+    }
+    return s;
+  })();
+  const W = (lens[0] + lens[2]) / 2;
+  const H = (lens[1] + lens[3]) / 2;
+  if (W <= 0.5 || H <= 0.5) return null;
+
+  const hue = patchHue(q);
+  const hex = _hueToHex(hue);
+  const hexLight = _hueToHexLight(hue);
+
+  const textColor = (colorMode === "black") ? "#000000" : hexLight;
+
+  const screenCorners = squareCornersScreen(sq) || corners;
+  const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
+  const readingAngle  = _shapeLabelScreenAngleDeg(sq, screenCorners);
+
+  const name = squareDisplayName(sq);
+  const fontNat = Math.min(W, H) * 0.40;
+
+  const anchorCenter = _flatAnchorFromVisual(
+    screenCorners, W, H, textPos, padFrac, fontNat, name.length,
+    readingAngle, flatRotation
+  );
+  const anchor = _anchorForPosition(
+    anchorCenter, flatRotation, name.length, fontNat, textPos
+  );
+
+  return {
+    name:            name,
+    points:          corners.map(([x, y]) => [x, y]),
+    natural_w:       W,
+    natural_h:       H,
+    flat_rotation:   flatRotation,
+    text_anchor:     anchor,
+    fill:            hex,
+    fill_opacity:    0.40,
+    stroke:          hex,
+    stroke_width:    2.0,
+    stroke_opacity:  1.0,
+    text_color:      textColor,
+  };
+}
+
+function buildKraShapes(options) {
+  options = options || {};
   const shapes = [];
   for (let i = 0; i < floatSquares.length; i++) {
     const sq = floatSquares[i];
-    const qi = quadIdxById(sq.quadId);
-    if (qi < 0) continue;
-    const q = quads[qi];
-    if (!q) continue;
 
-    const corners = _unclippedProjectedCorners(sq);
-    if (!corners || corners.length < 4) continue;
+    const e1 = _kraShapeEntry(sq, options);
+    if (e1) shapes.push(e1);
 
-    const lens = (function () {
-      const n = corners.length;
-      const s = [];
-      for (let k = 0; k < n; k++) {
-        const a = corners[k];
-        const b = corners[(k + 1) % n];
-        s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
-      }
-      return s;
-    })();
-    const W = (lens[0] + lens[2]) / 2;
-    const H = (lens[1] + lens[3]) / 2;
-    if (W <= 0.5 || H <= 0.5) continue;
-
-    const hue = patchHue(q);
-    const hex = _hueToHex(hue);
-    const hexLight = _hueToHexLight(hue);
-
-    const textColor = (colorMode === "black") ? "#000000" : hexLight;
-
-    const screenCorners = squareCornersScreen(sq) || corners;
-    const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
-    const readingAngle  = _shapeLabelScreenAngleDeg(sq, screenCorners);
-
-    const name = squareDisplayName(sq);
-    const fontNat = Math.min(W, H) * 0.40;
-
-    const anchorCenter = _flatAnchorFromVisual(
-      screenCorners, W, H, textPos, padFrac, fontNat, name.length,
-      readingAngle, flatRotation
-    );
-    const anchor = _anchorForPosition(
-      anchorCenter, flatRotation, name.length, fontNat, textPos
-    );
-
-    shapes.push({
-      name:            name,
-      points:          corners.map(([x, y]) => [x, y]),
-      natural_w:       W,
-      natural_h:       H,
-      flat_rotation:   flatRotation,
-      text_anchor:     anchor,
-      fill:            hex,
-      fill_opacity:    0.40,
-      stroke:          hex,
-      stroke_width:    2.0,
-      stroke_opacity:  1.0,
-      text_color:      textColor,
+    _withSquareMirror(sq, () => {
+      const e2 = _kraShapeEntry(sq, options);
+      if (e2) shapes.push(e2);
     });
   }
   return shapes;
@@ -4426,7 +4531,10 @@ function _bilinearInterpQuad(corners, u, v) {
 
 /* ==========================================================================
    PATCH MODE — one group + one mask per patch
-   ========================================================================== */
+   ==========================================================================
+   NOTE — per the module docstring (MIRROR), this per-patch mode
+   does NOT emit a mirror copy of the patch group.  Only the three
+   per-square modes (square, text, text-shear) do. */
 
 function _projectedPatchCorners(q) {
   const corners = quadCorners(q);
@@ -4678,95 +4786,109 @@ function buildKraPatches(options) {
    TEXT MODE — one group + one mask per text
    ========================================================================== */
 
-function buildKraTexts(options) {
-  options = options || {};
+function _kraTextEntry(sq, options) {
   const colorMode = options.text_color_mode || "color";
   const textPos   = options.text_position || "center";
   const padFrac   = (typeof options.text_padding === "number")
                       ? options.text_padding : 0.06;
   const drawRects = options.draw_rectangles !== false;
 
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const q = quads[qi];
+  if (!q) return null;
+
+  const unclipped = _unclippedProjectedCorners(sq);
+  if (!unclipped || unclipped.length < 4) return null;
+
+  const screenCorners = squareCornersScreen(sq) || unclipped;
+
+  const lens = (function () {
+    const n = unclipped.length;
+    const s = [];
+    for (let k = 0; k < n; k++) {
+      const a = unclipped[k];
+      const b = unclipped[(k + 1) % n];
+      s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
+    }
+    return s;
+  })();
+  const W_sq = (lens[0] + lens[2]) / 2;
+  const H_sq = (lens[1] + lens[3]) / 2;
+  if (W_sq <= 0.5 || H_sq <= 0.5) return null;
+
+  const hue = patchHue(q);
+  const hex = _hueToHex(hue);
+  const hexLight = _hueToHexLight(hue);
+  const textColor = (colorMode === "black") ? "#000000" : hexLight;
+
+  const name = squareDisplayName(sq);
+
+  let rect = null;
+  if (drawRects) {
+    rect = {
+      name: name,
+      points: screenCorners.map(([x, y]) => [x, y]),
+      fill: hex,
+      fill_opacity: 0.40,
+      stroke: hex,
+      stroke_width: 2.0,
+      stroke_opacity: 1.0,
+    };
+  }
+
+  const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
+  const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
+  const fontNat = Math.min(W_sq, H_sq) * 0.40;
+
+  const anchorCenter = _flatAnchorFromVisual(
+    screenCorners, W_sq, H_sq, textPos, padFrac,
+    fontNat, name.length,
+    readingAngle, flatRotation
+  );
+  const anchor = _anchorForPosition(
+    anchorCenter, flatRotation, name.length, fontNat, textPos
+  );
+
+  const srcPts = [
+    [0, 0],
+    [W_sq, 0],
+    [W_sq, H_sq],
+    [0, H_sq],
+  ];
+  const dstPts = unclipped.map(([x, y]) => [x, y]);
+
+  const item = {
+    name: name,
+    src_w: W_sq,
+    src_h: H_sq,
+    text_x: anchor.x,
+    text_y: anchor.y,
+    font_px: Math.max(6, fontNat),
+    rotation: flatRotation,
+    alignment: anchor.alignment,
+    color: textColor,
+    src_pts: srcPts,
+    dst_pts: dstPts,
+  };
+
+  return { item, rect };
+}
+
+function buildKraTexts(options) {
+  options = options || {};
   const items = [];
   const rects = [];
 
   for (let i = 0; i < floatSquares.length; i++) {
     const sq = floatSquares[i];
-    const qi = quadIdxById(sq.quadId);
-    if (qi < 0) continue;
-    const q = quads[qi];
-    if (!q) continue;
 
-    const unclipped = _unclippedProjectedCorners(sq);
-    if (!unclipped || unclipped.length < 4) continue;
+    const e1 = _kraTextEntry(sq, options);
+    if (e1) { items.push(e1.item); if (e1.rect) rects.push(e1.rect); }
 
-    const screenCorners = squareCornersScreen(sq) || unclipped;
-
-    const lens = (function () {
-      const n = unclipped.length;
-      const s = [];
-      for (let k = 0; k < n; k++) {
-        const a = unclipped[k];
-        const b = unclipped[(k + 1) % n];
-        s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
-      }
-      return s;
-    })();
-    const W_sq = (lens[0] + lens[2]) / 2;
-    const H_sq = (lens[1] + lens[3]) / 2;
-    if (W_sq <= 0.5 || H_sq <= 0.5) continue;
-
-    const hue = patchHue(q);
-    const hex = _hueToHex(hue);
-    const hexLight = _hueToHexLight(hue);
-    const textColor = (colorMode === "black") ? "#000000" : hexLight;
-
-    const name = squareDisplayName(sq);
-
-    if (drawRects) {
-      rects.push({
-        name: name,
-        points: screenCorners.map(([x, y]) => [x, y]),
-        fill: hex,
-        fill_opacity: 0.40,
-        stroke: hex,
-        stroke_width: 2.0,
-        stroke_opacity: 1.0,
-      });
-    }
-
-    const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
-    const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
-    const fontNat = Math.min(W_sq, H_sq) * 0.40;
-
-    const anchorCenter = _flatAnchorFromVisual(
-      screenCorners, W_sq, H_sq, textPos, padFrac,
-      fontNat, name.length,
-      readingAngle, flatRotation
-    );
-    const anchor = _anchorForPosition(
-      anchorCenter, flatRotation, name.length, fontNat, textPos
-    );
-
-    const srcPts = [
-      [0, 0],
-      [W_sq, 0],
-      [W_sq, H_sq],
-      [0, H_sq],
-    ];
-    const dstPts = unclipped.map(([x, y]) => [x, y]);
-
-    items.push({
-      name: name,
-      src_w: W_sq,
-      src_h: H_sq,
-      text_x: anchor.x,
-      text_y: anchor.y,
-      font_px: Math.max(6, fontNat),
-      rotation: flatRotation,
-      alignment: anchor.alignment,
-      color: textColor,
-      src_pts: srcPts,
-      dst_pts: dstPts,
+    _withSquareMirror(sq, () => {
+      const e2 = _kraTextEntry(sq, options);
+      if (e2) { items.push(e2.item); if (e2.rect) rects.push(e2.rect); }
     });
   }
   return { items: items, rects: rects };
@@ -4793,132 +4915,147 @@ function buildKraTexts(options) {
    longer dimension reaches fontNat, the shorter is proportionally
    smaller, and nothing overflows.  Rotation and shear are invariant
    under the normalization, so the shape of the text is preserved. */
-function buildKraShearTexts(options) {
-  options = options || {};
+
+function _kraShearTextEntry(sq, options) {
   const colorMode = options.text_color_mode || "color";
   const textPos   = options.text_position || "center";
   const padFrac   = (typeof options.text_padding === "number")
                       ? options.text_padding : 0.06;
   const drawRects = options.draw_rectangles !== false;
 
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const q = quads[qi];
+  if (!q) return null;
+
+  const unclipped = _unclippedProjectedCorners(sq);
+  if (!unclipped || unclipped.length < 4) return null;
+  const screenCorners = squareCornersScreen(sq) || unclipped;
+
+  const lens = (function () {
+    const n = unclipped.length;
+    const s = [];
+    for (let k = 0; k < n; k++) {
+      const a = unclipped[k];
+      const b = unclipped[(k + 1) % n];
+      s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
+    }
+    return s;
+  })();
+  const W_sq = (lens[0] + lens[2]) / 2;
+  const H_sq = (lens[1] + lens[3]) / 2;
+  if (W_sq <= 0.5 || H_sq <= 0.5) return null;
+
+  const hue = patchHue(q);
+  const hex = _hueToHex(hue);
+  const hexLight = _hueToHexLight(hue);
+  const textColor = (colorMode === "black") ? "#000000" : hexLight;
+
+  const name = squareDisplayName(sq);
+
+  let rect = null;
+  if (drawRects) {
+    rect = {
+      name: name,
+      points: screenCorners.map(([x, y]) => [x, y]),
+      fill: hex,
+      fill_opacity: 0.40,
+      stroke: hex,
+      stroke_width: 2.0,
+      stroke_opacity: 1.0,
+    };
+  }
+
+  const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
+  const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
+  const fontNat = Math.min(W_sq, H_sq) * 0.40;
+
+  const anchorCenter = _flatAnchorFromVisual(
+    screenCorners, W_sq, H_sq, textPos, padFrac,
+    fontNat, name.length, readingAngle, flatRotation
+  );
+  const anchor = _anchorForPosition(
+    anchorCenter, flatRotation, name.length, fontNat, textPos
+  );
+
+  const sqH = _computeHomography(
+    [{x: 0, y: 0}, {x: W_sq, y: 0},
+     {x: W_sq, y: H_sq}, {x: 0, y: H_sq}],
+    [{x: unclipped[0][0], y: unclipped[0][1]},
+     {x: unclipped[1][0], y: unclipped[1][1]},
+     {x: unclipped[2][0], y: unclipped[2][1]},
+     {x: unclipped[3][0], y: unclipped[3][1]}]
+  );
+
+  const anchorScreen = _applyHomography(sqH, anchor.x, anchor.y);
+  if (!anchorScreen) return null;
+
+  const J = _patchProjectiveJacobian(sqH, anchor.x, anchor.y);
+  if (!J) return null;
+
+  const cosR = Math.cos(flatRotation * Math.PI / 180);
+  const sinR = Math.sin(flatRotation * Math.PI / 180);
+
+  const M00 =  J.J11 * cosR + J.J12 * sinR;
+  const M01 = -J.J11 * sinR + J.J12 * cosR;
+  const M10 =  J.J21 * cosR + J.J22 * sinR;
+  const M11 = -J.J21 * sinR + J.J22 * cosR;
+
+  const decomp = _decomposeAffineLocal(M00, M01, M10, M11);
+  if (!decomp) return null;
+
+  // Normalize scales so the larger one is 1.  The text's on-screen
+  // bounding box then fits in a fontNat × fontNat square.
+  const maxScale = Math.max(Math.abs(decomp.scale_x),
+                            Math.abs(decomp.scale_y));
+  if (maxScale < 1e-9) return null;
+  const invScale = 1 / maxScale;
+
+  const N00 = M00 * invScale;
+  const N01 = M01 * invScale;
+  const N10 = M10 * invScale;
+  const N11 = M11 * invScale;
+
+  const ax = anchorScreen.x;
+  const ay = anchorScreen.y;
+  const dx = ax - N00 * ax - N01 * ay;
+  const dy = ay - N10 * ax - N11 * ay;
+
+  const item = {
+    name: name,
+    text: name,
+    x: ax,
+    y: ay,
+    font_px: Math.max(6, fontNat),
+    alignment: anchor.alignment,
+    color: textColor,
+    transform: [N00, N10, N01, N11, dx, dy],
+    decomposition: {
+      rotation_deg: decomp.rotation_deg,
+      shear: decomp.shear,
+      scale_x: decomp.scale_x,
+      scale_y: decomp.scale_y,
+      max_scale: maxScale,
+    },
+  };
+
+  return { item, rect };
+}
+
+function buildKraShearTexts(options) {
+  options = options || {};
   const items = [];
   const rects = [];
 
   for (let i = 0; i < floatSquares.length; i++) {
     const sq = floatSquares[i];
-    const qi = quadIdxById(sq.quadId);
-    if (qi < 0) continue;
-    const q = quads[qi];
-    if (!q) continue;
 
-    const unclipped = _unclippedProjectedCorners(sq);
-    if (!unclipped || unclipped.length < 4) continue;
-    const screenCorners = squareCornersScreen(sq) || unclipped;
+    const e1 = _kraShearTextEntry(sq, options);
+    if (e1) { items.push(e1.item); if (e1.rect) rects.push(e1.rect); }
 
-    const lens = (function () {
-      const n = unclipped.length;
-      const s = [];
-      for (let k = 0; k < n; k++) {
-        const a = unclipped[k];
-        const b = unclipped[(k + 1) % n];
-        s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
-      }
-      return s;
-    })();
-    const W_sq = (lens[0] + lens[2]) / 2;
-    const H_sq = (lens[1] + lens[3]) / 2;
-    if (W_sq <= 0.5 || H_sq <= 0.5) continue;
-
-    const hue = patchHue(q);
-    const hex = _hueToHex(hue);
-    const hexLight = _hueToHexLight(hue);
-    const textColor = (colorMode === "black") ? "#000000" : hexLight;
-
-    const name = squareDisplayName(sq);
-
-    if (drawRects) {
-      rects.push({
-        name: name,
-        points: screenCorners.map(([x, y]) => [x, y]),
-        fill: hex,
-        fill_opacity: 0.40,
-        stroke: hex,
-        stroke_width: 2.0,
-        stroke_opacity: 1.0,
-      });
-    }
-
-    const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
-    const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
-    const fontNat = Math.min(W_sq, H_sq) * 0.40;
-
-    const anchorCenter = _flatAnchorFromVisual(
-      screenCorners, W_sq, H_sq, textPos, padFrac,
-      fontNat, name.length, readingAngle, flatRotation
-    );
-    const anchor = _anchorForPosition(
-      anchorCenter, flatRotation, name.length, fontNat, textPos
-    );
-
-    const sqH = _computeHomography(
-      [{x: 0, y: 0}, {x: W_sq, y: 0},
-       {x: W_sq, y: H_sq}, {x: 0, y: H_sq}],
-      [{x: unclipped[0][0], y: unclipped[0][1]},
-       {x: unclipped[1][0], y: unclipped[1][1]},
-       {x: unclipped[2][0], y: unclipped[2][1]},
-       {x: unclipped[3][0], y: unclipped[3][1]}]
-    );
-
-    const anchorScreen = _applyHomography(sqH, anchor.x, anchor.y);
-    if (!anchorScreen) continue;
-
-    const J = _patchProjectiveJacobian(sqH, anchor.x, anchor.y);
-    if (!J) continue;
-
-    const cosR = Math.cos(flatRotation * Math.PI / 180);
-    const sinR = Math.sin(flatRotation * Math.PI / 180);
-
-    const M00 =  J.J11 * cosR + J.J12 * sinR;
-    const M01 = -J.J11 * sinR + J.J12 * cosR;
-    const M10 =  J.J21 * cosR + J.J22 * sinR;
-    const M11 = -J.J21 * sinR + J.J22 * cosR;
-
-    const decomp = _decomposeAffineLocal(M00, M01, M10, M11);
-    if (!decomp) continue;
-
-    // Normalize scales so the larger one is 1.  The text's on-screen
-    // bounding box then fits in a fontNat × fontNat square.
-    const maxScale = Math.max(Math.abs(decomp.scale_x),
-                              Math.abs(decomp.scale_y));
-    if (maxScale < 1e-9) continue;
-    const invScale = 1 / maxScale;
-
-    const N00 = M00 * invScale;
-    const N01 = M01 * invScale;
-    const N10 = M10 * invScale;
-    const N11 = M11 * invScale;
-
-    const ax = anchorScreen.x;
-    const ay = anchorScreen.y;
-    const dx = ax - N00 * ax - N01 * ay;
-    const dy = ay - N10 * ax - N11 * ay;
-
-    items.push({
-      name: name,
-      text: name,
-      x: ax,
-      y: ay,
-      font_px: Math.max(6, fontNat),
-      alignment: anchor.alignment,
-      color: textColor,
-      transform: [N00, N10, N01, N11, dx, dy],
-      decomposition: {
-        rotation_deg: decomp.rotation_deg,
-        shear: decomp.shear,
-        scale_x: decomp.scale_x,
-        scale_y: decomp.scale_y,
-        max_scale: maxScale,
-      },
+    _withSquareMirror(sq, () => {
+      const e2 = _kraShearTextEntry(sq, options);
+      if (e2) { items.push(e2.item); if (e2.rect) rects.push(e2.rect); }
     });
   }
 
@@ -4932,7 +5069,11 @@ function buildKraShearTexts(options) {
    instead of being flat under the export group.  No mask is applied
    at any level, so the transform each text carries is the entire
    warp.  The scale normalization matches text-shear's, so the two
-   modes render each text at the same on-screen size. */
+   modes render each text at the same on-screen size.
+
+   NOTE — per the module docstring (MIRROR), this per-patch mode
+   does NOT emit a mirror copy of the patch group. */
+
 function buildKraShearPatches(options) {
   options = options || {};
   const colorMode = options.text_color_mode || "color";
@@ -5435,6 +5576,8 @@ const HELP_HTML = `<!DOCTYPE html>
 <div class="hint">drag a patch in either band to move it</div>
 <div class="hint">hold <span class="kbd">Shift</span> while dragging a patch or a
   square to slide along the <em>centre&rarr;apex</em> axis only</div>
+<div class="hint">tick <strong>Mirror</strong> on a patch to draw a dimmed
+  clone of every square on it on the <em>opposite side of the cone</em></div>
 
 <div class="section">Squares</div>
 <div class="hint">hold <span class="kbd">Alt</span> while clicking a square to grab
@@ -5453,6 +5596,9 @@ const HELP_HTML = `<!DOCTYPE html>
   hold <span class="kbd">Shift</span> to snap</div>
 <div class="hint">fields with <em>&phi;</em>, <em>s</em>, <em>W</em>, <em>H</em>,
   and <em>slope</em> follow the current selection</div>
+<div class="hint"><strong>Mirror</strong> follows the selected patch:
+  greys out when nothing is selected, reflects the patch's flag
+  otherwise</div>
 
 <div class="section">Draw Quad \u2014 two fit modes</div>
 <div class="hint">click four corners in <strong>one band</strong> to fit a patch
@@ -5662,6 +5808,23 @@ function _syncPatchCoordInputs() {
       }
       if (document.activeElement !== sInput) {
         sInput.value = _patchSCenter(q).toFixed(3);
+      }
+    }
+  }
+
+  /* Mirror checkbox follows the selected patch: greyed out with no
+     selection, reflecting the patch's own flag otherwise. */
+  const mirrorEl = document.getElementById("patchMirror");
+  if (mirrorEl) {
+    const q = (selectedQuad >= 0 && selectedQuad < quads.length)
+      ? quads[selectedQuad] : null;
+    if (!q) {
+      mirrorEl.disabled = true;
+      mirrorEl.checked  = false;
+    } else {
+      mirrorEl.disabled = false;
+      if (document.activeElement !== mirrorEl) {
+        mirrorEl.checked = !!q.mirror;
       }
     }
   }
@@ -5983,6 +6146,7 @@ function flashStatus(msg, cls) {
   const drawFitModeEl  = document.getElementById("drawFitMode");
   const drawNoRotateEl = document.getElementById("drawNoRotate");
   const helpBtn        = document.getElementById("helpBtn");
+  const mirrorEl       = document.getElementById("patchMirror");
 
   if (d) d.addEventListener("input", () => {
     cone.depth = parseFloat(d.value);
@@ -6044,6 +6208,26 @@ function flashStatus(msg, cls) {
       _setPatchSCenter(quads[selectedQuad], raw);
     },
   });
+
+  /* ---- patch mirror toggle --------------------------------------
+     When checked, every square on the selected patch is also drawn
+     on the patch's mirror — the same patch shifted by π in φ, i.e.
+     on the opposite side of the cone.  The mirror is a visual
+     clone, not an independent object; it is not hit-tested and it
+     does not appear in the square list.  The checkbox's own state
+     is kept in sync with the selected patch by
+     _syncPatchCoordInputs, called from draw() and syncQuadList(). */
+  if (mirrorEl) {
+    mirrorEl.addEventListener("change", () => {
+      if (selectedQuad < 0 || selectedQuad >= quads.length) return;
+      quads[selectedQuad].mirror = mirrorEl.checked;
+      draw();
+      flashStatus(mirrorEl.checked
+                    ? "Mirror on for " + quads[selectedQuad].name
+                    : "Mirror off",
+                  "ok");
+    });
+  }
 
   /* ---- square-size scrub inputs ---------------------------------
      The two fields read and write the shape's reference-unit size,
@@ -6236,6 +6420,7 @@ function buildSceneJSON() {
       phi1: q.phi1,
       s0:   q.s0,
       s1:   q.s1,
+      mirror: !!q.mirror,
     })),
 
     squares: floatSquares.map(sq => ({
@@ -6361,6 +6546,7 @@ function applySceneJSON(data) {
       phi1: (typeof p.phi1 === "number") ? p.phi1 : Math.PI / 2,
       s0:   (typeof p.s0   === "number") ? p.s0   : 0.10,
       s1:   (typeof p.s1   === "number") ? p.s1   : 0.50,
+      mirror: !!p.mirror,
     });
   }
 

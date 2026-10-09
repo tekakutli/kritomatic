@@ -141,6 +141,25 @@ The clone overlaps its source pixel-for-pixel until it is dragged
 away.  The clone receives a fresh id and default name and becomes
 the new selection.
 
+MIRROR
+======
+A per-patch "Mirror" checkbox sits between the Patch s field and
+the Square W field.  When checked, every square on the selected
+patch is drawn a second time on the patch's mirror — the same patch
+shifted by π in φ, i.e. on the diametrically opposite side of the
+cone.  The mirror copy shares the square's full local state and is
+a pure visual clone: it is not independently editable and does not
+appear in the patch or square lists.
+
+The checkbox follows the selected patch: greying out when nothing
+is selected, and reflecting the selected patch's own flag every
+time _syncPatchCoordInputs runs.  Toggling it writes q.mirror and
+redraws.  The flag round-trips through Save / Load scene; old
+scene files load with mirror: false.  In KRA export, the three
+per-square modes (square, text, text-shear) export both the
+original and the mirror; the per-patch modes export only the
+original patch group (see pg_kra.py).
+
 GENERATE .KRA
 =============
 The "Generate .kra" button walks floatSquares, packages each shape
@@ -333,6 +352,8 @@ const HELP_HTML = `<!DOCTYPE html>
 <div class="hint">drag a patch in either band to move it</div>
 <div class="hint">hold <span class="kbd">Shift</span> while dragging a patch or a
   square to slide along the <em>centre&rarr;apex</em> axis only</div>
+<div class="hint">tick <strong>Mirror</strong> on a patch to draw a dimmed
+  clone of every square on it on the <em>opposite side of the cone</em></div>
 
 <div class="section">Squares</div>
 <div class="hint">hold <span class="kbd">Alt</span> while clicking a square to grab
@@ -351,6 +372,9 @@ const HELP_HTML = `<!DOCTYPE html>
   hold <span class="kbd">Shift</span> to snap</div>
 <div class="hint">fields with <em>&phi;</em>, <em>s</em>, <em>W</em>, <em>H</em>,
   and <em>slope</em> follow the current selection</div>
+<div class="hint"><strong>Mirror</strong> follows the selected patch:
+  greys out when nothing is selected, reflects the patch's flag
+  otherwise</div>
 
 <div class="section">Draw Quad \u2014 two fit modes</div>
 <div class="hint">click four corners in <strong>one band</strong> to fit a patch
@@ -560,6 +584,23 @@ function _syncPatchCoordInputs() {
       }
       if (document.activeElement !== sInput) {
         sInput.value = _patchSCenter(q).toFixed(3);
+      }
+    }
+  }
+
+  /* Mirror checkbox follows the selected patch: greyed out with no
+     selection, reflecting the patch's own flag otherwise. */
+  const mirrorEl = document.getElementById("patchMirror");
+  if (mirrorEl) {
+    const q = (selectedQuad >= 0 && selectedQuad < quads.length)
+      ? quads[selectedQuad] : null;
+    if (!q) {
+      mirrorEl.disabled = true;
+      mirrorEl.checked  = false;
+    } else {
+      mirrorEl.disabled = false;
+      if (document.activeElement !== mirrorEl) {
+        mirrorEl.checked = !!q.mirror;
       }
     }
   }
@@ -881,6 +922,7 @@ function flashStatus(msg, cls) {
   const drawFitModeEl  = document.getElementById("drawFitMode");
   const drawNoRotateEl = document.getElementById("drawNoRotate");
   const helpBtn        = document.getElementById("helpBtn");
+  const mirrorEl       = document.getElementById("patchMirror");
 
   if (d) d.addEventListener("input", () => {
     cone.depth = parseFloat(d.value);
@@ -942,6 +984,26 @@ function flashStatus(msg, cls) {
       _setPatchSCenter(quads[selectedQuad], raw);
     },
   });
+
+  /* ---- patch mirror toggle --------------------------------------
+     When checked, every square on the selected patch is also drawn
+     on the patch's mirror — the same patch shifted by π in φ, i.e.
+     on the opposite side of the cone.  The mirror is a visual
+     clone, not an independent object; it is not hit-tested and it
+     does not appear in the square list.  The checkbox's own state
+     is kept in sync with the selected patch by
+     _syncPatchCoordInputs, called from draw() and syncQuadList(). */
+  if (mirrorEl) {
+    mirrorEl.addEventListener("change", () => {
+      if (selectedQuad < 0 || selectedQuad >= quads.length) return;
+      quads[selectedQuad].mirror = mirrorEl.checked;
+      draw();
+      flashStatus(mirrorEl.checked
+                    ? "Mirror on for " + quads[selectedQuad].name
+                    : "Mirror off",
+                  "ok");
+    });
+  }
 
   /* ---- square-size scrub inputs ---------------------------------
      The two fields read and write the shape's reference-unit size,

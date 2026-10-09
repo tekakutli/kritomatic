@@ -54,6 +54,25 @@ its square when the local Jacobian is anisotropic — the compressed
 dimension grows only as much as the stretched dimension allows, and
 nothing is left to spill past the square's own edges.
 
+MIRROR
+======
+The three per-square modes — "square", "text", "text-shear" —
+export both the original and, when the patch's `mirror` flag is on,
+the mirror copy.  In each of these modes the per-square body is
+extracted into a helper that reads `quads[qi]` and the square's
+local state; the mirror entry is produced by shifting the patch's
+φ bounds by π (via _withSquareMirror) and calling the same helper
+again.  That way the mirror is identical to the original up to the
+π shift — same "square" polygon geometry, same text anchor,
+same affine transform, in lockstep with the on-screen rendering.
+
+The two per-patch modes ("patch" and "patch-shear") iterate over
+`quads` rather than `floatSquares`, so they do not automatically
+produce a mirror.  Mirroring in those two modes would require
+duplicating the whole patch group under a shifted φ, which raises
+naming and identity questions the visual mirror does not.  Those
+two modes are therefore unchanged: they export only the original.
+
 Do NOT use squareFlatCorners here — that returns the unfolded-cone
 footprint, which loses the perspective.
 """
@@ -376,72 +395,83 @@ function _decomposeAffineLocal(M00, M01, M10, M11) {
    SQUARE MODE
    ========================================================================== */
 
-function buildKraShapes(options) {
-  options = options || {};
-  const textPos = options.text_position || "center";
-  const padFrac = (typeof options.text_padding === "number")
-                    ? options.text_padding : 0.06;
+function _kraShapeEntry(sq, options) {
+  const textPos   = options.text_position || "center";
+  const padFrac   = (typeof options.text_padding === "number")
+                      ? options.text_padding : 0.06;
   const colorMode = options.text_color_mode || "color";
 
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const q = quads[qi];
+  if (!q) return null;
+
+  const corners = _unclippedProjectedCorners(sq);
+  if (!corners || corners.length < 4) return null;
+
+  const lens = (function () {
+    const n = corners.length;
+    const s = [];
+    for (let k = 0; k < n; k++) {
+      const a = corners[k];
+      const b = corners[(k + 1) % n];
+      s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
+    }
+    return s;
+  })();
+  const W = (lens[0] + lens[2]) / 2;
+  const H = (lens[1] + lens[3]) / 2;
+  if (W <= 0.5 || H <= 0.5) return null;
+
+  const hue = patchHue(q);
+  const hex = _hueToHex(hue);
+  const hexLight = _hueToHexLight(hue);
+
+  const textColor = (colorMode === "black") ? "#000000" : hexLight;
+
+  const screenCorners = squareCornersScreen(sq) || corners;
+  const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
+  const readingAngle  = _shapeLabelScreenAngleDeg(sq, screenCorners);
+
+  const name = squareDisplayName(sq);
+  const fontNat = Math.min(W, H) * 0.40;
+
+  const anchorCenter = _flatAnchorFromVisual(
+    screenCorners, W, H, textPos, padFrac, fontNat, name.length,
+    readingAngle, flatRotation
+  );
+  const anchor = _anchorForPosition(
+    anchorCenter, flatRotation, name.length, fontNat, textPos
+  );
+
+  return {
+    name:            name,
+    points:          corners.map(([x, y]) => [x, y]),
+    natural_w:       W,
+    natural_h:       H,
+    flat_rotation:   flatRotation,
+    text_anchor:     anchor,
+    fill:            hex,
+    fill_opacity:    0.40,
+    stroke:          hex,
+    stroke_width:    2.0,
+    stroke_opacity:  1.0,
+    text_color:      textColor,
+  };
+}
+
+function buildKraShapes(options) {
+  options = options || {};
   const shapes = [];
   for (let i = 0; i < floatSquares.length; i++) {
     const sq = floatSquares[i];
-    const qi = quadIdxById(sq.quadId);
-    if (qi < 0) continue;
-    const q = quads[qi];
-    if (!q) continue;
 
-    const corners = _unclippedProjectedCorners(sq);
-    if (!corners || corners.length < 4) continue;
+    const e1 = _kraShapeEntry(sq, options);
+    if (e1) shapes.push(e1);
 
-    const lens = (function () {
-      const n = corners.length;
-      const s = [];
-      for (let k = 0; k < n; k++) {
-        const a = corners[k];
-        const b = corners[(k + 1) % n];
-        s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
-      }
-      return s;
-    })();
-    const W = (lens[0] + lens[2]) / 2;
-    const H = (lens[1] + lens[3]) / 2;
-    if (W <= 0.5 || H <= 0.5) continue;
-
-    const hue = patchHue(q);
-    const hex = _hueToHex(hue);
-    const hexLight = _hueToHexLight(hue);
-
-    const textColor = (colorMode === "black") ? "#000000" : hexLight;
-
-    const screenCorners = squareCornersScreen(sq) || corners;
-    const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
-    const readingAngle  = _shapeLabelScreenAngleDeg(sq, screenCorners);
-
-    const name = squareDisplayName(sq);
-    const fontNat = Math.min(W, H) * 0.40;
-
-    const anchorCenter = _flatAnchorFromVisual(
-      screenCorners, W, H, textPos, padFrac, fontNat, name.length,
-      readingAngle, flatRotation
-    );
-    const anchor = _anchorForPosition(
-      anchorCenter, flatRotation, name.length, fontNat, textPos
-    );
-
-    shapes.push({
-      name:            name,
-      points:          corners.map(([x, y]) => [x, y]),
-      natural_w:       W,
-      natural_h:       H,
-      flat_rotation:   flatRotation,
-      text_anchor:     anchor,
-      fill:            hex,
-      fill_opacity:    0.40,
-      stroke:          hex,
-      stroke_width:    2.0,
-      stroke_opacity:  1.0,
-      text_color:      textColor,
+    _withSquareMirror(sq, () => {
+      const e2 = _kraShapeEntry(sq, options);
+      if (e2) shapes.push(e2);
     });
   }
   return shapes;
@@ -575,7 +605,10 @@ function _bilinearInterpQuad(corners, u, v) {
 
 /* ==========================================================================
    PATCH MODE — one group + one mask per patch
-   ========================================================================== */
+   ==========================================================================
+   NOTE — per the module docstring (MIRROR), this per-patch mode
+   does NOT emit a mirror copy of the patch group.  Only the three
+   per-square modes (square, text, text-shear) do. */
 
 function _projectedPatchCorners(q) {
   const corners = quadCorners(q);
@@ -827,95 +860,109 @@ function buildKraPatches(options) {
    TEXT MODE — one group + one mask per text
    ========================================================================== */
 
-function buildKraTexts(options) {
-  options = options || {};
+function _kraTextEntry(sq, options) {
   const colorMode = options.text_color_mode || "color";
   const textPos   = options.text_position || "center";
   const padFrac   = (typeof options.text_padding === "number")
                       ? options.text_padding : 0.06;
   const drawRects = options.draw_rectangles !== false;
 
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const q = quads[qi];
+  if (!q) return null;
+
+  const unclipped = _unclippedProjectedCorners(sq);
+  if (!unclipped || unclipped.length < 4) return null;
+
+  const screenCorners = squareCornersScreen(sq) || unclipped;
+
+  const lens = (function () {
+    const n = unclipped.length;
+    const s = [];
+    for (let k = 0; k < n; k++) {
+      const a = unclipped[k];
+      const b = unclipped[(k + 1) % n];
+      s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
+    }
+    return s;
+  })();
+  const W_sq = (lens[0] + lens[2]) / 2;
+  const H_sq = (lens[1] + lens[3]) / 2;
+  if (W_sq <= 0.5 || H_sq <= 0.5) return null;
+
+  const hue = patchHue(q);
+  const hex = _hueToHex(hue);
+  const hexLight = _hueToHexLight(hue);
+  const textColor = (colorMode === "black") ? "#000000" : hexLight;
+
+  const name = squareDisplayName(sq);
+
+  let rect = null;
+  if (drawRects) {
+    rect = {
+      name: name,
+      points: screenCorners.map(([x, y]) => [x, y]),
+      fill: hex,
+      fill_opacity: 0.40,
+      stroke: hex,
+      stroke_width: 2.0,
+      stroke_opacity: 1.0,
+    };
+  }
+
+  const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
+  const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
+  const fontNat = Math.min(W_sq, H_sq) * 0.40;
+
+  const anchorCenter = _flatAnchorFromVisual(
+    screenCorners, W_sq, H_sq, textPos, padFrac,
+    fontNat, name.length,
+    readingAngle, flatRotation
+  );
+  const anchor = _anchorForPosition(
+    anchorCenter, flatRotation, name.length, fontNat, textPos
+  );
+
+  const srcPts = [
+    [0, 0],
+    [W_sq, 0],
+    [W_sq, H_sq],
+    [0, H_sq],
+  ];
+  const dstPts = unclipped.map(([x, y]) => [x, y]);
+
+  const item = {
+    name: name,
+    src_w: W_sq,
+    src_h: H_sq,
+    text_x: anchor.x,
+    text_y: anchor.y,
+    font_px: Math.max(6, fontNat),
+    rotation: flatRotation,
+    alignment: anchor.alignment,
+    color: textColor,
+    src_pts: srcPts,
+    dst_pts: dstPts,
+  };
+
+  return { item, rect };
+}
+
+function buildKraTexts(options) {
+  options = options || {};
   const items = [];
   const rects = [];
 
   for (let i = 0; i < floatSquares.length; i++) {
     const sq = floatSquares[i];
-    const qi = quadIdxById(sq.quadId);
-    if (qi < 0) continue;
-    const q = quads[qi];
-    if (!q) continue;
 
-    const unclipped = _unclippedProjectedCorners(sq);
-    if (!unclipped || unclipped.length < 4) continue;
+    const e1 = _kraTextEntry(sq, options);
+    if (e1) { items.push(e1.item); if (e1.rect) rects.push(e1.rect); }
 
-    const screenCorners = squareCornersScreen(sq) || unclipped;
-
-    const lens = (function () {
-      const n = unclipped.length;
-      const s = [];
-      for (let k = 0; k < n; k++) {
-        const a = unclipped[k];
-        const b = unclipped[(k + 1) % n];
-        s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
-      }
-      return s;
-    })();
-    const W_sq = (lens[0] + lens[2]) / 2;
-    const H_sq = (lens[1] + lens[3]) / 2;
-    if (W_sq <= 0.5 || H_sq <= 0.5) continue;
-
-    const hue = patchHue(q);
-    const hex = _hueToHex(hue);
-    const hexLight = _hueToHexLight(hue);
-    const textColor = (colorMode === "black") ? "#000000" : hexLight;
-
-    const name = squareDisplayName(sq);
-
-    if (drawRects) {
-      rects.push({
-        name: name,
-        points: screenCorners.map(([x, y]) => [x, y]),
-        fill: hex,
-        fill_opacity: 0.40,
-        stroke: hex,
-        stroke_width: 2.0,
-        stroke_opacity: 1.0,
-      });
-    }
-
-    const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
-    const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
-    const fontNat = Math.min(W_sq, H_sq) * 0.40;
-
-    const anchorCenter = _flatAnchorFromVisual(
-      screenCorners, W_sq, H_sq, textPos, padFrac,
-      fontNat, name.length,
-      readingAngle, flatRotation
-    );
-    const anchor = _anchorForPosition(
-      anchorCenter, flatRotation, name.length, fontNat, textPos
-    );
-
-    const srcPts = [
-      [0, 0],
-      [W_sq, 0],
-      [W_sq, H_sq],
-      [0, H_sq],
-    ];
-    const dstPts = unclipped.map(([x, y]) => [x, y]);
-
-    items.push({
-      name: name,
-      src_w: W_sq,
-      src_h: H_sq,
-      text_x: anchor.x,
-      text_y: anchor.y,
-      font_px: Math.max(6, fontNat),
-      rotation: flatRotation,
-      alignment: anchor.alignment,
-      color: textColor,
-      src_pts: srcPts,
-      dst_pts: dstPts,
+    _withSquareMirror(sq, () => {
+      const e2 = _kraTextEntry(sq, options);
+      if (e2) { items.push(e2.item); if (e2.rect) rects.push(e2.rect); }
     });
   }
   return { items: items, rects: rects };
@@ -942,132 +989,147 @@ function buildKraTexts(options) {
    longer dimension reaches fontNat, the shorter is proportionally
    smaller, and nothing overflows.  Rotation and shear are invariant
    under the normalization, so the shape of the text is preserved. */
-function buildKraShearTexts(options) {
-  options = options || {};
+
+function _kraShearTextEntry(sq, options) {
   const colorMode = options.text_color_mode || "color";
   const textPos   = options.text_position || "center";
   const padFrac   = (typeof options.text_padding === "number")
                       ? options.text_padding : 0.06;
   const drawRects = options.draw_rectangles !== false;
 
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const q = quads[qi];
+  if (!q) return null;
+
+  const unclipped = _unclippedProjectedCorners(sq);
+  if (!unclipped || unclipped.length < 4) return null;
+  const screenCorners = squareCornersScreen(sq) || unclipped;
+
+  const lens = (function () {
+    const n = unclipped.length;
+    const s = [];
+    for (let k = 0; k < n; k++) {
+      const a = unclipped[k];
+      const b = unclipped[(k + 1) % n];
+      s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
+    }
+    return s;
+  })();
+  const W_sq = (lens[0] + lens[2]) / 2;
+  const H_sq = (lens[1] + lens[3]) / 2;
+  if (W_sq <= 0.5 || H_sq <= 0.5) return null;
+
+  const hue = patchHue(q);
+  const hex = _hueToHex(hue);
+  const hexLight = _hueToHexLight(hue);
+  const textColor = (colorMode === "black") ? "#000000" : hexLight;
+
+  const name = squareDisplayName(sq);
+
+  let rect = null;
+  if (drawRects) {
+    rect = {
+      name: name,
+      points: screenCorners.map(([x, y]) => [x, y]),
+      fill: hex,
+      fill_opacity: 0.40,
+      stroke: hex,
+      stroke_width: 2.0,
+      stroke_opacity: 1.0,
+    };
+  }
+
+  const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
+  const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
+  const fontNat = Math.min(W_sq, H_sq) * 0.40;
+
+  const anchorCenter = _flatAnchorFromVisual(
+    screenCorners, W_sq, H_sq, textPos, padFrac,
+    fontNat, name.length, readingAngle, flatRotation
+  );
+  const anchor = _anchorForPosition(
+    anchorCenter, flatRotation, name.length, fontNat, textPos
+  );
+
+  const sqH = _computeHomography(
+    [{x: 0, y: 0}, {x: W_sq, y: 0},
+     {x: W_sq, y: H_sq}, {x: 0, y: H_sq}],
+    [{x: unclipped[0][0], y: unclipped[0][1]},
+     {x: unclipped[1][0], y: unclipped[1][1]},
+     {x: unclipped[2][0], y: unclipped[2][1]},
+     {x: unclipped[3][0], y: unclipped[3][1]}]
+  );
+
+  const anchorScreen = _applyHomography(sqH, anchor.x, anchor.y);
+  if (!anchorScreen) return null;
+
+  const J = _patchProjectiveJacobian(sqH, anchor.x, anchor.y);
+  if (!J) return null;
+
+  const cosR = Math.cos(flatRotation * Math.PI / 180);
+  const sinR = Math.sin(flatRotation * Math.PI / 180);
+
+  const M00 =  J.J11 * cosR + J.J12 * sinR;
+  const M01 = -J.J11 * sinR + J.J12 * cosR;
+  const M10 =  J.J21 * cosR + J.J22 * sinR;
+  const M11 = -J.J21 * sinR + J.J22 * cosR;
+
+  const decomp = _decomposeAffineLocal(M00, M01, M10, M11);
+  if (!decomp) return null;
+
+  // Normalize scales so the larger one is 1.  The text's on-screen
+  // bounding box then fits in a fontNat × fontNat square.
+  const maxScale = Math.max(Math.abs(decomp.scale_x),
+                            Math.abs(decomp.scale_y));
+  if (maxScale < 1e-9) return null;
+  const invScale = 1 / maxScale;
+
+  const N00 = M00 * invScale;
+  const N01 = M01 * invScale;
+  const N10 = M10 * invScale;
+  const N11 = M11 * invScale;
+
+  const ax = anchorScreen.x;
+  const ay = anchorScreen.y;
+  const dx = ax - N00 * ax - N01 * ay;
+  const dy = ay - N10 * ax - N11 * ay;
+
+  const item = {
+    name: name,
+    text: name,
+    x: ax,
+    y: ay,
+    font_px: Math.max(6, fontNat),
+    alignment: anchor.alignment,
+    color: textColor,
+    transform: [N00, N10, N01, N11, dx, dy],
+    decomposition: {
+      rotation_deg: decomp.rotation_deg,
+      shear: decomp.shear,
+      scale_x: decomp.scale_x,
+      scale_y: decomp.scale_y,
+      max_scale: maxScale,
+    },
+  };
+
+  return { item, rect };
+}
+
+function buildKraShearTexts(options) {
+  options = options || {};
   const items = [];
   const rects = [];
 
   for (let i = 0; i < floatSquares.length; i++) {
     const sq = floatSquares[i];
-    const qi = quadIdxById(sq.quadId);
-    if (qi < 0) continue;
-    const q = quads[qi];
-    if (!q) continue;
 
-    const unclipped = _unclippedProjectedCorners(sq);
-    if (!unclipped || unclipped.length < 4) continue;
-    const screenCorners = squareCornersScreen(sq) || unclipped;
+    const e1 = _kraShearTextEntry(sq, options);
+    if (e1) { items.push(e1.item); if (e1.rect) rects.push(e1.rect); }
 
-    const lens = (function () {
-      const n = unclipped.length;
-      const s = [];
-      for (let k = 0; k < n; k++) {
-        const a = unclipped[k];
-        const b = unclipped[(k + 1) % n];
-        s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
-      }
-      return s;
-    })();
-    const W_sq = (lens[0] + lens[2]) / 2;
-    const H_sq = (lens[1] + lens[3]) / 2;
-    if (W_sq <= 0.5 || H_sq <= 0.5) continue;
-
-    const hue = patchHue(q);
-    const hex = _hueToHex(hue);
-    const hexLight = _hueToHexLight(hue);
-    const textColor = (colorMode === "black") ? "#000000" : hexLight;
-
-    const name = squareDisplayName(sq);
-
-    if (drawRects) {
-      rects.push({
-        name: name,
-        points: screenCorners.map(([x, y]) => [x, y]),
-        fill: hex,
-        fill_opacity: 0.40,
-        stroke: hex,
-        stroke_width: 2.0,
-        stroke_opacity: 1.0,
-      });
-    }
-
-    const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
-    const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
-    const fontNat = Math.min(W_sq, H_sq) * 0.40;
-
-    const anchorCenter = _flatAnchorFromVisual(
-      screenCorners, W_sq, H_sq, textPos, padFrac,
-      fontNat, name.length, readingAngle, flatRotation
-    );
-    const anchor = _anchorForPosition(
-      anchorCenter, flatRotation, name.length, fontNat, textPos
-    );
-
-    const sqH = _computeHomography(
-      [{x: 0, y: 0}, {x: W_sq, y: 0},
-       {x: W_sq, y: H_sq}, {x: 0, y: H_sq}],
-      [{x: unclipped[0][0], y: unclipped[0][1]},
-       {x: unclipped[1][0], y: unclipped[1][1]},
-       {x: unclipped[2][0], y: unclipped[2][1]},
-       {x: unclipped[3][0], y: unclipped[3][1]}]
-    );
-
-    const anchorScreen = _applyHomography(sqH, anchor.x, anchor.y);
-    if (!anchorScreen) continue;
-
-    const J = _patchProjectiveJacobian(sqH, anchor.x, anchor.y);
-    if (!J) continue;
-
-    const cosR = Math.cos(flatRotation * Math.PI / 180);
-    const sinR = Math.sin(flatRotation * Math.PI / 180);
-
-    const M00 =  J.J11 * cosR + J.J12 * sinR;
-    const M01 = -J.J11 * sinR + J.J12 * cosR;
-    const M10 =  J.J21 * cosR + J.J22 * sinR;
-    const M11 = -J.J21 * sinR + J.J22 * cosR;
-
-    const decomp = _decomposeAffineLocal(M00, M01, M10, M11);
-    if (!decomp) continue;
-
-    // Normalize scales so the larger one is 1.  The text's on-screen
-    // bounding box then fits in a fontNat × fontNat square.
-    const maxScale = Math.max(Math.abs(decomp.scale_x),
-                              Math.abs(decomp.scale_y));
-    if (maxScale < 1e-9) continue;
-    const invScale = 1 / maxScale;
-
-    const N00 = M00 * invScale;
-    const N01 = M01 * invScale;
-    const N10 = M10 * invScale;
-    const N11 = M11 * invScale;
-
-    const ax = anchorScreen.x;
-    const ay = anchorScreen.y;
-    const dx = ax - N00 * ax - N01 * ay;
-    const dy = ay - N10 * ax - N11 * ay;
-
-    items.push({
-      name: name,
-      text: name,
-      x: ax,
-      y: ay,
-      font_px: Math.max(6, fontNat),
-      alignment: anchor.alignment,
-      color: textColor,
-      transform: [N00, N10, N01, N11, dx, dy],
-      decomposition: {
-        rotation_deg: decomp.rotation_deg,
-        shear: decomp.shear,
-        scale_x: decomp.scale_x,
-        scale_y: decomp.scale_y,
-        max_scale: maxScale,
-      },
+    _withSquareMirror(sq, () => {
+      const e2 = _kraShearTextEntry(sq, options);
+      if (e2) { items.push(e2.item); if (e2.rect) rects.push(e2.rect); }
     });
   }
 
@@ -1081,7 +1143,11 @@ function buildKraShearTexts(options) {
    instead of being flat under the export group.  No mask is applied
    at any level, so the transform each text carries is the entire
    warp.  The scale normalization matches text-shear's, so the two
-   modes render each text at the same on-screen size. */
+   modes render each text at the same on-screen size.
+
+   NOTE — per the module docstring (MIRROR), this per-patch mode
+   does NOT emit a mirror copy of the patch group. */
+
 function buildKraShearPatches(options) {
   options = options || {};
   const colorMode = options.text_color_mode || "color";

@@ -124,6 +124,9 @@ function buildSceneJSON() {
       s0:   q.s0,
       s1:   q.s1,
       mirror: !!q.mirror,
+      mirrorAngle: (typeof q.mirrorAngle === "number")
+                     ? q.mirrorAngle : Math.PI,
+      mirrorFlip: q.mirrorFlip !== false,
     })),
 
     squares: floatSquares.map(sq => ({
@@ -250,6 +253,9 @@ function applySceneJSON(data) {
       s0:   (typeof p.s0   === "number") ? p.s0   : 0.10,
       s1:   (typeof p.s1   === "number") ? p.s1   : 0.50,
       mirror: !!p.mirror,
+      mirrorAngle: (typeof p.mirrorAngle === "number")
+                     ? p.mirrorAngle : Math.PI,
+      mirrorFlip: p.mirrorFlip !== false,
     });
   }
 

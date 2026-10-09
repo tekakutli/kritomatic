@@ -330,8 +330,7 @@ function drawFlatView() {
       _drawFlatSquareOne(sq, isSel, false);
 
       if (activeQ.mirror) {
-        _withQuadPhiShifted(activeQ, Math.PI,
-          () => _drawFlatSquareOne(sq, false, true));
+        _withSquareMirror(sq, () => _drawFlatSquareOne(sq, false, true));
       }
     }
   }

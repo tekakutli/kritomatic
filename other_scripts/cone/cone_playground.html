@@ -326,6 +326,18 @@
            title="Draw a visual clone of every square on this patch
                   on the diametrically opposite side of the cone">
   </div>
+  <div class="field">
+    <label>Mirror &ang;</label>
+    <input type="text" id="patchMirrorAngle" class="scrubInput"
+           value="&#8212;" autocomplete="off" spellcheck="false"
+           disabled>
+  </div>
+  <div class="field">
+    <label>Mirror flip</label>
+    <input type="checkbox" id="patchMirrorFlip"
+           title="Negate the mirror's rotation so tilted shapes are
+                  not 180°-rotated relative to the original">
+  </div>
 
   <hr>
 
@@ -574,6 +586,8 @@ function addQuad() {
     s0: DEFAULT_PATCH_S_CENTER - halfS,
     s1: DEFAULT_PATCH_S_CENTER + halfS,
     mirror: false,
+    mirrorAngle: Math.PI,   // NEW: angular offset around the cone
+    mirrorFlip: true,       // NEW: negate θ so the mirror isn't 180°-rotated
   });
   selectedQuad = quads.length - 1;
   syncQuadList();
@@ -601,6 +615,9 @@ function cloneQuad(idx) {
     s0:   src.s0,
     s1:   src.s1,
     mirror: !!src.mirror,
+    mirrorAngle: (typeof src.mirrorAngle === "number")
+                   ? src.mirrorAngle : Math.PI,
+    mirrorFlip:  src.mirrorFlip !== false,
   });
 
   for (let i = 0; i < floatSquares.length; i++) {
@@ -1576,8 +1593,7 @@ function drawFlatView() {
       _drawFlatSquareOne(sq, isSel, false);
 
       if (activeQ.mirror) {
-        _withQuadPhiShifted(activeQ, Math.PI,
-          () => _drawFlatSquareOne(sq, false, true));
+        _withSquareMirror(sq, () => _drawFlatSquareOne(sq, false, true));
       }
     }
   }
@@ -2255,12 +2271,55 @@ function _squareHasMirror(sq) {
   return !!(q && q.mirror);
 }
 
+/* The mirror draws the same square on the diametrically-opposite
+   side of the cone, offset by `mirrorAngle` in φ (default π).  When
+   `mirrorFlip` is true, the shape's θ is negated for the duration of
+   the mirror draw, which cancels the 180° frame rotation that the
+   φ-shift introduces — so a tilted square on the mirror tilts the
+   same way it does on the original instead of appearing upside
+   down. */
 function _withSquareMirror(sq, fn) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const q = quads[qi];
   if (!q || !q.mirror) return;
-  _withQuadPhiShifted(q, Math.PI, fn);
+
+  const angle = (typeof q.mirrorAngle === "number")
+                  ? q.mirrorAngle : Math.PI;
+  const flip  = q.mirrorFlip !== false;
+
+  const phi0   = q.phi0;
+  const phi1   = q.phi1;
+  const theta0 = sq.theta || 0;
+  const slope0 = sq.slope || 0;
+  const u0     = sq.u;     // was: const v0 = sq.v;
+
+  q.phi0 = phi0 + angle;
+  q.phi1 = phi1 + angle;
+
+  if (flip) {
+    /* Reflect the shape through the patch's U axis.  A rectangle
+       has no internal left/right asymmetry, so negating θ alone
+       only rotates it; negating slope alone only tips it.  The
+       real "flip" is in the shape's POSITION along the patch's V
+       axis, which combined with the two sign flips is exactly the
+       point reflection v → -v, θ → -θ, slope → -slope.  This is
+       what makes the mirror read as the original flipped
+       top-to-bottom on the patch rather than as a rotated ghost. */
+    sq.theta = -theta0;
+    sq.slope = -slope0;
+    sq.u     = -u0;        // was: sq.v = -v0;
+  }
+
+  try {
+    fn();
+  } finally {
+    q.phi0   = phi0;
+    q.phi1   = phi1;
+    sq.theta = theta0;
+    sq.slope = slope0;
+    sq.u     = u0;         // was: sq.v = v0;
+  }
 }
 
 /* The direction that the patch's outward surface normal projects to,
@@ -5439,6 +5498,14 @@ const SQUARE_SIZE_SNAP_STEP  = 0.25;
 const SLOPE_SCRUB_RATE_DEG_PER_PX = 0.5;
 const SLOPE_SNAP_STEP_DEG         = 15;
 
+/* Mirror-angle scrub rate: 1° per pixel of horizontal drag.
+   Snap step with Shift held is one meridian (15°), matching the
+   default meridian spacing.  Stored in radians in the model and
+   shown in degrees in the field.  See the MIRROR ANGLE AND FLIP
+   section in the module docstring. */
+const MIRROR_ANGLE_SCRUB_RATE_DEG_PER_PX = 1.0;
+const MIRROR_ANGLE_SNAP_STEP_DEG         = 15;
+
 const SCRUB_DRAG_THRESHOLD = 3;
 
 /* ==========================================================================
@@ -5578,6 +5645,12 @@ const HELP_HTML = `<!DOCTYPE html>
   square to slide along the <em>centre&rarr;apex</em> axis only</div>
 <div class="hint">tick <strong>Mirror</strong> on a patch to draw a dimmed
   clone of every square on it on the <em>opposite side of the cone</em></div>
+<div class="hint"><strong>Mirror &ang;</strong> slides the mirror around the
+  cone \u2014 pull it off &pi; when the original and mirror would otherwise
+  visually cross at the apex</div>
+<div class="hint"><strong>Mirror flip</strong> negates the mirror's rotation
+  so a tilted or rotated shape is a faithful copy, not a 180&deg;-rotated
+  ghost</div>
 
 <div class="section">Squares</div>
 <div class="hint">hold <span class="kbd">Alt</span> while clicking a square to grab
@@ -5596,9 +5669,10 @@ const HELP_HTML = `<!DOCTYPE html>
   hold <span class="kbd">Shift</span> to snap</div>
 <div class="hint">fields with <em>&phi;</em>, <em>s</em>, <em>W</em>, <em>H</em>,
   and <em>slope</em> follow the current selection</div>
-<div class="hint"><strong>Mirror</strong> follows the selected patch:
-  greys out when nothing is selected, reflects the patch's flag
-  otherwise</div>
+<div class="hint"><strong>Mirror</strong>, <strong>Mirror &ang;</strong>, and
+  <strong>Mirror flip</strong> follow the selected patch:
+  they grey out when nothing is selected, and reflect the patch's own
+  flags otherwise</div>
 
 <div class="section">Draw Quad \u2014 two fit modes</div>
 <div class="hint">click four corners in <strong>one band</strong> to fit a patch
@@ -5825,6 +5899,47 @@ function _syncPatchCoordInputs() {
       mirrorEl.disabled = false;
       if (document.activeElement !== mirrorEl) {
         mirrorEl.checked = !!q.mirror;
+      }
+    }
+  }
+
+  /* Mirror angle field follows the selected patch the same way.
+     Displayed in degrees; the model stores radians.  Defaults to
+     π (the diametric mirror) when the field is missing, so a scene
+     written before this field existed reads as a full π offset. */
+  const mirrorAngleEl = document.getElementById("patchMirrorAngle");
+  if (mirrorAngleEl) {
+    const q = (selectedQuad >= 0 && selectedQuad < quads.length)
+      ? quads[selectedQuad] : null;
+    if (!q) {
+      mirrorAngleEl.disabled = true;
+      if (document.activeElement !== mirrorAngleEl) {
+        mirrorAngleEl.value = "\u2014";
+      }
+    } else {
+      mirrorAngleEl.disabled = false;
+      if (document.activeElement !== mirrorAngleEl) {
+        const ang = (typeof q.mirrorAngle === "number")
+                      ? q.mirrorAngle : Math.PI;
+        mirrorAngleEl.value = (ang * 180 / Math.PI).toFixed(1);
+      }
+    }
+  }
+
+  /* Mirror flip checkbox follows the selected patch.  Defaults to
+     true, matching the pre-existing behaviour for scenes that
+     predate the field. */
+  const mirrorFlipEl = document.getElementById("patchMirrorFlip");
+  if (mirrorFlipEl) {
+    const q = (selectedQuad >= 0 && selectedQuad < quads.length)
+      ? quads[selectedQuad] : null;
+    if (!q) {
+      mirrorFlipEl.disabled = true;
+      mirrorFlipEl.checked  = false;
+    } else {
+      mirrorFlipEl.disabled = false;
+      if (document.activeElement !== mirrorFlipEl) {
+        mirrorFlipEl.checked = q.mirrorFlip !== false;
       }
     }
   }
@@ -6211,11 +6326,11 @@ function flashStatus(msg, cls) {
 
   /* ---- patch mirror toggle --------------------------------------
      When checked, every square on the selected patch is also drawn
-     on the patch's mirror — the same patch shifted by π in φ, i.e.
-     on the opposite side of the cone.  The mirror is a visual
-     clone, not an independent object; it is not hit-tested and it
-     does not appear in the square list.  The checkbox's own state
-     is kept in sync with the selected patch by
+     on the patch's mirror — the same patch shifted by q.mirrorAngle
+     in φ, i.e. on the opposite side of the cone.  The mirror is a
+     visual clone, not an independent object; it is not hit-tested
+     and it does not appear in the square list.  The checkbox's own
+     state is kept in sync with the selected patch by
      _syncPatchCoordInputs, called from draw() and syncQuadList(). */
   if (mirrorEl) {
     mirrorEl.addEventListener("change", () => {
@@ -6225,6 +6340,52 @@ function flashStatus(msg, cls) {
       flashStatus(mirrorEl.checked
                     ? "Mirror on for " + quads[selectedQuad].name
                     : "Mirror off",
+                  "ok");
+    });
+  }
+
+  /* ---- mirror angle scrub input ---------------------------------
+     The angular offset at which the mirror patch is drawn, in
+     radians in the model and degrees in the field.  The rate and
+     snap step are converted from degrees to radians here so the
+     installer's radian-per-pixel contract is honoured.
+
+     The offset is added directly to the patch's φ bounds when the
+     mirror is drawn.  Pulling it off π separates the original and
+     the mirror when the tilted cone makes them converge at the
+     apex.  See the MIRROR ANGLE AND FLIP note in the module
+     docstring. */
+  const mirrorAngleInput = document.getElementById("patchMirrorAngle");
+  if (mirrorAngleInput) _installScrubInput(mirrorAngleInput, {
+    rate:     MIRROR_ANGLE_SCRUB_RATE_DEG_PER_PX * Math.PI / 180,
+    snapStep: MIRROR_ANGLE_SNAP_STEP_DEG * Math.PI / 180,
+    read: () => {
+      if (selectedQuad < 0 || selectedQuad >= quads.length) return Math.PI;
+      const q = quads[selectedQuad];
+      return (typeof q.mirrorAngle === "number") ? q.mirrorAngle : Math.PI;
+    },
+    write: (raw) => {
+      if (selectedQuad < 0 || selectedQuad >= quads.length) return;
+      quads[selectedQuad].mirrorAngle = raw;
+    },
+  });
+
+  /* ---- mirror flip toggle ---------------------------------------
+     When checked (the default), the shape's θ is negated for the
+     duration of the mirror draw.  The φ-shift of the mirror rotates
+     the patch's local U/V frame by the same angle, which would
+     otherwise render a tilted, rotated, or anchored shape 180°-
+     rotated relative to the original.  See the MIRROR ANGLE AND
+     FLIP note in the module docstring. */
+  const mirrorFlipEl = document.getElementById("patchMirrorFlip");
+  if (mirrorFlipEl) {
+    mirrorFlipEl.addEventListener("change", () => {
+      if (selectedQuad < 0 || selectedQuad >= quads.length) return;
+      quads[selectedQuad].mirrorFlip = mirrorFlipEl.checked;
+      draw();
+      flashStatus(mirrorFlipEl.checked
+                    ? "Mirror flip on for " + quads[selectedQuad].name
+                    : "Mirror flip off",
                   "ok");
     });
   }
@@ -6421,6 +6582,9 @@ function buildSceneJSON() {
       s0:   q.s0,
       s1:   q.s1,
       mirror: !!q.mirror,
+      mirrorAngle: (typeof q.mirrorAngle === "number")
+                     ? q.mirrorAngle : Math.PI,
+      mirrorFlip: q.mirrorFlip !== false,
     })),
 
     squares: floatSquares.map(sq => ({
@@ -6547,6 +6711,9 @@ function applySceneJSON(data) {
       s0:   (typeof p.s0   === "number") ? p.s0   : 0.10,
       s1:   (typeof p.s1   === "number") ? p.s1   : 0.50,
       mirror: !!p.mirror,
+      mirrorAngle: (typeof p.mirrorAngle === "number")
+                     ? p.mirrorAngle : Math.PI,
+      mirrorFlip: p.mirrorFlip !== false,
     });
   }
 

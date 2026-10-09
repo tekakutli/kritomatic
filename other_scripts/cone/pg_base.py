@@ -358,6 +358,18 @@ HTML_HEAD = r"""<!DOCTYPE html>
            title="Draw a visual clone of every square on this patch
                   on the diametrically opposite side of the cone">
   </div>
+  <div class="field">
+    <label>Mirror &ang;</label>
+    <input type="text" id="patchMirrorAngle" class="scrubInput"
+           value="&#8212;" autocomplete="off" spellcheck="false"
+           disabled>
+  </div>
+  <div class="field">
+    <label>Mirror flip</label>
+    <input type="checkbox" id="patchMirrorFlip"
+           title="Negate the mirror's rotation so tilted shapes are
+                  not 180°-rotated relative to the original">
+  </div>
 
   <hr>
 

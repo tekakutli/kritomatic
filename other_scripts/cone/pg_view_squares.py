@@ -554,12 +554,55 @@ function _squareHasMirror(sq) {
   return !!(q && q.mirror);
 }
 
+/* The mirror draws the same square on the diametrically-opposite
+   side of the cone, offset by `mirrorAngle` in φ (default π).  When
+   `mirrorFlip` is true, the shape's θ is negated for the duration of
+   the mirror draw, which cancels the 180° frame rotation that the
+   φ-shift introduces — so a tilted square on the mirror tilts the
+   same way it does on the original instead of appearing upside
+   down. */
 function _withSquareMirror(sq, fn) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const q = quads[qi];
   if (!q || !q.mirror) return;
-  _withQuadPhiShifted(q, Math.PI, fn);
+
+  const angle = (typeof q.mirrorAngle === "number")
+                  ? q.mirrorAngle : Math.PI;
+  const flip  = q.mirrorFlip !== false;
+
+  const phi0   = q.phi0;
+  const phi1   = q.phi1;
+  const theta0 = sq.theta || 0;
+  const slope0 = sq.slope || 0;
+  const u0     = sq.u;     // was: const v0 = sq.v;
+
+  q.phi0 = phi0 + angle;
+  q.phi1 = phi1 + angle;
+
+  if (flip) {
+    /* Reflect the shape through the patch's U axis.  A rectangle
+       has no internal left/right asymmetry, so negating θ alone
+       only rotates it; negating slope alone only tips it.  The
+       real "flip" is in the shape's POSITION along the patch's V
+       axis, which combined with the two sign flips is exactly the
+       point reflection v → -v, θ → -θ, slope → -slope.  This is
+       what makes the mirror read as the original flipped
+       top-to-bottom on the patch rather than as a rotated ghost. */
+    sq.theta = -theta0;
+    sq.slope = -slope0;
+    sq.u     = -u0;        // was: sq.v = -v0;
+  }
+
+  try {
+    fn();
+  } finally {
+    q.phi0   = phi0;
+    q.phi1   = phi1;
+    sq.theta = theta0;
+    sq.slope = slope0;
+    sq.u     = u0;         // was: sq.v = v0;
+  }
 }
 
 /* The direction that the patch's outward surface normal projects to,

@@ -212,6 +212,8 @@ function addQuad() {
     s0: DEFAULT_PATCH_S_CENTER - halfS,
     s1: DEFAULT_PATCH_S_CENTER + halfS,
     mirror: false,
+    mirrorAngle: Math.PI,   // NEW: angular offset around the cone
+    mirrorFlip: true,       // NEW: negate θ so the mirror isn't 180°-rotated
   });
   selectedQuad = quads.length - 1;
   syncQuadList();
@@ -239,6 +241,9 @@ function cloneQuad(idx) {
     s0:   src.s0,
     s1:   src.s1,
     mirror: !!src.mirror,
+    mirrorAngle: (typeof src.mirrorAngle === "number")
+                   ? src.mirrorAngle : Math.PI,
+    mirrorFlip:  src.mirrorFlip !== false,
   });
 
   for (let i = 0; i < floatSquares.length; i++) {

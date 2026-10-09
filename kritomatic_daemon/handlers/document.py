@@ -1,15 +1,17 @@
 import os
+import base64
 from krita import *
+from PyQt5.QtCore import QBuffer, QByteArray, QIODevice, Qt
 from ..decorators import command
 from ..utils.refresh import refresh
 from ..utils.krita_actions import find_rotate_action
+
 
 class DocumentHandler:
     def __init__(self):
         pass
 
     def execute(self, cmd_type, params):
-        """Execute document-related commands"""
         if cmd_type == 'get_current_dimensions':
             return self.get_current_dimensions()
         elif cmd_type == 'create_new_from_current':
@@ -40,7 +42,17 @@ class DocumentHandler:
             return self.rotate_document(params)
         elif cmd_type == 'rotate_kra_file':
             return self.rotate_kra_file(params)
+        elif cmd_type == 'get_document_thumbnail':
+            return self.get_document_thumbnail(params)
+        elif cmd_type == 'get_all_document_thumbnails':
+            return self.get_all_document_thumbnails(params)
+        elif cmd_type == 'activate_document':
+            return self.activate_document(params)
         return {'success': False, 'message': f'Unknown document command: {cmd_type}'}
+
+    # ------------------------------------------------------------------
+    #  Shared helpers
+    # ------------------------------------------------------------------
 
     def _build_export_info(self, output_path):
         info = InfoObject()
@@ -73,13 +85,69 @@ class DocumentHandler:
         finally:
             doc.setBatchmode(previous)
 
+    @staticmethod
+    def _qimage_to_data_url(img):
+        """Encode a QImage as a `data:image/png;base64,...` URL."""
+        if img is None or img.isNull():
+            return None
+        buf = QByteArray()
+        buffer = QBuffer(buf)
+        buffer.open(QIODevice.WriteOnly)
+        ok = img.save(buffer, "PNG")
+        buffer.close()
+        if not ok:
+            return None
+        b64 = base64.b64encode(bytes(buf)).decode("ascii")
+        return "data:image/png;base64," + b64
+
+    @staticmethod
+    def _doc_meta(doc):
+        return {
+            'name':       doc.name(),
+            'file_name':  doc.fileName() or '',
+            'width':      doc.width(),
+            'height':     doc.height(),
+            'resolution': doc.resolution(),
+            'modified':   doc.modified(),
+        }
+
+    @staticmethod
+    def _fresh_thumbnail(doc, max_size):
+        """Return a QImage thumbnail of the document's CURRENT composite.
+
+        Prefers `Doc.projection()`, which composites fresh every time.
+        `Doc.thumbnail()` can return a cached scale that lags behind a
+        change made on another thread — most visibly, a paste applied
+        by `paste_document_region_as_layer`.  Falls back to
+        `Doc.thumbnail()` if `projection()` is unavailable or returns
+        something that is not a QImage.
+        """
+        try:
+            qimg = doc.projection()
+        except Exception:
+            qimg = None
+
+        if (qimg is not None
+                and hasattr(qimg, 'isNull')
+                and not qimg.isNull()):
+            if qimg.width() > max_size or qimg.height() > max_size:
+                qimg = qimg.scaled(max_size, max_size,
+                                   Qt.KeepAspectRatio,
+                                   Qt.SmoothTransformation)
+            return qimg
+
+        return doc.thumbnail(max_size, max_size)
+
+    # ------------------------------------------------------------------
+    #  Existing commands
+    # ------------------------------------------------------------------
+
     @command(
         category='doc',
         help_text='Get current document dimensions',
         args={}
     )
     def get_current_dimensions(self):
-        """Get dimensions of current active document"""
         try:
             doc = Krita.instance().activeDocument()
             if not doc:
@@ -115,7 +183,6 @@ class DocumentHandler:
         }
     )
     def create_new_from_current(self, name="New Document"):
-        """Create a new document with same dimensions as current"""
         try:
             current = Krita.instance().activeDocument()
             if not current:
@@ -163,7 +230,6 @@ class DocumentHandler:
     )
     def create_new_with_dimensions(self, name, width, height, resolution=300,
                                    color_model="RGBA", color_depth="U8", profile=""):
-        """Create a new document with custom dimensions"""
         try:
             app = Krita.instance()
             new_doc = app.createDocument(
@@ -193,7 +259,6 @@ class DocumentHandler:
         args={}
     )
     def get_all_documents(self):
-        """Get list of all open documents"""
         try:
             app = Krita.instance()
             documents = []
@@ -222,7 +287,6 @@ class DocumentHandler:
         }
     )
     def save_document(self, file_path):
-        """Save current document to file path"""
         try:
             doc = Krita.instance().activeDocument()
             if not doc:
@@ -238,25 +302,42 @@ class DocumentHandler:
 
     @command(
         category='doc',
-        help_text='Open an existing .kra file as a new document (no view added)',
+        help_text='Open an existing .kra file as a new document',
         args={
-            '--file_path': {'type': 'str', 'required': True, 'help': 'Path to a .kra file'}
+            '--file_path': {'type': 'str', 'required': True, 'help': 'Path to a .kra file'},
+            '--add_view': {'type': 'bool', 'default': False,
+                           'help': 'Also add a view for the document so it becomes '
+                                   'visible in the active window'}
         }
     )
     def open_document(self, params):
-        """Open a .kra file as a document in the running Krita session."""
         try:
             app = Krita.instance()
             file_path = params.get('file_path', '')
+            add_view = bool(params.get('add_view', False))
             if not os.path.exists(file_path):
                 return {'success': False, 'message': f'File not found: {file_path}'}
             doc = app.openDocument(file_path)
             if not doc:
                 return {'success': False, 'message': f'Failed to open {file_path}'}
+            if add_view:
+                try:
+                    window = app.activeWindow()
+                    if window:
+                        view = window.addView(doc)
+                        try:
+                            window.activateView(view)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             return {
                 'success': True,
                 'message': f'Opened {file_path}',
-                'data': {'name': doc.name()}
+                'data': {
+                    'name': doc.name(),
+                    'file_name': doc.fileName(),
+                }
             }
         except Exception as e:
             return {'success': False, 'message': str(e)}
@@ -269,7 +350,6 @@ class DocumentHandler:
         }
     )
     def close_document(self, params):
-        """Close a document without saving."""
         try:
             app = Krita.instance()
             name = params.get('name', None)
@@ -280,7 +360,6 @@ class DocumentHandler:
             if not doc:
                 return {'success': False, 'message': 'No matching document'}
             doc_name = doc.name()
-            # Suppress the save-changes prompt.
             doc.setBatchmode(True)
             doc.close()
             return {'success': True, 'message': f'Closed {doc_name}'}
@@ -296,7 +375,6 @@ class DocumentHandler:
         }
     )
     def export_document(self, params):
-        """Export the specified (or active) document to an image file."""
         try:
             app = Krita.instance()
             file_path = params.get('file_path', '')
@@ -324,7 +402,6 @@ class DocumentHandler:
         }
     )
     def export_file_to_image(self, params):
-        """Open a .kra, flatten it to an image file, close it. Atomic."""
         try:
             app = Krita.instance()
             input_path = params.get('input_path', '')
@@ -357,11 +434,6 @@ class DocumentHandler:
         }
     )
     def rotate_document(self, params):
-        """
-        Rotate the currently active document via Krita's built-in
-        image-rotation action. The document's canvas AND all its layers
-        rotate together.
-        """
         try:
             app = Krita.instance()
             doc = app.activeDocument()
@@ -405,12 +477,6 @@ class DocumentHandler:
         }
     )
     def rotate_kra_file(self, params):
-        """
-        Open a .kra, rotate it via Krita's image-rotation action, save,
-        close. The .kra is added to the active window while it's being
-        rotated (Krita's actions are attached to views), then removed
-        when we close it.
-        """
         try:
             app = Krita.instance()
             input_path = params.get('input_path', '')
@@ -458,5 +524,147 @@ class DocumentHandler:
                     'output_path': output_path,
                 }
             }
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    # ------------------------------------------------------------------
+    #  Thumbnails
+    # ------------------------------------------------------------------
+
+    @command(
+        category='doc',
+        help_text='Get a base64 PNG data URL of a document thumbnail '
+                  '(the flattened composite of every visible layer).',
+        args={
+            '--name': {'type': 'str', 'required': False,
+                       'help': 'Document name (defaults to active)'},
+            '--max_size': {'type': 'int', 'default': 512,
+                           'help': 'Max dimension in pixels'},
+        }
+    )
+    def get_document_thumbnail(self, params):
+        try:
+            app = Krita.instance()
+            name = params.get('name')
+            max_size = int(params.get('max_size', 512))
+
+            if name:
+                doc = next((d for d in app.documents()
+                            if d.name() == name), None)
+            else:
+                doc = app.activeDocument()
+
+            if not doc:
+                return {'success': False,
+                        'message': 'No matching document'}
+
+            img = self._fresh_thumbnail(doc, max_size)
+            return {
+                'success': True,
+                'message': f'Thumbnail for {doc.name()}',
+                'data': {
+                    'name':     doc.name(),
+                    'data_url': self._qimage_to_data_url(img),
+                    'meta':     self._doc_meta(doc),
+                },
+            }
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    @command(
+        category='doc',
+        help_text='Get thumbnails of every open document, plus which '
+                  'one is currently active.',
+        args={
+            '--max_size': {'type': 'int', 'default': 512,
+                           'help': 'Max dimension in pixels'},
+        }
+    )
+    def get_all_document_thumbnails(self, params):
+        try:
+            app = Krita.instance()
+            max_size = int(params.get('max_size', 512))
+            active = app.activeDocument()
+            active_name = active.name() if active else None
+
+            docs = []
+            for doc in app.documents():
+                img = self._fresh_thumbnail(doc, max_size)
+                entry = self._doc_meta(doc)
+                entry['data_url'] = self._qimage_to_data_url(img)
+                entry['active'] = (doc.name() == active_name)
+                docs.append(entry)
+
+            return {
+                'success': True,
+                'message': f'{len(docs)} document(s)',
+                'data': {
+                    'documents': docs,
+                    'active':    active_name,
+                },
+            }
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    @command(
+        category='doc',
+        help_text='Bring a document to the front of the Krita window, '
+                  'adding a view for it if none is open.  Accepts either '
+                  'the document name or its file path.',
+        args={
+            '--name': {'type': 'str', 'required': True,
+                       'help': 'Document name or .kra file path'},
+        }
+    )
+    def activate_document(self, params):
+        try:
+            app = Krita.instance()
+            key = params.get('name', '')
+            if not key:
+                return {'success': False, 'message': 'No name or path given'}
+
+            def _resolve(candidate):
+                try:
+                    return os.path.realpath(os.path.expanduser(str(candidate)))
+                except Exception:
+                    return str(candidate)
+
+            target_norm = _resolve(key)
+
+            doc = None
+            for d in app.documents():
+                if d.name() == key:
+                    doc = d
+                    break
+                try:
+                    fn = d.fileName()
+                except Exception:
+                    fn = ''
+                if fn and _resolve(fn) == target_norm:
+                    doc = d
+                    break
+
+            if not doc:
+                return {'success': False,
+                        'message': f'No open document matches "{key}"'}
+
+            window = app.activeWindow()
+            if not window:
+                return {'success': False,
+                        'message': 'No active window'}
+
+            try:
+                for view in window.views():
+                    vdoc = view.document()
+                    if vdoc is doc:
+                        window.activateView(view)
+                        return {'success': True,
+                                'message': f'Activated {doc.name() or key}'}
+            except Exception:
+                pass
+
+            window.addView(doc)
+            return {'success': True,
+                    'message': f'Opened a view for {doc.name() or key}'}
         except Exception as e:
             return {'success': False, 'message': str(e)}

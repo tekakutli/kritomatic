@@ -28,7 +28,8 @@ class LayerHandler:
 
         # File layer operations
         elif cmd_type in ['create_file_layer', 'convert_to_file_layer',
-                          'embed_image_as_layer', 'import_kra_as_group']:
+                          'embed_image_as_layer', 'import_kra_as_group',
+                          'paste_document_transform_as_layer']:
             return self.file.execute(cmd_type, params)
 
         # Transform mask operations

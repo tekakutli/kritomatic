@@ -192,6 +192,7 @@ class CommandHandler:
                           'rename_layer_by_name', 'move_layer_to_group', 'move_active_layer_to_group',
                           'create_file_layer', 'convert_to_file_layer', 'create_blend_layer',
                           'embed_image_as_layer', 'import_kra_as_group',
+                          'paste_document_transform_as_layer',
                           'fill_layer', 'fill_selection', 'move_layer_to_new_document',
                           'export_layer_to_file', 'apply_color_to_alpha', 'add_color_to_alpha_mask',
                           'create_transform_mask', 'transform_mask',
@@ -219,7 +220,9 @@ class CommandHandler:
         elif cmd_type in ['get_current_dimensions', 'create_new_from_current',
                           'create_new_with_dimensions', 'get_all_documents', 'save_document',
                           'open_document', 'close_document', 'export_document',
-                          'export_file_to_image', 'rotate_document', 'rotate_kra_file']:
+                          'export_file_to_image', 'rotate_document', 'rotate_kra_file',
+                          'get_document_thumbnail', 'get_all_document_thumbnails',
+                          'activate_document']:
             return self.handlers['document'].execute(cmd_type, command)
 
         # View commands

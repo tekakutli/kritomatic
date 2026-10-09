@@ -1,33 +1,34 @@
 """
-pg_scene.py — save and load the board layout.
+pg_scene.py — save and load the board.
 
-The scene is what the user has arranged: every doc's identity, board
-position, size, and assigned hue.  The thumbnails themselves are not
-saved — they are pulled fresh from Krita on load — so a saved board
-file is small and does not go stale.
+The saved board is a list of file paths, the layout the user has
+arranged on the canvas, and each card's z and rotation.  Thumbnails
+are not saved — they are pulled fresh from Krita.
+
+On load, three things happen in order:
+
+    1.  Paths, layout, z, and rotation are applied.
+    2.  Every file whose path is not currently open in Krita is opened
+        in Krita, sequentially, via the same endpoint the per-row
+        "Open" button uses.
+    3.  A single refresh picks up thumbnails and state for everything
+        that just opened.
 
 File shape:
 
     {
-      "sceneVersion": 1,
+      "sceneVersion": 4,
       "type":         "board_scene",
       "generatedAt":  "2026-...",
-      "board": {
-        "defaultWidth": 320,
-        "gridGap":      24,
-      },
-      "view": { "zoom": ..., "panX": ..., "panY": ... },
-      "docs": [
-        { "id": ..., "name": ..., "x": ..., "y": ...,
-          "w": ..., "aspect": ...,
+      "board": { "defaultWidth": 320, "gridGap": 24 },
+      "view":  { "zoom": ..., "panX": ..., "panY": ... },
+      "files": [
+        { "path": ..., "name": ..., "x": ..., "y": ...,
+          "w": ..., "aspect": ..., "z": ..., "rotation": ...,
           "color": { "r": ..., "g": ..., "b": ... } },
         ...
       ]
     }
-
-On load, the docs list is applied to whatever documents are currently
-open in Krita; docs that are not open are still placed on the board
-(showing a "not open" placeholder) so the user can see the layout.
 """
 
 SCENE_JS = r"""
@@ -35,7 +36,7 @@ SCENE_JS = r"""
    SCENE SAVE / LOAD
    ========================================================================== */
 
-const SCENE_VERSION = 1;
+const SCENE_VERSION = 4;
 const SCENE_TYPE    = "board_scene";
 const SCENE_FILE    = "board_scene.json";
 
@@ -53,14 +54,16 @@ function buildBoardScene() {
       panX: view.panX,
       panY: view.panY,
     },
-    docs: board.docs.map(d => ({
-      id:     d.id,
-      name:   d.name,
-      x:      d.x,
-      y:      d.y,
-      w:      d.w,
-      aspect: d.aspect,
-      color:  d.color ? { r: d.color.r, g: d.color.g, b: d.color.b } : null,
+    files: board.files.map(f => ({
+      path:     f.path,
+      name:     f.name,
+      x:        f.x,
+      y:        f.y,
+      w:        f.w,
+      aspect:   f.aspect,
+      z:        f.z,
+      rotation: f.rotation,
+      color:    f.color ? { r: f.color.r, g: f.color.g, b: f.color.b } : null,
     })),
   };
 }
@@ -76,7 +79,7 @@ function saveBoardJSON() {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  flashStatus("saved " + board.docs.length + " card positions", "ok");
+  flashStatus("saved " + board.files.length + " file path(s)", "ok");
 }
 
 function applyBoardScene(data) {
@@ -106,61 +109,41 @@ function applyBoardScene(data) {
     if (typeof data.view.panY === "number") view.panY = data.view.panY;
   }
 
-  // Merge the saved layout onto the current docs list.  A saved doc
-  // whose name matches a currently-open document updates that doc's
-  // position and size.  A saved doc whose name does not match any
-  // open document is still placed — the doc is recreated with no
-  // thumbnail, so the layout is preserved even when the document
-  // was not open at load time.
-  const saved = Array.isArray(data.docs) ? data.docs : [];
-  const byName = new Map();
-  for (const d of board.docs) byName.set(d.name, d);
+  const saved = Array.isArray(data.files) ? data.files : [];
+  board.files = [];
+  board.selectedIdx = -1;
+  board.nextZ = 1;
 
-  const next = [];
   for (const s of saved) {
-    if (!s.name) continue;
-    const existing = byName.get(s.name);
-    if (existing) {
-      existing.x      = (typeof s.x === "number") ? s.x : existing.x;
-      existing.y      = (typeof s.y === "number") ? s.y : existing.y;
-      existing.w      = (typeof s.w === "number") ? s.w : existing.w;
-      existing.aspect = (typeof s.aspect === "number") ? s.aspect : existing.aspect;
-      if (s.color && typeof s.color.r === "number") {
-        existing.color = { r: s.color.r, g: s.color.g, b: s.color.b };
-      }
-      existing.h = Math.round(existing.w * (existing.aspect || 1));
-      next.push(existing);
-      byName.delete(s.name);
-    } else {
-      const aspect = (typeof s.aspect === "number") ? s.aspect : 1.0;
-      const doc = {
-        id:        s.name,
-        name:      s.name,
-        thumb:     null,
-        aspect:    aspect,
-        w:         (typeof s.w === "number") ? s.w : board.defaultWidth,
-        h:         Math.round(((typeof s.w === "number") ? s.w : board.defaultWidth) * aspect),
-        x:         (typeof s.x === "number") ? s.x : 0,
-        y:         (typeof s.y === "number") ? s.y : 0,
-        modified:  false,
-        active:    false,
-        color:     (s.color && typeof s.color.r === "number")
-                     ? { r: s.color.r, g: s.color.g, b: s.color.b }
-                     : null,
-      };
-      _assignColor(doc);
-      next.push(doc);
+    if (!s.path) continue;
+    const idx = addFileByPath(s.path);
+    if (idx < 0) continue;
+    const f = board.files[idx];
+    if (typeof s.x === "number") f.x = s.x;
+    if (typeof s.y === "number") f.y = s.y;
+    if (typeof s.w === "number") f.w = s.w;
+    if (typeof s.aspect === "number") f.aspect = s.aspect;
+    f.h = Math.round(f.w * (f.aspect || 1));
+    if (typeof s.z === "number") f.z = s.z;
+    if (typeof s.rotation === "number") f.rotation = s.rotation;
+    if (s.color && typeof s.color.r === "number") {
+      f.color = { r: s.color.r, g: s.color.g, b: s.color.b };
     }
+    if (typeof s.name === "string" && s.name) f.name = s.name;
   }
 
-  board.docs = next;
-  board.selectedIdx = -1;
+  let maxZ = 0;
+  for (const f of board.files) {
+    if (typeof f.z === "number" && f.z > maxZ) maxZ = f.z;
+  }
+  board.nextZ = Math.max(board.nextZ, maxZ + 1);
+
   syncPanelSliders();
-  syncDocList();
+  syncFileList();
   draw();
 }
 
-function loadBoardFromText(text) {
+async function loadBoardFromText(text) {
   let data;
   try {
     data = JSON.parse(text);
@@ -174,7 +157,11 @@ function loadBoardFromText(text) {
     flashStatus("Load failed: " + e.message, "bad");
     return false;
   }
-  flashStatus("loaded " + board.docs.length + " card positions", "ok");
+
+  flashStatus("loaded layout; opening files in Krita…", "ok");
+  await openAllMissing();
+
+  flashStatus("loaded " + board.files.length + " file(s)", "ok");
   return true;
 }
 

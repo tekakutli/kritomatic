@@ -5,10 +5,11 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtGui import QImage
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread
 from krita import Krita
 from ..utils.refresh import refresh
 from ..decorators import command
+
 
 class LayerFileHandler:
     def execute(self, cmd_type, params):
@@ -20,6 +21,8 @@ class LayerFileHandler:
             return self.embed_image_as_layer(params)
         elif cmd_type == 'import_kra_as_group':
             return self.import_kra_as_group(params)
+        elif cmd_type == 'paste_document_transform_as_layer':
+            return self.paste_document_transform_as_layer(params)
         return {'success': False, 'message': f'Unknown file layer command: {cmd_type}'}
 
     @command(
@@ -63,10 +66,6 @@ class LayerFileHandler:
                 return {'success': True, 'message': f'Created file layer "{name}"',
                         'data': {'name': name, 'file_path': file_path}}
 
-            # Real dimensions, read directly. A file layer inside a temp
-            # Krita document is clipped to that document's canvas, so a
-            # 1x1 temp doc reports 1x1 regardless of the source's real
-            # size. QImage bypasses that.
             qimg = QImage(file_path)
             if qimg.isNull():
                 return {'success': False,
@@ -137,6 +136,13 @@ class LayerFileHandler:
         Read an image, scale it to (width, height), blit the pixels into
         a fresh paint layer at (x, y). The result is a self-contained
         document — nothing on disk is referenced at open time.
+
+        The image is composited into a full-document-sized QImage
+        before setPixelData, so the new layer's extent covers the
+        whole canvas.  Writing pixel data at (0, 0) with the full
+        document dimensions sidesteps the case where a new layer's
+        bounds start at the origin and a paste landing further down
+        the canvas would be silently discarded.
         """
         try:
             app = Krita.instance()
@@ -163,19 +169,29 @@ class LayerFileHandler:
                 th = int(height) if height else img.height()
                 img = img.scaled(tw, th, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
 
-            img = img.convertToFormat(QImage.Format_RGBA8888)
+            img = img.convertToFormat(QImage.Format_ARGB32)
             iw = img.width()
             ih = img.height()
 
-            # Format_RGBA8888 is exactly 4 bytes per pixel, so bytesPerLine
-            # == iw * 4 and there is no row padding. Direct copy works.
-            ptr = img.constBits()
-            ptr.setsize(img.byteCount())
+            B_W = doc.width()
+            B_H = doc.height()
+
+            full = QImage(B_W, B_H, QImage.Format_ARGB32)
+            full.fill(0)
+            from PyQt5.QtGui import QPainter
+            painter = QPainter(full)
+            painter.drawImage(x, y, img)
+            painter.end()
+            full = full.convertToFormat(QImage.Format_ARGB32)
+            fw = full.width()
+            fh = full.height()
+            ptr = full.constBits()
+            ptr.setsize(full.byteCount())
             raw = bytes(ptr)
 
             layer = doc.createNode(name, "paintlayer")
             doc.rootNode().addChildNode(layer, None)
-            layer.setPixelData(raw, x, y, iw, ih)
+            layer.setPixelData(raw, 0, 0, fw, fh)
 
             doc.setActiveNode(layer)
             refresh(doc)
@@ -197,15 +213,6 @@ class LayerFileHandler:
         }
     )
     def import_kra_as_group(self, params):
-        """
-        Open the source .kra, duplicate each root child into a new group
-        in the target document, close the source.
-
-        No sizing is done here — the imported layers land at their
-        source coordinates. The batch is expected to follow this with a
-        create_transform_mask + transform_mask pair to position and
-        scale the group as needed.
-        """
         try:
             app = Krita.instance()
             target_doc = app.activeDocument()
@@ -226,8 +233,6 @@ class LayerFileHandler:
             src_h = src_doc.height()
             layer_count = 0
 
-            # Suppress any save-changes prompt on close; the source doc
-            # is never modified, but Krita still asks in some builds.
             src_batch_was = src_doc.batchmode()
             src_doc.setBatchmode(True)
             try:
@@ -240,7 +245,7 @@ class LayerFileHandler:
 
                 target_doc.rootNode().addChildNode(group, None)
                 target_doc.setActiveNode(group)
-                target_refresh(doc)
+                refresh(target_doc)
             finally:
                 src_doc.setBatchmode(src_batch_was)
                 src_doc.close()
@@ -318,7 +323,7 @@ class LayerFileHandler:
 
             duplicated_layer = src_layer.duplicate()
             temp_doc.rootNode().addChildNode(duplicated_layer, None)
-            temp_refresh(doc)
+            refresh(temp_doc)
             temp_doc.saveAs(output_path)
             temp_doc.close()
 
@@ -352,3 +357,258 @@ class LayerFileHandler:
             }
         except Exception as e:
             return {'success': False, 'message': str(e)}
+
+    @command(
+        category='layer',
+        help_text='Apply an affine transform to one open document\'s composite '
+                  'and paste the result into another as a new paint layer.  '
+                  'Documents are identified by their .kra path.',
+        args={
+            '--name': {'type': 'str', 'required': True,
+                       'help': 'Name for the new layer'},
+            '--source_document': {'type': 'str', 'required': True,
+                                  'help': 'Path of the .kra to copy from'},
+            '--target_document': {'type': 'str', 'required': True,
+                                  'help': 'Path of the .kra to paste into'},
+            '--a': {'type': 'float', 'required': True,
+                    'help': 'Affine matrix a (x\' = a*x + c*y + e)'},
+            '--b': {'type': 'float', 'required': True,
+                    'help': 'Affine matrix b (y\' = b*x + d*y + f)'},
+            '--c': {'type': 'float', 'required': True,
+                    'help': 'Affine matrix c'},
+            '--d': {'type': 'float', 'required': True,
+                    'help': 'Affine matrix d'},
+            '--e': {'type': 'float', 'required': True,
+                    'help': 'Affine matrix e'},
+            '--f': {'type': 'float', 'required': True,
+                    'help': 'Affine matrix f'},
+        }
+    )
+    def paste_document_transform_as_layer(self, params):
+        """Render the source document, apply an affine transform
+        mapping its pixels into the target document's space, and add
+        the result as a new paint layer.
+
+        The transform is a 2x3 column-vector affine map:
+            x' = a*x + c*y + e
+            y' = b*x + d*y + f
+        QTransform takes its elements in row-vector order, so the
+        constructor call is QTransform(a, b, 0, c, d, 0, e, f, 1).
+
+        The transformed source is drawn into a full-target-canvas
+        QImage at the correct offset, and that image is written into
+        a single new paint layer at (0, 0) with the target's full
+        dimensions.  Doing the write at the origin with the full
+        canvas extent means the layer's bounds cover every pixel of
+        the paste, including one that lands near the bottom or right
+        edge of the target; a write at a non-zero offset would be
+        confined to the layer's initial (empty, origin-anchored)
+        bounds and discarded.
+        """
+        import math
+        from PyQt5.QtGui import QPainter, QTransform as QTx
+        from PyQt5.QtCore import QPointF
+
+        try:
+            app = Krita.instance()
+            name    = params.get('name', 'Pasted Region')
+            src_key = params.get('source_document', '')
+            tgt_key = params.get('target_document', '')
+
+            print(f"[board/paste] enter: src={src_key!r} tgt={tgt_key!r}",
+                  flush=True)
+
+            def _resolve(candidate):
+                try:
+                    return os.path.realpath(os.path.expanduser(str(candidate)))
+                except Exception:
+                    return str(candidate)
+
+            def _find(key):
+                if not key:
+                    return None
+                target_norm = _resolve(key)
+                for d in app.documents():
+                    if d.name() == key:
+                        return d
+                    try:
+                        fn = d.fileName()
+                    except Exception:
+                        fn = ''
+                    if fn and _resolve(fn) == target_norm:
+                        return d
+                return None
+
+            src_doc = _find(src_key)
+            tgt_doc = _find(tgt_key)
+            print(f"[board/paste] src resolved to "
+                  f"{src_doc.fileName() if src_doc else None!r}, "
+                  f"tgt resolved to "
+                  f"{tgt_doc.fileName() if tgt_doc else None!r}",
+                  flush=True)
+
+            if not src_doc:
+                return {'success': False,
+                        'message': f'Source document not open: {src_key}'}
+            if not tgt_doc:
+                return {'success': False,
+                        'message': f'Target document not open: {tgt_key}'}
+
+            a = float(params.get('a', 1.0))
+            b = float(params.get('b', 0.0))
+            c = float(params.get('c', 0.0))
+            d = float(params.get('d', 1.0))
+            e = float(params.get('e', 0.0))
+            f = float(params.get('f', 0.0))
+
+            det = a * d - b * c
+            if abs(det) < 1e-9:
+                return {'success': False,
+                        'message': f'Affine matrix is degenerate (det={det})'}
+
+            A_W = src_doc.width()
+            A_H = src_doc.height()
+            B_W = tgt_doc.width()
+            B_H = tgt_doc.height()
+            print(f"[board/paste] source canvas {A_W}x{A_H}, "
+                  f"target canvas {B_W}x{B_H}", flush=True)
+
+            # Source composite.  projection() is ideal but can return
+            # null off the main thread; thumbnail() works from any
+            # thread and is scaled up to the true canvas size.
+            src_img = None
+            try:
+                src_img = src_doc.projection()
+            except Exception as exc:
+                print(f"[board/paste] projection() raised: {exc}", flush=True)
+                src_img = None
+
+            if src_img is None or src_img.isNull():
+                print(f"[board/paste] projection() null, "
+                      f"falling back to thumbnail({A_W}, {A_H})", flush=True)
+                src_img = src_doc.thumbnail(A_W, A_H)
+
+            if src_img is None or src_img.isNull():
+                return {'success': False,
+                        'message': 'Source composite returned null'}
+
+            if src_img.width() != A_W or src_img.height() != A_H:
+                print(f"[board/paste] composite is "
+                      f"{src_img.width()}x{src_img.height()}, "
+                      f"scaling to {A_W}x{A_H}", flush=True)
+                src_img = src_img.scaled(
+                    A_W, A_H,
+                    Qt.IgnoreAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+                if src_img.isNull():
+                    return {'success': False,
+                            'message': 'Rescaling source composite returned null'}
+
+            # QTransform takes its elements in row-vector order.
+            T = QTx(a, b, 0.0, c, d, 0.0, e, f, 1.0)
+
+            # Where does the source rectangle land in the target?
+            corners = [
+                T.map(QPointF(0.0,         0.0)),
+                T.map(QPointF(float(A_W),  0.0)),
+                T.map(QPointF(float(A_W),  float(A_H))),
+                T.map(QPointF(0.0,         float(A_H))),
+            ]
+            min_x = min(p.x() for p in corners)
+            min_y = min(p.y() for p in corners)
+            max_x = max(p.x() for p in corners)
+            max_y = max(p.y() for p in corners)
+
+            clip_x0 = max(0, int(math.floor(min_x)))
+            clip_y0 = max(0, int(math.floor(min_y)))
+            clip_x1 = min(B_W, int(math.ceil(max_x)))
+            clip_y1 = min(B_H, int(math.ceil(max_y)))
+
+            if clip_x1 <= clip_x0 or clip_y1 <= clip_y0:
+                return {'success': False,
+                        'message': 'Transformed source lies entirely '
+                                   'outside the target canvas'}
+
+            print(f"[board/paste] transformed bbox in target: "
+                  f"({clip_x0}, {clip_y0}) {clip_x1 - clip_x0}x{clip_y1 - clip_y0}",
+                  flush=True)
+
+            # Draw the transformed source into a full-canvas image.
+            # The transform places src_img pixel (px, py) at target
+            # pixel T.map((px, py)); painter clipping handles the
+            # parts that land outside the canvas.
+            full = QImage(B_W, B_H, QImage.Format_ARGB32)
+            full.fill(0)
+            painter = QPainter(full)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform)
+            painter.setTransform(T)
+            painter.drawImage(0, 0, src_img)
+            painter.end()
+
+            full = full.convertToFormat(QImage.Format_ARGB32)
+            fw = full.width()
+            fh = full.height()
+            ptr = full.constBits()
+            ptr.setsize(full.byteCount())
+            raw = bytes(ptr)
+            if not raw:
+                return {'success': False,
+                        'message': 'Transformed pixel buffer came back empty'}
+
+            layer = tgt_doc.createNode(name, "paintlayer")
+            if layer is None:
+                return {'success': False,
+                        'message': f'createNode returned None for {name!r}'}
+            tgt_doc.rootNode().addChildNode(layer, None)
+
+            print(f"[board/paste] writing full {fw}x{fh} layer",
+                  flush=True)
+
+            layer.setPixelData(raw, 0, 0, fw, fh)
+
+            try:
+                prev_batch = tgt_doc.batchmode()
+            except Exception:
+                prev_batch = False
+            try:
+                if prev_batch:
+                    tgt_doc.setBatchmode(False)
+                tgt_doc.refreshProjection()
+                try:
+                    QThread.msleep(50)
+                except Exception:
+                    pass
+                tgt_doc.refreshProjection()
+                print("[board/paste] composited target document", flush=True)
+            except Exception as exc:
+                print(f"[board/paste] composite raised: {exc}", flush=True)
+            finally:
+                if prev_batch:
+                    try:
+                        tgt_doc.setBatchmode(True)
+                    except Exception:
+                        pass
+
+            print(f"[board/paste] done: layer={layer.name()!r}", flush=True)
+
+            return {
+                'success': True,
+                'message': f'Pasted transformed region from '
+                           f'"{src_doc.name() or src_key}" into '
+                           f'"{tgt_doc.name() or tgt_key}" as "{name}"',
+                'data': {
+                    'name':            name,
+                    'source_document': src_doc.fileName() or src_key,
+                    'target_document': tgt_doc.fileName() or tgt_key,
+                    'matrix':          (a, b, c, d, e, f),
+                    'paste_bbox':      (clip_x0, clip_y0,
+                                        clip_x1 - clip_x0, clip_y1 - clip_y0),
+                    'layer_size':      (fw, fh),
+                },
+            }
+        except Exception as exc:
+            import traceback as _tb
+            _tb.print_exc()
+            return {'success': False,
+                    'message': f'paste_document_transform_as_layer raised: {exc}'}

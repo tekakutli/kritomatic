@@ -1,17 +1,19 @@
 """
-board_server.py — the same tiny threaded server the cone playground
-uses, plus two /krita endpoints that forward to the running Kritomatic
-daemon.
+board_server.py — threaded HTTP server.
 
-    GET  /krita/status       → is the daemon reachable?
-    GET  /krita/documents    → every open document with a base64
-                               thumbnail and a small metadata block
-    POST /krita/activate     → bring a document to the front in Krita
+    POST /krita/refresh       { paths, max_size }
+    POST /krita/open          { path, add_view }
+    POST /krita/activate      { name }
+    POST /krita/pick_files    {}
+    POST /krita/paste_regions { regions: [...] }
+    POST /log                 { tag, message }
 
-The Python side that talks to the daemon lives in board_krita.py.
-This module only knows how to route HTTP to that bridge.
+Every request and response is logged to the terminal, and the /log
+endpoint lets the browser forward its own caught errors here so
+there is one place to look.
 """
 
+import datetime
 import json
 import os
 import threading
@@ -20,6 +22,11 @@ import webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 import board_krita
+
+
+def _log(msg):
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] board: {msg}", flush=True)
 
 
 def serve(port=8770, open_browser=True, html_file="board_playground.html"):
@@ -31,46 +38,109 @@ def serve(port=8770, open_browser=True, html_file="board_playground.html"):
         def log_message(self, *args):
             pass
 
-        def do_GET(self):
-            if self.path.startswith("/krita/"):
-                try:
-                    if self.path == "/krita/status":
-                        self._serve_json(200, board_krita.status())
-                        return
-                    if self.path.startswith("/krita/documents"):
-                        max_size = 512
-                        if "?" in self.path:
-                            q = self.path.split("?", 1)[1]
-                            for pair in q.split("&"):
-                                if pair.startswith("max_size="):
-                                    try:
-                                        max_size = int(pair.split("=", 1)[1])
-                                    except ValueError:
-                                        pass
-                        self._serve_json(200, board_krita.fetch_documents(max_size))
-                        return
-                except Exception as e:
-                    traceback.print_exc()
-                    self._serve_json(500, {"success": False, "message": str(e)})
-                    return
-            super().do_GET()
+        def _read_json(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body   = self.rfile.read(length).decode("utf-8") if length else ""
+            return json.loads(body) if body else {}
 
         def do_POST(self):
-            if self.path != "/krita/activate":
+            try:
+                if self.path == "/log":
+                    payload = self._read_json()
+                    tag = payload.get("tag", "js")
+                    msg = payload.get("message", "")
+                    ts  = datetime.datetime.now().strftime("%H:%M:%S")
+                    print(f"[{ts}] js/{tag}: {msg}", flush=True)
+                    self._serve_json(200, {"success": True})
+                    return
+
+                if self.path == "/krita/refresh":
+                    payload = self._read_json()
+                    paths = payload.get("paths", [])
+                    max_size = int(payload.get("max_size", 512))
+                    _log(f"refresh: {len(paths)} path(s)")
+                    result = board_krita.refresh(paths, max_size)
+                    if not result.get("success"):
+                        _log(f"refresh FAILED: {result.get('message')}")
+                    else:
+                        opens = sum(1 for r in result.get("results", [])
+                                    if r.get("open"))
+                        miss  = sum(1 for r in result.get("results", [])
+                                    if r.get("missing"))
+                        _log(f"refresh ok: {opens} open, {miss} missing")
+                    self._serve_json(200, result)
+                    return
+
+                if self.path == "/krita/open":
+                    payload = self._read_json()
+                    path = payload.get("path", "")
+                    add_view = bool(payload.get("add_view", True))
+                    if not path:
+                        self._serve_json(400, {"success": False,
+                                               "message": "no path"})
+                        return
+                    _log(f"open: {path!r} add_view={add_view}")
+                    result = board_krita.open_file(path, add_view)
+                    if not result.get("success"):
+                        _log(f"open FAILED: {result.get('message')}")
+                    else:
+                        _log(f"open ok: name={result.get('name')!r}")
+                    self._serve_json(200, result)
+                    return
+
+                if self.path == "/krita/activate":
+                    payload = self._read_json()
+                    name = payload.get("name", "")
+                    _log(f"activate: {name!r}")
+                    result = board_krita.activate_document(name)
+                    if not result.get("success"):
+                        _log(f"activate FAILED: {result.get('message')}")
+                    else:
+                        _log(f"activate ok: {result.get('message')}")
+                    self._serve_json(200, result)
+                    return
+
+                if self.path == "/krita/pick_files":
+                    _log("pick_files: opening native dialog")
+                    result = board_krita.pick_files()
+                    if not result.get("success"):
+                        _log(f"pick_files FAILED: {result.get('message')}")
+                    else:
+                        _log(f"pick_files ok: {len(result.get('paths', []))} path(s)")
+                    self._serve_json(200, result)
+                    return
+
+                if self.path == "/krita/paste_transforms":
+                    payload = self._read_json()
+                    transforms = payload.get("transforms", [])
+                    _log(f"paste_transforms: {len(transforms)} transform(s) requested")
+                    for t in transforms:
+                        _log(
+                            "  transform: "
+                            f"src={t.get('source_document')!r} "
+                            f"tgt={t.get('target_document')!r} "
+                            f"a={t.get('a',0):.6f} b={t.get('b',0):.6f} "
+                            f"c={t.get('c',0):.6f} d={t.get('d',0):.6f} "
+                            f"e={t.get('e',0):.1f} f={t.get('f',0):.1f}"
+                        )
+                    result = board_krita.paste_transforms(transforms)
+                    if not result.get("success"):
+                        _log(f"paste_transforms FAILED: {result.get('message')}")
+                    else:
+                        _log(f"paste_transforms done: "
+                             f"{result.get('successful',0)} ok, "
+                             f"{result.get('failed',0)} failed")
+                        for r in (result.get("results") or []):
+                            _log(f"  result[{r.get('index','?')}] "
+                                 f"{r.get('status','?')}: "
+                                 f"{r.get('message','')}")
+                    self._serve_json(200, result)
+                    return
+
                 self.send_error(404)
-                return
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                body   = self.rfile.read(length).decode("utf-8")
-                payload = json.loads(body) if body else {}
-            except Exception as e:
-                self._serve_json(400, {"success": False, "message": f"Bad request: {e}"})
-                return
-            try:
-                name = payload.get("name", "")
-                self._serve_json(200, board_krita.activate_document(name))
             except Exception as e:
                 traceback.print_exc()
+                _log(f"unhandled error: {e}")
                 self._serve_json(500, {"success": False, "message": str(e)})
 
         def _serve_json(self, code, data):

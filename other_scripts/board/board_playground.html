@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Board — every open Krita document</title>
+<title>Board — files on a canvas</title>
 <style>
   html, body {
     margin:0; padding:0; height:100%; overflow:hidden;
@@ -20,7 +20,7 @@
     box-shadow:0 6px 28px rgba(0,0,0,0.65);
     font-size:11px; color:#a8b5c4;
     user-select:none;
-    width:300px; box-sizing:border-box;
+    width:320px; box-sizing:border-box;
   }
   #ui.collapsed { display:none; }
 
@@ -51,6 +51,41 @@
     font-variant-numeric: tabular-nums;
   }
 
+  /* Scrub input: a text field the user drags horizontally to change.
+     Clicking once focuses it for typing; dragging sideways scrubs. */
+  #ui .field input.scrubInput {
+    flex:1 1 auto;
+    min-width:0;
+    background:transparent;
+    border:0;
+    border-bottom:1px solid #223040;
+    color:#00e5ff;
+    font-family:inherit;
+    font-size:12px;
+    font-weight:700;
+    font-variant-numeric: tabular-nums;
+    text-align:right;
+    padding:2px 4px;
+    margin:0;
+    outline:none;
+    cursor:ew-resize;
+    user-select:none;
+    transition: border-color 0.1s ease;
+  }
+  #ui .field input.scrubInput:hover {
+    border-bottom-color:#34445a;
+  }
+  #ui .field input.scrubInput:focus {
+    border-bottom-color:#00e5ff;
+    cursor:text;
+    user-select:text;
+  }
+  #ui .field input.scrubInput:disabled {
+    color:#3d4756;
+    border-bottom-color:#1e2836;
+    cursor:not-allowed;
+  }
+
   #ui .row { display:flex; gap:6px; margin:6px 0; }
   #ui .row button { flex:1 1 auto; }
 
@@ -68,6 +103,11 @@
     background:rgba(220,230,242,0.03);
   }
   #ui button:active { background:rgba(220,230,242,0.07); }
+  #ui button:disabled {
+    color:#3d4756;
+    border-color:#1e2836;
+    cursor:not-allowed;
+  }
 
   #ui button#refreshBtn {
     border-color: rgba(0, 229, 255, 0.72);
@@ -79,22 +119,53 @@
     color: #d8f4ff;
   }
 
+  #ui button#retrieveBtn {
+    border-color: rgba(120, 220, 255, 0.72);
+    color: #b8ecff;
+  }
+  #ui button#retrieveBtn:hover {
+    border-color: rgba(140, 225, 255, 1.00);
+    background: rgba(120, 220, 255, 0.10);
+    color: #d8f4ff;
+  }
+
+  #ui button#openAllBtn {
+    border-color: rgba(255, 200, 90, 0.72);
+    color: #ffd89b;
+  }
+  #ui button#openAllBtn:hover {
+    border-color: rgba(255, 200, 90, 1.00);
+    background: rgba(255, 200, 90, 0.10);
+    color: #ffe6b8;
+  }
+
+  #ui button#projectBtn {
+    border-color: rgba(255, 130, 210, 0.72);
+    color: #ffb0e6;
+  }
+  #ui button#projectBtn:hover {
+    border-color: rgba(255, 130, 210, 1.00);
+    background: rgba(255, 130, 210, 0.10);
+    color: #ffd0f0;
+  }
+
   #ui hr { border:0; border-top:1px solid #1e2836; margin:10px 0; }
 
-  .docList {
+  .fileList {
     display:flex; flex-direction:column;
     gap:3px; margin:6px 0 0;
-    max-height:200px; overflow-y:auto;
+    max-height:220px; overflow-y:auto;
   }
-  .docList::-webkit-scrollbar { width:6px; }
-  .docList::-webkit-scrollbar-thumb {
+  .fileList::-webkit-scrollbar { width:6px; }
+  .fileList::-webkit-scrollbar-thumb {
     background:#1e2836; border-radius:3px;
   }
-  .docList .empty {
+  .fileList .empty {
     font-size:10px; color:#3d4756;
     font-style:italic; padding:3px 4px;
   }
-  .docRow {
+
+  .fileRow {
     display:flex; align-items:center; gap:7px;
     padding:3px 6px;
     border:1px solid #223040;
@@ -105,35 +176,62 @@
     letter-spacing:0.04em;
     flex:0 0 auto;
   }
-  .docRow:hover {
+  .fileRow:hover {
     border-color:#34445a; color:#dce6f2;
     background:rgba(220,230,242,0.03);
   }
-  .docRow.selected {
+  .fileRow.selected {
     border-color:rgba(0, 229, 255, 0.72);
     color:#b8ecff;
     background:rgba(0, 229, 255, 0.06);
   }
-  .docRow.active {
-    box-shadow: inset 0 0 0 1px rgba(255, 200, 90, 0.35);
+  .fileRow.closed  { opacity: 0.65; }
+  .fileRow.missing {
+    border-color: rgba(212, 133, 144, 0.55);
+    color: #d48590;
+    opacity: 0.75;
   }
-  .docSwatch {
+  .fileRow.missing:hover {
+    border-color: rgba(232, 160, 168, 0.85);
+    color: #e8a0a8;
+  }
+
+  .fileSwatch {
     width:9px; height:9px;
     border-radius:1px;
     flex:0 0 auto;
   }
-  .docLabel {
+  .fileLabel {
     flex:1 1 auto; font-weight:700;
     font-variant-numeric: tabular-nums;
     overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
   }
-  .docDot {
-    width:6px; height:6px; border-radius:50%;
-    background:#ffc966;
+  .fileState {
     flex:0 0 auto;
+    font-size:11px; line-height:1;
+    letter-spacing:0;
   }
-  .docDot.hidden { display:none; }
-  .docDel {
+  .fileState.open    { color:#00e5ff; }
+  .fileState.closed  { color:#5a6774; }
+  .fileState.missing { color:#d48590; }
+
+  .fileAct {
+    width:auto !important;
+    padding:1px 7px !important;
+    font-size:10px !important;
+    line-height:1.3 !important;
+    letter-spacing:0.06em !important;
+  }
+  .fileAct.open {
+    border-color: rgba(255, 200, 90, 0.55) !important;
+    color: #ffd89b !important;
+  }
+  .fileAct.open:hover {
+    background: rgba(255, 200, 90, 0.10) !important;
+    border-color: rgba(255, 200, 90, 0.95) !important;
+    color: #ffe6b8 !important;
+  }
+  .fileDel {
     width:auto !important;
     padding:1px 6px !important;
     font-size:12px !important;
@@ -142,7 +240,7 @@
     color:#d48590 !important;
     letter-spacing:0 !important;
   }
-  .docDel:hover {
+  .fileDel:hover {
     background:rgba(212,133,144,0.10) !important;
     border-color:#7a3e4a !important;
     color:#e8a0a8 !important;
@@ -186,8 +284,29 @@
   </h3>
 
   <div class="row">
-    <button id="refreshBtn" title="Pull every open document from Krita (R)">
+    <button id="refreshBtn" title="Ask Krita which of the board's files are open (R)">
       Refresh from Krita
+    </button>
+  </div>
+
+  <div class="row">
+    <button id="addFilesBtn" title="Pick .kra (or other image) files to put on the board">
+      + Add files…
+    </button>
+    <button id="retrieveBtn" title="Add every document currently open in Krita to the board">
+      Retrieve open
+    </button>
+  </div>
+
+  <div class="row">
+    <button id="openAllBtn" title="Open every closed file in Krita (O)">
+      Open all
+    </button>
+  </div>
+
+  <div class="row">
+    <button id="projectBtn" title="Copy the selected card's overlapping region into every overlapped Krita document as a new layer (P)">
+      Project overlaps
     </button>
   </div>
 
@@ -206,20 +325,37 @@
     <label>Card width</label>
     <input type="range" id="cardWSlider"
            min="120" max="720" step="10" value="320"
-           title="Board-space width of every card.  Heights follow
-                  each document's own aspect ratio.">
+           title="Reference width for the board.  Existing cards are
+                  rescaled proportionally, so their relative sizes
+                  are preserved.">
     <span class="val" id="cardWVal">320</span>
+  </div>
+
+  <div class="field">
+    <label>Scale</label>
+    <input type="text" id="cardScaleVal" class="scrubInput"
+           value="—" autocomplete="off" spellcheck="false" disabled
+           title="Selected card's scale relative to the reference width.
+                  Drag sideways to scrub; hold Shift to snap.">
+  </div>
+
+  <div class="field">
+    <label>Rotation</label>
+    <input type="text" id="cardRotVal" class="scrubInput"
+           value="—" autocomplete="off" spellcheck="false" disabled
+           title="Selected card's rotation in degrees.  Drag sideways
+                  to scrub; hold Shift to snap to 15°.">
   </div>
 
   <hr>
 
   <div class="field" style="margin-bottom:2px;">
-    <label>Documents</label>
+    <label>Files</label>
     <button id="clearBtn"
-            title="Empty the board.  Does not close the documents in Krita."
+            title="Empty the board.  Does not touch Krita."
             style="flex:0 0 auto;">Clear</button>
   </div>
-  <div id="docList" class="docList"></div>
+  <div id="fileList" class="fileList"></div>
 
   <hr>
 
@@ -228,7 +364,7 @@
     <button id="loadSceneBtn">Load board</button>
   </div>
 
-  <div id="status">connecting to Krita…</div>
+  <div id="status">ready</div>
 </div>
 
 <button id="restoreBtn" title="Show panel (H)">☰ Show panel</button>
@@ -249,17 +385,12 @@ let dpr = window.devicePixelRatio || 1;
    VIEW
    ========================================================================== */
 
-const view = {
-  zoom: 1,
-  panX: 0,
-  panY: 0,
-};
+const view = { zoom: 1, panX: 0, panY: 0 };
 
 function b2s(bx, by) {
   return [bx * view.zoom + view.panX,
           by * view.zoom + view.panY];
 }
-
 function s2b(sx, sy) {
   return [(sx - view.panX) / view.zoom,
           (sy - view.panY) / view.zoom];
@@ -270,26 +401,41 @@ function s2b(sx, sy) {
    ========================================================================== */
 
 const board = {
-  docs:         [],
+  files:        [],
   selectedIdx:  -1,
   gridGap:      24,
   defaultWidth: 320,
+  nextZ:        1,
   palette: [
-    { r: 255, g: 200, b:  90 },   // amber
-    { r: 120, g: 220, b: 255 },   // cyan
-    { r: 255, g: 130, b: 210 },   // magenta
-    { r: 140, g: 225, b: 160 },   // green
-    { r: 180, g: 155, b: 255 },   // violet
-    { r: 255, g: 165, b: 105 },   // orange
-    { r: 110, g: 220, b: 210 },   // teal
-    { r: 220, g: 230, b: 120 },   // lime
+    { r: 255, g: 200, b:  90 },
+    { r: 120, g: 220, b: 255 },
+    { r: 255, g: 130, b: 210 },
+    { r: 140, g: 225, b: 160 },
+    { r: 180, g: 155, b: 255 },
+    { r: 255, g: 165, b: 105 },
+    { r: 110, g: 220, b: 210 },
+    { r: 220, g: 230, b: 120 },
   ],
 };
+
+const CARD_HANDLE_R    = 4.5;
+const CARD_HIT_R       = 11;
+const ROTATE_HANDLE_R  = 6;
+const ROTATE_HANDLE_HR = 10;
+const ROTATE_HANDLE_OFFSET = 26;
+const MIN_CARD_W       = 40;
+const MIN_CARD_H       = 30;
+
+const CORNER_SIGNS = [
+  [-1, -1],
+  [ 1, -1],
+  [ 1,  1],
+  [-1,  1],
+];
 
 function _rgba(h, a) {
   return "rgba(" + h.r + ", " + h.g + ", " + h.b + ", " + a + ")";
 }
-
 function _rgbaLight(h) {
   const r = Math.round(h.r * 0.7 + 255 * 0.3);
   const g = Math.round(h.g * 0.7 + 255 * 0.3);
@@ -297,95 +443,175 @@ function _rgbaLight(h) {
   return "rgb(" + r + ", " + g + ", " + b + ")";
 }
 
-function _assignColor(doc) {
-  if (doc.color) return;
-  // Colour is keyed by the document name so a doc keeps its hue across
-  // refreshes; two docs that happen to hash to the same slot get
-  // slightly different shades because the palette wraps.
+function _assignColor(file) {
+  if (file.color) return;
   let hash = 0;
-  for (let i = 0; i < doc.name.length; i++) {
-    hash = ((hash << 5) - hash + doc.name.charCodeAt(i)) | 0;
+  const s = file.path || file.name || "";
+  for (let i = 0; i < s.length; i++) {
+    hash = ((hash << 5) - hash + s.charCodeAt(i)) | 0;
   }
   const idx = Math.abs(hash) % board.palette.length;
-  doc.color = board.palette[idx];
+  file.color = board.palette[idx];
+}
+
+function _basenameWithoutExt(path) {
+  if (!path) return "(untitled)";
+  const norm = String(path).replace(/\\/g, "/");
+  const base = norm.substring(norm.lastIndexOf("/") + 1);
+  const dot  = base.lastIndexOf(".");
+  return dot > 0 ? base.substring(0, dot) : base;
+}
+
+/* ==========================================================================
+   FILE STATE HELPERS
+   ========================================================================== */
+
+function fileState(f) {
+  if (f.missing)   return "missing";
+  if (f.open)      return "open";
+  return "closed";
+}
+
+/* ==========================================================================
+   RECTANGLE OVERLAP
+   ========================================================================== */
+
+function _rectsOverlap(x1, y1, w1, h1, x2, y2, w2, h2) {
+  return !(x1 + w1 <= x2 || x2 + w2 <= x1 ||
+           y1 + h1 <= y2 || y2 + h2 <= y1);
+}
+
+/* ==========================================================================
+   ROTATION HELPERS
+   ========================================================================== */
+
+function _rotateOffset(dx, dy, angle) {
+  const c = Math.cos(angle), s = Math.sin(angle);
+  return [dx * c - dy * s, dx * s + dy * c];
+}
+
+function _cardCornersBoard(f) {
+  const cx = f.x + f.w / 2;
+  const cy = f.y + f.h / 2;
+  const hw = f.w / 2, hh = f.h / 2;
+  return CORNER_SIGNS.map(([sx, sy]) => {
+    const [rx, ry] = _rotateOffset(sx * hw, sy * hh, f.rotation);
+    return [cx + rx, cy + ry];
+  });
+}
+
+function _fileCornerScreen(f, corner) {
+  const [bx, by] = _cardCornersBoard(f)[corner];
+  return b2s(bx, by);
+}
+
+function _rotateHandleScreen(f) {
+  const cx = f.x + f.w / 2;
+  const cy = f.y + f.h / 2;
+  const screenOffset = (f.h * view.zoom) / 2 + ROTATE_HANDLE_OFFSET;
+  const [csx, csy] = b2s(cx, cy);
+  const rx =  screenOffset * Math.sin(f.rotation);
+  const ry = -screenOffset * Math.cos(f.rotation);
+  return [csx + rx, csy + ry];
+}
+
+function _cardAABB(f) {
+  const corners = _cardCornersBoard(f);
+  let minX = Infinity, minY = Infinity;
+  let maxX = -Infinity, maxY = -Infinity;
+  for (const [x, y] of corners) {
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+  }
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+/* ==========================================================================
+   Z ORDER
+   ========================================================================== */
+
+function _zSortedIndices() {
+  const idx = [];
+  for (let i = 0; i < board.files.length; i++) idx.push(i);
+  idx.sort((a, b) =>
+    ((board.files[a].z || 0) - (board.files[b].z || 0)));
+  return idx;
+}
+
+function bringToTop(idx) {
+  if (idx < 0 || idx >= board.files.length) return;
+  board.files[idx].z = board.nextZ++;
 }
 
 /* ==========================================================================
    THUMBNAIL CACHE
-   ==========================================================================
-   Each card's thumbnail is a data URL.  Decoding it once into an
-   Image object and hanging that off the doc avoids re-decoding the
-   PNG on every frame.  A doc whose thumb changes (a fresh pull) gets
-   a new Image. */
+   ========================================================================== */
 
-function ensureThumbLoaded(doc) {
-  if (!doc.thumb) return null;
-  if (doc.img && doc.imgUrl === doc.thumb) return doc.img;
+function ensureThumbLoaded(file) {
+  if (!file.thumb) return null;
+  if (file.img && file.imgUrl === file.thumb) return file.img;
   const img = new Image();
   img.onload  = () => draw();
   img.onerror = () => draw();
-  img.src = doc.thumb;
-  doc.img = img;
-  doc.imgUrl = doc.thumb;
+  img.src = file.thumb;
+  file.img = img;
+  file.imgUrl = file.thumb;
   return img;
 }
 
 /* ==========================================================================
    PLACEMENT
-   ==========================================================================
-   Newly-arrived docs are placed to the right of the current rightmost
-   card.  A more elaborate placement algorithm is not needed: the user
-   can always rearrange by hand or press G to grid everything up. */
+   ========================================================================== */
 
 function findFreeSlot() {
-  if (board.docs.length === 0) return { x: 0, y: 0 };
-  const gap = board.gridGap;
-  let maxRight = -Infinity;
-  let minTop   =  Infinity;
-  for (const d of board.docs) {
-    maxRight = Math.max(maxRight, d.x + d.w);
-    minTop   = Math.min(minTop,   d.y);
-  }
-  if (minTop === Infinity) minTop = 0;
-  return { x: maxRight + gap, y: minTop };
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
+  const w  = board.defaultWidth;
+  const h  = board.defaultWidth;
+  const [cx0, cy0] = s2b(cw / 2, ch / 2);
+  const step = 22;
+  const cascade = board.files.length % 12;
+  const cx = cx0 + cascade * step;
+  const cy = cy0 + cascade * step;
+  return { x: cx - w / 2, y: cy - h / 2 };
 }
 
 /* ==========================================================================
-   GRID ARRANGEMENT
+   GRID / FIT / RESIZE
    ========================================================================== */
 
 function arrangeGrid(columns) {
-  if (board.docs.length === 0) return;
+  if (board.files.length === 0) return;
   const gap = board.gridGap;
-  if (!columns) columns = Math.max(1, Math.ceil(Math.sqrt(board.docs.length)));
+  if (!columns) columns = Math.max(1, Math.ceil(Math.sqrt(board.files.length)));
 
   let curX = 0, curY = 0, rowH = 0, col = 0;
-  for (const d of board.docs) {
-    d.w = board.defaultWidth;
-    d.h = Math.round(d.w * (d.aspect || 1));
+  for (const f of board.files) {
+    f.rotation = 0;
+    f.w = board.defaultWidth;
+    f.h = Math.round(f.w * (f.aspect || 1));
+    f.userSized = false;
     if (col >= columns) {
       curX = 0;
       curY += rowH + gap;
       rowH = 0;
       col  = 0;
     }
-    d.x = curX;
-    d.y = curY;
-    curX += d.w + gap;
-    rowH = Math.max(rowH, d.h);
+    f.x = curX;
+    f.y = curY;
+    curX += f.w + gap;
+    rowH = Math.max(rowH, f.h);
     col++;
   }
 }
-
-/* ==========================================================================
-   FIT ALL
-   ========================================================================== */
 
 function fitAll() {
   const cw = window.innerWidth;
   const ch = window.innerHeight;
 
-  if (board.docs.length === 0) {
+  if (board.files.length === 0) {
     view.zoom = 1;
     view.panX = cw / 2;
     view.panY = ch / 2;
@@ -395,11 +621,12 @@ function fitAll() {
 
   let minX =  Infinity, minY =  Infinity;
   let maxX = -Infinity, maxY = -Infinity;
-  for (const d of board.docs) {
-    minX = Math.min(minX, d.x);
-    minY = Math.min(minY, d.y);
-    maxX = Math.max(maxX, d.x + d.w);
-    maxY = Math.max(maxY, d.y + d.h);
+  for (const f of board.files) {
+    const bb = _cardAABB(f);
+    minX = Math.min(minX, bb.x);
+    minY = Math.min(minY, bb.y);
+    maxX = Math.max(maxX, bb.x + bb.w);
+    maxY = Math.max(maxY, bb.y + bb.h);
   }
 
   const pad = 60;
@@ -412,10 +639,6 @@ function fitAll() {
   view.panY = (ch - (maxY + minY) * view.zoom) / 2;
   draw();
 }
-
-/* ==========================================================================
-   RESIZE
-   ========================================================================== */
 
 function resize() {
   dpr = window.devicePixelRatio || 1;
@@ -432,18 +655,358 @@ function resize() {
 window.addEventListener("resize", resize);
 
 /* ==========================================================================
-   HIT TEST
+   HIT TESTING
    ========================================================================== */
 
-function docHitTest(sx, sy) {
-  for (let i = board.docs.length - 1; i >= 0; i--) {
-    const d = board.docs[i];
-    const [x, y] = b2s(d.x, d.y);
-    const w = d.w * view.zoom;
-    const h = d.h * view.zoom;
-    if (sx >= x && sx <= x + w && sy >= y && sy <= y + h) return i;
+function _boardPointInCard(f, bx, by) {
+  const cx = f.x + f.w / 2;
+  const cy = f.y + f.h / 2;
+  const dx = bx - cx;
+  const dy = by - cy;
+  const c = Math.cos(-f.rotation), s = Math.sin(-f.rotation);
+  const lx = dx * c - dy * s;
+  const ly = dx * s + dy * c;
+  return Math.abs(lx) <= f.w / 2 && Math.abs(ly) <= f.h / 2;
+}
+
+function fileHitTest(sx, sy) {
+  const order = _zSortedIndices();
+  const [bx, by] = s2b(sx, sy);
+  for (let k = order.length - 1; k >= 0; k--) {
+    const i = order[k];
+    if (_boardPointInCard(board.files[i], bx, by)) return i;
   }
   return -1;
+}
+
+function fileCornerHitTest(sx, sy) {
+  const order = _zSortedIndices();
+  for (let k = order.length - 1; k >= 0; k--) {
+    const i = order[k];
+    const f = board.files[i];
+    for (let c = 0; c < 4; c++) {
+      const [cx, cy] = _fileCornerScreen(f, c);
+      if (Math.hypot(sx - cx, sy - cy) <= CARD_HIT_R) {
+        return { idx: i, corner: c };
+      }
+    }
+  }
+  return null;
+}
+
+function rotateHandleHitTest(sx, sy) {
+  if (board.selectedIdx < 0 || board.selectedIdx >= board.files.length) return false;
+  const f = board.files[board.selectedIdx];
+  const [hx, hy] = _rotateHandleScreen(f);
+  return Math.hypot(sx - hx, sy - hy) <= ROTATE_HANDLE_HR;
+}
+
+function _resizeCursorFor(corner) {
+  return (corner === 0 || corner === 2) ? "nwse-resize" : "nesw-resize";
+}
+
+/* ==========================================================================
+   RESIZE — rotation-aware
+   ========================================================================== */
+
+function resizeCardFromCorner(f, corner, bx, by,
+                              anchorX, anchorY,
+                              startAspect, preserveAspect) {
+  const [dsx, dsy] = CORNER_SIGNS[corner];
+  const ddx = bx - anchorX;
+  const ddy = by - anchorY;
+  const [lx, ly] = _rotateOffset(ddx, ddy, -f.rotation);
+
+  let rw = dsx * lx;
+  let rh = dsy * ly;
+  rw = Math.max(MIN_CARD_W, rw);
+  rh = Math.max(MIN_CARD_H, rh);
+
+  let nw, nh;
+  if (preserveAspect) {
+    if (rw * startAspect >= rh) {
+      nw = rw;
+      nh = rw * startAspect;
+    } else {
+      nh = rh;
+      nw = rh / startAspect;
+    }
+  } else {
+    nw = rw;
+    nh = rh;
+  }
+
+  const [axRot, ayRot] = _rotateOffset(-dsx * nw / 2, -dsy * nh / 2, f.rotation);
+  const ncx = anchorX - axRot;
+  const ncy = anchorY - ayRot;
+
+  f.w = nw;
+  f.h = nh;
+  f.x = ncx - nw / 2;
+  f.y = ncy - nh / 2;
+}
+
+/* ==========================================================================
+   FILE MANAGEMENT
+   ========================================================================== */
+
+function addFileByPath(path) {
+  if (!path) return -1;
+  const norm = String(path);
+  for (let i = 0; i < board.files.length; i++) {
+    if (board.files[i].path === norm) return i;
+  }
+  const f = {
+    path:       norm,
+    normPath:   null,
+    name:       _basenameWithoutExt(norm),
+    thumb:      null,
+    imgUrl:     null,
+    img:        null,
+    aspect:     1.0,
+    docWidth:   0,
+    docHeight:  0,
+    w:          board.defaultWidth,
+    h:          board.defaultWidth,
+    x:          0,
+    y:          0,
+    rotation:   0,
+    z:          board.nextZ++,
+    userSized:  false,
+    color:      null,
+    open:       false,
+    active:     false,
+    modified:   false,
+    missing:    false,
+    kritaName:  null,
+  };
+  _assignColor(f);
+  const slot = findFreeSlot();
+  f.x = slot.x;
+  f.y = slot.y;
+  board.files.push(f);
+  return board.files.length - 1;
+}
+
+function removeFile(idx) {
+  if (idx < 0 || idx >= board.files.length) return;
+  board.files.splice(idx, 1);
+  if (board.selectedIdx === idx) board.selectedIdx = -1;
+  else if (board.selectedIdx > idx) board.selectedIdx -= 1;
+  syncFileList();
+  draw();
+}
+
+/* ==========================================================================
+   RECTANGLE AND POLYGON OVERLAP
+   ==========================================================================
+   _rectsOverlap is the cheap AABB test used for early filters.
+
+   _polygonsOverlap is the actual test between two rotated cards: it
+   returns true iff the two convex quads share any area.  A pair of
+   rotated rects whose AABBs overlap but whose edges do not actually
+   cross is not an overlap, and nothing should be pasted. */
+
+function _rectsOverlap(x1, y1, w1, h1, x2, y2, w2, h2) {
+  return !(x1 + w1 <= x2 || x2 + w2 <= x1 ||
+           y1 + h1 <= y2 || y2 + h2 <= y1);
+}
+
+function _pointInPoly(p, poly) {
+  let inside = false;
+  const n = poly.length;
+  for (let i = 0, j = n - 1; i < n; j = i++) {
+    const xi = poly[i][0], yi = poly[i][1];
+    const xj = poly[j][0], yj = poly[j][1];
+    if (((yi > p[1]) !== (yj > p[1])) &&
+        (p[0] < (xj - xi) * (p[1] - yi) / (yj - yi) + xi)) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function _segmentsIntersect(a1, a2, b1, b2) {
+  const d1x = a2[0] - a1[0], d1y = a2[1] - a1[1];
+  const d2x = b2[0] - b1[0], d2y = b2[1] - b1[1];
+  const denom = d1x * d2y - d1y * d2x;
+  if (Math.abs(denom) < 1e-12) return false;
+  const t = ((b1[0] - a1[0]) * d2y - (b1[1] - a1[1]) * d2x) / denom;
+  const u = ((b1[0] - a1[0]) * d1y - (b1[1] - a1[1]) * d1x) / denom;
+  return t >= 0 && t <= 1 && u >= 0 && u <= 1;
+}
+
+function _polygonsOverlap(polyA, polyB) {
+  for (const p of polyA) if (_pointInPoly(p, polyB)) return true;
+  for (const p of polyB) if (_pointInPoly(p, polyA)) return true;
+  const nA = polyA.length, nB = polyB.length;
+  for (let i = 0; i < nA; i++) {
+    const a1 = polyA[i], a2 = polyA[(i + 1) % nA];
+    for (let j = 0; j < nB; j++) {
+      const b1 = polyB[j], b2 = polyB[(j + 1) % nB];
+      if (_segmentsIntersect(a1, a2, b1, b2)) return true;
+    }
+  }
+  return false;
+}
+
+/* ==========================================================================
+   PROJECTION TRANSFORM
+   ==========================================================================
+   Compute the affine map from the SOURCE document's pixel space to
+   the TARGET document's pixel space, taking both cards' positions
+   and rotations into account.
+
+   The chain is:
+
+       A_doc pixels
+           → A card's local unrotated frame    (scale + offset)
+           → board space                       (rotate by A, translate)
+           → B card's local unrotated frame    (translate, rotate by -B)
+           → B_doc pixels                      (scale + offset)
+
+   Both the source and the target images are stretched on the board
+   to fill their cards; if the card's aspect has been changed away
+   from the document's, that stretch is baked into the transform.
+   Whatever the user sees overlapping on the board is what ends up
+   pasted into the target document.
+
+   The result is a 2×3 affine map in column-vector form:
+
+       [x_B]   [a c e] [x_A]
+       [y_B] = [b d f] [y_A]
+       [ 1 ]   [0 0 1] [ 1 ]
+
+   The daemon builds a QTransform out of (a, b, c, d, e, f) and
+   applies it to the source document's composite.  QTransform's
+   constructor takes (m11, m12, m13, m21, m22, m23, m31, m32, m33);
+   mapping to our (a..f) means m11=a, m12=b, m21=c, m22=d, m31=e,
+   m32=f, and the rest zero/one. */
+
+function _mat3mul(A, B) {
+  // Column-vector 3×3 multiply: returns A · B.
+  const C = [[0,0,0],[0,0,0],[0,0,0]];
+  for (let i = 0; i < 3; i++) {
+    for (let j = 0; j < 3; j++) {
+      let s = 0;
+      for (let k = 0; k < 3; k++) s += A[i][k] * B[k][j];
+      C[i][j] = s;
+    }
+  }
+  return C;
+}
+
+function _buildProjectionTransform(A, B) {
+  const A_cx = A.x + A.w / 2;
+  const A_cy = A.y + A.h / 2;
+  const B_cx = B.x + B.w / 2;
+  const B_cy = B.y + B.h / 2;
+  const A_W = A.docWidth,  A_H = A.docHeight;
+  const B_W = B.docWidth,  B_H = B.docHeight;
+  const Aw = A.w, Ah = A.h;
+  const Bw = B.w, Bh = B.h;
+  const cosA = Math.cos(A.rotation), sinA = Math.sin(A.rotation);
+  const cosB = Math.cos(B.rotation), sinB = Math.sin(B.rotation);
+
+  // A_doc → A_local:  scale by (Aw/A_W, Ah/A_H), then translate by
+  // (-Aw/2, -Ah/2), so A_doc (0,0) → A_local (-Aw/2, -Ah/2).
+  const M1 = [
+    [Aw / A_W,        0, -Aw / 2],
+    [       0, Ah / A_H, -Ah / 2],
+    [       0,        0,       1],
+  ];
+
+  // A_local → board:  rotate by A.rotation, then translate by
+  // (A_cx, A_cy).
+  const M2 = [
+    [cosA, -sinA, A_cx],
+    [sinA,  cosA, A_cy],
+    [   0,     0,    1],
+  ];
+
+  // board → B_local:  translate by (-B_cx, -B_cy), then rotate by
+  // -B.rotation.
+  const M3 = [
+    [ cosB, sinB, -cosB * B_cx - sinB * B_cy],
+    [-sinB, cosB,  sinB * B_cx - cosB * B_cy],
+    [    0,    0,                          1],
+  ];
+
+  // B_local → B_doc:  translate by (Bw/2, Bh/2), then scale by
+  // (B_W/Bw, B_H/Bh).
+  const M4 = [
+    [B_W / Bw,        0, B_W / 2],
+    [       0, B_H / Bh, B_H / 2],
+    [       0,        0,       1],
+  ];
+
+  let M = _mat3mul(M4, M3);
+  M = _mat3mul(M, M2);
+  M = _mat3mul(M, M1);
+
+  return {
+    a: M[0][0], c: M[0][1], e: M[0][2],
+    b: M[1][0], d: M[1][1], f: M[1][2],
+  };
+}
+
+/* ==========================================================================
+   OVERLAP REGIONS
+   ==========================================================================
+   Given the currently-selected file A, find every other file B whose
+   card's rotated rectangle overlaps A's, and compute for each the
+   affine transform that maps A's document pixels to B's.
+
+   Overlap is decided on the actual rotated quads, not on their
+   AABBs: two cards whose bounding boxes overlap but whose edges do
+   not cross have no visual overlap and nothing should be pasted.
+
+   Closed targets are counted (they cannot receive a paste) and
+   reported; the caller surfaces the count in the status line. */
+
+function computeProjectionRegions() {
+  if (board.selectedIdx < 0 || board.selectedIdx >= board.files.length) {
+    return { regions: [], skippedClosed: 0, reason: "no card selected" };
+  }
+  const A = board.files[board.selectedIdx];
+
+  if (!A.open || !A.docWidth || !A.docHeight) {
+    const bits = [];
+    if (!A.open)
+      bits.push("not open in Krita (press R)");
+    if (A.open && (!A.docWidth || !A.docHeight))
+      bits.push("document dimensions unknown (press R)");
+    return {
+      regions: [], skippedClosed: 0,
+      reason: "selected card: " + bits.join(", ")
+    };
+  }
+
+  const A_poly = _cardCornersBoard(A);
+  const regions = [];
+  let skippedClosed = 0;
+
+  for (let i = 0; i < board.files.length; i++) {
+    if (i === board.selectedIdx) continue;
+    const B = board.files[i];
+    const B_poly = _cardCornersBoard(B);
+
+    if (!_polygonsOverlap(A_poly, B_poly)) continue;
+    if (!B.open || !B.docWidth || !B.docHeight) {
+      skippedClosed++;
+      continue;
+    }
+
+    const t = _buildProjectionTransform(A, B);
+    regions.push({
+      name:            "projection of " + A.name,
+      source_document: A.path,
+      target_document: B.path,
+      a: t.a, b: t.b, c: t.c, d: t.d, e: t.e, f: t.f,
+    });
+  }
+
+  return { regions: regions, skippedClosed: skippedClosed, reason: "" };
 }
 
 /* ==========================================================================
@@ -454,9 +1017,6 @@ function _drawBoardGrid() {
   const cw = window.innerWidth;
   const ch = window.innerHeight;
 
-  // Board-space spacing of the base grid.  When zoomed out far enough
-  // that the base spacing would be denser than ~16 screen pixels,
-  // step up by powers of two until the visible grid is legible.
   let step = 64;
   while (step * view.zoom < 16) step *= 2;
   while (step * view.zoom > 160) step /= 2;
@@ -481,119 +1041,195 @@ function _drawBoardGrid() {
    CARD
    ========================================================================== */
 
-function _drawDocCard(doc, isSelected) {
-  const hue = doc.color || board.palette[0];
+function _drawFileCard(file, isSelected) {
+  const hue   = file.color || board.palette[0];
+  const state = fileState(file);
 
-  const [sx, sy] = b2s(doc.x, doc.y);
-  const sw = doc.w * view.zoom;
-  const sh = doc.h * view.zoom;
+  const cx = file.x + file.w / 2;
+  const cy = file.y + file.h / 2;
+  const [csx, csy] = b2s(cx, cy);
+  const sw = file.w * view.zoom;
+  const sh = file.h * view.zoom;
   const RADIUS = 3;
 
-  // Drop shadow.
+  ctx.save();
+  ctx.translate(csx, csy);
+  ctx.rotate(file.rotation);
+
+  // Shadow.
   ctx.save();
   ctx.shadowColor = "rgba(0, 0, 0, 0.55)";
   ctx.shadowBlur = 18;
   ctx.shadowOffsetY = 4;
   ctx.fillStyle = "#0e1622";
   ctx.beginPath();
-  _roundRect(sx, sy, sw, sh, RADIUS);
+  _roundRect(-sw / 2, -sh / 2, sw, sh, RADIUS);
   ctx.fill();
   ctx.restore();
 
-  // Thumbnail.  Letterbox if the actual thumbnail image and the card
-  // disagree on aspect (only happens if the daemon didn't return
-  // dimensions for a document that's still resolving).
-  const img = ensureThumbLoaded(doc);
+  // Body.
+  ctx.save();
+  ctx.beginPath();
+  _roundRect(-sw / 2, -sh / 2, sw, sh, RADIUS);
+  ctx.clip();
+
+  const img = ensureThumbLoaded(file);
   if (img && img.complete && img.naturalWidth > 0) {
-    ctx.save();
-    ctx.beginPath();
-    _roundRect(sx, sy, sw, sh, RADIUS);
-    ctx.clip();
+    ctx.globalAlpha = (state === "open")   ? 1.00
+                    : (state === "closed") ? 0.55
+                    :                        0.20;
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "high";
-
-    const imgAR  = img.naturalWidth / img.naturalHeight;
-    const cardAR = sw / sh;
-    let dx = sx, dy = sy, dw = sw, dh = sh;
-    if (imgAR > cardAR) {
-      dh = sw / imgAR;
-      dy = sy + (sh - dh) / 2;
-    } else {
-      dw = sh * imgAR;
-      dx = sx + (sw - dw) / 2;
-    }
-    ctx.drawImage(img, dx, dy, dw, dh);
-    ctx.restore();
+    // Stretch the image to fill the card completely.  If the card's
+    // aspect no longer matches the document's, the image is
+    // squashed or stretched rather than letterboxed; a gap would
+    // misrepresent where the document ends.
+    ctx.drawImage(img, -sw / 2, -sh / 2, sw, sh);
+    ctx.globalAlpha = 1.0;
   } else {
-    // Placeholder for a doc whose thumbnail is decoding (thumb set,
-    // img not yet complete) or was never returned (thumb null).
-    ctx.fillStyle = "#0e1622";
-    ctx.fillRect(sx, sy, sw, sh);
+    ctx.fillStyle = state === "missing" ? "#1a0c10" : "#0e1622";
+    ctx.fillRect(-sw / 2, -sh / 2, sw, sh);
     if (sw > 60 && sh > 20) {
       ctx.fillStyle = "#3d4756";
       ctx.font = "700 11px 'JetBrains Mono', monospace";
       ctx.textAlign    = "center";
       ctx.textBaseline = "middle";
-      const msg = doc.thumb ? "loading\u2026" : "no thumbnail";
-      ctx.fillText(msg, sx + sw / 2, sy + sh / 2);
+      let msg;
+      if (state === "missing")  msg = "file missing";
+      else if (file.thumb)      msg = "loading\u2026";
+      else                      msg = "not loaded";
+      ctx.fillText(msg, 0, 0);
     }
   }
+  ctx.restore();
 
   // Border.
-  const strokeAlpha = isSelected ? 1.00 : (doc.active ? 0.85 : 0.55);
-  const strokeW     = isSelected ? 2.4  : 1.4;
-  ctx.strokeStyle = _rgba(hue, strokeAlpha);
-  ctx.lineWidth   = strokeW;
+  let borderColor, borderAlpha, borderW;
+  if (state === "missing") {
+    borderColor = { r: 212, g: 133, b: 144 };
+    borderAlpha = isSelected ? 1.00 : 0.75;
+    borderW     = isSelected ? 2.4 : 1.4;
+  } else if (state === "closed") {
+    borderColor = hue;
+    borderAlpha = isSelected ? 0.85 : 0.35;
+    borderW     = isSelected ? 2.4 : 1.2;
+  } else {
+    borderColor = hue;
+    borderAlpha = isSelected ? 1.00 : (file.active ? 0.85 : 0.65);
+    borderW     = isSelected ? 2.4 : 1.4;
+  }
+  ctx.strokeStyle = _rgba(borderColor, borderAlpha);
+  ctx.lineWidth   = borderW;
   ctx.beginPath();
-  _roundRect(sx + 0.5, sy + 0.5, sw - 1, sh - 1, RADIUS);
+  _roundRect(-sw / 2 + 0.5, -sh / 2 + 0.5, sw - 1, sh - 1, RADIUS);
   ctx.stroke();
 
-  // Active-document glow.
-  if (doc.active) {
+  if (file.active && state === "open") {
     ctx.save();
     ctx.shadowColor = _rgba(hue, 0.85);
     ctx.shadowBlur = 14;
     ctx.strokeStyle = _rgba(hue, 0.95);
     ctx.lineWidth = 2.0;
     ctx.beginPath();
-    _roundRect(sx + 0.5, sy + 0.5, sw - 1, sh - 1, RADIUS);
+    _roundRect(-sw / 2 + 0.5, -sh / 2 + 0.5, sw - 1, sh - 1, RADIUS);
     ctx.stroke();
     ctx.restore();
   }
 
-  // Modified dot.
-  if (doc.modified && sw > 30 && sh > 30) {
+  // State icon, top-right of the rotated card.
+  if (sw > 40 && sh > 24) {
+    const ix = sw / 2 - 12;
+    const iy = -sh / 2 + 12;
+    if (state === "open") {
+      ctx.beginPath();
+      ctx.arc(ix, iy, 4.0, 0, Math.PI * 2);
+      ctx.fillStyle = file.modified ? "#ffc966" : _rgba(hue, 0.95);
+      ctx.fill();
+      ctx.strokeStyle = "#0a0e14";
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+    } else if (state === "closed") {
+      ctx.beginPath();
+      ctx.arc(ix, iy, 4.0, 0, Math.PI * 2);
+      ctx.strokeStyle = _rgba(hue, 0.65);
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = "#d48590";
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.moveTo(ix - 4, iy - 4); ctx.lineTo(ix + 4, iy + 4);
+      ctx.moveTo(ix + 4, iy - 4); ctx.lineTo(ix - 4, iy + 4);
+      ctx.stroke();
+    }
+  }
+
+  // Corner handles on the selected card.
+  if (isSelected && sw > 20 && sh > 20) {
+    const hw = sw / 2, hh = sh / 2;
+    for (const [sx, sy] of CORNER_SIGNS) {
+      ctx.beginPath();
+      ctx.arc(sx * hw, sy * hh, CARD_HANDLE_R, 0, Math.PI * 2);
+      ctx.fillStyle = _rgba(hue, 0.95);
+      ctx.fill();
+      ctx.strokeStyle = "#0a0e14";
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+    }
+  }
+
+  // Rotate handle: above the card's top edge, rotated with the card.
+  if (isSelected && sw > 20 && sh > 20) {
+    const hy = -sh / 2 - ROTATE_HANDLE_OFFSET;
     ctx.beginPath();
-    ctx.arc(sx + sw - 10, sy + 10, 4.5, 0, Math.PI * 2);
-    ctx.fillStyle = "#ffc966";
+    ctx.moveTo(0, -sh / 2);
+    ctx.lineTo(0, hy + ROTATE_HANDLE_R);
+    ctx.strokeStyle = _rgba(hue, 0.55);
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(0, hy, ROTATE_HANDLE_R, 0, Math.PI * 2);
+    ctx.fillStyle = _rgbaLight(hue);
     ctx.fill();
     ctx.strokeStyle = "#0a0e14";
-    ctx.lineWidth = 1.2;
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(0, hy, ROTATE_HANDLE_R * 0.5, Math.PI * 0.15, Math.PI * 1.85);
+    ctx.strokeStyle = "#0a0e14";
+    ctx.lineWidth = 1.1;
     ctx.stroke();
   }
 
-  // Name label below the card.
+  // Label — drawn inside the transform, so it rotates with the card.
   if (sw > 60) {
-    ctx.save();
     ctx.font = "700 11px 'JetBrains Mono', 'Fira Code', monospace";
     ctx.textAlign    = "left";
     ctx.textBaseline = "top";
-    const label = doc.name;
+    const label = file.name;
     const labelW = ctx.measureText(label).width;
     const padX = 6;
     const lh   = 18;
-    const lx   = sx;
-    const ly   = sy + sh + 6;
+    const lx   = -sw / 2;
+    const ly   = sh / 2 + 6;
 
     ctx.fillStyle = "rgba(10, 14, 20, 0.86)";
     ctx.fillRect(lx, ly, labelW + 2 * padX, lh);
-    ctx.strokeStyle = _rgba(hue, 0.75);
+    ctx.strokeStyle = _rgba(
+      state === "missing" ? {r:212,g:133,b:144} : hue,
+      0.75
+    );
     ctx.lineWidth = 0.8;
     ctx.strokeRect(lx + 0.4, ly + 0.4, labelW + 2 * padX - 0.8, lh - 0.8);
-    ctx.fillStyle = _rgba(hue, 0.95);
+    ctx.fillStyle = state === "missing"
+      ? "rgb(212, 133, 144)"
+      : _rgba(hue, 0.95);
     ctx.fillText(label, lx + padX, ly + 4);
-    ctx.restore();
   }
+
+  ctx.restore();
 }
 
 function _roundRect(x, y, w, h, r) {
@@ -620,27 +1256,47 @@ function drawBoardView() {
 
   _drawBoardGrid();
 
-  // Non-selected first, selected on top.
-  for (let i = 0; i < board.docs.length; i++) {
-    if (i === board.selectedIdx) continue;
-    _drawDocCard(board.docs[i], false);
-  }
-  if (board.selectedIdx >= 0 && board.selectedIdx < board.docs.length) {
-    _drawDocCard(board.docs[board.selectedIdx], true);
+  const order = _zSortedIndices();
+  for (const i of order) {
+    _drawFileCard(board.files[i], i === board.selectedIdx);
   }
 
-  // Empty-state caption.
-  if (board.docs.length === 0) {
+  if (board.files.length === 0) {
     ctx.save();
     ctx.fillStyle = "#5a6774";
     ctx.font = "700 12px 'JetBrains Mono', monospace";
     ctx.textAlign    = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText("no documents on the board — press R to pull from Krita",
+    ctx.fillText("empty board — click + Add files… or Retrieve open",
                  cw / 2, ch / 2);
     ctx.restore();
   }
 }
+
+/* ==========================================================================
+   ERROR REPORTING
+   ========================================================================== */
+
+function reportError(tag, message) {
+  try {
+    fetch("/log", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ tag: tag, message: String(message) }),
+    }).catch(() => {});
+  } catch (_) {}
+  try { console.error("[" + tag + "] " + message); } catch (_) {}
+}
+
+window.addEventListener("error", (e) => {
+  const loc = (e.filename || "") + ":" + (e.lineno || "") + ":" + (e.colno || "");
+  reportError("uncaught", (e.message || "unknown error") + " @ " + loc);
+});
+window.addEventListener("unhandledrejection", (e) => {
+  let reason = e.reason;
+  if (reason && reason.message) reason = reason.message;
+  reportError("unhandled-rejection", reason || "no reason given");
+});
 
 /* ==========================================================================
    REFRESH
@@ -654,15 +1310,22 @@ async function refreshFromKrita() {
 
   const statusEl = document.getElementById("status");
   if (statusEl) {
-    statusEl.textContent = "pulling thumbnails from Krita…";
+    statusEl.textContent = "asking Krita which files are open…";
     statusEl.className   = "";
   }
 
+  const paths = board.files.map(f => f.path);
+
   let payload;
   try {
-    const res = await fetch("/krita/documents");
+    const res = await fetch("/krita/refresh", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ paths: paths, max_size: 512 }),
+    });
     payload = await res.json();
   } catch (err) {
+    reportError("refresh", err.message);
     if (statusEl) {
       statusEl.textContent = "Request failed: " + err.message;
       statusEl.className   = "bad";
@@ -674,130 +1337,435 @@ async function refreshFromKrita() {
   _refreshInFlight = false;
 
   if (!payload || !payload.success) {
+    const msg = (payload && payload.message) ? payload.message : "unknown error";
+    reportError("refresh", msg);
     if (statusEl) {
-      statusEl.textContent =
-        "Krita: " + (payload && payload.message ? payload.message : "unknown error");
-      statusEl.className = "bad";
+      statusEl.textContent = "Krita: " + msg;
+      statusEl.className   = "bad";
     }
     return;
   }
 
-  mergeIncomingDocs(payload.documents || [], payload.active || null);
+  mergeIncoming(payload);
 
   if (payload.partial && payload.message && statusEl) {
     statusEl.textContent = payload.message;
     statusEl.className   = "warn";
     setTimeout(updateStatus, 1800);
-  } else if (statusEl) {
-    statusEl.textContent =
-      "refreshed · " + board.docs.length + " doc" +
-      (board.docs.length === 1 ? "" : "s");
-    statusEl.className = "ok";
-    setTimeout(updateStatus, 1200);
+  } else {
+    const opens  = board.files.filter(f => f.open).length;
+    const closed = board.files.filter(f => !f.open && !f.missing).length;
+    const miss   = board.files.filter(f => f.missing).length;
+    if (statusEl) {
+      statusEl.textContent =
+        opens + " open · " + closed + " closed" +
+        (miss ? (" · " + miss + " missing") : "");
+      statusEl.className = miss ? "warn" : "ok";
+      setTimeout(updateStatus, 1600);
+    }
   }
 
-  syncDocList();
+  syncFileList();
   draw();
+}
+
+/* ==========================================================================
+   RETRIEVE OPEN
+   ========================================================================== */
+
+async function retrieveOpenFromKrita() {
+  const statusEl = document.getElementById("status");
+  if (statusEl) {
+    statusEl.textContent = "retrieving currently-open documents from Krita…";
+    statusEl.className   = "";
+  }
+
+  const paths = board.files.map(f => f.path);
+
+  let payload;
+  try {
+    const res = await fetch("/krita/refresh", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ paths: paths, max_size: 512 }),
+    });
+    payload = await res.json();
+  } catch (err) {
+    reportError("retrieve", err.message);
+    if (statusEl) {
+      statusEl.textContent = "Retrieve failed: " + err.message;
+      statusEl.className   = "bad";
+    }
+    return;
+  }
+
+  if (!payload || !payload.success) {
+    const msg = (payload && payload.message) ? payload.message : "unknown error";
+    reportError("retrieve", msg);
+    if (statusEl) {
+      statusEl.textContent = "Krita: " + msg;
+      statusEl.className   = "bad";
+    }
+    return;
+  }
+
+  const incoming = payload.all_documents || [];
+  const onBoard  = new Set();
+  for (const f of board.files) {
+    if (f.normPath) onBoard.add(f.normPath);
+  }
+
+  let added = 0;
+  for (const doc of incoming) {
+    const n = doc.norm_path;
+    if (!n) continue;
+    if (onBoard.has(n)) continue;
+    const idx = addFileByPath(doc.file_name);
+    if (idx >= 0) {
+      board.files[idx].normPath = n;
+      onBoard.add(n);
+      added++;
+    }
+  }
+
+  mergeIncoming(payload);
+
+  syncFileList();
+  draw();
+
+  if (statusEl) {
+    if (added > 0) {
+      statusEl.textContent =
+        "retrieved " + added + " new document" + (added === 1 ? "" : "s");
+      statusEl.className = "ok";
+    } else {
+      statusEl.textContent = "no new open documents";
+      statusEl.className   = "";
+    }
+    setTimeout(updateStatus, 1600);
+  }
 }
 
 /* ==========================================================================
    MERGE POLICY
    ==========================================================================
-   Incoming docs are matched to existing ones by name.  A match keeps
-   the existing position and color; a mismatch is removed.  Everything
-   in the incoming list ends up on the board after this call.
+   On refresh, a card that the user has never resized by hand keeps
+   its height locked to width · aspect, so it mirrors the document's
+   own proportions.  Once the user has dragged a corner on the card
+   (`userSized === true`), the user's size wins and refresh only
+   updates metadata. */
 
-   The `active` field on each doc is set from the payload's own
-   `active` marker for the currently-focused document in Krita, and
-   from each doc's own `active` field otherwise (the daemon reports
-   it, so it survives round-trips without the caller having to
-   recompute it). */
+function mergeIncoming(payload) {
+  const results = payload.results || [];
+  const byPath  = new Map();
+  for (const r of results) byPath.set(r.path, r);
 
-function mergeIncomingDocs(incoming, activeName) {
-  const byName = new Map();
-  for (const d of board.docs) byName.set(d.name, d);
+  const activeName = payload.active || null;
 
-  const merged = [];
-  for (const inc of incoming) {
-    const name = inc.name || "(untitled)";
-    const existing = byName.get(name);
+  for (const f of board.files) {
+    const r = byPath.get(f.path);
+    if (!r) continue;
 
-    if (existing) {
-      existing.thumb     = inc.data_url || existing.thumb;
-      existing.modified  = !!inc.modified;
-      existing.active    = (activeName === name) || !!inc.active;
-      if (inc.width && inc.height) {
-        existing.aspect = inc.height / inc.width;
-        existing.h      = Math.round(existing.w * existing.aspect);
+    if (r.norm_path) f.normPath = r.norm_path;
+
+    if (r.open && r.doc) {
+      const doc = r.doc;
+      f.open     = true;
+      f.active   = !!doc.active || (activeName && doc.name === activeName);
+      f.modified = !!doc.modified;
+      f.missing  = false;
+      f.kritaName = doc.file_name || doc.name || f.kritaName;
+      if (doc.data_url) f.thumb = doc.data_url;
+      if (doc.width && doc.height) {
+        f.docWidth  = doc.width;
+        f.docHeight = doc.height;
+        f.aspect    = doc.height / doc.width;
+        // Preserve the user's size once they have set it.  Until
+        // then, the card mirrors its document's own proportions.
+        if (!f.userSized) {
+          f.h = Math.round(f.w * f.aspect);
+        }
       }
-      merged.push(existing);
-      byName.delete(name);
     } else {
-      const aspect = (inc.height && inc.width)
-        ? (inc.height / inc.width)
-        : 1.0;
-      const doc = {
-        id:        name,
-        name:      name,
-        thumb:     inc.data_url || null,
-        aspect:    aspect,
-        w:         board.defaultWidth,
-        h:         Math.round(board.defaultWidth * aspect),
-        x:         0,
-        y:         0,
-        modified:  !!inc.modified,
-        active:    (activeName === name) || !!inc.active,
-      };
-      _assignColor(doc);
-      const slot = findFreeSlot();
-      doc.x = slot.x;
-      doc.y = slot.y;
-      merged.push(doc);
+      f.open     = false;
+      f.active   = false;
+      f.modified = false;
+      f.missing  = !!r.missing;
     }
   }
+}
 
-  board.docs = merged;
-  if (board.selectedIdx >= board.docs.length) board.selectedIdx = -1;
+/* ==========================================================================
+   OPEN
+   ========================================================================== */
+
+async function openFileInKrita(file) {
+  if (!file) return false;
+
+  const statusEl = document.getElementById("status");
+  if (statusEl) {
+    statusEl.textContent = "opening " + file.name + " in Krita…";
+    statusEl.className   = "";
+  }
+
+  try {
+    const res = await fetch("/krita/open", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ path: file.path, add_view: true }),
+    });
+    const payload = await res.json();
+    if (payload && payload.success) {
+      if (statusEl) {
+        statusEl.textContent = payload.message || ("opened " + file.name);
+        statusEl.className   = "ok";
+      }
+      return true;
+    } else {
+      const msg = (payload && payload.message) ? payload.message : "unknown";
+      reportError("open", msg);
+      if (statusEl) {
+        statusEl.textContent = "open failed: " + msg;
+        statusEl.className   = "bad";
+      }
+      return false;
+    }
+  } catch (err) {
+    reportError("open", err.message);
+    if (statusEl) {
+      statusEl.textContent = "open request failed: " + err.message;
+      statusEl.className   = "bad";
+    }
+    return false;
+  }
+}
+
+async function openAllMissing() {
+  const missing = board.files.filter(f => !f.open && !f.missing);
+  if (missing.length === 0) {
+    flashStatus("every file already open", "ok");
+    return;
+  }
+
+  const statusEl = document.getElementById("status");
+  let opened = 0;
+  for (let i = 0; i < missing.length; i++) {
+    if (statusEl) {
+      statusEl.textContent =
+        "opening " + (i + 1) + " / " + missing.length + ": " + missing[i].name;
+      statusEl.className = "";
+    }
+    const ok = await openFileInKrita(missing[i]);
+    if (ok) opened++;
+  }
+
+  await refreshFromKrita();
+
+  if (statusEl) {
+    statusEl.textContent = "opened " + opened + " of " + missing.length;
+    statusEl.className   = (opened === missing.length) ? "ok" : "warn";
+    setTimeout(updateStatus, 1800);
+  }
 }
 
 /* ==========================================================================
    ACTIVATE
    ========================================================================== */
 
-async function activateDocument(doc) {
-  if (!doc) return;
+async function activateFile(file) {
+  if (!file) return;
+  if (!file.open) {
+    const ok = await openFileInKrita(file);
+    if (ok) await refreshFromKrita();
+    return;
+  }
+
   const statusEl = document.getElementById("status");
   if (statusEl) {
-    statusEl.textContent = "activating " + doc.name + "…";
+    statusEl.textContent = "activating " + file.name + "…";
     statusEl.className   = "";
   }
+
+  const key = file.kritaName || file.path;
+
   try {
     const res = await fetch("/krita/activate", {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ name: doc.name }),
+      body:    JSON.stringify({ name: key }),
     });
     const payload = await res.json();
     if (payload && payload.success) {
       if (statusEl) {
-        statusEl.textContent = payload.message || ("activated " + doc.name);
+        statusEl.textContent = payload.message || ("activated " + file.name);
         statusEl.className   = "ok";
         setTimeout(updateStatus, 1400);
       }
     } else {
+      const msg = (payload && payload.message) ? payload.message : "unknown";
+      reportError("activate", msg);
       if (statusEl) {
-        statusEl.textContent =
-          "activate failed: " + (payload && payload.message ? payload.message : "unknown");
-        statusEl.className = "bad";
+        statusEl.textContent = "activate failed: " + msg;
+        statusEl.className   = "bad";
       }
     }
   } catch (err) {
+    reportError("activate", err.message);
     if (statusEl) {
       statusEl.textContent = "activate request failed: " + err.message;
       statusEl.className   = "bad";
     }
   }
 }
+
+/* ==========================================================================
+   FILE PICKER
+   ========================================================================== */
+
+async function pickFilesViaServer() {
+  const statusEl = document.getElementById("status");
+  if (statusEl) {
+    statusEl.textContent = "opening file picker…";
+    statusEl.className   = "";
+  }
+  try {
+    const res = await fetch("/krita/pick_files", { method: "POST" });
+    const payload = await res.json();
+    if (!payload || !payload.success) {
+      const msg = (payload && payload.message) ? payload.message : "unknown";
+      reportError("picker", msg);
+      if (statusEl) {
+        statusEl.textContent = "picker failed: " + msg;
+        statusEl.className   = "bad";
+      }
+      return;
+    }
+    const paths = payload.paths || [];
+    if (paths.length === 0) {
+      if (statusEl) {
+        statusEl.textContent = "no files picked";
+        statusEl.className   = "";
+        setTimeout(updateStatus, 1200);
+      }
+      return;
+    }
+    for (const p of paths) addFileByPath(p);
+    syncFileList();
+    draw();
+    flashStatus("added " + paths.length + " file(s)", "ok");
+  } catch (err) {
+    reportError("picker", err.message);
+    if (statusEl) {
+      statusEl.textContent = "picker request failed: " + err.message;
+      statusEl.className   = "bad";
+    }
+  }
+}
+
+/* ==========================================================================
+   PROJECT OVERLAPS
+   ==========================================================================
+   Sends one batch of transform-based paste commands.  Each command
+   tells the daemon: "take this document, apply this affine map, and
+   paste the result into that document".  The daemon composites the
+   source, transforms it, clips to the target's canvas, and adds the
+   result as a new paint layer.
+
+   On failure, the first error message is shown on the status line
+   and the full response is logged to the console.  The same messages
+   appear on the terminal that serves the board. */
+
+async function projectSelectedOntoOverlaps() {
+  try {
+    const calc = computeProjectionRegions();
+
+    if (!calc) {
+      flashStatus("no card selected", "warn");
+      return;
+    }
+    if (calc.reason) {
+      flashStatus(calc.reason, "warn");
+      return;
+    }
+    if (calc.regions.length === 0) {
+      flashStatus(
+        calc.skippedClosed > 0
+          ? "overlaps only closed cards (open them first)"
+          : "selected card overlaps nothing open",
+        "warn"
+      );
+      return;
+    }
+
+    const statusEl = document.getElementById("status");
+    if (statusEl) {
+      statusEl.textContent =
+        "projecting onto " + calc.regions.length + " card(s)…";
+      statusEl.className = "";
+    }
+
+    let payload;
+    try {
+      const res = await fetch("/krita/paste_transforms", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ transforms: calc.regions }),
+      });
+      payload = await res.json();
+    } catch (err) {
+      reportError("project", "request failed: " + err.message);
+      if (statusEl) {
+        statusEl.textContent = "projection request failed: " + err.message;
+        statusEl.className   = "bad";
+      }
+      return;
+    }
+
+    if (!payload || !payload.success) {
+      const msg = (payload && payload.message) ? payload.message : "unknown";
+      reportError("project", "endpoint failed: " + msg);
+      if (statusEl) {
+        statusEl.textContent = "projection failed: " + msg;
+        statusEl.className   = "bad";
+      }
+      return;
+    }
+
+    await refreshFromKrita();
+
+    const ok  = payload.successful || 0;
+    const bad = payload.failed     || 0;
+
+    let firstFailMsg = "";
+    if (bad > 0) {
+      for (const r of (payload.results || [])) {
+        if (r.status === "error") { firstFailMsg = r.message || ""; break; }
+      }
+    }
+
+    let msg = "projected onto " + ok + " card(s)";
+    if (bad)      msg += " · " + bad + " failed";
+    if (calc.skippedClosed > 0)
+                  msg += " · " + calc.skippedClosed + " closed skipped";
+    if (firstFailMsg) msg += " — " + firstFailMsg;
+
+    flashStatus(msg, bad ? "bad" : "ok");
+  } catch (err) {
+    reportError("project", err.message);
+    flashStatus("project: " + err.message, "bad");
+  }
+}
+
+/* ==========================================================================
+   CONSTANTS
+   ========================================================================== */
+
+const SCRUB_DRAG_THRESHOLD = 3;
+
+const SCALE_SCRUB_RATE      = 0.005;
+const SCALE_SNAP_STEP       = 0.25;
+const ROTATION_SCRUB_RATE   = 0.5;
+const ROTATION_SNAP_STEP    = 15;
 
 /* ==========================================================================
    SLIDER
@@ -814,79 +1782,199 @@ function updatePanelLabels() {
   if (v) v.textContent = String(board.defaultWidth);
 }
 
+function selectedFile() {
+  if (board.selectedIdx < 0 || board.selectedIdx >= board.files.length)
+    return null;
+  return board.files[board.selectedIdx];
+}
+
 /* ==========================================================================
-   DOC LIST
+   CARD FIELDS (Scale, Rotation)
    ========================================================================== */
 
-function syncDocList() {
-  const list = document.getElementById("docList");
+function _syncCardFields() {
+  const scaleEl = document.getElementById("cardScaleVal");
+  const rotEl   = document.getElementById("cardRotVal");
+  const f = selectedFile();
+
+  if (!f) {
+    if (scaleEl) {
+      scaleEl.disabled = true;
+      if (document.activeElement !== scaleEl) scaleEl.value = "\u2014";
+    }
+    if (rotEl) {
+      rotEl.disabled = true;
+      if (document.activeElement !== rotEl) rotEl.value = "\u2014";
+    }
+    return;
+  }
+
+  if (scaleEl) {
+    scaleEl.disabled = false;
+    if (document.activeElement !== scaleEl) {
+      const denom = board.defaultWidth > 0 ? board.defaultWidth : 1;
+      scaleEl.value = (f.w / denom).toFixed(2);
+    }
+  }
+  if (rotEl) {
+    rotEl.disabled = false;
+    if (document.activeElement !== rotEl) {
+      rotEl.value = (f.rotation * 180 / Math.PI).toFixed(1);
+    }
+  }
+}
+
+/* ==========================================================================
+   SCRUB-INPUT INSTALLER
+   ========================================================================== */
+
+function _installScrubInput(el, opts) {
+  let drag = null;
+
+  function onMove(e) {
+    if (!drag) return;
+    const dx = e.clientX - drag.startX;
+    if (!drag.moved) {
+      if (Math.abs(dx) < SCRUB_DRAG_THRESHOLD) return;
+      drag.moved = true;
+    }
+
+    let raw = drag.startValue + dx * opts.rate;
+    if (opts.snapStep && e.shiftKey) {
+      const delta = raw - drag.startValue;
+      const snapped = Math.round(delta / opts.snapStep) * opts.snapStep;
+      raw = drag.startValue + snapped;
+    }
+    opts.write(raw);
+    draw();
+  }
+
+  function onUp() {
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", onUp);
+    const wasMoved = drag && drag.moved;
+    drag = null;
+    if (!wasMoved) {
+      el.focus();
+      el.select();
+    }
+  }
+
+  el.addEventListener("mousedown", (e) => {
+    if (el.disabled) return;
+    if (document.activeElement === el) return;
+    e.preventDefault();
+    drag = { startX: e.clientX, startValue: opts.read(), moved: false };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  });
+
+  el.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const v = parseFloat(el.value);
+      if (isFinite(v)) opts.write(v);
+      el.blur();
+      draw();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      el.blur();
+      _syncCardFields();
+    }
+  });
+
+  el.addEventListener("blur", () => {
+    const v = parseFloat(el.value);
+    if (isFinite(v)) opts.write(v);
+    _syncCardFields();
+    draw();
+  });
+}
+
+/* ==========================================================================
+   FILE LIST
+   ========================================================================== */
+
+function syncFileList() {
+  const list = document.getElementById("fileList");
   if (!list) return;
   list.innerHTML = "";
 
-  if (board.docs.length === 0) {
+  if (board.files.length === 0) {
     const e = document.createElement("div");
     e.className = "empty";
-    e.textContent = "no documents yet — press Refresh";
+    e.textContent = "no files yet — click + Add files… or Retrieve open";
     list.appendChild(e);
     return;
   }
 
-  for (let i = 0; i < board.docs.length; i++) {
-    const d = board.docs[i];
+  for (let i = 0; i < board.files.length; i++) {
+    const f = board.files[i];
+    const state = fileState(f);
     const isSel = (i === board.selectedIdx);
 
     const row = document.createElement("div");
-    row.className = "docRow" + (isSel ? " selected" : "") + (d.active ? " active" : "");
+    row.className = "fileRow"
+      + (isSel ? " selected" : "")
+      + (state === "closed"  ? " closed"  : "")
+      + (state === "missing" ? " missing" : "");
     row.dataset.idx = String(i);
 
     const sw = document.createElement("span");
-    sw.className = "docSwatch";
-    const hue = d.color || board.palette[0];
-    sw.style.background  = _rgba(hue, isSel ? 0.95 : 0.55);
-    sw.style.border      = "1px solid " + _rgba(hue, isSel ? 1.0 : 0.85);
+    sw.className = "fileSwatch";
+    const hue = f.color || board.palette[0];
+    sw.style.background = _rgba(hue, isSel ? 0.95 : 0.55);
+    sw.style.border     = "1px solid " + _rgba(hue, isSel ? 1.0 : 0.85);
     row.appendChild(sw);
 
     const lb = document.createElement("span");
-    lb.className = "docLabel";
-    lb.textContent = d.name;
+    lb.className = "fileLabel";
+    lb.textContent = f.name;
+    lb.title = f.path;
     row.appendChild(lb);
 
-    const dot = document.createElement("span");
-    dot.className = "docDot" + (d.modified ? "" : " hidden");
-    dot.title = "unsaved changes in Krita";
-    row.appendChild(dot);
+    const st = document.createElement("span");
+    st.className = "fileState " + state;
+    if (state === "open")        st.textContent = "●";
+    else if (state === "closed") st.textContent = "○";
+    else                          st.textContent = "✗";
+    st.title = (state === "open")
+      ? (f.modified ? "open in Krita (unsaved changes)" : "open in Krita")
+      : (state === "closed" ? "not open in Krita" : "file missing on disk");
+    row.appendChild(st);
+
+    if (state === "closed") {
+      const openBtn = document.createElement("button");
+      openBtn.className = "fileAct open";
+      openBtn.textContent = "Open";
+      openBtn.title = "Open this file in Krita";
+      openBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const ok = await openFileInKrita(f);
+        if (ok) await refreshFromKrita();
+      });
+      row.appendChild(openBtn);
+    }
 
     const del = document.createElement("button");
-    del.className = "docDel";
+    del.className = "fileDel";
     del.textContent = "×";
     del.title = "Remove from the board (does not close it in Krita)";
     del.addEventListener("click", (e) => {
       e.stopPropagation();
-      removeDoc(i);
+      removeFile(i);
     });
     row.appendChild(del);
 
     row.addEventListener("click", () => {
       board.selectedIdx = i;
-      syncDocList();
+      bringToTop(i);
+      syncFileList();
       draw();
     });
 
     list.appendChild(row);
   }
-}
-
-/* ==========================================================================
-   DOC OPERATIONS
-   ========================================================================== */
-
-function removeDoc(idx) {
-  if (idx < 0 || idx >= board.docs.length) return;
-  board.docs.splice(idx, 1);
-  if (board.selectedIdx === idx) board.selectedIdx = -1;
-  else if (board.selectedIdx > idx) board.selectedIdx -= 1;
-  syncDocList();
-  draw();
 }
 
 /* ==========================================================================
@@ -911,21 +1999,40 @@ function flashStatus(msg, cls) {
    ========================================================================== */
 
 (function installPanel() {
-  const refreshBtn = document.getElementById("refreshBtn");
-  const gridBtn    = document.getElementById("gridBtn");
-  const fitBtn     = document.getElementById("fitBtn");
-  const resetBtn   = document.getElementById("resetBtn");
-  const clearBtn   = document.getElementById("clearBtn");
-  const saveBtn    = document.getElementById("saveSceneBtn");
-  const loadBtn    = document.getElementById("loadSceneBtn");
-  const slider     = document.getElementById("cardWSlider");
+  const refreshBtn  = document.getElementById("refreshBtn");
+  const addBtn      = document.getElementById("addFilesBtn");
+  const retrieveBtn = document.getElementById("retrieveBtn");
+  const openAllBtn  = document.getElementById("openAllBtn");
+  const projectBtn  = document.getElementById("projectBtn");
+  const gridBtn     = document.getElementById("gridBtn");
+  const fitBtn      = document.getElementById("fitBtn");
+  const resetBtn    = document.getElementById("resetBtn");
+  const clearBtn    = document.getElementById("clearBtn");
+  const saveBtn     = document.getElementById("saveSceneBtn");
+  const loadBtn     = document.getElementById("loadSceneBtn");
+  const slider      = document.getElementById("cardWSlider");
+  const scaleInput  = document.getElementById("cardScaleVal");
+  const rotInput    = document.getElementById("cardRotVal");
 
-  if (refreshBtn) refreshBtn.addEventListener("click", refreshFromKrita);
+  if (refreshBtn)  refreshBtn.addEventListener("click", refreshFromKrita);
+  if (addBtn)      addBtn.addEventListener("click", pickFilesViaServer);
+  if (retrieveBtn) retrieveBtn.addEventListener("click", retrieveOpenFromKrita);
+  if (openAllBtn)  openAllBtn.addEventListener("click", openAllMissing);
+
+  if (projectBtn) projectBtn.addEventListener("click", () => {
+    console.log("[panel] project button clicked");
+    try {
+      projectSelectedOntoOverlaps();
+    } catch (err) {
+      console.error("[panel] project handler threw:", err);
+      flashStatus("project error: " + err.message, "bad");
+    }
+  });
 
   if (gridBtn) gridBtn.addEventListener("click", () => {
     arrangeGrid();
     draw();
-    flashStatus("arranged " + board.docs.length + " cards", "ok");
+    flashStatus("arranged " + board.files.length + " cards", "ok");
   });
 
   if (fitBtn) fitBtn.addEventListener("click", fitAll);
@@ -938,10 +2045,10 @@ function flashStatus(msg, cls) {
   });
 
   if (clearBtn) clearBtn.addEventListener("click", () => {
-    if (board.docs.length === 0) return;
-    board.docs = [];
+    if (board.files.length === 0) return;
+    board.files = [];
     board.selectedIdx = -1;
-    syncDocList();
+    syncFileList();
     draw();
     flashStatus("board cleared", "ok");
   });
@@ -952,13 +2059,55 @@ function flashStatus(msg, cls) {
   if (slider) slider.addEventListener("input", () => {
     const v = parseInt(slider.value, 10);
     if (!isFinite(v) || v <= 0) return;
-    board.defaultWidth = v;
-    for (const d of board.docs) {
-      d.w = v;
-      d.h = Math.round(v * (d.aspect || 1));
+    const oldDefault = board.defaultWidth;
+    if (oldDefault <= 0) {
+      board.defaultWidth = v;
+    } else {
+      const factor = v / oldDefault;
+      for (const f of board.files) {
+        f.w *= factor;
+        f.h *= factor;
+      }
+      board.defaultWidth = v;
     }
     updatePanelLabels();
     draw();
+  });
+
+  if (scaleInput) _installScrubInput(scaleInput, {
+    rate:     SCALE_SCRUB_RATE,
+    snapStep: SCALE_SNAP_STEP,
+    read: () => {
+      const f = selectedFile();
+      if (!f) return 1;
+      const denom = board.defaultWidth > 0 ? board.defaultWidth : 1;
+      return f.w / denom;
+    },
+    write: (raw) => {
+      const f = selectedFile();
+      if (!f) return;
+      const clamped = Math.max(0.05, Math.min(20, raw));
+      const oldScale = f.w / board.defaultWidth;
+      if (oldScale <= 0) return;
+      const factor = clamped / oldScale;
+      f.w *= factor;
+      f.h *= factor;
+    },
+  });
+
+  if (rotInput) _installScrubInput(rotInput, {
+    rate:     ROTATION_SCRUB_RATE,
+    snapStep: ROTATION_SNAP_STEP,
+    read: () => {
+      const f = selectedFile();
+      if (!f) return 0;
+      return f.rotation * 180 / Math.PI;
+    },
+    write: (raw) => {
+      const f = selectedFile();
+      if (!f) return;
+      f.rotation = raw * Math.PI / 180;
+    },
   });
 })();
 
@@ -966,7 +2115,7 @@ function flashStatus(msg, cls) {
    SCENE SAVE / LOAD
    ========================================================================== */
 
-const SCENE_VERSION = 1;
+const SCENE_VERSION = 4;
 const SCENE_TYPE    = "board_scene";
 const SCENE_FILE    = "board_scene.json";
 
@@ -984,14 +2133,16 @@ function buildBoardScene() {
       panX: view.panX,
       panY: view.panY,
     },
-    docs: board.docs.map(d => ({
-      id:     d.id,
-      name:   d.name,
-      x:      d.x,
-      y:      d.y,
-      w:      d.w,
-      aspect: d.aspect,
-      color:  d.color ? { r: d.color.r, g: d.color.g, b: d.color.b } : null,
+    files: board.files.map(f => ({
+      path:     f.path,
+      name:     f.name,
+      x:        f.x,
+      y:        f.y,
+      w:        f.w,
+      aspect:   f.aspect,
+      z:        f.z,
+      rotation: f.rotation,
+      color:    f.color ? { r: f.color.r, g: f.color.g, b: f.color.b } : null,
     })),
   };
 }
@@ -1007,7 +2158,7 @@ function saveBoardJSON() {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  flashStatus("saved " + board.docs.length + " card positions", "ok");
+  flashStatus("saved " + board.files.length + " file path(s)", "ok");
 }
 
 function applyBoardScene(data) {
@@ -1037,61 +2188,41 @@ function applyBoardScene(data) {
     if (typeof data.view.panY === "number") view.panY = data.view.panY;
   }
 
-  // Merge the saved layout onto the current docs list.  A saved doc
-  // whose name matches a currently-open document updates that doc's
-  // position and size.  A saved doc whose name does not match any
-  // open document is still placed — the doc is recreated with no
-  // thumbnail, so the layout is preserved even when the document
-  // was not open at load time.
-  const saved = Array.isArray(data.docs) ? data.docs : [];
-  const byName = new Map();
-  for (const d of board.docs) byName.set(d.name, d);
+  const saved = Array.isArray(data.files) ? data.files : [];
+  board.files = [];
+  board.selectedIdx = -1;
+  board.nextZ = 1;
 
-  const next = [];
   for (const s of saved) {
-    if (!s.name) continue;
-    const existing = byName.get(s.name);
-    if (existing) {
-      existing.x      = (typeof s.x === "number") ? s.x : existing.x;
-      existing.y      = (typeof s.y === "number") ? s.y : existing.y;
-      existing.w      = (typeof s.w === "number") ? s.w : existing.w;
-      existing.aspect = (typeof s.aspect === "number") ? s.aspect : existing.aspect;
-      if (s.color && typeof s.color.r === "number") {
-        existing.color = { r: s.color.r, g: s.color.g, b: s.color.b };
-      }
-      existing.h = Math.round(existing.w * (existing.aspect || 1));
-      next.push(existing);
-      byName.delete(s.name);
-    } else {
-      const aspect = (typeof s.aspect === "number") ? s.aspect : 1.0;
-      const doc = {
-        id:        s.name,
-        name:      s.name,
-        thumb:     null,
-        aspect:    aspect,
-        w:         (typeof s.w === "number") ? s.w : board.defaultWidth,
-        h:         Math.round(((typeof s.w === "number") ? s.w : board.defaultWidth) * aspect),
-        x:         (typeof s.x === "number") ? s.x : 0,
-        y:         (typeof s.y === "number") ? s.y : 0,
-        modified:  false,
-        active:    false,
-        color:     (s.color && typeof s.color.r === "number")
-                     ? { r: s.color.r, g: s.color.g, b: s.color.b }
-                     : null,
-      };
-      _assignColor(doc);
-      next.push(doc);
+    if (!s.path) continue;
+    const idx = addFileByPath(s.path);
+    if (idx < 0) continue;
+    const f = board.files[idx];
+    if (typeof s.x === "number") f.x = s.x;
+    if (typeof s.y === "number") f.y = s.y;
+    if (typeof s.w === "number") f.w = s.w;
+    if (typeof s.aspect === "number") f.aspect = s.aspect;
+    f.h = Math.round(f.w * (f.aspect || 1));
+    if (typeof s.z === "number") f.z = s.z;
+    if (typeof s.rotation === "number") f.rotation = s.rotation;
+    if (s.color && typeof s.color.r === "number") {
+      f.color = { r: s.color.r, g: s.color.g, b: s.color.b };
     }
+    if (typeof s.name === "string" && s.name) f.name = s.name;
   }
 
-  board.docs = next;
-  board.selectedIdx = -1;
+  let maxZ = 0;
+  for (const f of board.files) {
+    if (typeof f.z === "number" && f.z > maxZ) maxZ = f.z;
+  }
+  board.nextZ = Math.max(board.nextZ, maxZ + 1);
+
   syncPanelSliders();
-  syncDocList();
+  syncFileList();
   draw();
 }
 
-function loadBoardFromText(text) {
+async function loadBoardFromText(text) {
   let data;
   try {
     data = JSON.parse(text);
@@ -1105,7 +2236,11 @@ function loadBoardFromText(text) {
     flashStatus("Load failed: " + e.message, "bad");
     return false;
   }
-  flashStatus("loaded " + board.docs.length + " card positions", "ok");
+
+  flashStatus("loaded layout; opening files in Krita…", "ok");
+  await openAllMissing();
+
+  flashStatus("loaded " + board.files.length + " file(s)", "ok");
   return true;
 }
 
@@ -1142,8 +2277,8 @@ function promptLoadBoard() {
 const DRAG_THRESHOLD = 3;
 
 const state = {
-  dragCanvas: null,   // {startSx, startSy, startPanX, startPanY}
-  dragCard:   null,   // {idx, startSx, startSy, startDocX, startDocY, moved}
+  dragCanvas: null,
+  dragFile:   null,
   mouse:      { sx: 0, sy: 0, inside: false },
 };
 
@@ -1164,17 +2299,22 @@ function draw() {
   ctx.strokeRect(M + 0.5, M + 0.5, cw - 2 * M - 1, ch - 2 * M - 1);
 
   updateStatus();
+  _syncCardFields();
 }
 
 function updateStatus() {
   const el = document.getElementById("status");
   if (!el) return;
-  const parts = [];
-  parts.push(board.docs.length + " doc" + (board.docs.length === 1 ? "" : "s"));
+  if (_statusTimer) return;
+  const opens  = board.files.filter(f => f.open).length;
+  const closed = board.files.filter(f => !f.open && !f.missing).length;
+  const miss   = board.files.filter(f => f.missing).length;
+  const parts  = [
+    opens + " open",
+    closed + " closed",
+  ];
+  if (miss) parts.push(miss + " missing");
   parts.push("zoom " + (view.zoom * 100).toFixed(0) + "%");
-  if (board.selectedIdx >= 0 && board.selectedIdx < board.docs.length) {
-    parts.push(board.docs[board.selectedIdx].name);
-  }
   el.textContent = parts.join("  ·  ");
   el.className = "";
 }
@@ -1189,28 +2329,84 @@ canvas.addEventListener("mousedown", (e) => {
   const sx = e.clientX - rect.left;
   const sy = e.clientY - rect.top;
 
-  const hit = docHitTest(sx, sy);
-  if (hit >= 0) {
-    const wasSelected = (board.selectedIdx === hit);
-    board.selectedIdx = hit;
-
-    const d = board.docs[hit];
-    state.dragCard = {
-      idx:        hit,
-      startSx:    sx,
-      startSy:    sy,
-      startDocX:  d.x,
-      startDocY:  d.y,
-      moved:      false,
-      wasSelected: wasSelected,
+  // 1) Rotate handle — offered only on the selected card.
+  if (rotateHandleHitTest(sx, sy)) {
+    const f = board.files[board.selectedIdx];
+    state.dragFile = {
+      idx:      board.selectedIdx,
+      mode:     "rotate",
+      startSx:  sx,
+      startSy:  sy,
+      centerX:  f.x + f.w / 2,
+      centerY:  f.y + f.h / 2,
+      startRotation: f.rotation,
+      moved:    false,
     };
     canvas.style.cursor = "grabbing";
-    syncDocList();
     draw();
     return;
   }
 
-  // Empty canvas: begin pan.
+  // 2) Corner handle — takes priority over the body.
+  const cornerHit = fileCornerHitTest(sx, sy);
+  if (cornerHit) {
+    board.selectedIdx = cornerHit.idx;
+    bringToTop(cornerHit.idx);
+    const f = board.files[cornerHit.idx];
+    f.userSized = true;
+
+    // Anchor: the diagonally-opposite corner in world space.  Its
+    // offset from the centre, in the card's unrotated frame, is
+    // (−dsx · w/2, −dsy · h/2); rotate that offset by the card's
+    // rotation to get the world offset.
+    const [dsx, dsy] = CORNER_SIGNS[cornerHit.corner];
+    const cx = f.x + f.w / 2;
+    const cy = f.y + f.h / 2;
+    const [aox, aoy] = _rotateOffset(
+      -dsx * f.w / 2,
+      -dsy * f.h / 2,
+      f.rotation
+    );
+
+    state.dragFile = {
+      idx:         cornerHit.idx,
+      mode:        "resize",
+      corner:      cornerHit.corner,
+      anchorX:     cx + aox,
+      anchorY:     cy + aoy,
+      startAspect: f.h / f.w,
+      startSx:     sx,
+      startSy:     sy,
+      moved:       false,
+    };
+    canvas.style.cursor = _resizeCursorFor(cornerHit.corner);
+    syncFileList();
+    draw();
+    return;
+  }
+
+  // 3) Card body — move.
+  const hit = fileHitTest(sx, sy);
+  if (hit >= 0) {
+    board.selectedIdx = hit;
+    bringToTop(hit);
+    const f = board.files[hit];
+    state.dragFile = {
+      idx:        hit,
+      mode:       "move",
+      startSx:    sx,
+      startSy:    sy,
+      startFileX: f.x,
+      startFileY: f.y,
+      moved:      false,
+    };
+    canvas.style.cursor = "grabbing";
+    syncFileList();
+    draw();
+    return;
+  }
+
+  // 4) Empty canvas — pan.
   board.selectedIdx = -1;
   state.dragCanvas = {
     startSx:   sx,
@@ -1219,7 +2415,7 @@ canvas.addEventListener("mousedown", (e) => {
     startPanY: view.panY,
   };
   canvas.style.cursor = "grabbing";
-  syncDocList();
+  syncFileList();
   draw();
 });
 
@@ -1232,35 +2428,57 @@ window.addEventListener("mousemove", (e) => {
   state.mouse.inside = (sx >= 0 && sy >= 0 &&
                         sx < window.innerWidth && sy < window.innerHeight);
 
-  if (state.dragCard) {
-    const dd = state.dragCard;
-    const dx = sx - dd.startSx;
-    const dy = sy - dd.startSy;
-    if (!dd.moved && Math.hypot(dx, dy) > DRAG_THRESHOLD) dd.moved = true;
-    if (dd.moved) {
-      const d = board.docs[dd.idx];
-      d.x = dd.startDocX + dx / view.zoom;
-      d.y = dd.startDocY + dy / view.zoom;
+  if (state.dragFile) {
+    const df = state.dragFile;
+    const dx = sx - df.startSx;
+    const dy = sy - df.startSy;
+    if (!df.moved && Math.hypot(dx, dy) > DRAG_THRESHOLD) df.moved = true;
+    if (df.moved) {
+      const f = board.files[df.idx];
+      if (df.mode === "resize") {
+        const [bx, by] = s2b(sx, sy);
+        resizeCardFromCorner(f, df.corner, bx, by,
+                             df.anchorX, df.anchorY,
+                             df.startAspect, e.shiftKey);
+      } else if (df.mode === "rotate") {
+        const [bx, by] = s2b(sx, sy);
+        let angle = Math.atan2(by - df.centerY, bx - df.centerX) + Math.PI / 2;
+        if (e.shiftKey) {
+          const snap = 15 * Math.PI / 180;
+          angle = Math.round(angle / snap) * snap;
+        }
+        f.rotation = angle;
+      } else {
+        f.x = df.startFileX + dx / view.zoom;
+        f.y = df.startFileY + dy / view.zoom;
+      }
     }
   } else if (state.dragCanvas) {
     const dc = state.dragCanvas;
     view.panX = dc.startPanX + (sx - dc.startSx);
     view.panY = dc.startPanY + (sy - dc.startSy);
+  } else {
+    // Idle: pick the cursor that matches what a mousedown here would
+    // start.  Rotate handle over corner over body over empty.
+    if (rotateHandleHitTest(sx, sy)) {
+      canvas.style.cursor = "grab";
+    } else {
+      const cornerHit = fileCornerHitTest(sx, sy);
+      if (cornerHit) {
+        canvas.style.cursor = _resizeCursorFor(cornerHit.corner);
+      } else if (fileHitTest(sx, sy) >= 0) {
+        canvas.style.cursor = "grab";
+      } else {
+        canvas.style.cursor = "default";
+      }
+    }
   }
+
   draw();
 });
 
 window.addEventListener("mouseup", () => {
-  if (state.dragCard) {
-    // A click (no drag) on an already-selected card acts as
-    // "activate in Krita", so a single click both selects and
-    // activates when the user is already looking at that card.
-    if (!state.dragCard.moved && state.dragCard.wasSelected) {
-      const d = board.docs[state.dragCard.idx];
-      if (d) activateDocument(d);
-    }
-  }
-  state.dragCard   = null;
+  state.dragFile   = null;
   state.dragCanvas = null;
   canvas.style.cursor = "default";
   draw();
@@ -1271,14 +2489,11 @@ canvas.addEventListener("wheel", (e) => {
   const rect = canvas.getBoundingClientRect();
   const mx = e.clientX - rect.left;
   const my = e.clientY - rect.top;
-
-  // Board point under cursor before the zoom change.
   const [bx, by] = s2b(mx, my);
 
   const factor  = e.deltaY < 0 ? 1.10 : 1 / 1.10;
   view.zoom = Math.max(0.05, Math.min(8, view.zoom * factor));
 
-  // Keep (bx, by) under the cursor after the zoom change.
   view.panX = mx - bx * view.zoom;
   view.panY = my - by * view.zoom;
 
@@ -1289,8 +2504,8 @@ canvas.addEventListener("dblclick", (e) => {
   const rect = canvas.getBoundingClientRect();
   const sx = e.clientX - rect.left;
   const sy = e.clientY - rect.top;
-  const hit = docHitTest(sx, sy);
-  if (hit >= 0) activateDocument(board.docs[hit]);
+  const hit = fileHitTest(sx, sy);
+  if (hit >= 0) activateFile(board.files[hit]);
 });
 
 window.addEventListener("keydown", (e) => {
@@ -1302,10 +2517,12 @@ window.addEventListener("keydown", (e) => {
   if (k === "r") { e.preventDefault(); refreshFromKrita(); }
   else if (k === "g") { e.preventDefault(); arrangeGrid(); draw(); }
   else if (k === "f") { e.preventDefault(); fitAll(); }
+  else if (k === "o") { e.preventDefault(); openAllMissing(); }
+  else if (k === "p") { e.preventDefault(); projectSelectedOntoOverlaps(); }
   else if (k === "delete" || k === "backspace") {
     if (board.selectedIdx >= 0) {
       e.preventDefault();
-      removeDoc(board.selectedIdx);
+      removeFile(board.selectedIdx);
     }
   }
 });
@@ -1340,11 +2557,9 @@ canvas.style.cursor = "default";
 })();
 
 syncPanelSliders();
-syncDocList();
+syncFileList();
 resize();
 
-/* First pull.  If the daemon is reachable the board populates itself;
-   if not, the status line says so and the user can press R later. */
 refreshFromKrita();
 </script>
 </body>

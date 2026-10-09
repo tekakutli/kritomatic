@@ -27,7 +27,36 @@ same patch shifted by π in φ, i.e. on the diametrically opposite
 side of the cone.  The mirror copy is a pure visual clone: it
 shares the square's full local state and is not independently
 editable.  See pg_view_squares.py (MIRROR) for the model and
-helpers.
+helpers.  Two companion fields — a "Mirror ∠" scrub input and a
+"Mirror flip" checkbox — let the mirror be pulled off the
+diametric line and reflected across the patch's V axis rather than
+merely shifted, respectively.  See pg_panel.py for the model.
+
+A per-square "Visual bot." checkbox sits after the Slope field.
+When checked, the shape's text anchor and the four corner senses
+(which corner is read as top-left, top-right, bottom-right,
+bottom-left) are anchored to the visual bottom of the scene — the
+edge of the square whose midpoint sits lowest on screen — instead
+of the shape's own longest edge.  The flag is a per-square field
+(sq.visualBottom) and is read by pg_kra.py's
+_shapeLabelScreenAngleDeg; see that module and pg_panel.py for
+the details.
+
+Every checkbox in the panel carries a `title` attribute, so
+hovering it (or its surrounding field) shows a one-line explanation
+of what the checkbox does and — where the flag is read at
+draw-finish time rather than at toggle time — when the change takes
+effect.  The three checkboxes that already carried one
+(patchMirror, patchMirrorFlip, squareVisualBottom) are joined by
+drawNoRotate and kraDrawRects; no other panel control is
+unexplained.
+
+The "Generate .kra" button carries a bright-red accent — the
+export action reads as its own tier in the palette, distinct from
+the neutral grey/cyan sliders and the amber patch lists.  The
+resting text is bright enough (a light rose with a faint glow) to
+stay legible at the 10px uppercase size the panel uses, rather
+than receding into the background until hover.
 """
 
 HTML_HEAD = r"""<!DOCTYPE html>
@@ -161,6 +190,27 @@ HTML_HEAD = r"""<!DOCTYPE html>
     background:rgba(220,230,242,0.03);
   }
   #ui button:active { background:rgba(220,230,242,0.07); }
+
+  /* The "Generate .kra" button carries a red accent — the export
+     action reads as destructive-tier in the palette, distinct from
+     the neutral grey/cyan sliders and the amber patch lists.  The
+     resting text is deliberately bright (a light rose) so the
+     label stays legible at 10px uppercase; the faint text-shadow
+     adds body to the glyphs without creating a glow. */
+  #ui button#generateKraBtn {
+    border-color: rgba(255, 105, 125, 0.80);
+    color: #ffb0bc;
+    text-shadow: 0 0 4px rgba(255, 80, 100, 0.45);
+  }
+  #ui button#generateKraBtn:hover {
+    border-color: rgba(255, 130, 150, 1.00);
+    color: #ffd0d8;
+    background: rgba(220, 90, 110, 0.12);
+    text-shadow: 0 0 6px rgba(255, 80, 100, 0.65);
+  }
+  #ui button#generateKraBtn:active {
+    background: rgba(220, 90, 110, 0.20);
+  }
 
   #ui hr { border:0; border-top:1px solid #1e2836; margin:10px 0; }
 
@@ -391,6 +441,17 @@ HTML_HEAD = r"""<!DOCTYPE html>
            value="&#8212;" autocomplete="off" spellcheck="false"
            disabled>
   </div>
+  <div class="field">
+    <label>Visual bot.</label>
+    <input type="checkbox" id="squareVisualBottom"
+           title="When checked, the shape's text anchor and corner
+                  senses follow the visual bottom of the scene — the
+                  side of the square that sits lowest on screen —
+                  instead of the shape's own longest edge.  Changes
+                  both the label's baseline angle and which corner
+                  is read as top-left, top-right, bottom-right,
+                  bottom-left.">
+  </div>
 
   <hr>
 
@@ -417,7 +478,12 @@ HTML_HEAD = r"""<!DOCTYPE html>
   </div>
   <div class="field">
     <label>No rotate</label>
-    <input type="checkbox" id="drawNoRotate">
+    <input type="checkbox" id="drawNoRotate"
+           title="Lock the fitted shape's rotation to zero, so its
+                  edges run parallel to the flat view's φ and s
+                  axes — the shape reads as north/south aligned on
+                  the unfolded sheet.  Read at draw-finish time, so
+                  it can be changed mid-draw.">
   </div>
   <div class="row" style="margin-top:-2px;">
     <button id="drawQuadBtn">Draw Quad</button>
@@ -478,7 +544,11 @@ HTML_HEAD = r"""<!DOCTYPE html>
   </div>
   <div class="field">
     <label>Rectangles</label>
-    <input type="checkbox" id="kraDrawRects" checked>
+    <input type="checkbox" id="kraDrawRects" checked
+           title="When checked, the KRA export writes one filled
+                  rectangle per square alongside its text, using
+                  the square's projected corners.  When unchecked,
+                  only the text layers are written.">
   </div>
 
   <div id="status">drag apex to tilt · scroll to change depth</div>

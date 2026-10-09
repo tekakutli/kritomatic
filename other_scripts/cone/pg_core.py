@@ -16,6 +16,14 @@ in its patch's local frame; the frame derivation lives in
 pg_view_squares.  `slope` is a small pseudo-3D tilt out of the
 patch plane; zero leaves the shape flat on the patch.
 
+A square also carries a per-square boolean `visualBottom`.  When
+true, the KRA export reads the shape's text anchor and the four
+corner senses from the visual bottom of the scene rather than from
+the shape's own longest edge.  See pg_kra.py's
+_shapeLabelScreenAngleDeg and the VISUAL BOTTOM section in
+pg_panel.py.  The flag round-trips through Save / Load scene and is
+copied by cloneQuad.
+
 PATCH SHAPE EDITING
 ===================
 Patches are the planes squares live on, not shapes to be edited.  The
@@ -224,9 +232,10 @@ function addQuad() {
    The clone gets a fresh id and default name; its squares likewise.
    The clone is placed one patch-width to the right in φ so it does
    not sit on top of the source.  φ wraps harmlessly, so pushing past
-   2π is fine.  Square (u, v, scaleU, scaleV, θ, slope) are copied
-   as-is, so the clone's squares sit in the same spot on the new
-   patch as they did on the old. */
+   2π is fine.  Square (u, v, scaleU, scaleV, θ, slope, visualBottom)
+   are copied as-is, so the clone's squares sit in the same spot on
+   the new patch as they did on the old, with the same per-square
+   text-anchor mode. */
 function cloneQuad(idx) {
   if (idx < 0 || idx >= quads.length) return;
   const src = quads[idx];
@@ -260,6 +269,7 @@ function cloneQuad(idx) {
       scaleV: sq.scaleV,
       theta:  sq.theta || 0,
       slope:  sq.slope || 0,
+      visualBottom: !!sq.visualBottom,
     });
   }
 

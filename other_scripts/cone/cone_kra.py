@@ -29,6 +29,30 @@ Five export modes, selected by options.text_warp_mode:
         same size.
 
 No background layer is created in any mode.
+
+MIRROR
+======
+When a patch's `mirror` flag is on, the JS side emits a mirror
+copy of every square on that patch.  All five modes now export that
+copy:
+
+    - "square" and "patch" modes emit the mirror in the same
+      per-square or per-patch group structure as the original,
+      with a `_mirror` suffix on every layer name so Krita cannot
+      confuse the two;
+
+    - "text" and "text-shear" modes emit the mirror per text, again
+      with a `_mirror` suffix on the layer names;
+
+    - "patch-shear" mode emits a second group per patch, named
+      `<patch>_mirror`, holding the mirror squares' own text
+      layers.
+
+Mirror entries carry the same text label as the original (the
+plain square name), and the LAYER names are what differ.  This is
+what the `label` field on the text item is for: the daemon writes
+`label` into the vector text's content but uses the layer name as
+the tree's identifier, so the two must be independent.
 """
 
 import json
@@ -171,7 +195,7 @@ def _build_square_mode(shapes, opts, band, doc_name):
         commands.append({
             "type": "add_vector_text",
             "layer_name": content_name,
-            "text": layer_name,
+            "text": sh.get("label", layer_name),
             "font_family": DEFAULT_FONT_FAMILY,
             "font_size": font_px,
             "x": text_x,
@@ -256,7 +280,7 @@ def _build_patch_mode(patches, opts, band, doc_name):
             commands.append({
                 "type": "add_vector_text",
                 "layer_name": content_name,
-                "text": str(txt["text"]),
+                "text": str(txt.get("text", txt.get("label", ""))),
                 "font_family": DEFAULT_FONT_FAMILY,
                 "font_size": max(6, int(round(float(txt["font_px"])))),
                 "x": float(txt["x"]),
@@ -335,7 +359,7 @@ def _build_text_mode(texts, rects, opts, band, doc_name):
         commands.append({
             "type": "add_vector_text",
             "layer_name": content_name,
-            "text": str(t["name"]),
+            "text": str(t.get("label", t["name"])),
             "font_family": DEFAULT_FONT_FAMILY,
             "font_size": max(6, int(round(float(t["font_px"])))),
             "x": float(t["text_x"]),
@@ -404,7 +428,7 @@ def _build_shear_mode(texts, rects, opts, band, doc_name):
         commands.append({
             "type": "add_vector_text",
             "layer_name": layer_name,
-            "text": str(t["text"]),
+            "text": str(t.get("text", t.get("label", ""))),
             "font_family": DEFAULT_FONT_FAMILY,
             "font_size": max(6, int(round(float(t["font_px"])))),
             "x": float(t["x"]),
@@ -430,6 +454,8 @@ def _build_patch_shear_mode(patches, opts, band, doc_name):
             vector layer <sq>_rect ...
             group <patch>
                 vector layer <sq>_text ...
+            group <patch>_mirror
+                vector layer <sq>_mirror_text ...
     """
     commands = _common_header(band, doc_name)
 
@@ -476,7 +502,7 @@ def _build_patch_shear_mode(patches, opts, band, doc_name):
             commands.append({
                 "type": "add_vector_text",
                 "layer_name": layer_name,
-                "text": str(t["text"]),
+                "text": str(t.get("text", t.get("label", ""))),
                 "font_family": DEFAULT_FONT_FAMILY,
                 "font_size": max(6, int(round(float(t["font_px"])))),
                 "x": float(t["x"]),

@@ -10,15 +10,24 @@ A shape is a rectangle in the patch's own (u, v) plane, rotated by
 an angle, with independent width and height multipliers, and
 optionally tilted out of the patch plane:
 
-    { id, name, quadId, u, v, scaleU, scaleV, theta, slope }
+    { id, name, quadId, u, v, scaleU, scaleV, theta, slope,
+      visualBottom }
 
-    u, v      centre in NORMALIZED patch coordinates
-    scaleU    width multiplier (reference frame)
-    scaleV    height multiplier (reference frame)
-    theta     rotation angle, radians, in the REFERENCE frame
-    slope     tilt out of the patch plane, radians, about the
-              reference U axis (see SLOPE below)
-    name      user-editable label, rendered as a pill at the centre
+    u, v        centre in NORMALIZED patch coordinates
+    scaleU      width multiplier (reference frame)
+    scaleV      height multiplier (reference frame)
+    theta       rotation angle, radians, in the REFERENCE frame
+    slope       tilt out of the patch plane, radians, about the
+                reference U axis (see SLOPE below)
+    visualBottom
+                per-square meta flag read only by the KRA export
+                (pg_kra.py's _shapeLabelScreenAngleDeg).  When
+                true, the shape's text anchor and its four corner
+                senses are derived from the visual bottom of the
+                scene rather than from the shape's own longest
+                edge.  See the VISUAL BOTTOM section in
+                pg_panel.py.  Nothing on the render path reads it.
+    name        user-editable label, rendered as a pill at the centre
 
 SHAPE DIMENSIONS — REFERENCE FRAME
 ==================================
@@ -108,17 +117,17 @@ A shared (û, v̂) edge maps to the same (phi, s) edge regardless of
 uLen and vLen, so two shapes placed at adjacent û / v̂ values touch
 when the shape's reference half-extent matches their û / v̂ spacing.
 
-ANCHORED RESIZE (SHIFT-HELD)
-============================
-By default a corner drag resizes the shape about its own centre:
-all four sides move symmetrically, the centre stays where it was,
-and the shape's stored (u, v) does not change.
+ANCHORED RESIZE (DEFAULT) AND CENTRED RESIZE (SHIFT-HELD)
+=========================================================
+By default a corner drag ANCHORS the shape: the corner diagonally
+opposite the one being dragged stays fixed in place, and only the
+two edges that meet at the dragged corner move.  The shape's
+centre therefore shifts — it ends up at the midpoint between the
+fixed anchor and the cursor.
 
-Holding Shift while dragging a corner switches to an ANCHORED
-resize.  The corner DIAGONALLY OPPOSITE the one being dragged stays
-fixed in place, and only the two edges that meet at the dragged
-corner move.  The shape's centre therefore shifts: it ends up at
-the midpoint between the fixed anchor and the cursor.
+Holding Shift switches to a CENTRED resize: the shape resizes
+about its own centre, all four sides move symmetrically, and the
+shape's stored (u, v) does not change.
 
 The anchor is captured at the moment the drag begins, from the
 shape's pre-drag state, and it does not move for the duration of
@@ -145,10 +154,10 @@ recomputed from the clamped half-extents and the fixed anchor, so
 the anchor stays exactly put even when the cursor is dragged onto
 it.
 
-If Shift is pressed or released mid-drag, the next motion event
-switches resize modes; the anchor is not re-captured, so a later
-switch back to anchored mode may jump slightly.  This mirrors how
-Shift is handled by the other drags (body, rotate, patch).
+Toggling Shift mid-drag switches resize modes on the next motion
+event; the anchor is not re-captured, so a later switch back to
+anchored mode may jump slightly.  This mirrors how Shift is
+handled by the other drags (body, rotate, patch).
 
 SHAPE DEPTH
 ===========
@@ -289,20 +298,38 @@ CLONING
 =======
 cloneSquare(idx) duplicates a shape at the EXACT same location as
 its source: same quadId, same (u, v), same scaleU / scaleV, same
-theta, same slope.  The clone overlaps its source pixel-for-pixel
-until it is dragged away, so the operation reads as "stamp another
-copy right here".  The clone receives a fresh id and default name
-and becomes the new selection.
+theta, same slope, same visualBottom.  The clone overlaps its
+source pixel-for-pixel until it is dragged away, so the operation
+reads as "stamp another copy right here".  The clone receives a
+fresh id and default name and becomes the new selection.
 
 MIRROR
 ======
 Every patch carries a boolean `mirror`.  When it is true, every
 square on the patch is drawn a second time on the patch's mirror —
-the same patch shifted by π in φ, i.e. on the diametrically
-opposite side of the cone.  The mirror copy shares the square's
-full local state (u, v, theta, scaleU, scaleV, slope): it is a
-pure visual clone, not an independent object.  Dragging or editing
-the original updates both; the mirror itself is not hit-testable.
+the same patch shifted by `mirrorAngle` in φ (default π), i.e. on
+the opposite side of the cone.  The mirror copy shares the square's
+full local state and is a pure visual clone, not an independent
+object.  Dragging or editing the original updates both; the mirror
+itself is not hit-testable EXCEPT through the Alt pass-through: a
+click on a mirror square with Alt held targets the patch that
+square belongs to, exactly the way a click on the original does.
+See pg_dispatch.py, ALT PASS-THROUGH.
+
+The MIRROR FLIP toggle determines whether the mirror is a faithful
+copy of the original or a reflected ghost.  With the flip on (the
+default), the shape's θ and slope are negated AND its u is negated
+for the duration of the mirror draw — a reflection across the
+patch's V axis.  With the flip off, only the patch's φ is shifted
+and the shape renders with its unmodified local state, which reads
+as a rotated ghost in the shifted frame.
+
+The flip is implemented by mutating the square in place inside
+_withSquareMirror, running the caller's drawing/exports/hit-tests
+through that state, and restoring the original in a `finally`.
+Every renderer and every export path routes the mirror draw through
+this one helper, so a change here applies uniformly to both bands
+and to all five KRA export modes.
 
 LABELS
 ======
@@ -523,19 +550,17 @@ function quadIdxById(id) {
    ==========================================================================
    Every patch carries a boolean `mirror`.  When it is true, every
    square on the patch is drawn a second time on the patch's mirror —
-   the same patch shifted by π in φ, i.e. on the diametrically
-   opposite side of the cone.  The mirror copy shares the square's
-   full local state (u, v, theta, scaleU, scaleV, slope): it is a
-   pure visual clone, not an independent object.  Dragging or
-   editing the original updates both; the mirror itself is not hit-
-   testable.
+   the same patch shifted by `mirrorAngle` in φ (default π), i.e. on
+   the opposite side of the cone.  The mirror copy shares the
+   square's full local state and is a pure visual clone, not an
+   independent object.
 
-   The renderer shifts the patch's φ bounds in place, runs the same
-   drawing routines, then restores them.  Every square geometry
-   function reads the patch through `quads[qi]`, so the shifted
-   patch is what they see; nothing in the per-square math needs to
-   know a mirror is being drawn.  The shift is restored in a
-   `finally`, so an exception cannot leave the model shifted. */
+   The renderer shifts the patch's φ bounds in place, flips the
+   square's local state if `mirrorFlip` is on, runs the caller's
+   drawing/export routine, then restores everything in a `finally`.
+   Every square geometry function reads the patch through
+   `quads[qi]`, so the shifted patch is what they see; nothing in
+   the per-square math needs to know a mirror is being drawn. */
 
 function _withQuadPhiShifted(q, dPhi, fn) {
   const phi0 = q.phi0, phi1 = q.phi1;
@@ -554,13 +579,22 @@ function _squareHasMirror(sq) {
   return !!(q && q.mirror);
 }
 
-/* The mirror draws the same square on the diametrically-opposite
-   side of the cone, offset by `mirrorAngle` in φ (default π).  When
-   `mirrorFlip` is true, the shape's θ is negated for the duration of
-   the mirror draw, which cancels the 180° frame rotation that the
-   φ-shift introduces — so a tilted square on the mirror tilts the
-   same way it does on the original instead of appearing upside
-   down. */
+/* Run `fn` with the square in its mirror state and restore on exit.
+
+   With `mirrorFlip` on (the default), the flip is a reflection
+   across the patch's V axis: θ → −θ, slope → −slope, u → −u.  This
+   is the transformation that makes a rotated or tilted shape read
+   as a true left-right reflection of the original on the mirror,
+   rather than as a rotated ghost.
+
+   With `mirrorFlip` off, only the patch's φ bounds shift; the
+   square keeps its local state and renders as a straight copy at
+   the mirror location (which, since the patch itself is now on the
+   opposite side of the cone, usually looks wrong — that's what the
+   toggle exists for).
+
+   The `finally` restores every field that was mutated, so an
+   exception inside `fn` cannot leave the model in a mirror state. */
 function _withSquareMirror(sq, fn) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
@@ -575,23 +609,15 @@ function _withSquareMirror(sq, fn) {
   const phi1   = q.phi1;
   const theta0 = sq.theta || 0;
   const slope0 = sq.slope || 0;
-  const u0     = sq.u;     // was: const v0 = sq.v;
+  const u0     = sq.u;
 
   q.phi0 = phi0 + angle;
   q.phi1 = phi1 + angle;
 
   if (flip) {
-    /* Reflect the shape through the patch's U axis.  A rectangle
-       has no internal left/right asymmetry, so negating θ alone
-       only rotates it; negating slope alone only tips it.  The
-       real "flip" is in the shape's POSITION along the patch's V
-       axis, which combined with the two sign flips is exactly the
-       point reflection v → -v, θ → -θ, slope → -slope.  This is
-       what makes the mirror read as the original flipped
-       top-to-bottom on the patch rather than as a rotated ghost. */
     sq.theta = -theta0;
     sq.slope = -slope0;
-    sq.u     = -u0;        // was: sq.v = -v0;
+    sq.u     = -u0;
   }
 
   try {
@@ -601,7 +627,7 @@ function _withSquareMirror(sq, fn) {
     q.phi1   = phi1;
     sq.theta = theta0;
     sq.slope = slope0;
-    sq.u     = u0;         // was: sq.v = v0;
+    sq.u     = u0;
   }
 }
 
@@ -781,6 +807,7 @@ function addSquareAt(quadIdx, uLocal, vLocal) {
     scaleV: SHAPE_DEFAULT_SCALE,
     theta: 0,
     slope: 0,
+    visualBottom: false,
   });
   selectedSquare = floatSquares.length - 1;
   syncQuadList();
@@ -791,9 +818,9 @@ function addSquareAtCenter(quadIdx) { addSquareAt(quadIdx, 0, 0); }
 
 /* Duplicate a square at the EXACT same location as its source: same
    patch (quadId), same normalized (u, v), same scaleU / scaleV,
-   same theta, same slope.  The clone overlaps the source
-   pixel-for-pixel until it is dragged away.  It receives a fresh id
-   and default name, and becomes the new selection. */
+   same theta, same slope, same visualBottom.  The clone overlaps
+   the source pixel-for-pixel until it is dragged away.  It receives
+   a fresh id and default name, and becomes the new selection. */
 function cloneSquare(idx) {
   if (idx < 0 || idx >= floatSquares.length) return;
   const src = floatSquares[idx];
@@ -810,6 +837,7 @@ function cloneSquare(idx) {
     scaleV: src.scaleV,
     theta:  src.theta || 0,
     slope:  src.slope || 0,
+    visualBottom: !!src.visualBottom,
   });
   selectedSquare = floatSquares.length - 1;
   syncQuadList();
@@ -959,10 +987,10 @@ function squareCornersLocalWith(sq, depthScale) {
 }
 
 /* The local (u, v) of the corner DIAGONALLY OPPOSITE the given
-   corner — the anchor a Shift-held corner drag keeps fixed.  Same
-   math as squareCornersLocalWith but at the opposite sign pair.
-   Corners are ordered [TL, TR, BR, BL], so the opposite of corner
-   i is corner (i + 2) % 4.  depthScale is folded into the
+   corner — the anchor an anchored (default) corner drag keeps fixed.
+   Same math as squareCornersLocalWith but at the opposite sign
+   pair.  Corners are ordered [TL, TR, BR, BL], so the opposite of
+   corner i is corner (i + 2) % 4.  depthScale is folded into the
    reference v half-extent, matching squareCornersLocalWith; pass
    effectiveConeDepth() from the cone band and SHAPE_DEPTH_FLAT
    from the flat band. */
@@ -1360,7 +1388,9 @@ function drawFloatSquare(sq, selected, isMirror) {
   }
 
   /* The mirror gets no corner or rotate handles — it is a visual
-     clone, not a second editable object. */
+     clone, not a second editable object.  The mirror is still
+     hit-testable through the Alt pass-through, which see: a click
+     on it with Alt held targets the patch that square belongs to. */
   if (!selected || isMirror) return;
 
   for (const [sx, sy] of pts) {
@@ -1394,7 +1424,12 @@ function drawFloatSquare(sq, selected, isMirror) {
 
 /* ==========================================================================
    HIT TESTING — cone band
-   ========================================================================== */
+   ==========================================================================
+   The per-square hit test body is factored into _squareHitTestOne so
+   that the mirror hit test can reuse it inside _withSquareMirror:
+   the square's geometry functions read its current state, so running
+   the same body inside the mirror wrapper is what makes the mirror
+   hit-testable without duplicating any of the math. */
 
 const SQUARE_HANDLE_R   = 10;
 const SQUARE_BODY_MIN_R = 8;
@@ -1413,7 +1448,11 @@ function _ptInQuadPx(px, py, poly) {
   return inside;
 }
 
-function squareHitTest(sx, sy) {
+/* The order in which squares are hit-tested: the selected square
+   first, then every other square in declaration order.  Shared by
+   the original and the mirror hit tests so both prefer the same
+   square when two overlap. */
+function _squareHitOrder() {
   const order = [];
   if (selectedSquare >= 0 && selectedSquare < floatSquares.length) {
     order.push(selectedSquare);
@@ -1421,30 +1460,65 @@ function squareHitTest(sx, sy) {
   for (let i = 0; i < floatSquares.length; i++) {
     if (i !== selectedSquare) order.push(i);
   }
-  for (const si of order) {
+  return order;
+}
+
+/* Hit-test one square's CURRENT geometry.  The caller is
+   responsible for having put the square into whichever state it
+   wants tested — the plain hit test calls this directly, and the
+   mirror hit test wraps the call in _withSquareMirror. */
+function _squareHitTestOne(si, sx, sy) {
+  const sq = floatSquares[si];
+  if (!sq) return null;
+
+  const pts = squareCornersScreen(sq);
+  if (!pts || pts.length < 3) return null;
+
+  const rh = squareRotateHandleScreen(sq);
+  if (rh && Math.hypot(sx - rh[0], sy - rh[1]) < ROTATE_HANDLE_R) {
+    return { kind: "rotate", squareIdx: si };
+  }
+
+  for (let ci = 0; ci < pts.length; ci++) {
+    if (Math.hypot(sx - pts[ci][0], sy - pts[ci][1]) < SQUARE_HANDLE_R) {
+      return { kind: "corner", squareIdx: si, cornerIdx: ci };
+    }
+  }
+
+  if (_ptInQuadPx(sx, sy, pts)) return { kind: "body", squareIdx: si };
+
+  let mx = 0, my = 0;
+  for (const [x, y] of pts) { mx += x; my += y; }
+  mx /= pts.length; my /= pts.length;
+  if (Math.hypot(sx - mx, sy - my) < SQUARE_BODY_MIN_R) {
+    return { kind: "body", squareIdx: si };
+  }
+  return null;
+}
+
+function squareHitTest(sx, sy) {
+  for (const si of _squareHitOrder()) {
+    const hit = _squareHitTestOne(si, sx, sy);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/* Hit-test the mirror copies of every square.  Runs each square's
+   own hit test inside _withSquareMirror, so it sees the mirrored
+   geometry (shifted patch φ, and — when mirrorFlip is on — the
+   negated θ, slope, and u).  Used only by the Alt pass-through:
+   a click on a mirror square should grab the patch that square
+   belongs to, the same way a click on the original does. */
+function squareMirrorHitTest(sx, sy) {
+  for (const si of _squareHitOrder()) {
     const sq = floatSquares[si];
-    const pts = squareCornersScreen(sq);
-    if (!pts || pts.length < 3) continue;
-
-    const rh = squareRotateHandleScreen(sq);
-    if (rh && Math.hypot(sx - rh[0], sy - rh[1]) < ROTATE_HANDLE_R) {
-      return { kind: "rotate", squareIdx: si };
-    }
-
-    for (let ci = 0; ci < pts.length; ci++) {
-      if (Math.hypot(sx - pts[ci][0], sy - pts[ci][1]) < SQUARE_HANDLE_R) {
-        return { kind: "corner", squareIdx: si, cornerIdx: ci };
-      }
-    }
-
-    if (_ptInQuadPx(sx, sy, pts)) return { kind: "body", squareIdx: si };
-
-    let mx = 0, my = 0;
-    for (const [x, y] of pts) { mx += x; my += y; }
-    mx /= pts.length; my /= pts.length;
-    if (Math.hypot(sx - mx, sy - my) < SQUARE_BODY_MIN_R) {
-      return { kind: "body", squareIdx: si };
-    }
+    if (!sq) continue;
+    let hit = null;
+    _withSquareMirror(sq, () => {
+      hit = _squareHitTestOne(si, sx, sy);
+    });
+    if (hit) return hit;
   }
   return null;
 }
@@ -1658,9 +1732,25 @@ function cursorToLocalWithPersp(f, qi, sq, sx, sy) {
    SHARED EDIT OPERATIONS
    ========================================================================== */
 
-/* Corner resize.  The cursor's offset from the shape's centre is
-   mapped to the REFERENCE frame by inverting the same map the
-   renderer applies:
+/* Corner resize.
+
+   DEFAULT BRANCH — anchored.  When anchorU / anchorV are supplied,
+   the drag keeps the OPPOSITE corner fixed at (anchorU, anchorV)
+   and moves only the two edges that meet at the dragged corner.
+   The shape's centre shifts to the midpoint of the anchor and the
+   cursor.  Both half-extents are clamped to SHAPE_MIN_SCALE, then
+   the centre is recomputed from the clamped half-extents and the
+   fixed anchor so the anchor stays exactly put even when the cursor
+   lands on it.
+
+   SHIFT BRANCH — centred.  When no anchor is supplied, the shape
+   resizes about its own centre: the cursor's offset from the
+   centre's stored (u, v) sets the new reference half-extents, and
+   the centre itself does not move, so all four sides move
+   symmetrically.
+
+   The cursor's offset from the shape's centre is mapped to the
+   REFERENCE frame by inverting the same map the renderer applies:
 
        local_u_offset = duR · Ku
        local_v_offset = dvR · Kv
@@ -1669,26 +1759,11 @@ function cursorToLocalWithPersp(f, qi, sq, sx, sy) {
    resulting duR, dvR are un-rotated to recover the reference half-
    extents, hence the new scaleU / scaleV.
 
-   NOTE — the earlier version divided by uLen / vLen *in addition*
-   to Ku / Kv, which made the computed half-extent 1/uLen (resp.
-   1/vLen) of the correct value and collapsed the shape to a
-   fraction of its size the moment a corner was grabbed.
-
    depthScale is the multiplier the height is drawn at:
    effectiveConeDepth() from the cone band, SHAPE_DEPTH_FLAT from the
    flat band.  It enters only through the reference height's
    normalizer, so the corner follows the cursor in the band the drag
-   came from.
-
-   ANCHORED BRANCH — when anchorU / anchorV are supplied, the drag
-   switches to the Shift-held anchored resize: the OPPOSITE corner
-   stays fixed in place at (anchorU, anchorV) and only the two edges
-   meeting at the dragged corner move.  The shape's centre shifts to
-   the midpoint between the anchor and the cursor.  Both half-extents
-   are clamped to SHAPE_MIN_SCALE, then the centre is recomputed from
-   the clamped half-extents and the fixed anchor so the anchor stays
-   exactly put even when the cursor lands on it.  See the module
-   docstring, ANCHORED RESIZE (SHIFT-HELD), for the derivation. */
+   came from. */
 
 function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale,
                                  anchorU, anchorV) {
@@ -1718,7 +1793,7 @@ function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale,
   const refHWmin = SHAPE_MIN_SCALE * SHAPE_REL_SIZE / 2;
   const refHHmin = SHAPE_MIN_SCALE * SHAPE_REL_SIZE / 2 * depthScale;
 
-  /* ---- anchored branch (Shift-held) ----------------------------
+  /* ---- anchored branch (default) -------------------------------
      The anchor is the OPPOSITE corner's local position, captured
      at drag start.  We solve for the new half-extents and centre
      from the anchor and the cursor alone; the shape's own rotation
@@ -1766,7 +1841,7 @@ function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale,
     return;
   }
 
-  /* ---- default branch: resize about the FIXED centre -----------
+  /* ---- centred branch (Shift-held) -----------------------------
      The cursor's offset from the shape's centre sets the new
      reference half-extents; the centre is not moved, so all four
      sides move symmetrically. */
@@ -1839,9 +1914,11 @@ function alignSelectedShapeToAxis() {
    ==========================================================================
    resizeSquareFromCorner takes an optional anchor.  When both
    anchorU and anchorV are supplied, the resize is anchored on that
-   fixed local point (the opposite corner) instead of on the shape's
-   centre.  pg_dispatch reads Shift at each move event and passes the
-   drag-start anchor when Shift is held. */
+   fixed local point (the opposite corner) — the default behaviour.
+   When they are not supplied, the resize is centred on the shape's
+   own (u, v) — the Shift-held behaviour.  pg_dispatch reads Shift
+   at each move event and passes the drag-start anchor when the
+   anchored branch is active. */
 
 function resizeSquareFromCorner(sq, cornerIdx, cursorWX, cursorWY,
                                  anchorU, anchorV) {
@@ -1928,10 +2005,11 @@ function squareFlatRotateHandleScreen(sq, shift) {
    ==========================================================================
    flatResizeSquareFromCornerIdx mirrors resizeSquareFromCorner: when
    anchorU / anchorV are supplied the resize is anchored on that
-   fixed local point (the opposite corner); otherwise the shape
-   resizes about its own centre.  The flat band uses SHAPE_DEPTH_FLAT
-   for the depth multiplier, so the anchor is captured and used at
-   the same scale. */
+   fixed local point (the opposite corner) — the default behaviour.
+   When they are not supplied, the resize is centred on the shape's
+   own (u, v) — the Shift-held behaviour.  The flat band uses
+   SHAPE_DEPTH_FLAT for the depth multiplier, so the anchor is
+   captured and used at the same scale. */
 
 function flatCursorToShapeLocal(sq, sx, sy) {
   const qi = quadIdxById(sq.quadId);
@@ -1979,42 +2057,71 @@ function flatMoveSquareBody(sq, sx, sy) {
 
 /* ==========================================================================
    FLAT-VIEW HIT TEST
-   ========================================================================== */
+   ==========================================================================
+   Same split as the cone band: the per-square body lives in
+   _squareFlatHitTestOne, so a mirror variant can run the exact same
+   body inside _withSquareMirror. */
+
+function _squareFlatHitTestOne(si, sx, sy) {
+  const sq = floatSquares[si];
+  if (!sq) return null;
+
+  const corners = squareFlatCorners(sq);
+  if (!corners) return null;
+  const phis = corners.map(c => c[0]);
+  const shifts = _phiCopies(Math.min(...phis), Math.max(...phis));
+
+  for (const shift of shifts) {
+    const rh = squareFlatRotateHandleScreen(sq, shift);
+    if (rh && Math.hypot(sx - rh[0], sy - rh[1]) < ROTATE_HANDLE_R) {
+      return { kind: "rotate", squareIdx: si };
+    }
+  }
+
+  for (const shift of shifts) {
+    const screen = corners.map(([phi, s]) =>
+      flatToScreen(phi + shift, s));
+
+    for (let ci = 0; ci < 4; ci++) {
+      if (Math.hypot(sx - screen[ci][0], sy - screen[ci][1])
+          < FLAT_HANDLE_R) {
+        return { kind: "corner", squareIdx: si, cornerIdx: ci };
+      }
+    }
+
+    if (_ptInQuadPx(sx, sy, screen)) {
+      return { kind: "body", squareIdx: si };
+    }
+  }
+  return null;
+}
 
 function squareFlatHitTest(sx, sy) {
   if (selectedQuad < 0 || selectedQuad >= quads.length) return null;
   const activeQ = quads[selectedQuad];
   for (let i = floatSquares.length - 1; i >= 0; i--) {
+    if (floatSquares[i].quadId !== activeQ.id) continue;
+    const hit = _squareFlatHitTestOne(i, sx, sy);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/* Same shape as squareFlatHitTest, but each square is tested inside
+   _withSquareMirror.  Only the selected patch's squares are
+   considered — the flat band only draws the selected patch's mirror
+   copies, so only those can be clicked. */
+function squareFlatMirrorHitTest(sx, sy) {
+  if (selectedQuad < 0 || selectedQuad >= quads.length) return null;
+  const activeQ = quads[selectedQuad];
+  for (let i = floatSquares.length - 1; i >= 0; i--) {
     const sq = floatSquares[i];
     if (sq.quadId !== activeQ.id) continue;
-
-    const corners = squareFlatCorners(sq);
-    if (!corners) continue;
-    const phis = corners.map(c => c[0]);
-    const shifts = _phiCopies(Math.min(...phis), Math.max(...phis));
-
-    for (const shift of shifts) {
-      const rh = squareFlatRotateHandleScreen(sq, shift);
-      if (rh && Math.hypot(sx - rh[0], sy - rh[1]) < ROTATE_HANDLE_R) {
-        return { kind: "rotate", squareIdx: i };
-      }
-    }
-
-    for (const shift of shifts) {
-      const screen = corners.map(([phi, s]) =>
-        flatToScreen(phi + shift, s));
-
-      for (let ci = 0; ci < 4; ci++) {
-        if (Math.hypot(sx - screen[ci][0], sy - screen[ci][1])
-            < FLAT_HANDLE_R) {
-          return { kind: "corner", squareIdx: i, cornerIdx: ci };
-        }
-      }
-
-      if (_ptInQuadPx(sx, sy, screen)) {
-        return { kind: "body", squareIdx: i };
-      }
-    }
+    let hit = null;
+    _withSquareMirror(sq, () => {
+      hit = _squareFlatHitTestOne(i, sx, sy);
+    });
+    if (hit) return hit;
   }
   return null;
 }

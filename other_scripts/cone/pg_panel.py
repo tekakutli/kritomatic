@@ -132,14 +132,52 @@ The flat view ignores slope — its footprint is the un-tilted (φ, s)
 projection — so editing in that band stays exact.  Only the cone
 view reads slope.  See the SLOPE section in pg_view_squares.py.
 
+VISUAL BOTTOM
+=============
+The "Visual bot." checkbox after the Slope field is a per-square
+meta option that changes how the shape's text anchor and its four
+corner senses are chosen during KRA export.  It is stored on the
+square object as `visualBottom`.
+
+    unchecked (default, and every pre-existing scene)
+
+        The "bottom" of the shape is its own LONGEST edge in screen
+        space.  The label's baseline runs along that edge, and the
+        four corners are classified from it: the two ends of the
+        long edge are read as bottom-left and bottom-right, the two
+        ends of the opposite edge as top-left and top-right.  This
+        is the historical behaviour.
+
+    checked
+
+        The "bottom" is the visual bottom of the SCENE: of the
+        shape's four drawn edges, the one whose midpoint sits
+        lowest on screen.  The label's baseline runs along that
+        edge, and the four corner senses follow it the same way.
+
+The flag affects only the KRA export (pg_kra.py's
+_shapeLabelScreenAngleDeg); it does not change how the shape is
+drawn on the canvas, nor its geometry.  It matters most for tall
+narrow shapes tilted so that the long edge is not the bottom edge,
+and for shapes rotated past 45°.
+
+The checkbox follows the selected square the same way Square W / H /
+Slope do: it greys out when nothing is selected, and reflects the
+selected square's own flag otherwise.  Toggling it writes the flag
+onto the square and redraws.  The flag round-trips through Save /
+Load scene, and cloneQuad / cloneSquare copy it to the new square.
+Old scene files load with the flag defaulting to false, so a scene
+written before this field existed renders and exports identically to
+one written after with the defaults.
+
 CLONING SQUARES
 ===============
 "+ Clone" in the Squares row duplicates the selected square at the
 EXACT same location as its source: same patch (quadId), same
-normalized (u, v), same scaleU / scaleV, same theta, same slope.
-The clone overlaps its source pixel-for-pixel until it is dragged
-away.  The clone receives a fresh id and default name and becomes
-the new selection.
+normalized (u, v), same scaleU / scaleV, same theta, same slope,
+same visualBottom.  The clone overlaps its source pixel-for-pixel
+until it is dragged away.  The clone receives a fresh id and default
+name and becomes the new selection.
 
 MIRROR
 ======
@@ -167,10 +205,9 @@ Two additional per-patch fields sit below the Mirror checkbox:
 
     Mirror ∠     the angular offset around the cone at which the
                  mirror patch is drawn.  Default π (diametric).
-                 The rate is 1° per pixel of horizontal drag;
-                 Shift snaps to one meridian (15°).  Stored in
-                 radians in the model, shown in degrees in the
-                 field.  The value is added directly to the
+                 The rate is 1° per pixel of horizontal drag.
+                 Stored in radians in the model, shown in degrees
+                 in the field.  The value is added directly to the
                  patch's φ bounds, so a drift of the mirror off
                  the diametric line separates the original and
                  the mirror when they would otherwise visually
@@ -189,6 +226,18 @@ Two additional per-patch fields sit below the Mirror checkbox:
                  just displaced around the cone.  Unchecking it
                  restores the pre-fix behaviour.
 
+    Shift-drag  holding Shift while scrubbing "Mirror ∠" enters a
+                 symmetric mode: the mirror angle advances by Δ and
+                 the patch's φ shifts by −Δ/2, so the mirror and
+                 the original separate (or converge) at equal rates
+                 about the midpoint they shared at drag start.
+                 No snap is applied in this mode — the motion is
+                 continuous.  Releasing Shift mid-drag restores the
+                 patch to its start φ; the mirror angle itself is
+                 not undone.  The midpoint is captured once at
+                 mousedown, so a long drag does not accumulate
+                 drift.
+
 Both fields follow the selected patch the same way the checkbox
 does, and both round-trip through Save / Load scene.  Old scene
 files load with mirrorAngle defaulting to π and mirrorFlip to true,
@@ -203,15 +252,15 @@ local server.  The server forwards to cone_kra.py, which builds a
 Kritomatic batch and sends it to the Krita daemon.  The output is a
 .kra with one vector-text layer per shape.
 
-SHIFT-HELD CORNER RESIZE
-========================
-Holding Shift while dragging a shape's corner vertex anchors the
-DIAGONALLY OPPOSITE corner and resizes only along the two edges
-that meet at the dragged corner.  Without Shift, the corner drag
-resizes about the shape's centre, moving all four sides
-symmetrically.  The behaviour itself lives in pg_view_squares.py;
-the drag-state anchor is captured in pg_dispatch.py at mousedown
-time.  The help popup's "Squares" section documents this modifier.
+CORNER RESIZE
+=============
+By default a corner drag anchors the DIAGONALLY OPPOSITE corner and
+resizes only along the two edges that meet at the dragged corner.
+Holding Shift switches to a centred resize: the shape resizes about
+its own centre, moving all four sides symmetrically.  The behaviour
+itself lives in pg_view_squares.py; the drag-state anchor is
+captured in pg_dispatch.py at mousedown time.  The help popup's
+"Squares" section documents both modes.
 """
 
 PANEL_JS = r"""
@@ -251,12 +300,10 @@ const SLOPE_SCRUB_RATE_DEG_PER_PX = 0.5;
 const SLOPE_SNAP_STEP_DEG         = 15;
 
 /* Mirror-angle scrub rate: 1° per pixel of horizontal drag.
-   Snap step with Shift held is one meridian (15°), matching the
-   default meridian spacing.  Stored in radians in the model and
-   shown in degrees in the field.  See the MIRROR ANGLE AND FLIP
-   section in the module docstring. */
+   Stored in radians in the model and shown in degrees in the
+   field.  See the MIRROR ANGLE AND FLIP section in the module
+   docstring. */
 const MIRROR_ANGLE_SCRUB_RATE_DEG_PER_PX = 1.0;
-const MIRROR_ANGLE_SNAP_STEP_DEG         = 15;
 
 const SCRUB_DRAG_THRESHOLD = 3;
 
@@ -400,6 +447,10 @@ const HELP_HTML = `<!DOCTYPE html>
 <div class="hint"><strong>Mirror &ang;</strong> slides the mirror around the
   cone \u2014 pull it off &pi; when the original and mirror would otherwise
   visually cross at the apex</div>
+<div class="hint">hold <span class="kbd">Shift</span> while dragging
+  <strong>Mirror &ang;</strong> to move the mirror <em>and</em> the
+  original symmetrically about the midpoint they shared at drag
+  start</div>
 <div class="hint"><strong>Mirror flip</strong> negates the mirror's rotation
   so a tilted or rotated shape is a faithful copy, not a 180&deg;-rotated
   ghost</div>
@@ -407,20 +458,27 @@ const HELP_HTML = `<!DOCTYPE html>
 <div class="section">Squares</div>
 <div class="hint">hold <span class="kbd">Alt</span> while clicking a square to grab
   its <strong>patch</strong> instead</div>
+<div class="hint">dragging a <strong>corner</strong> anchors the
+  <em>opposite corner</em> \u2014 only the two edges that meet at that
+  corner move</div>
 <div class="hint">hold <span class="kbd">Shift</span> while dragging a
-  <strong>corner</strong> to anchor the <em>opposite corner</em> in place \u2014
-  only the two edges that meet at that corner move</div>
+  <strong>corner</strong> to resize about the shape's own centre
+  instead</div>
 <div class="hint">hold <span class="kbd">Shift</span> while dragging the
   rotate handle to jump in 15&deg; steps</div>
 <div class="hint"><span class="kbd">Shift</span>+<span class="kbd">A</span>
   aligns the selected square to 45&deg;</div>
 <div class="hint"><span class="kbd">Delete</span> removes the selected square</div>
+<div class="hint"><strong>Visual bot.</strong> on a square makes its
+  KRA text anchor and its four corner senses follow the <em>visual
+  bottom of the scene</em> \u2014 the side of the square that sits
+  lowest on screen \u2014 instead of the shape's own longest edge</div>
 
 <div class="section">Panel fields</div>
 <div class="hint">drag a value sideways to <strong>scrub</strong> it;
   hold <span class="kbd">Shift</span> to snap</div>
 <div class="hint">fields with <em>&phi;</em>, <em>s</em>, <em>W</em>, <em>H</em>,
-  and <em>slope</em> follow the current selection</div>
+  <em>slope</em>, and <em>visual bottom</em> follow the current selection</div>
 <div class="hint"><strong>Mirror</strong>, <strong>Mirror &ang;</strong>, and
   <strong>Mirror flip</strong> follow the selected patch:
   they grey out when nothing is selected, and reflect the patch's own
@@ -705,12 +763,16 @@ function _syncPatchCoordInputs() {
    The W / H fields show the shape's reference-unit size, which is
    independent of the patch it sits on and of the cone's depth /
    half-angle.  The Slope field shows the shape's pseudo-3D tilt in
-   degrees.  All three are disabled until a square is selected. */
+   degrees.  The Visual bot. checkbox is a per-square flag that
+   changes how the KRA export reads the shape's "bottom" edge (see
+   the VISUAL BOTTOM section in the module docstring).  All four are
+   disabled until a square is selected. */
 
 function _syncSquareSizeInputs() {
-  const wInput = document.getElementById("squareWVal");
-  const hInput = document.getElementById("squareHVal");
-  const sInput = document.getElementById("squareSlopeVal");
+  const wInput  = document.getElementById("squareWVal");
+  const hInput  = document.getElementById("squareHVal");
+  const sInput  = document.getElementById("squareSlopeVal");
+  const vbInput = document.getElementById("squareVisualBottom");
   if (!wInput || !hInput || !sInput) return;
 
   const sq = (selectedSquare >= 0 && selectedSquare < floatSquares.length)
@@ -720,6 +782,10 @@ function _syncSquareSizeInputs() {
     wInput.disabled = true;
     hInput.disabled = true;
     sInput.disabled = true;
+    if (vbInput) {
+      vbInput.disabled = true;
+      if (document.activeElement !== vbInput) vbInput.checked = false;
+    }
     if (document.activeElement !== wInput) wInput.value = "\u2014";
     if (document.activeElement !== hInput) hInput.value = "\u2014";
     if (document.activeElement !== sInput) sInput.value = "\u2014";
@@ -729,6 +795,12 @@ function _syncSquareSizeInputs() {
   wInput.disabled = false;
   hInput.disabled = false;
   sInput.disabled = false;
+  if (vbInput) {
+    vbInput.disabled = false;
+    if (document.activeElement !== vbInput) {
+      vbInput.checked = !!sq.visualBottom;
+    }
+  }
 
   if (document.activeElement !== wInput) {
     wInput.value = squareWorldWidth(sq).toFixed(3);
@@ -743,7 +815,51 @@ function _syncSquareSizeInputs() {
 
 /* ==========================================================================
    SCRUB-INPUT INSTALLER
-   ========================================================================== */
+   ==========================================================================
+   A scrub input is a text field the user drags horizontally to
+   change.  The installer owns the drag loop and the read/write
+   plumbing; each binding supplies four things:
+
+       rate             units per pixel of horizontal drag
+       snapStep         optional; Shift-held drags step by this
+       read()           current value, in the binding's own units
+       write(raw, drag) apply a value; `drag` is the drag-state
+                        object (see below), or undefined when the
+                        call came from Enter / blur rather than a
+                        drag
+
+   Two optional hooks extend the loop for bindings that need to
+   coordinate more than one model field:
+
+       onDragStart(drag)      called once at mousedown, after `drag`
+                              has been created, so a binding can
+                              snapshot whatever else it needs to
+                              hold fixed for the duration of the
+                              drag (e.g. the patch's φ at drag
+                              start, for the symmetric mirror-angle
+                              mode).
+
+       symmetricOnShift       when true, a Shift-held drag routes to
+       + writeSymmetric       writeSymmetric(raw, drag) instead of
+                              write.  Any snapStep the binding
+                              declared is skipped in this branch, so
+                              a symmetric drag is continuous even if
+                              the same field snaps in its other
+                              modes.  Releasing Shift mid-drag
+                              routes back to `write`, which the
+                              binding can use to undo any secondary
+                              motion the symmetric branch caused.
+
+   The `drag` object passed to the callbacks carries:
+
+       startX       screen x at mousedown
+       startValue   the field's value at mousedown (from read())
+       moved        true once the drag has passed the threshold
+       ... plus anything the binding's onDragStart added
+
+   The installer never reads the model directly — every binding's
+   `read` / `write` is the only place that knows what the field
+   means. */
 
 function _installScrubInput(el, opts) {
   let drag = null;
@@ -755,13 +871,26 @@ function _installScrubInput(el, opts) {
       if (Math.abs(dx) < SCRUB_DRAG_THRESHOLD) return;
       drag.moved = true;
     }
+
+    const symmetric = opts.symmetricOnShift && opts.writeSymmetric &&
+                      e.shiftKey;
+
     let raw = drag.startValue + dx * opts.rate;
-    if (opts.snapStep && e.shiftKey) {
+    /* Snap is only applied outside the symmetric branch: the
+       symmetric mode is a continuous coordinated motion, and a snap
+       on the mirror angle would also snap the patch's φ through the
+       Δ/2 coupling. */
+    if (!symmetric && opts.snapStep && e.shiftKey) {
       const delta = raw - drag.startValue;
       const snapped = Math.round(delta / opts.snapStep) * opts.snapStep;
       raw = drag.startValue + snapped;
     }
-    opts.write(raw);
+
+    if (symmetric) {
+      opts.writeSymmetric(raw, drag);
+    } else {
+      opts.write(raw, drag);
+    }
     draw();
   }
   function onUp() {
@@ -784,6 +913,7 @@ function _installScrubInput(el, opts) {
       startValue: opts.read(),
       moved: false,
     };
+    if (opts.onDragStart) opts.onDragStart(drag);
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
   });
@@ -1098,27 +1228,71 @@ function flashStatus(msg, cls) {
 
   /* ---- mirror angle scrub input ---------------------------------
      The angular offset at which the mirror patch is drawn, in
-     radians in the model and degrees in the field.  The rate and
-     snap step are converted from degrees to radians here so the
-     installer's radian-per-pixel contract is honoured.
+     radians in the model and degrees in the field.  No snap on this
+     field: the plain drag is continuous, and the Shift-held
+     symmetric drag below is also continuous.
 
-     The offset is added directly to the patch's φ bounds when the
-     mirror is drawn.  Pulling it off π separates the original and
-     the mirror when the tilted cone makes them converge at the
-     apex.  See the MIRROR ANGLE AND FLIP note in the module
-     docstring. */
+     Plain drag: moves only the mirror angle.
+
+     Shift-held drag (the symmetric mode): moves the mirror AND the
+     original patch symmetrically about the midpoint they shared at
+     drag start.  If the mirror angle advances by Δ, the patch's φ
+     shifts by −Δ/2 and the mirror (which sits at patch_φ +
+     mirrorAngle) moves by +Δ/2.  The two therefore separate (or
+     converge) at equal rates on either side of that fixed midpoint.
+
+     The midpoint is captured at mousedown — not recomputed from
+     the current patch position — so a long drag does not
+     accumulate drift.  Releasing Shift mid-drag restores the
+     patch to its start φ on the next motion event; the write
+     callback handles that via drag.startPhi.
+
+     See the MIRROR ANGLE AND FLIP note in the module docstring. */
   const mirrorAngleInput = document.getElementById("patchMirrorAngle");
   if (mirrorAngleInput) _installScrubInput(mirrorAngleInput, {
-    rate:     MIRROR_ANGLE_SCRUB_RATE_DEG_PER_PX * Math.PI / 180,
-    snapStep: MIRROR_ANGLE_SNAP_STEP_DEG * Math.PI / 180,
+    rate: MIRROR_ANGLE_SCRUB_RATE_DEG_PER_PX * Math.PI / 180,
+    symmetricOnShift: true,
+
     read: () => {
       if (selectedQuad < 0 || selectedQuad >= quads.length) return Math.PI;
       const q = quads[selectedQuad];
       return (typeof q.mirrorAngle === "number") ? q.mirrorAngle : Math.PI;
     },
-    write: (raw) => {
+
+    /* Snapshot the patch's φ at drag start so a symmetric drag can
+       always be recomputed from the same origin. */
+    onDragStart: (drag) => {
       if (selectedQuad < 0 || selectedQuad >= quads.length) return;
-      quads[selectedQuad].mirrorAngle = raw;
+      drag.startPhi = _patchPhiCenter(quads[selectedQuad]);
+    },
+
+    /* Plain drag: set the mirror angle.  If the drag was in
+       symmetric mode at any point, restore the patch's φ to its
+       start value so releasing Shift does not leave the patch
+       stranded mid-offset. */
+    write: (raw, drag) => {
+      if (selectedQuad < 0 || selectedQuad >= quads.length) return;
+      const q = quads[selectedQuad];
+      if (drag && typeof drag.startPhi === "number") {
+        _setPatchPhiCenter(q, drag.startPhi);
+      }
+      q.mirrorAngle = raw;
+    },
+
+    /* Shift-held drag: Δ = mirrorAngle − startMirrorAngle.  Mirror
+       moves by Δ; patch moves by −Δ/2.  Both are absolute from the
+       drag-start snapshot, so repeated mousemoves are idempotent
+       and no drift accumulates. */
+    writeSymmetric: (raw, drag) => {
+      if (selectedQuad < 0 || selectedQuad >= quads.length) return;
+      const q = quads[selectedQuad];
+      const startAngle = drag.startValue;
+      const startPhi   = (typeof drag.startPhi === "number")
+                           ? drag.startPhi
+                           : _patchPhiCenter(q);
+      const delta = raw - startAngle;
+      q.mirrorAngle = startAngle + delta;
+      _setPatchPhiCenter(q, startPhi - delta / 2);
     },
   });
 
@@ -1198,6 +1372,30 @@ function flashStatus(msg, cls) {
       floatSquares[selectedSquare].slope = s;
     },
   });
+
+  /* ---- per-square visual-bottom toggle --------------------------
+     A per-square meta option: when checked, the shape's KRA text
+     anchor and its four corner senses are read from the visual
+     bottom of the scene (the edge of the drawn square whose
+     midpoint sits lowest on screen) instead of from the shape's own
+     longest edge.  The flag is stored on the square object as
+     `visualBottom` and read by pg_kra.py's
+     _shapeLabelScreenAngleDeg.  See the VISUAL BOTTOM section in
+     the module docstring.  The checkbox's own state follows the
+     selected square, kept in sync by _syncSquareSizeInputs. */
+  const visualBottomEl = document.getElementById("squareVisualBottom");
+  if (visualBottomEl) {
+    visualBottomEl.addEventListener("change", () => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return;
+      const sq = floatSquares[selectedSquare];
+      sq.visualBottom = visualBottomEl.checked;
+      draw();
+      flashStatus(visualBottomEl.checked
+                    ? "Visual bottom on for " + squareDisplayName(sq)
+                    : "Visual bottom off",
+                  "ok");
+    });
+  }
 
   /* ---- draw tool + help popup -----------------------------------
      Draw Quad toggles the fitting tool (state and fitting logic in

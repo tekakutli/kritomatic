@@ -39,6 +39,16 @@ tips the +v (apex-facing) edge of the shape into the cone's cavity;
 the flat view ignores slope so its (φ, s) footprint is unaffected.
 The cone-view screen corners reported in `cornersScreenCone` reflect
 the tilt; `cornersFlatParam` / `cornersScreenFlat` do not.
+
+Schema v7
+=========
+Each shape now carries a `visualBottom` boolean: the per-square flag
+that switches the KRA export's text-anchor and corner-sense logic
+from "longest edge" (false / unset) to "visual bottom of the scene"
+(true).  Nothing on the render path reads it; it is included here so
+the visual-state dump matches the scene file and the KRA export's
+own inputs.  See pg_kra.py's `_shapeLabelScreenAngleDeg` and the
+VISUAL BOTTOM note in pg_panel.py.
 """
 
 EXPORT_JS = r"""
@@ -70,7 +80,7 @@ function _worldSideLengths(pts) {
 
 function buildVisualStateExport() {
   const out = {
-    schemaVersion: 6,
+    schemaVersion: 7,
     generatedAt:   new Date().toISOString(),
 
     cone: {
@@ -165,6 +175,7 @@ function buildVisualStateExport() {
       thetaDeg: _round3((sq.theta || 0) * 180 / Math.PI),
       slopeRad: _round3(sq.slope || 0),
       slopeDeg: _round3((sq.slope || 0) * 180 / Math.PI),
+      visualBottom: !!sq.visualBottom,
     };
 
     if (!f) {

@@ -5,9 +5,10 @@ The scene is the complete editable state of the workspace:
 
     cone state      ax, ay, depth, halfAngle, ringCount, meridianCount
     shapeDepthCone  the cone view's SHAPE_DEPTH_CONE multiplier
-    patches         id, name, phi0, phi1, s0, s1, mirror
+    patches         id, name, phi0, phi1, s0, s1, mirror,
+                    mirrorAngle, mirrorFlip
     squares         id, name, quadId, u, v, scaleU, scaleV, theta,
-                    slope
+                    slope, visualBottom
     id counters     nextQuadId, nextSquareId
     kraOptions      the KRA-export meta-options block
 
@@ -80,10 +81,20 @@ unchanged.
 
 MIRROR
 ======
-The per-patch `mirror` boolean is persisted alongside the patch's
-φ and s bounds.  Files written before mirror existed simply omit
-it; the loader defaults a missing value to false, so old scenes
-load unchanged.
+The per-patch `mirror`, `mirrorAngle`, and `mirrorFlip` fields are
+persisted alongside the patch's φ and s bounds.  Files written
+before any of these existed simply omit them; the loader defaults
+`mirror` to false, `mirrorAngle` to π, and `mirrorFlip` to true, so
+old scenes load unchanged.
+
+VISUAL BOTTOM
+=============
+The per-square `visualBottom` boolean is persisted alongside the
+square's geometry.  Files written before this field existed simply
+omit it; the loader defaults a missing value to false, so old
+scenes load with the historical longest-edge reading of the
+shape's "bottom".  See the VISUAL BOTTOM section in pg_panel.py
+for the semantics.
 """
 
 
@@ -139,6 +150,7 @@ function buildSceneJSON() {
       scaleV: sq.scaleV,
       theta:  sq.theta || 0,
       slope:  sq.slope || 0,
+      visualBottom: !!sq.visualBottom,
     })),
 
     /* KRA-export meta-options.  The mapping between DOM controls
@@ -285,6 +297,7 @@ function applySceneJSON(data) {
                 ? s.scaleV : SHAPE_DEFAULT_SCALE,
       theta:  (typeof s.theta === "number") ? s.theta : 0,
       slope:  (typeof s.slope === "number") ? s.slope : 0,
+      visualBottom: !!s.visualBottom,
     });
   }
 

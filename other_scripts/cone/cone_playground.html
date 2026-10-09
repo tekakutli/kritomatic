@@ -130,6 +130,27 @@
   }
   #ui button:active { background:rgba(220,230,242,0.07); }
 
+  /* The "Generate .kra" button carries a red accent — the export
+     action reads as destructive-tier in the palette, distinct from
+     the neutral grey/cyan sliders and the amber patch lists.  The
+     resting text is deliberately bright (a light rose) so the
+     label stays legible at 10px uppercase; the faint text-shadow
+     adds body to the glyphs without creating a glow. */
+  #ui button#generateKraBtn {
+    border-color: rgba(255, 105, 125, 0.80);
+    color: #ffb0bc;
+    text-shadow: 0 0 4px rgba(255, 80, 100, 0.45);
+  }
+  #ui button#generateKraBtn:hover {
+    border-color: rgba(255, 130, 150, 1.00);
+    color: #ffd0d8;
+    background: rgba(220, 90, 110, 0.12);
+    text-shadow: 0 0 6px rgba(255, 80, 100, 0.65);
+  }
+  #ui button#generateKraBtn:active {
+    background: rgba(220, 90, 110, 0.20);
+  }
+
   #ui hr { border:0; border-top:1px solid #1e2836; margin:10px 0; }
 
   .quadList {
@@ -359,6 +380,17 @@
            value="&#8212;" autocomplete="off" spellcheck="false"
            disabled>
   </div>
+  <div class="field">
+    <label>Visual bot.</label>
+    <input type="checkbox" id="squareVisualBottom"
+           title="When checked, the shape's text anchor and corner
+                  senses follow the visual bottom of the scene — the
+                  side of the square that sits lowest on screen —
+                  instead of the shape's own longest edge.  Changes
+                  both the label's baseline angle and which corner
+                  is read as top-left, top-right, bottom-right,
+                  bottom-left.">
+  </div>
 
   <hr>
 
@@ -385,7 +417,12 @@
   </div>
   <div class="field">
     <label>No rotate</label>
-    <input type="checkbox" id="drawNoRotate">
+    <input type="checkbox" id="drawNoRotate"
+           title="Lock the fitted shape's rotation to zero, so its
+                  edges run parallel to the flat view's φ and s
+                  axes — the shape reads as north/south aligned on
+                  the unfolded sheet.  Read at draw-finish time, so
+                  it can be changed mid-draw.">
   </div>
   <div class="row" style="margin-top:-2px;">
     <button id="drawQuadBtn">Draw Quad</button>
@@ -446,7 +483,11 @@
   </div>
   <div class="field">
     <label>Rectangles</label>
-    <input type="checkbox" id="kraDrawRects" checked>
+    <input type="checkbox" id="kraDrawRects" checked
+           title="When checked, the KRA export writes one filled
+                  rectangle per square alongside its text, using
+                  the square's projected corners.  When unchecked,
+                  only the text layers are written.">
   </div>
 
   <div id="status">drag apex to tilt · scroll to change depth</div>
@@ -598,9 +639,10 @@ function addQuad() {
    The clone gets a fresh id and default name; its squares likewise.
    The clone is placed one patch-width to the right in φ so it does
    not sit on top of the source.  φ wraps harmlessly, so pushing past
-   2π is fine.  Square (u, v, scaleU, scaleV, θ, slope) are copied
-   as-is, so the clone's squares sit in the same spot on the new
-   patch as they did on the old. */
+   2π is fine.  Square (u, v, scaleU, scaleV, θ, slope, visualBottom)
+   are copied as-is, so the clone's squares sit in the same spot on
+   the new patch as they did on the old, with the same per-square
+   text-anchor mode. */
 function cloneQuad(idx) {
   if (idx < 0 || idx >= quads.length) return;
   const src = quads[idx];
@@ -634,6 +676,7 @@ function cloneQuad(idx) {
       scaleV: sq.scaleV,
       theta:  sq.theta || 0,
       slope:  sq.slope || 0,
+      visualBottom: !!sq.visualBottom,
     });
   }
 
@@ -2240,19 +2283,17 @@ function quadIdxById(id) {
    ==========================================================================
    Every patch carries a boolean `mirror`.  When it is true, every
    square on the patch is drawn a second time on the patch's mirror —
-   the same patch shifted by π in φ, i.e. on the diametrically
-   opposite side of the cone.  The mirror copy shares the square's
-   full local state (u, v, theta, scaleU, scaleV, slope): it is a
-   pure visual clone, not an independent object.  Dragging or
-   editing the original updates both; the mirror itself is not hit-
-   testable.
+   the same patch shifted by `mirrorAngle` in φ (default π), i.e. on
+   the opposite side of the cone.  The mirror copy shares the
+   square's full local state and is a pure visual clone, not an
+   independent object.
 
-   The renderer shifts the patch's φ bounds in place, runs the same
-   drawing routines, then restores them.  Every square geometry
-   function reads the patch through `quads[qi]`, so the shifted
-   patch is what they see; nothing in the per-square math needs to
-   know a mirror is being drawn.  The shift is restored in a
-   `finally`, so an exception cannot leave the model shifted. */
+   The renderer shifts the patch's φ bounds in place, flips the
+   square's local state if `mirrorFlip` is on, runs the caller's
+   drawing/export routine, then restores everything in a `finally`.
+   Every square geometry function reads the patch through
+   `quads[qi]`, so the shifted patch is what they see; nothing in
+   the per-square math needs to know a mirror is being drawn. */
 
 function _withQuadPhiShifted(q, dPhi, fn) {
   const phi0 = q.phi0, phi1 = q.phi1;
@@ -2271,13 +2312,22 @@ function _squareHasMirror(sq) {
   return !!(q && q.mirror);
 }
 
-/* The mirror draws the same square on the diametrically-opposite
-   side of the cone, offset by `mirrorAngle` in φ (default π).  When
-   `mirrorFlip` is true, the shape's θ is negated for the duration of
-   the mirror draw, which cancels the 180° frame rotation that the
-   φ-shift introduces — so a tilted square on the mirror tilts the
-   same way it does on the original instead of appearing upside
-   down. */
+/* Run `fn` with the square in its mirror state and restore on exit.
+
+   With `mirrorFlip` on (the default), the flip is a reflection
+   across the patch's V axis: θ → −θ, slope → −slope, u → −u.  This
+   is the transformation that makes a rotated or tilted shape read
+   as a true left-right reflection of the original on the mirror,
+   rather than as a rotated ghost.
+
+   With `mirrorFlip` off, only the patch's φ bounds shift; the
+   square keeps its local state and renders as a straight copy at
+   the mirror location (which, since the patch itself is now on the
+   opposite side of the cone, usually looks wrong — that's what the
+   toggle exists for).
+
+   The `finally` restores every field that was mutated, so an
+   exception inside `fn` cannot leave the model in a mirror state. */
 function _withSquareMirror(sq, fn) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
@@ -2292,23 +2342,15 @@ function _withSquareMirror(sq, fn) {
   const phi1   = q.phi1;
   const theta0 = sq.theta || 0;
   const slope0 = sq.slope || 0;
-  const u0     = sq.u;     // was: const v0 = sq.v;
+  const u0     = sq.u;
 
   q.phi0 = phi0 + angle;
   q.phi1 = phi1 + angle;
 
   if (flip) {
-    /* Reflect the shape through the patch's U axis.  A rectangle
-       has no internal left/right asymmetry, so negating θ alone
-       only rotates it; negating slope alone only tips it.  The
-       real "flip" is in the shape's POSITION along the patch's V
-       axis, which combined with the two sign flips is exactly the
-       point reflection v → -v, θ → -θ, slope → -slope.  This is
-       what makes the mirror read as the original flipped
-       top-to-bottom on the patch rather than as a rotated ghost. */
     sq.theta = -theta0;
     sq.slope = -slope0;
-    sq.u     = -u0;        // was: sq.v = -v0;
+    sq.u     = -u0;
   }
 
   try {
@@ -2318,7 +2360,7 @@ function _withSquareMirror(sq, fn) {
     q.phi1   = phi1;
     sq.theta = theta0;
     sq.slope = slope0;
-    sq.u     = u0;         // was: sq.v = v0;
+    sq.u     = u0;
   }
 }
 
@@ -2498,6 +2540,7 @@ function addSquareAt(quadIdx, uLocal, vLocal) {
     scaleV: SHAPE_DEFAULT_SCALE,
     theta: 0,
     slope: 0,
+    visualBottom: false,
   });
   selectedSquare = floatSquares.length - 1;
   syncQuadList();
@@ -2508,9 +2551,9 @@ function addSquareAtCenter(quadIdx) { addSquareAt(quadIdx, 0, 0); }
 
 /* Duplicate a square at the EXACT same location as its source: same
    patch (quadId), same normalized (u, v), same scaleU / scaleV,
-   same theta, same slope.  The clone overlaps the source
-   pixel-for-pixel until it is dragged away.  It receives a fresh id
-   and default name, and becomes the new selection. */
+   same theta, same slope, same visualBottom.  The clone overlaps
+   the source pixel-for-pixel until it is dragged away.  It receives
+   a fresh id and default name, and becomes the new selection. */
 function cloneSquare(idx) {
   if (idx < 0 || idx >= floatSquares.length) return;
   const src = floatSquares[idx];
@@ -2527,6 +2570,7 @@ function cloneSquare(idx) {
     scaleV: src.scaleV,
     theta:  src.theta || 0,
     slope:  src.slope || 0,
+    visualBottom: !!src.visualBottom,
   });
   selectedSquare = floatSquares.length - 1;
   syncQuadList();
@@ -2676,10 +2720,10 @@ function squareCornersLocalWith(sq, depthScale) {
 }
 
 /* The local (u, v) of the corner DIAGONALLY OPPOSITE the given
-   corner — the anchor a Shift-held corner drag keeps fixed.  Same
-   math as squareCornersLocalWith but at the opposite sign pair.
-   Corners are ordered [TL, TR, BR, BL], so the opposite of corner
-   i is corner (i + 2) % 4.  depthScale is folded into the
+   corner — the anchor an anchored (default) corner drag keeps fixed.
+   Same math as squareCornersLocalWith but at the opposite sign
+   pair.  Corners are ordered [TL, TR, BR, BL], so the opposite of
+   corner i is corner (i + 2) % 4.  depthScale is folded into the
    reference v half-extent, matching squareCornersLocalWith; pass
    effectiveConeDepth() from the cone band and SHAPE_DEPTH_FLAT
    from the flat band. */
@@ -3077,7 +3121,9 @@ function drawFloatSquare(sq, selected, isMirror) {
   }
 
   /* The mirror gets no corner or rotate handles — it is a visual
-     clone, not a second editable object. */
+     clone, not a second editable object.  The mirror is still
+     hit-testable through the Alt pass-through, which see: a click
+     on it with Alt held targets the patch that square belongs to. */
   if (!selected || isMirror) return;
 
   for (const [sx, sy] of pts) {
@@ -3111,7 +3157,12 @@ function drawFloatSquare(sq, selected, isMirror) {
 
 /* ==========================================================================
    HIT TESTING — cone band
-   ========================================================================== */
+   ==========================================================================
+   The per-square hit test body is factored into _squareHitTestOne so
+   that the mirror hit test can reuse it inside _withSquareMirror:
+   the square's geometry functions read its current state, so running
+   the same body inside the mirror wrapper is what makes the mirror
+   hit-testable without duplicating any of the math. */
 
 const SQUARE_HANDLE_R   = 10;
 const SQUARE_BODY_MIN_R = 8;
@@ -3130,7 +3181,11 @@ function _ptInQuadPx(px, py, poly) {
   return inside;
 }
 
-function squareHitTest(sx, sy) {
+/* The order in which squares are hit-tested: the selected square
+   first, then every other square in declaration order.  Shared by
+   the original and the mirror hit tests so both prefer the same
+   square when two overlap. */
+function _squareHitOrder() {
   const order = [];
   if (selectedSquare >= 0 && selectedSquare < floatSquares.length) {
     order.push(selectedSquare);
@@ -3138,30 +3193,65 @@ function squareHitTest(sx, sy) {
   for (let i = 0; i < floatSquares.length; i++) {
     if (i !== selectedSquare) order.push(i);
   }
-  for (const si of order) {
+  return order;
+}
+
+/* Hit-test one square's CURRENT geometry.  The caller is
+   responsible for having put the square into whichever state it
+   wants tested — the plain hit test calls this directly, and the
+   mirror hit test wraps the call in _withSquareMirror. */
+function _squareHitTestOne(si, sx, sy) {
+  const sq = floatSquares[si];
+  if (!sq) return null;
+
+  const pts = squareCornersScreen(sq);
+  if (!pts || pts.length < 3) return null;
+
+  const rh = squareRotateHandleScreen(sq);
+  if (rh && Math.hypot(sx - rh[0], sy - rh[1]) < ROTATE_HANDLE_R) {
+    return { kind: "rotate", squareIdx: si };
+  }
+
+  for (let ci = 0; ci < pts.length; ci++) {
+    if (Math.hypot(sx - pts[ci][0], sy - pts[ci][1]) < SQUARE_HANDLE_R) {
+      return { kind: "corner", squareIdx: si, cornerIdx: ci };
+    }
+  }
+
+  if (_ptInQuadPx(sx, sy, pts)) return { kind: "body", squareIdx: si };
+
+  let mx = 0, my = 0;
+  for (const [x, y] of pts) { mx += x; my += y; }
+  mx /= pts.length; my /= pts.length;
+  if (Math.hypot(sx - mx, sy - my) < SQUARE_BODY_MIN_R) {
+    return { kind: "body", squareIdx: si };
+  }
+  return null;
+}
+
+function squareHitTest(sx, sy) {
+  for (const si of _squareHitOrder()) {
+    const hit = _squareHitTestOne(si, sx, sy);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/* Hit-test the mirror copies of every square.  Runs each square's
+   own hit test inside _withSquareMirror, so it sees the mirrored
+   geometry (shifted patch φ, and — when mirrorFlip is on — the
+   negated θ, slope, and u).  Used only by the Alt pass-through:
+   a click on a mirror square should grab the patch that square
+   belongs to, the same way a click on the original does. */
+function squareMirrorHitTest(sx, sy) {
+  for (const si of _squareHitOrder()) {
     const sq = floatSquares[si];
-    const pts = squareCornersScreen(sq);
-    if (!pts || pts.length < 3) continue;
-
-    const rh = squareRotateHandleScreen(sq);
-    if (rh && Math.hypot(sx - rh[0], sy - rh[1]) < ROTATE_HANDLE_R) {
-      return { kind: "rotate", squareIdx: si };
-    }
-
-    for (let ci = 0; ci < pts.length; ci++) {
-      if (Math.hypot(sx - pts[ci][0], sy - pts[ci][1]) < SQUARE_HANDLE_R) {
-        return { kind: "corner", squareIdx: si, cornerIdx: ci };
-      }
-    }
-
-    if (_ptInQuadPx(sx, sy, pts)) return { kind: "body", squareIdx: si };
-
-    let mx = 0, my = 0;
-    for (const [x, y] of pts) { mx += x; my += y; }
-    mx /= pts.length; my /= pts.length;
-    if (Math.hypot(sx - mx, sy - my) < SQUARE_BODY_MIN_R) {
-      return { kind: "body", squareIdx: si };
-    }
+    if (!sq) continue;
+    let hit = null;
+    _withSquareMirror(sq, () => {
+      hit = _squareHitTestOne(si, sx, sy);
+    });
+    if (hit) return hit;
   }
   return null;
 }
@@ -3375,9 +3465,25 @@ function cursorToLocalWithPersp(f, qi, sq, sx, sy) {
    SHARED EDIT OPERATIONS
    ========================================================================== */
 
-/* Corner resize.  The cursor's offset from the shape's centre is
-   mapped to the REFERENCE frame by inverting the same map the
-   renderer applies:
+/* Corner resize.
+
+   DEFAULT BRANCH — anchored.  When anchorU / anchorV are supplied,
+   the drag keeps the OPPOSITE corner fixed at (anchorU, anchorV)
+   and moves only the two edges that meet at the dragged corner.
+   The shape's centre shifts to the midpoint of the anchor and the
+   cursor.  Both half-extents are clamped to SHAPE_MIN_SCALE, then
+   the centre is recomputed from the clamped half-extents and the
+   fixed anchor so the anchor stays exactly put even when the cursor
+   lands on it.
+
+   SHIFT BRANCH — centred.  When no anchor is supplied, the shape
+   resizes about its own centre: the cursor's offset from the
+   centre's stored (u, v) sets the new reference half-extents, and
+   the centre itself does not move, so all four sides move
+   symmetrically.
+
+   The cursor's offset from the shape's centre is mapped to the
+   REFERENCE frame by inverting the same map the renderer applies:
 
        local_u_offset = duR · Ku
        local_v_offset = dvR · Kv
@@ -3386,26 +3492,11 @@ function cursorToLocalWithPersp(f, qi, sq, sx, sy) {
    resulting duR, dvR are un-rotated to recover the reference half-
    extents, hence the new scaleU / scaleV.
 
-   NOTE — the earlier version divided by uLen / vLen *in addition*
-   to Ku / Kv, which made the computed half-extent 1/uLen (resp.
-   1/vLen) of the correct value and collapsed the shape to a
-   fraction of its size the moment a corner was grabbed.
-
    depthScale is the multiplier the height is drawn at:
    effectiveConeDepth() from the cone band, SHAPE_DEPTH_FLAT from the
    flat band.  It enters only through the reference height's
    normalizer, so the corner follows the cursor in the band the drag
-   came from.
-
-   ANCHORED BRANCH — when anchorU / anchorV are supplied, the drag
-   switches to the Shift-held anchored resize: the OPPOSITE corner
-   stays fixed in place at (anchorU, anchorV) and only the two edges
-   meeting at the dragged corner move.  The shape's centre shifts to
-   the midpoint between the anchor and the cursor.  Both half-extents
-   are clamped to SHAPE_MIN_SCALE, then the centre is recomputed from
-   the clamped half-extents and the fixed anchor so the anchor stays
-   exactly put even when the cursor lands on it.  See the module
-   docstring, ANCHORED RESIZE (SHIFT-HELD), for the derivation. */
+   came from. */
 
 function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale,
                                  anchorU, anchorV) {
@@ -3435,7 +3526,7 @@ function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale,
   const refHWmin = SHAPE_MIN_SCALE * SHAPE_REL_SIZE / 2;
   const refHHmin = SHAPE_MIN_SCALE * SHAPE_REL_SIZE / 2 * depthScale;
 
-  /* ---- anchored branch (Shift-held) ----------------------------
+  /* ---- anchored branch (default) -------------------------------
      The anchor is the OPPOSITE corner's local position, captured
      at drag start.  We solve for the new half-extents and centre
      from the anchor and the cursor alone; the shape's own rotation
@@ -3483,7 +3574,7 @@ function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale,
     return;
   }
 
-  /* ---- default branch: resize about the FIXED centre -----------
+  /* ---- centred branch (Shift-held) -----------------------------
      The cursor's offset from the shape's centre sets the new
      reference half-extents; the centre is not moved, so all four
      sides move symmetrically. */
@@ -3556,9 +3647,11 @@ function alignSelectedShapeToAxis() {
    ==========================================================================
    resizeSquareFromCorner takes an optional anchor.  When both
    anchorU and anchorV are supplied, the resize is anchored on that
-   fixed local point (the opposite corner) instead of on the shape's
-   centre.  pg_dispatch reads Shift at each move event and passes the
-   drag-start anchor when Shift is held. */
+   fixed local point (the opposite corner) — the default behaviour.
+   When they are not supplied, the resize is centred on the shape's
+   own (u, v) — the Shift-held behaviour.  pg_dispatch reads Shift
+   at each move event and passes the drag-start anchor when the
+   anchored branch is active. */
 
 function resizeSquareFromCorner(sq, cornerIdx, cursorWX, cursorWY,
                                  anchorU, anchorV) {
@@ -3645,10 +3738,11 @@ function squareFlatRotateHandleScreen(sq, shift) {
    ==========================================================================
    flatResizeSquareFromCornerIdx mirrors resizeSquareFromCorner: when
    anchorU / anchorV are supplied the resize is anchored on that
-   fixed local point (the opposite corner); otherwise the shape
-   resizes about its own centre.  The flat band uses SHAPE_DEPTH_FLAT
-   for the depth multiplier, so the anchor is captured and used at
-   the same scale. */
+   fixed local point (the opposite corner) — the default behaviour.
+   When they are not supplied, the resize is centred on the shape's
+   own (u, v) — the Shift-held behaviour.  The flat band uses
+   SHAPE_DEPTH_FLAT for the depth multiplier, so the anchor is
+   captured and used at the same scale. */
 
 function flatCursorToShapeLocal(sq, sx, sy) {
   const qi = quadIdxById(sq.quadId);
@@ -3696,42 +3790,71 @@ function flatMoveSquareBody(sq, sx, sy) {
 
 /* ==========================================================================
    FLAT-VIEW HIT TEST
-   ========================================================================== */
+   ==========================================================================
+   Same split as the cone band: the per-square body lives in
+   _squareFlatHitTestOne, so a mirror variant can run the exact same
+   body inside _withSquareMirror. */
+
+function _squareFlatHitTestOne(si, sx, sy) {
+  const sq = floatSquares[si];
+  if (!sq) return null;
+
+  const corners = squareFlatCorners(sq);
+  if (!corners) return null;
+  const phis = corners.map(c => c[0]);
+  const shifts = _phiCopies(Math.min(...phis), Math.max(...phis));
+
+  for (const shift of shifts) {
+    const rh = squareFlatRotateHandleScreen(sq, shift);
+    if (rh && Math.hypot(sx - rh[0], sy - rh[1]) < ROTATE_HANDLE_R) {
+      return { kind: "rotate", squareIdx: si };
+    }
+  }
+
+  for (const shift of shifts) {
+    const screen = corners.map(([phi, s]) =>
+      flatToScreen(phi + shift, s));
+
+    for (let ci = 0; ci < 4; ci++) {
+      if (Math.hypot(sx - screen[ci][0], sy - screen[ci][1])
+          < FLAT_HANDLE_R) {
+        return { kind: "corner", squareIdx: si, cornerIdx: ci };
+      }
+    }
+
+    if (_ptInQuadPx(sx, sy, screen)) {
+      return { kind: "body", squareIdx: si };
+    }
+  }
+  return null;
+}
 
 function squareFlatHitTest(sx, sy) {
   if (selectedQuad < 0 || selectedQuad >= quads.length) return null;
   const activeQ = quads[selectedQuad];
   for (let i = floatSquares.length - 1; i >= 0; i--) {
+    if (floatSquares[i].quadId !== activeQ.id) continue;
+    const hit = _squareFlatHitTestOne(i, sx, sy);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/* Same shape as squareFlatHitTest, but each square is tested inside
+   _withSquareMirror.  Only the selected patch's squares are
+   considered — the flat band only draws the selected patch's mirror
+   copies, so only those can be clicked. */
+function squareFlatMirrorHitTest(sx, sy) {
+  if (selectedQuad < 0 || selectedQuad >= quads.length) return null;
+  const activeQ = quads[selectedQuad];
+  for (let i = floatSquares.length - 1; i >= 0; i--) {
     const sq = floatSquares[i];
     if (sq.quadId !== activeQ.id) continue;
-
-    const corners = squareFlatCorners(sq);
-    if (!corners) continue;
-    const phis = corners.map(c => c[0]);
-    const shifts = _phiCopies(Math.min(...phis), Math.max(...phis));
-
-    for (const shift of shifts) {
-      const rh = squareFlatRotateHandleScreen(sq, shift);
-      if (rh && Math.hypot(sx - rh[0], sy - rh[1]) < ROTATE_HANDLE_R) {
-        return { kind: "rotate", squareIdx: i };
-      }
-    }
-
-    for (const shift of shifts) {
-      const screen = corners.map(([phi, s]) =>
-        flatToScreen(phi + shift, s));
-
-      for (let ci = 0; ci < 4; ci++) {
-        if (Math.hypot(sx - screen[ci][0], sy - screen[ci][1])
-            < FLAT_HANDLE_R) {
-          return { kind: "corner", squareIdx: i, cornerIdx: ci };
-        }
-      }
-
-      if (_ptInQuadPx(sx, sy, screen)) {
-        return { kind: "body", squareIdx: i };
-      }
-    }
+    let hit = null;
+    _withSquareMirror(sq, () => {
+      hit = _squareFlatHitTestOne(i, sx, sy);
+    });
+    if (hit) return hit;
   }
   return null;
 }
@@ -3894,7 +4017,7 @@ function _worldSideLengths(pts) {
 
 function buildVisualStateExport() {
   const out = {
-    schemaVersion: 6,
+    schemaVersion: 7,
     generatedAt:   new Date().toISOString(),
 
     cone: {
@@ -3989,6 +4112,7 @@ function buildVisualStateExport() {
       thetaDeg: _round3((sq.theta || 0) * 180 / Math.PI),
       slopeRad: _round3(sq.slope || 0),
       slopeDeg: _round3((sq.slope || 0) * 180 / Math.PI),
+      visualBottom: !!sq.visualBottom,
     };
 
     if (!f) {
@@ -4114,6 +4238,25 @@ function _unclippedProjectedCorners(sq) {
     projectShapePoint(f, qi, u, v, vC, pC, vMax, phiC, slope));
 }
 
+/* ==========================================================================
+   READING DIRECTION — TWO SOURCES
+   ==========================================================================
+   The label's baseline runs along whichever edge of the drawn polygon
+   is read as the shape's "bottom".  Two candidate edges exist, and
+   the per-square `visualBottom` flag picks between them:
+
+     visualBottom falsy  — the shape's own LONGEST edge in screen
+                           space (_longestEdgeDir).  This is the
+                           historical behaviour and the default.
+
+     visualBottom truthy — the VISUAL BOTTOM of the scene: the edge
+                           whose midpoint sits lowest on screen
+                           (_bottomEdgeDir).
+
+   Both helpers return a unit vector pointing along the chosen edge
+   with bx >= 0, so the reading angle lies in [-90°, +90°].  See the
+   module docstring, TEXT BOTTOM — TWO MODES. */
+
 function _longestEdgeDir(pts) {
   let bestLen = 0, bx = 0, by = 0;
   const n = pts.length;
@@ -4133,10 +4276,49 @@ function _longestEdgeDir(pts) {
   return [bx, by];
 }
 
+/* Direction of the shape's bottom edge as it appears on screen: the
+   edge whose midpoint has the largest y, i.e. sits lowest on screen
+   (screen y grows downward).  Returned as a unit vector from the
+   edge's left endpoint to its right endpoint, so bx >= 0.  Works on
+   any polygon — the shape is fed in its clipped form, so a shape
+   that overhangs the horizon is judged on its drawn bottom edge,
+   not on the invisible part beyond the clip. */
+function _bottomEdgeDir(screenPts) {
+  if (!screenPts || screenPts.length < 3) return null;
+  const n = screenPts.length;
+  let bestMidY = -Infinity;
+  let bestI = -1;
+  for (let i = 0; i < n; i++) {
+    const a = screenPts[i];
+    const b = screenPts[(i + 1) % n];
+    const midY = (a[1] + b[1]) / 2;
+    if (midY > bestMidY) {
+      bestMidY = midY;
+      bestI = i;
+    }
+  }
+  if (bestI < 0) return null;
+  let a = screenPts[bestI];
+  let b = screenPts[(bestI + 1) % n];
+  if (a[0] > b[0]) { const t = a; a = b; b = t; }
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-6) return null;
+  return [dx / len, dy / len];
+}
+
 function _shapeLabelScreenAngleDeg(sq, screenPts) {
   if (!screenPts || screenPts.length < 3) return 0;
 
-  const baseDir = _longestEdgeDir(screenPts);
+  /* Per-square mode selector.  Undefined / false keeps the
+     historical longest-edge behaviour; true switches to the visual
+     bottom of the scene.  See the module docstring, TEXT BOTTOM —
+     TWO MODES. */
+  const useVisualBottom = !!(sq && sq.visualBottom);
+  const baseDir = useVisualBottom
+    ? _bottomEdgeDir(screenPts)
+    : _longestEdgeDir(screenPts);
   if (!baseDir) return 0;
 
   let bx = baseDir[0];
@@ -4378,9 +4560,14 @@ function _decomposeAffineLocal(M00, M01, M10, M11) {
 
 /* ==========================================================================
    SQUARE MODE
-   ========================================================================== */
+   ==========================================================================
+   Same structure as before, but each entry now also carries a
+   `label` — the plain text to write into the vector shape — so the
+   layer name (`name`) and the text content can differ.  The mirror
+   pass uses `name + "_mirror"` for the layer and the original
+   `label` for the text. */
 
-function _kraShapeEntry(sq, options) {
+function _kraShapeEntry(sq, options, nameSuffix) {
   const textPos   = options.text_position || "center";
   const padFrac   = (typeof options.text_padding === "number")
                       ? options.text_padding : 0.06;
@@ -4418,19 +4605,21 @@ function _kraShapeEntry(sq, options) {
   const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
   const readingAngle  = _shapeLabelScreenAngleDeg(sq, screenCorners);
 
-  const name = squareDisplayName(sq);
-  const fontNat = Math.min(W, H) * 0.40;
+  const label     = squareDisplayName(sq);
+  const layerName = label + (nameSuffix || "");
+  const fontNat   = Math.min(W, H) * 0.40;
 
   const anchorCenter = _flatAnchorFromVisual(
-    screenCorners, W, H, textPos, padFrac, fontNat, name.length,
+    screenCorners, W, H, textPos, padFrac, fontNat, label.length,
     readingAngle, flatRotation
   );
   const anchor = _anchorForPosition(
-    anchorCenter, flatRotation, name.length, fontNat, textPos
+    anchorCenter, flatRotation, label.length, fontNat, textPos
   );
 
   return {
-    name:            name,
+    name:            layerName,
+    label:           label,
     points:          corners.map(([x, y]) => [x, y]),
     natural_w:       W,
     natural_h:       H,
@@ -4451,11 +4640,11 @@ function buildKraShapes(options) {
   for (let i = 0; i < floatSquares.length; i++) {
     const sq = floatSquares[i];
 
-    const e1 = _kraShapeEntry(sq, options);
+    const e1 = _kraShapeEntry(sq, options, "");
     if (e1) shapes.push(e1);
 
     _withSquareMirror(sq, () => {
-      const e2 = _kraShapeEntry(sq, options);
+      const e2 = _kraShapeEntry(sq, options, "_mirror");
       if (e2) shapes.push(e2);
     });
   }
@@ -4591,9 +4780,11 @@ function _bilinearInterpQuad(corners, u, v) {
 /* ==========================================================================
    PATCH MODE — one group + one mask per patch
    ==========================================================================
-   NOTE — per the module docstring (MIRROR), this per-patch mode
-   does NOT emit a mirror copy of the patch group.  Only the three
-   per-square modes (square, text, text-shear) do. */
+   The per-patch body is extracted into _buildOnePatchKraPatch so it
+   can be called twice: once on the patch as stored, and once with
+   the patch's φ shifted and each square flipped to emit the mirror
+   group.  The mirror group's name carries a `_mirror` suffix so
+   Krita's name lookup cannot collide the two. */
 
 function _projectedPatchCorners(q) {
   const corners = quadCorners(q);
@@ -4618,52 +4809,55 @@ function _patchFlatDimensions(projCorners) {
   };
 }
 
-function buildKraPatches(options) {
-  options = options || {};
+function _buildOnePatchKraPatch(q, options, nameSuffix, isMirror) {
   const colorMode = options.text_color_mode || "color";
-  const textPos = options.text_position || "center";
-  const padFrac = (typeof options.text_padding === "number")
-                    ? options.text_padding : 0.06;
+  const textPos   = options.text_position || "center";
+  const padFrac   = (typeof options.text_padding === "number")
+                      ? options.text_padding : 0.06;
   const drawRects = options.draw_rectangles !== false;
 
-  const patches = [];
-  for (let qi = 0; qi < quads.length; qi++) {
-    const q = quads[qi];
+  const sqsOnPatch = [];
+  for (let i = 0; i < floatSquares.length; i++) {
+    if (floatSquares[i].quadId === q.id) sqsOnPatch.push(floatSquares[i]);
+  }
+  if (sqsOnPatch.length === 0) return null;
 
-    const sqsOnPatch = [];
-    for (let i = 0; i < floatSquares.length; i++) {
-      if (floatSquares[i].quadId === q.id) {
-        sqsOnPatch.push(floatSquares[i]);
-      }
+  const projCorners = _projectedPatchCorners(q);
+  const dims = _patchFlatDimensions(projCorners);
+  if (dims.w <= 0.5 || dims.h <= 0.5) return null;
+
+  const patchH = _computeHomography(
+    [{x: 0, y: 0}, {x: dims.w, y: 0},
+     {x: dims.w, y: dims.h}, {x: 0, y: dims.h}],
+    [{x: projCorners[0][0], y: projCorners[0][1]},
+     {x: projCorners[1][0], y: projCorners[1][1]},
+     {x: projCorners[2][0], y: projCorners[2][1]},
+     {x: projCorners[3][0], y: projCorners[3][1]}]
+  );
+  const patchHinv = _invert3x3(patchH);
+  if (!patchHinv) return null;
+
+  const hue = patchHue(q);
+  const hex = _hueToHex(hue);
+  const hexLight = _hueToHexLight(hue);
+  const textColor = (colorMode === "black") ? "#000000" : hexLight;
+
+  const rects = [];
+  const pending = [];
+  let bbMinX = 0, bbMinY = 0, bbMaxX = dims.w, bbMaxY = dims.h;
+
+  const flip = isMirror && (q.mirrorFlip !== false);
+
+  for (const sq of sqsOnPatch) {
+    const theta0 = sq.theta || 0;
+    const slope0 = sq.slope || 0;
+    const u0     = sq.u;
+    if (flip) {
+      sq.theta = -theta0;
+      sq.slope = -slope0;
+      sq.u     = -u0;
     }
-    if (sqsOnPatch.length === 0) continue;
-
-    const projCorners = _projectedPatchCorners(q);
-    const dims = _patchFlatDimensions(projCorners);
-    if (dims.w <= 0.5 || dims.h <= 0.5) continue;
-
-    const patchH = _computeHomography(
-      [{x: 0, y: 0}, {x: dims.w, y: 0},
-       {x: dims.w, y: dims.h}, {x: 0, y: dims.h}],
-      [{x: projCorners[0][0], y: projCorners[0][1]},
-       {x: projCorners[1][0], y: projCorners[1][1]},
-       {x: projCorners[2][0], y: projCorners[2][1]},
-       {x: projCorners[3][0], y: projCorners[3][1]}]
-    );
-    const patchHinv = _invert3x3(patchH);
-    if (!patchHinv) continue;
-
-    const hue = patchHue(q);
-    const hex = _hueToHex(hue);
-    const hexLight = _hueToHexLight(hue);
-    const textColor = (colorMode === "black") ? "#000000" : hexLight;
-
-    const rects = [];
-    const pending = [];
-
-    let bbMinX = 0, bbMinY = 0, bbMaxX = dims.w, bbMaxY = dims.h;
-
-    for (const sq of sqsOnPatch) {
+    try {
       const unclipped = _unclippedProjectedCorners(sq);
       if (!unclipped || unclipped.length < 4) continue;
       const screenCorners = squareCornersScreen(sq) || unclipped;
@@ -4682,17 +4876,15 @@ function buildKraPatches(options) {
       const H_sq = (lens[1] + lens[3]) / 2;
       if (W_sq <= 0.5 || H_sq <= 0.5) continue;
 
-      const name = squareDisplayName(sq);
+      const label     = squareDisplayName(sq);
+      const layerName = label + (nameSuffix || "");
 
       if (drawRects) {
         rects.push({
-          name: name,
+          name: layerName,
           points: screenCorners.map(([x, y]) => [x, y]),
-          fill: hex,
-          fill_opacity: 0.40,
-          stroke: hex,
-          stroke_width: 2.0,
-          stroke_opacity: 1.0,
+          fill: hex, fill_opacity: 0.40,
+          stroke: hex, stroke_width: 2.0, stroke_opacity: 1.0,
         });
       }
 
@@ -4702,10 +4894,10 @@ function buildKraPatches(options) {
 
       const anchorCenterFlatSq = _flatAnchorFromVisual(
         screenCorners, W_sq, H_sq, textPos, padFrac,
-        fontNat, name.length, readAngSq, flatRotSq
+        fontNat, label.length, readAngSq, flatRotSq
       );
       const anchorFlatSq = _anchorForPosition(
-        anchorCenterFlatSq, flatRotSq, name.length, fontNat, textPos
+        anchorCenterFlatSq, flatRotSq, label.length, fontNat, textPos
       );
 
       const sqH = _computeHomography(
@@ -4755,10 +4947,10 @@ function buildKraPatches(options) {
       }
 
       pending.push({
-        name: name,
-        px: px,
-        py: py,
-        font_px: font_px,
+        label:  label,
+        text:   label,
+        px, py,
+        font_px,
         rotation: flatRotation,
         alignment: anchorFlatSq.alignment,
       });
@@ -4767,7 +4959,7 @@ function buildKraPatches(options) {
       const cosR = Math.cos(rad);
       const sinR = Math.sin(rad);
       const h2 = font_px / 2;
-      const textLenPx = name.length * font_px * 0.55;
+      const textLenPx = label.length * font_px * 0.55;
 
       let extStart, extEnd;
       if (anchorFlatSq.alignment === "right") {
@@ -4790,53 +4982,80 @@ function buildKraPatches(options) {
         bbMinY = Math.min(bbMinY, py + ry);
         bbMaxY = Math.max(bbMaxY, py + ry);
       }
+    } finally {
+      sq.theta = theta0;
+      sq.slope = slope0;
+      sq.u     = u0;
     }
+  }
 
-    if (pending.length === 0) continue;
+  if (pending.length === 0) return null;
 
-    const MARGIN = 4;
-    bbMinX -= MARGIN;
-    bbMinY -= MARGIN;
-    bbMaxX += MARGIN;
-    bbMaxY += MARGIN;
+  const MARGIN = 4;
+  bbMinX -= MARGIN; bbMinY -= MARGIN;
+  bbMaxX += MARGIN; bbMaxY += MARGIN;
 
-    const offX = bbMinX;
-    const offY = bbMinY;
-    const Wshift = bbMaxX - bbMinX;
-    const Hshift = bbMaxY - bbMinY;
+  const offX = bbMinX;
+  const offY = bbMinY;
+  const Wshift = bbMaxX - bbMinX;
+  const Hshift = bbMaxY - bbMinY;
 
-    const texts = [];
-    for (const p of pending) {
-      texts.push({
-        text: p.name,
-        x: p.px - offX,
-        y: p.py - offY,
-        font_px: p.font_px,
-        flat_rotation: p.rotation,
-        alignment: p.alignment,
-        color: textColor,
-      });
+  const texts = [];
+  for (const p of pending) {
+    texts.push({
+      text: p.text,
+      x: p.px - offX,
+      y: p.py - offY,
+      font_px: p.font_px,
+      flat_rotation: p.rotation,
+      alignment: p.alignment,
+      color: textColor,
+    });
+  }
+
+  const srcPts = [[0, 0], [Wshift, 0], [Wshift, Hshift], [0, Hshift]];
+  const unshiftedCorners = [
+    [bbMinX, bbMinY], [bbMaxX, bbMinY],
+    [bbMaxX, bbMaxY], [bbMinX, bbMaxY],
+  ];
+  const dstPts = unshiftedCorners.map(([fx, fy]) => {
+    const p = _applyHomography(patchH, fx, fy);
+    return p ? [p.x, p.y] : [0, 0];
+  });
+
+  return {
+    name: q.name + (nameSuffix || ""),
+    src_pts: srcPts,
+    dst_pts: dstPts,
+    texts: texts,
+    rects: rects,
+  };
+}
+
+function buildKraPatches(options) {
+  options = options || {};
+  const patches = [];
+
+  for (let qi = 0; qi < quads.length; qi++) {
+    const q = quads[qi];
+
+    const p1 = _buildOnePatchKraPatch(q, options, "", false);
+    if (p1) patches.push(p1);
+
+    if (q.mirror) {
+      const angle = (typeof q.mirrorAngle === "number")
+                      ? q.mirrorAngle : Math.PI;
+      const phi0 = q.phi0, phi1 = q.phi1;
+      q.phi0 = phi0 + angle;
+      q.phi1 = phi1 + angle;
+      try {
+        const p2 = _buildOnePatchKraPatch(q, options, "_mirror", true);
+        if (p2) patches.push(p2);
+      } finally {
+        q.phi0 = phi0;
+        q.phi1 = phi1;
+      }
     }
-
-    const srcPts = [
-      [0, 0], [Wshift, 0], [Wshift, Hshift], [0, Hshift],
-    ];
-    const unshiftedCorners = [
-      [bbMinX, bbMinY], [bbMaxX, bbMinY],
-      [bbMaxX, bbMaxY], [bbMinX, bbMaxY],
-    ];
-    const dstPts = unshiftedCorners.map(([fx, fy]) => {
-      const p = _applyHomography(patchH, fx, fy);
-      return p ? [p.x, p.y] : [0, 0];
-    });
-
-    patches.push({
-      name: q.name,
-      src_pts: srcPts,
-      dst_pts: dstPts,
-      texts: texts,
-      rects: rects,
-    });
   }
   return patches;
 }
@@ -4845,7 +5064,7 @@ function buildKraPatches(options) {
    TEXT MODE — one group + one mask per text
    ========================================================================== */
 
-function _kraTextEntry(sq, options) {
+function _kraTextEntry(sq, options, nameSuffix) {
   const colorMode = options.text_color_mode || "color";
   const textPos   = options.text_position || "center";
   const padFrac   = (typeof options.text_padding === "number")
@@ -4881,18 +5100,16 @@ function _kraTextEntry(sq, options) {
   const hexLight = _hueToHexLight(hue);
   const textColor = (colorMode === "black") ? "#000000" : hexLight;
 
-  const name = squareDisplayName(sq);
+  const label     = squareDisplayName(sq);
+  const layerName = label + (nameSuffix || "");
 
   let rect = null;
   if (drawRects) {
     rect = {
-      name: name,
+      name: layerName,
       points: screenCorners.map(([x, y]) => [x, y]),
-      fill: hex,
-      fill_opacity: 0.40,
-      stroke: hex,
-      stroke_width: 2.0,
-      stroke_opacity: 1.0,
+      fill: hex, fill_opacity: 0.40,
+      stroke: hex, stroke_width: 2.0, stroke_opacity: 1.0,
     };
   }
 
@@ -4902,23 +5119,18 @@ function _kraTextEntry(sq, options) {
 
   const anchorCenter = _flatAnchorFromVisual(
     screenCorners, W_sq, H_sq, textPos, padFrac,
-    fontNat, name.length,
-    readingAngle, flatRotation
+    fontNat, label.length, readingAngle, flatRotation
   );
   const anchor = _anchorForPosition(
-    anchorCenter, flatRotation, name.length, fontNat, textPos
+    anchorCenter, flatRotation, label.length, fontNat, textPos
   );
 
-  const srcPts = [
-    [0, 0],
-    [W_sq, 0],
-    [W_sq, H_sq],
-    [0, H_sq],
-  ];
+  const srcPts = [[0, 0], [W_sq, 0], [W_sq, H_sq], [0, H_sq]];
   const dstPts = unclipped.map(([x, y]) => [x, y]);
 
   const item = {
-    name: name,
+    name: layerName,
+    label: label,
     src_w: W_sq,
     src_h: H_sq,
     text_x: anchor.x,
@@ -4942,11 +5154,11 @@ function buildKraTexts(options) {
   for (let i = 0; i < floatSquares.length; i++) {
     const sq = floatSquares[i];
 
-    const e1 = _kraTextEntry(sq, options);
+    const e1 = _kraTextEntry(sq, options, "");
     if (e1) { items.push(e1.item); if (e1.rect) rects.push(e1.rect); }
 
     _withSquareMirror(sq, () => {
-      const e2 = _kraTextEntry(sq, options);
+      const e2 = _kraTextEntry(sq, options, "_mirror");
       if (e2) { items.push(e2.item); if (e2.rect) rects.push(e2.rect); }
     });
   }
@@ -4975,7 +5187,7 @@ function buildKraTexts(options) {
    smaller, and nothing overflows.  Rotation and shear are invariant
    under the normalization, so the shape of the text is preserved. */
 
-function _kraShearTextEntry(sq, options) {
+function _kraShearTextEntry(sq, options, nameSuffix) {
   const colorMode = options.text_color_mode || "color";
   const textPos   = options.text_position || "center";
   const padFrac   = (typeof options.text_padding === "number")
@@ -5010,18 +5222,16 @@ function _kraShearTextEntry(sq, options) {
   const hexLight = _hueToHexLight(hue);
   const textColor = (colorMode === "black") ? "#000000" : hexLight;
 
-  const name = squareDisplayName(sq);
+  const label     = squareDisplayName(sq);
+  const layerName = label + (nameSuffix || "");
 
   let rect = null;
   if (drawRects) {
     rect = {
-      name: name,
+      name: layerName,
       points: screenCorners.map(([x, y]) => [x, y]),
-      fill: hex,
-      fill_opacity: 0.40,
-      stroke: hex,
-      stroke_width: 2.0,
-      stroke_opacity: 1.0,
+      fill: hex, fill_opacity: 0.40,
+      stroke: hex, stroke_width: 2.0, stroke_opacity: 1.0,
     };
   }
 
@@ -5031,10 +5241,10 @@ function _kraShearTextEntry(sq, options) {
 
   const anchorCenter = _flatAnchorFromVisual(
     screenCorners, W_sq, H_sq, textPos, padFrac,
-    fontNat, name.length, readingAngle, flatRotation
+    fontNat, label.length, readingAngle, flatRotation
   );
   const anchor = _anchorForPosition(
-    anchorCenter, flatRotation, name.length, fontNat, textPos
+    anchorCenter, flatRotation, label.length, fontNat, textPos
   );
 
   const sqH = _computeHomography(
@@ -5063,8 +5273,6 @@ function _kraShearTextEntry(sq, options) {
   const decomp = _decomposeAffineLocal(M00, M01, M10, M11);
   if (!decomp) return null;
 
-  // Normalize scales so the larger one is 1.  The text's on-screen
-  // bounding box then fits in a fontNat × fontNat square.
   const maxScale = Math.max(Math.abs(decomp.scale_x),
                             Math.abs(decomp.scale_y));
   if (maxScale < 1e-9) return null;
@@ -5081,10 +5289,10 @@ function _kraShearTextEntry(sq, options) {
   const dy = ay - N10 * ax - N11 * ay;
 
   const item = {
-    name: name,
-    text: name,
-    x: ax,
-    y: ay,
+    name: layerName,
+    label: label,
+    text: label,
+    x: ax, y: ay,
     font_px: Math.max(6, fontNat),
     alignment: anchor.alignment,
     color: textColor,
@@ -5109,11 +5317,11 @@ function buildKraShearTexts(options) {
   for (let i = 0; i < floatSquares.length; i++) {
     const sq = floatSquares[i];
 
-    const e1 = _kraShearTextEntry(sq, options);
+    const e1 = _kraShearTextEntry(sq, options, "");
     if (e1) { items.push(e1.item); if (e1.rect) rects.push(e1.rect); }
 
     _withSquareMirror(sq, () => {
-      const e2 = _kraShearTextEntry(sq, options);
+      const e2 = _kraShearTextEntry(sq, options, "_mirror");
       if (e2) { items.push(e2.item); if (e2.rect) rects.push(e2.rect); }
     });
   }
@@ -5130,17 +5338,128 @@ function buildKraShearTexts(options) {
    warp.  The scale normalization matches text-shear's, so the two
    modes render each text at the same on-screen size.
 
-   NOTE — per the module docstring (MIRROR), this per-patch mode
-   does NOT emit a mirror copy of the patch group. */
+   The per-square work is extracted into _shearTextForSquare so it
+   can be called twice per square: once for the original group, and
+   once — inside a patch φ shift plus per-square flip — for the
+   mirror group.  The mirror group's name carries a `_mirror` suffix
+   and the mirror text's layer name carries the same suffix, so
+   Krita's name lookup cannot collide the two. */
 
-function buildKraShearPatches(options) {
-  options = options || {};
-  const colorMode = options.text_color_mode || "color";
+function _shearTextForSquare(sq, options, hex, textColor, nameSuffix) {
   const textPos   = options.text_position || "center";
   const padFrac   = (typeof options.text_padding === "number")
                       ? options.text_padding : 0.06;
   const drawRects = options.draw_rectangles !== false;
 
+  const unclipped = _unclippedProjectedCorners(sq);
+  if (!unclipped || unclipped.length < 4) return null;
+  const screenCorners = squareCornersScreen(sq) || unclipped;
+
+  const lens = (function () {
+    const n = unclipped.length;
+    const s = [];
+    for (let k = 0; k < n; k++) {
+      const a = unclipped[k];
+      const b = unclipped[(k + 1) % n];
+      s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
+    }
+    return s;
+  })();
+  const W_sq = (lens[0] + lens[2]) / 2;
+  const H_sq = (lens[1] + lens[3]) / 2;
+  if (W_sq <= 0.5 || H_sq <= 0.5) return null;
+
+  const label     = squareDisplayName(sq);
+  const layerName = label + (nameSuffix || "");
+
+  let rect = null;
+  if (drawRects) {
+    rect = {
+      name: layerName,
+      points: screenCorners.map(([x, y]) => [x, y]),
+      fill: hex, fill_opacity: 0.40,
+      stroke: hex, stroke_width: 2.0, stroke_opacity: 1.0,
+    };
+  }
+
+  const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
+  const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
+  const fontNat = Math.min(W_sq, H_sq) * 0.40;
+
+  const anchorCenter = _flatAnchorFromVisual(
+    screenCorners, W_sq, H_sq, textPos, padFrac,
+    fontNat, label.length, readingAngle, flatRotation
+  );
+  const anchor = _anchorForPosition(
+    anchorCenter, flatRotation, label.length, fontNat, textPos
+  );
+
+  const sqH = _computeHomography(
+    [{x: 0, y: 0}, {x: W_sq, y: 0},
+     {x: W_sq, y: H_sq}, {x: 0, y: H_sq}],
+    [{x: unclipped[0][0], y: unclipped[0][1]},
+     {x: unclipped[1][0], y: unclipped[1][1]},
+     {x: unclipped[2][0], y: unclipped[2][1]},
+     {x: unclipped[3][0], y: unclipped[3][1]}]
+  );
+
+  const anchorScreen = _applyHomography(sqH, anchor.x, anchor.y);
+  if (!anchorScreen) return null;
+
+  const J = _patchProjectiveJacobian(sqH, anchor.x, anchor.y);
+  if (!J) return null;
+
+  const cosR = Math.cos(flatRotation * Math.PI / 180);
+  const sinR = Math.sin(flatRotation * Math.PI / 180);
+
+  const M00 =  J.J11 * cosR + J.J12 * sinR;
+  const M01 = -J.J11 * sinR + J.J12 * cosR;
+  const M10 =  J.J21 * cosR + J.J22 * sinR;
+  const M11 = -J.J21 * sinR + J.J22 * cosR;
+
+  const decomp = _decomposeAffineLocal(M00, M01, M10, M11);
+  if (!decomp) return null;
+
+  const maxScale = Math.max(Math.abs(decomp.scale_x),
+                            Math.abs(decomp.scale_y));
+  if (maxScale < 1e-9) return null;
+  const invScale = 1 / maxScale;
+
+  const N00 = M00 * invScale;
+  const N01 = M01 * invScale;
+  const N10 = M10 * invScale;
+  const N11 = M11 * invScale;
+
+  const ax = anchorScreen.x;
+  const ay = anchorScreen.y;
+  const dx = ax - N00 * ax - N01 * ay;
+  const dy = ay - N10 * ax - N11 * ay;
+
+  return {
+    text: {
+      name: layerName,
+      label: label,
+      text: label,
+      x: ax, y: ay,
+      font_px: Math.max(6, fontNat),
+      alignment: anchor.alignment,
+      color: textColor,
+      transform: [N00, N10, N01, N11, dx, dy],
+      decomposition: {
+        rotation_deg: decomp.rotation_deg,
+        shear: decomp.shear,
+        scale_x: decomp.scale_x,
+        scale_y: decomp.scale_y,
+        max_scale: maxScale,
+      },
+    },
+    rect: rect,
+  };
+}
+
+function buildKraShearPatches(options) {
+  options = options || {};
+  const colorMode = options.text_color_mode || "color";
   const patches = [];
 
   for (let qi = 0; qi < quads.length; qi++) {
@@ -5148,9 +5467,7 @@ function buildKraShearPatches(options) {
 
     const sqsOnPatch = [];
     for (let i = 0; i < floatSquares.length; i++) {
-      if (floatSquares[i].quadId === q.id) {
-        sqsOnPatch.push(floatSquares[i]);
-      }
+      if (floatSquares[i].quadId === q.id) sqsOnPatch.push(floatSquares[i]);
     }
     if (sqsOnPatch.length === 0) continue;
 
@@ -5159,121 +5476,64 @@ function buildKraShearPatches(options) {
     const hexLight = _hueToHexLight(hue);
     const textColor = (colorMode === "black") ? "#000000" : hexLight;
 
-    const rects = [];
-    const texts = [];
-
-    for (const sq of sqsOnPatch) {
-      const unclipped = _unclippedProjectedCorners(sq);
-      if (!unclipped || unclipped.length < 4) continue;
-      const screenCorners = squareCornersScreen(sq) || unclipped;
-
-      const lens = (function () {
-        const n = unclipped.length;
-        const s = [];
-        for (let k = 0; k < n; k++) {
-          const a = unclipped[k];
-          const b = unclipped[(k + 1) % n];
-          s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
-        }
-        return s;
-      })();
-      const W_sq = (lens[0] + lens[2]) / 2;
-      const H_sq = (lens[1] + lens[3]) / 2;
-      if (W_sq <= 0.5 || H_sq <= 0.5) continue;
-
-      const name = squareDisplayName(sq);
-
-      if (drawRects) {
-        rects.push({
-          name: name,
-          points: screenCorners.map(([x, y]) => [x, y]),
-          fill: hex,
-          fill_opacity: 0.40,
-          stroke: hex,
-          stroke_width: 2.0,
-          stroke_opacity: 1.0,
-        });
+    /* ---- original group ---------------------------------------- */
+    {
+      const rects = [];
+      const texts = [];
+      for (const sq of sqsOnPatch) {
+        const r = _shearTextForSquare(sq, options, hex, textColor, "");
+        if (!r) continue;
+        if (r.rect) rects.push(r.rect);
+        texts.push(r.text);
       }
-
-      const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
-      const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
-      const fontNat = Math.min(W_sq, H_sq) * 0.40;
-
-      const anchorCenter = _flatAnchorFromVisual(
-        screenCorners, W_sq, H_sq, textPos, padFrac,
-        fontNat, name.length, readingAngle, flatRotation
-      );
-      const anchor = _anchorForPosition(
-        anchorCenter, flatRotation, name.length, fontNat, textPos
-      );
-
-      const sqH = _computeHomography(
-        [{x: 0, y: 0}, {x: W_sq, y: 0},
-         {x: W_sq, y: H_sq}, {x: 0, y: H_sq}],
-        [{x: unclipped[0][0], y: unclipped[0][1]},
-         {x: unclipped[1][0], y: unclipped[1][1]},
-         {x: unclipped[2][0], y: unclipped[2][1]},
-         {x: unclipped[3][0], y: unclipped[3][1]}]
-      );
-
-      const anchorScreen = _applyHomography(sqH, anchor.x, anchor.y);
-      if (!anchorScreen) continue;
-
-      const J = _patchProjectiveJacobian(sqH, anchor.x, anchor.y);
-      if (!J) continue;
-
-      const cosR = Math.cos(flatRotation * Math.PI / 180);
-      const sinR = Math.sin(flatRotation * Math.PI / 180);
-
-      const M00 =  J.J11 * cosR + J.J12 * sinR;
-      const M01 = -J.J11 * sinR + J.J12 * cosR;
-      const M10 =  J.J21 * cosR + J.J22 * sinR;
-      const M11 = -J.J21 * sinR + J.J22 * cosR;
-
-      const decomp = _decomposeAffineLocal(M00, M01, M10, M11);
-      if (!decomp) continue;
-
-      const maxScale = Math.max(Math.abs(decomp.scale_x),
-                                Math.abs(decomp.scale_y));
-      if (maxScale < 1e-9) continue;
-      const invScale = 1 / maxScale;
-
-      const N00 = M00 * invScale;
-      const N01 = M01 * invScale;
-      const N10 = M10 * invScale;
-      const N11 = M11 * invScale;
-
-      const ax = anchorScreen.x;
-      const ay = anchorScreen.y;
-      const dx = ax - N00 * ax - N01 * ay;
-      const dy = ay - N10 * ax - N11 * ay;
-
-      texts.push({
-        name: name,
-        text: name,
-        x: ax,
-        y: ay,
-        font_px: Math.max(6, fontNat),
-        alignment: anchor.alignment,
-        color: textColor,
-        transform: [N00, N10, N01, N11, dx, dy],
-        decomposition: {
-          rotation_deg: decomp.rotation_deg,
-          shear: decomp.shear,
-          scale_x: decomp.scale_x,
-          scale_y: decomp.scale_y,
-          max_scale: maxScale,
-        },
-      });
+      if (texts.length > 0 || rects.length > 0) {
+        patches.push({ name: q.name, texts, rects });
+      }
     }
 
-    if (texts.length === 0 && rects.length === 0) continue;
+    /* ---- mirror group ------------------------------------------ */
+    if (q.mirror) {
+      const angle = (typeof q.mirrorAngle === "number")
+                      ? q.mirrorAngle : Math.PI;
+      const flip  = q.mirrorFlip !== false;
 
-    patches.push({
-      name: q.name,
-      texts: texts,
-      rects: rects,
-    });
+      const phi0 = q.phi0, phi1 = q.phi1;
+      q.phi0 = phi0 + angle;
+      q.phi1 = phi1 + angle;
+
+      const rects = [];
+      const texts = [];
+      try {
+        for (const sq of sqsOnPatch) {
+          const theta0 = sq.theta || 0;
+          const slope0 = sq.slope || 0;
+          const u0     = sq.u;
+          if (flip) {
+            sq.theta = -theta0;
+            sq.slope = -slope0;
+            sq.u     = -u0;
+          }
+          try {
+            const r = _shearTextForSquare(sq, options, hex, textColor,
+                                          "_mirror");
+            if (!r) continue;
+            if (r.rect) rects.push(r.rect);
+            texts.push(r.text);
+          } finally {
+            sq.theta = theta0;
+            sq.slope = slope0;
+            sq.u     = u0;
+          }
+        }
+      } finally {
+        q.phi0 = phi0;
+        q.phi1 = phi1;
+      }
+
+      if (texts.length > 0 || rects.length > 0) {
+        patches.push({ name: q.name + "_mirror", texts, rects });
+      }
+    }
   }
 
   return patches;
@@ -5285,8 +5545,12 @@ function buildKraShearPatches(options) {
 
 function _coneBandDimensions() {
   const w = Math.max(1, Math.round(window.innerWidth));
-  const h = Math.max(1, Math.round(layout.coneH));
+  const h = Math.max(1, Math.round(LAYOUT_coneH()));
   return { width: w, height: h };
+}
+
+function LAYOUT_coneH() {
+  return layout.coneH;
 }
 
 /* ==========================================================================
@@ -5499,12 +5763,10 @@ const SLOPE_SCRUB_RATE_DEG_PER_PX = 0.5;
 const SLOPE_SNAP_STEP_DEG         = 15;
 
 /* Mirror-angle scrub rate: 1° per pixel of horizontal drag.
-   Snap step with Shift held is one meridian (15°), matching the
-   default meridian spacing.  Stored in radians in the model and
-   shown in degrees in the field.  See the MIRROR ANGLE AND FLIP
-   section in the module docstring. */
+   Stored in radians in the model and shown in degrees in the
+   field.  See the MIRROR ANGLE AND FLIP section in the module
+   docstring. */
 const MIRROR_ANGLE_SCRUB_RATE_DEG_PER_PX = 1.0;
-const MIRROR_ANGLE_SNAP_STEP_DEG         = 15;
 
 const SCRUB_DRAG_THRESHOLD = 3;
 
@@ -5648,6 +5910,10 @@ const HELP_HTML = `<!DOCTYPE html>
 <div class="hint"><strong>Mirror &ang;</strong> slides the mirror around the
   cone \u2014 pull it off &pi; when the original and mirror would otherwise
   visually cross at the apex</div>
+<div class="hint">hold <span class="kbd">Shift</span> while dragging
+  <strong>Mirror &ang;</strong> to move the mirror <em>and</em> the
+  original symmetrically about the midpoint they shared at drag
+  start</div>
 <div class="hint"><strong>Mirror flip</strong> negates the mirror's rotation
   so a tilted or rotated shape is a faithful copy, not a 180&deg;-rotated
   ghost</div>
@@ -5655,20 +5921,27 @@ const HELP_HTML = `<!DOCTYPE html>
 <div class="section">Squares</div>
 <div class="hint">hold <span class="kbd">Alt</span> while clicking a square to grab
   its <strong>patch</strong> instead</div>
+<div class="hint">dragging a <strong>corner</strong> anchors the
+  <em>opposite corner</em> \u2014 only the two edges that meet at that
+  corner move</div>
 <div class="hint">hold <span class="kbd">Shift</span> while dragging a
-  <strong>corner</strong> to anchor the <em>opposite corner</em> in place \u2014
-  only the two edges that meet at that corner move</div>
+  <strong>corner</strong> to resize about the shape's own centre
+  instead</div>
 <div class="hint">hold <span class="kbd">Shift</span> while dragging the
   rotate handle to jump in 15&deg; steps</div>
 <div class="hint"><span class="kbd">Shift</span>+<span class="kbd">A</span>
   aligns the selected square to 45&deg;</div>
 <div class="hint"><span class="kbd">Delete</span> removes the selected square</div>
+<div class="hint"><strong>Visual bot.</strong> on a square makes its
+  KRA text anchor and its four corner senses follow the <em>visual
+  bottom of the scene</em> \u2014 the side of the square that sits
+  lowest on screen \u2014 instead of the shape's own longest edge</div>
 
 <div class="section">Panel fields</div>
 <div class="hint">drag a value sideways to <strong>scrub</strong> it;
   hold <span class="kbd">Shift</span> to snap</div>
 <div class="hint">fields with <em>&phi;</em>, <em>s</em>, <em>W</em>, <em>H</em>,
-  and <em>slope</em> follow the current selection</div>
+  <em>slope</em>, and <em>visual bottom</em> follow the current selection</div>
 <div class="hint"><strong>Mirror</strong>, <strong>Mirror &ang;</strong>, and
   <strong>Mirror flip</strong> follow the selected patch:
   they grey out when nothing is selected, and reflect the patch's own
@@ -5953,12 +6226,16 @@ function _syncPatchCoordInputs() {
    The W / H fields show the shape's reference-unit size, which is
    independent of the patch it sits on and of the cone's depth /
    half-angle.  The Slope field shows the shape's pseudo-3D tilt in
-   degrees.  All three are disabled until a square is selected. */
+   degrees.  The Visual bot. checkbox is a per-square flag that
+   changes how the KRA export reads the shape's "bottom" edge (see
+   the VISUAL BOTTOM section in the module docstring).  All four are
+   disabled until a square is selected. */
 
 function _syncSquareSizeInputs() {
-  const wInput = document.getElementById("squareWVal");
-  const hInput = document.getElementById("squareHVal");
-  const sInput = document.getElementById("squareSlopeVal");
+  const wInput  = document.getElementById("squareWVal");
+  const hInput  = document.getElementById("squareHVal");
+  const sInput  = document.getElementById("squareSlopeVal");
+  const vbInput = document.getElementById("squareVisualBottom");
   if (!wInput || !hInput || !sInput) return;
 
   const sq = (selectedSquare >= 0 && selectedSquare < floatSquares.length)
@@ -5968,6 +6245,10 @@ function _syncSquareSizeInputs() {
     wInput.disabled = true;
     hInput.disabled = true;
     sInput.disabled = true;
+    if (vbInput) {
+      vbInput.disabled = true;
+      if (document.activeElement !== vbInput) vbInput.checked = false;
+    }
     if (document.activeElement !== wInput) wInput.value = "\u2014";
     if (document.activeElement !== hInput) hInput.value = "\u2014";
     if (document.activeElement !== sInput) sInput.value = "\u2014";
@@ -5977,6 +6258,12 @@ function _syncSquareSizeInputs() {
   wInput.disabled = false;
   hInput.disabled = false;
   sInput.disabled = false;
+  if (vbInput) {
+    vbInput.disabled = false;
+    if (document.activeElement !== vbInput) {
+      vbInput.checked = !!sq.visualBottom;
+    }
+  }
 
   if (document.activeElement !== wInput) {
     wInput.value = squareWorldWidth(sq).toFixed(3);
@@ -5991,7 +6278,51 @@ function _syncSquareSizeInputs() {
 
 /* ==========================================================================
    SCRUB-INPUT INSTALLER
-   ========================================================================== */
+   ==========================================================================
+   A scrub input is a text field the user drags horizontally to
+   change.  The installer owns the drag loop and the read/write
+   plumbing; each binding supplies four things:
+
+       rate             units per pixel of horizontal drag
+       snapStep         optional; Shift-held drags step by this
+       read()           current value, in the binding's own units
+       write(raw, drag) apply a value; `drag` is the drag-state
+                        object (see below), or undefined when the
+                        call came from Enter / blur rather than a
+                        drag
+
+   Two optional hooks extend the loop for bindings that need to
+   coordinate more than one model field:
+
+       onDragStart(drag)      called once at mousedown, after `drag`
+                              has been created, so a binding can
+                              snapshot whatever else it needs to
+                              hold fixed for the duration of the
+                              drag (e.g. the patch's φ at drag
+                              start, for the symmetric mirror-angle
+                              mode).
+
+       symmetricOnShift       when true, a Shift-held drag routes to
+       + writeSymmetric       writeSymmetric(raw, drag) instead of
+                              write.  Any snapStep the binding
+                              declared is skipped in this branch, so
+                              a symmetric drag is continuous even if
+                              the same field snaps in its other
+                              modes.  Releasing Shift mid-drag
+                              routes back to `write`, which the
+                              binding can use to undo any secondary
+                              motion the symmetric branch caused.
+
+   The `drag` object passed to the callbacks carries:
+
+       startX       screen x at mousedown
+       startValue   the field's value at mousedown (from read())
+       moved        true once the drag has passed the threshold
+       ... plus anything the binding's onDragStart added
+
+   The installer never reads the model directly — every binding's
+   `read` / `write` is the only place that knows what the field
+   means. */
 
 function _installScrubInput(el, opts) {
   let drag = null;
@@ -6003,13 +6334,26 @@ function _installScrubInput(el, opts) {
       if (Math.abs(dx) < SCRUB_DRAG_THRESHOLD) return;
       drag.moved = true;
     }
+
+    const symmetric = opts.symmetricOnShift && opts.writeSymmetric &&
+                      e.shiftKey;
+
     let raw = drag.startValue + dx * opts.rate;
-    if (opts.snapStep && e.shiftKey) {
+    /* Snap is only applied outside the symmetric branch: the
+       symmetric mode is a continuous coordinated motion, and a snap
+       on the mirror angle would also snap the patch's φ through the
+       Δ/2 coupling. */
+    if (!symmetric && opts.snapStep && e.shiftKey) {
       const delta = raw - drag.startValue;
       const snapped = Math.round(delta / opts.snapStep) * opts.snapStep;
       raw = drag.startValue + snapped;
     }
-    opts.write(raw);
+
+    if (symmetric) {
+      opts.writeSymmetric(raw, drag);
+    } else {
+      opts.write(raw, drag);
+    }
     draw();
   }
   function onUp() {
@@ -6032,6 +6376,7 @@ function _installScrubInput(el, opts) {
       startValue: opts.read(),
       moved: false,
     };
+    if (opts.onDragStart) opts.onDragStart(drag);
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
   });
@@ -6346,27 +6691,71 @@ function flashStatus(msg, cls) {
 
   /* ---- mirror angle scrub input ---------------------------------
      The angular offset at which the mirror patch is drawn, in
-     radians in the model and degrees in the field.  The rate and
-     snap step are converted from degrees to radians here so the
-     installer's radian-per-pixel contract is honoured.
+     radians in the model and degrees in the field.  No snap on this
+     field: the plain drag is continuous, and the Shift-held
+     symmetric drag below is also continuous.
 
-     The offset is added directly to the patch's φ bounds when the
-     mirror is drawn.  Pulling it off π separates the original and
-     the mirror when the tilted cone makes them converge at the
-     apex.  See the MIRROR ANGLE AND FLIP note in the module
-     docstring. */
+     Plain drag: moves only the mirror angle.
+
+     Shift-held drag (the symmetric mode): moves the mirror AND the
+     original patch symmetrically about the midpoint they shared at
+     drag start.  If the mirror angle advances by Δ, the patch's φ
+     shifts by −Δ/2 and the mirror (which sits at patch_φ +
+     mirrorAngle) moves by +Δ/2.  The two therefore separate (or
+     converge) at equal rates on either side of that fixed midpoint.
+
+     The midpoint is captured at mousedown — not recomputed from
+     the current patch position — so a long drag does not
+     accumulate drift.  Releasing Shift mid-drag restores the
+     patch to its start φ on the next motion event; the write
+     callback handles that via drag.startPhi.
+
+     See the MIRROR ANGLE AND FLIP note in the module docstring. */
   const mirrorAngleInput = document.getElementById("patchMirrorAngle");
   if (mirrorAngleInput) _installScrubInput(mirrorAngleInput, {
-    rate:     MIRROR_ANGLE_SCRUB_RATE_DEG_PER_PX * Math.PI / 180,
-    snapStep: MIRROR_ANGLE_SNAP_STEP_DEG * Math.PI / 180,
+    rate: MIRROR_ANGLE_SCRUB_RATE_DEG_PER_PX * Math.PI / 180,
+    symmetricOnShift: true,
+
     read: () => {
       if (selectedQuad < 0 || selectedQuad >= quads.length) return Math.PI;
       const q = quads[selectedQuad];
       return (typeof q.mirrorAngle === "number") ? q.mirrorAngle : Math.PI;
     },
-    write: (raw) => {
+
+    /* Snapshot the patch's φ at drag start so a symmetric drag can
+       always be recomputed from the same origin. */
+    onDragStart: (drag) => {
       if (selectedQuad < 0 || selectedQuad >= quads.length) return;
-      quads[selectedQuad].mirrorAngle = raw;
+      drag.startPhi = _patchPhiCenter(quads[selectedQuad]);
+    },
+
+    /* Plain drag: set the mirror angle.  If the drag was in
+       symmetric mode at any point, restore the patch's φ to its
+       start value so releasing Shift does not leave the patch
+       stranded mid-offset. */
+    write: (raw, drag) => {
+      if (selectedQuad < 0 || selectedQuad >= quads.length) return;
+      const q = quads[selectedQuad];
+      if (drag && typeof drag.startPhi === "number") {
+        _setPatchPhiCenter(q, drag.startPhi);
+      }
+      q.mirrorAngle = raw;
+    },
+
+    /* Shift-held drag: Δ = mirrorAngle − startMirrorAngle.  Mirror
+       moves by Δ; patch moves by −Δ/2.  Both are absolute from the
+       drag-start snapshot, so repeated mousemoves are idempotent
+       and no drift accumulates. */
+    writeSymmetric: (raw, drag) => {
+      if (selectedQuad < 0 || selectedQuad >= quads.length) return;
+      const q = quads[selectedQuad];
+      const startAngle = drag.startValue;
+      const startPhi   = (typeof drag.startPhi === "number")
+                           ? drag.startPhi
+                           : _patchPhiCenter(q);
+      const delta = raw - startAngle;
+      q.mirrorAngle = startAngle + delta;
+      _setPatchPhiCenter(q, startPhi - delta / 2);
     },
   });
 
@@ -6446,6 +6835,30 @@ function flashStatus(msg, cls) {
       floatSquares[selectedSquare].slope = s;
     },
   });
+
+  /* ---- per-square visual-bottom toggle --------------------------
+     A per-square meta option: when checked, the shape's KRA text
+     anchor and its four corner senses are read from the visual
+     bottom of the scene (the edge of the drawn square whose
+     midpoint sits lowest on screen) instead of from the shape's own
+     longest edge.  The flag is stored on the square object as
+     `visualBottom` and read by pg_kra.py's
+     _shapeLabelScreenAngleDeg.  See the VISUAL BOTTOM section in
+     the module docstring.  The checkbox's own state follows the
+     selected square, kept in sync by _syncSquareSizeInputs. */
+  const visualBottomEl = document.getElementById("squareVisualBottom");
+  if (visualBottomEl) {
+    visualBottomEl.addEventListener("change", () => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return;
+      const sq = floatSquares[selectedSquare];
+      sq.visualBottom = visualBottomEl.checked;
+      draw();
+      flashStatus(visualBottomEl.checked
+                    ? "Visual bottom on for " + squareDisplayName(sq)
+                    : "Visual bottom off",
+                  "ok");
+    });
+  }
 
   /* ---- draw tool + help popup -----------------------------------
      Draw Quad toggles the fitting tool (state and fitting logic in
@@ -6597,6 +7010,7 @@ function buildSceneJSON() {
       scaleV: sq.scaleV,
       theta:  sq.theta || 0,
       slope:  sq.slope || 0,
+      visualBottom: !!sq.visualBottom,
     })),
 
     /* KRA-export meta-options.  The mapping between DOM controls
@@ -6743,6 +7157,7 @@ function applySceneJSON(data) {
                 ? s.scaleV : SHAPE_DEFAULT_SCALE,
       theta:  (typeof s.theta === "number") ? s.theta : 0,
       slope:  (typeof s.slope === "number") ? s.slope : 0,
+      visualBottom: !!s.visualBottom,
     });
   }
 
@@ -7022,6 +7437,72 @@ function findQuadVertexAt(sx, sy) {
 }
 
 /* ==========================================================================
+   ALT PASS-THROUGH HELPERS
+   ==========================================================================
+   Both bands' Alt+square paths end in the same action: select the
+   patch that the square belongs to, clear the square selection, and
+   seed the appropriate patch-body drag state.  Extracting the two
+   bodies into named helpers lets the ordinary hit test and the
+   mirror fallback share exactly one code path, so their behaviour
+   cannot drift apart. */
+
+function _beginConePatchDragFromSquareIdx(squareIdx, sx, sy) {
+  const sq = floatSquares[squareIdx];
+  const qi = sq ? quadIdxById(sq.quadId) : -1;
+  if (qi < 0) return false;
+
+  const q = quads[qi];
+  if (qi !== selectedQuad) {
+    selectedQuad = qi;
+    syncQuadList();
+  }
+  selectedSquare = -1;
+
+  const [wx, wy] = s2w(sx, sy);
+  const p0 = projectToConeSurface(wx, wy, (q.s0 + q.s1) / 2);
+  state.dragPatchBody = {
+    quadIdx:   qi,
+    startPhi:  p0.phi,
+    startS:    p0.s,
+    startPhi0: q.phi0,
+    startPhi1: q.phi1,
+    startS0:   q.s0,
+    startS1:   q.s1,
+  };
+  canvas.style.cursor = "grabbing";
+  draw();
+  return true;
+}
+
+function _beginFlatPatchDragFromSquareIdx(squareIdx, sx, sy) {
+  const sq = floatSquares[squareIdx];
+  const qi = sq ? quadIdxById(sq.quadId) : -1;
+  if (qi < 0) return false;
+
+  const q = quads[qi];
+  if (qi !== selectedQuad) {
+    selectedQuad = qi;
+    syncQuadList();
+  }
+  selectedSquare = -1;
+
+  const p = screenToFlat(sx, sy);
+  state.flatDrag = {
+    mode:      "body",
+    quadIdx:   qi,
+    startPhi:  p.phi,
+    startS:    p.s,
+    startPhi0: q.phi0,
+    startPhi1: q.phi1,
+    startS0:   q.s0,
+    startS1:   q.s1,
+  };
+  canvas.style.cursor = "grabbing";
+  draw();
+  return true;
+}
+
+/* ==========================================================================
    EVENTS
    ========================================================================== */
 
@@ -7041,8 +7522,10 @@ canvas.addEventListener("mousedown", (e) => {
   /* Alt is the "grab the patch under the square" modifier.  When
      held, a click on a square targets the patch that square belongs
      to (identified by the square's quadId, so the pass-through works
-     even when the square overhangs its patch).  See the module
-     docstring, ALT PASS-THROUGH. */
+     even when the square overhangs its patch).  A click that misses
+     every editable square but lands on a MIRROR square does the
+     same, via the mirror hit test.  See the module docstring,
+     ALT PASS-THROUGH. */
   const passThrough = e.altKey;
 
   /* ---- cone band ------------------------------------------------ */
@@ -7050,34 +7533,23 @@ canvas.addEventListener("mousedown", (e) => {
 
     /* The square hit test always runs, so we know what is under the
        cursor even when Alt is held.  It is the only reliable way to
-       name the patch that a clicked square belongs to. */
+       name the patch that a clicked square belongs to.  It only
+       sees editable squares; the mirror fallback below covers the
+       visual clones. */
     const sqHit = squareHitTest(sx, sy);
 
-    if (passThrough && sqHit) {
-      /* Alt + square: target the patch that square lives on. */
-      const sq = floatSquares[sqHit.squareIdx];
-      const qi = sq ? quadIdxById(sq.quadId) : -1;
-      if (qi >= 0) {
-        const q = quads[qi];
-        if (qi !== selectedQuad) {
-          selectedQuad = qi;
-          syncQuadList();
-        }
-        selectedSquare = -1;
-
-        const [wx, wy] = s2w(sx, sy);
-        const p0 = projectToConeSurface(wx, wy, (q.s0 + q.s1) / 2);
-        state.dragPatchBody = {
-          quadIdx:   qi,
-          startPhi:  p0.phi,
-          startS:    p0.s,
-          startPhi0: q.phi0,
-          startPhi1: q.phi1,
-          startS0:   q.s0,
-          startS1:   q.s1,
-        };
-        canvas.style.cursor = "grabbing";
-        draw();
+    if (passThrough) {
+      let hit = sqHit;
+      if (!hit) {
+        /* Ordinary hit missed.  The cursor might be over a mirror
+           square — one that the ordinary hit test can't see because
+           it exists only inside the mirror state.  Try again with
+           the mirror hit test; a hit there resolves to the same
+           patch the original square would. */
+        hit = squareMirrorHitTest(sx, sy);
+      }
+      if (hit && _beginConePatchDragFromSquareIdx(hit.squareIdx,
+                                                  sx, sy)) {
         return;
       }
     }
@@ -7116,11 +7588,10 @@ canvas.addEventListener("mousedown", (e) => {
         };
       } else if (sqHit.kind === "corner") {
         /* Capture the anchor (the diagonally-opposite corner's
-           local position) at drag start, so a later Shift-held
-           motion can use it without recomputing from a shape
-           that has already been reshaped by the non-Shift phase
-           of the drag.  See the module docstring, SHIFT-HELD
-           CORNER RESIZE. */
+           local position) at drag start, so the anchored (default)
+           resize has it available without recomputing from a
+           shape the drag has already reshaped.  See the module
+           docstring, SHIFT-HELD CORNER RESIZE. */
         const anchor = squareAnchorCornerLocal(
           sq, sqHit.cornerIdx, effectiveConeDepth());
         state.dragSquare = {
@@ -7208,35 +7679,17 @@ canvas.addEventListener("mousedown", (e) => {
 
   /* ---- flat band ------------------------------------------------ */
 
-  /* Same shape: run the flat square hit test first, so an alt+click
-     can name the patch by the square's quadId rather than relying
-     on the pointer being over the patch's own quad. */
+  /* Same shape as the cone band: run the flat square hit test first,
+     then fall back to the mirror hit test when Alt is held.  Both
+     bands route the pass-through into the same helper, so an alt+click
+     on a mirror grabs the same patch the original square would. */
   const sqFlatHit = squareFlatHitTest(sx, sy);
 
-  if (passThrough && sqFlatHit) {
-    const sq = floatSquares[sqFlatHit.squareIdx];
-    const qi = sq ? quadIdxById(sq.quadId) : -1;
-    if (qi >= 0) {
-      const q = quads[qi];
-      if (qi !== selectedQuad) {
-        selectedQuad = qi;
-        syncQuadList();
-      }
-      selectedSquare = -1;
-
-      const p = screenToFlat(sx, sy);
-      state.flatDrag = {
-        mode: "body",
-        quadIdx:   qi,
-        startPhi:  p.phi,
-        startS:    p.s,
-        startPhi0: q.phi0,
-        startPhi1: q.phi1,
-        startS0:   q.s0,
-        startS1:   q.s1,
-      };
-      canvas.style.cursor = "grabbing";
-      draw();
+  if (passThrough) {
+    let hit = sqFlatHit;
+    if (!hit) hit = squareFlatMirrorHitTest(sx, sy);
+    if (hit && _beginFlatPatchDragFromSquareIdx(hit.squareIdx,
+                                                sx, sy)) {
       return;
     }
   }
@@ -7391,13 +7844,13 @@ window.addEventListener("mousemove", (e) => {
           const newV = ds.startCenterV + dV;
           setClonePosition(sq, newU, newV);
         } else if (ds.mode === "corner") {
-          /* Shift held: anchor the diagonally-opposite corner.
-             Without Shift: resize about the shape's centre.  The
+          /* Default: anchor the diagonally-opposite corner.
+             Shift held: resize about the shape's centre.  The
              anchor was captured at mousedown; see the module
              docstring, SHIFT-HELD CORNER RESIZE. */
           const [wx, wy] = s2w(sx, sy);
-          const useAnchor = e.shiftKey && ds.anchorU !== undefined &&
-                                          ds.anchorV !== undefined;
+          const useAnchor = !e.shiftKey && ds.anchorU !== undefined &&
+                                           ds.anchorV !== undefined;
           resizeSquareFromCorner(
             sq, ds.cornerIdx, wx, wy,
             useAnchor ? ds.anchorU : undefined,
@@ -7457,10 +7910,11 @@ window.addEventListener("mousemove", (e) => {
           }
         }
       } else if (fsd.mode === "corner") {
-        /* Same anchored / centred split as the cone band.  See the
-           module docstring, SHIFT-HELD CORNER RESIZE. */
-        const useAnchor = e.shiftKey && fsd.anchorU !== undefined &&
-                                        fsd.anchorV !== undefined;
+        /* Same anchored / centred split as the cone band, with the
+           default roles flipped: no Shift anchors, Shift centres.
+           See the module docstring, SHIFT-HELD CORNER RESIZE. */
+        const useAnchor = !e.shiftKey && fsd.anchorU !== undefined &&
+                                         fsd.anchorV !== undefined;
         flatResizeSquareFromCornerIdx(
           sq, sx, sy, fsd.cornerIdx,
           useAnchor ? fsd.anchorU : undefined,

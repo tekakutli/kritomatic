@@ -14,7 +14,23 @@ bounds).  Without that indirection, an alt+click on an overhanging
 part of a square would miss every patch and fall through to the
 apex drag, changing the point of view instead of moving the patch.
 
-When Alt is NOT held, square interaction is unchanged.
+Alt also works on MIRROR squares.  A mirror is drawn by mutating
+the square into its mirrored state and running the ordinary draw,
+so the mirror's on-screen geometry is a second position for the
+same square — one that no ordinary hit test can see.  When Alt is
+held, a click that misses every editable square falls back to
+squareMirrorHitTest / squareFlatMirrorHitTest, which run the same
+per-square hit test inside _withSquareMirror.  A hit there resolves
+to the same patch the original square would, and the drag proceeds
+identically.
+
+The order matters: the ordinary hit test runs first, so an Alt+click
+that lands on an editable square always wins over a mirror square
+that happens to overlap it.  Mirrors are only considered when the
+cursor is over nothing editable.
+
+When Alt is NOT held, square interaction is unchanged — mirror
+squares remain non-editable, as before.
 
 Alt also suppresses the Shift+click "drop a square here" action, so
 Alt+Shift+drag on a square behaves as a patch drag constrained to
@@ -27,13 +43,14 @@ with e.button !== 0 and the handler bails at the top.
 
 SHIFT-HELD CORNER RESIZE
 ========================
-A corner drag resizes a shape.  By default the shape resizes about
-its own centre: all four sides move symmetrically and the stored
-(u, v) does not change.  Holding Shift while dragging a corner
-switches to an ANCHORED resize — the DIAGONALLY OPPOSITE corner
-stays fixed, and only the two edges that meet at the dragged corner
-move.  The shape's centre shifts to the midpoint of the fixed anchor
-and the cursor.
+A corner drag resizes a shape.  By default the drag ANCHORS the
+DIAGONALLY OPPOSITE corner: that corner stays fixed, and only the
+two edges that meet at the dragged corner move.  The shape's centre
+shifts to the midpoint of the fixed anchor and the cursor.
+
+Holding Shift switches to a CENTRED resize — the shape resizes
+about its own centre.  All four sides move symmetrically and the
+stored (u, v) does not change.
 
 The anchor is captured at mousedown time (from the shape's pre-drag
 state) and stored on the drag state as anchorU / anchorV.  It is
@@ -45,8 +62,8 @@ SHAPE_DEPTH_FLAT).
 
 Shift's existing meanings for the other drags are unchanged:
 constrain-to-V-axis for square body drags, 15° snap for rotate
-drags, centre→apex axis constraint for patch drags.  The anchored
-resize only applies when the drag mode is "corner".
+drags, centre→apex axis constraint for patch drags.  The role swap
+only applies when the drag mode is "corner".
 
 DRAW TOOL INTERCEPTION
 ======================
@@ -250,6 +267,72 @@ function findQuadVertexAt(sx, sy) {
 }
 
 /* ==========================================================================
+   ALT PASS-THROUGH HELPERS
+   ==========================================================================
+   Both bands' Alt+square paths end in the same action: select the
+   patch that the square belongs to, clear the square selection, and
+   seed the appropriate patch-body drag state.  Extracting the two
+   bodies into named helpers lets the ordinary hit test and the
+   mirror fallback share exactly one code path, so their behaviour
+   cannot drift apart. */
+
+function _beginConePatchDragFromSquareIdx(squareIdx, sx, sy) {
+  const sq = floatSquares[squareIdx];
+  const qi = sq ? quadIdxById(sq.quadId) : -1;
+  if (qi < 0) return false;
+
+  const q = quads[qi];
+  if (qi !== selectedQuad) {
+    selectedQuad = qi;
+    syncQuadList();
+  }
+  selectedSquare = -1;
+
+  const [wx, wy] = s2w(sx, sy);
+  const p0 = projectToConeSurface(wx, wy, (q.s0 + q.s1) / 2);
+  state.dragPatchBody = {
+    quadIdx:   qi,
+    startPhi:  p0.phi,
+    startS:    p0.s,
+    startPhi0: q.phi0,
+    startPhi1: q.phi1,
+    startS0:   q.s0,
+    startS1:   q.s1,
+  };
+  canvas.style.cursor = "grabbing";
+  draw();
+  return true;
+}
+
+function _beginFlatPatchDragFromSquareIdx(squareIdx, sx, sy) {
+  const sq = floatSquares[squareIdx];
+  const qi = sq ? quadIdxById(sq.quadId) : -1;
+  if (qi < 0) return false;
+
+  const q = quads[qi];
+  if (qi !== selectedQuad) {
+    selectedQuad = qi;
+    syncQuadList();
+  }
+  selectedSquare = -1;
+
+  const p = screenToFlat(sx, sy);
+  state.flatDrag = {
+    mode:      "body",
+    quadIdx:   qi,
+    startPhi:  p.phi,
+    startS:    p.s,
+    startPhi0: q.phi0,
+    startPhi1: q.phi1,
+    startS0:   q.s0,
+    startS1:   q.s1,
+  };
+  canvas.style.cursor = "grabbing";
+  draw();
+  return true;
+}
+
+/* ==========================================================================
    EVENTS
    ========================================================================== */
 
@@ -269,8 +352,10 @@ canvas.addEventListener("mousedown", (e) => {
   /* Alt is the "grab the patch under the square" modifier.  When
      held, a click on a square targets the patch that square belongs
      to (identified by the square's quadId, so the pass-through works
-     even when the square overhangs its patch).  See the module
-     docstring, ALT PASS-THROUGH. */
+     even when the square overhangs its patch).  A click that misses
+     every editable square but lands on a MIRROR square does the
+     same, via the mirror hit test.  See the module docstring,
+     ALT PASS-THROUGH. */
   const passThrough = e.altKey;
 
   /* ---- cone band ------------------------------------------------ */
@@ -278,34 +363,23 @@ canvas.addEventListener("mousedown", (e) => {
 
     /* The square hit test always runs, so we know what is under the
        cursor even when Alt is held.  It is the only reliable way to
-       name the patch that a clicked square belongs to. */
+       name the patch that a clicked square belongs to.  It only
+       sees editable squares; the mirror fallback below covers the
+       visual clones. */
     const sqHit = squareHitTest(sx, sy);
 
-    if (passThrough && sqHit) {
-      /* Alt + square: target the patch that square lives on. */
-      const sq = floatSquares[sqHit.squareIdx];
-      const qi = sq ? quadIdxById(sq.quadId) : -1;
-      if (qi >= 0) {
-        const q = quads[qi];
-        if (qi !== selectedQuad) {
-          selectedQuad = qi;
-          syncQuadList();
-        }
-        selectedSquare = -1;
-
-        const [wx, wy] = s2w(sx, sy);
-        const p0 = projectToConeSurface(wx, wy, (q.s0 + q.s1) / 2);
-        state.dragPatchBody = {
-          quadIdx:   qi,
-          startPhi:  p0.phi,
-          startS:    p0.s,
-          startPhi0: q.phi0,
-          startPhi1: q.phi1,
-          startS0:   q.s0,
-          startS1:   q.s1,
-        };
-        canvas.style.cursor = "grabbing";
-        draw();
+    if (passThrough) {
+      let hit = sqHit;
+      if (!hit) {
+        /* Ordinary hit missed.  The cursor might be over a mirror
+           square — one that the ordinary hit test can't see because
+           it exists only inside the mirror state.  Try again with
+           the mirror hit test; a hit there resolves to the same
+           patch the original square would. */
+        hit = squareMirrorHitTest(sx, sy);
+      }
+      if (hit && _beginConePatchDragFromSquareIdx(hit.squareIdx,
+                                                  sx, sy)) {
         return;
       }
     }
@@ -344,11 +418,10 @@ canvas.addEventListener("mousedown", (e) => {
         };
       } else if (sqHit.kind === "corner") {
         /* Capture the anchor (the diagonally-opposite corner's
-           local position) at drag start, so a later Shift-held
-           motion can use it without recomputing from a shape
-           that has already been reshaped by the non-Shift phase
-           of the drag.  See the module docstring, SHIFT-HELD
-           CORNER RESIZE. */
+           local position) at drag start, so the anchored (default)
+           resize has it available without recomputing from a
+           shape the drag has already reshaped.  See the module
+           docstring, SHIFT-HELD CORNER RESIZE. */
         const anchor = squareAnchorCornerLocal(
           sq, sqHit.cornerIdx, effectiveConeDepth());
         state.dragSquare = {
@@ -436,35 +509,17 @@ canvas.addEventListener("mousedown", (e) => {
 
   /* ---- flat band ------------------------------------------------ */
 
-  /* Same shape: run the flat square hit test first, so an alt+click
-     can name the patch by the square's quadId rather than relying
-     on the pointer being over the patch's own quad. */
+  /* Same shape as the cone band: run the flat square hit test first,
+     then fall back to the mirror hit test when Alt is held.  Both
+     bands route the pass-through into the same helper, so an alt+click
+     on a mirror grabs the same patch the original square would. */
   const sqFlatHit = squareFlatHitTest(sx, sy);
 
-  if (passThrough && sqFlatHit) {
-    const sq = floatSquares[sqFlatHit.squareIdx];
-    const qi = sq ? quadIdxById(sq.quadId) : -1;
-    if (qi >= 0) {
-      const q = quads[qi];
-      if (qi !== selectedQuad) {
-        selectedQuad = qi;
-        syncQuadList();
-      }
-      selectedSquare = -1;
-
-      const p = screenToFlat(sx, sy);
-      state.flatDrag = {
-        mode: "body",
-        quadIdx:   qi,
-        startPhi:  p.phi,
-        startS:    p.s,
-        startPhi0: q.phi0,
-        startPhi1: q.phi1,
-        startS0:   q.s0,
-        startS1:   q.s1,
-      };
-      canvas.style.cursor = "grabbing";
-      draw();
+  if (passThrough) {
+    let hit = sqFlatHit;
+    if (!hit) hit = squareFlatMirrorHitTest(sx, sy);
+    if (hit && _beginFlatPatchDragFromSquareIdx(hit.squareIdx,
+                                                sx, sy)) {
       return;
     }
   }
@@ -619,13 +674,13 @@ window.addEventListener("mousemove", (e) => {
           const newV = ds.startCenterV + dV;
           setClonePosition(sq, newU, newV);
         } else if (ds.mode === "corner") {
-          /* Shift held: anchor the diagonally-opposite corner.
-             Without Shift: resize about the shape's centre.  The
+          /* Default: anchor the diagonally-opposite corner.
+             Shift held: resize about the shape's centre.  The
              anchor was captured at mousedown; see the module
              docstring, SHIFT-HELD CORNER RESIZE. */
           const [wx, wy] = s2w(sx, sy);
-          const useAnchor = e.shiftKey && ds.anchorU !== undefined &&
-                                          ds.anchorV !== undefined;
+          const useAnchor = !e.shiftKey && ds.anchorU !== undefined &&
+                                           ds.anchorV !== undefined;
           resizeSquareFromCorner(
             sq, ds.cornerIdx, wx, wy,
             useAnchor ? ds.anchorU : undefined,
@@ -685,10 +740,11 @@ window.addEventListener("mousemove", (e) => {
           }
         }
       } else if (fsd.mode === "corner") {
-        /* Same anchored / centred split as the cone band.  See the
-           module docstring, SHIFT-HELD CORNER RESIZE. */
-        const useAnchor = e.shiftKey && fsd.anchorU !== undefined &&
-                                        fsd.anchorV !== undefined;
+        /* Same anchored / centred split as the cone band, with the
+           default roles flipped: no Shift anchors, Shift centres.
+           See the module docstring, SHIFT-HELD CORNER RESIZE. */
+        const useAnchor = !e.shiftKey && fsd.anchorU !== undefined &&
+                                         fsd.anchorV !== undefined;
         flatResizeSquareFromCornerIdx(
           sq, sx, sy, fsd.cornerIdx,
           useAnchor ? fsd.anchorU : undefined,

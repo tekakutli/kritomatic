@@ -11,6 +11,10 @@
                  'SF Mono', monospace;
   }
 
+  /* The panel is a flex column: the title bar stays pinned, the
+     body scrolls.  max-height is the viewport minus the 12px top
+     and 12px bottom margins the panel's absolute position already
+     reserves, so the panel never exceeds the visible area. */
   #ui {
     position:absolute; top:12px; left:12px; z-index:10;
     background:#0b1018;
@@ -21,19 +25,45 @@
     font-size:11px; color:#a8b5c4;
     user-select:none;
     width:288px; box-sizing:border-box;
+    max-height: calc(100vh - 24px);
+    display: flex;
+    flex-direction: column;
   }
   #ui.collapsed { display:none; }
 
   #ui h3 {
     display:flex; align-items:center; gap:6px;
-    margin:0 0 10px; padding:0 0 8px;
+    margin:0 0 4px; padding:0 0 8px;
     border-bottom:1px solid #1e2836;
     font-size:11px; font-weight:700;
     letter-spacing:0.16em; text-transform:uppercase;
     color:#dce6f2;
+    flex: 0 0 auto;
   }
 
-  #ui .field { display:flex; align-items:center; gap:8px; margin:7px 0; }
+  /* The scrollable body.  min-height: 0 is the flexbox quirk that
+     lets a flex child actually overflow instead of forcing the
+     parent to grow.  The horizontal negative margin + matching
+     right padding keeps the scrollbar from eating layout width,
+     so field widths don't visibly shift when the bar appears. */
+  #ui .panel-body {
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-height: 0;
+    flex: 1 1 auto;
+    margin-right: -6px;
+    padding-right: 6px;
+  }
+  #ui .panel-body::-webkit-scrollbar { width: 6px; }
+  #ui .panel-body::-webkit-scrollbar-track { background: transparent; }
+  #ui .panel-body::-webkit-scrollbar-thumb {
+    background: #1e2836; border-radius: 3px;
+  }
+  #ui .panel-body::-webkit-scrollbar-thumb:hover {
+    background: #2a3848;
+  }
+
+  #ui .field { display:flex; align-items:center; gap:8px; margin:4px 0; }
   #ui .field label {
     flex:0 0 78px;
     font-size:9px; color:#5a6774;
@@ -112,7 +142,7 @@
     border-color:#00e5ff;
   }
 
-  #ui .row { display:flex; gap:6px; margin:6px 0; }
+  #ui .row { display:flex; gap:6px; margin:4px 0; }
   #ui .row button { flex:1 1 auto; }
 
   #ui button {
@@ -151,12 +181,65 @@
     background: rgba(220, 90, 110, 0.20);
   }
 
-  #ui hr { border:0; border-top:1px solid #1e2836; margin:10px 0; }
+  /* ---- Collapsible sections -----------------------------------
+     Each group of fields lives in a <details> whose <summary> is
+     styled like the old section headers.  A rotating caret shows
+     open/closed state; the summary's top border doubles as the
+     <hr> between sections, so no standalone rules remain. */
+  #ui details.section {
+    margin: 0;
+  }
+  #ui details.section > summary {
+    list-style: none;
+    cursor: pointer;
+    user-select: none;
+    padding: 6px 0 5px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: #5a6774;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    border-top: 1px solid #1e2836;
+    margin-top: 6px;
+    transition: color 0.08s ease;
+  }
+  #ui details.section:first-of-type > summary {
+    margin-top: 0;
+    border-top: 0;
+  }
+  #ui details.section > summary::-webkit-details-marker {
+    display: none;
+  }
+  #ui details.section > summary::before {
+    content: "\25B8";
+    display: inline-block;
+    font-size: 8px;
+    color: #3d4756;
+    transition: transform 0.1s ease;
+  }
+  #ui details.section[open] > summary::before {
+    transform: rotate(90deg);
+  }
+  #ui details.section > summary:hover {
+    color: #a8b5c4;
+  }
+  #ui details.section[open] > summary {
+    color: #00e5ff;
+  }
+  #ui details.section[open] > summary::before {
+    color: #00e5ff;
+  }
+  #ui details.section > .section-body {
+    padding-bottom: 4px;
+  }
 
   .quadList {
     display:flex; flex-direction:column;
     gap:3px; margin:6px 0 0;
-    max-height:160px; overflow-y:auto;
+    max-height:110px; overflow-y:auto;
   }
   .quadList::-webkit-scrollbar { width:6px; }
   .quadList::-webkit-scrollbar-thumb {
@@ -257,10 +340,10 @@
   }
 
   #status {
-    margin-top:10px; padding-top:8px;
+    margin-top:6px; padding-top:6px;
     border-top:1px solid #1e2836;
     font-size:10px; color:#7b8794;
-    min-height:14px;
+    min-height:0;
     font-variant-numeric: tabular-nums;
     overflow-wrap:anywhere; line-height:1.5;
   }
@@ -296,201 +379,253 @@
              height:20px; font-size:11px; line-height:1;">−</button>
   </h3>
 
-  <div class="field">
-    <label>Depth</label>
-    <input type="range" id="depthSlider"
-           min="3" max="40" step="0.5" value="15">
-    <span class="val" id="depthVal">15.0</span>
-  </div>
-  <div class="field">
-    <label>Half-angle</label>
-    <input type="range" id="angleSlider"
-           min="10" max="60" step="1" value="30">
-    <span class="val" id="angleVal">30°</span>
-  </div>
-  <div class="field">
-    <label>Rings</label>
-    <input type="range" id="ringsSlider"
-           min="4" max="40" step="1" value="14">
-    <span class="val" id="ringsVal">14</span>
-  </div>
-  <div class="field">
-    <label>Meridians</label>
-    <input type="range" id="meridiansSlider"
-           min="4" max="48" step="1" value="24">
-    <span class="val" id="meridiansVal">24</span>
-  </div>
-  <div class="field">
-    <label>Shape depth</label>
-    <input type="range" id="shapeDepthSlider"
-           min="0.05" max="2.00" step="0.05" value="1.00">
-    <span class="val" id="shapeDepthVal">1.00</span>
-  </div>
+  <div class="panel-body">
 
-  <hr>
+    <details class="section" open>
+      <summary>View</summary>
+      <div class="section-body">
+        <div class="field">
+          <label>Depth</label>
+          <input type="range" id="depthSlider"
+                 min="3" max="40" step="0.5" value="15">
+          <span class="val" id="depthVal">15.0</span>
+        </div>
+        <div class="field">
+          <label>Half-angle</label>
+          <input type="range" id="angleSlider"
+                 min="10" max="60" step="1" value="30">
+          <span class="val" id="angleVal">30°</span>
+        </div>
+        <div class="field">
+          <label>Rings</label>
+          <input type="range" id="ringsSlider"
+                 min="4" max="40" step="1" value="14">
+          <span class="val" id="ringsVal">14</span>
+        </div>
+        <div class="field">
+          <label>Meridians</label>
+          <input type="range" id="meridiansSlider"
+                 min="4" max="48" step="1" value="24">
+          <span class="val" id="meridiansVal">24</span>
+        </div>
+        <div class="field">
+          <label>Shape depth</label>
+          <input type="range" id="shapeDepthSlider"
+                 min="0.05" max="2.00" step="0.05" value="1.00">
+          <span class="val" id="shapeDepthVal">1.00</span>
+        </div>
+        <div class="row">
+          <button id="resetBtn">Reset</button>
+          <button id="centerBtn">Center apex</button>
+        </div>
+      </div>
+    </details>
 
-  <div class="field">
-    <label>Patch &phi;</label>
-    <input type="text" id="patchPhiVal" class="scrubInput"
-           value="&#8212;" autocomplete="off" spellcheck="false"
-           disabled>
-  </div>
-  <div class="field">
-    <label>Patch s</label>
-    <input type="text" id="patchSVal" class="scrubInput"
-           value="&#8212;" autocomplete="off" spellcheck="false"
-           disabled>
-  </div>
-  <div class="field">
-    <label>Mirror</label>
-    <input type="checkbox" id="patchMirror"
-           title="Draw a visual clone of every square on this patch
-                  on the diametrically opposite side of the cone">
-  </div>
-  <div class="field">
-    <label>Mirror &ang;</label>
-    <input type="text" id="patchMirrorAngle" class="scrubInput"
-           value="&#8212;" autocomplete="off" spellcheck="false"
-           disabled>
-  </div>
-  <div class="field">
-    <label>Mirror flip</label>
-    <input type="checkbox" id="patchMirrorFlip"
-           title="Negate the mirror's rotation so tilted shapes are
-                  not 180°-rotated relative to the original">
-  </div>
+    <details class="section" open>
+      <summary>Patches</summary>
+      <div class="section-body">
+        <div class="field">
+          <label>Patch &phi;</label>
+          <input type="text" id="patchPhiVal" class="scrubInput"
+                 value="&#8212;" autocomplete="off" spellcheck="false"
+                 disabled>
+        </div>
+        <div class="field">
+          <label>Patch s</label>
+          <input type="text" id="patchSVal" class="scrubInput"
+                 value="&#8212;" autocomplete="off" spellcheck="false"
+                 disabled>
+        </div>
+        <div class="field">
+          <label>Mirror</label>
+          <input type="checkbox" id="patchMirror"
+                 title="Draw a visual clone of every square on this
+                        patch on the diametrically opposite side of
+                        the cone">
+        </div>
+        <div class="field">
+          <label>Mirror &ang;</label>
+          <input type="text" id="patchMirrorAngle" class="scrubInput"
+                 value="&#8212;" autocomplete="off" spellcheck="false"
+                 disabled>
+        </div>
+        <div class="field">
+          <label>Mirror flip</label>
+          <input type="checkbox" id="patchMirrorFlip"
+                 title="Negate the mirror's rotation so tilted shapes
+                        are not 180°-rotated relative to the
+                        original">
+        </div>
 
-  <hr>
+        <div class="field" style="margin-top:6px; margin-bottom:2px;">
+          <label>List</label>
+          <button id="addQuadBtn" style="flex:1 1 auto;">+ Patch</button>
+          <button id="cloneQuadBtn" style="flex:1 1 auto;">+ Clone</button>
+        </div>
+        <div id="quadList" class="quadList"></div>
+      </div>
+    </details>
 
-  <div class="field">
-    <label>Square W</label>
-    <input type="text" id="squareWVal" class="scrubInput"
-           value="&#8212;" autocomplete="off" spellcheck="false"
-           disabled>
-  </div>
-  <div class="field">
-    <label>Square H</label>
-    <input type="text" id="squareHVal" class="scrubInput"
-           value="&#8212;" autocomplete="off" spellcheck="false"
-           disabled>
-  </div>
-  <div class="field">
-    <label>Slope</label>
-    <input type="text" id="squareSlopeVal" class="scrubInput"
-           value="&#8212;" autocomplete="off" spellcheck="false"
-           disabled>
-  </div>
-  <div class="field">
-    <label>Visual bot.</label>
-    <input type="checkbox" id="squareVisualBottom"
-           title="When checked, the shape's text anchor and corner
-                  senses follow the visual bottom of the scene — the
-                  side of the square that sits lowest on screen —
-                  instead of the shape's own longest edge.  Changes
-                  both the label's baseline angle and which corner
-                  is read as top-left, top-right, bottom-right,
-                  bottom-left.">
-  </div>
+    <details class="section" open>
+      <summary>Squares</summary>
+      <div class="section-body">
+        <div class="field">
+          <label>Square &phi;</label>
+          <input type="text" id="squarePhiVal" class="scrubInput"
+                 value="&#8212;" autocomplete="off" spellcheck="false"
+                 disabled
+                 title="Centre of the selected shape along the
+                        unfolded cone's φ axis (radians, 0 to 2π).
+                        The cone wraps, so a typed value outside
+                        the range folds back in, and a value far
+                        from the current one moves the shape the
+                        short way around.">
+        </div>
+        <div class="field">
+          <label>Square s</label>
+          <input type="text" id="squareSVal" class="scrubInput"
+                 value="&#8212;" autocomplete="off" spellcheck="false"
+                 disabled
+                 title="Centre of the selected shape along the
+                        unfolded cone's axial axis (0 at base,
+                        1 at apex).">
+        </div>
+        <div class="field">
+          <label>Square W</label>
+          <input type="text" id="squareWVal" class="scrubInput"
+                 value="&#8212;" autocomplete="off" spellcheck="false"
+                 disabled>
+        </div>
+        <div class="field">
+          <label>Square H</label>
+          <input type="text" id="squareHVal" class="scrubInput"
+                 value="&#8212;" autocomplete="off" spellcheck="false"
+                 disabled>
+        </div>
+        <div class="field">
+          <label>Slope &times;</label>
+          <input type="text" id="squareSlopeVal" class="scrubInput"
+                 value="&#8212;" autocomplete="off" spellcheck="false"
+                 disabled
+                 title="Hinge amount for the selected shape, 0 to 1.">
+          <input type="text" id="shapeStandingMultVal" class="scrubInput"
+                 value="2.00" autocomplete="off" spellcheck="false"
+                 title="Standing height multiplier — how tall a
+                        hinged shape stands, as a multiple of its
+                        flat-view height.  Global; applies to every
+                        shape.">
+        </div>
+        <div class="field">
+          <label>Visual bot.</label>
+          <input type="checkbox" id="squareVisualBottom"
+                 title="When checked, the shape's text anchor and
+                        corner senses follow the visual bottom of
+                        the scene — the side of the square that
+                        sits lowest on screen — instead of the
+                        shape's own longest edge.  Changes both the
+                        label's baseline angle and which corner is
+                        read as top-left, top-right, bottom-right,
+                        bottom-left.">
+        </div>
 
-  <hr>
+        <div class="field" style="margin-top:6px; margin-bottom:2px;">
+          <label>List</label>
+          <button id="addSquareBtn" style="flex:1 1 auto;">+ Square</button>
+          <button id="cloneSquareBtn" style="flex:1 1 auto;">+ Clone</button>
+        </div>
+        <div id="squareList" class="quadList"></div>
+      </div>
+    </details>
 
-  <div class="field" style="margin-bottom:2px;">
-    <label>Patches</label>
-    <button id="addQuadBtn" style="flex:1 1 auto;">+ Patch</button>
-    <button id="cloneQuadBtn" style="flex:1 1 auto;">+ Clone</button>
-  </div>
-  <div id="quadList" class="quadList"></div>
+    <details class="section" open>
+      <summary>Draw</summary>
+      <div class="section-body">
+        <div class="field">
+          <label>Draw fit</label>
+          <select id="drawFitMode">
+            <option value="shape-first" selected>shape &rarr; patch</option>
+            <option value="patch-first">patch &rarr; shape</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>No rotate</label>
+          <input type="checkbox" id="drawNoRotate"
+                 title="Lock the fitted shape's rotation to zero, so
+                        its edges run parallel to the flat view's
+                        φ and s axes — the shape reads as
+                        north/south aligned on the unfolded sheet.
+                        Read at draw-finish time, so it can be
+                        changed mid-draw.">
+        </div>
+        <div class="row" style="margin-top:-2px;">
+          <button id="drawQuadBtn">Draw Quad</button>
+        </div>
+      </div>
+    </details>
 
-  <div class="field" style="margin-top:8px; margin-bottom:2px;">
-    <label>Squares</label>
-    <button id="addSquareBtn" style="flex:1 1 auto;">+ Square</button>
-    <button id="cloneSquareBtn" style="flex:1 1 auto;">+ Clone</button>
-  </div>
-  <div id="squareList" class="quadList"></div>
+    <details class="section" open>
+      <summary>Export</summary>
+      <div class="section-body">
+        <div class="row">
+          <button id="saveSceneBtn">Save scene</button>
+          <button id="loadSceneBtn">Load scene</button>
+        </div>
+        <div class="row">
+          <button id="exportBtn">Export visual state</button>
+          <button id="generateKraBtn">Generate .kra</button>
+        </div>
 
-  <div class="field">
-    <label>Draw fit</label>
-    <select id="drawFitMode">
-      <option value="shape-first" selected>shape &rarr; patch</option>
-      <option value="patch-first">patch &rarr; shape</option>
-    </select>
-  </div>
-  <div class="field">
-    <label>No rotate</label>
-    <input type="checkbox" id="drawNoRotate"
-           title="Lock the fitted shape's rotation to zero, so its
-                  edges run parallel to the flat view's φ and s
-                  axes — the shape reads as north/south aligned on
-                  the unfolded sheet.  Read at draw-finish time, so
-                  it can be changed mid-draw.">
-  </div>
-  <div class="row" style="margin-top:-2px;">
-    <button id="drawQuadBtn">Draw Quad</button>
-  </div>
+        <div class="field" style="margin-top:6px;">
+          <label>KRA text</label>
+          <select id="kraTextPos">
+            <option value="center">center</option>
+            <option value="tl">top-left</option>
+            <option value="tr">top-right</option>
+            <option value="bl">bottom-left</option>
+            <option value="br">bottom-right</option>
+            <option value="top">top edge</option>
+            <option value="bottom">bottom edge</option>
+            <option value="left">left edge</option>
+            <option value="right">right edge</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Padding</label>
+          <input type="text" id="kraTextPad" class="scrubInput"
+                 value="0.06" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label>Text color</label>
+          <select id="kraTextColor">
+            <option value="color">patch hue</option>
+            <option value="black">black</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Warp</label>
+          <select id="kraTextWarp">
+            <option value="square">per-square</option>
+            <option value="patch">per-patch</option>
+            <option value="text">per-text</option>
+            <option value="text-shear">per-text shear</option>
+            <option value="patch-shear">per-patch shear</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Rectangles</label>
+          <input type="checkbox" id="kraDrawRects" checked
+                 title="When checked, the KRA export writes one
+                        filled rectangle per square alongside its
+                        text, using the square's projected corners.
+                        When unchecked, only the text layers are
+                        written.">
+        </div>
+      </div>
+    </details>
 
-  <hr>
+    <div id="status">drag apex to tilt · scroll to change depth</div>
 
-  <div class="row">
-    <button id="saveSceneBtn">Save scene</button>
-    <button id="loadSceneBtn">Load scene</button>
-  </div>
-  <div class="row">
-    <button id="resetBtn">Reset</button>
-    <button id="centerBtn">Center apex</button>
-  </div>
-  <div class="row">
-    <button id="exportBtn">Export visual state</button>
-    <button id="generateKraBtn">Generate .kra</button>
-  </div>
-
-  <hr>
-
-  <div class="field" style="margin-bottom:2px;">
-    <label>KRA text</label>
-    <select id="kraTextPos">
-      <option value="center">center</option>
-      <option value="tl">top-left</option>
-      <option value="tr">top-right</option>
-      <option value="bl">bottom-left</option>
-      <option value="br">bottom-right</option>
-      <option value="top">top edge</option>
-      <option value="bottom">bottom edge</option>
-      <option value="left">left edge</option>
-      <option value="right">right edge</option>
-    </select>
-  </div>
-  <div class="field">
-    <label>Padding</label>
-    <input type="text" id="kraTextPad" class="scrubInput"
-           value="0.06" autocomplete="off" spellcheck="false">
-  </div>
-  <div class="field">
-    <label>Text color</label>
-    <select id="kraTextColor">
-      <option value="color">patch hue</option>
-      <option value="black">black</option>
-    </select>
-  </div>
-  <div class="field">
-    <label>Warp</label>
-    <select id="kraTextWarp">
-      <option value="square">per-square</option>
-      <option value="patch">per-patch</option>
-      <option value="text">per-text</option>
-      <option value="text-shear">per-text shear</option>
-      <option value="patch-shear">per-patch shear</option>
-    </select>
-  </div>
-  <div class="field">
-    <label>Rectangles</label>
-    <input type="checkbox" id="kraDrawRects" checked
-           title="When checked, the KRA export writes one filled
-                  rectangle per square alongside its text, using
-                  the square's projected corners.  When unchecked,
-                  only the text layers are written.">
-  </div>
-
-  <div id="status">drag apex to tilt · scroll to change depth</div>
+  </div><!-- .panel-body -->
 </div>
 
 <button id="restoreBtn" title="Show panel (H)">☰ Show panel</button>
@@ -2108,20 +2243,37 @@ const SHAPE_MIN_SCALE     = 0.03;
 const SHAPE_MAX_SCALE     = 10.00;
 
 /* ==========================================================================
-   SHAPE SLOPE
+   SHAPE SLOPE — HINGE PARAMETER
    ==========================================================================
-   How far a shape may tilt out of the patch plane, about its own
-   reference U axis.  Zero leaves the shape flat on the patch.
-   Positive slope tips the +v edge (the one that points toward the
-   apex) INTO the cavity of the cone; negative slope tips the −v
-   edge.  See the SLOPE section in the module docstring.
+   A unitless value in [0, 1].  Zero leaves the shape flat on the
+   patch plane.  As the value rises the shape hinges upward about
+   its NEAR edge — the edge of the shape whose corners have the
+   smallest local v, i.e. the side facing the viewer.  At 1 the
+   shape has rotated a full 90 degrees out of the patch plane,
+   standing perpendicular to it, and (for a shape on the front of
+   the cone) projects as a rectangle on screen.
 
-   ±85° is the hard bound.  At ±90° the shape would be edge-on to
-   the patch plane, the projection would collapse to a line, and
-   the corner/rotate handle offsets would become singular. */
+   See the SLOPE section in the module docstring. */
 
-const SHAPE_SLOPE_MIN = -85 * Math.PI / 180;
-const SHAPE_SLOPE_MAX =  85 * Math.PI / 180;
+const SHAPE_SLOPE_MIN = 0;
+const SHAPE_SLOPE_MAX = 1;
+
+/* ==========================================================================
+   STANDING HEIGHT MULTIPLIER
+   ==========================================================================
+   Aesthetic knob for the hinge.  The standing height of a hinged
+   shape is targeted at the shape's own v-extent as it appears in
+   the FLAT view, times this factor.
+
+       1.00   the shape stands the same height it looks flat
+       2.00   the shape stands twice as tall as it looks flat
+       0.50   half as tall
+
+   Only the cone view's hinge projection reads this; the flat view
+   is unaffected, and the shape's stored geometry is unchanged.
+   The mirror inherits the same factor, so original and mirror stay
+   consistent. */
+let SHAPE_STANDING_HEIGHT_MULT = 2.00;
 
 /* ==========================================================================
    PATCH-RELATIVE ASPECT SCALING
@@ -2316,7 +2468,7 @@ function _squareHasMirror(sq) {
 
    With `mirrorFlip` on (the default), the flip is a reflection
    across the patch's V axis: θ → −θ, slope → −slope, u → −u.  This
-   is the transformation that makes a rotated or tilted shape read
+   is the transformation that makes a rotated or hinged shape read
    as a true left-right reflection of the original on the mirror,
    rather than as a rotated ghost.
 
@@ -2349,7 +2501,10 @@ function _withSquareMirror(sq, fn) {
 
   if (flip) {
     sq.theta = -theta0;
-    sq.slope = -slope0;
+    /* slope is a hinge amount in [0,1], not a signed angle.  The
+       mirror is a reflection across the patch's V axis, which flips
+       u and θ but leaves the hinge edge (min v) on the same side,
+       so slope is unchanged. */
     sq.u     = -u0;
   }
 
@@ -2368,7 +2523,7 @@ function _withSquareMirror(sq, fn) {
    in the cone view, is the radial direction at the patch's angular
    centre.  When the apex is off-centre the axis is not vertical,
    but the projection of "outward" is still radial in the xy plane,
-   so this is the correct screen direction to slide the tilted shape
+   so this is the correct screen direction to slide the hinged shape
    along.  Returned in world φ (radians, [0, 2π)). */
 function _patchNormalPhi(qi) {
   if (qi < 0 || qi >= quads.length) return 0;
@@ -2440,6 +2595,67 @@ function shapeVMax(sq) {
 }
 
 /* ==========================================================================
+   STANDING-HEIGHT SCALE FOR THE HINGE
+   ==========================================================================
+   The scale converts the raw out-of-plane displacement `d · sin θ`
+   (world units) into a screen offset (px) via `* view.scale`.
+
+   The TARGET standing height is the shape's own v-extent as it
+   appears in the FLAT view.  The flat view is a φ-independent
+   linear map, so this target is identical for every reference
+   square regardless of where on the cone the shape sits and
+   regardless of the apex's position.
+
+   Why not use `shapeWorldH` (= f.vLen / 2 for a reference square)?
+   Because f.vLen is the patch's meridian length, and on an oblique
+   cone that varies with φ.  Using it as the denominator makes the
+   standing height vary with φ by the same ratio — the 92 px / 236 px
+   spread you're seeing.
+
+   Returns 1 when the correction cannot be computed, so a
+   degenerate frame falls back to the raw displacement. */
+
+function _flatVExtentPxForShape(sq) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const q = quads[qi];
+  const f = patchFrame(qi);
+  if (!f) return null;
+
+  const dS = q.s1 - q.s0;
+  if (Math.abs(dS) < 1e-9) return null;
+
+  /* Shape's v-extent in local world units. */
+  const vExtentLocal = SHAPE_REL_SIZE * (sq.scaleV || 1)
+                       * (f.vLen / SHAPE_V_REF);
+
+  /* In normalized s units (the flat view's own vertical axis). */
+  const vExtentS = vExtentLocal * dS / f.vLen;
+
+  /* In flat-screen pixels: flatToScreen maps s so that 1 unit of
+     s spans flatRect().h pixels (with y inverted). */
+  const r = flatRect();
+  return vExtentS * r.h * SHAPE_STANDING_HEIGHT_MULT;
+}
+
+function _shapeStandingScale(f, sq, qi, hingeV, depthScale) {
+  if (!f || !sq) return 1;
+
+  const flatVExtentPx = _flatVExtentPxForShape(sq);
+  if (!flatVExtentPx || !isFinite(flatVExtentPx) ||
+      flatVExtentPx < 1e-6) return 1;
+
+  /* World v-extent the raw displacement `d · sin θ` must produce
+     on screen as `flatVExtentPx` at slope = 1. */
+  const Kv = f.vLen / SHAPE_V_REF;
+  const shapeWorldH = SHAPE_REL_SIZE * (sq.scaleV || 1) * depthScale * Kv;
+  if (shapeWorldH < 1e-9) return 1;
+
+  const scale = flatVExtentPx / (shapeWorldH * view.scale);
+  return (isFinite(scale) && scale > 0) ? scale : 1;
+}
+
+/* ==========================================================================
    HORIZON CLIP
    ==========================================================================
    Sutherland-Hodgman against the half-plane v ≤ vMaxLocal. */
@@ -2478,9 +2694,9 @@ function clampCloneV(qi, vHat) {
    SHAPE V-EXTENT (preserved, not on the render path)
    ==========================================================================
    Reports the shape's half-extent along v̂, in NORMALIZED v̂ units,
-   accounting for the rotation and the aspect correction.  The slope
-   is not folded in here: this is the footprint the shape would have
-   if it were flat on the patch plane. */
+   accounting for the rotation and the aspect correction.  Slope is
+   not folded in here: this is the footprint the shape would have if
+   it were flat on the patch plane. */
 
 function _vExtentNormFromDims(f, dims, theta) {
   const hwHat = (dims.w / 2) / f.uLen;
@@ -2680,8 +2896,8 @@ function squareCenterLocal(sq) {
    shape, so the set of local corners is the same at θ = 0° and 90°.
 
    Slope is not applied here.  The flat view (via these local
-   corners) sees the un-tilted footprint; the cone view applies the
-   tilt later, in projectShapePoint. */
+   corners) sees the un-hinged footprint; the cone view applies the
+   hinge later, in projectShapePoint. */
 
 function squareCornersLocal(sq) {
   return squareCornersLocalWith(sq, SHAPE_DEPTH_FLAT);
@@ -2783,44 +2999,62 @@ function squareRotateHandleLocalWith(sq, depthScale) {
 }
 
 /* ==========================================================================
-   PROJECTION — shape-relative taper, WITH SLOPE
+   PROJECTION — shape-relative taper, WITH HINGE SLOPE
    ==========================================================================
-   The single place slope is realised.  Given a point's local (u, v)
-   on the patch plane, the projection proceeds in three steps:
+   The slope parameter is a unitless value in [0, 1]:
 
-     1.  Decompose the point's offset from the shape's centre along
-         the reference V axis into an in-plane part and an
-         out-of-plane part:
+       slope = 0    shape lies flat on the patch
+       slope = 1    shape has rotated 90 degrees about its near edge
+                    (the edge whose corners have the smallest local v)
 
-             dv          = vLocal - vC
-             vInPlane    = vC + dv · cos(slope)
-             hOut        =   - dv · sin(slope)
+   The rotation is about the horizontal line v = hingeV in the patch
+   plane, where hingeV is the minimum local v of the shape's four
+   (unclipped) corners.  For a point at local (u, v):
 
-     2.  Project the in-plane point through the usual shape-relative
-         perspective taper:
+       d        = v - hingeV
+       theta    = slope * PI / 2
+       vInPlane = hingeV + d * cos(theta)
+       hOut     = -d * sin(theta) * standingScale
 
-             p = pC - (vInPlane - vC) / vMax
+   vInPlane is fed through the normal perspective taper; hOut is a
+   screen-space offset along the patch's INWARD radial direction
+   (-cos phiC, sin phiC) * view.scale.  A positive hOut moves the
+   point INWARD from the cone surface, into the cavity.
 
-     3.  Add the out-of-plane part as a screen-space offset along
-         the direction the patch's outward surface normal projects
-         to.  That direction is the radial direction at the patch's
-         angular centre φc:  in screen space it is
-         ( cos φc , -sin φc ), because screen y is flipped.
+   For a shape on the front of the cone (phiC ~= -PI/2), the inward
+   direction is roughly (0, -1) on screen: the far edge lifts
+   upward.  At slope = 1, every point sits at vInPlane = hingeV
+   in-plane and is displaced inward by d * standingScale — which
+   projects as a rectangle on screen for a front-of-cone shape.
 
-             px += hOut ·  cos(φc) · view.scale
-             py += hOut · -sin(φc) · view.scale
+   `standingScale` is the shape-driven scale from _shapeStandingScale:
+   it makes the standing height equal the shape's own world width,
+   so a reference square stands as a square rather than as the
+   patch's aspect-warped rectangle.  Pass undefined or 1 to disable
+   the correction.
 
-   Positive slope drops the +v side (dv > 0) INTO the cone — the
-   outward normal points away from the axis, so hOut < 0 for dv > 0
-   moves the point toward the axis. */
+   Points at or below hingeV do not move: hOut = 0. */
 
 function projectShapePoint(f, qi, uLocal, vLocal, vC, pC, vMax,
-                           phiC, slope) {
-  const dv   = vLocal - vC;
-  const cosS = Math.cos(slope || 0);
-  const sinS = Math.sin(slope || 0);
+                           phiC, slopeParam, hingeV, standingScale) {
+  const s = Math.max(0, Math.min(1, slopeParam || 0));
 
-  const vInPlane = vC + dv * cosS;
+  let vInPlane = vLocal;
+  let hOut = 0;
+
+  if (s > 1e-6 && hingeV !== undefined && isFinite(hingeV)) {
+    const theta = s * Math.PI / 2;
+    const cosT  = Math.cos(theta);
+    const sinT  = Math.sin(theta);
+    const d     = vLocal - hingeV;
+    vInPlane = hingeV + d * cosT;
+
+    const scaleFactor = (standingScale !== undefined &&
+                         isFinite(standingScale) && standingScale > 0)
+                          ? standingScale : 1;
+    /* Positive: the far edge tips INTO the cavity. */
+    hOut = d * sinT * scaleFactor;
+  }
 
   const [wx, wy] = frameToWorld(f, uLocal, vInPlane);
   const [sx, sy] = w2s(wx, wy);
@@ -2829,10 +3063,10 @@ function projectShapePoint(f, qi, uLocal, vLocal, vC, pC, vMax,
   let px = ax + p * (sx - ax);
   let py = ay + p * (sy - ay);
 
-  const hN = -dv * sinS;
-  if (hN !== 0) {
-    px += hN *  Math.cos(phiC) * view.scale;
-    py += hN * -Math.sin(phiC) * view.scale;
+  if (hOut !== 0) {
+    /* Inward radial direction, in screen coordinates. */
+    px += hOut * -Math.cos(phiC) * view.scale;
+    py += hOut *  Math.sin(phiC) * view.scale;
   }
 
   return [px, py];
@@ -2858,8 +3092,20 @@ function squareCornersScreen(sq) {
   const phiC  = _patchNormalPhi(qi);
   const slope = sq.slope || 0;
 
+  /* Hinge v: minimum local v of the UNCLIPPED corners.  For an
+     unrotated shape this is exactly the bottom edge; for a rotated
+     shape it is the lowest corner. */
+  let hingeV = Infinity;
+  for (const [u, v] of local) {
+    if (v < hingeV) hingeV = v;
+  }
+
+  const standingScale = _shapeStandingScale(
+    f, sq, qi, hingeV, effectiveConeDepth());
+
   return clipped.map(([u, v]) =>
-    projectShapePoint(f, qi, u, v, vC, pC, vMax, phiC, slope));
+    projectShapePoint(f, qi, u, v, vC, pC, vMax, phiC, slope, hingeV,
+                      standingScale));
 }
 
 function squareRotateHandleScreen(sq) {
@@ -2886,24 +3132,32 @@ function squareRotateHandleScreen(sq) {
   const phiC  = _patchNormalPhi(qi);
   const slope = sq.slope || 0;
 
-  return projectShapePoint(f, qi, hl[0], hv, vC, pC, vMax, phiC, slope);
+  let hingeV = Infinity;
+  const local = squareCornersLocalCone(sq);
+  if (local) {
+    for (const [u, v] of local) {
+      if (v < hingeV) hingeV = v;
+    }
+  }
+
+  const standingScale = _shapeStandingScale(
+    f, sq, qi, hingeV, effectiveConeDepth());
+
+  return projectShapePoint(f, qi, hl[0], hv, vC, pC, vMax, phiC,
+                            slope, hingeV, standingScale);
 }
 
 /* ==========================================================================
    PLANE INTERSECTION
    ==========================================================================
-   When a shape is tilted out of its patch plane, its plane cuts the
-   patch plane along a line: the pivot axis.  The projection tilts
-   about local v = vC (the shape's centre along the patch's V axis),
-   so the intersection segment is the piece of the line v = vC that
-   lies inside the shape's own local quad.  It is drawn as a faint
-   dashed hint so a tilted shape reads as "pivoted about this axis"
-   rather than floating arbitrarily.  With slope = 0 the line is not
-   drawn. */
+   With the hinge model the shape's plane intersects the patch
+   plane along the hinge line itself: the edge between the two
+   corners with the smallest local v.  At slope = 0 there is no
+   intersection, since the shape lies on the patch. */
 
 function squarePlaneIntersectionLocal(sq) {
   const slope = sq.slope || 0;
-  if (Math.abs(slope) < 1e-6) return null;
+  if (slope < 1e-6) return null;
 
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
@@ -2913,43 +3167,13 @@ function squarePlaneIntersectionLocal(sq) {
   const corners = squareCornersLocalCone(sq);
   if (!corners || corners.length < 3) return null;
 
-  const vC = sq.v * f.vLen;
-
-  /* Intersect the line v = vC with every edge of the quad. */
-  const pts = [];
-  const n = corners.length;
-  for (let i = 0; i < n; i++) {
-    const A = corners[i];
-    const B = corners[(i + 1) % n];
-    const da = A[1] - vC;
-    const db = B[1] - vC;
-    if (Math.abs(da) < 1e-9) pts.push([A[0], vC]);
-    if (Math.abs(db) < 1e-9) pts.push([B[0], vC]);
-    if (da * db < 0) {
-      const t = da / (da - db);
-      pts.push([A[0] + (B[0] - A[0]) * t, vC]);
-    }
-  }
-
-  if (pts.length < 2) return null;
-
-  /* The two most distant intersections are the chord endpoints. */
-  let best  = [pts[0], pts[1]];
-  let bestD = -1;
-  for (let i = 0; i < pts.length; i++) {
-    for (let j = i + 1; j < pts.length; j++) {
-      const dx = pts[i][0] - pts[j][0];
-      const dy = pts[i][1] - pts[j][1];
-      const d  = dx * dx + dy * dy;
-      if (d > bestD) { bestD = d; best = [pts[i], pts[j]]; }
-    }
-  }
-  return best;
+  const sorted = corners.slice().sort((a, b) => a[1] - b[1]);
+  return [sorted[0], sorted[1]];
 }
 
-/* Cone-band screen endpoints.  Both lie at local v = vC, so the
-   projection's slope term is zero there and they read as the same
-   line the un-tilted shape would show: exactly the pivot. */
+/* Cone-band screen endpoints.  Both lie at local v = hingeV, so the
+   projection's hinge term is zero there and they read as the same
+   line the un-hinged shape would show: exactly the pivot. */
 function squarePlaneIntersectionScreen(sq) {
   const local = squarePlaneIntersectionLocal(sq);
   if (!local) return null;
@@ -2967,8 +3191,20 @@ function squarePlaneIntersectionScreen(sq) {
   const phiC  = _patchNormalPhi(qi);
   const slope = sq.slope || 0;
 
+  let hingeV = Infinity;
+  const allCorners = squareCornersLocalCone(sq);
+  if (allCorners) {
+    for (const [u, v] of allCorners) {
+      if (v < hingeV) hingeV = v;
+    }
+  }
+
+  const standingScale = _shapeStandingScale(
+    f, sq, qi, hingeV, effectiveConeDepth());
+
   return local.map(([u, v]) =>
-    projectShapePoint(f, qi, u, v, vC, pC, vMax, phiC, slope));
+    projectShapePoint(f, qi, u, v, vC, pC, vMax, phiC, slope, hingeV,
+                      standingScale));
 }
 
 /* Flat-band (phi, s) endpoints, using the same linear (u, v) →
@@ -3103,7 +3339,7 @@ function drawFloatSquare(sq, selected, isMirror) {
   ctx.lineWidth = lineW;
   ctx.stroke();
 
-  /* Intersection with the patch plane, when tilted. */
+  /* Intersection with the patch plane, when hinged. */
   if (sq.slope && Math.abs(sq.slope) > 1e-6) {
     const isect = squarePlaneIntersectionScreen(sq);
     if (isect) {
@@ -3272,8 +3508,8 @@ function findPatchAtScreen(sx, sy) {
    INVERSE #1 — shape-relative taper, EXACT (quadratic)
    ==========================================================================
    These solvers assume the shape is FLAT on the patch plane.  A
-   tilted shape's corner drag therefore lands the corner at the
-   un-tilted (u, v) of the cursor.  Reset slope to 0 for precise
+   hinged shape's corner drag therefore lands the corner at the
+   un-hinged (u, v) of the cursor.  Reset slope to 0 for precise
    corner editing in the cone view. */
 
 function cursorToLocalShapeRelativeExactWith(f, qi, vC, pC, vMax,
@@ -3683,7 +3919,7 @@ function rotateSquareToCursor(sq, cursorWX, cursorWY, snap, startTheta) {
 /* ==========================================================================
    FLAT-VIEW PROJECTION
    ==========================================================================
-   The flat view ignores slope: it draws the shape's un-tilted (φ, s)
+   The flat view ignores slope: it draws the shape's un-hinged (φ, s)
    footprint, so editing in that band stays exact. */
 
 function squareFlatCorners(sq) {
@@ -3702,6 +3938,56 @@ function squareFlatCorners(sq) {
     phiC + (u / f.uLen) * dPhi,
     sC   + (v / f.vLen) * dS,
   ]);
+}
+
+/* The shape's centre in the flat view's (φ, s) coordinates.  Same
+   linear (u, v) → (φ, s) map squareFlatCorners uses, evaluated at
+   the shape's centre instead of at its corners.  Used by the
+   panel's Square φ / Square s inputs. */
+function squareFlatCenter(sq) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const q = quads[qi];
+  const f = patchFrame(qi);
+  if (!f) return null;
+  const phiC = (q.phi0 + q.phi1) / 2;
+  const sC   = (q.s0   + q.s1)   / 2;
+  const dPhi = q.phi1 - q.phi0;
+  const dS   = q.s1   - q.s0;
+  return {
+    phi: phiC + sq.u * dPhi,
+    s:   sC   + sq.v * dS,
+  };
+}
+
+/* Move the shape so its centre lands at the given (φ, s) in the
+   flat view.  φ is unwrapped to the nearest equivalent of the
+   shape's current φ before it is applied, so typing a value on the
+   far side of the seam moves the shape the short way around the
+   cone — the flat view loops, and this preserves the user's sense
+   of "shortest drag". */
+function setSquareFlatCenter(sq, targetPhi, targetS) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return;
+  const q = quads[qi];
+  const f = patchFrame(qi);
+  if (!f) return;
+  const phiC = (q.phi0 + q.phi1) / 2;
+  const sC   = (q.s0   + q.s1)   / 2;
+  const dPhi = q.phi1 - q.phi0;
+  const dS   = q.s1   - q.s0;
+  if (Math.abs(dPhi) < 1e-9 || Math.abs(dS) < 1e-9) return;
+
+  const curPhi = phiC + sq.u * dPhi;
+  let deltaPhi = targetPhi - curPhi;
+  while (deltaPhi >  Math.PI) deltaPhi -= 2 * Math.PI;
+  while (deltaPhi < -Math.PI) deltaPhi += 2 * Math.PI;
+  const newPhi = curPhi + deltaPhi;
+
+  const newU = (newPhi - phiC) / dPhi;
+  const newV = (targetS - sC) / dS;
+
+  setClonePosition(sq, newU * f.uLen, newV * f.vLen);
 }
 
 function squareFlatCornersScreen(sq, shift) {
@@ -4017,7 +4303,7 @@ function _worldSideLengths(pts) {
 
 function buildVisualStateExport() {
   const out = {
-    schemaVersion: 7,
+    schemaVersion: 8,
     generatedAt:   new Date().toISOString(),
 
     cone: {
@@ -4110,8 +4396,7 @@ function buildVisualStateExport() {
       scaleV: _round3(sq.scaleV),
       thetaRad: _round3(sq.theta || 0),
       thetaDeg: _round3((sq.theta || 0) * 180 / Math.PI),
-      slopeRad: _round3(sq.slope || 0),
-      slopeDeg: _round3((sq.slope || 0) * 180 / Math.PI),
+      slope: _round3(sq.slope || 0),
       visualBottom: !!sq.visualBottom,
     };
 
@@ -4220,6 +4505,11 @@ function _polygonArea(pts) {
   return Math.abs(area) / 2;
 }
 
+/* Unclipped projection of the shape's corners, with the hinge
+   applied using the same standing scale as the on-screen renderer.
+   The hinge is the minimum local v of the four corners; the standing
+   scale is _shapeStandingScale, so the KRA export sees exactly the
+   hinged shape the renderer draws. */
 function _unclippedProjectedCorners(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
@@ -4234,8 +4524,21 @@ function _unclippedProjectedCorners(sq) {
   const phiC = _patchNormalPhi(qi);
   const slope = sq.slope || 0;
 
+  /* Hinge v: minimum local v of the four unclipped corners.
+     Matches the hinge used by squareCornersScreen and the other
+     projection callers, so the KRA export sees exactly the hinged
+     shape the on-screen renderer draws. */
+  let hingeV = Infinity;
+  for (const [u, v] of local) {
+    if (v < hingeV) hingeV = v;
+  }
+
+  const standingScale = _shapeStandingScale(
+    f, sq, qi, hingeV, effectiveConeDepth());
+
   return local.map(([u, v]) =>
-    projectShapePoint(f, qi, u, v, vC, pC, vMax, phiC, slope));
+    projectShapePoint(f, qi, u, v, vC, pC, vMax, phiC, slope, hingeV,
+                      standingScale));
 }
 
 /* ==========================================================================
@@ -5755,12 +6058,18 @@ const PATCH_SNAP_PHI_NORM = 1 / 12;
 const SQUARE_SIZE_SCRUB_RATE = 0.005;
 const SQUARE_SIZE_SNAP_STEP  = 0.25;
 
-/* Slope scrub rate: 0.5° per pixel of horizontal drag, so a
-   100-px drag swings the shape 50°.  Snap step with Shift held is
-   one meridian (15°).  Values are stored in radians in the model
-   and shown in degrees in the field. */
-const SLOPE_SCRUB_RATE_DEG_PER_PX = 0.5;
-const SLOPE_SNAP_STEP_DEG         = 15;
+/* Square-position scrub rates.  φ is in flat-view radians; 0.008
+   per pixel matches the physical rate the patch-φ field uses.  s
+   is in axial-fraction units, matching the patch-s field. */
+const SQUARE_PHI_SCRUB_RATE = 0.008;
+const SQUARE_S_SCRUB_RATE   = 0.0015;
+
+/* Slope scrub rate: 0.005 parameter units per pixel of horizontal
+   drag, so a 100-px drag swings the hinge halfway.  Shift snaps to
+   0.1 — ten discrete stops across the [0, 1] range.  The stored
+   value is the unitless parameter itself; no conversion. */
+const SLOPE_SCRUB_RATE_PER_PX = 0.005;
+const SLOPE_SNAP_STEP         = 0.1;
 
 /* Mirror-angle scrub rate: 1° per pixel of horizontal drag.
    Stored in radians in the model and shown in degrees in the
@@ -5932,6 +6241,16 @@ const HELP_HTML = `<!DOCTYPE html>
 <div class="hint"><span class="kbd">Shift</span>+<span class="kbd">A</span>
   aligns the selected square to 45&deg;</div>
 <div class="hint"><span class="kbd">Delete</span> removes the selected square</div>
+<div class="hint"><strong>Square &phi;</strong> / <strong>Square s</strong> set
+  the selected shape's centre on the unfolded sheet.  &phi; is in radians
+  on [0, 2&pi;); the cone wraps, so typing a value on the far side of the
+  seam moves the shape the short way around</div>
+<div class="hint"><strong>Slope</strong> hinges the shape out of its patch
+  about the near edge.  0 = flat on the patch, 1 = rotated a full
+  90&deg; and standing perpendicular to it, tipped into the cone's cavity</div>
+<div class="hint">the multiplier to the right of Slope controls how tall a
+  hinged shape stands, as a multiple of its flat-view height.  Global,
+  not per-shape</div>
 <div class="hint"><strong>Visual bot.</strong> on a square makes its
   KRA text anchor and its four corner senses follow the <em>visual
   bottom of the scene</em> \u2014 the side of the square that sits
@@ -6221,20 +6540,26 @@ function _syncPatchCoordInputs() {
 }
 
 /* ==========================================================================
-   SQUARE-SIZE FIELDS
+   SQUARE-SIZE AND -POSITION FIELDS
    ==========================================================================
    The W / H fields show the shape's reference-unit size, which is
    independent of the patch it sits on and of the cone's depth /
-   half-angle.  The Slope field shows the shape's pseudo-3D tilt in
-   degrees.  The Visual bot. checkbox is a per-square flag that
-   changes how the KRA export reads the shape's "bottom" edge (see
-   the VISUAL BOTTOM section in the module docstring).  All four are
-   disabled until a square is selected. */
+   half-angle.  The Slope field shows the shape's hinge parameter,
+   a unitless value in [0, 1].  The φ / s fields show and set the
+   shape's centre in the flat view's coordinates.
+
+   The Visual bot. checkbox is a per-square flag that changes how
+   the KRA export reads the shape's "bottom" edge (see the VISUAL
+   BOTTOM section in the module docstring).  All of them are
+   disabled until a square is selected, except the global
+   standing-height multiplier, which is always shown. */
 
 function _syncSquareSizeInputs() {
   const wInput  = document.getElementById("squareWVal");
   const hInput  = document.getElementById("squareHVal");
   const sInput  = document.getElementById("squareSlopeVal");
+  const phiPos  = document.getElementById("squarePhiVal");
+  const sPos    = document.getElementById("squareSVal");
   const vbInput = document.getElementById("squareVisualBottom");
   if (!wInput || !hInput || !sInput) return;
 
@@ -6245,6 +6570,14 @@ function _syncSquareSizeInputs() {
     wInput.disabled = true;
     hInput.disabled = true;
     sInput.disabled = true;
+    if (phiPos) {
+      phiPos.disabled = true;
+      if (document.activeElement !== phiPos) phiPos.value = "\u2014";
+    }
+    if (sPos) {
+      sPos.disabled = true;
+      if (document.activeElement !== sPos) sPos.value = "\u2014";
+    }
     if (vbInput) {
       vbInput.disabled = true;
       if (document.activeElement !== vbInput) vbInput.checked = false;
@@ -6258,6 +6591,8 @@ function _syncSquareSizeInputs() {
   wInput.disabled = false;
   hInput.disabled = false;
   sInput.disabled = false;
+  if (phiPos) phiPos.disabled = false;
+  if (sPos)   sPos.disabled   = false;
   if (vbInput) {
     vbInput.disabled = false;
     if (document.activeElement !== vbInput) {
@@ -6272,7 +6607,32 @@ function _syncSquareSizeInputs() {
     hInput.value = squareWorldHeight(sq).toFixed(3);
   }
   if (document.activeElement !== sInput) {
-    sInput.value = ((sq.slope || 0) * 180 / Math.PI).toFixed(1);
+    sInput.value = (sq.slope || 0).toFixed(3);
+  }
+
+  /* φ / s follow the selected square's centre in the flat view.
+     φ is shown normalized to [0, 2π); the underlying value can be
+     any real number, but two φ that differ by a full turn are the
+     same direction and displaying the canonical one avoids the
+     field jumping by 2π while the user scrubs across the seam. */
+  const centre = squareFlatCenter(sq);
+  if (centre) {
+    if (phiPos && document.activeElement !== phiPos) {
+      let p = centre.phi;
+      p = ((p % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+      phiPos.value = p.toFixed(3);
+    }
+    if (sPos && document.activeElement !== sPos) {
+      sPos.value = centre.s.toFixed(3);
+    }
+  }
+
+  /* The global standing-height multiplier follows no selection; it
+     is always shown.  Updated here so it refreshes on the same
+     frame cycle as the slope field. */
+  const mInput = document.getElementById("shapeStandingMultVal");
+  if (mInput && document.activeElement !== mInput) {
+    mInput.value = SHAPE_STANDING_HEIGHT_MULT.toFixed(2);
   }
 }
 
@@ -6814,17 +7174,15 @@ function flashStatus(msg, cls) {
   });
 
   /* ---- slope scrub input ----------------------------------------
-     The field reads and writes the shape's pseudo-3D tilt.  The
-     model speaks radians; the field speaks degrees (see the SLOPE
-     note in the module docstring).  The rate and snap step are
-     converted from degrees to radians here so the installer's
-     radian-per-pixel contract is honoured. */
+     The field reads and writes the shape's hinge parameter — a
+     unitless value in [0, 1].  See the SLOPE note in the module
+     docstring. */
 
   const slopeInput = document.getElementById("squareSlopeVal");
 
   if (slopeInput) _installScrubInput(slopeInput, {
-    rate: SLOPE_SCRUB_RATE_DEG_PER_PX * Math.PI / 180,
-    snapStep: SLOPE_SNAP_STEP_DEG * Math.PI / 180,
+    rate: SLOPE_SCRUB_RATE_PER_PX,
+    snapStep: SLOPE_SNAP_STEP,
     read: () => {
       if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return 0;
       return floatSquares[selectedSquare].slope || 0;
@@ -6833,6 +7191,73 @@ function flashStatus(msg, cls) {
       if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return;
       const s = Math.max(SHAPE_SLOPE_MIN, Math.min(SHAPE_SLOPE_MAX, raw));
       floatSquares[selectedSquare].slope = s;
+    },
+  });
+
+  /* ---- standing-height multiplier scrub input -------------------
+     The field reads and writes the global aesthetic factor
+     SHAPE_STANDING_HEIGHT_MULT — how tall a hinged shape stands,
+     as a multiple of its flat-view height.  Applies to every shape
+     in the scene; not per-square, and not written by scene save.
+     See the STANDING HEIGHT MULTIPLIER section in
+     pg_view_squares.py. */
+  const multInput = document.getElementById("shapeStandingMultVal");
+  if (multInput) _installScrubInput(multInput, {
+    rate: 0.005,
+    snapStep: 0.1,
+    read: () => SHAPE_STANDING_HEIGHT_MULT,
+    write: (raw) => {
+      SHAPE_STANDING_HEIGHT_MULT =
+        Math.max(0.05, Math.min(10, raw));
+    },
+  });
+
+  /* ---- square-position scrub inputs -----------------------------
+     The two fields read and write the selected shape's centre in
+     the flat view's (φ, s) coordinates.  φ is displayed in
+     [0, 2π); a value outside that range, whether typed or produced
+     by scrubbing across the seam, is folded back in by the read
+     side.  The write side passes the raw value through to
+     setSquareFlatCenter, which unwraps it relative to the shape's
+     current φ so a jump across the seam moves the shape the short
+     way around the cone. */
+
+  const squarePhiInput = document.getElementById("squarePhiVal");
+  const squareSInput   = document.getElementById("squareSVal");
+
+  if (squarePhiInput) _installScrubInput(squarePhiInput, {
+    rate: SQUARE_PHI_SCRUB_RATE,
+    read: () => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return 0;
+      const c = squareFlatCenter(floatSquares[selectedSquare]);
+      if (!c) return 0;
+      let p = c.phi;
+      p = ((p % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+      return p;
+    },
+    write: (raw) => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return;
+      const sq = floatSquares[selectedSquare];
+      const c = squareFlatCenter(sq);
+      if (!c) return;
+      setSquareFlatCenter(sq, raw, c.s);
+    },
+  });
+
+  if (squareSInput) _installScrubInput(squareSInput, {
+    rate: SQUARE_S_SCRUB_RATE,
+    read: () => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return 0;
+      const c = squareFlatCenter(floatSquares[selectedSquare]);
+      if (!c) return 0;
+      return c.s;
+    },
+    write: (raw) => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return;
+      const sq = floatSquares[selectedSquare];
+      const c = squareFlatCenter(sq);
+      if (!c) return;
+      setSquareFlatCenter(sq, c.phi, raw);
     },
   });
 
@@ -6983,6 +7408,7 @@ function buildSceneJSON() {
     },
 
     shapeDepthCone: SHAPE_DEPTH_CONE,
+    shapeStandingMult: SHAPE_STANDING_HEIGHT_MULT,
 
     nextQuadId:   nextQuadId,
     nextSquareId: nextSquareId,
@@ -7098,6 +7524,14 @@ function applySceneJSON(data) {
   }
   /* SHAPE_DEPTH_FLAT is a fixed const and is not restored. */
 
+  /* Standing-height multiplier.  Optional: a scene written before
+     this field existed leaves the current session's value alone,
+     so the default 2.00 (or whatever the user set) is preserved. */
+  if (typeof data.shapeStandingMult === "number") {
+    SHAPE_STANDING_HEIGHT_MULT =
+      Math.max(0.05, Math.min(10, data.shapeStandingMult));
+  }
+
   /* ---- KRA meta-options --------------------------------------- */
   /* The DOM ⇄ object mapping lives in pg_kra.py.  Older scenes
      without this field simply leave the panel's option controls
@@ -7144,6 +7578,13 @@ function applySceneJSON(data) {
     }
     if (!quadExists) continue;
 
+    /* Legacy scenes stored slope in radians over ±85°.  Anything
+       outside the new [0, 1] range is discarded; a small positive
+       value is left as-is, since it maps reasonably to the new
+       hinge parameter. */
+    let slopeVal = (typeof s.slope === "number") ? s.slope : 0;
+    if (slopeVal < 0 || slopeVal > 1) slopeVal = 0;
+
     floatSquares.push({
       id:     s.id,
       name:   (typeof s.name === "string" && s.name.length)
@@ -7156,7 +7597,7 @@ function applySceneJSON(data) {
       scaleV: (typeof s.scaleV === "number")
                 ? s.scaleV : SHAPE_DEFAULT_SCALE,
       theta:  (typeof s.theta === "number") ? s.theta : 0,
-      slope:  (typeof s.slope === "number") ? s.slope : 0,
+      slope:  slopeVal,
       visualBottom: !!s.visualBottom,
     });
   }
@@ -7379,12 +7820,12 @@ function updateStatus() {
     if (sq) {
       const dims = squareDims(sq);
       const deg  = Math.round((sq.theta || 0) * 180 / Math.PI);
-      const slp  = Math.round((sq.slope || 0) * 180 / Math.PI);
+      const slp  = (sq.slope || 0).toFixed(2);
       drag = "   \u00B7  shape #" + sq.id +
              "  W " + dims.w.toFixed(2) +
              "  H " + dims.h.toFixed(2) +
              "  \u2220 " + deg + "\u00B0" +
-             "  \u2197 " + slp + "\u00B0";
+             "  \u2197 " + slp;
     }
   } else if (state.dragPatchBody) {
     drag = "   \u00B7  moving " +

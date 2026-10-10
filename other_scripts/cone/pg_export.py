@@ -33,12 +33,8 @@ actually draws.
 
 Schema v6
 =========
-Each shape now carries a `slopeRad` / `slopeDeg` pair: the pseudo-3D
-tilt of the shape about its own reference U axis.  Positive slope
-tips the +v (apex-facing) edge of the shape into the cone's cavity;
-the flat view ignores slope so its (φ, s) footprint is unaffected.
-The cone-view screen corners reported in `cornersScreenCone` reflect
-the tilt; `cornersFlatParam` / `cornersScreenFlat` do not.
+Each shape gained a `slopeRad` / `slopeDeg` pair: a pseudo-3D tilt
+about the shape's own reference U axis.  Superseded by schema v8.
 
 Schema v7
 =========
@@ -49,6 +45,17 @@ from "longest edge" (false / unset) to "visual bottom of the scene"
 the visual-state dump matches the scene file and the KRA export's
 own inputs.  See pg_kra.py's `_shapeLabelScreenAngleDeg` and the
 VISUAL BOTTOM note in pg_panel.py.
+
+Schema v8
+=========
+The per-shape `slope` field is now a unitless hinge parameter in
+[0, 1] rather than a tilt angle in radians.  At 0 the shape lies
+flat on the patch; at 1 it has rotated a full 90 degrees about its
+near edge (the edge of the shape facing the viewer) and stands
+perpendicular to the patch plane.  The `slopeRad` / `slopeDeg`
+pair from v6 is gone — there is a single `slope` field.  The cone
+view reads it; the flat view still ignores it.  See the SLOPE
+section in pg_view_squares.py.
 """
 
 EXPORT_JS = r"""
@@ -80,7 +87,7 @@ function _worldSideLengths(pts) {
 
 function buildVisualStateExport() {
   const out = {
-    schemaVersion: 7,
+    schemaVersion: 8,
     generatedAt:   new Date().toISOString(),
 
     cone: {
@@ -173,8 +180,7 @@ function buildVisualStateExport() {
       scaleV: _round3(sq.scaleV),
       thetaRad: _round3(sq.theta || 0),
       thetaDeg: _round3((sq.theta || 0) * 180 / Math.PI),
-      slopeRad: _round3(sq.slope || 0),
-      slopeDeg: _round3((sq.slope || 0) * 180 / Math.PI),
+      slope: _round3(sq.slope || 0),
       visualBottom: !!sq.visualBottom,
     };
 

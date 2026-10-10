@@ -5,6 +5,8 @@ The scene is the complete editable state of the workspace:
 
     cone state      ax, ay, depth, halfAngle, ringCount, meridianCount
     shapeDepthCone  the cone view's SHAPE_DEPTH_CONE multiplier
+    shapeStandingMult
+                    the global hinge standing-height multiplier
     patches         id, name, phi0, phi1, s0, s1, mirror,
                     mirrorAngle, mirrorFlip
     squares         id, name, quadId, u, v, scaleU, scaleV, theta,
@@ -40,6 +42,7 @@ File shape
       "generatedAt":  "2026-...",
       "cone":         { ... },
       "shapeDepthCone": 0.5,
+      "shapeStandingMult": 2.0,
       "nextQuadId":   3,
       "nextSquareId": 5,
       "patches":      [ ... ],
@@ -74,10 +77,21 @@ the flat view's footprint.
 
 SLOPE
 =====
-The per-square `slope` field is persisted alongside `theta`.  Files
-written before slope existed simply omit it; the loader defaults a
-missing value to 0 (shape flat on its patch), so old scenes load
-unchanged.
+The per-square `slope` field is persisted alongside `theta`.  It is
+a unitless hinge parameter in [0, 1] (see the SLOPE section in
+pg_view_squares.py).  Files written before slope existed simply
+omit it; the loader defaults a missing value to 0 (shape flat on
+its patch), so old scenes load unchanged.  A value from a scene
+written under the old radians-based model — outside [0, 1] — is
+reset to 0 on load.
+
+The global `shapeStandingMult` (see STANDING HEIGHT MULTIPLIER in
+pg_view_squares.py) is also persisted here: it is a single scalar
+that controls how tall a hinged shape stands, as a multiple of its
+flat-view height.  On load it is clamped to [0.05, 10].  A scene
+written before this field existed simply leaves the current
+session's value alone, so the default 2.00 (or whatever the user
+set) is preserved.
 
 MIRROR
 ======
@@ -123,6 +137,7 @@ function buildSceneJSON() {
     },
 
     shapeDepthCone: SHAPE_DEPTH_CONE,
+    shapeStandingMult: SHAPE_STANDING_HEIGHT_MULT,
 
     nextQuadId:   nextQuadId,
     nextSquareId: nextSquareId,
@@ -238,6 +253,14 @@ function applySceneJSON(data) {
   }
   /* SHAPE_DEPTH_FLAT is a fixed const and is not restored. */
 
+  /* Standing-height multiplier.  Optional: a scene written before
+     this field existed leaves the current session's value alone,
+     so the default 2.00 (or whatever the user set) is preserved. */
+  if (typeof data.shapeStandingMult === "number") {
+    SHAPE_STANDING_HEIGHT_MULT =
+      Math.max(0.05, Math.min(10, data.shapeStandingMult));
+  }
+
   /* ---- KRA meta-options --------------------------------------- */
   /* The DOM ⇄ object mapping lives in pg_kra.py.  Older scenes
      without this field simply leave the panel's option controls
@@ -284,6 +307,13 @@ function applySceneJSON(data) {
     }
     if (!quadExists) continue;
 
+    /* Legacy scenes stored slope in radians over ±85°.  Anything
+       outside the new [0, 1] range is discarded; a small positive
+       value is left as-is, since it maps reasonably to the new
+       hinge parameter. */
+    let slopeVal = (typeof s.slope === "number") ? s.slope : 0;
+    if (slopeVal < 0 || slopeVal > 1) slopeVal = 0;
+
     floatSquares.push({
       id:     s.id,
       name:   (typeof s.name === "string" && s.name.length)
@@ -296,7 +326,7 @@ function applySceneJSON(data) {
       scaleV: (typeof s.scaleV === "number")
                 ? s.scaleV : SHAPE_DEFAULT_SCALE,
       theta:  (typeof s.theta === "number") ? s.theta : 0,
-      slope:  (typeof s.slope === "number") ? s.slope : 0,
+      slope:  slopeVal,
       visualBottom: !!s.visualBottom,
     });
   }

@@ -6,21 +6,18 @@ size, SVG anchor position, alignment, and any affine transform Krita
 has applied via Shape.setTransformation — compute the bounding box of
 every word in the string.
 
-The text board uses this to draw word-level overlays inside each card.
-The user sees not just the shape's overall rectangle, but the extent
-of each individual word, so word-level alignment and formatting
-become visible at a glance.
-
 Conventions
 -----------
-* `x` and `y` in the input are the SVG anchor point — the same
-  numbers Krita writes into the `<text x= y=>` element.
-* `alignment` is the shape's resolved text-anchor: 'left', 'center',
-  or 'right'.
-* `transform`, when given, is a QTransform (Qt row-vector convention).
-  It is applied to every word's corner; the mapped quad becomes the
-  word's `corners`, and the axis-aligned bounding box of that quad
-  becomes `x, y, w, h`.
+* `x` and `y` are the anchor point of the text baseline, in document
+  pixels.  Krita's SVG emission writes y as the baseline for left-
+  and right-aligned text, and as the vertical center for center-
+  aligned text; the caller is responsible for having resolved that
+  before calling in.
+* `font_size` is a size in document pixels, not points.  Qt's
+  QFontMetricsF interprets its input according to how the font was
+  configured, so we set the pixel size explicitly.
+* `alignment` is the resolved text-anchor: 'left', 'center', or
+  'right'.
 
 Output record
 -------------
@@ -32,17 +29,22 @@ Output record
 """
 
 from PyQt5.QtGui import QFont, QFontMetricsF
-from PyQt5.QtCore import QPointF
 
 
 def _font_metrics(font_family, font_size):
     font = QFont(font_family or "sans-serif")
-    font.setPointSizeF(float(font_size or 12))
+    # font_size arrives in document pixels, so configure the QFont in
+    # pixels.  setPointSizeF would interpret the same number as
+    # points, which is a different physical size (and on HiDPI
+    # displays an entirely different pixel size).
+    px = int(round(float(font_size or 12)))
+    if px < 1:
+        px = 1
+    font.setPixelSize(px)
     return QFontMetricsF(font)
 
 
-def word_boxes(text, font_family, font_size, x, y, alignment="left",
-               transform=None):
+def word_boxes(text, font_family, font_size, x, y, alignment="left"):
     if not text:
         return []
 
@@ -80,22 +82,12 @@ def word_boxes(text, font_family, font_size, x, y, alignment="left",
 
         corners = [[x0, top], [x1, top], [x1, bottom], [x0, bottom]]
 
-        if transform is not None:
-            mapped = []
-            for cx, cy in corners:
-                p = transform.map(QPointF(cx, cy))
-                mapped.append([p.x(), p.y()])
-            corners = mapped
-
-        xs = [c[0] for c in corners]
-        ys = [c[1] for c in corners]
-
         out.append({
             "word":    word,
-            "x":       min(xs),
-            "y":       min(ys),
-            "w":       max(xs) - min(xs),
-            "h":       max(ys) - min(ys),
+            "x":       min(c[0] for c in corners),
+            "y":       min(c[1] for c in corners),
+            "w":       max(c[0] for c in corners) - min(c[0] for c in corners),
+            "h":       max(c[1] for c in corners) - min(c[1] for c in corners),
             "corners": corners,
         })
 

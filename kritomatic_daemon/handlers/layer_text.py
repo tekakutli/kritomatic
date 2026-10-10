@@ -3,6 +3,7 @@ import math
 import re
 from krita import Krita
 from PyQt5.QtGui import QTransform
+from PyQt5.QtCore import QPointF
 from ..decorators import command
 from ..utils.refresh import refresh
 
@@ -122,6 +123,189 @@ def _collect_vector_layers(doc):
 
     walk(doc.rootNode())
     return found
+
+
+# ==========================================================================
+# Pixel-measured word boxes
+# ==========================================================================
+# Rather than predicting where a word should be from Qt font metrics,
+# read the layer's own rendered pixels and measure.  Krita's renderer is
+# the only authority on where Krita draws the glyphs, and the layer's
+# projectionPixelData() is Krita's own output.
+#
+# For each text shape:
+#   1.  Get the layer's bounds() and projectionPixelData().
+#   2.  For every inked pixel, inverse-transform its document-space
+#       center back into the shape's local frame.
+#   3.  Cluster the local x-coordinates by gaps larger than a
+#       threshold; each cluster is a word.
+#   4.  Merge the smallest-gap neighbours until the cluster count
+#       matches the number of whitespace-separated words in the text.
+#   5.  For each cluster, compute the min/max local x and y of its
+#       ink pixels.  Those are the word's local-frame rectangle.
+#   6.  Map each rectangle's four corners through the shape's
+#       transformation and report them in document space.
+#
+# Fallback: if the pixel scan yields nothing, use the shape's own
+# boundingBox() mapped through the transform, so the shape still
+# appears on the board.
+
+def _source_words(text):
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        start = i
+        while i < n and not text[i].isspace():
+            i += 1
+        out.append(text[start:i])
+    return out
+
+
+def _merge_runs(runs, target_count):
+    runs = list(runs)
+    while len(runs) > target_count and len(runs) > 1:
+        gaps = [(runs[i + 1][0] - runs[i][1], i)
+                for i in range(len(runs) - 1)]
+        gaps.sort()
+        _, idx = gaps[0]
+        runs[idx] = (runs[idx][0], runs[idx + 1][1])
+        del runs[idx + 1]
+    return runs
+
+
+def _words_from_pixels(layer, transform, text):
+    """Return a list of { word, corners: [[x,y]x4] } in document
+    space, measured from the layer's own rendered pixels."""
+    try:
+        b = layer.bounds()
+    except Exception:
+        return []
+    bx, by = int(b.x()), int(b.y())
+    bw, bh = int(b.width()), int(b.height())
+    if bw <= 0 or bh <= 0:
+        return []
+
+    try:
+        raw = layer.projectionPixelData(bx, by, bw, bh)
+    except Exception:
+        return []
+    if not raw:
+        return []
+    pixels = bytes(raw)
+    if len(pixels) < bw * bh * 4:
+        return []
+
+    t_inv, ok = transform.inverted()
+    if not ok:
+        return []
+    mi11 = t_inv.m11(); mi12 = t_inv.m12()
+    mi21 = t_inv.m21(); mi22 = t_inv.m22()
+    mi31 = t_inv.m31(); mi32 = t_inv.m32()
+
+    # Collect the local-frame position of every inked pixel.
+    ink = []
+    for yy in range(bh):
+        base = yy * bw
+        dy = by + yy + 0.5
+        for xx in range(bw):
+            if pixels[(base + xx) * 4 + 3] > 0:
+                dx = bx + xx + 0.5
+                lx = dx * mi11 + dy * mi21 + mi31
+                ly = dx * mi12 + dy * mi22 + mi32
+                ink.append((lx, ly))
+
+    if not ink:
+        return []
+
+    # Cluster by local x.
+    xs_sorted = sorted(p[0] for p in ink)
+    span = xs_sorted[-1] - xs_sorted[0]
+    threshold = max(4.0, span / 40.0)
+
+    runs = []
+    cur_start = xs_sorted[0]
+    prev = xs_sorted[0]
+    for x in xs_sorted[1:]:
+        if x - prev > threshold:
+            runs.append((cur_start, prev))
+            cur_start = x
+        prev = x
+    runs.append((cur_start, prev))
+
+    # Merge until the cluster count matches the source words.
+    words = _source_words(text)
+    target = max(1, len(words))
+    runs = _merge_runs(runs, target)
+
+    result = []
+    for k, (x0, x1) in enumerate(runs):
+        lo = x0 - 0.5
+        hi = x1 + 0.5
+        band = [p for p in ink if lo <= p[0] <= hi]
+        if not band:
+            continue
+        lxs = [p[0] for p in band]
+        lys = [p[1] for p in band]
+        wx = min(lxs)
+        wy = min(lys)
+        ww = max(lxs) - wx
+        wh = max(lys) - wy
+
+        local_corners = [
+            (wx, wy),
+            (wx + ww, wy),
+            (wx + ww, wy + wh),
+            (wx, wy + wh),
+        ]
+        doc_corners = [transform.map(QPointF(c[0], c[1]))
+                       for c in local_corners]
+        label = words[k] if k < len(words) else ""
+        result.append({
+            'word': label,
+            'corners': [[p.x(), p.y()] for p in doc_corners],
+        })
+    return result
+
+
+def _bounds_from_words(word_boxes):
+    """Axis-aligned document-space AABB that encloses every word box."""
+    xs = []
+    ys = []
+    for wb in word_boxes:
+        for c in wb['corners']:
+            xs.append(c[0])
+            ys.append(c[1])
+    if not xs:
+        return {'x': 0, 'y': 0, 'w': 0, 'h': 0}
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    return {'x': x0, 'y': y0, 'w': x1 - x0, 'h': y1 - y0}
+
+
+def _fallback_word_box(shape, transform, text):
+    """If the pixel scan yields nothing, fall back to Krita's own
+    padded bounding box mapped through the shape's transform."""
+    try:
+        b = shape.boundingBox()
+    except Exception:
+        return []
+    local_corners = [
+        (b.x(),             b.y()),
+        (b.x() + b.width(), b.y()),
+        (b.x() + b.width(), b.y() + b.height()),
+        (b.x(),             b.y() + b.height()),
+    ]
+    doc_corners = [transform.map(QPointF(c[0], c[1]))
+                   for c in local_corners]
+    return [{
+        'word': text,
+        'corners': [[p.x(), p.y()] for p in doc_corners],
+    }]
 
 
 class LayerTextHandler:
@@ -550,7 +734,7 @@ class LayerTextHandler:
 
                     total_replacements += replacements_in_layer
                     layers_modified += 1
-                    print(f"  ✓ Updated {replacements_in_layer} text(s) in layer '{layer.name()}'")
+                    print(f"  \u2713 Updated {replacements_in_layer} text(s) in layer '{layer.name()}'")
 
             refresh(doc)
 
@@ -937,20 +1121,23 @@ class LayerTextHandler:
     @command(
         category='layer',
         help_text='Return every text shape across every open document, '
-                  'with full metadata and per-word bounding boxes.',
+                  'with full metadata and per-word bounding boxes '
+                  'measured from the layer\'s own rendered pixels.',
         args={}
     )
     def dump_all_text_shapes(self, params):
         try:
             app = Krita.instance()
-            from ..utils.text_metrics import word_boxes as _word_boxes
 
             records = []
             for doc in app.documents():
                 doc_path = doc.fileName() or ''
+                if not doc_path:
+                    doc_path = ("untitled://" + doc.name()
+                                + "#" + str(id(doc)))
                 doc_name = doc.name()
-                doc_w    = doc.width()
-                doc_h    = doc.height()
+                doc_w = doc.width()
+                doc_h = doc.height()
 
                 for layer in _collect_vector_layers(doc):
                     try:
@@ -967,6 +1154,32 @@ class LayerTextHandler:
                             continue
 
                         rec = _parse_text_svg(svg)
+                        text = rec.get('text', '')
+
+                        t = None
+                        if hasattr(shape, 'transformation'):
+                            try:
+                                t = shape.transformation()
+                            except Exception:
+                                t = None
+                        if t is None:
+                            t = QTransform()
+
+                        # Measured word boxes and shape bounds, taken
+                        # from the layer's own rendered pixels.
+                        word_boxes = _words_from_pixels(layer, t, text)
+                        if not word_boxes:
+                            word_boxes = _fallback_word_box(shape, t, text)
+                        shape_bounds = _bounds_from_words(word_boxes)
+
+                        # SVG anchor, mapped to document space.
+                        ax = rec.get('x', 0)
+                        ay = rec.get('y', 0)
+                        p = t.map(QPointF(ax, ay))
+
+                        rotation_deg = math.degrees(
+                            math.atan2(t.m12(), t.m11()))
+
                         rec['document_path']   = doc_path
                         rec['document_name']   = doc_name
                         rec['document_width']  = doc_w
@@ -974,59 +1187,11 @@ class LayerTextHandler:
                         rec['layer_name']      = layer.name()
                         rec['text_index']      = i
 
-                        qtransform = None
-                        if hasattr(shape, 'transformation'):
-                            try:
-                                qtransform = shape.transformation()
-                                if qtransform is not None:
-                                    rec['rotation_deg'] = math.degrees(
-                                        math.atan2(qtransform.m12(),
-                                                   qtransform.m11()))
-                                    rec['transform'] = [
-                                        qtransform.m11(), qtransform.m12(),
-                                        qtransform.m13(),
-                                        qtransform.m21(), qtransform.m22(),
-                                        qtransform.m23(),
-                                        qtransform.m31(), qtransform.m32(),
-                                        qtransform.m33(),
-                                    ]
-                            except Exception:
-                                qtransform = None
-
-                        try:
-                            rec['word_boxes'] = _word_boxes(
-                                rec.get('text', ''),
-                                rec.get('font_family', 'sans-serif'),
-                                rec.get('font_size', 12),
-                                rec.get('x', 0),
-                                rec.get('y', 0),
-                                rec.get('alignment', 'left'),
-                                transform=qtransform,
-                            )
-                        except Exception:
-                            rec['word_boxes'] = []
-
-                        boxes = rec['word_boxes']
-                        if boxes:
-                            xs0 = min(b['x'] for b in boxes)
-                            ys0 = min(b['y'] for b in boxes)
-                            xs1 = max(b['x'] + b['w'] for b in boxes)
-                            ys1 = max(b['y'] + b['h'] for b in boxes)
-                            rec['shape_bounds'] = {
-                                'x': xs0, 'y': ys0,
-                                'w': xs1 - xs0, 'h': ys1 - ys0,
-                            }
-                        else:
-                            try:
-                                b = shape.boundingBox()
-                                rec['shape_bounds'] = {
-                                    'x': b.x(), 'y': b.y(),
-                                    'w': b.width(), 'h': b.height(),
-                                }
-                            except Exception:
-                                rec['shape_bounds'] = {
-                                    'x': 0, 'y': 0, 'w': 0, 'h': 0,
-                                }
+                        rec['x']            = p.x()
+                        rec['y']            = p.y()
+                        rec['rotation_deg'] = rotation_deg
+                        rec['shape_bounds'] = shape_bounds
+                        rec['word_boxes']   = word_boxes
 
                         records.append(rec)
 
@@ -1037,4 +1202,6 @@ class LayerTextHandler:
                 'data': {'shapes': records},
             }
         except Exception as e:
+            import traceback as _tb
+            _tb.print_exc()
             return {'success': False, 'message': str(e)}

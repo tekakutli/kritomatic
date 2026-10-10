@@ -1,31 +1,18 @@
 """
 tb_core.py — canvas, view, item model, formatting signature, wanted paths.
 
-A text item on the board is:
+Layout model
+------------
+Documents are laid out side by side in a horizontal row, ordered by a
+stable hash of the document path.  Each slot is as wide as its
+document, expressed in board units.  A shape sits at
+(slot.x + shape_bounds.x * scale, slot.y + shape_bounds.y * scale),
+where shape_bounds is the axis-aligned document-space rectangle the
+daemon reports for the shape.
 
-    {
-      id,           // document_path :: layer_name :: text_index
-      documentPath, documentName,
-      layerName, textIndex,
-      text, fontFamily, fontSize, color, alignment,
-      x, y,          // SVG anchor in document pixels
-      rotationDeg,
-      transform,     // 9-element list, or null
-      wordBoxes,     // [{ word, x, y, w, h, corners }, ...]
-      shapeBounds,   // { x, y, w, h } in document pixels
-      documentWidth, documentHeight,
-
-      bx, by,        // board-space position
-      bw, bh,        // board-space size
-      bz,            // stacking order
-
-      colorRGB,      // { r, g, b } for border / list swatch
-      formatSig,     // deterministic hash of the format parameters
-    }
-
-A wanted path is a .kra the user added to the board, open or not:
-
-    { path, name, opened }
+The card's rectangle is exactly the shape's text area — no padding,
+no rotation.  The text label is drawn as an indication on top and is
+allowed to overflow.
 """
 
 CORE_JS = r"""
@@ -64,6 +51,8 @@ const board = {
   nextZ:        1,
   showWordBoxes: true,
   wantedPaths:  [],
+  _scaleUserSet: false,
+  _autoFitDone:  false,
   palette: [
     { r: 255, g: 200, b:  90 },
     { r: 120, g: 220, b: 255 },
@@ -76,8 +65,112 @@ const board = {
   ],
 };
 
-const MIN_CARD_W = 60;
-const MIN_CARD_H = 24;
+const MIN_SHAPE_PX_W = 12;   // document pixels
+const MIN_SHAPE_PX_H = 8;    // document pixels
+
+/* ==========================================================================
+   DOCUMENT SLOTS AND BOARD SCALE
+   ========================================================================== */
+
+let _boardScale = 0.25;
+
+const _documentSlots = new Map();
+
+const DOCUMENT_GAP = 60;   // board units between adjacent slots
+
+function _slotHash(docPath) {
+  let h = 0;
+  for (let i = 0; i < docPath.length; i++) {
+    h = ((h << 5) - h + docPath.charCodeAt(i)) | 0;
+  }
+  return h >>> 0;
+}
+
+function _computeBoardScale() {
+  let widest = 0;
+  for (const s of _documentSlots.values()) {
+    if (s.docW > widest) widest = s.docW;
+  }
+  if (widest <= 0) return 0.25;
+  return board.defaultWidth / widest;
+}
+
+function _documentOrigin(docPath, docW, docH) {
+  if (!_documentSlots.has(docPath)) {
+    const myHash = _slotHash(docPath);
+    const existing = Array.from(_documentSlots.values());
+    let index = 0;
+    for (const s of existing) {
+      if (s.hash < myHash) index++;
+    }
+    for (const s of existing) {
+      if (s.index >= index) s.index++;
+    }
+    _documentSlots.set(docPath, {
+      hash:  myHash,
+      index: index,
+      docW:  docW,
+      docH:  docH,
+      name:  _pathBasename(docPath),
+    });
+  } else {
+    const slot = _documentSlots.get(docPath);
+    slot.docW = docW;
+    slot.docH = docH;
+  }
+  return _documentSlots.get(docPath);
+}
+
+function _slotRowWidth() {
+  let total = 0;
+  let count = 0;
+  for (const s of _documentSlots.values()) {
+    total += s.docW * _boardScale;
+    count++;
+  }
+  if (count > 1) total += DOCUMENT_GAP * (count - 1);
+  return total;
+}
+
+/* ==========================================================================
+   DOCUMENT HIT-TEST AND COORDINATE MAPPING
+   ========================================================================== */
+
+function documentAtBoardPoint(bx, by) {
+  const sorted = Array.from(_documentSlots.values())
+    .sort((a, b) => a.index - b.index);
+
+  const rowW = _slotRowWidth();
+  const rowLeft = -rowW / 2;
+
+  let x = rowLeft;
+  for (const s of sorted) {
+    const sx = x;
+    const sy = -(s.docH * _boardScale) / 2;
+    const sw = s.docW * _boardScale;
+    const sh = s.docH * _boardScale;
+
+    if (bx >= sx && bx <= sx + sw &&
+        by >= sy && by <= sy + sh) {
+      const dx = (bx - sx) / _boardScale;
+      const dy = (by - sy) / _boardScale;
+      return {
+        slot: s,
+        docX: dx,
+        docY: dy,
+        docW: s.docW,
+        docH: s.docH,
+      };
+    }
+
+    x += s.docW * _boardScale + DOCUMENT_GAP;
+  }
+  return null;
+}
+
+/* ==========================================================================
+   COLOR HELPERS
+   ========================================================================== */
 
 function _rgba(h, a) {
   return "rgba(" + h.r + ", " + h.g + ", " + h.b + ", " + a + ")";
@@ -133,23 +226,31 @@ function _findItemById(id) {
 }
 
 /* ==========================================================================
-   ITEM CONSTRUCTION
-   ========================================================================== */
+   CARD GEOMETRY
+   ==========================================================================
+   The card is exactly the shape's document-space AABB.  No padding is
+   applied: shape_bounds already comes from Krita's own boundingBox,
+   transformed into document space.  The text label is drawn as an
+   indication on top and is allowed to overflow the card. */
 
 function _cardSizeFor(shapeBounds) {
-  const refW = board.defaultWidth;
-  const refH = board.defaultWidth;
-  const w = Math.max(1, shapeBounds.w || 1);
-  const h = Math.max(1, shapeBounds.h || 1);
-  const scale = Math.min(refW / w, refH / h);
+  const wpx = Math.max(MIN_SHAPE_PX_W, shapeBounds.w || 1);
+  const hpx = Math.max(MIN_SHAPE_PX_H, shapeBounds.h || 1);
   return {
-    bw: Math.max(MIN_CARD_W, w * scale),
-    bh: Math.max(MIN_CARD_H, h * scale),
+    bw: wpx * _boardScale,
+    bh: hpx * _boardScale,
   };
 }
 
+/* ==========================================================================
+   ITEM CONSTRUCTION
+   ========================================================================== */
+
 function makeItemFromRecord(rec) {
-  const sb = rec.shape_bounds || { x:0, y:0, w:1, h:1 };
+  const sb  = rec.shape_bounds || { x:0, y:0, w:1, h:1 };
+  const docW = rec.document_width  || 1;
+  const docH = rec.document_height || 1;
+  const slot = _documentOrigin(rec.document_path || "", docW, docH);
   const size = _cardSizeFor(sb);
   const sig  = computeFormatSig(rec);
   return {
@@ -167,15 +268,16 @@ function makeItemFromRecord(rec) {
     x:             rec.x             || 0,
     y:             rec.y             || 0,
     rotationDeg:   rec.rotation_deg  || 0,
-    transform:     rec.transform     || null,
 
     wordBoxes:     rec.word_boxes    || [],
     shapeBounds:   sb,
-    documentWidth:  rec.document_width  || 0,
-    documentHeight: rec.document_height || 0,
+    documentWidth:  docW,
+    documentHeight: docH,
 
-    bx: 0, by: 0,
-    bw: size.bw, bh: size.bh,
+    bx: 0,
+    by: 0,
+    bw: size.bw,
+    bh: size.bh,
     bz: board.nextZ++,
 
     colorRGB:  _colorFromSig(sig),
@@ -184,12 +286,41 @@ function makeItemFromRecord(rec) {
 }
 
 /* ==========================================================================
+   REBASE
+   ========================================================================== */
+
+function _rebaseAllItems() {
+  const sorted = Array.from(_documentSlots.values())
+    .sort((a, b) => a.index - b.index);
+
+  const rowW = _slotRowWidth();
+  const rowLeft = -rowW / 2;
+
+  const slotX = new Map();
+  const slotY = new Map();
+  let x = rowLeft;
+  for (const s of sorted) {
+    slotX.set(s.index, x);
+    slotY.set(s.index, -(s.docH * _boardScale) / 2);
+    x += s.docW * _boardScale + DOCUMENT_GAP;
+  }
+
+  for (const it of board.items) {
+    const slot = _documentSlots.get(it.documentPath);
+    if (!slot) continue;
+    const sx = slotX.get(slot.index) || 0;
+    const sy = slotY.get(slot.index) || 0;
+    it.bx = sx + it.shapeBounds.x * _boardScale;
+    it.by = sy + it.shapeBounds.y * _boardScale;
+    const size = _cardSizeFor(it.shapeBounds);
+    it.bw = size.bw;
+    it.bh = size.bh;
+  }
+}
+
+/* ==========================================================================
    MERGE POLICY
-   ==========================================================================
-   Identity is the item id.  Layout (bx, by, bw, bh, bz) is preserved
-   when the item already exists; content and formatting come from the
-   fresh record.  wantedPaths are marked opened/closed based on what
-   documents show up. */
+   ========================================================================== */
 
 function mergeIncomingShapes(shapes) {
   const byId = new Map();
@@ -210,7 +341,6 @@ function mergeIncomingShapes(shapes) {
       old.x              = rec.x             || 0;
       old.y              = rec.y             || 0;
       old.rotationDeg    = rec.rotation_deg  || 0;
-      old.transform      = rec.transform     || null;
       old.wordBoxes      = rec.word_boxes    || [];
       old.shapeBounds    = rec.shape_bounds  || old.shapeBounds;
       old.documentWidth  = rec.document_width  || old.documentWidth;
@@ -220,10 +350,9 @@ function mergeIncomingShapes(shapes) {
       next.push(old);
       byId.delete(id);
     } else {
+      const dp = rec.document_path || "";
+      if (!dp || dp.indexOf("untitled://") === 0) continue;
       const it = makeItemFromRecord(rec);
-      const slot = findFreeSlot();
-      it.bx = slot.x;
-      it.by = slot.y;
       next.push(it);
     }
   }
@@ -234,16 +363,17 @@ function mergeIncomingShapes(shapes) {
   for (const it of board.items) if (it.bz > maxZ) maxZ = it.bz;
   board.nextZ = Math.max(board.nextZ, maxZ + 1);
 
+  if (!board._scaleUserSet) {
+    _boardScale = _computeBoardScale();
+  }
+
+  _rebaseAllItems();
   _markWantedPathsFromItems();
 }
 
 /* ==========================================================================
    WANTED PATHS
-   ==========================================================================
-   Paths the user has explicitly added to the board, whether or not
-   Krita has them open.  A path with no shapes is a picked-but-closed
-   file; it stays in this list so Open all and the status line can see
-   it, and turns "opened" as soon as a shape for it arrives. */
+   ========================================================================== */
 
 function _pathBasename(path) {
   if (!path) return "(untitled)";
@@ -284,18 +414,6 @@ function closedWantedPaths() {
    LAYOUT
    ========================================================================== */
 
-function findFreeSlot() {
-  const cw = window.innerWidth;
-  const ch = window.innerHeight;
-  const [cx0, cy0] = s2b(cw / 2, ch / 2);
-  const cascade = board.items.length % 12;
-  const step = 22;
-  return {
-    x: cx0 + cascade * step - board.defaultWidth / 2,
-    y: cy0 + cascade * step - board.defaultWidth / 4,
-  };
-}
-
 function arrangeGrid(columns) {
   if (board.items.length === 0) return;
   const gap = board.gridGap;
@@ -330,11 +448,53 @@ function groupByFormat() {
   arrangeGrid();
 }
 
+/* ==========================================================================
+   CONTENT BOUNDS
+   ==========================================================================
+   The union of every document rectangle and every card, in board
+   coordinates.  fitAll frames this so the user sees whole documents
+   with their cards inside, not just a cluster of cards floating in
+   space. */
+
+function _contentBounds() {
+  let minX =  Infinity, minY =  Infinity;
+  let maxX = -Infinity, maxY = -Infinity;
+  let any = false;
+
+  const sorted = Array.from(_documentSlots.values())
+    .sort((a, b) => a.index - b.index);
+  const rowW = _slotRowWidth();
+  let sx = -rowW / 2;
+  for (const s of sorted) {
+    const sy = -(s.docH * _boardScale) / 2;
+    const ex = sx + s.docW * _boardScale;
+    const ey = sy + s.docH * _boardScale;
+    minX = Math.min(minX, sx);
+    minY = Math.min(minY, sy);
+    maxX = Math.max(maxX, ex);
+    maxY = Math.max(maxY, ey);
+    any = true;
+    sx += s.docW * _boardScale + DOCUMENT_GAP;
+  }
+
+  for (const it of board.items) {
+    minX = Math.min(minX, it.bx);
+    minY = Math.min(minY, it.by);
+    maxX = Math.max(maxX, it.bx + it.bw);
+    maxY = Math.max(maxY, it.by + it.bh);
+    any = true;
+  }
+
+  if (!any) return null;
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
 function fitAll() {
   const cw = window.innerWidth;
   const ch = window.innerHeight;
+  const bounds = _contentBounds();
 
-  if (board.items.length === 0) {
+  if (!bounds) {
     view.zoom = 1;
     view.panX = cw / 2;
     view.panY = ch / 2;
@@ -342,23 +502,18 @@ function fitAll() {
     return;
   }
 
-  let minX =  Infinity, minY =  Infinity;
-  let maxX = -Infinity, maxY = -Infinity;
-  for (const it of board.items) {
-    minX = Math.min(minX, it.bx);
-    minY = Math.min(minY, it.by);
-    maxX = Math.max(maxX, it.bx + it.bw);
-    maxY = Math.max(maxY, it.by + it.bh);
-  }
-
   const pad = 60;
-  const bw = (maxX - minX) + pad * 2;
-  const bh = (maxY - minY) + pad * 2;
+  const bw = bounds.w + pad * 2;
+  const bh = bounds.h + pad * 2;
 
   const z = Math.min(cw / bw, ch / bh);
   view.zoom = Math.max(0.05, Math.min(8, z));
-  view.panX = (cw - (maxX + minX) * view.zoom) / 2;
-  view.panY = (ch - (maxY + minY) * view.zoom) / 2;
+
+  const cx = bounds.x + bounds.w / 2;
+  const cy = bounds.y + bounds.h / 2;
+  view.panX = cw / 2 - cx * view.zoom;
+  view.panY = ch / 2 - cy * view.zoom;
+
   draw();
 }
 

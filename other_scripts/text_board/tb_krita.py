@@ -3,8 +3,9 @@ tb_krita.py — JS glue for the /krita endpoints.
 
 Every caught error and every unhandled error or rejection is also
 POSTed to /log so it appears on the terminal that serves the board.
-Provides: refreshFromKrita, applySelectedChanges, activateItemDocument,
-pickFilesViaServer, openOneFileInKrita, openAllClosed.
+After the first successful refresh, if nothing has been fit yet, the
+board fits to content once; after that the user's zoom and pan are
+authoritative.
 """
 
 KRITA_JS = r"""
@@ -91,6 +92,17 @@ async function refreshFromKrita() {
   syncItemList();
   _syncEditor();
   draw();
+
+  // Auto-fit only the first time the board actually has content.
+  // An empty first refresh must not consume the auto-fit flag, or
+  // a slow daemon leaves the view parked at the wrong place for the
+  // rest of the session.
+  if (!board._autoFitDone && board.items.length > 0) {
+    board._autoFitDone = true;
+    fitAll();
+    console.log("[board] auto-fit on first non-empty refresh;",
+                "items =", board.items.length);
+  }
 }
 
 /* ==========================================================================

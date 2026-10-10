@@ -1,8 +1,9 @@
 """
 pg_panel.py — panel bindings.
 
-Five graphics sliders, five scrub-inputs (the selected patch's φ and
-s, the selected square's width, height, and slope), ten buttons
+Five graphics sliders, six scrub-inputs bound to the selected patch
+or shape (the selected patch's φ and s, the selected square's φ, s,
+W, H, and slope), a global standing-height multiplier, ten buttons
 (Save scene, Load scene, Reset, Center apex, Export visual state,
 Generate .kra, + Patch, + Clone, + Square, + Clone), two lists, a
 persistent hint block.
@@ -90,6 +91,31 @@ patch (span 0.50, halfSpan 0.25) the centre is confined to
 [0.25, 0.75] — bottom edge at the base on the low end, top edge at
 the apex on the high end.
 
+SQUARE PHI / S
+==============
+The "Square φ" and "Square s" scrub inputs show and set the
+selected shape's centre in the FLAT view's (φ, s) coordinates — the
+same axis the unfolded-cone sheet is drawn in, and the same
+numbers the status line reports for a cursor over that sheet.
+
+φ is displayed in [0, 2π) so the user reads the canonical value
+the flat sheet draws with.  The cone wraps: 0 and 2π are the same
+physical meridian, and the flat view draws every integer-2π copy of
+a shape whose patch straddles the seam.  Typing a value on the far
+side of the seam therefore moves the shape the short way around the
+cone — the write side unwraps the new φ against the shape's current
+φ before applying it, so a jump from near 2π to near 0 is a step of
+a few hundredths of a radian, not a full turn.
+
+s is the axial fraction (0 at the base ring, 1 at the apex) and is
+clamped to the horizon envelope the way every other shape-position
+drag is: a typed value that would put the shape off the sheet pins
+it to the nearest valid position, via setClonePosition's existing
+clamps.
+
+Both fields are disabled until a square is selected, and they follow
+the selection the same way Square W / H / Slope do.
+
 SQUARE W / H
 ============
 The "Square W" and "Square H" scrub inputs show the selected shape's
@@ -116,21 +142,29 @@ bounds the corner-drag resize uses.
 
 SLOPE
 =====
-The "Slope" scrub input shows the selected shape's pseudo-3D tilt
-about its own reference U axis, in degrees.  Zero leaves the shape
-flat on the patch (the historic behaviour); a positive value tips
-the +v edge — the edge that points toward the apex — into the
-cone's cavity, so the shape reads as dipping forward off the plane.
-Negative values tip the −v edge instead.
+The "Slope" scrub input shows the selected shape's hinge parameter,
+a unitless value in [0, 1].  Zero leaves the shape flat on the
+patch (the historic behaviour).  As the value rises the shape
+hinges upward about its near edge — the edge of the shape facing
+the viewer — and at 1 it has rotated a full 90 degrees out of the
+patch plane, standing perpendicular to it, with the far edge
+tipped INTO the cone's cavity.  For a shape on the front of the
+cone the projection at 1 is a rectangle on screen.
 
-The rate is 0.5° per pixel of horizontal drag; Shift snaps to 15°
-increments, matching one meridian.  The stored value is in radians
-(the model's convention); the panel converts to and from degrees at
-the field boundary.  Values are clamped to ±85°.
+The rate is 0.005 per pixel of horizontal drag, so a 100-pixel drag
+swings the hinge halfway.  Shift snaps to 0.1 — ten discrete stops
+across the [0, 1] range.  The stored value is the same unitless
+parameter the model uses; no unit conversion happens at the field
+boundary.
 
-The flat view ignores slope — its footprint is the un-tilted (φ, s)
+The flat view ignores slope — its footprint is the un-hinged (φ, s)
 projection — so editing in that band stays exact.  Only the cone
 view reads slope.  See the SLOPE section in pg_view_squares.py.
+
+The standing-height multiplier input sits to the right of Slope.
+It is global (not per-shape) and controls how tall a hinged shape
+stands, as a multiple of the shape's flat-view height.  See
+STANDING HEIGHT MULTIPLIER in pg_view_squares.py.
 
 VISUAL BOTTOM
 =============
@@ -158,7 +192,7 @@ square object as `visualBottom`.
 The flag affects only the KRA export (pg_kra.py's
 _shapeLabelScreenAngleDeg); it does not change how the shape is
 drawn on the canvas, nor its geometry.  It matters most for tall
-narrow shapes tilted so that the long edge is not the bottom edge,
+narrow shapes hinged so that the long edge is not the bottom edge,
 and for shapes rotated past 45°.
 
 The checkbox follows the selected square the same way Square W / H /
@@ -292,12 +326,18 @@ const PATCH_SNAP_PHI_NORM = 1 / 12;
 const SQUARE_SIZE_SCRUB_RATE = 0.005;
 const SQUARE_SIZE_SNAP_STEP  = 0.25;
 
-/* Slope scrub rate: 0.5° per pixel of horizontal drag, so a
-   100-px drag swings the shape 50°.  Snap step with Shift held is
-   one meridian (15°).  Values are stored in radians in the model
-   and shown in degrees in the field. */
-const SLOPE_SCRUB_RATE_DEG_PER_PX = 0.5;
-const SLOPE_SNAP_STEP_DEG         = 15;
+/* Square-position scrub rates.  φ is in flat-view radians; 0.008
+   per pixel matches the physical rate the patch-φ field uses.  s
+   is in axial-fraction units, matching the patch-s field. */
+const SQUARE_PHI_SCRUB_RATE = 0.008;
+const SQUARE_S_SCRUB_RATE   = 0.0015;
+
+/* Slope scrub rate: 0.005 parameter units per pixel of horizontal
+   drag, so a 100-px drag swings the hinge halfway.  Shift snaps to
+   0.1 — ten discrete stops across the [0, 1] range.  The stored
+   value is the unitless parameter itself; no conversion. */
+const SLOPE_SCRUB_RATE_PER_PX = 0.005;
+const SLOPE_SNAP_STEP         = 0.1;
 
 /* Mirror-angle scrub rate: 1° per pixel of horizontal drag.
    Stored in radians in the model and shown in degrees in the
@@ -469,6 +509,16 @@ const HELP_HTML = `<!DOCTYPE html>
 <div class="hint"><span class="kbd">Shift</span>+<span class="kbd">A</span>
   aligns the selected square to 45&deg;</div>
 <div class="hint"><span class="kbd">Delete</span> removes the selected square</div>
+<div class="hint"><strong>Square &phi;</strong> / <strong>Square s</strong> set
+  the selected shape's centre on the unfolded sheet.  &phi; is in radians
+  on [0, 2&pi;); the cone wraps, so typing a value on the far side of the
+  seam moves the shape the short way around</div>
+<div class="hint"><strong>Slope</strong> hinges the shape out of its patch
+  about the near edge.  0 = flat on the patch, 1 = rotated a full
+  90&deg; and standing perpendicular to it, tipped into the cone's cavity</div>
+<div class="hint">the multiplier to the right of Slope controls how tall a
+  hinged shape stands, as a multiple of its flat-view height.  Global,
+  not per-shape</div>
 <div class="hint"><strong>Visual bot.</strong> on a square makes its
   KRA text anchor and its four corner senses follow the <em>visual
   bottom of the scene</em> \u2014 the side of the square that sits
@@ -758,20 +808,26 @@ function _syncPatchCoordInputs() {
 }
 
 /* ==========================================================================
-   SQUARE-SIZE FIELDS
+   SQUARE-SIZE AND -POSITION FIELDS
    ==========================================================================
    The W / H fields show the shape's reference-unit size, which is
    independent of the patch it sits on and of the cone's depth /
-   half-angle.  The Slope field shows the shape's pseudo-3D tilt in
-   degrees.  The Visual bot. checkbox is a per-square flag that
-   changes how the KRA export reads the shape's "bottom" edge (see
-   the VISUAL BOTTOM section in the module docstring).  All four are
-   disabled until a square is selected. */
+   half-angle.  The Slope field shows the shape's hinge parameter,
+   a unitless value in [0, 1].  The φ / s fields show and set the
+   shape's centre in the flat view's coordinates.
+
+   The Visual bot. checkbox is a per-square flag that changes how
+   the KRA export reads the shape's "bottom" edge (see the VISUAL
+   BOTTOM section in the module docstring).  All of them are
+   disabled until a square is selected, except the global
+   standing-height multiplier, which is always shown. */
 
 function _syncSquareSizeInputs() {
   const wInput  = document.getElementById("squareWVal");
   const hInput  = document.getElementById("squareHVal");
   const sInput  = document.getElementById("squareSlopeVal");
+  const phiPos  = document.getElementById("squarePhiVal");
+  const sPos    = document.getElementById("squareSVal");
   const vbInput = document.getElementById("squareVisualBottom");
   if (!wInput || !hInput || !sInput) return;
 
@@ -782,6 +838,14 @@ function _syncSquareSizeInputs() {
     wInput.disabled = true;
     hInput.disabled = true;
     sInput.disabled = true;
+    if (phiPos) {
+      phiPos.disabled = true;
+      if (document.activeElement !== phiPos) phiPos.value = "\u2014";
+    }
+    if (sPos) {
+      sPos.disabled = true;
+      if (document.activeElement !== sPos) sPos.value = "\u2014";
+    }
     if (vbInput) {
       vbInput.disabled = true;
       if (document.activeElement !== vbInput) vbInput.checked = false;
@@ -795,6 +859,8 @@ function _syncSquareSizeInputs() {
   wInput.disabled = false;
   hInput.disabled = false;
   sInput.disabled = false;
+  if (phiPos) phiPos.disabled = false;
+  if (sPos)   sPos.disabled   = false;
   if (vbInput) {
     vbInput.disabled = false;
     if (document.activeElement !== vbInput) {
@@ -809,7 +875,32 @@ function _syncSquareSizeInputs() {
     hInput.value = squareWorldHeight(sq).toFixed(3);
   }
   if (document.activeElement !== sInput) {
-    sInput.value = ((sq.slope || 0) * 180 / Math.PI).toFixed(1);
+    sInput.value = (sq.slope || 0).toFixed(3);
+  }
+
+  /* φ / s follow the selected square's centre in the flat view.
+     φ is shown normalized to [0, 2π); the underlying value can be
+     any real number, but two φ that differ by a full turn are the
+     same direction and displaying the canonical one avoids the
+     field jumping by 2π while the user scrubs across the seam. */
+  const centre = squareFlatCenter(sq);
+  if (centre) {
+    if (phiPos && document.activeElement !== phiPos) {
+      let p = centre.phi;
+      p = ((p % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+      phiPos.value = p.toFixed(3);
+    }
+    if (sPos && document.activeElement !== sPos) {
+      sPos.value = centre.s.toFixed(3);
+    }
+  }
+
+  /* The global standing-height multiplier follows no selection; it
+     is always shown.  Updated here so it refreshes on the same
+     frame cycle as the slope field. */
+  const mInput = document.getElementById("shapeStandingMultVal");
+  if (mInput && document.activeElement !== mInput) {
+    mInput.value = SHAPE_STANDING_HEIGHT_MULT.toFixed(2);
   }
 }
 
@@ -1351,17 +1442,15 @@ function flashStatus(msg, cls) {
   });
 
   /* ---- slope scrub input ----------------------------------------
-     The field reads and writes the shape's pseudo-3D tilt.  The
-     model speaks radians; the field speaks degrees (see the SLOPE
-     note in the module docstring).  The rate and snap step are
-     converted from degrees to radians here so the installer's
-     radian-per-pixel contract is honoured. */
+     The field reads and writes the shape's hinge parameter — a
+     unitless value in [0, 1].  See the SLOPE note in the module
+     docstring. */
 
   const slopeInput = document.getElementById("squareSlopeVal");
 
   if (slopeInput) _installScrubInput(slopeInput, {
-    rate: SLOPE_SCRUB_RATE_DEG_PER_PX * Math.PI / 180,
-    snapStep: SLOPE_SNAP_STEP_DEG * Math.PI / 180,
+    rate: SLOPE_SCRUB_RATE_PER_PX,
+    snapStep: SLOPE_SNAP_STEP,
     read: () => {
       if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return 0;
       return floatSquares[selectedSquare].slope || 0;
@@ -1370,6 +1459,73 @@ function flashStatus(msg, cls) {
       if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return;
       const s = Math.max(SHAPE_SLOPE_MIN, Math.min(SHAPE_SLOPE_MAX, raw));
       floatSquares[selectedSquare].slope = s;
+    },
+  });
+
+  /* ---- standing-height multiplier scrub input -------------------
+     The field reads and writes the global aesthetic factor
+     SHAPE_STANDING_HEIGHT_MULT — how tall a hinged shape stands,
+     as a multiple of its flat-view height.  Applies to every shape
+     in the scene; not per-square, and not written by scene save.
+     See the STANDING HEIGHT MULTIPLIER section in
+     pg_view_squares.py. */
+  const multInput = document.getElementById("shapeStandingMultVal");
+  if (multInput) _installScrubInput(multInput, {
+    rate: 0.005,
+    snapStep: 0.1,
+    read: () => SHAPE_STANDING_HEIGHT_MULT,
+    write: (raw) => {
+      SHAPE_STANDING_HEIGHT_MULT =
+        Math.max(0.05, Math.min(10, raw));
+    },
+  });
+
+  /* ---- square-position scrub inputs -----------------------------
+     The two fields read and write the selected shape's centre in
+     the flat view's (φ, s) coordinates.  φ is displayed in
+     [0, 2π); a value outside that range, whether typed or produced
+     by scrubbing across the seam, is folded back in by the read
+     side.  The write side passes the raw value through to
+     setSquareFlatCenter, which unwraps it relative to the shape's
+     current φ so a jump across the seam moves the shape the short
+     way around the cone. */
+
+  const squarePhiInput = document.getElementById("squarePhiVal");
+  const squareSInput   = document.getElementById("squareSVal");
+
+  if (squarePhiInput) _installScrubInput(squarePhiInput, {
+    rate: SQUARE_PHI_SCRUB_RATE,
+    read: () => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return 0;
+      const c = squareFlatCenter(floatSquares[selectedSquare]);
+      if (!c) return 0;
+      let p = c.phi;
+      p = ((p % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+      return p;
+    },
+    write: (raw) => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return;
+      const sq = floatSquares[selectedSquare];
+      const c = squareFlatCenter(sq);
+      if (!c) return;
+      setSquareFlatCenter(sq, raw, c.s);
+    },
+  });
+
+  if (squareSInput) _installScrubInput(squareSInput, {
+    rate: SQUARE_S_SCRUB_RATE,
+    read: () => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return 0;
+      const c = squareFlatCenter(floatSquares[selectedSquare]);
+      if (!c) return 0;
+      return c.s;
+    },
+    write: (raw) => {
+      if (selectedSquare < 0 || selectedSquare >= floatSquares.length) return;
+      const sq = floatSquares[selectedSquare];
+      const c = squareFlatCenter(sq);
+      if (!c) return;
+      setSquareFlatCenter(sq, c.phi, raw);
     },
   });
 

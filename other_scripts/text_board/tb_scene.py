@@ -1,14 +1,16 @@
 """
 tb_scene.py — save and load the board.
 
-Only layout is persisted: board settings, view state, and the
-position / size / z of each card keyed by its item id.  Content is
-always pulled fresh from Krita on load.  Cards whose ids no longer
-match a shape in the document are dropped silently.
+Only presentation is persisted: board settings, view state, the
+current board scale, and — for reference — each item's board
+rectangle.  Content is always pulled fresh from Krita on load, and
+positions are recomputed from the documents' current shapes via
+`_rebaseAllItems`, so a saved board is a set of settings, not a
+snapshot of a layout that will go stale.
 """
 
 SCENE_JS = r"""
-const SCENE_VERSION = 1;
+const SCENE_VERSION = 2;
 const SCENE_TYPE    = "text_board_scene";
 const SCENE_FILE    = "text_board_scene.json";
 
@@ -21,6 +23,7 @@ function buildBoardScene() {
       defaultWidth:  board.defaultWidth,
       gridGap:       board.gridGap,
       showWordBoxes: board.showWordBoxes,
+      boardScale:    _boardScale,
     },
     view: {
       zoom: view.zoom,
@@ -64,6 +67,10 @@ function applyBoardScene(data) {
       board.gridGap = data.board.gridGap;
     if (typeof data.board.showWordBoxes === "boolean")
       board.showWordBoxes = data.board.showWordBoxes;
+    if (typeof data.board.boardScale === "number")
+      _boardScale = data.board.boardScale;
+    else
+      _boardScale = _boardScaleForWidth(board.defaultWidth);
   }
   if (data.view) {
     if (typeof data.view.zoom === "number") view.zoom = data.view.zoom;
@@ -71,24 +78,22 @@ function applyBoardScene(data) {
     if (typeof data.view.panY === "number") view.panY = data.view.panY;
   }
 
-  const saved = new Map();
+  // bz is preserved across a load so a user's manual stacking
+  // survives; positions are recomputed from the documents.
+  const savedBz = new Map();
   for (const s of (data.items || [])) {
-    if (s && s.id) saved.set(s.id, s);
+    if (s && s.id && typeof s.bz === "number") savedBz.set(s.id, s.bz);
   }
-
   for (const it of board.items) {
-    const s = saved.get(it.id);
-    if (!s) continue;
-    if (typeof s.bx === "number") it.bx = s.bx;
-    if (typeof s.by === "number") it.by = s.by;
-    if (typeof s.bw === "number") it.bw = s.bw;
-    if (typeof s.bh === "number") it.bh = s.bh;
-    if (typeof s.bz === "number") it.bz = s.bz;
+    const bz = savedBz.get(it.id);
+    if (typeof bz === "number") it.bz = bz;
   }
 
   let maxZ = 0;
   for (const it of board.items) if (it.bz > maxZ) maxZ = it.bz;
   board.nextZ = Math.max(board.nextZ, maxZ + 1);
+
+  _rebaseAllItems();
 
   const wb = document.getElementById("wordBoxToggle");
   if (wb) wb.checked = !!board.showWordBoxes;
@@ -107,8 +112,7 @@ async function loadBoardFromText(text) {
   try { applyBoardScene(data); }
   catch (e) { flashStatus("Load failed: " + e.message, "bad"); return false; }
 
-  // Refresh to pick up content, then re-apply the layout (ids will
-  // match because identity is doc + layer + index).
+  // Refresh to pick up content, then re-apply the settings.
   await refreshFromKrita();
   try { applyBoardScene(data); }
   catch (e) { /* already reported */ }

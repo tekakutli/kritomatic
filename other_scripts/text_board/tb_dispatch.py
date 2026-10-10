@@ -6,7 +6,15 @@ Two drag modes, mutually exclusive:
     dragCanvas   pan the view
     dragItem     move a card
 
-Clicking a card selects it; clicking empty canvas clears selection.
+Dragging a card moves it off its document position; a subsequent
+Refresh snaps it back, because `_rebaseAllItems` recomputes board
+positions from the document slot on every merge.  That is the
+intended behaviour: the document is the source of truth for layout,
+and manual drags are a scratchpad on top of it.
+
+The cursor readout is updated on every mousemove: it maps the pointer
+to a document and reports the document-space coordinates.
+
 Keyboard: R refresh, G grid, F fit, W toggle word boxes, O open all
 picked files, H toggle panel.
 """
@@ -46,17 +54,19 @@ function updateStatus() {
 
   const total   = board.items.length;
   const formats = new Set(board.items.map(it => it.formatSig)).size;
+  const docs    = _documentSlots.size;
   const closed  = closedWantedPaths().length;
 
   const parts = [
     total + " item" + (total === 1 ? "" : "s"),
     formats + " format" + (formats === 1 ? "" : "s"),
+    docs + " doc" + (docs === 1 ? "" : "s"),
     "zoom " + (view.zoom * 100).toFixed(0) + "%",
   ];
   if (closed > 0) {
     parts.push(closed + " closed file" + (closed === 1 ? "" : "s"));
   }
-  el.textContent = parts.join("  ·  ");
+  el.textContent = parts.join("  \u00b7  ");
   el.className = closed > 0 ? "warn" : "";
 }
 
@@ -111,6 +121,12 @@ window.addEventListener("mousemove", (e) => {
   state.mouse.sy = sy;
   state.mouse.inside = (sx >= 0 && sy >= 0 &&
                         sx < window.innerWidth && sy < window.innerHeight);
+
+  if (state.mouse.inside) {
+    updateCursorReadout(sx, sy);
+  } else {
+    clearCursorReadout();
+  }
 
   if (state.dragItem) {
     const di = state.dragItem;
@@ -177,7 +193,11 @@ window.addEventListener("keydown", (e) => {
   const k = e.key.toLowerCase();
   if (k === "r") { e.preventDefault(); refreshFromKrita(); }
   else if (k === "g") { e.preventDefault(); arrangeGrid(); draw(); }
-  else if (k === "f") { e.preventDefault(); fitAll(); }
+  else if (k === "f") {
+    e.preventDefault();
+    board._autoFitDone = true;
+    fitAll();
+  }
   else if (k === "o") { e.preventDefault(); openAllClosed(); }
   else if (k === "w") {
     e.preventDefault();

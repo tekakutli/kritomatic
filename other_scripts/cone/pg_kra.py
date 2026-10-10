@@ -63,7 +63,7 @@ from the panel's "Visual bot." checkbox; see pg_panel.py):
         corner senses (which corner is "top-left", etc.) follow
         that edge rather than the shape's own geometry.
 
-The choice matters most for tall, narrow shapes tilted so that the
+The choice matters most for tall, narrow shapes hinged so that the
 longest edge is not the bottom edge, and for shapes rotated past
 45°: with `visualBottom` off, the label stands on the long side; with
 it on, the label lies flat along the visually-lowest side.
@@ -170,6 +170,11 @@ function _polygonArea(pts) {
   return Math.abs(area) / 2;
 }
 
+/* Unclipped projection of the shape's corners, with the hinge
+   applied using the same standing scale as the on-screen renderer.
+   The hinge is the minimum local v of the four corners; the standing
+   scale is _shapeStandingScale, so the KRA export sees exactly the
+   hinged shape the renderer draws. */
 function _unclippedProjectedCorners(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
@@ -184,8 +189,21 @@ function _unclippedProjectedCorners(sq) {
   const phiC = _patchNormalPhi(qi);
   const slope = sq.slope || 0;
 
+  /* Hinge v: minimum local v of the four unclipped corners.
+     Matches the hinge used by squareCornersScreen and the other
+     projection callers, so the KRA export sees exactly the hinged
+     shape the on-screen renderer draws. */
+  let hingeV = Infinity;
+  for (const [u, v] of local) {
+    if (v < hingeV) hingeV = v;
+  }
+
+  const standingScale = _shapeStandingScale(
+    f, sq, qi, hingeV, effectiveConeDepth());
+
   return local.map(([u, v]) =>
-    projectShapePoint(f, qi, u, v, vC, pC, vMax, phiC, slope));
+    projectShapePoint(f, qi, u, v, vC, pC, vMax, phiC, slope, hingeV,
+                      standingScale));
 }
 
 /* ==========================================================================

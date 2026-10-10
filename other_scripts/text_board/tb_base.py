@@ -4,9 +4,8 @@ tb_base.py — palette, stylesheet, HTML head, bootstrap.
 The panel has one Krita-facing sync action (Refresh from Krita), two
 file-loading actions (+ Add files…, Open all), two layout actions
 (Arrange grid, Fit), one view reset, one grouping action, a
-reference-width slider, a word-box toggle, an item list, and a
-selected-item editor: text, font, size, color, alignment, rotation,
-and an Apply button.
+reference-width slider, a word-box toggle, an item list, a cursor
+coordinate readout, and a selected-item editor.
 """
 
 HTML_HEAD = r"""<!DOCTYPE html>
@@ -300,8 +299,22 @@ HTML_HEAD = r"""<!DOCTYPE html>
   </div>
   <div id="itemList" class="itemList"></div>
 
+  <div class="field" style="margin-top:10px;">
+    <label>Cursor</label>
+    <span id="cursorDoc" class="val" style="flex:1 1 auto;
+          text-align:left; color:#7b8794;">—</span>
+    <span id="cursorPos" class="val" style="flex:0 0 90px;
+          color:#00e5ff;">—</span>
+  </div>
+
   <hr>
 
+  <div class="row">
+    <button id="exportJsonBtn"
+            title="Download a JSON dump of every canvas object, with document, board, and screen coordinates">
+      Export canvas JSON
+    </button>
+  </div>
   <div class="row">
     <button id="saveSceneBtn">Save board</button>
     <button id="loadSceneBtn">Load board</button>

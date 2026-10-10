@@ -43,7 +43,8 @@ class LayerHandler:
                           'replace_all_text', 'extract_all_text',
                           'list_text_layers',
                           'get_layer_text_metadata',
-                          'patch_layer_text']:
+                          'patch_layer_text',
+                          'dump_all_text_shapes']:
             return self.text.execute(cmd_type, params)
 
         # Fill operations

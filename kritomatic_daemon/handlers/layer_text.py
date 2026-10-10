@@ -144,6 +144,8 @@ class LayerTextHandler:
             return self.get_layer_text_metadata(params)
         elif cmd_type == 'patch_layer_text':
             return self.patch_layer_text(params)
+        elif cmd_type == 'dump_all_text_shapes':
+            return self.dump_all_text_shapes(params)
         return {'success': False, 'message': f'Unknown text command: {cmd_type}'}
 
     # ------------------------------------------------------------------
@@ -924,6 +926,115 @@ class LayerTextHandler:
                     'text_index': text_index,
                     'applied': sorted(patch.keys()),
                 },
+            }
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    # ------------------------------------------------------------------
+    # dump_all_text_shapes
+    # ------------------------------------------------------------------
+
+    @command(
+        category='layer',
+        help_text='Return every text shape across every open document, '
+                  'with full metadata and per-word bounding boxes.',
+        args={}
+    )
+    def dump_all_text_shapes(self, params):
+        try:
+            app = Krita.instance()
+            from ..utils.text_metrics import word_boxes as _word_boxes
+
+            records = []
+            for doc in app.documents():
+                doc_path = doc.fileName() or ''
+                doc_name = doc.name()
+                doc_w    = doc.width()
+                doc_h    = doc.height()
+
+                for layer in _collect_vector_layers(doc):
+                    try:
+                        shapes = list(layer.shapes())
+                    except Exception:
+                        continue
+
+                    for i, shape in enumerate(shapes):
+                        if not _is_text_shape(shape):
+                            continue
+                        try:
+                            svg = shape.toSvg()
+                        except Exception:
+                            continue
+
+                        rec = _parse_text_svg(svg)
+                        rec['document_path']   = doc_path
+                        rec['document_name']   = doc_name
+                        rec['document_width']  = doc_w
+                        rec['document_height'] = doc_h
+                        rec['layer_name']      = layer.name()
+                        rec['text_index']      = i
+
+                        qtransform = None
+                        if hasattr(shape, 'transformation'):
+                            try:
+                                qtransform = shape.transformation()
+                                if qtransform is not None:
+                                    rec['rotation_deg'] = math.degrees(
+                                        math.atan2(qtransform.m12(),
+                                                   qtransform.m11()))
+                                    rec['transform'] = [
+                                        qtransform.m11(), qtransform.m12(),
+                                        qtransform.m13(),
+                                        qtransform.m21(), qtransform.m22(),
+                                        qtransform.m23(),
+                                        qtransform.m31(), qtransform.m32(),
+                                        qtransform.m33(),
+                                    ]
+                            except Exception:
+                                qtransform = None
+
+                        try:
+                            rec['word_boxes'] = _word_boxes(
+                                rec.get('text', ''),
+                                rec.get('font_family', 'sans-serif'),
+                                rec.get('font_size', 12),
+                                rec.get('x', 0),
+                                rec.get('y', 0),
+                                rec.get('alignment', 'left'),
+                                transform=qtransform,
+                            )
+                        except Exception:
+                            rec['word_boxes'] = []
+
+                        boxes = rec['word_boxes']
+                        if boxes:
+                            xs0 = min(b['x'] for b in boxes)
+                            ys0 = min(b['y'] for b in boxes)
+                            xs1 = max(b['x'] + b['w'] for b in boxes)
+                            ys1 = max(b['y'] + b['h'] for b in boxes)
+                            rec['shape_bounds'] = {
+                                'x': xs0, 'y': ys0,
+                                'w': xs1 - xs0, 'h': ys1 - ys0,
+                            }
+                        else:
+                            try:
+                                b = shape.boundingBox()
+                                rec['shape_bounds'] = {
+                                    'x': b.x(), 'y': b.y(),
+                                    'w': b.width(), 'h': b.height(),
+                                }
+                            except Exception:
+                                rec['shape_bounds'] = {
+                                    'x': 0, 'y': 0, 'w': 0, 'h': 0,
+                                }
+
+                        records.append(rec)
+
+            return {
+                'success': True,
+                'message': f'{len(records)} text shape(s) across '
+                           f'{len(app.documents())} document(s)',
+                'data': {'shapes': records},
             }
         except Exception as e:
             return {'success': False, 'message': str(e)}

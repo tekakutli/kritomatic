@@ -205,7 +205,8 @@ class CommandHandler:
                           'extract_all_text',
                           'list_text_layers',
                           'get_layer_text_metadata',
-                          'patch_layer_text']:
+                          'patch_layer_text',
+                          'dump_all_text_shapes']:
             return self.handlers['layer'].execute(cmd_type, command)
 
         # Palette commands

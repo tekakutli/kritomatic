@@ -1,0 +1,1759 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Text board — every text shape on a canvas</title>
+<style>
+  html, body {
+    margin:0; padding:0; height:100%; overflow:hidden;
+    background:#0a0e14; color:#dce6f2;
+    font-family:'JetBrains Mono','Fira Code','Consolas','SF Mono',monospace;
+  }
+  #ui {
+    position:absolute; top:12px; left:12px; z-index:10;
+    background:#0b1018; padding:12px 14px;
+    border:1px solid #1e2836; border-radius:3px;
+    box-shadow:0 6px 28px rgba(0,0,0,0.65);
+    font-size:11px; color:#a8b5c4;
+    user-select:none;
+    width:340px; box-sizing:border-box;
+    max-height:calc(100vh - 24px); overflow-y:auto;
+  }
+  #ui.collapsed { display:none; }
+  #ui h3 {
+    display:flex; align-items:center; gap:6px;
+    margin:0 0 10px; padding:0 0 8px;
+    border-bottom:1px solid #1e2836;
+    font-size:11px; font-weight:700;
+    letter-spacing:0.16em; text-transform:uppercase;
+    color:#dce6f2;
+  }
+  #ui .field { display:flex; align-items:center; gap:8px; margin:7px 0; }
+  #ui .field label {
+    flex:0 0 74px;
+    font-size:9px; color:#5a6774;
+    letter-spacing:0.14em; text-transform:uppercase;
+    font-weight:700;
+  }
+  #ui .field input[type=range] {
+    flex:1 1 auto; min-width:0; accent-color:#00e5ff;
+  }
+  #ui .field input[type=text],
+  #ui .field input[type=number],
+  #ui .field select {
+    flex:1 1 auto; min-width:0;
+    background:transparent; border:0;
+    border-bottom:1px solid #223040;
+    color:#00e5ff; font-family:inherit; font-size:12px;
+    font-weight:700; padding:2px 4px; margin:0;
+    outline:none;
+  }
+  #ui .field input[type=text]:focus,
+  #ui .field select:focus { border-bottom-color:#00e5ff; }
+  #ui .field input:disabled,
+  #ui .field select:disabled {
+    color:#3d4756; border-bottom-color:#1e2836;
+    cursor:not-allowed;
+  }
+  #ui textarea {
+    width:100%; box-sizing:border-box;
+    background:#0d1219; color:#00e5ff;
+    border:1px solid #223040; border-radius:2px;
+    font-family:inherit; font-size:12px;
+    padding:4px 6px; margin:2px 0 6px; outline:none;
+    resize:vertical; min-height:44px;
+  }
+  #ui textarea:focus { border-color:#00e5ff; }
+  #ui textarea:disabled { color:#3d4756; }
+  #ui .row { display:flex; gap:6px; margin:6px 0; }
+  #ui .row button { flex:1 1 auto; }
+  #ui button {
+    padding:5px 10px; cursor:pointer;
+    border:1px solid #223040; background:transparent;
+    color:#b8c4d2; border-radius:2px;
+    font-family:inherit; font-size:10px;
+    letter-spacing:0.10em; text-transform:uppercase;
+    font-weight:700;
+    transition:background 0.08s ease, border-color 0.08s ease;
+  }
+  #ui button:hover {
+    border-color:#34445a; color:#dce6f2;
+    background:rgba(220,230,242,0.03);
+  }
+  #ui button:disabled { color:#3d4756; border-color:#1e2836;
+    cursor:not-allowed; }
+  #ui button#refreshBtn {
+    border-color:rgba(0,229,255,0.72); color:#b8ecff;
+  }
+  #ui button#refreshBtn:hover {
+    border-color:rgba(140,225,255,1.0);
+    background:rgba(0,229,255,0.10); color:#d8f4ff;
+  }
+  #ui button#addFilesBtn {
+    border-color:rgba(120,220,255,0.72); color:#b8ecff;
+  }
+  #ui button#addFilesBtn:hover {
+    border-color:rgba(140,225,255,1.00);
+    background:rgba(120,220,255,0.10); color:#d8f4ff;
+  }
+  #ui button#openAllBtn {
+    border-color:rgba(255,200,90,0.72); color:#ffd89b;
+  }
+  #ui button#openAllBtn:hover {
+    border-color:rgba(255,200,90,1.00);
+    background:rgba(255,200,90,0.10); color:#ffe6b8;
+  }
+  #ui button#applyBtn {
+    border-color:rgba(140,225,160,0.72); color:#b8f0c4;
+  }
+  #ui button#applyBtn:hover {
+    border-color:rgba(140,225,160,1.0);
+    background:rgba(140,225,160,0.10); color:#d8ffe0;
+  }
+  #ui hr { border:0; border-top:1px solid #1e2836; margin:10px 0; }
+  #ui .val {
+    flex:0 0 44px; font-size:11px; color:#00e5ff;
+    text-align:right; font-weight:700;
+    font-variant-numeric:tabular-nums;
+  }
+  #status {
+    margin-top:10px; padding-top:8px;
+    border-top:1px solid #1e2836;
+    font-size:10px; color:#7b8794;
+    min-height:14px;
+    font-variant-numeric:tabular-nums;
+    overflow-wrap:anywhere; line-height:1.5;
+  }
+  #status.ok   { color:#00e5ff; }
+  #status.bad  { color:#d48590; }
+  #status.warn { color:#ffe600; }
+
+  .itemList {
+    display:flex; flex-direction:column; gap:3px;
+    margin:6px 0 0; max-height:180px; overflow-y:auto;
+  }
+  .itemList::-webkit-scrollbar { width:6px; }
+  .itemList::-webkit-scrollbar-thumb {
+    background:#1e2836; border-radius:3px;
+  }
+  .itemList .empty {
+    font-size:10px; color:#3d4756;
+    font-style:italic; padding:3px 4px;
+  }
+  .itemRow {
+    display:flex; align-items:center; gap:7px;
+    padding:3px 6px; border:1px solid #223040;
+    border-radius:2px; cursor:pointer;
+    font-size:10px; color:#a8b5c4;
+    letter-spacing:0.02em;
+  }
+  .itemRow:hover {
+    border-color:#34445a; color:#dce6f2;
+    background:rgba(220,230,242,0.03);
+  }
+  .itemRow.selected {
+    border-color:rgba(0,229,255,0.72);
+    color:#b8ecff; background:rgba(0,229,255,0.06);
+  }
+  .itemSwatch {
+    width:9px; height:9px; border-radius:1px; flex:0 0 auto;
+  }
+  .itemText {
+    flex:1 1 auto; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap;
+  }
+  .itemMeta {
+    flex:0 0 auto; font-size:9px; color:#5a6774;
+  }
+
+  canvas { display:block; touch-action:none; background:#0a0e14; }
+
+  #restoreBtn {
+    position:absolute; top:12px; left:12px; z-index:10;
+    display:none; padding:6px 12px; cursor:pointer;
+    border:1px solid #1e2836; background:#0b1018;
+    border-radius:3px; box-shadow:0 6px 28px rgba(0,0,0,0.65);
+    font-family:inherit; font-size:10px; font-weight:700;
+    letter-spacing:0.10em; text-transform:uppercase;
+    color:#a8b5c4;
+  }
+  #restoreBtn:hover { border-color:#34445a; color:#dce6f2; }
+  #restoreBtn.visible { display:block; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <h3>Text board
+    <button id="collapseBtn" title="Collapse (H)"
+      style="margin-left:auto; width:auto; padding:0 6px;
+             height:20px; font-size:11px; line-height:1;">−</button>
+  </h3>
+
+  <div class="row">
+    <button id="refreshBtn" title="Ask the daemon for every text shape (R)">
+      Refresh from Krita
+    </button>
+  </div>
+
+  <div class="row">
+    <button id="addFilesBtn"
+            title="Pick .kra files to add to the board and open in Krita">
+      + Add files…
+    </button>
+  </div>
+
+  <div class="row">
+    <button id="openAllBtn"
+            title="Open every picked file that Krita does not already have open">
+      Open all
+    </button>
+  </div>
+
+  <div class="row">
+    <button id="gridBtn" title="Rearrange cards into a grid (G)">Arrange grid</button>
+    <button id="fitBtn"  title="Fit every card in view (F)">Fit</button>
+  </div>
+
+  <div class="row">
+    <button id="resetBtn" title="Reset zoom and pan">Reset view</button>
+    <button id="groupBtn" title="Recolour and regroup cards by their formatting signature">
+      Group by format
+    </button>
+  </div>
+
+  <hr>
+
+  <div class="field">
+    <label>Card width</label>
+    <input type="range" id="cardWSlider"
+           min="120" max="720" step="10" value="320">
+    <span class="val" id="cardWVal">320</span>
+  </div>
+
+  <div class="field">
+    <label>Word boxes</label>
+    <input type="checkbox" id="wordBoxToggle" checked>
+  </div>
+
+  <hr>
+
+  <div class="field">
+    <label>Selected</label>
+    <span id="selLabel" style="font-size:10px; color:#7b8794;">—</span>
+  </div>
+
+  <textarea id="editText" disabled placeholder="select a card"
+            spellcheck="false"></textarea>
+
+  <div class="field">
+    <label>Font</label>
+    <input type="text" id="editFont" disabled autocomplete="off"
+           spellcheck="false">
+    <label style="flex:0 0 42px;">Size</label>
+    <input type="text" id="editSize" disabled autocomplete="off"
+           spellcheck="false">
+  </div>
+
+  <div class="field">
+    <label>Color</label>
+    <input type="text" id="editColor" disabled autocomplete="off"
+           spellcheck="false">
+    <label style="flex:0 0 42px;">Align</label>
+    <select id="editAlign" disabled>
+      <option value="left">left</option>
+      <option value="center">center</option>
+      <option value="right">right</option>
+    </select>
+  </div>
+
+  <div class="field">
+    <label>Rot°</label>
+    <input type="text" id="editRot" disabled autocomplete="off"
+           spellcheck="false">
+    <span style="font-size:9px; color:#3d4756;">+CW</span>
+  </div>
+
+  <div class="row">
+    <button id="applyBtn" disabled>Apply changes</button>
+  </div>
+
+  <hr>
+
+  <div class="field" style="margin-bottom:2px;">
+    <label>Items</label>
+    <span id="itemCount" style="font-size:10px; color:#5a6774;">0</span>
+    <button id="clearBtn"
+            style="flex:0 0 auto;"
+            title="Empty the board (does not touch Krita).">Clear</button>
+  </div>
+  <div id="itemList" class="itemList"></div>
+
+  <hr>
+
+  <div class="row">
+    <button id="saveSceneBtn">Save board</button>
+    <button id="loadSceneBtn">Load board</button>
+  </div>
+
+  <div id="status">ready</div>
+</div>
+
+<button id="restoreBtn" title="Show panel (H)">☰ Show panel</button>
+
+<canvas id="c"></canvas>
+<script>
+"use strict";
+
+/* ==========================================================================
+   CANVAS
+   ========================================================================== */
+
+const canvas = document.getElementById("c");
+const ctx    = canvas.getContext("2d");
+let dpr = window.devicePixelRatio || 1;
+
+/* ==========================================================================
+   VIEW
+   ========================================================================== */
+
+const view = { zoom: 1, panX: 0, panY: 0 };
+
+function b2s(bx, by) {
+  return [bx * view.zoom + view.panX,
+          by * view.zoom + view.panY];
+}
+function s2b(sx, sy) {
+  return [(sx - view.panX) / view.zoom,
+          (sy - view.panY) / view.zoom];
+}
+
+/* ==========================================================================
+   BOARD STATE
+   ========================================================================== */
+
+const board = {
+  items:        [],
+  selectedIdx:  -1,
+  gridGap:      24,
+  defaultWidth: 320,
+  nextZ:        1,
+  showWordBoxes: true,
+  wantedPaths:  [],
+  palette: [
+    { r: 255, g: 200, b:  90 },
+    { r: 120, g: 220, b: 255 },
+    { r: 255, g: 130, b: 210 },
+    { r: 140, g: 225, b: 160 },
+    { r: 180, g: 155, b: 255 },
+    { r: 255, g: 165, b: 105 },
+    { r: 110, g: 220, b: 210 },
+    { r: 220, g: 230, b: 120 },
+  ],
+};
+
+const MIN_CARD_W = 60;
+const MIN_CARD_H = 24;
+
+function _rgba(h, a) {
+  return "rgba(" + h.r + ", " + h.g + ", " + h.b + ", " + a + ")";
+}
+function _rgbaLight(h) {
+  const r = Math.round(h.r * 0.7 + 255 * 0.3);
+  const g = Math.round(h.g * 0.7 + 255 * 0.3);
+  const b = Math.round(h.b * 0.7 + 255 * 0.3);
+  return "rgb(" + r + ", " + g + ", " + b + ")";
+}
+
+/* ==========================================================================
+   FORMATTING SIGNATURE
+   ========================================================================== */
+
+function computeFormatSig(item) {
+  const s = [
+    (item.fontFamily || "").toLowerCase(),
+    String(item.fontSize || 0),
+    (item.color || "").toLowerCase(),
+    (item.alignment || ""),
+  ].join("|");
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  }
+  return String(h >>> 0);
+}
+
+function _colorFromSig(sig) {
+  let h = 0;
+  for (let i = 0; i < sig.length; i++) {
+    h = ((h << 5) - h + sig.charCodeAt(i)) | 0;
+  }
+  return board.palette[Math.abs(h) % board.palette.length];
+}
+
+/* ==========================================================================
+   ITEM IDENTITY
+   ========================================================================== */
+
+function itemId(rec) {
+  return (rec.document_path || "") + "::" +
+         (rec.layer_name    || "") + "::" +
+         String(rec.text_index || 0);
+}
+
+function _findItemById(id) {
+  for (let i = 0; i < board.items.length; i++) {
+    if (board.items[i].id === id) return i;
+  }
+  return -1;
+}
+
+/* ==========================================================================
+   ITEM CONSTRUCTION
+   ========================================================================== */
+
+function _cardSizeFor(shapeBounds) {
+  const refW = board.defaultWidth;
+  const refH = board.defaultWidth;
+  const w = Math.max(1, shapeBounds.w || 1);
+  const h = Math.max(1, shapeBounds.h || 1);
+  const scale = Math.min(refW / w, refH / h);
+  return {
+    bw: Math.max(MIN_CARD_W, w * scale),
+    bh: Math.max(MIN_CARD_H, h * scale),
+  };
+}
+
+function makeItemFromRecord(rec) {
+  const sb = rec.shape_bounds || { x:0, y:0, w:1, h:1 };
+  const size = _cardSizeFor(sb);
+  const sig  = computeFormatSig(rec);
+  return {
+    id:            itemId(rec),
+    documentPath:  rec.document_path || "",
+    documentName:  rec.document_name || "",
+    layerName:     rec.layer_name    || "",
+    textIndex:     rec.text_index    || 0,
+
+    text:          rec.text          || "",
+    fontFamily:    rec.font_family   || "sans-serif",
+    fontSize:      rec.font_size     || 12,
+    color:         rec.color         || "#000000",
+    alignment:     rec.alignment     || "left",
+    x:             rec.x             || 0,
+    y:             rec.y             || 0,
+    rotationDeg:   rec.rotation_deg  || 0,
+    transform:     rec.transform     || null,
+
+    wordBoxes:     rec.word_boxes    || [],
+    shapeBounds:   sb,
+    documentWidth:  rec.document_width  || 0,
+    documentHeight: rec.document_height || 0,
+
+    bx: 0, by: 0,
+    bw: size.bw, bh: size.bh,
+    bz: board.nextZ++,
+
+    colorRGB:  _colorFromSig(sig),
+    formatSig: sig,
+  };
+}
+
+/* ==========================================================================
+   MERGE POLICY
+   ==========================================================================
+   Identity is the item id.  Layout (bx, by, bw, bh, bz) is preserved
+   when the item already exists; content and formatting come from the
+   fresh record.  wantedPaths are marked opened/closed based on what
+   documents show up. */
+
+function mergeIncomingShapes(shapes) {
+  const byId = new Map();
+  for (const it of board.items) byId.set(it.id, it);
+
+  const next = [];
+  for (const rec of shapes) {
+    const id  = itemId(rec);
+    const old = byId.get(id);
+    if (old) {
+      old.documentPath   = rec.document_path || old.documentPath;
+      old.documentName   = rec.document_name || old.documentName;
+      old.text           = rec.text          || "";
+      old.fontFamily     = rec.font_family   || old.fontFamily;
+      old.fontSize       = rec.font_size     || old.fontSize;
+      old.color          = rec.color         || old.color;
+      old.alignment      = rec.alignment     || old.alignment;
+      old.x              = rec.x             || 0;
+      old.y              = rec.y             || 0;
+      old.rotationDeg    = rec.rotation_deg  || 0;
+      old.transform      = rec.transform     || null;
+      old.wordBoxes      = rec.word_boxes    || [];
+      old.shapeBounds    = rec.shape_bounds  || old.shapeBounds;
+      old.documentWidth  = rec.document_width  || old.documentWidth;
+      old.documentHeight = rec.document_height || old.documentHeight;
+      old.formatSig      = computeFormatSig(rec);
+      old.colorRGB       = _colorFromSig(old.formatSig);
+      next.push(old);
+      byId.delete(id);
+    } else {
+      const it = makeItemFromRecord(rec);
+      const slot = findFreeSlot();
+      it.bx = slot.x;
+      it.by = slot.y;
+      next.push(it);
+    }
+  }
+
+  board.items = next;
+
+  let maxZ = 0;
+  for (const it of board.items) if (it.bz > maxZ) maxZ = it.bz;
+  board.nextZ = Math.max(board.nextZ, maxZ + 1);
+
+  _markWantedPathsFromItems();
+}
+
+/* ==========================================================================
+   WANTED PATHS
+   ==========================================================================
+   Paths the user has explicitly added to the board, whether or not
+   Krita has them open.  A path with no shapes is a picked-but-closed
+   file; it stays in this list so Open all and the status line can see
+   it, and turns "opened" as soon as a shape for it arrives. */
+
+function _pathBasename(path) {
+  if (!path) return "(untitled)";
+  const norm = String(path).replace(/\\/g, "/");
+  const base = norm.substring(norm.lastIndexOf("/") + 1);
+  const dot  = base.lastIndexOf(".");
+  return dot > 0 ? base.substring(0, dot) : base;
+}
+
+function addWantedPath(path) {
+  if (!path) return;
+  const norm = String(path);
+  for (const p of board.wantedPaths) {
+    if (p.path === norm) return;
+  }
+  board.wantedPaths.push({
+    path:   norm,
+    name:   _pathBasename(norm),
+    opened: false,
+  });
+}
+
+function _markWantedPathsFromItems() {
+  for (const wp of board.wantedPaths) wp.opened = false;
+  for (const it of board.items) {
+    if (!it.documentPath) continue;
+    for (const wp of board.wantedPaths) {
+      if (wp.path === it.documentPath) wp.opened = true;
+    }
+  }
+}
+
+function closedWantedPaths() {
+  return board.wantedPaths.filter(wp => !wp.opened);
+}
+
+/* ==========================================================================
+   LAYOUT
+   ========================================================================== */
+
+function findFreeSlot() {
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
+  const [cx0, cy0] = s2b(cw / 2, ch / 2);
+  const cascade = board.items.length % 12;
+  const step = 22;
+  return {
+    x: cx0 + cascade * step - board.defaultWidth / 2,
+    y: cy0 + cascade * step - board.defaultWidth / 4,
+  };
+}
+
+function arrangeGrid(columns) {
+  if (board.items.length === 0) return;
+  const gap = board.gridGap;
+  if (!columns) columns = Math.max(1, Math.ceil(Math.sqrt(board.items.length)));
+
+  let curX = 0, curY = 0, rowH = 0, col = 0;
+  for (const it of board.items) {
+    if (col >= columns) {
+      curX = 0;
+      curY += rowH + gap;
+      rowH = 0;
+      col  = 0;
+    }
+    it.bx = curX;
+    it.by = curY;
+    curX += it.bw + gap;
+    rowH = Math.max(rowH, it.bh);
+    col++;
+  }
+}
+
+function groupByFormat() {
+  board.items.sort((a, b) => {
+    if (a.formatSig !== b.formatSig)
+      return a.formatSig < b.formatSig ? -1 : 1;
+    if (a.documentName !== b.documentName)
+      return a.documentName < b.documentName ? -1 : 1;
+    if (a.layerName !== b.layerName)
+      return a.layerName < b.layerName ? -1 : 1;
+    return a.textIndex - b.textIndex;
+  });
+  arrangeGrid();
+}
+
+function fitAll() {
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
+
+  if (board.items.length === 0) {
+    view.zoom = 1;
+    view.panX = cw / 2;
+    view.panY = ch / 2;
+    draw();
+    return;
+  }
+
+  let minX =  Infinity, minY =  Infinity;
+  let maxX = -Infinity, maxY = -Infinity;
+  for (const it of board.items) {
+    minX = Math.min(minX, it.bx);
+    minY = Math.min(minY, it.by);
+    maxX = Math.max(maxX, it.bx + it.bw);
+    maxY = Math.max(maxY, it.by + it.bh);
+  }
+
+  const pad = 60;
+  const bw = (maxX - minX) + pad * 2;
+  const bh = (maxY - minY) + pad * 2;
+
+  const z = Math.min(cw / bw, ch / bh);
+  view.zoom = Math.max(0.05, Math.min(8, z));
+  view.panX = (cw - (maxX + minX) * view.zoom) / 2;
+  view.panY = (ch - (maxY + minY) * view.zoom) / 2;
+  draw();
+}
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
+
+  canvas.width  = Math.round(cw * dpr);
+  canvas.height = Math.round(ch * dpr);
+  canvas.style.width  = cw + "px";
+  canvas.style.height = ch + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  draw();
+}
+window.addEventListener("resize", resize);
+
+/* ==========================================================================
+   HIT TESTING
+   ========================================================================== */
+
+function _pointInItem(it, bx, by) {
+  return bx >= it.bx && bx <= it.bx + it.bw &&
+         by >= it.by && by <= it.by + it.bh;
+}
+
+function _zSortedIndices() {
+  const idx = [];
+  for (let i = 0; i < board.items.length; i++) idx.push(i);
+  idx.sort((a, b) => (board.items[a].bz || 0) - (board.items[b].bz || 0));
+  return idx;
+}
+
+function itemHitTest(sx, sy) {
+  const order = _zSortedIndices();
+  const [bx, by] = s2b(sx, sy);
+  for (let k = order.length - 1; k >= 0; k--) {
+    const i = order[k];
+    if (_pointInItem(board.items[i], bx, by)) return i;
+  }
+  return -1;
+}
+
+function bringToTop(idx) {
+  if (idx < 0 || idx >= board.items.length) return;
+  board.items[idx].bz = board.nextZ++;
+}
+
+/* ==========================================================================
+   SELECTED ITEM
+   ========================================================================== */
+
+function selectedItem() {
+  if (board.selectedIdx < 0 ||
+      board.selectedIdx >= board.items.length) return null;
+  return board.items[board.selectedIdx];
+}
+
+/* ==========================================================================
+   BACKGROUND GRID
+   ========================================================================== */
+
+function _drawBoardGrid() {
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
+
+  let step = 64;
+  while (step * view.zoom < 16) step *= 2;
+  while (step * view.zoom > 160) step /= 2;
+
+  const startBx = Math.floor((-view.panX / view.zoom) / step) * step;
+  const startBy = Math.floor((-view.panY / view.zoom) / step) * step;
+  const endBx   = (cw - view.panX) / view.zoom + step;
+  const endBy   = (ch - view.panY) / view.zoom + step;
+
+  ctx.save();
+  ctx.fillStyle = "rgba(0, 229, 255, 0.10)";
+  for (let bx = startBx; bx < endBx; bx += step) {
+    for (let by = startBy; by < endBy; by += step) {
+      const [sx, sy] = b2s(bx, by);
+      ctx.fillRect(sx, sy, 1.1, 1.1);
+    }
+  }
+  ctx.restore();
+}
+
+/* ==========================================================================
+   CARD
+   ========================================================================== */
+
+function _roundRect(x, y, w, h, r) {
+  if (w <= 2 * r) r = Math.max(0, w / 2 - 0.01);
+  if (h <= 2 * r) r = Math.max(0, h / 2 - 0.01);
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y,     x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x,     y + h, r);
+  ctx.arcTo(x,     y + h, x,     y,     r);
+  ctx.arcTo(x,     y,     x + w, y,     r);
+  ctx.closePath();
+}
+
+function _drawItemCard(it, isSelected) {
+  const hue = it.colorRGB || board.palette[0];
+
+  const [csx, csy] = b2s(it.bx, it.by);
+  const sw = it.bw * view.zoom;
+  const sh = it.bh * view.zoom;
+  const RADIUS = 3;
+
+  // Card background.
+  ctx.save();
+  ctx.shadowColor   = "rgba(0, 0, 0, 0.55)";
+  ctx.shadowBlur    = 16;
+  ctx.shadowOffsetY = 4;
+  ctx.fillStyle     = "#0e1622";
+  ctx.beginPath();
+  _roundRect(csx, csy, sw, sh, RADIUS);
+  ctx.fill();
+  ctx.restore();
+
+  // Clip to the card so text and word boxes stay inside.
+  ctx.save();
+  ctx.beginPath();
+  _roundRect(csx, csy, sw, sh, RADIUS);
+  ctx.clip();
+
+  const sb = it.shapeBounds;
+  const scale = sb.w > 0 ? it.bw / sb.w : 1;
+
+  // Text rendering.
+  const tx = csx + (it.x - sb.x) * scale * view.zoom;
+  const ty = csy + (it.y - sb.y) * scale * view.zoom;
+  const fontPx = Math.max(4, it.fontSize * scale * view.zoom);
+
+  ctx.font = fontPx + "px " + (it.fontFamily || "sans-serif");
+  ctx.textBaseline = "alphabetic";
+  if (it.alignment === "center")      ctx.textAlign = "center";
+  else if (it.alignment === "right")  ctx.textAlign = "right";
+  else                                ctx.textAlign = "left";
+
+  // If a rotation is present, rotate the text about its anchor.
+  const rotRad = (it.rotationDeg || 0) * Math.PI / 180;
+  if (Math.abs(rotRad) > 1e-4) {
+    ctx.save();
+    ctx.translate(tx, ty);
+    ctx.rotate(rotRad);
+    ctx.fillStyle = it.color || "#dce6f2";
+    ctx.fillText(it.text || "", 0, 0);
+    ctx.restore();
+  } else {
+    ctx.fillStyle = it.color || "#dce6f2";
+    ctx.fillText(it.text || "", tx, ty);
+  }
+
+  // Per-word bounding boxes.
+  if (board.showWordBoxes && it.wordBoxes && it.wordBoxes.length) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(0, 229, 255, 0.55)";
+    ctx.lineWidth   = 1.0 / Math.max(view.zoom, 0.3);
+    for (const wb of it.wordBoxes) {
+      const corners = wb.corners;
+      if (!corners || corners.length < 4) continue;
+      ctx.beginPath();
+      for (let k = 0; k < 4; k++) {
+        const dx = csx + (corners[k][0] - sb.x) * scale * view.zoom;
+        const dy = csy + (corners[k][1] - sb.y) * scale * view.zoom;
+        if (k === 0) ctx.moveTo(dx, dy);
+        else         ctx.lineTo(dx, dy);
+      }
+      ctx.closePath();
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  ctx.restore(); // un-clip
+
+  // Border.
+  const alpha = isSelected ? 1.0 : 0.65;
+  const width = isSelected ? 2.4 : 1.4;
+  ctx.strokeStyle = _rgba(hue, alpha);
+  ctx.lineWidth   = width;
+  ctx.beginPath();
+  _roundRect(csx + 0.5, csy + 0.5, sw - 1, sh - 1, RADIUS);
+  ctx.stroke();
+
+  if (isSelected) {
+    ctx.save();
+    ctx.shadowColor = _rgba(hue, 0.85);
+    ctx.shadowBlur  = 14;
+    ctx.strokeStyle = _rgba(hue, 0.95);
+    ctx.lineWidth   = 2.0;
+    ctx.beginPath();
+    _roundRect(csx + 0.5, csy + 0.5, sw - 1, sh - 1, RADIUS);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Label under the card.
+  if (sw > 60) {
+    ctx.font = "700 11px 'JetBrains Mono', 'Fira Code', monospace";
+    ctx.textAlign    = "left";
+    ctx.textBaseline = "top";
+    const label = (it.layerName || it.documentName || "?") + " · " +
+                  (it.text || "").slice(0, 40);
+    const labelW = ctx.measureText(label).width;
+    const padX = 6;
+    const lh   = 18;
+    const lx   = csx;
+    const ly   = csy + sh + 6;
+
+    ctx.fillStyle = "rgba(10, 14, 20, 0.86)";
+    ctx.fillRect(lx, ly, labelW + 2 * padX, lh);
+    ctx.strokeStyle = _rgba(hue, 0.75);
+    ctx.lineWidth = 0.8;
+    ctx.strokeRect(lx + 0.4, ly + 0.4, labelW + 2 * padX - 0.8, lh - 0.8);
+    ctx.fillStyle = _rgba(hue, 0.95);
+    ctx.fillText(label, lx + padX, ly + 4);
+  }
+}
+
+/* ==========================================================================
+   VIEW
+   ========================================================================== */
+
+function drawBoardView() {
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
+
+  ctx.fillStyle = "#0a0e14";
+  ctx.fillRect(0, 0, cw, ch);
+
+  _drawBoardGrid();
+
+  const order = _zSortedIndices();
+  for (const i of order) {
+    _drawItemCard(board.items[i], i === board.selectedIdx);
+  }
+
+  if (board.items.length === 0) {
+    ctx.save();
+    ctx.fillStyle = "#5a6774";
+    ctx.font = "700 12px 'JetBrains Mono', monospace";
+    ctx.textAlign    = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("empty board — press R to pull every text shape from Krita",
+                 cw / 2, ch / 2);
+    ctx.restore();
+  }
+}
+
+/* ==========================================================================
+   ERROR REPORTING
+   ========================================================================== */
+
+function reportError(tag, message) {
+  try {
+    fetch("/log", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ tag: tag, message: String(message) }),
+    }).catch(() => {});
+  } catch (_) {}
+  try { console.error("[" + tag + "] " + message); } catch (_) {}
+}
+
+window.addEventListener("error", (e) => {
+  const loc = (e.filename || "") + ":" + (e.lineno || "") + ":" + (e.colno || "");
+  reportError("uncaught", (e.message || "unknown error") + " @ " + loc);
+});
+window.addEventListener("unhandledrejection", (e) => {
+  let reason = e.reason;
+  if (reason && reason.message) reason = reason.message;
+  reportError("unhandled-rejection", reason || "no reason given");
+});
+
+/* ==========================================================================
+   REFRESH
+   ========================================================================== */
+
+let _refreshInFlight = false;
+
+async function refreshFromKrita() {
+  if (_refreshInFlight) return;
+  _refreshInFlight = true;
+
+  const statusEl = document.getElementById("status");
+  if (statusEl) {
+    statusEl.textContent = "pulling every text shape from Krita…";
+    statusEl.className   = "";
+  }
+
+  let payload;
+  try {
+    const res = await fetch("/krita/dump_text", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    "{}",
+    });
+    payload = await res.json();
+  } catch (err) {
+    reportError("refresh", err.message);
+    if (statusEl) {
+      statusEl.textContent = "Request failed: " + err.message;
+      statusEl.className   = "bad";
+    }
+    _refreshInFlight = false;
+    return;
+  }
+
+  _refreshInFlight = false;
+
+  if (!payload || !payload.success) {
+    const msg = (payload && payload.message) ? payload.message : "unknown error";
+    reportError("refresh", msg);
+    if (statusEl) {
+      statusEl.textContent = "Krita: " + msg;
+      statusEl.className   = "bad";
+    }
+    return;
+  }
+
+  mergeIncomingShapes(payload.shapes || []);
+
+  if (statusEl) {
+    const n = board.items.length;
+    statusEl.textContent = "loaded " + n + " text shape" + (n === 1 ? "" : "s");
+    statusEl.className   = "ok";
+    setTimeout(updateStatus, 1600);
+  }
+
+  syncItemList();
+  _syncEditor();
+  draw();
+}
+
+/* ==========================================================================
+   APPLY CHANGES
+   ========================================================================== */
+
+async function applySelectedChanges() {
+  const it = selectedItem();
+  if (!it) {
+    flashStatus("no card selected", "warn");
+    return;
+  }
+
+  const textEl  = document.getElementById("editText");
+  const fontEl  = document.getElementById("editFont");
+  const sizeEl  = document.getElementById("editSize");
+  const colorEl = document.getElementById("editColor");
+  const alignEl = document.getElementById("editAlign");
+  const rotEl   = document.getElementById("editRot");
+
+  const patch = {};
+  const newText = textEl.value;
+  if (newText !== it.text) patch.text = newText;
+
+  const newFont = fontEl.value.trim();
+  if (newFont && newFont !== it.fontFamily) patch.font_family = newFont;
+
+  const newSizeRaw = parseFloat(sizeEl.value);
+  if (isFinite(newSizeRaw) && newSizeRaw !== it.fontSize)
+    patch.font_size = newSizeRaw;
+
+  const newColor = colorEl.value.trim();
+  if (newColor && newColor !== it.color) patch.color = newColor;
+
+  const newAlign = alignEl.value;
+  if (newAlign && newAlign !== it.alignment) patch.alignment = newAlign;
+
+  const newRotRaw = parseFloat(rotEl.value);
+  if (isFinite(newRotRaw) &&
+      Math.abs(newRotRaw - it.rotationDeg) > 0.01)
+    patch.rotation_deg = newRotRaw;
+
+  if (Object.keys(patch).length === 0) {
+    flashStatus("no changes to apply", "warn");
+    return;
+  }
+
+  const statusEl = document.getElementById("status");
+  if (statusEl) {
+    statusEl.textContent = "applying " +
+      Object.keys(patch).length + " change(s)…";
+    statusEl.className = "";
+  }
+
+  let payload;
+  try {
+    const res = await fetch("/krita/patch_text", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({
+        document_path: it.documentPath,
+        layer_name:    it.layerName,
+        text_index:    it.textIndex,
+        patch:         patch,
+      }),
+    });
+    payload = await res.json();
+  } catch (err) {
+    reportError("apply", err.message);
+    if (statusEl) {
+      statusEl.textContent = "apply request failed: " + err.message;
+      statusEl.className   = "bad";
+    }
+    return;
+  }
+
+  if (!payload || !payload.success) {
+    const msg = (payload && payload.message) ? payload.message : "unknown";
+    reportError("apply", msg);
+    if (statusEl) {
+      statusEl.textContent = "apply failed: " + msg;
+      statusEl.className   = "bad";
+    }
+    return;
+  }
+
+  flashStatus("applied " + Object.keys(patch).length + " change(s)", "ok");
+  await refreshFromKrita();
+}
+
+async function activateItemDocument(it) {
+  if (!it || !it.documentPath) return;
+  try {
+    await fetch("/krita/activate", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ name: it.documentPath }),
+    });
+  } catch (err) {
+    reportError("activate", err.message);
+  }
+}
+
+/* ==========================================================================
+   FILE PICKER
+   ========================================================================== */
+
+async function pickFilesViaServer() {
+  const statusEl = document.getElementById("status");
+  if (statusEl) {
+    statusEl.textContent = "opening file picker…";
+    statusEl.className   = "";
+  }
+  try {
+    const res = await fetch("/krita/pick_files", { method: "POST" });
+    const payload = await res.json();
+    if (!payload || !payload.success) {
+      const msg = (payload && payload.message) ? payload.message : "unknown";
+      reportError("picker", msg);
+      if (statusEl) {
+        statusEl.textContent = "picker failed: " + msg;
+        statusEl.className   = "bad";
+      }
+      return;
+    }
+    const paths = payload.paths || [];
+    if (paths.length === 0) {
+      flashStatus("no files picked", "warn");
+      return;
+    }
+    for (const p of paths) addWantedPath(p);
+    syncItemList();
+    draw();
+
+    flashStatus("added " + paths.length + " file(s); opening…", "ok");
+    await openAllClosed();
+  } catch (err) {
+    reportError("picker", err.message);
+    flashStatus("picker request failed: " + err.message, "bad");
+  }
+}
+
+/* ==========================================================================
+   OPEN
+   ========================================================================== */
+
+async function openOneFileInKrita(path) {
+  if (!path) return false;
+  try {
+    const res = await fetch("/krita/open", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ path: path, add_view: true }),
+    });
+    const payload = await res.json();
+    if (payload && payload.success) return true;
+    const msg = (payload && payload.message) ? payload.message : "unknown";
+    reportError("open", msg);
+    return false;
+  } catch (err) {
+    reportError("open", err.message);
+    return false;
+  }
+}
+
+async function openAllClosed() {
+  const closed = closedWantedPaths();
+  if (closed.length === 0) {
+    await refreshFromKrita();
+    flashStatus("everything already open", "ok");
+    return;
+  }
+
+  const statusEl = document.getElementById("status");
+  let opened = 0;
+  for (let i = 0; i < closed.length; i++) {
+    if (statusEl) {
+      statusEl.textContent =
+        "opening " + (i + 1) + " / " + closed.length + ": " + closed[i].name;
+      statusEl.className = "";
+    }
+    const ok = await openOneFileInKrita(closed[i].path);
+    if (ok) opened++;
+  }
+
+  await refreshFromKrita();
+
+  if (statusEl) {
+    statusEl.textContent = "opened " + opened + " of " + closed.length;
+    statusEl.className   = (opened === closed.length) ? "ok" : "warn";
+    setTimeout(updateStatus, 1800);
+  }
+}
+
+/* ==========================================================================
+   SLIDERS
+   ========================================================================== */
+
+function syncPanelSliders() {
+  const s = document.getElementById("cardWSlider");
+  if (s) s.value = board.defaultWidth;
+  updatePanelLabels();
+}
+
+function updatePanelLabels() {
+  const v = document.getElementById("cardWVal");
+  if (v) v.textContent = String(board.defaultWidth);
+}
+
+/* ==========================================================================
+   EDITOR
+   ========================================================================== */
+
+function _syncEditor() {
+  const it = selectedItem();
+
+  const textEl  = document.getElementById("editText");
+  const fontEl  = document.getElementById("editFont");
+  const sizeEl  = document.getElementById("editSize");
+  const colorEl = document.getElementById("editColor");
+  const alignEl = document.getElementById("editAlign");
+  const rotEl   = document.getElementById("editRot");
+  const applyEl = document.getElementById("applyBtn");
+  const selLbl  = document.getElementById("selLabel");
+
+  if (!it) {
+    if (textEl)  { textEl.value = ""; textEl.disabled = true; }
+    if (fontEl)  { fontEl.value = ""; fontEl.disabled = true; }
+    if (sizeEl)  { sizeEl.value = ""; sizeEl.disabled = true; }
+    if (colorEl) { colorEl.value = ""; colorEl.disabled = true; }
+    if (alignEl) { alignEl.value = "left"; alignEl.disabled = true; }
+    if (rotEl)   { rotEl.value = ""; rotEl.disabled = true; }
+    if (applyEl) applyEl.disabled = true;
+    if (selLbl)  selLbl.textContent = "—";
+    return;
+  }
+
+  if (textEl) {
+    textEl.disabled = false;
+    if (document.activeElement !== textEl) textEl.value = it.text || "";
+  }
+  if (fontEl) {
+    fontEl.disabled = false;
+    if (document.activeElement !== fontEl)
+      fontEl.value = it.fontFamily || "";
+  }
+  if (sizeEl) {
+    sizeEl.disabled = false;
+    if (document.activeElement !== sizeEl)
+      sizeEl.value = String(it.fontSize || "");
+  }
+  if (colorEl) {
+    colorEl.disabled = false;
+    if (document.activeElement !== colorEl)
+      colorEl.value = it.color || "";
+  }
+  if (alignEl) {
+    alignEl.disabled = false;
+    alignEl.value = it.alignment || "left";
+  }
+  if (rotEl) {
+    rotEl.disabled = false;
+    if (document.activeElement !== rotEl)
+      rotEl.value = (it.rotationDeg || 0).toFixed(2);
+  }
+  if (applyEl) applyEl.disabled = false;
+
+  if (selLbl) {
+    selLbl.textContent = (it.layerName || "?") +
+      " · idx " + it.textIndex;
+  }
+}
+
+/* ==========================================================================
+   ITEM LIST
+   ========================================================================== */
+
+function syncItemList() {
+  const list = document.getElementById("itemList");
+  const countEl = document.getElementById("itemCount");
+  if (!list) return;
+  list.innerHTML = "";
+  if (countEl) countEl.textContent = String(board.items.length);
+
+  if (board.items.length === 0) {
+    const e = document.createElement("div");
+    e.className = "empty";
+    e.textContent = "no text shapes yet — press Refresh from Krita";
+    list.appendChild(e);
+    return;
+  }
+
+  for (let i = 0; i < board.items.length; i++) {
+    const it = board.items[i];
+    const isSel = (i === board.selectedIdx);
+
+    const row = document.createElement("div");
+    row.className = "itemRow" + (isSel ? " selected" : "");
+
+    const sw = document.createElement("span");
+    sw.className = "itemSwatch";
+    const hue = it.colorRGB || board.palette[0];
+    sw.style.background = _rgba(hue, isSel ? 0.95 : 0.55);
+    sw.style.border     = "1px solid " + _rgba(hue, isSel ? 1.0 : 0.85);
+    row.appendChild(sw);
+
+    const t = document.createElement("span");
+    t.className = "itemText";
+    t.textContent = (it.text || "(empty)").slice(0, 48);
+    t.title = it.text || "";
+    row.appendChild(t);
+
+    const m = document.createElement("span");
+    m.className = "itemMeta";
+    m.textContent = it.layerName || "";
+    m.title = it.documentName + " / " + it.layerName;
+    row.appendChild(m);
+
+    row.addEventListener("click", () => {
+      board.selectedIdx = i;
+      bringToTop(i);
+      syncItemList();
+      _syncEditor();
+      draw();
+    });
+
+    row.addEventListener("dblclick", (e) => {
+      e.stopPropagation();
+      activateItemDocument(it);
+      flashStatus("activating " + (it.documentName || "document"), "ok");
+    });
+
+    list.appendChild(row);
+  }
+}
+
+/* ==========================================================================
+   STATUS
+   ========================================================================== */
+
+let _statusTimer = null;
+function flashStatus(msg, cls) {
+  const el = document.getElementById("status");
+  if (!el) return;
+  el.textContent = msg;
+  el.className = cls || "";
+  if (_statusTimer) clearTimeout(_statusTimer);
+  _statusTimer = setTimeout(() => {
+    _statusTimer = null;
+    updateStatus();
+  }, 1800);
+}
+
+/* ==========================================================================
+   BINDINGS
+   ========================================================================== */
+
+(function installPanel() {
+  const refreshBtn  = document.getElementById("refreshBtn");
+  const addFilesBtn = document.getElementById("addFilesBtn");
+  const openAllBtn  = document.getElementById("openAllBtn");
+  const gridBtn     = document.getElementById("gridBtn");
+  const fitBtn      = document.getElementById("fitBtn");
+  const resetBtn    = document.getElementById("resetBtn");
+  const groupBtn    = document.getElementById("groupBtn");
+  const clearBtn    = document.getElementById("clearBtn");
+  const saveBtn     = document.getElementById("saveSceneBtn");
+  const loadBtn     = document.getElementById("loadSceneBtn");
+  const applyBtn    = document.getElementById("applyBtn");
+  const slider      = document.getElementById("cardWSlider");
+  const wbToggle    = document.getElementById("wordBoxToggle");
+
+  if (refreshBtn)  refreshBtn.addEventListener("click", refreshFromKrita);
+  if (addFilesBtn) addFilesBtn.addEventListener("click", pickFilesViaServer);
+  if (openAllBtn)  openAllBtn.addEventListener("click", openAllClosed);
+
+  if (gridBtn) gridBtn.addEventListener("click", () => {
+    arrangeGrid();
+    draw();
+    flashStatus("arranged " + board.items.length + " card(s)", "ok");
+  });
+
+  if (fitBtn) fitBtn.addEventListener("click", fitAll);
+
+  if (resetBtn) resetBtn.addEventListener("click", () => {
+    view.zoom = 1;
+    view.panX = window.innerWidth  / 2;
+    view.panY = window.innerHeight / 2;
+    draw();
+  });
+
+  if (groupBtn) groupBtn.addEventListener("click", () => {
+    groupByFormat();
+    draw();
+    flashStatus("grouped by format", "ok");
+  });
+
+  if (clearBtn) clearBtn.addEventListener("click", () => {
+    if (board.items.length === 0) return;
+    board.items = [];
+    board.selectedIdx = -1;
+    syncItemList();
+    _syncEditor();
+    draw();
+    flashStatus("board cleared", "ok");
+  });
+
+  if (applyBtn) applyBtn.addEventListener("click", applySelectedChanges);
+
+  if (saveBtn) saveBtn.addEventListener("click", saveBoardJSON);
+  if (loadBtn) loadBtn.addEventListener("click", promptLoadBoard);
+
+  if (wbToggle) wbToggle.addEventListener("change", () => {
+    board.showWordBoxes = !!wbToggle.checked;
+    draw();
+  });
+
+  if (slider) slider.addEventListener("input", () => {
+    const v = parseInt(slider.value, 10);
+    if (!isFinite(v) || v <= 0) return;
+    const oldDefault = board.defaultWidth;
+    if (oldDefault > 0) {
+      const factor = v / oldDefault;
+      for (const it of board.items) {
+        it.bw *= factor;
+        it.bh *= factor;
+      }
+    }
+    board.defaultWidth = v;
+    updatePanelLabels();
+    draw();
+  });
+})();
+
+const SCENE_VERSION = 1;
+const SCENE_TYPE    = "text_board_scene";
+const SCENE_FILE    = "text_board_scene.json";
+
+function buildBoardScene() {
+  return {
+    sceneVersion: SCENE_VERSION,
+    type:         SCENE_TYPE,
+    generatedAt:  new Date().toISOString(),
+    board: {
+      defaultWidth:  board.defaultWidth,
+      gridGap:       board.gridGap,
+      showWordBoxes: board.showWordBoxes,
+    },
+    view: {
+      zoom: view.zoom,
+      panX: view.panX,
+      panY: view.panY,
+    },
+    items: board.items.map(it => ({
+      id: it.id,
+      bx: it.bx, by: it.by,
+      bw: it.bw, bh: it.bh,
+      bz: it.bz,
+    })),
+  };
+}
+
+function saveBoardJSON() {
+  const text = JSON.stringify(buildBoardScene(), null, 2);
+  const url  = "data:application/json;charset=utf-8," +
+               encodeURIComponent(text);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = SCENE_FILE;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  flashStatus("saved " + board.items.length + " item(s)", "ok");
+}
+
+function applyBoardScene(data) {
+  if (!data || typeof data !== "object") throw new Error("not an object");
+  if (data.type && data.type !== SCENE_TYPE)
+    throw new Error("wrong type '" + data.type + "'");
+  if (data.sceneVersion !== SCENE_VERSION)
+    throw new Error("unsupported sceneVersion " + data.sceneVersion);
+
+  if (data.board) {
+    if (typeof data.board.defaultWidth === "number")
+      board.defaultWidth = data.board.defaultWidth;
+    if (typeof data.board.gridGap === "number")
+      board.gridGap = data.board.gridGap;
+    if (typeof data.board.showWordBoxes === "boolean")
+      board.showWordBoxes = data.board.showWordBoxes;
+  }
+  if (data.view) {
+    if (typeof data.view.zoom === "number") view.zoom = data.view.zoom;
+    if (typeof data.view.panX === "number") view.panX = data.view.panX;
+    if (typeof data.view.panY === "number") view.panY = data.view.panY;
+  }
+
+  const saved = new Map();
+  for (const s of (data.items || [])) {
+    if (s && s.id) saved.set(s.id, s);
+  }
+
+  for (const it of board.items) {
+    const s = saved.get(it.id);
+    if (!s) continue;
+    if (typeof s.bx === "number") it.bx = s.bx;
+    if (typeof s.by === "number") it.by = s.by;
+    if (typeof s.bw === "number") it.bw = s.bw;
+    if (typeof s.bh === "number") it.bh = s.bh;
+    if (typeof s.bz === "number") it.bz = s.bz;
+  }
+
+  let maxZ = 0;
+  for (const it of board.items) if (it.bz > maxZ) maxZ = it.bz;
+  board.nextZ = Math.max(board.nextZ, maxZ + 1);
+
+  const wb = document.getElementById("wordBoxToggle");
+  if (wb) wb.checked = !!board.showWordBoxes;
+
+  syncPanelSliders();
+  syncItemList();
+  _syncEditor();
+  draw();
+}
+
+async function loadBoardFromText(text) {
+  let data;
+  try { data = JSON.parse(text); }
+  catch (e) { flashStatus("Load failed: not valid JSON", "bad"); return false; }
+
+  try { applyBoardScene(data); }
+  catch (e) { flashStatus("Load failed: " + e.message, "bad"); return false; }
+
+  // Refresh to pick up content, then re-apply the layout (ids will
+  // match because identity is doc + layer + index).
+  await refreshFromKrita();
+  try { applyBoardScene(data); }
+  catch (e) { /* already reported */ }
+
+  flashStatus("loaded " + board.items.length + " item(s)", "ok");
+  return true;
+}
+
+let _boardFileInput = null;
+function _installBoardFileInput() {
+  if (_boardFileInput) return _boardFileInput;
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = "application/json,.json";
+  inp.style.display = "none";
+  inp.addEventListener("change", (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      loadBoardFromText(String(reader.result || ""));
+      inp.value = "";
+    };
+    reader.onerror = () => {
+      flashStatus("Load failed: could not read file", "bad");
+      inp.value = "";
+    };
+    reader.readAsText(file);
+  });
+  document.body.appendChild(inp);
+  _boardFileInput = inp;
+  return inp;
+}
+
+function promptLoadBoard() {
+  _installBoardFileInput().click();
+}
+
+const DRAG_THRESHOLD = 3;
+
+const state = {
+  dragCanvas: null,
+  dragItem:   null,
+  mouse:      { sx: 0, sy: 0, inside: false },
+};
+
+/* ==========================================================================
+   DRAW
+   ========================================================================== */
+
+function draw() {
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  drawBoardView();
+
+  const M = 6;
+  ctx.strokeStyle = "#1e2836";
+  ctx.lineWidth = 0.8;
+  ctx.strokeRect(M + 0.5, M + 0.5, cw - 2 * M - 1, ch - 2 * M - 1);
+
+  updateStatus();
+}
+
+function updateStatus() {
+  const el = document.getElementById("status");
+  if (!el) return;
+  if (_statusTimer) return;
+
+  const total   = board.items.length;
+  const formats = new Set(board.items.map(it => it.formatSig)).size;
+  const closed  = closedWantedPaths().length;
+
+  const parts = [
+    total + " item" + (total === 1 ? "" : "s"),
+    formats + " format" + (formats === 1 ? "" : "s"),
+    "zoom " + (view.zoom * 100).toFixed(0) + "%",
+  ];
+  if (closed > 0) {
+    parts.push(closed + " closed file" + (closed === 1 ? "" : "s"));
+  }
+  el.textContent = parts.join("  ·  ");
+  el.className = closed > 0 ? "warn" : "";
+}
+
+/* ==========================================================================
+   EVENTS
+   ========================================================================== */
+
+canvas.addEventListener("mousedown", (e) => {
+  if (e.button !== 0) return;
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+
+  const hit = itemHitTest(sx, sy);
+  if (hit >= 0) {
+    board.selectedIdx = hit;
+    bringToTop(hit);
+    const it = board.items[hit];
+    state.dragItem = {
+      idx:       hit,
+      startSx:   sx,
+      startSy:   sy,
+      startBx:   it.bx,
+      startBy:   it.by,
+      moved:     false,
+    };
+    canvas.style.cursor = "grabbing";
+    syncItemList();
+    _syncEditor();
+    draw();
+    return;
+  }
+
+  board.selectedIdx = -1;
+  state.dragCanvas = {
+    startSx:   sx,
+    startSy:   sy,
+    startPanX: view.panX,
+    startPanY: view.panY,
+  };
+  canvas.style.cursor = "grabbing";
+  syncItemList();
+  _syncEditor();
+  draw();
+});
+
+window.addEventListener("mousemove", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+  state.mouse.sx = sx;
+  state.mouse.sy = sy;
+  state.mouse.inside = (sx >= 0 && sy >= 0 &&
+                        sx < window.innerWidth && sy < window.innerHeight);
+
+  if (state.dragItem) {
+    const di = state.dragItem;
+    const dx = sx - di.startSx;
+    const dy = sy - di.startSy;
+    if (!di.moved && Math.hypot(dx, dy) > DRAG_THRESHOLD) di.moved = true;
+    if (di.moved) {
+      const it = board.items[di.idx];
+      it.bx = di.startBx + dx / view.zoom;
+      it.by = di.startBy + dy / view.zoom;
+    }
+  } else if (state.dragCanvas) {
+    const dc = state.dragCanvas;
+    view.panX = dc.startPanX + (sx - dc.startSx);
+    view.panY = dc.startPanY + (sy - dc.startSy);
+  } else {
+    if (itemHitTest(sx, sy) >= 0) canvas.style.cursor = "grab";
+    else                          canvas.style.cursor = "default";
+  }
+
+  draw();
+});
+
+window.addEventListener("mouseup", () => {
+  state.dragItem   = null;
+  state.dragCanvas = null;
+  canvas.style.cursor = "default";
+  draw();
+});
+
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  const [bx, by] = s2b(mx, my);
+
+  const factor = e.deltaY < 0 ? 1.10 : 1 / 1.10;
+  view.zoom = Math.max(0.05, Math.min(8, view.zoom * factor));
+
+  view.panX = mx - bx * view.zoom;
+  view.panY = my - by * view.zoom;
+  draw();
+}, { passive: false });
+
+canvas.addEventListener("dblclick", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+  const hit = itemHitTest(sx, sy);
+  if (hit >= 0) {
+    const it = board.items[hit];
+    activateItemDocument(it);
+    flashStatus("activating " + (it.documentName || "document"), "ok");
+  }
+});
+
+window.addEventListener("keydown", (e) => {
+  const t = e.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" ||
+            t.tagName === "SELECT")) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+  const k = e.key.toLowerCase();
+  if (k === "r") { e.preventDefault(); refreshFromKrita(); }
+  else if (k === "g") { e.preventDefault(); arrangeGrid(); draw(); }
+  else if (k === "f") { e.preventDefault(); fitAll(); }
+  else if (k === "o") { e.preventDefault(); openAllClosed(); }
+  else if (k === "w") {
+    e.preventDefault();
+    board.showWordBoxes = !board.showWordBoxes;
+    const cb = document.getElementById("wordBoxToggle");
+    if (cb) cb.checked = board.showWordBoxes;
+    draw();
+  }
+});
+
+canvas.style.cursor = "default";
+
+(function installShellControls() {
+  const ui          = document.getElementById("ui");
+  const restoreBtn  = document.getElementById("restoreBtn");
+  const collapseBtn = document.getElementById("collapseBtn");
+
+  const collapse = () => {
+    ui.classList.add("collapsed");
+    restoreBtn.classList.add("visible");
+  };
+  const restore = () => {
+    ui.classList.remove("collapsed");
+    restoreBtn.classList.remove("visible");
+  };
+
+  collapseBtn.addEventListener("click", collapse);
+  restoreBtn.addEventListener("click", restore);
+
+  window.addEventListener("keydown", (e) => {
+    const t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" ||
+              t.tagName === "SELECT")) return;
+    if (e.key === "h" || e.key === "H") {
+      if (ui.classList.contains("collapsed")) restore();
+      else                                     collapse();
+    }
+  });
+})();
+
+syncPanelSliders();
+syncItemList();
+_syncEditor();
+resize();
+
+refreshFromKrita();
+</script>
+</body>
+</html>

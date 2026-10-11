@@ -3,9 +3,9 @@ import random
 import string
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from PyQt5.QtWidgets import QApplication
-from PyQt5.QtGui import QImage
-from PyQt5.QtCore import Qt, QThread
+from PyQt6.QtWidgets import QApplication
+from PyQt6.QtGui import QImage
+from PyQt6.QtCore import Qt, QThread
 from krita import Krita
 from ..utils.refresh import refresh
 from ..decorators import command, AutoDispatchHandler
@@ -155,26 +155,26 @@ class LayerFileHandler(AutoDispatchHandler):
             if width or height:
                 tw = int(width) if width else img.width()
                 th = int(height) if height else img.height()
-                img = img.scaled(tw, th, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+                img = img.scaled(tw, th, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
 
-            img = img.convertToFormat(QImage.Format_ARGB32)
+            img = img.convertToFormat(QImage.Format.Format_ARGB32)
             iw = img.width()
             ih = img.height()
 
             B_W = doc.width()
             B_H = doc.height()
 
-            full = QImage(B_W, B_H, QImage.Format_ARGB32)
+            full = QImage(B_W, B_H, QImage.Format.Format_ARGB32)
             full.fill(0)
-            from PyQt5.QtGui import QPainter
+            from PyQt6.QtGui import QPainter
             painter = QPainter(full)
             painter.drawImage(x, y, img)
             painter.end()
-            full = full.convertToFormat(QImage.Format_ARGB32)
+            full = full.convertToFormat(QImage.Format.Format_ARGB32)
             fw = full.width()
             fh = full.height()
             ptr = full.constBits()
-            ptr.setsize(full.byteCount())
+            ptr.setsize(full.sizeInBytes())
             raw = bytes(ptr)
 
             layer = doc.createNode(name, "paintlayer")
@@ -394,8 +394,8 @@ class LayerFileHandler(AutoDispatchHandler):
         bounds and discarded.
         """
         import math
-        from PyQt5.QtGui import QPainter, QTransform as QTx
-        from PyQt5.QtCore import QPointF
+        from PyQt6.QtGui import QPainter, QTransform as QTx
+        from PyQt6.QtCore import QPointF
 
         try:
             app = Krita.instance()
@@ -486,8 +486,8 @@ class LayerFileHandler(AutoDispatchHandler):
                       f"scaling to {A_W}x{A_H}", flush=True)
                 src_img = src_img.scaled(
                     A_W, A_H,
-                    Qt.IgnoreAspectRatio,
-                    Qt.SmoothTransformation,
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
                 )
                 if src_img.isNull():
                     return {'success': False,
@@ -526,19 +526,19 @@ class LayerFileHandler(AutoDispatchHandler):
             # The transform places src_img pixel (px, py) at target
             # pixel T.map((px, py)); painter clipping handles the
             # parts that land outside the canvas.
-            full = QImage(B_W, B_H, QImage.Format_ARGB32)
+            full = QImage(B_W, B_H, QImage.Format.Format_ARGB32)
             full.fill(0)
             painter = QPainter(full)
-            painter.setRenderHint(QPainter.SmoothPixmapTransform)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             painter.setTransform(T)
             painter.drawImage(0, 0, src_img)
             painter.end()
 
-            full = full.convertToFormat(QImage.Format_ARGB32)
+            full = full.convertToFormat(QImage.Format.Format_ARGB32)
             fw = full.width()
             fh = full.height()
             ptr = full.constBits()
-            ptr.setsize(full.byteCount())
+            ptr.setsize(full.sizeInBytes())
             raw = bytes(ptr)
             if not raw:
                 return {'success': False,

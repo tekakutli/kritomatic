@@ -3,8 +3,8 @@ import json
 import math
 import re
 from krita import Krita
-from PyQt5.QtGui import QTransform
-from PyQt5.QtCore import QPointF
+from PyQt6.QtGui import QTransform
+from PyQt6.QtCore import QPointF
 from ..decorators import command, AutoDispatchHandler
 from ..utils.refresh import refresh
 

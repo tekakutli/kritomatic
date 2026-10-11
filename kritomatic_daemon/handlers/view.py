@@ -1,5 +1,5 @@
 from krita import Krita
-from PyQt5.QtCore import QPointF
+from PyQt6.QtCore import QPointF
 from ..decorators import command, AutoDispatchHandler
 
 

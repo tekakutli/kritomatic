@@ -4,7 +4,7 @@ from ..decorators import command, AutoDispatchHandler
 import os
 import zipfile
 import tempfile
-from PyQt5.QtCore import QStandardPaths
+from PyQt6.QtCore import QStandardPaths
 
 
 class PaletteHandler(AutoDispatchHandler):
@@ -64,7 +64,7 @@ class PaletteHandler(AutoDispatchHandler):
                 if n.lower() == name.lower():
                     return {'success': False, 'message': f'Palette "{name}" already exists'}
 
-            resource_dir = QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation)
+            resource_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)
             palettes_dir = os.path.join(resource_dir, 'palettes')
             if not os.path.exists(palettes_dir):
                 os.makedirs(palettes_dir)

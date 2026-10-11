@@ -1,7 +1,7 @@
 import os
 import base64
 from krita import *
-from PyQt5.QtCore import QBuffer, QByteArray, QIODevice, Qt
+from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, Qt
 from ..decorators import command, AutoDispatchHandler
 from ..utils.refresh import refresh
 from ..utils.krita_actions import find_rotate_action
@@ -51,7 +51,7 @@ class DocumentHandler(AutoDispatchHandler):
             return None
         buf = QByteArray()
         buffer = QBuffer(buf)
-        buffer.open(QIODevice.WriteOnly)
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
         ok = img.save(buffer, "PNG")
         buffer.close()
         if not ok:
@@ -91,8 +91,8 @@ class DocumentHandler(AutoDispatchHandler):
                 and not qimg.isNull()):
             if qimg.width() > max_size or qimg.height() > max_size:
                 qimg = qimg.scaled(max_size, max_size,
-                                   Qt.KeepAspectRatio,
-                                   Qt.SmoothTransformation)
+                                   Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
             return qimg
 
         return doc.thumbnail(max_size, max_size)

@@ -28,7 +28,7 @@ Output record
     }
 """
 
-from PyQt5.QtGui import QFont, QFontMetricsF
+from PyQt6.QtGui import QFont, QFontMetricsF
 
 
 def _font_metrics(font_family, font_size):

@@ -1,7 +1,7 @@
 from krita import Krita
-from PyQt5.QtWidgets import QWidget, QStackedWidget, QLabel, QComboBox, QLineEdit, QPushButton, QCheckBox, QSpinBox, QDoubleSpinBox
-from PyQt5.QtCore import QPoint, Qt
-from PyQt5.QtGui import QMouseEvent
+from PyQt6.QtWidgets import QWidget, QStackedWidget, QLabel, QComboBox, QLineEdit, QPushButton, QCheckBox, QSpinBox, QDoubleSpinBox
+from PyQt6.QtCore import QPoint, QPointF, QEvent, Qt
+from PyQt6.QtGui import QMouseEvent
 from ..decorators import command, AutoDispatchHandler
 import json
 import os
@@ -105,11 +105,11 @@ class DiffusionHandler(AutoDispatchHandler):
             click_x = 5  # Left side to turn off
 
         click_y = geometry.height() // 2
-        click_pos = QPoint(click_x, click_y)
+        click_pos = QPointF(click_x, click_y)
 
         # Simulate mouse click
-        press_event = QMouseEvent(QMouseEvent.MouseButtonPress, click_pos, Qt.LeftButton, Qt.LeftButton, Qt.NoModifier)
-        release_event = QMouseEvent(QMouseEvent.MouseButtonRelease, click_pos, Qt.LeftButton, Qt.LeftButton, Qt.NoModifier)
+        press_event = QMouseEvent(QEvent.Type.MouseButtonPress, click_pos, Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        release_event = QMouseEvent(QEvent.Type.MouseButtonRelease, click_pos, Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
 
         switch.mousePressEvent(press_event)
         switch.mouseReleaseEvent(release_event)

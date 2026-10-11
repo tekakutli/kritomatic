@@ -178,7 +178,7 @@ other_scripts/room/leader_optimizer/target/
 # Other (second project)
 playgrounds/board/board_drops/
 *.html
-
+*.bak
 
 *.pdf
 *.svg

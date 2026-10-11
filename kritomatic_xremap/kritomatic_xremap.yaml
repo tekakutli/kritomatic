@@ -13,6 +13,12 @@ keymap:
         launch: ["python", "__VIEWER_TOGGLE_DEFAULT_SCRIPT__"]
       l:
         launch: ["kritomatic", "window", "toggle_detached"]
+      # KEY:
+      #   launch: ["bash", "__KRITOMATIC_WINDOW_FOCUS_DOCKER_NAME_PALETTEDOCKER_SCRIPT__"]
+      # KEY:
+      #   launch: ["bash", "__KRITOMATIC_WINDOW_FOCUS_DOCKER_NAME_KISLAYERBOX_SCRIPT__"]
+      # KEY:
+      #   launch: ["bash", "__KRITOMATIC_WINDOW_FOCUS_DOCKER_NAME_COLORSELECTORNG_SCRIPT__"]
 
   # BLOCK 2: Krita-Specific Keybindings
   - name: Krita Custom Scripts

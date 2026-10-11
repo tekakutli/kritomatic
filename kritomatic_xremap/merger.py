@@ -23,6 +23,9 @@ SCRIPTS = {
     "__CLIPBOARD2CROPPED_SCRIPT__": "clipboard2cropped.py",
     "__UTIL_CALL_BASH_FUNCTION_SCRIPT__": "util_call_bash_function.py",
     "__VIEWER_TOGGLE_DEFAULT_SCRIPT__": "viewer_toggle_default.py",
+    "__KRITOMATIC_WINDOW_FOCUS_DOCKER_NAME_KISLAYERBOX_SCRIPT__": "bash_commands/kritomatic_window_focus_docker_name_KisLayerBox.sh",
+    "__KRITOMATIC_WINDOW_FOCUS_DOCKER_NAME_COLORSELECTORNG_SCRIPT__": "bash_commands/kritomatic_window_focus_docker_name_ColorSelectorNg.sh",
+    "__KRITOMATIC_WINDOW_FOCUS_DOCKER_NAME_PALETTEDOCKER_SCRIPT__": "bash_commands/kritomatic_window_focus_docker_name_PaletteDocker.sh",
 }
 
 

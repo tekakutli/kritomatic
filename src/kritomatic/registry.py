@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional, List
 from functools import lru_cache
 
 from kritomatic.helpful_argparse import HelpfulArgumentParser
+from kritomatic.playground_launcher import PLAYGROUNDS
 
 
 def _escape_help_for_argparse(text):
@@ -165,6 +166,7 @@ class CommandRegistry:
                    '  kritomatic batch validate \'{"commands": [...]}\'\n'
                    '  kritomatic text dump --output labels.json\n'
                    '  kritomatic text load --input labels.json\n'
+                   '  kritomatic playgrounds board\n'
                    '  kritomatic --refresh\n'
                    '  kritomatic export-manual'
         )
@@ -241,6 +243,26 @@ class CommandRegistry:
             '--input', '-i', default=None,
             help='Read JSON from this file (default: stdin)'
         )
+
+        # Interactive playgrounds.  Launch is client-side (see
+        # main.py and playground_launcher.py); the parser entry exists
+        # so `kritomatic --help` lists them and `kritomatic
+        # playgrounds` alone prints its own subcommand menu.
+        #
+        # The playground list is imported from playground_launcher so
+        # adding a playground is a one-file edit: append to PLAYGROUNDS
+        # there and both this parser and the launcher pick it up.
+        playgrounds_parser = subparsers.add_parser(
+            'playgrounds',
+            help='Launch an interactive browser-based playground '
+                 'that drives Krita through the daemon'
+        )
+        playgrounds_sub = playgrounds_parser.add_subparsers(
+            dest='playground', metavar='PLAYGROUND',
+            required=True, help='Playgrounds'
+        )
+        for pg in PLAYGROUNDS:
+            playgrounds_sub.add_parser(pg['name'], help=pg['help'])
 
         # Batch commands
         batch_parser = subparsers.add_parser('batch', help='Batch operations')

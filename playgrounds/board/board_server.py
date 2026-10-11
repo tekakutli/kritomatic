@@ -5,6 +5,7 @@ board_server.py — threaded HTTP server.
     POST /krita/open          { path, add_view }
     POST /krita/activate      { name }
     POST /krita/pick_files    {}
+    POST /krita/drop_file     raw body, filename in X-Filename header
     POST /krita/paste_regions { regions: [...] }
     POST /log                 { tag, message }
 
@@ -20,6 +21,7 @@ import threading
 import traceback
 import webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote
 
 import board_krita
 
@@ -107,6 +109,23 @@ def serve(port=8770, open_browser=True, html_file="board_playground.html"):
                         _log(f"pick_files FAILED: {result.get('message')}")
                     else:
                         _log(f"pick_files ok: {len(result.get('paths', []))} path(s)")
+                    self._serve_json(200, result)
+                    return
+
+                if self.path == "/krita/drop_file":
+                    # Browser drops: the File API does not expose a
+                    # real path, so the browser streams the bytes and
+                    # puts the filename in X-Filename (URL-encoded).
+                    raw_name = self.headers.get("X-Filename", "")
+                    name = unquote(raw_name) if raw_name else "dropped_file"
+                    length = int(self.headers.get("Content-Length", "0"))
+                    data   = self.rfile.read(length) if length else b""
+                    _log(f"drop_file: name={name!r} size={len(data)}")
+                    result = board_krita.save_dropped_file(name, data)
+                    if not result.get("success"):
+                        _log(f"drop_file FAILED: {result.get('message')}")
+                    else:
+                        _log(f"drop_file ok: {result.get('path')}")
                     self._serve_json(200, result)
                     return
 

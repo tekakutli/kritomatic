@@ -243,6 +243,67 @@ def paste_transforms(transforms):
     }
 
 
+_DROP_DIR = None
+
+
+def _drop_dir():
+    """Return the directory that dropped files are saved into,
+    creating it on first use.  It lives beside this module so it
+    survives restarts and is easy to find from a file manager."""
+    global _DROP_DIR
+    if _DROP_DIR is None:
+        here = Path(__file__).resolve().parent
+        d = here / "board_drops"
+        d.mkdir(parents=True, exist_ok=True)
+        _DROP_DIR = d
+    return _DROP_DIR
+
+
+def save_dropped_file(name, data_bytes):
+    """Persist a file the browser received from a drop event.
+
+    The browser's File API deliberately hides the source path, so
+    when the board is served by a browser the only way to honour a
+    filesystem drop is to receive the bytes and store them locally.
+    Files land in board_drops/ next to this module, under their
+    original name; a numeric suffix is appended if a file of that
+    name already exists.
+    """
+    try:
+        safe = os.path.basename(str(name)) or "dropped_file"
+    except Exception:
+        safe = "dropped_file"
+    safe = safe.strip() or "dropped_file"
+
+    try:
+        d = _drop_dir()
+    except Exception as e:
+        _log(f"save_dropped_file: could not create drop dir: {e}")
+        return {"success": False, "message": str(e)}
+
+    target = d / safe
+    if target.exists():
+        stem, ext = os.path.splitext(safe)
+        i = 1
+        while True:
+            cand = d / f"{stem}_{i}{ext}"
+            if not cand.exists():
+                target = cand
+                break
+            i += 1
+
+    try:
+        with open(target, "wb") as fh:
+            fh.write(data_bytes)
+    except Exception as e:
+        _log(f"save_dropped_file: write failed: {e}")
+        return {"success": False, "message": str(e)}
+
+    path = str(target.resolve())
+    _log(f"save_dropped_file: wrote {path} ({len(data_bytes)} bytes)")
+    return {"success": True, "path": path, "name": target.name}
+
+
 _picker_lock = threading.Lock()
 
 

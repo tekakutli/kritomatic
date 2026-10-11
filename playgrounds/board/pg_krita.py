@@ -398,6 +398,70 @@ async function pickFilesViaServer() {
 }
 
 /* ==========================================================================
+   DROPPED FILES
+   ==========================================================================
+   Called from the drop handler in pg_dispatch.py.  Two paths:
+
+     * Some browser contexts (Electron, some Chromium builds, file://
+       pages with the right permissions) expose the original
+       filesystem path on the File object.  When they do, use it
+       directly — that is the true source, and Krita can open it
+       as-is.
+
+     * Standard browsers strip the path.  In that case the bytes are
+       streamed to the local server via /krita/drop_file, which saves
+       them under board_drops/ next to the module and returns the
+       saved path.  That path is what goes on the board.
+
+   Either way the return value is the same: true if a card was added
+   (or reused), false otherwise.  The caller runs a single refresh
+   afterwards to pick up open/thumbnail state. */
+
+async function importDroppedFile(file) {
+  if (!file) return false;
+
+  // Preferred case: the browser knows the real path.
+  if (typeof file.path === "string" && file.path) {
+    const idx = addFileByPath(file.path);
+    return idx >= 0;
+  }
+
+  // Fallback: stream the bytes to the server, which stores them and
+  // returns the on-disk path it used.
+  let res;
+  try {
+    res = await fetch("/krita/drop_file", {
+      method:  "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-Filename":   encodeURIComponent(file.name || "dropped_file"),
+      },
+      body: file,
+    });
+  } catch (err) {
+    reportError("drop", "upload failed: " + err.message);
+    return false;
+  }
+
+  let payload;
+  try {
+    payload = await res.json();
+  } catch (err) {
+    reportError("drop", "bad response: " + err.message);
+    return false;
+  }
+
+  if (!payload || !payload.success) {
+    const msg = (payload && payload.message) ? payload.message : "upload failed";
+    reportError("drop", msg);
+    return false;
+  }
+
+  const idx = addFileByPath(payload.path);
+  return idx >= 0;
+}
+
+/* ==========================================================================
    PROJECT OVERLAPS
    ==========================================================================
    Sends one batch of transform-based paste commands.  Each command

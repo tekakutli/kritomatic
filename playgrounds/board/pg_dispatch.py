@@ -16,6 +16,13 @@ preserves the card's aspect ratio as it was at drag start.
 
 Keyboard: R refresh, G grid, F fit, O open-all-missing, P project
 overlaps, H toggle panel.
+
+Filesystem drops: dragging a file (or several) from the OS onto the
+page imports each one exactly like the "+ Add files…" button — the
+path (or the saved copy for browsers that hide it) goes onto the
+board and a normal refresh runs afterwards.  A translucent overlay
+appears while a drag hovers over the page so the drop target is
+obvious.
 """
 
 DISPATCH_JS = r"""
@@ -273,4 +280,106 @@ window.addEventListener("keydown", (e) => {
 });
 
 canvas.style.cursor = "default";
+
+/* ==========================================================================
+   FILESYSTEM DROP
+   ==========================================================================
+   Dragging files from the OS onto the page is treated exactly like
+   clicking "+ Add files…": every dropped file is added to the board
+   through importDroppedFile() (which resolves a real path when the
+   browser exposes one, and otherwise uploads the bytes to the local
+   server), then a single refresh pulls state from Krita.
+
+   A drag-depth counter keeps the overlay visible while the pointer
+   is over any descendant of the window — dragleave fires every time
+   the pointer crosses an element boundary, so we increment on
+   dragenter and decrement on dragleave, and only hide the overlay
+   once the depth reaches zero. */
+
+let _dropDepth = 0;
+
+function _hasFiles(dt) {
+  if (!dt) return false;
+  const types = dt.types || [];
+  for (let i = 0; i < types.length; i++) {
+    if (types[i] === "Files") return true;
+  }
+  return false;
+}
+
+function _dropOverlay() {
+  return document.getElementById("dropOverlay");
+}
+
+window.addEventListener("dragenter", (e) => {
+  if (!_hasFiles(e.dataTransfer)) return;
+  e.preventDefault();
+  _dropDepth++;
+  const o = _dropOverlay();
+  if (o) o.classList.add("visible");
+});
+
+window.addEventListener("dragover", (e) => {
+  if (!_hasFiles(e.dataTransfer)) return;
+  e.preventDefault();
+  try { e.dataTransfer.dropEffect = "copy"; } catch (_) {}
+});
+
+window.addEventListener("dragleave", (e) => {
+  if (!_hasFiles(e.dataTransfer)) return;
+  _dropDepth = Math.max(0, _dropDepth - 1);
+  if (_dropDepth === 0) {
+    const o = _dropOverlay();
+    if (o) o.classList.remove("visible");
+  }
+});
+
+window.addEventListener("drop", async (e) => {
+  if (!_hasFiles(e.dataTransfer)) return;
+  e.preventDefault();
+  _dropDepth = 0;
+  const o = _dropOverlay();
+  if (o) o.classList.remove("visible");
+
+  const files = Array.from(e.dataTransfer.files || []);
+  if (files.length === 0) return;
+
+  const statusEl = document.getElementById("status");
+  if (statusEl) {
+    statusEl.textContent =
+      "importing " + files.length + " dropped file" +
+      (files.length === 1 ? "" : "s") + "\u2026";
+    statusEl.className = "";
+  }
+
+  let added = 0, failed = 0;
+  for (const f of files) {
+    try {
+      const ok = await importDroppedFile(f);
+      if (ok) added++; else failed++;
+    } catch (err) {
+      reportError("drop", (err && err.message) ? err.message : String(err));
+      failed++;
+    }
+  }
+
+  if (added > 0) {
+    await refreshFromKrita();
+  }
+
+  syncFileList();
+  draw();
+
+  if (statusEl) {
+    if (failed === 0) {
+      statusEl.textContent =
+        "imported " + added + " dropped file" + (added === 1 ? "" : "s");
+      statusEl.className = "ok";
+    } else {
+      statusEl.textContent = "imported " + added + ", failed " + failed;
+      statusEl.className   = "bad";
+    }
+    setTimeout(updateStatus, 1800);
+  }
+});
 """

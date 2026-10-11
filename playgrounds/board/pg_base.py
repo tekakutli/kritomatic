@@ -11,6 +11,11 @@ The Scale and Rotation fields follow the selected card: they grey out
 when nothing is selected, and reflect the selected card's own values
 otherwise.  Both support scrub-drag; Rotation snaps to 15° with
 Shift held.
+
+Dropping files from the OS onto the page is treated exactly like
+picking them through "+ Add files…": the same code path adds the
+path to the board, then a normal refresh runs.  A translucent
+overlay appears while a drag is hovering over the page.
 """
 
 HTML_HEAD = r"""<!DOCTYPE html>
@@ -287,6 +292,24 @@ HTML_HEAD = r"""<!DOCTYPE html>
   }
   #restoreBtn:hover { border-color:#34445a; color:#dce6f2; }
   #restoreBtn.visible { display:block; }
+
+  /* Drop overlay: shown while a filesystem drag is hovering over
+     the page.  pointer-events:none so the dragleave event isn't
+     swallowed by this layer. */
+  #dropOverlay {
+    position:fixed; inset:0; z-index:100;
+    display:none;
+    background:rgba(0,229,255,0.06);
+    border:2px dashed rgba(0,229,255,0.65);
+    box-sizing:border-box;
+    pointer-events:none;
+    align-items:center; justify-content:center;
+    font-family:inherit; font-size:14px; font-weight:700;
+    color:#b8ecff;
+    letter-spacing:0.16em; text-transform:uppercase;
+    text-shadow:0 0 12px rgba(0,229,255,0.55);
+  }
+  #dropOverlay.visible { display:flex; }
 </style>
 </head>
 <body>
@@ -385,6 +408,8 @@ HTML_HEAD = r"""<!DOCTYPE html>
 <button id="restoreBtn" title="Show panel (H)">☰ Show panel</button>
 
 <canvas id="c"></canvas>
+
+<div id="dropOverlay">Drop files to add them to the board</div>
 """
 
 

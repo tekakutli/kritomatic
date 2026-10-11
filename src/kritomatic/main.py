@@ -77,6 +77,15 @@ def main():
         run_text_command()
         return
 
+    # ========== HANDLE playgrounds (client-side only) ==========
+    #
+    # Fires on the first positional, defers to playground_launcher,
+    # and returns control to the shell once the playground's server
+    # stops.  Nothing here touches the daemon.
+    if len(sys.argv) >= 2 and sys.argv[1] == 'playgrounds':
+        from playground_launcher import run_playground_command
+        run_playground_command()
+        return
 
     # ========== NORMAL COMMAND EXECUTION ==========
     registry_mgr = get_registry_manager()

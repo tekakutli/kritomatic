@@ -46,7 +46,7 @@ DEFAULT_TREE_ONLY  = False            # only emit the directory tree, no file co
 # Directory names to skip entirely (exact match on the directory basename,
 # at any depth). Add your own as needed.
 # DEFAULT_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules"]
-DEFAULT_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules", "kritomatic_xremap", "other_scripts"]
+DEFAULT_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules", "kritomatic_xremap", "other_scripts", "playgrounds"]
 
 # Filename substrings whitelist: if NON-EMPTY, a file is only kept when its
 # filename contains AT LEAST ONE of these substrings (partial match,

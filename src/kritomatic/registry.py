@@ -358,6 +358,7 @@ class CommandRegistry:
                     arg_type = arg_info.get('type', 'str')
                     required = arg_info.get('required', False)
                     default = arg_info.get('default')
+                    choices = arg_info.get('choices')
                     help_text = _escape_help_for_argparse(arg_info.get('help', ''))
 
                     if arg_type == 'int':
@@ -369,20 +370,40 @@ class CommandRegistry:
                     else:
                         arg_type = str
 
-                    if arg_name.startswith('--'):
-                        if required:
-                            cmd_parser.add_argument(arg_name, type=arg_type, required=True, help=help_text)
-                        elif default is not None:
-                            cmd_parser.add_argument(arg_name, type=arg_type, default=default, help=help_text)
-                        else:
-                            cmd_parser.add_argument(arg_name, type=arg_type, help=help_text)
-                    else:
-                        if required:
-                            cmd_parser.add_argument(arg_name, type=arg_type, help=help_text)
-                        elif default is not None:
-                            cmd_parser.add_argument(arg_name, type=arg_type, default=default, help=help_text)
-                        else:
-                            cmd_parser.add_argument(arg_name, type=arg_type, help=help_text)
+                    kwargs = {'type': arg_type, 'help': help_text}
+
+                    # The schema declares choices as strings.  Coerce
+                    # them to match the argument's declared type, so
+                    # argparse's membership test compares like against
+                    # like: after type= the parser hands it an int for
+                    # an int-typed arg, and `5 in ['5','6']` would
+                    # never match.  For str-typed args the choices go
+                    # through unchanged.
+                    if choices is not None and arg_type is not bool:
+                        try:
+                            if arg_type is int:
+                                kwargs['choices'] = [int(c) for c in choices]
+                            elif arg_type is float:
+                                kwargs['choices'] = [float(c) for c in choices]
+                            else:
+                                kwargs['choices'] = list(choices)
+                        except (TypeError, ValueError):
+                            # A malformed choices list should not
+                            # crash the whole parser build.  Fall back
+                            # to the raw values; the daemon will still
+                            # validate on its side.
+                            kwargs['choices'] = list(choices)
+
+                    if default is not None:
+                        kwargs['default'] = default
+
+                    # Positional args do not take a `required` kwarg;
+                    # required-ness is inferred from the absence of a
+                    # leading `--`.
+                    if arg_name.startswith('--') and required:
+                        kwargs['required'] = True
+
+                    cmd_parser.add_argument(arg_name, **kwargs)
 
                 cmd_parser.set_defaults(func=None)
 

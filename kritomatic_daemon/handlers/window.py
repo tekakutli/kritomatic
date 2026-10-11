@@ -1,6 +1,15 @@
 import json
+import time
 
 from krita import Krita
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (
+    QDockWidget,
+    QScrollArea,
+    QSizePolicy,
+    QWidget,
+)
+
 from ..decorators import command, AutoDispatchHandler
 
 
@@ -96,7 +105,7 @@ class WindowHandler(AutoDispatchHandler):
 
     @command(
         category='window',
-        help_text='Toggle dockers visibility via Krita\'s Show Dockers action',
+        help_text='Toggle dockers visibility.',
         args={}
     )
     def toggle_dockers(self):
@@ -123,12 +132,7 @@ class WindowHandler(AutoDispatchHandler):
 
     @command(
         category='window',
-        help_text='Toggle docker visibility without affecting toolbars, '
-                  'mirroring Settings -> Show Dockers.  Like that action, '
-                  'hiding remembers exactly which dockers were visible and '
-                  'showing restores only those.  Unlike that action, '
-                  'toolbars are never saved or restored, so toolbar '
-                  'visibility is left untouched.',
+        help_text='Toggle docker visibility, leaving toolbars untouched.',
         args={}
     )
     def toggle_dockers_only(self):
@@ -208,14 +212,7 @@ class WindowHandler(AutoDispatchHandler):
 
     @command(
         category='window',
-        help_text='Bring a docker to the front of its tab group.  If the '
-                  'docker is hidden entirely, it is shown first.  If the '
-                  'dockers are currently hidden by toggle_dockers_only, '
-                  'they are all restored first so the focus does not '
-                  'strand the other dockers.  Matches by internal object '
-                  'name, then by displayed window title, '
-                  'case-insensitively; run introspect list_dockers to see '
-                  'the available names.',
+        help_text='Bring a named docker to the front of its tab group.',
         args={
             '--name': {'type': 'str', 'required': True,
                        'help': 'Docker object name or displayed window '
@@ -362,4 +359,239 @@ class WindowHandler(AutoDispatchHandler):
                 return {'success': True, 'message': 'Opened new window'}
             return {'success': False, 'message': 'New window action not found'}
         except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    @command(
+        category='window',
+        help_text='Resize the left, right, or both docker columns to a '
+                  'specific width.',
+        args={
+            '--mode': {
+                'type': 'str', 'default': 'left',
+                'choices': ['left', 'right', 'both'],
+                'help': 'Which column(s) to resize.',
+            },
+            '--target_width': {
+                'type': 'int', 'default': 300,
+                'help': 'Preferred column width in pixels.',
+            },
+            '--min_width': {
+                'type': 'int', 'default': 180,
+                'help': 'Minimum column width; how narrow the splitter '
+                        'handle can drag the column.',
+            },
+            '--max_width': {
+                'type': 'int', 'default': 800,
+                'help': 'Maximum column width; also caps any pathological '
+                        'widget size hint.',
+            },
+            '--hint_threshold': {
+                'type': 'int', 'default': 2000,
+                'help': 'A widget whose sizeHint or minimumSizeHint '
+                        'exceeds this is treated as broken and clamped.',
+            },
+        }
+    )
+    def resize_docker_columns(self, params):
+        """Force one or both docker columns to a target width.
+
+        Three things happen per docker, in order:
+
+          1. Every widget under the docker whose sizeHint or
+             minimumSizeHint exceeds `hint_threshold` is clamped.  This
+             is the load-bearing step.  The AI Diffusion docker's
+             welcome page is a QLabel with an unbreakable line, and Qt
+             faithfully reports it as needing ~87k pixels; without
+             this clamp, every resizeDocks call gets silently reverted
+             by Qt's own layout pass trying to satisfy that hint.
+
+          2. The docker's top-level content widget is pinned to a range
+             [min_width, max_width] with an Expanding horizontal size
+             policy.  The range is what keeps the splitter handle
+             visible (min == max would hide it); Expanding is what
+             makes the content fill whatever width the column
+             currently has.
+
+          3. resizeDocks is called with every docker in the target
+             area(s) and the target width.  Passing all of them at
+             once -- not just one -- is what lets Qt redistribute the
+             whole column.
+
+        The sequence runs several times with short sleeps, because
+        Krita's dock layout recomputes a beat after each change and
+        the first attempt can be silently overridden.  QTimer is not
+        an option here: the handler runs on the socket server's client
+        thread, which has no Qt event loop, so a scheduled timer would
+        never fire.  Blocking sleeps are impolite but brief, and the
+        client thread is per-connection.
+
+        Args are the params dict.  `mode` selects the areas:
+        LeftDockWidgetArea, RightDockWidgetArea, or both.
+        """
+        try:
+            win = Krita.instance().activeWindow()
+            if not win:
+                return {'success': False, 'message': 'No active window'}
+            qwin = win.qwindow()
+            if qwin is None:
+                return {'success': False,
+                        'message': 'Active window has no qwindow'}
+
+            mode = str(params.get('mode', 'left')).lower()
+            try:
+                target_width = int(params.get('target_width', 300))
+                min_width = int(params.get('min_width', 180))
+                max_width = int(params.get('max_width', 800))
+                hint_threshold = int(params.get('hint_threshold', 2000))
+            except (TypeError, ValueError) as e:
+                return {'success': False,
+                        'message': f'Numeric arg could not be parsed: {e}'}
+
+            if min_width < 0 or max_width <= 0 or min_width > max_width:
+                return {'success': False,
+                        'message': f'Invalid width range: '
+                                   f'min={min_width}, max={max_width}'}
+            if target_width < min_width or target_width > max_width:
+                return {'success': False,
+                        'message': f'target_width={target_width} outside '
+                                   f'[min_width={min_width}, '
+                                   f'max_width={max_width}]'}
+
+            area_by_mode = {
+                'left':  [Qt.DockWidgetArea.LeftDockWidgetArea],
+                'right': [Qt.DockWidgetArea.RightDockWidgetArea],
+                'both':  [Qt.DockWidgetArea.LeftDockWidgetArea,
+                          Qt.DockWidgetArea.RightDockWidgetArea],
+            }
+            if mode not in area_by_mode:
+                return {'success': False,
+                        'message': f'mode must be one of '
+                                   f'{sorted(area_by_mode)}, got {mode!r}'}
+            areas = area_by_mode[mode]
+
+            # -- offender discovery and clamping -----------------------
+
+            def find_offenders(docker):
+                content = docker.widget()
+                if content is None:
+                    return []
+                offenders = []
+                for w in [content] + content.findChildren(QWidget):
+                    try:
+                        hint = w.sizeHint().width()
+                        minh = w.minimumSizeHint().width()
+                    except Exception:
+                        continue
+                    if hint > hint_threshold or minh > hint_threshold:
+                        offenders.append((w, hint, minh))
+                return offenders
+
+            def clamp_widget(w):
+                w.setMinimumWidth(0)
+                w.setMaximumWidth(max_width)
+                w.updateGeometry()
+
+            def tune_docker(d):
+                content = d.widget()
+                if content is None:
+                    return []
+
+                clamped = []
+                for w, hint, minh in find_offenders(d):
+                    clamp_widget(w)
+                    try:
+                        cname = w.metaObject().className()
+                    except Exception:
+                        cname = type(w).__name__
+                    clamped.append(f'{cname}(hint={hint}, min={minh})')
+
+                content.setMinimumWidth(min_width)
+                content.setMaximumWidth(max_width)
+                sp = content.sizePolicy()
+                sp.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
+                content.setSizePolicy(sp)
+                content.updateGeometry()
+
+                for sa in d.findChildren(QScrollArea):
+                    sa.setWidgetResizable(True)
+                    sa.setMinimumWidth(min_width)
+                    sa.setMaximumWidth(max_width)
+
+                d.setMinimumWidth(0)
+                d.setMaximumWidth(16777215)
+                d.updateGeometry()
+                return clamped
+
+            # -- area collection ----------------------------------------
+
+            def collect_dockers():
+                return [d for d in qwin.findChildren(QDockWidget)
+                        if qwin.dockWidgetArea(d) in areas]
+
+            def apply_once():
+                dockers = collect_dockers()
+                if not dockers:
+                    return []
+                for d in dockers:
+                    tune_docker(d)
+                qwin.resizeDocks(dockers,
+                                 [target_width] * len(dockers),
+                                 Qt.Orientation.Horizontal)
+                qwin.updateGeometry()
+                return dockers
+
+            # -- run ---------------------------------------------------
+
+            dockers = apply_once()
+            if not dockers:
+                return {'success': False,
+                        'message': f'No dockers found in area(s): '
+                                   f'{[a.name for a in areas]}'}
+
+            clamped_report = []
+            for d in dockers:
+                offenders = find_offenders(d)
+                if offenders:
+                    names = []
+                    for w, hint, minh in offenders:
+                        try:
+                            cname = w.metaObject().className()
+                        except Exception:
+                            cname = type(w).__name__
+                        names.append(f'{cname}(hint={hint}, min={minh})')
+                    clamped_report.append({
+                        'docker': d.objectName(),
+                        'widgets': names,
+                    })
+
+            # Re-apply across the next few hundred ms.  Krita's own
+            # layout pass fires shortly after any docker change and can
+            # overwrite the first request.  No QTimer here: the handler
+            # runs on a plain Python thread (see _HandlerBox in
+            # kritomatic_daemon.py), which has no Qt event loop, so a
+            # scheduled timer would never fire.
+            for _ in range(3):
+                time.sleep(0.05)
+                apply_once()
+
+            return {
+                'success': True,
+                'message': f'Resized {len(dockers)} docker(s) in '
+                           f'{[a.name for a in areas]} to '
+                           f'{target_width}px (mode={mode})',
+                'data': {
+                    'mode': mode,
+                    'areas': [a.name for a in areas],
+                    'docker_count': len(dockers),
+                    'docker_names': [d.objectName() for d in dockers],
+                    'target_width': target_width,
+                    'min_width': min_width,
+                    'max_width': max_width,
+                    'hint_threshold': hint_threshold,
+                    'clamped': clamped_report,
+                },
+            }
+        except Exception as e:
+            import traceback as _tb
+            _tb.print_exc()
             return {'success': False, 'message': str(e)}

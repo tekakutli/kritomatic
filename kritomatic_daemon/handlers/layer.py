@@ -6,6 +6,7 @@ from .layer_fill import LayerFillHandler
 from .layer_color import LayerColorHandler
 from .layer_export import LayerExportHandler
 from .layer_blend import LayerBlendHandler
+from ..decorators import build_dispatch_map
 
 
 class LayerHandler:
@@ -19,50 +20,29 @@ class LayerHandler:
         self.export = LayerExportHandler()
         self.blend = LayerBlendHandler()
 
+        # Declared explicitly so the base dispatch map (built in
+        # CommandHandler.__init__) can see through this container and
+        # claim every layer command for the LayerHandler instance.
+        # The recursion in all_command_names() reads exactly this
+        # attribute.
+        self._sub_handlers = [
+            self.basic,
+            self.file,
+            self.transform,
+            self.text,
+            self.fill,
+            self.color,
+            self.export,
+            self.blend,
+        ]
+
+        # Route each layer command name to its owning sub-handler.
+        # Replaces the if/elif chain that used to live in execute().
+        self._cmd_map = build_dispatch_map(self._sub_handlers)
+
     def execute(self, cmd_type, params):
-        # Basic layer operations
-        if cmd_type in ['create_layer', 'list_layers', 'set_active_layer',
-                        'rename_active_layer', 'rename_layer_by_name',
-                        'move_layer_to_group', 'move_active_layer_to_group']:
-            return self.basic.execute(cmd_type, params)
-
-        # File layer operations
-        elif cmd_type in ['create_file_layer', 'convert_to_file_layer',
-                          'embed_image_as_layer', 'import_kra_as_group',
-                          'paste_document_transform_as_layer']:
-            return self.file.execute(cmd_type, params)
-
-        # Transform mask operations
-        elif cmd_type in ['create_transform_mask', 'transform_mask',
-                          'set_perspective_transform_mask', 'fit_to_canvas']:
-            return self.transform.execute(cmd_type, params)
-
-        # Vector shapes: text and polygons
-        elif cmd_type in ['add_vector_text', 'add_vector_polygon',
-                          'update_vector_text', 'list_shapes',
-                          'replace_all_text', 'extract_all_text',
-                          'list_text_layers',
-                          'get_layer_text_metadata',
-                          'patch_layer_text',
-                          'dump_all_text_shapes',
-                          'move_text_handle',
-                          'set_text_inline_size']:
-            return self.text.execute(cmd_type, params)
-
-        # Fill operations
-        elif cmd_type in ['fill_layer', 'fill_selection']:
-            return self.fill.execute(cmd_type, params)
-
-        # Blend operations
-        elif cmd_type in ['create_blend_layer']:
-            return self.blend.execute(cmd_type, params)
-
-        # Color operations
-        elif cmd_type in ['apply_color_to_alpha', 'add_color_to_alpha_mask']:
-            return self.color.execute(cmd_type, params)
-
-        # Export operations
-        elif cmd_type in ['move_layer_to_new_document', 'export_layer_to_file']:
-            return self.export.execute(cmd_type, params)
-
-        return {'success': False, 'message': f'Unknown layer command: {cmd_type}'}
+        handler = self._cmd_map.get(cmd_type)
+        if handler is None:
+            return {'success': False,
+                    'message': f'Unknown layer command: {cmd_type}'}
+        return handler.execute(cmd_type, params)

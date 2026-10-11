@@ -14,7 +14,19 @@ from .diffusion import DiffusionHandler
 from .introspect import IntrospectHandler
 from .daemon import DaemonHandler
 from ..registry import get_command_registry
+from ..decorators import build_dispatch_map
 from ..utils.refresh import begin_defer, end_defer
+
+
+# Command names that reach a handler's execute method without being
+# registered through @command.  These are legacy aliases: they work
+# today because a handler's own if/elif chain happens to list them,
+# but they do not appear in the auto-generated schema.  Preserved
+# here so that callers using the older name keep working after the
+# dispatch map replaced the top-level if/elif chain.
+_ALIASES = {
+    'add_to_palette': 'palette',
+}
 
 
 class CommandHandler:
@@ -31,6 +43,14 @@ class CommandHandler:
             'introspect': IntrospectHandler(),
             'daemon': DaemonHandler()
         }
+        # Map {command_name: handler_instance}, built by introspecting
+        # the @command markers on every handler's methods (and, for
+        # container handlers like LayerHandler, on their declared
+        # sub-handlers).  Replaces the top-level if/elif chain that
+        # used to live in _dispatch.  Rebuilt on every CommandHandler
+        # construction — see handlers/daemon.py for the reload path
+        # that relies on this.
+        self._cmd_map = build_dispatch_map(self.handlers.values())
 
     def _send_line(self, client_socket, payload):
         try:
@@ -180,77 +200,15 @@ class CommandHandler:
             }
             return result
 
-        # Brush commands
-        if cmd_type in ['set_brush_size', 'set_brush_opacity', 'set_brush_flow',
-                        'set_brush_blending_mode', 'set_brush_preset', 'list_brush_presets',
-                        'get_brush_properties', 'set_foreground_color', 'set_background_color',
-                        'select_opaque']:
-            return self.handlers['brush'].execute(cmd_type, command)
-
-        # Layer commands (non-text)
-        elif cmd_type in ['create_layer', 'list_layers', 'set_active_layer', 'rename_active_layer',
-                          'rename_layer_by_name', 'move_layer_to_group', 'move_active_layer_to_group',
-                          'create_file_layer', 'convert_to_file_layer', 'create_blend_layer',
-                          'embed_image_as_layer', 'import_kra_as_group',
-                          'paste_document_transform_as_layer',
-                          'fill_layer', 'fill_selection', 'move_layer_to_new_document',
-                          'export_layer_to_file', 'apply_color_to_alpha', 'add_color_to_alpha_mask',
-                          'create_transform_mask', 'transform_mask',
-                          'set_perspective_transform_mask', 'fit_to_canvas']:
-            return self.handlers['layer'].execute(cmd_type, command)
-
-        # Vector shapes: text and polygons
-        elif cmd_type in ['add_vector_text', 'add_vector_polygon',
-                          'update_vector_text', 'list_shapes', 'replace_all_text',
-                          'extract_all_text',
-                          'list_text_layers',
-                          'get_layer_text_metadata',
-                          'patch_layer_text',
-                          'dump_all_text_shapes',
-                          'move_text_handle',
-                          'set_text_inline_size']:
-            return self.handlers['layer'].execute(cmd_type, command)
-
-        # Palette commands
-        elif cmd_type in ['add_to_palette', 'create_palette', 'activate_palette', 'list_palettes']:
-            return self.handlers['palette'].execute(cmd_type, command)
-
-        # Mask commands
-        elif cmd_type in ['add_selection_mask', 'add_selection_mask_to_active']:
-            return self.handlers['mask'].execute(cmd_type, command)
-
-        # Document commands
-        elif cmd_type in ['get_current_dimensions', 'create_new_from_current',
-                          'create_new_with_dimensions', 'get_all_documents', 'save_document',
-                          'open_document', 'close_document', 'export_document',
-                          'export_file_to_image', 'rotate_document', 'rotate_kra_file',
-                          'get_document_thumbnail', 'get_all_document_thumbnails',
-                          'activate_document']:
-            return self.handlers['document'].execute(cmd_type, command)
-
-        # View commands
-        elif cmd_type in ['push', 'pop', 'toggle', 'fit', 'fit_width', 'fit_height',
-                          'zoom_to', 'zoom_in', 'zoom_out', 'reset', 'get_state']:
-            return self.handlers['view'].execute(cmd_type, command)
-
-        # Window commands
-        elif cmd_type in ['toggle_detached', 'toggle_fullscreen', 'toggle_dockers',
-                          'toggle_docker_titles', 'new_window']:
-            return self.handlers['window'].execute(cmd_type, command)
-
-        # Diffusion commands
-        elif cmd_type in ['list_workflows', 'switch_workflow', 'get_params', 'set_param', 'generate', 'export_params', 'import_params']:
-            return self.handlers['diffusion'].execute(cmd_type, command)
-
-        # Introspect commands
-        elif cmd_type in ['list_actions', 'list_filters', 'list_resources',
-                          'list_dockers', 'describe_active', 'list_extensions',
-                          'get_node_xml', 'describe_vector_layer']:
-            return self.handlers['introspect'].execute(cmd_type, command)
-
-        # Daemon meta-commands
-        elif cmd_type in ['reload_daemon']:
-            return self.handlers['daemon'].execute(cmd_type, command)
-
-        else:
-            return {'success': False, 'message': f'Unknown command type: {cmd_type}'}
+        handler = self._cmd_map.get(cmd_type)
+        if handler is None:
+            # Legacy aliases — command names that reach a handler's
+            # execute method without having been registered via
+            # @command, and so are absent from the auto-built map.
+            alias_target = _ALIASES.get(cmd_type)
+            if alias_target:
+                handler = self.handlers.get(alias_target)
+        if handler is None:
+            return {'success': False,
+                    'message': f'Unknown command type: {cmd_type}'}
+        return handler.execute(cmd_type, command)

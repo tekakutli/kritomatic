@@ -7,6 +7,7 @@ from functools import lru_cache
 
 from kritomatic.helpful_argparse import HelpfulArgumentParser
 from kritomatic.playground_launcher import PLAYGROUNDS
+from kritomatic.xremap_launcher import XREMAP_COMMANDS
 
 
 def _escape_help_for_argparse(text):
@@ -167,6 +168,7 @@ class CommandRegistry:
                    '  kritomatic text dump --output labels.json\n'
                    '  kritomatic text load --input labels.json\n'
                    '  kritomatic playgrounds board\n'
+                   '  kritomatic xremap inject\n'
                    '  kritomatic --refresh\n'
                    '  kritomatic export-manual'
         )
@@ -263,6 +265,23 @@ class CommandRegistry:
         )
         for pg in PLAYGROUNDS:
             playgrounds_sub.add_parser(pg['name'], help=pg['help'])
+
+        # xremap helper scripts.  Like playgrounds, this is a client-
+        # side launcher: the actual work happens in a subprocess, not
+        # through the daemon.  The list of commands is imported from
+        # xremap_launcher so adding a command is a one-file edit there
+        # — both this menu and the launcher pick it up together.
+        xremap_parser = subparsers.add_parser(
+            'xremap',
+            help='Run helper scripts from the kritomatic_xremap '
+                 'subproject'
+        )
+        xremap_sub = xremap_parser.add_subparsers(
+            dest='xremap_command', metavar='XREMAP_COMMAND',
+            required=True, help='xremap commands'
+        )
+        for entry in XREMAP_COMMANDS:
+            xremap_sub.add_parser(entry['name'], help=entry['help'])
 
         # Batch commands
         batch_parser = subparsers.add_parser('batch', help='Batch operations')

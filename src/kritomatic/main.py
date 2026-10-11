@@ -87,6 +87,21 @@ def main():
         run_playground_command()
         return
 
+    # ========== HANDLE xremap helper scripts (client-side only) ==========
+    #
+    # The kritomatic_xremap subproject ships scripts that live outside
+    # the daemon's command surface — they edit the xremap YAML, inject
+    # new bindings, etc.  Dispatch fires on the first positional
+    # (`xremap`) and hands control to xremap_launcher, which runs the
+    # selected script as a subprocess with stdin/stdout/stderr
+    # inherited.  That last part matters: inject_script.py prompts on
+    # the terminal, so its streams must be passed through, not
+    # captured.
+    if len(sys.argv) >= 2 and sys.argv[1] == 'xremap':
+        from xremap_launcher import run_xremap_command
+        run_xremap_command()
+        return
+
     # ========== NORMAL COMMAND EXECUTION ==========
     registry_mgr = get_registry_manager()
     client = None

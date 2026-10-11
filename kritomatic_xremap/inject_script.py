@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Add or remove a script entry in merger.py's SCRIPTS dict, and a
-commented-out binding stub in kritomatic_xremap.yaml.
+Add or remove a script entry in merger.py's SCRIPTS dict.
 
 Two kinds of input are accepted:
 
@@ -50,6 +49,7 @@ Usage:
 import argparse
 import ast
 import hashlib
+import os
 import re
 import sys
 from pathlib import Path
@@ -69,6 +69,86 @@ YAML_TARGET_SECTION = "Global Krita Shortcuts"
 # +2 for the key itself). If the YAML's indentation ever changes, this
 # is the one line to update.
 YAML_INDENT = "      "
+
+
+# ---------------------------------------------------------------------------
+# CLI surface — the single declaration of this script's flags
+# ---------------------------------------------------------------------------
+#
+# CLI_SPEC is the authoritative list of this script's command-line
+# arguments, in the order argparse would add them.  Two consumers read
+# it:
+#
+#   1. _build_argparser() below, which turns it into the actual
+#      argparse parser used by main().
+#   2. xremap_launcher.py, which reads it via AST when building the
+#      `kritomatic xremap` menu, so `kritomatic xremap inject --help`
+#      lists these flags without running the script.
+#
+# Deriving both surfaces from one declaration is what stops the menu
+# and the script from drifting.  Adding a flag is a one-file edit:
+# add a dict here.
+#
+# The constant must be a literal — no calls, no name lookups — because
+# the launcher reads it with ast.literal_eval, not by importing this
+# module.  Supported keys mirror argparse: `name`, `nargs`, `action`
+# (only `store_true` / `store_false`), `type` (as a string: 'str',
+# 'int', 'float', 'path'), `default`, `metavar`, `choices`, `help`.
+
+CLI_SPEC = [
+    {
+        'name': 'input', 'nargs': '?',
+        'help': 'Script filename or shell command. If omitted, the '
+                'script prompts for one interactively.',
+    },
+    {
+        'name': '--remove', 'action': 'store_true',
+        'help': 'Remove the entry (and any commented YAML stub) '
+                'instead of adding.',
+    },
+    {
+        'name': '--list', 'action': 'store_true',
+        'help': 'List current SCRIPTS entries and exit.',
+    },
+    {
+        'name': '--no-yaml', 'action': 'store_true',
+        'help': 'Skip the YAML stub insertion / removal. Use when you '
+                'only want merger.py touched.',
+    },
+]
+
+# Argparse types named in CLI_SPEC as strings, mapped to the callables
+# argparse expects.  Kept in sync with the same map in
+# xremap_launcher.py so both sides interpret `type` identically.
+_ARG_TYPES = {
+    'str':   str,
+    'int':   int,
+    'float': float,
+    'path':  Path,
+}
+
+
+def _build_argparser():
+    """Build the CLI parser from CLI_SPEC.
+
+    See the block comment above CLI_SPEC for why the declaration lives
+    in one place.  `type` is given as a string in CLI_SPEC (so the
+    launcher can read it with ast.literal_eval) and mapped to the
+    actual callable here.
+    """
+    parser = argparse.ArgumentParser(
+        description="Add or remove a script entry in merger.py's "
+                    "SCRIPTS dict, and drop a commented binding stub "
+                    "into kritomatic_xremap.yaml.",
+    )
+    for spec in CLI_SPEC:
+        spec = dict(spec)
+        name = spec.pop('name')
+        t = spec.pop('type', None)
+        if t is not None:
+            spec['type'] = _ARG_TYPES.get(t, str)
+        parser.add_argument(name, **spec)
+    return parser
 
 
 # ---------------------------------------------------------------------------
@@ -163,17 +243,12 @@ def save_bash_command(command: str, merger_path: Path) -> str:
 # merger.py editing
 # ---------------------------------------------------------------------------
 
-def find_merger(explicit: Path | None) -> Path:
-    if explicit:
-        p = explicit.resolve()
-        if not p.is_file():
-            sys.exit(f"ERROR: merger.py not found at {p}")
-        return p
-    here = Path(__file__).resolve().parent
-    for candidate in (here / "merger.py", here.parent / "merger.py"):
-        if candidate.is_file():
-            return candidate
-    sys.exit("ERROR: could not locate merger.py; pass --merger PATH")
+def find_merger() -> Path:
+    """Return the path to merger.py, which sits next to this script."""
+    merger = Path(__file__).resolve().parent / "merger.py"
+    if not merger.is_file():
+        sys.exit(f"ERROR: merger.py not found at {merger}")
+    return merger
 
 
 def find_scripts_node(source: str) -> ast.Assign:
@@ -213,6 +288,145 @@ def rewrite_merger(merger_path: Path, items: list[tuple[str, str]]) -> None:
     new_source = "".join(lines[:start]) + render_block(items) + "".join(lines[end:])
     merger_path.with_suffix(".py.bak").write_text(source, encoding="utf-8")
     merger_path.write_text(new_source, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# --list rendering
+# ---------------------------------------------------------------------------
+
+# Minimum length for a shared prefix to be worth factoring out. Below
+# this, the extra header line costs more to read than the repeated
+# characters it replaces. Eight is high enough to skip trivial
+# coincidences — a shared leading underscore, a common two-letter
+# token — and low enough to catch a real slug.
+_MIN_FACTORED_PREFIX = 8
+
+
+def _longest_common_prefix(strings: list[str]) -> str:
+    """Longest shared leading substring of `strings`, or '' if none.
+
+    Uses the min/max trick: the longest common prefix of a set of
+    strings equals the longest common prefix of its lexicographically
+    smallest and largest members.  That makes this O(n * m) in the
+    lengths rather than O(n^2 * m), and it produces exactly the same
+    answer.
+    """
+    if not strings:
+        return ""
+    s1 = min(strings)
+    s2 = max(strings)
+    for i, c in enumerate(s1):
+        if i >= len(s2) or c != s2[i]:
+            return s1[:i]
+    return s1
+
+
+def _render_group(display_path: str, group: list[tuple[str, str]]) -> None:
+    """Render one group of SCRIPTS entries.
+
+    display_path is the directory the group's files live under, shown
+    once as a header.  `scripts/` for a group of bare filenames,
+    `scripts/bash_commands/` for that subdirectory, and so on for
+    whatever directories the SCRIPTS dict happens to reference.
+
+    group is a list of (placeholder, tail) pairs, where the tail is
+    the filename relative to display_path.
+
+    Within the group, the longest shared prefix of the placeholders
+    and of the tails is factored out when it is at least
+    _MIN_FACTORED_PREFIX characters.  A group of one entry is never
+    factored: it has nothing to share with, and stripping its only
+    row's prefix would leave the row empty.
+    """
+    if not group:
+        return
+
+    print()
+    g_count = len(group)
+    g_plural = '' if g_count == 1 else 's'
+    print(f"  {display_path}  ({g_count} file{g_plural})")
+
+    placeholders = [p for p, _ in group]
+    tails = [t for _, t in group]
+
+    common_p = ""
+    common_t = ""
+    if g_count > 1:
+        cp = _longest_common_prefix(placeholders)
+        if len(cp) >= _MIN_FACTORED_PREFIX:
+            common_p = cp
+        ct = _longest_common_prefix(tails)
+        if len(ct) >= _MIN_FACTORED_PREFIX:
+            common_t = ct
+
+    if common_p:
+        print(f"    placeholders: {common_p}*")
+    if common_t:
+        print(f"    files:        {common_t}*")
+
+    rows = []
+    for p, t in zip(placeholders, tails):
+        p_tail = p[len(common_p):] if common_p else p
+        t_tail = t[len(common_t):] if common_t else t
+        rows.append((p_tail, t_tail))
+
+    width = max(len(p) for p, _ in rows)
+    for p_tail, t_tail in rows:
+        print(f"      {p_tail:<{width}}  →  {t_tail}")
+
+
+def _print_list(entries: list[tuple[str, str]]) -> None:
+    """Render the SCRIPTS dict as a grouped, prefix-factored listing.
+
+    Entries are grouped by the directory component of their SCRIPTS
+    value.  SCRIPTS values are always relative to `scripts/`, so a
+    value's directory component is the subdirectory it lives in —
+    empty for a bare filename like `clipboard2krita.py`, and
+    `bash_commands` for a value like `bash_commands/foo.sh`.  The
+    group header shows that directory, and within the group only the
+    filename tail is displayed, so the shared directory is written
+    once instead of N times.
+
+    Grouping by actual structure rather than by an assumed kind is
+    what keeps this function honest for future entries: a script
+    dropped into a new subdirectory appears under its own header
+    without a code change here, and a label like "Python scripts" is
+    never invented for a set of files whose kind the listing has no
+    way to know.
+
+    Within each group, a long enough shared prefix of the
+    placeholders and of the filename tails is also factored into
+    header lines.  A run of commands that all derive from the same
+    invocation — as the current bash entries do — collapses to a
+    compact block of varying tails rather than N repetitions of the
+    same long prefix.
+
+    An empty SCRIPTS dict prints a single line rather than headers
+    with nothing under them.
+    """
+    if not entries:
+        print("SCRIPTS is empty.")
+        return
+
+    count = len(entries)
+    plural = 'entry' if count == 1 else 'entries'
+    print(f"SCRIPTS: {count} {plural}")
+
+    # Group by the directory the SCRIPTS value lives in, and reduce
+    # each value to just its filename tail relative to that directory.
+    # Sorting the group keys puts the bare-filename group first (empty
+    # string sorts before any non-empty string) and then subdirectories
+    # in alphabetical order, without either ordering being a special
+    # case.
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for placeholder, value in entries:
+        base = os.path.dirname(value)
+        tail = value[len(base) + 1:] if base else value
+        groups.setdefault(base, []).append((placeholder, tail))
+
+    for base in sorted(groups):
+        display_path = f"scripts/{base}/" if base else "scripts/"
+        _render_group(display_path, groups[base])
 
 
 # ---------------------------------------------------------------------------
@@ -363,42 +577,16 @@ def remove_yaml_stub(yaml_path: Path, placeholder: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Add or remove a script entry in merger.py's SCRIPTS dict, "
-                    "and drop a commented binding stub into "
-                    "kritomatic_xremap.yaml.",
-    )
-    parser.add_argument(
-        "input", nargs="?", default=None,
-        help="Script filename or shell command. If omitted, the script "
-             "prompts for one interactively.",
-    )
-    parser.add_argument(
-        "--remove", action="store_true",
-        help="Remove the entry (and any commented YAML stub) instead of adding.",
-    )
-    parser.add_argument(
-        "--list", action="store_true",
-        help="List current SCRIPTS entries and exit.",
-    )
-    parser.add_argument(
-        "--no-yaml", action="store_true",
-        help="Skip the YAML stub insertion / removal. Use when you only "
-             "want merger.py touched.",
-    )
-    parser.add_argument(
-        "--merger", type=Path, default=None,
-        help="Path to merger.py (default: auto-detect).",
-    )
+    parser = _build_argparser()
     args = parser.parse_args()
 
-    merger_path = find_merger(args.merger)
+    merger_path = find_merger()
     yaml_path = yaml_path_for(merger_path)
 
     if args.list:
         source = merger_path.read_text(encoding="utf-8")
-        for placeholder, filename in read_items(find_scripts_node(source)):
-            print(f"{placeholder:<40s} scripts/{filename}")
+        entries = read_items(find_scripts_node(source))
+        _print_list(entries)
         return 0
 
     # Resolve the raw input: positional argument, or interactive prompt.

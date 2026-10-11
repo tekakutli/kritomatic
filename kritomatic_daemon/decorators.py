@@ -1,61 +1,81 @@
-"""Decorators for registering commands with metadata, and the
-introspection helpers that let handler classes discover their own
-commands without a manual dispatch list.
+"""Decorators for registering commands, and the machinery that lets
+each handler discover and invoke its own commands without a manual
+dispatch list.
 
-The @command decorator does two things: it registers the command in
-the global schema registry (unchanged from before), and it stamps a
-marker attribute on the decorated function.  `build_dispatch_map()`
-reads that marker back at handler-construction time, replacing the
-if/elif chains that used to live in `base.py` and `layer.py`.  Adding
-a command is now a same-file edit: write the decorated method, and
-the dispatch map picks it up on the next reload.
+Three layers cooperate here:
 
-Container handlers — those that route to sub-handlers rather than
-executing commands themselves — declare an attribute
-`_sub_handlers`, a list of the handler instances they own.  The
-dispatch-map builder descends through that attribute, so a top-level
-handler's map claims every command reachable through its subtree.
+  - @command stamps metadata on the decorated function: its name, its
+    declared bundle args, an optional arg-rename map, and the schema
+    defaults to apply when the caller omits an arg.
+
+  - build_handler_map() reads those markers back at handler-construction
+    time and returns {command_name: caller}, where a caller is a
+    zero-arg-closure taking (cmd_type, params) and returning the result.
+
+  - AutoDispatchHandler is the base class every handler inherits from.
+    Its __init__ builds the map; its execute() consults it.  Subclasses
+    that own sub-handlers declare them in `_sub_handlers`, and the map
+    builder routes through them.
+
+Two calling conventions are supported, inferred from the method's own
+signature:
+
+    def foo(self, params):  →  method(params)
+        A single parameter named `params` means the method handles the
+        whole bundle dict itself.
+
+    def foo(self, value, other=0):  →  method(value=..., other=...)
+        Any other signature is called with keyword arguments, built by
+        forwarding each declared bundle arg (renamed via arg_map when
+        the method's parameter is spelled differently) and applying the
+        schema's default when the caller omitted the arg.
+
+Adding a command is now a same-file, single-method edit: write the
+decorated method, and dispatch picks it up.
 """
+
+import inspect
 
 from .registry import register_command
 
 
-def command(category, help_text, args):
+def command(category, help_text, args, arg_map=None):
     """
-    Decorator to register a command with its metadata
+    Register a method as a dispatchable command.
 
-    Usage:
-        @command(
-            category='layer',
-            help_text='Create a new layer',
-            args={
-                'name': {'type': 'str', 'required': True, 'help': 'Layer name'},
-                'layer_type': {'type': 'str', 'default': 'paintlayer', 'help': 'Layer type'}
-            }
-        )
-        def create_layer(self, name, layer_type='paintlayer'):
-            ...
+    Args:
+        category:  schema category, e.g. 'layer', 'brush'.
+        help_text: one-line description shown in the generated manual.
+        args:      schema arg spec, keyed by '--name', as before.
+        arg_map:   optional {bundle_arg: method_param} rename map.
+                   Bundle args not listed are forwarded under their own
+                   name.  Ignored for methods that take `params`.
     """
     def decorator(func):
         command_name = func.__name__
         register_command(category, command_name, help_text, args)
-        # Marker read back by build_dispatch_map().  Set on the
-        # function object itself, so it survives across every
-        # instance of the owning handler class.
+
+        # Markers read back by build_handler_map().
         func._kritomatic_command_name = command_name
+        func._kritomatic_arg_map = dict(arg_map) if arg_map else {}
+        func._kritomatic_bundle_args = [
+            a.lstrip('-') for a in args.keys()
+        ]
+        func._kritomatic_bundle_defaults = {
+            a.lstrip('-'): spec['default']
+            for a, spec in args.items()
+            if 'default' in spec
+        }
         return func
     return decorator
 
 
-def collect_command_names(handler):
-    """Return the directly-decorated @command method names on
-    `handler`.
+# ----------------------------------------------------------------------
+#  Introspection
+# ----------------------------------------------------------------------
 
-    Uses `dir()` + `getattr` rather than `inspect.getmembers` because
-    the marker lives on the function object, and going through
-    `__func__` explicitly removes any doubt about attribute lookup
-    forwarding from a bound method to its underlying function.
-    """
+def collect_command_names(handler):
+    """Names of the @command-decorated methods defined on `handler`."""
     found = set()
     for name in dir(handler):
         attr = getattr(handler, name, None)
@@ -68,41 +88,120 @@ def collect_command_names(handler):
 
 
 def all_command_names(handler):
-    """Every @command name reachable from `handler`, including those
-    owned by sub-handlers declared through `_sub_handlers`."""
+    """Every command name reachable from `handler`, including aliases
+    and, for container handlers, everything declared through
+    `_sub_handlers`."""
     names = set()
     sub = getattr(handler, '_sub_handlers', None)
     if sub:
         for s in sub:
             names |= all_command_names(s)
     names |= collect_command_names(handler)
+    names |= set(getattr(handler, '_aliases', {}).keys())
     return names
 
 
-def build_dispatch_map(handlers):
-    """Build {command_name: handler_instance} from an iterable of
-    handler instances.
+# ----------------------------------------------------------------------
+#  Invocation
+# ----------------------------------------------------------------------
 
-    A handler with `_sub_handlers` claims every command reachable
-    through its subtree.  This is how base.py's map routes a layer
-    command to the single LayerHandler instance, which then routes
-    the same command to the appropriate sub-handler via its own
-    map — the two-level dispatch structure is preserved, but neither
-    level needs a manual list of command names.
+def _make_leaf_caller(method):
+    """Return a callable (cmd_type, params) -> result for a single
+    @command-decorated bound method, applying the right convention."""
+    func = method.__func__
+    bundle_args = getattr(func, '_kritomatic_bundle_args', [])
+    bundle_defaults = getattr(func, '_kritomatic_bundle_defaults', {})
+    arg_map = getattr(func, '_kritomatic_arg_map', {})
 
-    Raises if the same command name is reachable from two handlers
-    in the same call.  Without the check, a duplicated name would
-    silently shadow one handler, with the winner depending on
-    iteration order.
+    sig = inspect.signature(func)
+    param_names = [p for p in sig.parameters if p != 'self']
+    passes_params = (param_names == ['params'])
+
+    if passes_params:
+        def caller(cmd_type, params):
+            return method(params)
+        return caller
+
+    def caller(cmd_type, params):
+        kwargs = {}
+        for bundle_arg in bundle_args:
+            if bundle_arg in params:
+                value = params[bundle_arg]
+            elif bundle_arg in bundle_defaults:
+                value = bundle_defaults[bundle_arg]
+            else:
+                # Required arg with no schema default and not
+                # supplied by the caller.  Skip; the method's own
+                # signature will raise a clear TypeError.
+                continue
+            method_param = arg_map.get(bundle_arg, bundle_arg)
+            kwargs[method_param] = value
+        return method(**kwargs)
+    return caller
+
+
+def build_handler_map(handler):
+    """{command_name: callable(cmd_type, params) -> result}.
+
+    For a container handler (one with `_sub_handlers`), routes each
+    command to the owning sub-handler's execute.  For a leaf handler,
+    routes each command to a caller that invokes the bound method
+    with the correct convention.
+
+    Raises if the same command name is claimed by two different
+    sources — that would otherwise be a silent shadow at runtime.
     """
+    sub = getattr(handler, '_sub_handlers', None)
+    if sub:
+        out = {}
+        for s in sub:
+            for name in all_command_names(s):
+                if name in out:
+                    raise RuntimeError(
+                        f"Command {name!r} is registered by two "
+                        f"sub-handlers: {type(out[name]).__name__} "
+                        f"and {type(s).__name__}"
+                    )
+                out[name] = s.execute
+        for alias, target in getattr(handler, '_aliases', {}).items():
+            if target in out:
+                out[alias] = out[target]
+        return out
+
     out = {}
-    for handler in handlers:
-        for cmd in all_command_names(handler):
-            if cmd in out:
-                raise RuntimeError(
-                    f"Command {cmd!r} is registered by two handlers: "
-                    f"{type(out[cmd]).__name__} and "
-                    f"{type(handler).__name__}"
-                )
-            out[cmd] = handler
+    for name in dir(handler):
+        attr = getattr(handler, name, None)
+        if not callable(attr):
+            continue
+        func = getattr(attr, '__func__', attr)
+        cmd_name = getattr(func, '_kritomatic_command_name', None)
+        if cmd_name:
+            out[cmd_name] = _make_leaf_caller(attr)
+    for alias, target in getattr(handler, '_aliases', {}).items():
+        if target in out:
+            out[alias] = out[target]
     return out
+
+
+# ----------------------------------------------------------------------
+#  Base class
+# ----------------------------------------------------------------------
+
+class AutoDispatchHandler:
+    """Base for every handler.  Builds its own dispatch map at init and
+    routes `execute(cmd_type, params)` through it.
+
+    Subclasses that own state call `super().__init__()` after their own
+    state is initialized.  Container subclasses set `_sub_handlers`
+    before calling super.
+    """
+    def __init__(self):
+        self._cmd_map = build_handler_map(self)
+
+    def execute(self, cmd_type, params):
+        caller = self._cmd_map.get(cmd_type)
+        if caller is None:
+            return {'success': False,
+                    'message': f'Unknown {type(self).__name__} command: '
+                               f'{cmd_type}'}
+        return caller(cmd_type, params)

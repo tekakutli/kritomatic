@@ -1,20 +1,8 @@
 from krita import Krita
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 
-class WindowHandler:
-    def execute(self, cmd_type, params):
-        """Execute window-related commands"""
-        if cmd_type == 'toggle_detached':
-            return self.toggle_detached()
-        elif cmd_type == 'toggle_fullscreen':
-            return self.toggle_fullscreen()
-        elif cmd_type == 'toggle_dockers':
-            return self.toggle_dockers()
-        elif cmd_type == 'toggle_docker_titles':
-            return self.toggle_docker_titles()
-        elif cmd_type == 'new_window':
-            return self.new_window()
-        return {'success': False, 'message': f'Unknown window command: {cmd_type}'}
+
+class WindowHandler(AutoDispatchHandler):
 
     @command(
         category='window',

@@ -1,26 +1,17 @@
 from krita import *
 from ..utils.color_utils import ColorUtils
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 import os
 import zipfile
 import tempfile
 from PyQt5.QtCore import QStandardPaths
 
-class PaletteHandler:
-    def execute(self, cmd_type, params):
-        if cmd_type == 'add_to_palette':
-            return self.add_color_to_palette(params.get('palette_name', ''))
-        elif cmd_type == 'create_palette':
-            return self.create_palette(
-                params.get('palette_name', ''),
-                params.get('columns', 8),
-                params.get('rows', 8)
-            )
-        elif cmd_type == 'activate_palette':
-            return self.activate_palette(params.get('palette_name', ''))
-        elif cmd_type == 'list_palettes':
-            return self.list_palettes()
-        return {'success': False, 'message': f'Unknown palette command: {cmd_type}'}
+
+class PaletteHandler(AutoDispatchHandler):
+    # Legacy dispatch name.  The schema advertises the method name
+    # `add_color_to_palette`; older callers use `add_to_palette`.
+    # Both route to the same method via the alias mechanism.
+    _aliases = {'add_to_palette': 'add_color_to_palette'}
 
     @command(
         category='palette',
@@ -62,7 +53,8 @@ class PaletteHandler:
             '--palette_name': {'type': 'str', 'required': True, 'help': 'Name of the new palette'},
             '--columns': {'type': 'int', 'default': 8, 'help': 'Number of columns'},
             '--rows': {'type': 'int', 'default': 8, 'help': 'Number of rows'}
-        }
+        },
+        arg_map={'palette_name': 'name'},
     )
     def create_palette(self, name, columns=8, rows=8):
         try:
@@ -106,7 +98,8 @@ class PaletteHandler:
         help_text='Activate a palette in the Palette Docker',
         args={
             '--palette_name': {'type': 'str', 'required': True, 'help': 'Name of the palette to activate'}
-        }
+        },
+        arg_map={'palette_name': 'name'},
     )
     def activate_palette(self, name):
         try:

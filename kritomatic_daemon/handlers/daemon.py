@@ -41,14 +41,10 @@ import sys
 import traceback
 
 from krita import Krita
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 
 
-class DaemonHandler:
-    def execute(self, cmd_type, params):
-        if cmd_type == 'reload_daemon':
-            return self.reload_daemon(params)
-        return {'success': False, 'message': f'Unknown daemon command: {cmd_type}'}
+class DaemonHandler(AutoDispatchHandler):
 
     @command(
         category='daemon',

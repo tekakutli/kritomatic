@@ -1,9 +1,11 @@
 from krita import Krita
 from PyQt5.QtCore import QPointF
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 
-class ViewHandler:
+
+class ViewHandler(AutoDispatchHandler):
     def __init__(self):
+        super().__init__()
         # Stack for view states: each entry is (zoom_level, center_x, center_y)
         self._zoom_stack = []
         # Single saved state for simple toggle
@@ -27,35 +29,6 @@ class ViewHandler:
         canvas = self._get_canvas()
         canvas.setZoomLevel(zoom)
         canvas.setPreferredCenter(QPointF(center_x, center_y))
-
-    def execute(self, cmd_type, params):
-        """Execute view-related commands"""
-        if cmd_type == 'push':
-            return self.push()
-        elif cmd_type == 'pop':
-            return self.pop()
-        elif cmd_type == 'toggle':
-            return self.toggle()
-        elif cmd_type == 'fit':
-            return self.fit()
-        elif cmd_type == 'fit_width':
-            return self.fit_width()
-        elif cmd_type == 'fit_height':
-            return self.fit_height()
-        elif cmd_type == 'zoom_to':
-            percent = params.get('percent', 100)
-            return self.zoom_to(percent)
-        elif cmd_type == 'zoom_in':
-            factor = params.get('factor', 1.2)
-            return self.zoom_in(factor)
-        elif cmd_type == 'zoom_out':
-            factor = params.get('factor', 1.2)
-            return self.zoom_out(factor)
-        elif cmd_type == 'reset':
-            return self.reset()
-        elif cmd_type == 'get_state':
-            return self.get_state()
-        return {'success': False, 'message': f'Unknown view command: {cmd_type}'}
 
     @command(
         category='view',

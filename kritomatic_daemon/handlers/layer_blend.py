@@ -1,12 +1,9 @@
 from krita import Krita
 from ..utils.refresh import refresh
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 
-class LayerBlendHandler:
-    def execute(self, cmd_type, params):
-        if cmd_type == 'create_blend_layer':
-            return self.create_blend_layer(params)
-        return {'success': False, 'message': f'Unknown blend command: {cmd_type}'}
+
+class LayerBlendHandler(AutoDispatchHandler):
 
     @command(
         category='layer',

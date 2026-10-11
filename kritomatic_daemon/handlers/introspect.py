@@ -14,29 +14,11 @@ to reproduce over a socket.
 """
 
 from krita import Krita
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 from ..utils.krita_actions import enumerate_actions
 
 
-class IntrospectHandler:
-    def execute(self, cmd_type, params):
-        if cmd_type == 'list_actions':
-            return self.list_actions(params)
-        elif cmd_type == 'list_filters':
-            return self.list_filters()
-        elif cmd_type == 'list_resources':
-            return self.list_resources(params)
-        elif cmd_type == 'list_dockers':
-            return self.list_dockers()
-        elif cmd_type == 'describe_active':
-            return self.describe_active(params)
-        elif cmd_type == 'list_extensions':
-            return self.list_extensions()
-        elif cmd_type == 'get_node_xml':
-            return self.get_node_xml(params)
-        elif cmd_type == 'describe_vector_layer':
-            return self.describe_vector_layer(params)
-        return {'success': False, 'message': f'Unknown introspect command: {cmd_type}'}
+class IntrospectHandler(AutoDispatchHandler):
 
     # ------------------------------------------------------------------
     #  Actions

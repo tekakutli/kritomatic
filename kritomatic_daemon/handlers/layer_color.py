@@ -1,14 +1,9 @@
 from krita import Krita
 from ..utils.refresh import refresh
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 
-class LayerColorHandler:
-    def execute(self, cmd_type, params):
-        if cmd_type == 'apply_color_to_alpha':
-            return self.apply_color_to_alpha(params)
-        elif cmd_type == 'add_color_to_alpha_mask':
-            return self.add_color_to_alpha_mask(params)
-        return {'success': False, 'message': f'Unknown color command: {cmd_type}'}
+
+class LayerColorHandler(AutoDispatchHandler):
 
     @command(
         category='layer',

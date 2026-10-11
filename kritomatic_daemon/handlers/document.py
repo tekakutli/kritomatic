@@ -2,53 +2,12 @@ import os
 import base64
 from krita import *
 from PyQt5.QtCore import QBuffer, QByteArray, QIODevice, Qt
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 from ..utils.refresh import refresh
 from ..utils.krita_actions import find_rotate_action
 
 
-class DocumentHandler:
-    def __init__(self):
-        pass
-
-    def execute(self, cmd_type, params):
-        if cmd_type == 'get_current_dimensions':
-            return self.get_current_dimensions()
-        elif cmd_type == 'create_new_from_current':
-            name = params.get('name', 'New Document')
-            return self.create_new_from_current(name)
-        elif cmd_type == 'create_new_with_dimensions':
-            name = params.get('name', 'New Document')
-            width = params.get('width', 1920)
-            height = params.get('height', 1080)
-            resolution = params.get('resolution', 300)
-            color_model = params.get('color_model', 'RGBA')
-            color_depth = params.get('color_depth', 'U8')
-            profile = params.get('profile', '')
-            return self.create_new_with_dimensions(name, width, height, resolution, color_model, color_depth, profile)
-        elif cmd_type == 'get_all_documents':
-            return self.get_all_documents()
-        elif cmd_type == 'save_document':
-            return self.save_document(params.get('file_path', ''))
-        elif cmd_type == 'open_document':
-            return self.open_document(params)
-        elif cmd_type == 'close_document':
-            return self.close_document(params)
-        elif cmd_type == 'export_document':
-            return self.export_document(params)
-        elif cmd_type == 'export_file_to_image':
-            return self.export_file_to_image(params)
-        elif cmd_type == 'rotate_document':
-            return self.rotate_document(params)
-        elif cmd_type == 'rotate_kra_file':
-            return self.rotate_kra_file(params)
-        elif cmd_type == 'get_document_thumbnail':
-            return self.get_document_thumbnail(params)
-        elif cmd_type == 'get_all_document_thumbnails':
-            return self.get_all_document_thumbnails(params)
-        elif cmd_type == 'activate_document':
-            return self.activate_document(params)
-        return {'success': False, 'message': f'Unknown document command: {cmd_type}'}
+class DocumentHandler(AutoDispatchHandler):
 
     # ------------------------------------------------------------------
     #  Shared helpers
@@ -139,7 +98,7 @@ class DocumentHandler:
         return doc.thumbnail(max_size, max_size)
 
     # ------------------------------------------------------------------
-    #  Existing commands
+    #  Commands
     # ------------------------------------------------------------------
 
     @command(
@@ -225,7 +184,14 @@ class DocumentHandler:
             '--name': {'type': 'str', 'default': 'New Document', 'help': 'Name for the new document'},
             '--width': {'type': 'int', 'default': 1920, 'help': 'Width in pixels'},
             '--height': {'type': 'int', 'default': 1080, 'help': 'Height in pixels'},
-            '--resolution': {'type': 'float', 'default': 300, 'help': 'Resolution in DPI'}
+            '--resolution': {'type': 'float', 'default': 300, 'help': 'Resolution in DPI'},
+            '--color_model': {'type': 'str', 'default': 'RGBA',
+                              'help': 'Color model, e.g. RGBA, RGB, GRAYA, CMYK, LAB'},
+            '--color_depth': {'type': 'str', 'default': 'U8',
+                              'help': 'Color depth, e.g. U8, U16, F16, F32'},
+            '--profile': {'type': 'str', 'default': '',
+                          'help': 'ICC color profile name; empty for the '
+                                  'application default'},
         }
     )
     def create_new_with_dimensions(self, name, width, height, resolution=300,
@@ -526,10 +492,6 @@ class DocumentHandler:
             }
         except Exception as e:
             return {'success': False, 'message': str(e)}
-
-    # ------------------------------------------------------------------
-    #  Thumbnails
-    # ------------------------------------------------------------------
 
     @command(
         category='doc',

@@ -14,22 +14,11 @@ from .diffusion import DiffusionHandler
 from .introspect import IntrospectHandler
 from .daemon import DaemonHandler
 from ..registry import get_command_registry
-from ..decorators import build_dispatch_map
+from ..decorators import AutoDispatchHandler
 from ..utils.refresh import begin_defer, end_defer
 
 
-# Command names that reach a handler's execute method without being
-# registered through @command.  These are legacy aliases: they work
-# today because a handler's own if/elif chain happens to list them,
-# but they do not appear in the auto-generated schema.  Preserved
-# here so that callers using the older name keep working after the
-# dispatch map replaced the top-level if/elif chain.
-_ALIASES = {
-    'add_to_palette': 'palette',
-}
-
-
-class CommandHandler:
+class CommandHandler(AutoDispatchHandler):
     def __init__(self):
         self.handlers = {
             'brush': BrushHandler(),
@@ -43,14 +32,11 @@ class CommandHandler:
             'introspect': IntrospectHandler(),
             'daemon': DaemonHandler()
         }
-        # Map {command_name: handler_instance}, built by introspecting
-        # the @command markers on every handler's methods (and, for
-        # container handlers like LayerHandler, on their declared
-        # sub-handlers).  Replaces the top-level if/elif chain that
-        # used to live in _dispatch.  Rebuilt on every CommandHandler
-        # construction — see handlers/daemon.py for the reload path
-        # that relies on this.
-        self._cmd_map = build_dispatch_map(self.handlers.values())
+        # Declared so build_handler_map() descends into every
+        # sub-handler and claims each of their commands for the
+        # appropriate instance.
+        self._sub_handlers = list(self.handlers.values())
+        super().__init__()
 
     def _send_line(self, client_socket, payload):
         try:
@@ -188,27 +174,18 @@ class CommandHandler:
     def _dispatch(self, command):
         cmd_type = command.get('type')
 
+        # get_schema is not a @command-decorated method anywhere; it
+        # is generated here so the schema reflects exactly what the
+        # registry knows about.
         if cmd_type == 'get_schema':
             registry = get_command_registry()
             registry_str = json.dumps(registry, sort_keys=True)
             version = hashlib.md5(registry_str.encode()).hexdigest()[:8]
-            result = {
-                    'success': True,
-                    'message': 'Command registry retrieved',
-                    'version': version,
-                    'data': registry
+            return {
+                'success': True,
+                'message': 'Command registry retrieved',
+                'version': version,
+                'data': registry,
             }
-            return result
 
-        handler = self._cmd_map.get(cmd_type)
-        if handler is None:
-            # Legacy aliases — command names that reach a handler's
-            # execute method without having been registered via
-            # @command, and so are absent from the auto-built map.
-            alias_target = _ALIASES.get(cmd_type)
-            if alias_target:
-                handler = self.handlers.get(alias_target)
-        if handler is None:
-            return {'success': False,
-                    'message': f'Unknown command type: {cmd_type}'}
-        return handler.execute(cmd_type, command)
+        return self.execute(cmd_type, command)

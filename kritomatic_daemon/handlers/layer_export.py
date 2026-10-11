@@ -2,16 +2,10 @@ import random
 import string
 from pathlib import Path
 from krita import Krita
-from ..utils.refresh import refresh
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 
-class LayerExportHandler:
-    def execute(self, cmd_type, params):
-        if cmd_type == 'move_layer_to_new_document':
-            return self.move_layer_to_new_document(params)
-        elif cmd_type == 'export_layer_to_file':
-            return self.export_layer_to_file(params)
-        return {'success': False, 'message': f'Unknown export command: {cmd_type}'}
+
+class LayerExportHandler(AutoDispatchHandler):
 
     @command(
         category='layer',
@@ -50,7 +44,6 @@ class LayerExportHandler:
             duplicated_layer = src_layer.duplicate()
             dst_doc.rootNode().addChildNode(duplicated_layer, None)
             app.activeWindow().addView(dst_doc)
-            dst_refresh(doc)
 
             return {
                 'success': True,
@@ -114,7 +107,6 @@ class LayerExportHandler:
             temp_doc = app.createDocument(width, height, "__temp_export__", src_doc.colorModel(), src_doc.colorDepth(), src_doc.colorProfile(), src_doc.resolution())
             duplicated_layer = src_layer.duplicate()
             temp_doc.rootNode().addChildNode(duplicated_layer, None)
-            temp_refresh(doc)
             temp_doc.saveAs(output_path)
             temp_doc.close()
 
@@ -129,8 +121,6 @@ class LayerExportHandler:
                 original_parent.addChildNode(file_layer, current_children[original_position])
             else:
                 original_parent.addChildNode(file_layer, None)
-
-            src_refresh(doc)
 
             return {
                 'success': True,

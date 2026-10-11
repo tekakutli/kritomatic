@@ -1,24 +1,9 @@
 from krita import Krita
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 from ..utils.refresh import refresh
 
-class LayerBasicHandler:
-    def execute(self, cmd_type, params):
-        if cmd_type == 'create_layer':
-            return self.create_layer(params)
-        elif cmd_type == 'list_layers':
-            return self.list_layers()
-        elif cmd_type == 'set_active_layer':
-            return self.set_active_layer(params)
-        elif cmd_type == 'rename_active_layer':
-            return self.rename_active_layer(params)
-        elif cmd_type == 'rename_layer_by_name':
-            return self.rename_layer_by_name(params)
-        elif cmd_type == 'move_layer_to_group':
-            return self.move_layer_to_group(params)
-        elif cmd_type == 'move_active_layer_to_group':
-            return self.move_active_layer_to_group(params)
-        return {'success': False, 'message': f'Unknown basic layer command: {cmd_type}'}
+
+class LayerBasicHandler(AutoDispatchHandler):
 
     def _get_prev_sibling(self, node):
         parent = node.parentNode()

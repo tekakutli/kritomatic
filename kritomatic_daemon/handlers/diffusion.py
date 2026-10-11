@@ -2,13 +2,14 @@ from krita import Krita
 from PyQt5.QtWidgets import QWidget, QStackedWidget, QLabel, QComboBox, QLineEdit, QPushButton, QCheckBox, QSpinBox, QDoubleSpinBox
 from PyQt5.QtCore import QPoint, Qt
 from PyQt5.QtGui import QMouseEvent
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 import json
 import os
 
 
-class DiffusionHandler:
+class DiffusionHandler(AutoDispatchHandler):
     def __init__(self):
+        super().__init__()
         self._docker = None
         self._stacked = None
 
@@ -113,26 +114,6 @@ class DiffusionHandler:
         switch.mousePressEvent(press_event)
         switch.mouseReleaseEvent(release_event)
 
-    def execute(self, cmd_type, params):
-        """Execute diffusion-related commands"""
-        if cmd_type == 'list_workflows':
-            return self.list_workflows()
-        elif cmd_type == 'switch_workflow':
-            return self.switch_workflow(params.get('workflow', ''))
-        elif cmd_type == 'get_params':
-            return self.get_params()
-        elif cmd_type == 'set_param':
-            param_name = params.get('param', '')
-            value = params.get('value', '')
-            return self.set_param(param_name, value)
-        elif cmd_type == 'generate':
-            return self.generate()
-        elif cmd_type == 'export_params':
-            return self.export_params(params)
-        elif cmd_type == 'import_params':
-            return self.import_params(params)
-        return {'success': False, 'message': f'Unknown diffusion command: {cmd_type}'}
-
     @command(
         category='diffusion',
         help_text='List available workflows',
@@ -178,7 +159,8 @@ class DiffusionHandler:
         help_text='Switch to a different workflow',
         args={
             '--workflow': {'type': 'str', 'required': True, 'help': 'Name of the workflow to switch to'}
-        }
+        },
+        arg_map={'workflow': 'workflow_name'},
     )
     def switch_workflow(self, workflow_name):
         """Switch to a different workflow"""
@@ -286,7 +268,8 @@ class DiffusionHandler:
         args={
             '--param': {'type': 'str', 'required': True, 'help': 'Parameter name'},
             '--value': {'type': 'str', 'required': True, 'help': 'Parameter value'}
-        }
+        },
+        arg_map={'param': 'param_name'},
     )
     def set_param(self, param_name, value):
         """Set a workflow parameter by name"""

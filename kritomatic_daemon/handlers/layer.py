@@ -6,10 +6,10 @@ from .layer_fill import LayerFillHandler
 from .layer_color import LayerColorHandler
 from .layer_export import LayerExportHandler
 from .layer_blend import LayerBlendHandler
-from ..decorators import build_dispatch_map
+from ..decorators import AutoDispatchHandler
 
 
-class LayerHandler:
+class LayerHandler(AutoDispatchHandler):
     def __init__(self):
         self.basic = LayerBasicHandler()
         self.file = LayerFileHandler()
@@ -19,12 +19,8 @@ class LayerHandler:
         self.color = LayerColorHandler()
         self.export = LayerExportHandler()
         self.blend = LayerBlendHandler()
-
-        # Declared explicitly so the base dispatch map (built in
-        # CommandHandler.__init__) can see through this container and
-        # claim every layer command for the LayerHandler instance.
-        # The recursion in all_command_names() reads exactly this
-        # attribute.
+        # Container dispatch: build_handler_map() descends into every
+        # sub-handler and routes each layer command to its owner.
         self._sub_handlers = [
             self.basic,
             self.file,
@@ -35,14 +31,4 @@ class LayerHandler:
             self.export,
             self.blend,
         ]
-
-        # Route each layer command name to its owning sub-handler.
-        # Replaces the if/elif chain that used to live in execute().
-        self._cmd_map = build_dispatch_map(self._sub_handlers)
-
-    def execute(self, cmd_type, params):
-        handler = self._cmd_map.get(cmd_type)
-        if handler is None:
-            return {'success': False,
-                    'message': f'Unknown layer command: {cmd_type}'}
-        return handler.execute(cmd_type, params)
+        super().__init__()

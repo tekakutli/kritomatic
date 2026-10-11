@@ -4,7 +4,7 @@ import re
 import xml.etree.ElementTree as ET
 from krita import Krita
 from ..utils.refresh import refresh
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 
 
 _DOCTYPE_RE = re.compile(r'^\s*<!DOCTYPE[^>]*>\s*', re.IGNORECASE)
@@ -150,17 +150,7 @@ def _column_to_qt_attrs(h):
     return m11, m12, m13, m21, m22, m23, m31, m32, m33
 
 
-class LayerTransformHandler:
-    def execute(self, cmd_type, params):
-        if cmd_type == 'create_transform_mask':
-            return self.create_transform_mask(params)
-        elif cmd_type == 'transform_mask':
-            return self.transform_mask(params)
-        elif cmd_type == 'set_perspective_transform_mask':
-            return self.set_perspective_transform_mask(params)
-        elif cmd_type == 'fit_to_canvas':
-            return self.fit_to_canvas(params)
-        return {'success': False, 'message': f'Unknown transform command: {cmd_type}'}
+class LayerTransformHandler(AutoDispatchHandler):
 
     @command(
         category='layer',

@@ -1,36 +1,16 @@
 from krita import *
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 
-class BrushHandler:
-    def execute(self, cmd_type, params):
-        if cmd_type == 'set_brush_size':
-            return self.set_brush_size(params.get('value', 50))
-        elif cmd_type == 'set_brush_opacity':
-            return self.set_brush_opacity(params.get('value', 100))
-        elif cmd_type == 'set_brush_flow':
-            return self.set_brush_flow(params.get('value', 100))
-        elif cmd_type == 'set_brush_blending_mode':
-            return self.set_brush_blending_mode(params.get('value', 'normal'))
-        elif cmd_type == 'set_brush_preset':
-            return self.set_brush_preset(params.get('value', ''))
-        elif cmd_type == 'list_brush_presets':
-            return self.list_brush_presets()
-        elif cmd_type == 'get_brush_properties':
-            return self.get_brush_properties()
-        elif cmd_type == 'set_foreground_color':
-            return self.set_foreground_color(params.get('color', '#000000'))
-        elif cmd_type == 'set_background_color':
-            return self.set_background_color(params.get('color', '#000000'))
-        elif cmd_type == 'select_opaque':
-            return self.select_opaque(params.get('mode', 'replace'))
-        return {'success': False, 'message': f'Unknown brush command: {cmd_type}'}
+
+class BrushHandler(AutoDispatchHandler):
 
     @command(
         category='brush',
         help_text='Set brush size in pixels',
         args={
             '--value': {'type': 'int', 'required': True, 'help': 'Brush size in pixels (1-1000)'}
-        }
+        },
+        arg_map={'value': 'size'},
     )
     def set_brush_size(self, size):
         try:
@@ -46,7 +26,8 @@ class BrushHandler:
         help_text='Set brush opacity percentage',
         args={
             '--value': {'type': 'int', 'required': True, 'help': 'Opacity percentage (0-100)'}
-        }
+        },
+        arg_map={'value': 'opacity'},
     )
     def set_brush_opacity(self, opacity):
         try:
@@ -62,7 +43,8 @@ class BrushHandler:
         help_text='Set brush flow percentage',
         args={
             '--value': {'type': 'int', 'required': True, 'help': 'Flow percentage (0-100)'}
-        }
+        },
+        arg_map={'value': 'flow'},
     )
     def set_brush_flow(self, flow):
         try:
@@ -84,7 +66,8 @@ class BrushHandler:
                             'difference', 'exclusion', 'hue', 'saturation', 'color', 'luminosity'],
                 'help': 'Blending mode'
             }
-        }
+        },
+        arg_map={'value': 'mode'},
     )
     def set_brush_blending_mode(self, mode):
         try:
@@ -99,7 +82,8 @@ class BrushHandler:
         help_text='Switch to a brush preset',
         args={
             '--value': {'type': 'str', 'required': True, 'help': 'Brush preset name (partial match works)'}
-        }
+        },
+        arg_map={'value': 'preset_name'},
     )
     def set_brush_preset(self, preset_name):
         try:
@@ -148,7 +132,8 @@ class BrushHandler:
         help_text='Set foreground color',
         args={
             '--color': {'type': 'str', 'required': True, 'help': 'Hex color (e.g., #ff0000)'}
-        }
+        },
+        arg_map={'color': 'color_hex'},
     )
     def set_foreground_color(self, color_hex):
         try:
@@ -169,7 +154,8 @@ class BrushHandler:
         help_text='Set background color',
         args={
             '--color': {'type': 'str', 'required': True, 'help': 'Hex color (e.g., #0000ff)'}
-        }
+        },
+        arg_map={'color': 'color_hex'},
     )
     def set_background_color(self, color_hex):
         try:

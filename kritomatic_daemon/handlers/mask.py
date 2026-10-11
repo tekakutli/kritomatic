@@ -1,18 +1,8 @@
 from krita import *
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 
-class MaskHandler:
-    def execute(self, cmd_type, params):
-        if cmd_type == 'add_selection_mask':
-            return self.add_selection_mask(
-                params.get('layer_name', ''),
-                params.get('use_current_selection', False)
-            )
-        elif cmd_type == 'add_selection_mask_to_active':
-            return self.add_selection_mask_to_active(
-                params.get('use_current_selection', False)
-            )
-        return {'success': False, 'message': f'Unknown mask command: {cmd_type}'}
+
+class MaskHandler(AutoDispatchHandler):
 
     @command(
         category='mask',
@@ -20,7 +10,8 @@ class MaskHandler:
         args={
             '--layer_name': {'type': 'str', 'required': True, 'help': 'Name of the target layer'},
             '--use_current_selection': {'type': 'bool', 'default': False, 'help': 'Use current global selection'}
-        }
+        },
+        arg_map={'use_current_selection': 'use_selection'},
     )
     def add_selection_mask(self, layer_name, use_selection=False):
         try:
@@ -69,7 +60,8 @@ class MaskHandler:
         help_text='Add a selection mask to the currently active layer',
         args={
             '--use_current_selection': {'type': 'bool', 'default': False, 'help': 'Use current global selection'}
-        }
+        },
+        arg_map={'use_current_selection': 'use_selection'},
     )
     def add_selection_mask_to_active(self, use_selection=False):
         try:

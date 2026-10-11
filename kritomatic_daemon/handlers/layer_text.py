@@ -5,7 +5,7 @@ import re
 from krita import Krita
 from PyQt5.QtGui import QTransform
 from PyQt5.QtCore import QPointF
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 from ..utils.refresh import refresh
 
 
@@ -639,33 +639,7 @@ def _fallback_word_box(shape, transform, text):
     }]
 
 
-class LayerTextHandler:
-    def execute(self, cmd_type, params):
-        if cmd_type == 'add_vector_text':
-            return self.add_vector_text(params)
-        elif cmd_type == 'add_vector_polygon':
-            return self.add_vector_polygon(params)
-        elif cmd_type == 'update_vector_text':
-            return self.update_vector_text(params)
-        elif cmd_type == 'list_shapes':
-            return self.list_shapes(params)
-        elif cmd_type == 'replace_all_text':
-            return self.replace_all_text(params)
-        elif cmd_type == 'extract_all_text':
-            return self.extract_all_text(params)
-        elif cmd_type == 'list_text_layers':
-            return self.list_text_layers(params)
-        elif cmd_type == 'get_layer_text_metadata':
-            return self.get_layer_text_metadata(params)
-        elif cmd_type == 'patch_layer_text':
-            return self.patch_layer_text(params)
-        elif cmd_type == 'dump_all_text_shapes':
-            return self.dump_all_text_shapes(params)
-        elif cmd_type == 'move_text_handle':
-            return self.move_text_handle(params)
-        elif cmd_type == 'set_text_inline_size':
-            return self.set_text_inline_size(params)
-        return {'success': False, 'message': f'Unknown text command: {cmd_type}'}
+class LayerTextHandler(AutoDispatchHandler):
 
     # ------------------------------------------------------------------
     # add_vector_text

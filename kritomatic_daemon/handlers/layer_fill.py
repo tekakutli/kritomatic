@@ -1,14 +1,9 @@
 from krita import Krita
 from ..utils.refresh import refresh
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 
-class LayerFillHandler:
-    def execute(self, cmd_type, params):
-        if cmd_type == 'fill_layer':
-            return self.fill_layer(params)
-        elif cmd_type == 'fill_selection':
-            return self.fill_selection(params)
-        return {'success': False, 'message': f'Unknown fill command: {cmd_type}'}
+
+class LayerFillHandler(AutoDispatchHandler):
 
     @command(
         category='layer',

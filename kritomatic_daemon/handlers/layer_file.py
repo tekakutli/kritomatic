@@ -8,22 +8,10 @@ from PyQt5.QtGui import QImage
 from PyQt5.QtCore import Qt, QThread
 from krita import Krita
 from ..utils.refresh import refresh
-from ..decorators import command
+from ..decorators import command, AutoDispatchHandler
 
 
-class LayerFileHandler:
-    def execute(self, cmd_type, params):
-        if cmd_type == 'create_file_layer':
-            return self.create_file_layer(params)
-        elif cmd_type == 'convert_to_file_layer':
-            return self.convert_to_file_layer(params)
-        elif cmd_type == 'embed_image_as_layer':
-            return self.embed_image_as_layer(params)
-        elif cmd_type == 'import_kra_as_group':
-            return self.import_kra_as_group(params)
-        elif cmd_type == 'paste_document_transform_as_layer':
-            return self.paste_document_transform_as_layer(params)
-        return {'success': False, 'message': f'Unknown file layer command: {cmd_type}'}
+class LayerFileHandler(AutoDispatchHandler):
 
     @command(
         category='layer',

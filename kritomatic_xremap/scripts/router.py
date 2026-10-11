@@ -574,6 +574,23 @@ TOOLS = {
             "BACKGROUND_COLOR",
         ],
     },
+    "imgs2merged": {
+        "file": "imgs2merged.py",
+        "entry": "main",
+        "params": [
+            "INPUT_DIR",
+            "HORIZONTAL",
+            "LIMIT_ENABLED",
+            "LIMIT",
+            "OUTPUT_PATH",
+            "IMAGE_EXTENSIONS",
+            "SORT_ORDER",
+            "SEPARATOR_ENABLED",
+            "SEPARATOR_COLOR",
+            "SEPARATOR_THICKNESS",
+            "BACKGROUND_COLOR",
+        ],
+    },
     "imgs2pattern_interleaved": {
         "file": "imgs2pattern_interleaved.py",
         "entry": "main",

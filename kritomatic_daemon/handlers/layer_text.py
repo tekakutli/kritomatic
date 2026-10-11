@@ -1,3 +1,4 @@
+import html
 import json
 import math
 import re
@@ -12,10 +13,14 @@ from ..utils.refresh import refresh
 # SVG parsing helpers
 # ==========================================================================
 
-_TEXT_BODY_RE = re.compile(r'<text[^>]*>([^<]*)</text>')
-_ATTR_RE = re.compile(r'\b([a-zA-Z-]+)="([^"]*)"')
-_STYLE_RE = re.compile(r'style="([^"]*)"')
+_TEXT_BODY_RE = re.compile(r'<text[^>]*>(.*?)</text>', re.DOTALL)
+_TAG_RE       = re.compile(r'<[^>]+>')
+_ATTR_RE      = re.compile(r'\b([a-zA-Z-]+)="([^"]*)"')
+_STYLE_RE     = re.compile(r'style="([^"]*)"')
 _STYLE_PROP_RE = re.compile(r'([a-zA-Z-]+)\s*:\s*([^;]+)')
+
+_INLINE_SIZE_RE  = re.compile(r'inline-size:\s*([0-9.]+)')
+_TEXT_ANCHOR_RE  = re.compile(r'text-anchor="([^"]*)"')
 
 
 def _parse_text_svg(svg):
@@ -23,7 +28,22 @@ def _parse_text_svg(svg):
 
     m = _TEXT_BODY_RE.search(svg)
     if m:
-        out['text'] = m.group(1)
+        raw = m.group(1)
+        # Krita emits <tspan> elements when a run inside the string
+        # carries its own style (font, weight, stretch, ...).  The
+        # `text` field this function produces is meant to be the
+        # visible characters, not the SVG markup, so strip the
+        # nested tags and decode entities.
+        #
+        # Order matters.  Unescaping first would turn a literal
+        # "&lt;tspan&gt;" the user typed into "<tspan>", which the
+        # tag pass would then eat.  Stripping first leaves
+        # entity-encoded angle brackets intact through the tag pass,
+        # and the unescape restores them as literal characters in
+        # the visible text.
+        raw = _TAG_RE.sub('', raw)
+        raw = html.unescape(raw)
+        out['text'] = raw
 
     attrs = dict(_ATTR_RE.findall(svg))
 
@@ -62,6 +82,14 @@ def _parse_text_svg(svg):
         out['alignment'] = 'right'
     else:
         out['alignment'] = 'left'
+
+    if 'inline-size' in style_props:
+        try:
+            out['inline_size'] = float(style_props['inline-size'])
+        except (TypeError, ValueError):
+            pass
+    if 'white-space' in style_props:
+        out['white_space'] = style_props['white-space']
 
     return out
 
@@ -126,29 +154,166 @@ def _collect_vector_layers(doc):
 
 
 # ==========================================================================
+# Inline-size handle utilities
+# ==========================================================================
+#
+# Krita's SVG 2 "inline wrapped" text mode draws two vertical handles
+# at the wrapping area's left and right edges.  Those edges sit, in
+# the text shape's local frame:
+#
+#     text-anchor="start"    left = 0     right = +I
+#     text-anchor="middle"   left = -I/2  right = +I/2
+#     text-anchor="end"      left = -I    right = 0
+#
+# where I is the shape's inline-size.  In the parent frame the edges
+# are the images of those local points under the shape's
+# transformation.
+
+_ALPHA = {'start': 0.0,  'middle': -0.5, 'end': -1.0}
+_BETA  = {'start': 1.0,  'middle':  0.5, 'end':  0.0}
+_GAMMA = {'start': 0.5,  'middle':  0.0, 'end': -0.5}
+
+
+def _get_inline_size(shape):
+    try:
+        svg = shape.toSvg()
+    except Exception:
+        return None
+    m = _INLINE_SIZE_RE.search(svg)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _get_anchor_mode(shape):
+    try:
+        svg = shape.toSvg()
+    except Exception:
+        return 'start'
+    m = _TEXT_ANCHOR_RE.search(svg)
+    if not m:
+        return 'start'
+    v = m.group(1)
+    if v in ('start', 'middle', 'end'):
+        return v
+    if v == 'left':   return 'start'
+    if v == 'right':  return 'end'
+    if v == 'center': return 'middle'
+    return 'start'
+
+
+def _get_transformation(shape):
+    if hasattr(shape, 'transformation'):
+        try:
+            t = shape.transformation()
+            if t is not None:
+                return t
+        except Exception:
+            pass
+    return QTransform()
+
+
+def _linear_sq(T):
+    return T.m11() * T.m11() + T.m12() * T.m12()
+
+
+def _make_transform_like(T, new_m31, new_m32):
+    return QTransform(
+        T.m11(), T.m12(), T.m13(),
+        T.m21(), T.m22(), T.m23(),
+        new_m31, new_m32, T.m33(),
+    )
+
+
+def _get_inline_size_from_svg(svg):
+    """Return the numeric inline-size parsed out of a text SVG, or
+    None.  Used to identify a specific shape by its inline-size value
+    rather than by list position."""
+    m = _INLINE_SIZE_RE.search(svg)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _rebuild_inline_shape(layer, old_shape, new_I, new_T):
+    """Replace `old_shape` on `layer` with the same SVG but a new
+    inline-size, and apply `new_T`.
+
+    Only the numeric inline-size value in the style attribute is
+    touched.  Fill, stroke, font-size, text-anchor,
+    dominant-baseline, and the text body itself are preserved
+    character-for-character.
+
+    The new shape is found by matching the inline-size value that
+    was just written, not by taking `layer.shapes()[-1]`.  Krita's
+    shape container order is not guaranteed to be creation order,
+    so index -1 can pick the OLD shape; when that happens the
+    transform is set on the shape about to be removed and the new
+    shape is left with an identity transform (which lands it at the
+    document origin).
+    """
+    svg = old_shape.toSvg()
+    svg_new = _INLINE_SIZE_RE.sub(
+        'inline-size: %.6f' % new_I, svg, count=1,
+    )
+
+    doc = Krita.instance().activeDocument()
+    if doc is None:
+        raise RuntimeError("no active document")
+    wrapper = (
+        '<svg width="%d" height="%d" xmlns="http://www.w3.org/2000/svg">'
+        '%s</svg>'
+    ) % (doc.width(), doc.height(), svg_new)
+
+    layer.addShapesFromSvg(wrapper)
+
+    # Find the newly-added shape by its inline-size value.
+    new_shape = None
+    for s in layer.shapes():
+        try:
+            s_I = _get_inline_size_from_svg(s.toSvg())
+        except Exception:
+            continue
+        if s_I is None:
+            continue
+        if abs(s_I - new_I) < 1e-6:
+            new_shape = s
+            break
+    if new_shape is None:
+        raise RuntimeError("new shape not found after rebuild")
+
+    new_shape.setTransformation(new_T)
+    for m in ('update', 'updateAbsoluteGeometry'):
+        if hasattr(new_shape, m):
+            try:
+                getattr(new_shape, m)()
+                break
+            except Exception:
+                continue
+
+    # Force the transform to be committed before the old shape is
+    # removed.  Inside a batch, refresh(doc) is deferred; a direct
+    # refreshProjection here ensures the renderer is looking at the
+    # new shape's state when the old one goes away.
+    try:
+        doc.refreshProjection()
+    except Exception:
+        pass
+
+    old_shape.remove()
+
+    return new_shape
+
+
+# ==========================================================================
 # Pixel-measured word boxes
 # ==========================================================================
-# Rather than predicting where a word should be from Qt font metrics,
-# read the layer's own rendered pixels and measure.  Krita's renderer is
-# the only authority on where Krita draws the glyphs, and the layer's
-# projectionPixelData() is Krita's own output.
-#
-# For each text shape:
-#   1.  Get the layer's bounds() and projectionPixelData().
-#   2.  For every inked pixel, inverse-transform its document-space
-#       center back into the shape's local frame.
-#   3.  Cluster the local x-coordinates by gaps larger than a
-#       threshold; each cluster is a word.
-#   4.  Merge the smallest-gap neighbours until the cluster count
-#       matches the number of whitespace-separated words in the text.
-#   5.  For each cluster, compute the min/max local x and y of its
-#       ink pixels.  Those are the word's local-frame rectangle.
-#   6.  Map each rectangle's four corners through the shape's
-#       transformation and report them in document space.
-#
-# Fallback: if the pixel scan yields nothing, use the shape's own
-# boundingBox() mapped through the transform, so the shape still
-# appears on the board.
 
 def _source_words(text):
     out = []
@@ -179,8 +344,6 @@ def _merge_runs(runs, target_count):
 
 
 def _words_from_pixels(layer, transform, text):
-    """Return a list of { word, corners: [[x,y]x4] } in document
-    space, measured from the layer's own rendered pixels."""
     try:
         b = layer.bounds()
     except Exception:
@@ -207,7 +370,6 @@ def _words_from_pixels(layer, transform, text):
     mi21 = t_inv.m21(); mi22 = t_inv.m22()
     mi31 = t_inv.m31(); mi32 = t_inv.m32()
 
-    # Collect the local-frame position of every inked pixel.
     ink = []
     for yy in range(bh):
         base = yy * bw
@@ -222,7 +384,6 @@ def _words_from_pixels(layer, transform, text):
     if not ink:
         return []
 
-    # Cluster by local x.
     xs_sorted = sorted(p[0] for p in ink)
     span = xs_sorted[-1] - xs_sorted[0]
     threshold = max(4.0, span / 40.0)
@@ -237,7 +398,6 @@ def _words_from_pixels(layer, transform, text):
         prev = x
     runs.append((cur_start, prev))
 
-    # Merge until the cluster count matches the source words.
     words = _source_words(text)
     target = max(1, len(words))
     runs = _merge_runs(runs, target)
@@ -272,8 +432,181 @@ def _words_from_pixels(layer, transform, text):
     return result
 
 
+# ==========================================================================
+# Multi-line (inline-wrapped) word boxes
+# ==========================================================================
+#
+# SVG 2 inline-wrapped text flows across multiple lines within a single
+# text shape.  Two words on adjacent lines overlap in x, so the
+# x-projection gap test used by `_words_from_pixels` cannot separate
+# them: the whole wrapped block clusters into one run and the result is
+# a single box around the entire paragraph.  Clustering in y first
+# (into text lines) and then in x within each line recovers the
+# per-word boxes without changing how pre-positioned text is measured.
+
+def _split_ink_into_lines(ink):
+    """Partition ink pixels into text lines by y-coordinate.
+
+    Within a line, ink varies in y over roughly the font's cap-height,
+    so consecutive y-values are dense (usually step 1).  Between lines
+    there is a gutter of roughly line-height minus cap-height.  The
+    largest gap between consecutive y-values is therefore a real
+    gutter when the text has multiple lines, and tiny when it has one.
+    Splitting at half that gap separates lines without touching
+    within-line variation.
+    """
+    if not ink:
+        return []
+    ink_by_y = sorted(ink, key=lambda p: p[1])
+    ys = [p[1] for p in ink_by_y]
+
+    if len(ys) < 2:
+        threshold = 1.0
+    else:
+        gaps = [ys[i + 1] - ys[i] for i in range(len(ys) - 1)]
+        largest = max(gaps)
+        threshold = max(2.0, largest * 0.5)
+
+    lines = []
+    cur = [ink_by_y[0]]
+    prev_y = ink_by_y[0][1]
+    for p in ink_by_y[1:]:
+        if p[1] - prev_y > threshold:
+            lines.append(cur)
+            cur = [p]
+        else:
+            cur.append(p)
+        prev_y = p[1]
+    lines.append(cur)
+    return lines
+
+
+def _cluster_line_by_x(line_pixels):
+    """Cluster one line's ink into x-runs (candidate words)."""
+    xs = sorted(p[0] for p in line_pixels)
+    x_span = xs[-1] - xs[0]
+    threshold = max(4.0, x_span / 40.0)
+    runs = []
+    cur_start = xs[0]
+    prev = xs[0]
+    for x in xs[1:]:
+        if x - prev > threshold:
+            runs.append((cur_start, prev))
+            cur_start = x
+        prev = x
+    runs.append((cur_start, prev))
+    return runs
+
+
+def _words_from_pixels_wrapped(layer, transform, text):
+    """Per-word boxes for inline-wrapped text.
+
+    Identical setup to `_words_from_pixels` — same pixel read, same
+    inverse transform, same ink extraction.  The difference is the
+    clustering: lines first (by y), then words within each line (by
+    x).  Reading order is line 1 left-to-right, line 2 left-to-right,
+    which is the order `_source_words(text)` yields.
+    """
+    try:
+        b = layer.bounds()
+    except Exception:
+        return []
+    bx, by = int(b.x()), int(b.y())
+    bw, bh = int(b.width()), int(b.height())
+    if bw <= 0 or bh <= 0:
+        return []
+
+    try:
+        raw = layer.projectionPixelData(bx, by, bw, bh)
+    except Exception:
+        return []
+    if not raw:
+        return []
+    pixels = bytes(raw)
+    if len(pixels) < bw * bh * 4:
+        return []
+
+    t_inv, ok = transform.inverted()
+    if not ok:
+        return []
+    mi11 = t_inv.m11(); mi12 = t_inv.m12()
+    mi21 = t_inv.m21(); mi22 = t_inv.m22()
+    mi31 = t_inv.m31(); mi32 = t_inv.m32()
+
+    ink = []
+    for yy in range(bh):
+        base = yy * bw
+        dy = by + yy + 0.5
+        for xx in range(bw):
+            if pixels[(base + xx) * 4 + 3] > 0:
+                dx = bx + xx + 0.5
+                lx = dx * mi11 + dy * mi21 + mi31
+                ly = dx * mi12 + dy * mi22 + mi32
+                ink.append((lx, ly))
+
+    if not ink:
+        return []
+
+    lines = _split_ink_into_lines(ink)
+
+    # Collect candidate runs as (line_idx, x0, x1).
+    runs = []
+    for li, line_pixels in enumerate(lines):
+        for x0, x1 in _cluster_line_by_x(line_pixels):
+            runs.append((li, x0, x1))
+
+    words  = _source_words(text)
+    target = max(1, len(words))
+
+    # Over-detection: merge the closest adjacent runs that are on the
+    # same line.  A cross-line merge is never valid — those are
+    # different words no matter how their x-ranges line up.
+    while len(runs) > target:
+        best_i = -1
+        best_gap = None
+        for i in range(len(runs) - 1):
+            if runs[i][0] != runs[i + 1][0]:
+                continue
+            gap = runs[i + 1][1] - runs[i][2]
+            if best_gap is None or gap < best_gap:
+                best_gap = gap
+                best_i = i
+        if best_i < 0:
+            break
+        li, x0, _ = runs[best_i]
+        _, _, x1 = runs[best_i + 1]
+        runs[best_i] = (li, x0, x1)
+        del runs[best_i + 1]
+
+    result = []
+    for k, (li, x0, x1) in enumerate(runs):
+        band = [p for p in lines[li] if x0 - 0.5 <= p[0] <= x1 + 0.5]
+        if not band:
+            continue
+        lxs = [p[0] for p in band]
+        lys = [p[1] for p in band]
+        wx = min(lxs)
+        wy = min(lys)
+        ww = max(lxs) - wx
+        wh = max(lys) - wy
+
+        local_corners = [
+            (wx, wy),
+            (wx + ww, wy),
+            (wx + ww, wy + wh),
+            (wx, wy + wh),
+        ]
+        doc_corners = [transform.map(QPointF(c[0], c[1]))
+                       for c in local_corners]
+        label = words[k] if k < len(words) else ""
+        result.append({
+            'word': label,
+            'corners': [[p.x(), p.y()] for p in doc_corners],
+        })
+    return result
+
+
 def _bounds_from_words(word_boxes):
-    """Axis-aligned document-space AABB that encloses every word box."""
     xs = []
     ys = []
     for wb in word_boxes:
@@ -288,8 +621,6 @@ def _bounds_from_words(word_boxes):
 
 
 def _fallback_word_box(shape, transform, text):
-    """If the pixel scan yields nothing, fall back to Krita's own
-    padded bounding box mapped through the shape's transform."""
     try:
         b = shape.boundingBox()
     except Exception:
@@ -330,6 +661,10 @@ class LayerTextHandler:
             return self.patch_layer_text(params)
         elif cmd_type == 'dump_all_text_shapes':
             return self.dump_all_text_shapes(params)
+        elif cmd_type == 'move_text_handle':
+            return self.move_text_handle(params)
+        elif cmd_type == 'set_text_inline_size':
+            return self.set_text_inline_size(params)
         return {'success': False, 'message': f'Unknown text command: {cmd_type}'}
 
     # ------------------------------------------------------------------
@@ -355,8 +690,13 @@ class LayerTextHandler:
                             'help': 'Optional 6-element list [m11, m12, m21, m22, dx, dy] '
                                     'defining a full affine QTransform (Qt row-vector '
                                     'convention) to apply to the newly-created shape.  '
-                                    'Replaces --rotation when given.  Accepts either a '
-                                    'JSON string or a native list (batch form).'},
+                                    'Replaces --rotation when given.'},
+            '--inline_size': {'type': 'float', 'required': False,
+                              'help': 'Optional wrap width.  When set, the text is '
+                                      'created in Krita\'s SVG 2 "inline wrapped" '
+                                      'mode and wraps automatically within this width.  '
+                                      'Omit for the classic pre-positioned (SVG 1.1) '
+                                      'text mode.'},
         }
     )
     def add_vector_text(self, params):
@@ -376,6 +716,7 @@ class LayerTextHandler:
             alignment = params.get('alignment', 'left')
             rotation = params.get('rotation', 0)
             transform_raw = params.get('transform', None)
+            inline_size = params.get('inline_size', None)
 
             target_layer = doc.nodeByName(layer_name)
             if not target_layer:
@@ -401,14 +742,39 @@ class LayerTextHandler:
             if not color.startswith('#'):
                 color = '#' + color
 
-            svg = (
-                f'<svg width="{canvas_width}" height="{canvas_height}" '
-                f'xmlns="http://www.w3.org/2000/svg">'
-                f'<text font-family="{font_family}" '
-                f'font-size="{font_size}" fill="{color}" '
-                f'x="{x}" y="{y}"{text_align}>{text}</text>'
-                f'</svg>'
-            )
+            is_wrapped = False
+            if inline_size is not None:
+                try:
+                    inline_size = float(inline_size)
+                except (TypeError, ValueError):
+                    inline_size = None
+            if inline_size is not None and inline_size > 0:
+                is_wrapped = True
+
+            if is_wrapped:
+                # Inline-wrapped: no x/y on the <text> element.  Every
+                # style property goes inside the style attribute.
+                style = (
+                    f'inline-size: {inline_size};'
+                    f'font-size: {font_size};'
+                    f'white-space: pre-wrap;'
+                )
+                svg = (
+                    f'<svg width="{canvas_width}" height="{canvas_height}" '
+                    f'xmlns="http://www.w3.org/2000/svg">'
+                    f'<text font-family="{font_family}" fill="{color}" '
+                    f'style="{style}"{text_align}>{text}</text>'
+                    f'</svg>'
+                )
+            else:
+                svg = (
+                    f'<svg width="{canvas_width}" height="{canvas_height}" '
+                    f'xmlns="http://www.w3.org/2000/svg">'
+                    f'<text font-family="{font_family}" '
+                    f'font-size="{font_size}" fill="{color}" '
+                    f'x="{x}" y="{y}"{text_align}>{text}</text>'
+                    f'</svg>'
+                )
 
             target_layer.addShapesFromSvg(svg)
             shapes_after = list(target_layer.shapes())
@@ -426,28 +792,64 @@ class LayerTextHandler:
                 new_shape = shapes_after[-1]
 
             if new_shape is not None:
-                applied_transform = False
-                if transform_raw:
-                    try:
-                        if isinstance(transform_raw, str):
-                            vals = json.loads(transform_raw)
-                        else:
-                            vals = transform_raw
-                        vals = [float(v) for v in vals]
-                        if len(vals) == 6:
-                            m11, m12, m21, m22, dx, dy = vals
-                            t = QTransform(m11, m12, m21, m22, dx, dy)
-                            _apply_transform(new_shape, t)
-                            applied_transform = True
-                    except Exception:
-                        pass
+                if is_wrapped:
+                    # Inline-wrapped shapes carry no x/y in their SVG,
+                    # so the shape's local origin is the anchor.  The
+                    # transformation must map local (0,0) to (x, y) in
+                    # the parent frame, with the rotation applied
+                    # around the anchor.
+                    #
+                    # Qt composes transforms by POST-multiplying, so
+                    # to get T = T_rot(θ) · T_trans(x, y) we must call
+                    # rotate() BEFORE translate().  Calling translate()
+                    # first would give T_trans(x, y) · T_rot(θ), whose
+                    # fixed point is (-x, -y) rather than the origin —
+                    # every rotated shape would land at the rotated
+                    # anchor instead of at (x, y).
+                    if transform_raw:
+                        try:
+                            if isinstance(transform_raw, str):
+                                vals = json.loads(transform_raw)
+                            else:
+                                vals = transform_raw
+                            vals = [float(v) for v in vals]
+                            if len(vals) == 6:
+                                m11, m12, m21, m22, dx, dy = vals
+                                dx2 = m11 * x + m21 * y + dx
+                                dy2 = m12 * x + m22 * y + dy
+                                t = QTransform(m11, m12, m21, m22, dx2, dy2)
+                                _apply_transform(new_shape, t)
+                        except Exception:
+                            pass
+                    else:
+                        t = QTransform()
+                        if rotation:
+                            t.rotate(rotation)
+                        t.translate(x, y)
+                        _apply_transform(new_shape, t)
+                else:
+                    applied_transform = False
+                    if transform_raw:
+                        try:
+                            if isinstance(transform_raw, str):
+                                vals = json.loads(transform_raw)
+                            else:
+                                vals = transform_raw
+                            vals = [float(v) for v in vals]
+                            if len(vals) == 6:
+                                m11, m12, m21, m22, dx, dy = vals
+                                t = QTransform(m11, m12, m21, m22, dx, dy)
+                                _apply_transform(new_shape, t)
+                                applied_transform = True
+                        except Exception:
+                            pass
 
-                if not applied_transform and rotation:
-                    t = QTransform()
-                    t.translate(x, y)
-                    t.rotate(rotation)
-                    t.translate(-x, -y)
-                    _apply_transform(new_shape, t)
+                    if not applied_transform and rotation:
+                        t = QTransform()
+                        t.translate(x, y)
+                        t.rotate(rotation)
+                        t.translate(-x, -y)
+                        _apply_transform(new_shape, t)
 
             refresh(doc)
 
@@ -458,6 +860,8 @@ class LayerTextHandler:
                     'text': text, 'font': font_family, 'size': font_size,
                     'position': (x, y), 'rotation': rotation,
                     'canvas': (canvas_width, canvas_height),
+                    'inline_size': inline_size if is_wrapped else None,
+                    'mode': 'inline-wrapped' if is_wrapped else 'pre-positioned',
                 },
             }
         except Exception as e:
@@ -1044,6 +1448,19 @@ class LayerTextHandler:
             y           = merged('y', 0)
             alignment   = merged('alignment', 'left')
 
+            inline_size = current.get('inline_size', None)
+            if 'inline_size' in patch:
+                try:
+                    inline_size = float(patch['inline_size'])
+                except (TypeError, ValueError):
+                    inline_size = None
+            if inline_size is not None:
+                try:
+                    inline_size = float(inline_size)
+                except (TypeError, ValueError):
+                    inline_size = None
+            is_wrapped = inline_size is not None and inline_size > 0
+
             if isinstance(color, str) and not color.startswith('#'):
                 color = '#' + color
 
@@ -1069,14 +1486,28 @@ class LayerTextHandler:
 
             shape.remove()
 
-            svg = (
-                f'<svg width="{W}" height="{H}" '
-                f'xmlns="http://www.w3.org/2000/svg">'
-                f'<text font-family="{font_family}" '
-                f'font-size="{font_size}" fill="{color}" '
-                f'x="{x}" y="{y}"{text_align}>{text}</text>'
-                f'</svg>'
-            )
+            if is_wrapped:
+                style = (
+                    f'inline-size: {inline_size};'
+                    f'font-size: {font_size};'
+                    f'white-space: pre-wrap;'
+                )
+                svg = (
+                    f'<svg width="{W}" height="{H}" '
+                    f'xmlns="http://www.w3.org/2000/svg">'
+                    f'<text font-family="{font_family}" fill="{color}" '
+                    f'style="{style}"{text_align}>{text}</text>'
+                    f'</svg>'
+                )
+            else:
+                svg = (
+                    f'<svg width="{W}" height="{H}" '
+                    f'xmlns="http://www.w3.org/2000/svg">'
+                    f'<text font-family="{font_family}" '
+                    f'font-size="{font_size}" fill="{color}" '
+                    f'x="{x}" y="{y}"{text_align}>{text}</text>'
+                    f'</svg>'
+                )
             layer.addShapesFromSvg(svg)
 
             marker = f'>{text}<'
@@ -1093,12 +1524,26 @@ class LayerTextHandler:
                 if all_shapes:
                     new_shape = all_shapes[-1]
 
-            if new_shape is not None and rotation_deg:
-                t = QTransform()
-                t.translate(x, y)
-                t.rotate(rotation_deg)
-                t.translate(-x, -y)
-                _apply_transform(new_shape, t)
+            if new_shape is not None:
+                if is_wrapped:
+                    # Preserve the old transformation if the shape
+                    # already had one; otherwise fall back to
+                    # rotate-then-translate to put the anchor at
+                    # (x, y).
+                    if old_transform is not None:
+                        _apply_transform(new_shape, old_transform)
+                    else:
+                        t = QTransform()
+                        if rotation_deg:
+                            t.rotate(rotation_deg)
+                        t.translate(x, y)
+                        _apply_transform(new_shape, t)
+                elif rotation_deg:
+                    t = QTransform()
+                    t.translate(x, y)
+                    t.rotate(rotation_deg)
+                    t.translate(-x, -y)
+                    _apply_transform(new_shape, t)
 
             refresh(doc)
 
@@ -1109,6 +1554,230 @@ class LayerTextHandler:
                     'layer_name': layer_name,
                     'text_index': text_index,
                     'applied': sorted(patch.keys()),
+                    'mode': 'inline-wrapped' if is_wrapped else 'pre-positioned',
+                },
+            }
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    # ------------------------------------------------------------------
+    # move_text_handle
+    # ------------------------------------------------------------------
+
+    @command(
+        category='layer',
+        help_text='Move one inline-size handle of an inline-wrapped text '
+                  'shape to a target position, holding either the other '
+                  'handle or the wrapping area\'s centre fixed.',
+        args={
+            '--layer_name': {'type': 'str', 'required': True,
+                             'help': 'Name of the vector layer'},
+            '--text_index': {'type': 'int', 'default': 0,
+                             'help': 'Index of the target shape within the '
+                                     'layer\'s shapes() list.'},
+            '--side': {'type': 'str', 'required': True,
+                       'choices': ['left', 'right'],
+                       'help': 'Which handle to move.'},
+            '--target_x': {'type': 'float', 'required': True,
+                           'help': 'Target x position in the layer\'s '
+                                   'coordinate system.'},
+            '--target_y': {'type': 'float', 'required': True,
+                           'help': 'Target y position in the layer\'s '
+                                   'coordinate system.'},
+            '--pivot': {'type': 'str', 'default': 'other',
+                        'choices': ['other', 'center'],
+                        'help': 'What stays fixed during the move: the '
+                                'other handle, or the wrapping area\'s '
+                                'centre.'},
+        }
+    )
+    def move_text_handle(self, params):
+        try:
+            doc = Krita.instance().activeDocument()
+            if not doc:
+                return {'success': False, 'message': 'No active document'}
+
+            layer_name = params.get('layer_name', '')
+            text_index = int(params.get('text_index', 0))
+            side = params.get('side', '')
+            pivot = params.get('pivot', 'other')
+            try:
+                target_x = float(params.get('target_x', 0))
+                target_y = float(params.get('target_y', 0))
+            except (TypeError, ValueError):
+                return {'success': False,
+                        'message': 'target_x and target_y must be numbers'}
+
+            if side not in ('left', 'right'):
+                return {'success': False,
+                        'message': f'side must be "left" or "right", got "{side}"'}
+            if pivot not in ('other', 'center'):
+                return {'success': False,
+                        'message': f'pivot must be "other" or "center", got "{pivot}"'}
+
+            layer = doc.nodeByName(layer_name)
+            if not layer:
+                return {'success': False,
+                        'message': f'Layer "{layer_name}" not found'}
+            if layer.type() != 'vectorlayer':
+                return {'success': False,
+                        'message': f'Layer "{layer_name}" is not a vector layer'}
+
+            try:
+                shapes = list(layer.shapes())
+            except Exception:
+                shapes = []
+            if text_index < 0 or text_index >= len(shapes):
+                return {'success': False,
+                        'message': f'text_index {text_index} out of range '
+                                   f'(layer has {len(shapes)} shape(s))'}
+            old_shape = shapes[text_index]
+
+            I_old = _get_inline_size(old_shape)
+            if I_old is None:
+                return {'success': False,
+                        'message': 'target shape is not inline-wrapped '
+                                   '(no inline-size in its style)'}
+
+            mode = _get_anchor_mode(old_shape)
+            T = _get_transformation(old_shape)
+            alpha = _ALPHA[mode]
+            beta  = _BETA[mode]
+            gamma = _GAMMA[mode]
+
+            d2 = _linear_sq(T)
+            if d2 < 1e-15:
+                return {'success': False,
+                        'message': 'shape has a degenerate transformation'}
+
+            if pivot == 'other':
+                if side == 'right':
+                    pin_coeff = alpha
+                    pin_local = alpha * I_old
+                else:
+                    pin_coeff = beta
+                    pin_local = beta * I_old
+            else:
+                pin_coeff = gamma
+                pin_local = gamma * I_old
+
+            pin_doc = T.map(QPointF(pin_local, 0.0))
+            target_coeff = beta if side == 'right' else alpha
+
+            k = target_coeff - pin_coeff
+            if abs(k) < 1e-12:
+                return {'success': False,
+                        'message': 'pivot would coincide with the moving '
+                                   'handle'}
+
+            dx = target_x - pin_doc.x()
+            dy = target_y - pin_doc.y()
+            new_I = (dx * T.m11() + dy * T.m12()) / (k * d2)
+
+            if new_I <= 0:
+                return {'success': False,
+                        'message': 'target would place the handles on the '
+                                   'wrong side of the pivot'}
+
+            new_m31 = pin_doc.x() - pin_coeff * new_I * T.m11()
+            new_m32 = pin_doc.y() - pin_coeff * new_I * T.m12()
+            T_new = _make_transform_like(T, new_m31, new_m32)
+
+            new_shape = _rebuild_inline_shape(layer, old_shape, new_I, T_new)
+            refresh(doc)
+
+            return {
+                'success': True,
+                'message': f'Moved {side} handle of "{layer_name}" '
+                           f'text {text_index}',
+                'data': {
+                    'layer_name': layer_name,
+                    'text_index': text_index,
+                    'side': side,
+                    'pivot': pivot,
+                    'inline_size_before': I_old,
+                    'inline_size_after': new_I,
+                    'anchor_before': (T.m31(), T.m32()),
+                    'anchor_after': (new_m31, new_m32),
+                },
+            }
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    # ------------------------------------------------------------------
+    # set_text_inline_size
+    # ------------------------------------------------------------------
+
+    @command(
+        category='layer',
+        help_text='Set the inline-size of an inline-wrapped text shape.  '
+                  'The shape\'s position and transformation are unchanged; '
+                  'both handles move according to the anchor mode.',
+        args={
+            '--layer_name': {'type': 'str', 'required': True,
+                             'help': 'Name of the vector layer'},
+            '--text_index': {'type': 'int', 'default': 0,
+                             'help': 'Index of the target shape within the '
+                                     'layer\'s shapes() list.'},
+            '--inline_size': {'type': 'float', 'required': True,
+                              'help': 'New inline-size (must be positive).'},
+        }
+    )
+    def set_text_inline_size(self, params):
+        try:
+            doc = Krita.instance().activeDocument()
+            if not doc:
+                return {'success': False, 'message': 'No active document'}
+
+            layer_name = params.get('layer_name', '')
+            text_index = int(params.get('text_index', 0))
+            try:
+                new_I = float(params.get('inline_size', 0))
+            except (TypeError, ValueError):
+                return {'success': False,
+                        'message': 'inline_size must be a number'}
+
+            if new_I <= 0:
+                return {'success': False,
+                        'message': 'inline_size must be positive'}
+
+            layer = doc.nodeByName(layer_name)
+            if not layer:
+                return {'success': False,
+                        'message': f'Layer "{layer_name}" not found'}
+            if layer.type() != 'vectorlayer':
+                return {'success': False,
+                        'message': f'Layer "{layer_name}" is not a vector layer'}
+
+            try:
+                shapes = list(layer.shapes())
+            except Exception:
+                shapes = []
+            if text_index < 0 or text_index >= len(shapes):
+                return {'success': False,
+                        'message': f'text_index {text_index} out of range '
+                                   f'(layer has {len(shapes)} shape(s))'}
+            old_shape = shapes[text_index]
+
+            I_old = _get_inline_size(old_shape)
+            if I_old is None:
+                return {'success': False,
+                        'message': 'target shape is not inline-wrapped'}
+
+            T = _get_transformation(old_shape)
+
+            new_shape = _rebuild_inline_shape(layer, old_shape, new_I, T)
+            refresh(doc)
+
+            return {
+                'success': True,
+                'message': f'Set inline-size on "{layer_name}" text '
+                           f'{text_index}: {I_old} -> {new_I}',
+                'data': {
+                    'layer_name': layer_name,
+                    'text_index': text_index,
+                    'inline_size_before': I_old,
+                    'inline_size_after': new_I,
                 },
             }
         except Exception as e:
@@ -1165,14 +1834,21 @@ class LayerTextHandler:
                         if t is None:
                             t = QTransform()
 
-                        # Measured word boxes and shape bounds, taken
-                        # from the layer's own rendered pixels.
-                        word_boxes = _words_from_pixels(layer, t, text)
+                        # Inline-wrapped text needs the line-then-word
+                        # clustering; pre-positioned text is unaffected
+                        # and keeps the original single-line clustering.
+                        inline_size = rec.get('inline_size')
+                        if inline_size is not None:
+                            word_boxes = _words_from_pixels_wrapped(
+                                layer, t, text)
+                        else:
+                            word_boxes = _words_from_pixels(
+                                layer, t, text)
+
                         if not word_boxes:
                             word_boxes = _fallback_word_box(shape, t, text)
                         shape_bounds = _bounds_from_words(word_boxes)
 
-                        # SVG anchor, mapped to document space.
                         ax = rec.get('x', 0)
                         ay = rec.get('y', 0)
                         p = t.map(QPointF(ax, ay))

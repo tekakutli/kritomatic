@@ -102,6 +102,32 @@ its square when the local Jacobian is anisotropic — the compressed
 dimension grows only as much as the stretched dimension allows, and
 nothing is left to spill past the square's own edges.
 
+INLINE-WRAPPED TEXT
+===================
+Every text this module emits is now sized for Krita's SVG 2
+"inline wrapped" text mode.  cone_kra.py turns that sizing into an
+`inline_size` argument on the `add_vector_text` command, and the
+daemon builds the SVG accordingly.
+
+For the inline-size handles to land on the square's own edges, the
+payload must carry the square's true width alongside the anchor.
+Each of the three per-text payload builders in this file therefore
+now emits a `src_w` field:
+
+    _buildOnePatchKraPatch  ->  src_w = W_sq
+    _kraShearTextEntry      ->  src_w = W_sq
+    _shearTextForSquare     ->  src_w = W_sq
+
+`W_sq` is the square's own width in its local frame, computed in
+each builder from the projected corner edge lengths.  cone_kra.py
+folds the anchor's offset inside the square into this width, so
+the wrapping area ends exactly at the square's far edge regardless
+of where in the square the anchor sits.
+
+The per-square `square` mode already carries the square's natural
+width as `natural_w` on each shape entry, so it does not need a
+new field; cone_kra.py takes it from there.
+
 MIRROR
 ======
 Every mode that has a per-square pass (square, text, text-shear)
@@ -921,6 +947,11 @@ function _buildOnePatchKraPatch(q, options, nameSuffix, isMirror) {
         font_px,
         rotation: flatRotation,
         alignment: anchorFlatSq.alignment,
+        /* The square's own width in its local frame.  cone_kra.py
+           uses this to size Krita's inline-wrapped text area so the
+           inline-size handles land on the square's edges.  See the
+           module docstring, INLINE-WRAPPED TEXT. */
+        src_w: W_sq,
       });
 
       const rad = flatRotation * Math.PI / 180;
@@ -978,6 +1009,7 @@ function _buildOnePatchKraPatch(q, options, nameSuffix, isMirror) {
       flat_rotation: p.rotation,
       alignment: p.alignment,
       color: textColor,
+      src_w: p.src_w,
     });
   }
 
@@ -1272,6 +1304,11 @@ function _kraShearTextEntry(sq, options, nameSuffix) {
       scale_y: decomp.scale_y,
       max_scale: maxScale,
     },
+    /* The square's own width in its local frame.  cone_kra.py uses
+       this to size Krita's inline-wrapped text area so the
+       inline-size handles land on the square's edges.  See the
+       module docstring, INLINE-WRAPPED TEXT. */
+    src_w: W_sq,
   };
 
   return { item, rect };
@@ -1420,6 +1457,11 @@ function _shearTextForSquare(sq, options, hex, textColor, nameSuffix) {
         scale_y: decomp.scale_y,
         max_scale: maxScale,
       },
+      /* The square's own width in its local frame.  cone_kra.py
+         uses this to size Krita's inline-wrapped text area so the
+         inline-size handles land on the square's edges.  See the
+         module docstring, INLINE-WRAPPED TEXT. */
+      src_w: W_sq,
     },
     rect: rect,
   };

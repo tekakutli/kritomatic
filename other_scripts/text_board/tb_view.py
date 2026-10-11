@@ -3,9 +3,12 @@ tb_view.py — draw the board.
 
 Cards are drawn in `_zSortedIndices()` order.  The card rectangle is
 the axis-aligned document-space AABB of the text shape, exactly as the
-daemon reports it.  The text label is drawn on top at its own anchor,
-rotated to its own angle, as an indication — it is not clipped to the
-card.  Word boxes are drawn from their document-space corners.
+daemon reports it.  Word boxes are drawn from their document-space
+corners.
+
+The shape's text is shown once: in the caption below its card, as
+`<layerName> · <text>`.  It is not also drawn rotated at the shape's
+document anchor inside the card.
 
 Before the cards, one dashed rectangle per document is drawn at that
 document's canvas extent in board-space coordinates.
@@ -176,9 +179,10 @@ function _drawItemCard(it, isSelected) {
   ctx.fill();
   ctx.restore();
 
-  // Border.
-  const borderAlpha = isSelected ? 1.00 : 0.90;
-  const borderW     = Math.max(1.5, isSelected ? 2.8 : 2.2);
+  // Border.  Dimmed: the outline is a spatial cue, not a highlight.
+  // Selection re-asserts the full-strength colour.
+  const borderAlpha = isSelected ? 0.95 : 0.30;
+  const borderW     = Math.max(1.0, isSelected ? 2.4 : 1.1);
   ctx.strokeStyle = _rgba(hue, borderAlpha);
   ctx.lineWidth   = borderW;
   ctx.beginPath();
@@ -188,10 +192,10 @@ function _drawItemCard(it, isSelected) {
 
   if (isSelected) {
     ctx.save();
-    ctx.shadowColor = _rgba(hue, 0.85);
-    ctx.shadowBlur  = 14;
-    ctx.strokeStyle = _rgba(hue, 0.95);
-    ctx.lineWidth   = 1.4;
+    ctx.shadowColor = _rgba(hue, 0.75);
+    ctx.shadowBlur  = 12;
+    ctx.strokeStyle = _rgba(hue, 0.90);
+    ctx.lineWidth   = 1.2;
     ctx.beginPath();
     _roundRect(csx + borderW + 0.5, csy + borderW + 0.5,
                sw - 2 * borderW - 1, sh - 2 * borderW - 1, RADIUS);
@@ -209,22 +213,6 @@ function _drawItemCard(it, isSelected) {
     const by = it.by + (py - sb.y) * _boardScale;
     return b2s(bx, by);
   };
-
-  // Text label at its document-space anchor, rotated.
-  const [ax, ay] = docToScreen(it.x, it.y);
-  const fontPx = Math.max(6, (it.fontSize || 12) * _boardScale * view.zoom);
-
-  ctx.save();
-  ctx.translate(ax, ay);
-  ctx.rotate((it.rotationDeg || 0) * Math.PI / 180);
-  ctx.font = fontPx + "px " + (it.fontFamily || "sans-serif");
-  ctx.textBaseline = "alphabetic";
-  if (it.alignment === "center")      ctx.textAlign = "center";
-  else if (it.alignment === "right")  ctx.textAlign = "right";
-  else                                ctx.textAlign = "left";
-  ctx.fillStyle = _lightenForDarkCard(it.color, "#dce6f2", 0.55);
-  ctx.fillText(it.text || "", 0, 0);
-  ctx.restore();
 
   // Word boxes: doc-space quads, mapped through the same helper.
   if (board.showWordBoxes && it.wordBoxes && it.wordBoxes.length) {

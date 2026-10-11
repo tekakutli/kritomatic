@@ -16,30 +16,54 @@ Five export modes, selected by options.text_warp_mode:
 
     "text-shear"
         No masks.  One direct vector layer per text, carrying a full
-        affine transform (rotation + shear + non-uniform scale)
-        computed on the JS side to reproduce the mask-mode result
-        while keeping the text's on-screen bounding box inside a
-        fontNat × fontNat square.
+        affine transform computed on the JS side to reproduce the
+        mask-mode result.
 
     "patch-shear"
-        No masks.  One group per patch (no mask on the group); each
-        text on the patch is a direct vector layer inside the group,
-        each with its own affine transform.  The scale normalization
-        matches text-shear's, so both modes render each text at the
-        same size.
+        No masks.  One group per patch; each text on the patch is a
+        direct vector layer inside the group, with its own affine.
 
 No background layer is created in any mode.
+
+INLINE-WRAPPED TEXT AND HANDLE ALIGNMENT
+========================================
+Every text the export creates is written in Krita's SVG 2 "inline
+wrapped" mode.  In that mode a text shape carries:
+
+    style="inline-size: <W>;font-size: <F>;white-space: pre-wrap;"
+
+and NO x/y attributes on the <text> element.  Krita then draws two
+vertical "inline-size handles" at the left and right edges of the
+wrapping area, and the text wraps within that area.
+
+The handles sit, in the shape's canvas frame, at
+
+    T.map(alpha * I, 0)   and   T.map(beta * I, 0)
+
+where T is the shape's own transform and alpha / beta depend on
+the anchor mode:
+
+    text-anchor="start"    alpha = 0     beta = +1
+    text-anchor="middle"   alpha = -0.5  beta = +0.5
+    text-anchor="end"      alpha = -1    beta = 0
+
+To put the handles on the polygon's edges, the shear modes follow
+each add_vector_text with two move_text_handle commands — one for
+the left handle, one for the right.  The targets are the midpoints
+of the polygon's two edges farthest apart along the text baseline
+direction (m11, m12).  Those are the polygon edges that run
+perpendicular to the baseline, which is where the wrapping area's
+left and right edges can coincide with them.
 
 MIRROR
 ======
 When a patch's `mirror` flag is on, the JS side emits a mirror
-copy of every square on that patch.  All five modes now export that
+copy of every square on that patch.  All five modes export that
 copy:
 
     - "square" and "patch" modes emit the mirror in the same
       per-square or per-patch group structure as the original,
-      with a `_mirror` suffix on every layer name so Krita cannot
-      confuse the two;
+      with a `_mirror` suffix on every layer name;
 
     - "text" and "text-shear" modes emit the mirror per text, again
       with a `_mirror` suffix on the layer names;
@@ -49,10 +73,7 @@ copy:
       layers.
 
 Mirror entries carry the same text label as the original (the
-plain square name), and the LAYER names are what differ.  This is
-what the `label` field on the text item is for: the daemon writes
-`label` into the vector text's content but uses the layer name as
-the tree's identifier, so the two must be independent.
+plain square name); the LAYER names are what differ.
 """
 
 import json
@@ -146,6 +167,127 @@ def _common_header(band, doc_name):
     ]
 
 
+def _inline_size_for(font_px, width=None):
+    """Return the wrap width for one exported text.
+
+    When the source width is available in the payload (`natural_w`
+    on shapes, `src_w` on texts) we use it directly.  Otherwise we
+    recover it from the font size: the JS side computed
+    font_px = min(W, H) * FONT_FRACTION, and every square in this
+    project is square, so font_px / FONT_FRACTION recovers W."""
+    if width is not None:
+        try:
+            w = float(width)
+            if w > 0:
+                return w
+        except (TypeError, ValueError):
+            pass
+    try:
+        fs = float(font_px)
+    except (TypeError, ValueError):
+        return None
+    if fs <= 0:
+        return None
+    return fs / FONT_FRACTION
+
+
+def _coerce_transform(raw):
+    """Accept a list or a JSON string; return a 6-float list or None."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return None
+    if not isinstance(raw, (list, tuple)):
+        return None
+    if len(raw) != 6:
+        return None
+    try:
+        return [float(v) for v in raw]
+    except (TypeError, ValueError):
+        return None
+
+
+def _polygon_target_edges(polygon_pts, baseline_dir):
+    """Return (target_left, target_right), the two polygon edge
+    midpoints farthest apart along the baseline direction.
+
+    polygon_pts: list of (x, y) canvas coordinates.
+    baseline_dir: (m11, m12) — the text's local X axis in canvas
+    coordinates, which is the direction along which the two handles
+    are separated.
+    """
+    n = len(polygon_pts)
+    if n < 3:
+        return None
+    bx, by = baseline_dir
+    bL2 = bx * bx + by * by
+    if bL2 < 1e-12:
+        return None
+    bL = bL2 ** 0.5
+    bux, buy = bx / bL, by / bL
+
+    edges = []
+    for i in range(n):
+        ax = float(polygon_pts[i][0])
+        ay = float(polygon_pts[i][1])
+        cx = float(polygon_pts[(i + 1) % n][0])
+        cy = float(polygon_pts[(i + 1) % n][1])
+        mx = (ax + cx) / 2.0
+        my = (ay + cy) / 2.0
+        proj = mx * bux + my * buy
+        edges.append((proj, mx, my))
+    edges.sort(key=lambda e: e[0])
+
+    return ((edges[0][1], edges[0][2]),
+            (edges[-1][1], edges[-1][2]))
+
+
+def _emit_handle_moves(commands, layer_name, t, polygon_pts):
+    import sys
+    affine = _coerce_transform(t.get("transform"))
+    print("=" * 60, file=sys.stderr)
+    print("text layer_name = %r" % layer_name, file=sys.stderr)
+    print("  t['name']     = %r" % t.get("name"), file=sys.stderr)
+    print("  t['x']  t['y'] = %r  %r" % (t.get("x"), t.get("y")), file=sys.stderr)
+    print("  t['transform']= %r" % t.get("transform"), file=sys.stderr)
+    print("  polygon_pts   = %r" % (polygon_pts,), file=sys.stderr)
+    if not polygon_pts or len(polygon_pts) < 4:
+        print("  -> SKIP (no polygon pts)", file=sys.stderr)
+        return
+    if affine is None:
+        print("  -> SKIP (bad transform)", file=sys.stderr)
+        return
+    targets = _polygon_target_edges(polygon_pts, (affine[0], affine[1]))
+    if targets is None:
+        print("  -> SKIP (targets None)", file=sys.stderr)
+        return
+    tl, tr = targets
+    print("  target_left  = %r" % (tl,), file=sys.stderr)
+    print("  target_right = %r" % (tr,), file=sys.stderr)
+
+    commands.append({
+        "type": "move_text_handle",
+        "layer_name": layer_name,
+        "text_index": 0,
+        "side": "left",
+        "target_x": round(float(tl[0]), 4),
+        "target_y": round(float(tl[1]), 4),
+        "pivot": "other",
+    })
+    commands.append({
+        "type": "move_text_handle",
+        "layer_name": layer_name,
+        "text_index": 0,
+        "side": "right",
+        "target_x": round(float(tr[0]), 4),
+        "target_y": round(float(tr[1]), 4),
+        "pivot": "other",
+    })
+
+
 def _build_square_mode(shapes, opts, band, doc_name):
     commands = _common_header(band, doc_name)
 
@@ -203,6 +345,7 @@ def _build_square_mode(shapes, opts, band, doc_name):
             "color": sh.get("text_color", "#ffffff"),
             "alignment": text_align,
             "rotation": float(sh.get("flat_rotation", 0.0)),
+            "inline_size": _inline_size_for(font_px, width=W),
         })
 
         commands.append({
@@ -221,19 +364,6 @@ def _build_square_mode(shapes, opts, band, doc_name):
 
 
 def _build_patch_mode(patches, opts, band, doc_name):
-    """One group + one mask per patch.
-
-    Rectangles, when enabled, are emitted first as direct polygons in
-    the export group (outside any mask), using each square's projected
-    corners verbatim.
-
-    Each text carries its own flat position, size, rotation, and
-    alignment, all pre-computed on the JS side so that after the
-    patch's mask the text lands at the same screen position, size,
-    and angle it would have had in square mode.  The mask's source
-    rectangle is extended to cover every text, so Krita's transform
-    actually reaches every glyph.
-    """
     commands = _common_header(band, doc_name)
 
     for patch in patches:
@@ -277,17 +407,19 @@ def _build_patch_mode(patches, opts, band, doc_name):
         })
 
         for txt in patch.get("texts", []):
+            font_px = max(6, int(round(float(txt["font_px"]))))
             commands.append({
                 "type": "add_vector_text",
                 "layer_name": content_name,
                 "text": str(txt.get("text", txt.get("label", ""))),
                 "font_family": DEFAULT_FONT_FAMILY,
-                "font_size": max(6, int(round(float(txt["font_px"])))),
+                "font_size": font_px,
                 "x": float(txt["x"]),
                 "y": float(txt["y"]),
                 "color": txt.get("color", "#ffffff"),
                 "alignment": txt.get("alignment", "center"),
                 "rotation": float(txt.get("flat_rotation", 0.0)),
+                "inline_size": _inline_size_for(font_px, width=txt.get("src_w")),
             })
 
         commands.append({
@@ -311,11 +443,6 @@ def _build_patch_mode(patches, opts, band, doc_name):
 
 
 def _build_text_mode(texts, rects, opts, band, doc_name):
-    """One group + one mask per text.  Each text's mask is a copy of
-    the square's own mask: source = the square's full flat rectangle,
-    destination = the square's projected corners.  Rectangles are
-    direct polygons in the export group, emitted first so they render
-    below."""
     commands = _common_header(band, doc_name)
 
     for rect in (rects or []):
@@ -367,6 +494,7 @@ def _build_text_mode(texts, rects, opts, band, doc_name):
             "color": t.get("color", "#ffffff"),
             "alignment": t.get("alignment", "center"),
             "rotation": float(t.get("rotation", 0.0)),
+            "inline_size": _inline_size_for(t["font_px"], width=t.get("src_w")),
         })
         commands.append({
             "type": "create_transform_mask",
@@ -388,13 +516,13 @@ def _build_text_mode(texts, rects, opts, band, doc_name):
 
 
 def _build_shear_mode(texts, rects, opts, band, doc_name):
-    """No masks.  One vector layer per text.  Position (x, y), size
-    (font_size), and a full affine transform (rotation + shear +
-    non-uniform scale, scale-normalized so the larger of the two
-    reaches 1) are pre-computed on the JS side to reproduce the mask-
-    based output without using a mask."""
+    """No masks.  One vector layer per text.  Position and full
+    affine are computed on the JS side, then the handles are moved
+    onto the polygon's edges by two move_text_handle commands per
+    text."""
     commands = _common_header(band, doc_name)
 
+    # Emit the polygons.
     for rect in (rects or []):
         rect_layer = rect["name"] + "_rect"
         commands.append({
@@ -416,6 +544,15 @@ def _build_shear_mode(texts, rects, opts, band, doc_name):
             "stroke_opacity": rect.get("stroke_opacity", 1.0),
         })
 
+    # Map polygon names to their corner lists, for the handle moves.
+    rect_by_name = {}
+    for rect in (rects or []):
+        name = rect.get("name")
+        pts = rect.get("points")
+        if name and pts and len(pts) >= 3:
+            rect_by_name[name] = pts
+
+    # Emit the texts and the two handle moves that follow each.
     for t in texts:
         layer_name = t["name"] + "_text"
 
@@ -437,17 +574,18 @@ def _build_shear_mode(texts, rects, opts, band, doc_name):
             "alignment": t.get("alignment", "center"),
             "rotation": 0.0,
             "transform": json.dumps(t["transform"]),
+            "inline_size": _inline_size_for(t["font_px"], width=t.get("src_w")),
         })
+        _emit_handle_moves(commands, layer_name, t,
+                           rect_by_name.get(t.get("name")))
 
     return {"id": "cone_export", "commands": commands}
 
 
 def _build_patch_shear_mode(patches, opts, band, doc_name):
     """No masks.  One group per patch; each text inside its patch's
-    group as a direct vector layer with its own affine transform.
-
-    Rectangles, when enabled, are direct polygons in the export group,
-    emitted first so they render below the texts.
+    group as a direct vector layer.  Handles are aligned to the
+    polygon edges by two move_text_handle commands per text.
 
     Group nesting:
         group <batchid>_Export
@@ -459,6 +597,7 @@ def _build_patch_shear_mode(patches, opts, band, doc_name):
     """
     commands = _common_header(band, doc_name)
 
+    # Emit every rectangle, across every patch, into the export group.
     for patch in patches:
         for rect in patch.get("rects", []):
             rect_layer = rect["name"] + "_rect"
@@ -481,6 +620,16 @@ def _build_patch_shear_mode(patches, opts, band, doc_name):
                 "stroke_opacity": rect.get("stroke_opacity", 1.0),
             })
 
+    # Build a global name -> points map.
+    rect_by_name = {}
+    for patch in patches:
+        for rect in patch.get("rects", []):
+            name = rect.get("name")
+            pts = rect.get("points")
+            if name and pts and len(pts) >= 3:
+                rect_by_name[name] = pts
+
+    # Emit each patch's texts into the patch's own group.
     for patch in patches:
         group_name = patch["name"]
 
@@ -493,6 +642,7 @@ def _build_patch_shear_mode(patches, opts, band, doc_name):
 
         for t in patch.get("texts", []):
             layer_name = t["name"] + "_text"
+
             commands.append({
                 "type": "create_layer",
                 "name": layer_name,
@@ -511,7 +661,10 @@ def _build_patch_shear_mode(patches, opts, band, doc_name):
                 "alignment": t.get("alignment", "center"),
                 "rotation": 0.0,
                 "transform": json.dumps(t["transform"]),
+                "inline_size": _inline_size_for(t["font_px"], width=t.get("src_w")),
             })
+            _emit_handle_moves(commands, layer_name, t,
+                               rect_by_name.get(t.get("name")))
 
     return {"id": "cone_export", "commands": commands}
 

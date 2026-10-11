@@ -112,29 +112,46 @@ class IntrospectHandler(AutoDispatchHandler):
 
     @command(
         category='introspect',
-        help_text='List dockers in the active window',
-        args={}
+        help_text='List dockers in the active window.  By default only '
+                  'visible dockers are returned; a docker tabbed behind '
+                  'another in the same group still counts as visible.  Set '
+                  'all=true to include hidden dockers too.  Each record '
+                  'always carries a visible field.',
+        args={
+            '--all': {'type': 'bool', 'default': False,
+                      'help': 'Include hidden dockers, not just the '
+                              'currently visible ones.'},
+        }
     )
-    def list_dockers(self):
+    def list_dockers(self, params):
         try:
             app = Krita.instance()
             win = app.activeWindow()
             if not win:
                 return {'success': False, 'message': 'No active window'}
+            include_hidden = bool(params.get('all', False))
             dockers = []
             for d in win.dockers():
                 try:
                     title = d.windowTitle()
                 except Exception:
                     title = ''
+                try:
+                    visible = bool(d.isVisible())
+                except Exception:
+                    visible = False
+                if not include_hidden and not visible:
+                    continue
                 dockers.append({
                     'name': d.objectName() or '',
                     'title': title,
+                    'visible': visible,
                 })
             dockers.sort(key=lambda x: x['name'])
+            scope = 'docker(s)' if include_hidden else 'visible docker(s)'
             return {
                 'success': True,
-                'message': f'{len(dockers)} docker(s)',
+                'message': f'{len(dockers)} {scope}',
                 'data': {'dockers': dockers}
             }
         except Exception as e:

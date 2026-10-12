@@ -56,6 +56,22 @@ perpendicular to the patch plane.  The `slopeRad` / `slopeDeg`
 pair from v6 is gone — there is a single `slope` field.  The cone
 view reads it; the flat view still ignores it.  See the SLOPE
 section in pg_view_squares.py.
+
+Schema v9
+=========
+(interim, not shipped) added a per-patch `warp` field.
+
+Schema v10
+==========
+Each patch carries a `warp` parameter in [0, 1] that reparametrises
+its own tangential plane.  0 = the historic axial (rectangular)
+chart, aligned with the patch's U and V axes.  1 = a concentric
+chart centred on the apex, whose lines of constant u are arcs
+around the apex and whose lines of constant v are radial spokes.
+In between, the two charts blend linearly.  The plane itself is
+never moved or bent.  Only the CONE view reads it; the flat view
+is unchanged.  See _warpedFrameToWorld and the PLANE WARP section
+of pg_view_squares.py.
 """
 
 EXPORT_JS = r"""
@@ -87,7 +103,7 @@ function _worldSideLengths(pts) {
 
 function buildVisualStateExport() {
   const out = {
-    schemaVersion: 8,
+    schemaVersion: 10,
     generatedAt:   new Date().toISOString(),
 
     cone: {
@@ -133,6 +149,7 @@ function buildVisualStateExport() {
       phi1: _round3(q.phi1),
       s0:   _round3(q.s0),
       s1:   _round3(q.s1),
+      warp: _round3((typeof q.warp === "number") ? q.warp : 0),
     };
 
     if (f) {

@@ -7,8 +7,8 @@ the selection (the selected patch's φ and s, the selected square's
 buttons (Reset, Center apex, Save scene, Load scene, Export visual
 state, Generate .kra, + Patch, + Clone, + Square, + Clone), a
 KRA-export options block (text position, text padding, text warp
-mode, rectangle on/off, text color), a per-patch mirror checkbox,
-two lists, and a help popup.
+mode, rectangle on/off, text color), a per-patch mirror checkbox, a
+per-patch plane-warp scrub input, two lists, and a help popup.
 
 SCROLLABLE, COLLAPSIBLE PANEL
 =============================
@@ -54,6 +54,17 @@ companion fields — a "Mirror ∠" scrub input and a "Mirror flip"
 checkbox — let the mirror be pulled off the diametric line and
 reflected across the patch's V axis rather than merely shifted,
 respectively.  See pg_panel.py for the model.
+
+A per-patch "Plane warp" scrub input sits below Mirror flip.  It
+reparametrises the patch's own tangential plane — the plane is not
+moved and not bent, only the chart used to address points on it
+changes.  At 0 the chart is the historic axial one (rectangular,
+aligned with the patch's U and V axes).  At 1 it is concentric
+about the apex: lines of constant u become arcs around the apex,
+lines of constant v become radial spokes.  Intermediate values
+blend linearly.  Only the cone view reads it; the flat view is
+unchanged.  See pg_view_squares.py (_warpedFrameToWorld and the
+PLANE WARP section of the module docstring).
 
 A per-square "Visual bot." checkbox sits after the Slope field.
 When checked, the shape's text anchor and the four corner senses
@@ -554,6 +565,22 @@ HTML_HEAD = r"""<!DOCTYPE html>
                  title="Negate the mirror's rotation so tilted shapes
                         are not 180°-rotated relative to the
                         original">
+        </div>
+
+        <div class="field">
+          <label>Plane warp</label>
+          <input type="text" id="patchWarp" class="scrubInput"
+                 value="&#8212;" autocomplete="off" spellcheck="false"
+                 disabled
+                 title="Reparametrise the patch's own tangential
+                        plane.  0 = the historic axial (rectangular)
+                        chart, aligned with the patch's own U and V
+                        axes.  1 = a concentric chart centred on the
+                        apex: lines of constant u become arcs around
+                        the apex, lines of constant v become radial
+                        spokes.  In between, the two charts blend
+                        linearly.  The plane itself is never moved
+                        or bent.  Only the cone view reads this.">
         </div>
 
         <div class="field" style="margin-top:6px; margin-bottom:2px;">

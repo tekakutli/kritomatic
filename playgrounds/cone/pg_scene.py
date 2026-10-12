@@ -8,7 +8,7 @@ The scene is the complete editable state of the workspace:
     shapeStandingMult
                     the global hinge standing-height multiplier
     patches         id, name, phi0, phi1, s0, s1, mirror,
-                    mirrorAngle, mirrorFlip
+                    mirrorAngle, mirrorFlip, warp
     squares         id, name, quadId, u, v, scaleU, scaleV, theta,
                     slope, visualBottom
     id counters     nextQuadId, nextSquareId
@@ -101,6 +101,16 @@ before any of these existed simply omit them; the loader defaults
 `mirror` to false, `mirrorAngle` to π, and `mirrorFlip` to true, so
 old scenes load unchanged.
 
+PLANE WARP
+==========
+The per-patch `warp` field is persisted alongside the patch's φ and
+s bounds.  It reparametrises the patch's own tangential plane — 0 is
+the historic axial (rectangular) chart, 1 is a concentric chart
+centred on the apex.  See the PLANE WARP section in
+pg_view_squares.py.  Files written before this field existed simply
+omit it; the loader defaults a missing value to 0, so old scenes
+load unchanged.  The value is clamped to [0, 1] on load.
+
 VISUAL BOTTOM
 =============
 The per-square `visualBottom` boolean is persisted alongside the
@@ -153,6 +163,7 @@ function buildSceneJSON() {
       mirrorAngle: (typeof q.mirrorAngle === "number")
                      ? q.mirrorAngle : Math.PI,
       mirrorFlip: q.mirrorFlip !== false,
+      warp: (typeof q.warp === "number") ? q.warp : 0,
     })),
 
     squares: floatSquares.map(sq => ({
@@ -291,6 +302,8 @@ function applySceneJSON(data) {
       mirrorAngle: (typeof p.mirrorAngle === "number")
                      ? p.mirrorAngle : Math.PI,
       mirrorFlip: p.mirrorFlip !== false,
+      warp: (typeof p.warp === "number")
+              ? Math.max(0, Math.min(1, p.warp)) : 0,
     });
   }
 

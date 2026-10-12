@@ -24,6 +24,18 @@ _shapeLabelScreenAngleDeg and the VISUAL BOTTOM section in
 pg_panel.py.  The flag round-trips through Save / Load scene and is
 copied by cloneQuad.
 
+A patch also carries a per-patch `warp` parameter in [0, 1] that
+reparametrises the patch's own tangential plane.  The plane itself
+is never moved and never bent — only the CHART used to address
+points on that plane changes: at warp = 0 it is the historic axial
+(rectangular) chart; at warp = 1 it is a concentric chart centred
+on the apex, whose lines of constant u are arcs around the apex and
+whose lines of constant v are radial spokes.  Intermediate values
+blend the two charts linearly.  See pg_view_squares.py
+(_warpedFrameToWorld, and the PLANE WARP section of the module
+docstring).  The flag round-trips through Save / Load scene and is
+copied by cloneQuad.
+
 PATCH SHAPE EDITING
 ===================
 Patches are the planes squares live on, not shapes to be edited.  The
@@ -169,7 +181,11 @@ function surfacePoint(phi, s) {
 
    The lateral edges lie on meridians; every meridian ends at the
    apex, so both lateral edges point at the peak.  S_MAX < 1 keeps a
-   patch from collapsing into the apex. */
+   patch from collapsing into the apex.
+
+   Each patch also carries a `warp` parameter in [0, 1] that
+   reparametrises its own tangential plane.  See the module
+   docstring for details. */
 
 const S_MIN = 0.00;
 const S_MAX = 0.90;
@@ -220,8 +236,9 @@ function addQuad() {
     s0: DEFAULT_PATCH_S_CENTER - halfS,
     s1: DEFAULT_PATCH_S_CENTER + halfS,
     mirror: false,
-    mirrorAngle: Math.PI,   // NEW: angular offset around the cone
-    mirrorFlip: true,       // NEW: negate θ so the mirror isn't 180°-rotated
+    mirrorAngle: Math.PI,
+    mirrorFlip: true,
+    warp: 0,
   });
   selectedQuad = quads.length - 1;
   syncQuadList();
@@ -235,7 +252,8 @@ function addQuad() {
    2π is fine.  Square (u, v, scaleU, scaleV, θ, slope, visualBottom)
    are copied as-is, so the clone's squares sit in the same spot on
    the new patch as they did on the old, with the same per-square
-   text-anchor mode. */
+   text-anchor mode.  The patch's own warp, mirrorAngle and
+   mirrorFlip are copied too. */
 function cloneQuad(idx) {
   if (idx < 0 || idx >= quads.length) return;
   const src = quads[idx];
@@ -253,6 +271,7 @@ function cloneQuad(idx) {
     mirrorAngle: (typeof src.mirrorAngle === "number")
                    ? src.mirrorAngle : Math.PI,
     mirrorFlip:  src.mirrorFlip !== false,
+    warp: (typeof src.warp === "number") ? src.warp : 0,
   });
 
   for (let i = 0; i < floatSquares.length; i++) {
@@ -647,6 +666,9 @@ function _pushPatchAndShapeFromParams(params, phiMin, phiMax, sMin, sMax,
     phi0: phiMin, phi1: phiMax,
     s0:   sMin,   s1:   sMax,
     mirror: false,
+    mirrorAngle: Math.PI,
+    mirrorFlip: true,
+    warp: 0,
   };
   quads.push(q);
   const qi = quads.length - 1;

@@ -6,9 +6,10 @@ Remove an image's background, then place the foreground on a canvas painted
 with the image's original background color (or a custom color).
 
 The script:
-  1. Removes the background using a ComfyUI RMBG workflow (the file set in
-     DEFAULT_WORKFLOW, next to this script). The intermediate result is
-     written next to the input with a "_fg" suffix.
+  1. Removes the background by delegating to the sibling bg_remove tool,
+     which owns the ComfyUI round-trip and the workflow-path convention.
+     Its _nobg.png output is renamed here to _fg.png (this script's
+     intermediate-file convention).
   2. Determines the background color: either detects it from the edges of the
      original image, or uses CUSTOM_HEX_COLOR if set.
   3. Either expands the canvas around the foreground (default) or just fills
@@ -64,128 +65,49 @@ EDGE_THICKNESS = 10
 DEBUG = False
 # =================================
 
-import subprocess
-import sys
+import argparse
 import os
 import re
-import json
-import requests
-import time
-import tempfile
-import shutil
-import argparse
+import sys
 from pathlib import Path
 from collections import Counter
+
 from PIL import Image
 
-# ComfyUI configuration
-COMFYUI_URL = "http://127.0.0.1:8188"
+# Reuse the sibling bg_remove tool for the RMBG step, so there is one source
+# of truth for the workflow path, handle filling, and the ComfyUI round-trip.
+# See bg_remove.py for the actual upload/queue/wait/download logic.
 SCRIPT_DIR = Path(__file__).parent
-DEFAULT_WORKFLOW = SCRIPT_DIR / "comfy_workflow_rmbg.json"
+sys.path.insert(0, str(SCRIPT_DIR))
+import bg_remove  # noqa: E402
 
-def upload_image(file_path):
-    """Upload an image to ComfyUI's server and return the filename."""
-    url = f"{COMFYUI_URL}/upload/image"
-
-    # Create unique filename using timestamp
-    file_path_obj = Path(file_path)
-    unique_name = f"{file_path_obj.stem}_{int(time.time())}{file_path_obj.suffix}"
-
-    with open(file_path, 'rb') as f:
-        files = {'image': (unique_name, f, 'image/png')}
-        data = {'overwrite': 'true'}
-        response = requests.post(url, files=files, data=data)
-
-    if response.status_code == 200:
-        return response.json()['name']
-    else:
-        raise Exception(f"Upload failed: {response.status_code}")
-
-def queue_prompt(workflow):
-    """Send a workflow to ComfyUI and get the prompt ID."""
-    response = requests.post(f"{COMFYUI_URL}/prompt", json={"prompt": workflow})
-
-    if response.status_code == 200:
-        return response.json()['prompt_id']
-    else:
-        raise Exception(f"Queue failed: {response.status_code}")
-
-def wait_for_completion(prompt_id):
-    """Wait for a prompt to complete."""
-    while True:
-        response = requests.get(f"{COMFYUI_URL}/history/{prompt_id}")
-        if response.status_code == 200:
-            history = response.json()
-            if prompt_id in history:
-                return history[prompt_id]
-        time.sleep(1)
-
-def get_output_images(history):
-    """Extract output images from workflow history."""
-    images = []
-    for node_out in history.get('outputs', {}).values():
-        if 'images' in node_out:
-            images.extend(node_out['images'])
-    return images
-
-def download_image(image_info, save_path):
-    """Download an image from ComfyUI."""
-    filename = image_info.get('filename')
-    subfolder = image_info.get('subfolder', '')
-    url = f"{COMFYUI_URL}/view?filename={filename}&subfolder={subfolder}&type=output"
-
-    response = requests.get(url)
-    if response.status_code == 200:
-        with open(save_path, 'wb') as f:
-            f.write(response.content)
-        return True
-    return False
 
 def remove_background(image_path):
-    """Remove background using ComfyUI RMBG workflow"""
-    # Check if workflow exists
-    if not DEFAULT_WORKFLOW.exists():
-        print(f"Error: Workflow not found at {DEFAULT_WORKFLOW}")
+    """
+    Run the RMBG step via bg_remove, then rename its _nobg.png output
+    to _fg.png (this script's intermediate-file convention).
+    Returns the _fg.png path, or None on failure.
+    """
+    nobg_path = bg_remove.remove_background(image_path)
+    if not nobg_path:
         return None
 
-    # Load workflow fresh each time
-    with open(DEFAULT_WORKFLOW, 'r', encoding='utf-8') as f:
-        workflow = json.load(f)
+    nobg = Path(nobg_path)
+    stem = nobg.stem
+    if stem.endswith("_nobg"):
+        stem = stem[:-len("_nobg")]
+    fg_path = nobg.with_name(f"{stem}_fg{nobg.suffix}")
 
-    # Upload image with unique name
-    uploaded_filename = upload_image(image_path)
-
-    # Find LoadImage node and set the image
-    for node_id, node_data in workflow.items():
-        if node_data.get('class_type') == 'LoadImage':
-            workflow[node_id]['inputs']['image'] = uploaded_filename
-            break
-
-    # Queue workflow
-    prompt_id = queue_prompt(workflow)
-
-    # Wait for completion
-    history = wait_for_completion(prompt_id)
-
-    # Get output images
-    images = get_output_images(history)
-    if not images:
-        print("Error: No output images generated")
+    try:
+        nobg.replace(fg_path)
+    except OSError as e:
+        print(f"Error renaming {nobg} -> {fg_path}: {e}")
         return None
 
-    # Save intermediate output next to input with "_fg" suffix
-    input_path = Path(image_path)
-    output_path = input_path.parent / f"{input_path.stem}_fg.png"
+    if DEBUG:
+        print(f"  RMBG output: {fg_path}")
+    return str(fg_path)
 
-    # Download and save
-    if download_image(images[0], output_path):
-        print(f"✓ Background removed successfully")
-        if DEBUG:
-            print(f"  Output: {output_path}")
-        return str(output_path)
-    else:
-        print("Error: Failed to download output image")
-        return None
 
 def detect_background_color(image_path, edge_thickness=10):
     """Detect background color by sampling edges of the image."""
@@ -223,6 +145,7 @@ def detect_background_color(image_path, edge_thickness=10):
 
     return hex_color
 
+
 def validate_hex_color(hex_color):
     """Validate and normalize hex color string"""
     hex_color = hex_color.strip().upper()
@@ -241,6 +164,7 @@ def validate_hex_color(hex_color):
     else:
         return None
 
+
 def get_image_dimensions(image_path):
     """Get image dimensions using PIL"""
     try:
@@ -249,6 +173,7 @@ def get_image_dimensions(image_path):
     except Exception as e:
         print(f"Error getting image dimensions: {e}")
         return None, None
+
 
 def change_background_color(foreground_path, hex_color):
     """Replace transparent background with solid color (no expansion)"""
@@ -284,6 +209,7 @@ def change_background_color(foreground_path, hex_color):
     except Exception as e:
         print(f"Error in change_background_color: {e}")
         return None
+
 
 def expand_and_composite(original_path, foreground_path, hex_color, skip_expansion=False):
     """Expand canvas and composite foreground onto it using PIL"""
@@ -346,6 +272,7 @@ def expand_and_composite(original_path, foreground_path, hex_color, skip_expansi
         print(f"Error in expand_and_composite: {e}")
         return None
 
+
 def process_image(image_path, custom_hex_color=None):
     """Main function: remove background, detect color (or use custom), expand canvas, composite"""
     # Check if input file exists
@@ -386,11 +313,12 @@ def process_image(image_path, custom_hex_color=None):
     else:
         return False, None, None
 
+
 def print_usage():
     """Print usage information"""
     print("Usage: fg2canvas_rmbg.py [image_path] [--color HEX]")
     print("\nThis script will:")
-    print("  1. Remove background using ComfyUI RMBG")
+    print("  1. Remove background using ComfyUI RMBG (via bg_remove.py)")
     print("  2. Detect original background color (or use custom if provided)")
     print("  3. Create an expanded canvas with that color, or just change the")
     print("     background if SKIP_EXPANSION is True")
@@ -418,6 +346,7 @@ def print_usage():
     print("  fg2canvas_rmbg.py image.png -c ff0000")
     print("\n  # Skip expansion (edit SKIP_EXPANSION in the script)")
     print("  fg2canvas_rmbg.py image.png")
+
 
 def main():
     # Set up argument parser
@@ -463,6 +392,7 @@ def main():
     else:
         print(f"\n✗ Failed to process image")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

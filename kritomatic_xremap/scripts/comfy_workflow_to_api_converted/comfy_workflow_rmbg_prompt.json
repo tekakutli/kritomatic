@@ -1,10 +1,6 @@
 {
   "1": {
     "inputs": {
-      "prompt": [
-        "6",
-        0
-      ],
       "sam_model": "sam_vit_h (2.56GB)",
       "dino_model": "GroundingDINO_SwinT_OGC (694MB)",
       "threshold": 0.35,
@@ -16,6 +12,10 @@
       "image": [
         "2",
         0
+      ],
+      "prompt": [
+        "6",
+        0
       ]
     },
     "class_type": "SegmentV2",
@@ -25,11 +25,20 @@
   },
   "2": {
     "inputs": {
-      "image": ""
+      "image": "{{loadimage_image_2}}"
     },
     "class_type": "LoadImage",
     "_meta": {
-      "title": "Load Image"
+      "title": "Load Image",
+      "handles": {
+        "image": {
+          "id": "loadimage_image_2",
+          "type": "image_filename",
+          "token": "{{loadimage_image_2}}",
+          "required": true,
+          "description": "LoadImage.image"
+        }
+      }
     }
   },
   "4": {
@@ -47,19 +56,24 @@
   },
   "6": {
     "inputs": {
-      "text": "person"
+      "text": "{{ttn_text_text_6}}"
     },
     "class_type": "ttN text",
     "_meta": {
-      "title": "Text Input"
+      "title": "Text Input",
+      "handles": {
+        "text": {
+          "id": "ttn_text_text_6",
+          "type": "string",
+          "token": "{{ttn_text_text_6}}",
+          "required": true,
+          "description": "ttN text.text"
+        }
+      }
     }
   },
   "7": {
     "inputs": {
-      "prompt": [
-        "6",
-        0
-      ],
       "sam_model": "sam_vit_h (2.56GB)",
       "dino_model": "GroundingDINO_SwinT_OGC (694MB)",
       "threshold": 0.3,
@@ -70,6 +84,10 @@
       "background_color": "#222222",
       "image": [
         "2",
+        0
+      ],
+      "prompt": [
+        "6",
         0
       ]
     },

@@ -39,7 +39,7 @@ DEFAULT_OUT        = "project_dump.md" # output markdown file
 #   .service  systemd unit files
 #   .md       Markdown
 #   .toml     TOML
-DEFAULT_EXTENSIONS = [".py", ".sh", "yaml", ".md", ".conf"]
+DEFAULT_EXTENSIONS = [".py", ".sh", "yaml", ".md", ".conf", ".json"]
 DEFAULT_AFFIX      = None             # e.g. "_test" (substring matched in filename)
 DEFAULT_RECURSIVE  = False            # descend into subdirectories
 DEFAULT_TREE_ONLY  = False            # only emit the directory tree, no file contents
@@ -47,6 +47,14 @@ DEFAULT_TREE_ONLY  = False            # only emit the directory tree, no file co
 # at any depth). Add your own as needed.
 # DEFAULT_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules"]
 DEFAULT_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules", "kritomatic_xremap", "other_scripts", "playgrounds"]
+
+# Directory names whitelist: if NON-EMPTY, only descend into subdirectories
+# whose basename is in this list (exact match, case-sensitive). Matching is
+# applied at every level. If empty ([]), every subdirectory is descended
+# into (subject to DEFAULT_EXCLUDE_DIRS). Directories in DEFAULT_EXCLUDE_DIRS
+# are always skipped, even if they appear here.
+# e.g. ["src", "tests"] to only walk into those two top-level folders.
+DEFAULT_INCLUDE_DIRS = []
 
 # Filename substrings whitelist: if NON-EMPTY, a file is only kept when its
 # filename contains AT LEAST ONE of these substrings (partial match,
@@ -81,6 +89,7 @@ def find_files(
     extensions: list[str],
     affix: str | None,
     exclude_dirs: set[str],
+    include_dirs: set[str],
     include_file_substrings: list[str],
     exclude_file_substrings: list[str],
     recursive: bool = True,
@@ -89,6 +98,11 @@ def find_files(
     for dirpath, dirnames, filenames in os.walk(root):
         # prune excluded directories in-place so os.walk skips them
         dirnames[:] = [d for d in dirnames if d not in exclude_dirs]
+
+        # if a whitelist of directories was provided, only descend into
+        # those (checked at every level); empty list = descend into all
+        if include_dirs:
+            dirnames[:] = [d for d in dirnames if d in include_dirs]
 
         # if not recursing, prevent os.walk from descending any further
         if not recursive:
@@ -209,6 +223,7 @@ def main() -> int:
 
     extensions = [e for e in (normalize_ext(x) for x in DEFAULT_EXTENSIONS) if e]
     exclude_dirs = {d for d in DEFAULT_EXCLUDE_DIRS if d}
+    include_dirs = {d for d in DEFAULT_INCLUDE_DIRS if d}
     include_file_substrings = [s for s in DEFAULT_INCLUDE_FILE_SUBSTRINGS if s]
     exclude_file_substrings = [s for s in DEFAULT_EXCLUDE_FILE_SUBSTRINGS if s]
 
@@ -228,6 +243,7 @@ def main() -> int:
         extensions,
         affix,
         exclude_dirs,
+        include_dirs,
         include_file_substrings,
         exclude_file_substrings,
         recursive,
@@ -240,6 +256,8 @@ def main() -> int:
             msg += f" matching affix '{affix}'"
         if include_file_substrings:
             msg += f" matching any of {include_file_substrings}"
+        if include_dirs:
+            msg += f" under any of {sorted(include_dirs)}"
         if not recursive:
             msg += " (non-recursive)"
         print(msg, file=sys.stderr)
@@ -287,6 +305,11 @@ def main() -> int:
                 if content and not content.endswith("\n"):
                     fh.write("\n")
                 fh.write("```\n\n")
+
+    # Count and report the total number of lines in the output file (stdout)
+    with out.open("r", encoding="utf-8") as fh:
+        line_count = sum(1 for _ in fh)
+    print(f"Total lines in output: {line_count}", file=sys.stdout)
 
     if tree_only:
         print(f"Wrote tree only ({total} file(s)) to {out}", file=sys.stderr)

@@ -1002,7 +1002,15 @@ def _dispatch(instruction):
 
     Exists so both the file/stdin path and the interactive prompt path
     share a single implementation of the checks, the trace line, and
-    the success message.
+    the terminal status line.
+
+    The status line is emitted on every code path that actually reaches
+    the tool: whether the tool returns normally or ends via sys.exit(),
+    the router prints one final `[router] done (exit N).` line so that a
+    caller reading stderr sees an unambiguous end marker. A SystemExit
+    whose code is a *string* is a router-generated error (unknown tool,
+    unknown param, missing file, bad instruction) — those carry their
+    own message and get no "done" line, because no tool ran.
     """
     if not isinstance(instruction, dict):
         raise SystemExit("Instruction JSON must be an object.")
@@ -1019,8 +1027,22 @@ def _dispatch(instruction):
         raise SystemExit("'params' must be a JSON object.")
 
     print(f"[router] tool={tool!r} params={params!r}", file=sys.stderr)
-    run_tool(tool, params)
-    print("[router] done.", file=sys.stderr)
+
+    try:
+        run_tool(tool, params)
+    except SystemExit as e:
+        # Tools frequently end via sys.exit() from their main(). Catch
+        # the SystemExit so the terminal status line is emitted on every
+        # code path, then re-raise so the tool's exit status becomes the
+        # router's exit status. Numeric or None codes mean the tool ran
+        # and chose its own ending; a string code came from the router
+        # itself and already carries its own message.
+        if e.code is None or isinstance(e.code, int):
+            status = 0 if e.code is None else e.code
+            print(f"[router] done (exit {status}).", file=sys.stderr)
+        raise
+
+    print("[router] done (exit 0).", file=sys.stderr)
 
 
 def main():

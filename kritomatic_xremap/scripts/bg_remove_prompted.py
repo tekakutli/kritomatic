@@ -7,45 +7,42 @@ text prompt for guided segmentation.
 
 This script:
   1. Uploads the input image to a running ComfyUI instance.
-  2. Loads a prompted RMBG workflow (comfy_workflow_rmbg_prompt.json next to
-     this script) and selects the segmentation pipeline based on DEFAULT_MODE.
-  3. Queues the workflow, waits for completion, and downloads the result(s).
-  4. Saves outputs next to the input with a "_nobg" suffix (and _v1/_v2 in
-     "both" mode).
+  2. Loads an API-format prompted workflow from
+     comfy_workflow_to_api_converted/comfy_workflow_rmbg_prompt.json
+     (next to this script), discovers its {{handle_id}} tokens via
+     _meta.handles, and fills them.
+  3. Prunes SaveImage nodes according to DEFAULT_MODE, identifying each
+     pipeline branch by the class_type of the node feeding into its
+     SaveImage rather than by hardcoded node ids.
+  4. Queues the workflow, waits for completion, and downloads the
+     result(s).
+  5. Saves outputs next to the input with a "_nobg" suffix (and _v1/_v2
+     in "both" mode).
 
-By default, the image path is taken from the IMAGE_PATH variable below.
-If a positional argument is given on the command line, it overrides
+By default, the image path is taken from IMAGE_PATH below. If a
+positional argument is given on the command line, it overrides
 IMAGE_PATH.
 
-The segmentation mode is set only via the DEFAULT_MODE variable below; there
-is no command-line flag for it.
+The segmentation mode is set only via the DEFAULT_MODE variable below;
+there is no command-line flag for it.
 
 Usage:
     python bg_remove_prompted.py [image_path] [--prompt TEXT]
-
-Examples:
-    # Use IMAGE_PATH variable and default prompt/mode
-    python bg_remove_prompted.py
-
-    # Override image path
-    python bg_remove_prompted.py photo.png
-
-    # Custom prompt (mode still comes from DEFAULT_MODE)
-    python bg_remove_prompted.py photo.png --prompt "a dog"
 """
 
-import subprocess
-import sys
-import os
-import re
-import json
-import requests
-import time
-import tempfile
 import argparse
+import json
+import os
+import sys
+import time
 from pathlib import Path
-from collections import Counter
-from PIL import Image
+
+import requests
+
+# Reuse the shared handle helpers from the sibling comfy_handles module.
+SCRIPT_DIR = Path(__file__).parent
+sys.path.insert(0, str(SCRIPT_DIR))
+from comfy_handles import discover_handles, fill_handles  # noqa: E402
 
 # ===== CONFIGURABLE SETTINGS =====
 IMAGE_PATH = "path/to/image.png"  # Default input image; overridden by positional arg
@@ -53,40 +50,69 @@ DEFAULT_PROMPT = "person"         # Default text prompt if none provided
 DEFAULT_MODE = "v2"               # Segmentation mode: "v2", "v1", or "both"
 # =================================
 
-# ComfyUI configuration
 COMFYUI_URL = "http://127.0.0.1:8188"
-SCRIPT_DIR = Path(__file__).parent
-DEFAULT_WORKFLOW = SCRIPT_DIR / "comfy_workflow_rmbg_prompt.json"
+DEFAULT_WORKFLOW = (
+    SCRIPT_DIR / "comfy_workflow_to_api_converted" / "comfy_workflow_rmbg_prompt.json"
+)
+
+
+# ---------------------------------------------------------------------------
+# Handle value assignment
+# ---------------------------------------------------------------------------
+
+def build_handle_values(handles, image_filename, text_prompt):
+    """
+    Assign each handle a value based on its declared type.
+
+    This tool understands two handle types: 'image_filename' (filled
+    with the uploaded name) and 'string' (filled with the text prompt).
+    Anything else means the workflow needs an input this script does
+    not produce, and it fails loudly rather than submitting a partial
+    workflow.
+    """
+    values = {}
+    for hid, spec in handles.items():
+        t = spec["type"]
+        if t == "image_filename":
+            values[hid] = image_filename
+        elif t == "string":
+            values[hid] = text_prompt
+        else:
+            raise RuntimeError(
+                f"Unsupported handle type '{t}' for handle '{hid}' "
+                f"(node {spec['node_id']}.{spec['field']})"
+            )
+    return values
+
+
+# ---------------------------------------------------------------------------
+# ComfyUI API
+# ---------------------------------------------------------------------------
 
 def upload_image(file_path):
-    """Upload an image to ComfyUI's server and return the filename."""
+    """Upload an image and return the filename ComfyUI stored it as."""
     url = f"{COMFYUI_URL}/upload/image"
+    p = Path(file_path)
+    unique_name = f"{p.stem}_{int(time.time())}{p.suffix}"
 
-    # Create unique filename using timestamp
-    file_path_obj = Path(file_path)
-    unique_name = f"{file_path_obj.stem}_{int(time.time())}{file_path_obj.suffix}"
-
-    with open(file_path, 'rb') as f:
-        files = {'image': (unique_name, f, 'image/png')}
-        data = {'overwrite': 'true'}
+    with open(file_path, "rb") as f:
+        files = {"image": (unique_name, f, "image/png")}
+        data = {"overwrite": "true"}
         response = requests.post(url, files=files, data=data)
 
-    if response.status_code == 200:
-        return response.json()['name']
-    else:
-        raise Exception(f"Upload failed: {response.status_code}")
+    if response.status_code != 200:
+        raise RuntimeError(f"Upload failed: {response.status_code} {response.text}")
+    return response.json()["name"]
+
 
 def queue_prompt(workflow):
-    """Send a workflow to ComfyUI and get the prompt ID."""
     response = requests.post(f"{COMFYUI_URL}/prompt", json={"prompt": workflow})
+    if response.status_code != 200:
+        raise RuntimeError(f"Queue failed: {response.status_code} {response.text}")
+    return response.json()["prompt_id"]
 
-    if response.status_code == 200:
-        return response.json()['prompt_id']
-    else:
-        raise Exception(f"Queue failed: {response.status_code}")
 
 def wait_for_completion(prompt_id):
-    """Wait for a prompt to complete."""
     while True:
         response = requests.get(f"{COMFYUI_URL}/history/{prompt_id}")
         if response.status_code == 200:
@@ -95,115 +121,138 @@ def wait_for_completion(prompt_id):
                 return history[prompt_id]
         time.sleep(1)
 
+
 def get_output_images(history):
-    """Extract output images from workflow history."""
     images = []
-    for node_out in history.get('outputs', {}).values():
-        if 'images' in node_out:
-            images.extend(node_out['images'])
+    for node_out in history.get("outputs", {}).values():
+        if "images" in node_out:
+            images.extend(node_out["images"])
     return images
 
-def download_image(image_info, save_path):
-    """Download an image from ComfyUI."""
-    filename = image_info.get('filename')
-    subfolder = image_info.get('subfolder', '')
-    url = f"{COMFYUI_URL}/view?filename={filename}&subfolder={subfolder}&type=output"
 
+def download_image(image_info, save_path):
+    filename = image_info.get("filename")
+    subfolder = image_info.get("subfolder", "")
+    url = (f"{COMFYUI_URL}/view"
+           f"?filename={filename}&subfolder={subfolder}&type=output")
     response = requests.get(url)
     if response.status_code == 200:
-        with open(save_path, 'wb') as f:
+        with open(save_path, "wb") as f:
             f.write(response.content)
         return True
     return False
 
+
+# ---------------------------------------------------------------------------
+# Mode selection (graph surgery, unrelated to handles)
+# ---------------------------------------------------------------------------
+
+# Which upstream class_type produces which branch's output. A SaveImage
+# node whose "images" input points at a node of one of these classes
+# belongs to that branch. Matching by class_type rather than by node id
+# keeps mode selection working even if node ids change when the
+# workflow is rebuilt in the ComfyUI editor.
+BRANCH_BY_UPSTREAM_CLASS = {
+    "SegmentV2": "v2",
+    "Segment":   "v1",
+}
+
+
 def prepare_workflow(mode):
     """
-    Prepare the workflow based on mode.
-    Disables the unwanted pipeline by removing its SaveImage node.
+    Load the workflow and prune SaveImage nodes according to mode.
+
+    A SaveImage's "images" input points at an upstream node id; the
+    upstream node's class_type identifies which pipeline branch the
+    SaveImage belongs to. Nodes feeding from the branch we do NOT want
+    are deleted, which is how the unwanted half of the graph stops
+    producing output. This operates on the API graph structure, so it
+    lives apart from the handle discovery/fill step.
     """
-    # Load workflow
     if not DEFAULT_WORKFLOW.exists():
         print(f"Error: Workflow not found at {DEFAULT_WORKFLOW}")
         return None
 
-    with open(DEFAULT_WORKFLOW, 'r', encoding='utf-8') as f:
+    with open(DEFAULT_WORKFLOW, "r", encoding="utf-8") as f:
         workflow = json.load(f)
 
-    # Mode selection: remove the corresponding SaveImage node
-    if mode == "v2":
-        # Remove V1's SaveImage node (node 8)
-        if "8" in workflow:
-            del workflow["8"]
-        print("  Mode v2: Keeping only Segmentation V2 (removed V1 SaveImage node)")
-
-    elif mode == "v1":
-        # Remove V2's SaveImage node (node 4)
-        if "4" in workflow:
-            del workflow["4"]
-        print("  Mode v1: Keeping only Segmentation V1 (removed V2 SaveImage node)")
-
-    elif mode == "both":
-        # Keep both SaveImage nodes (node 4 for V2, node 8 for V1)
+    if mode == "both":
         print("  Mode both: Keeping both Segmentation V2 and V1")
+        return workflow
 
-    else:
+    if mode not in ("v1", "v2"):
         print(f"Error: Unknown mode '{mode}'")
         return None
 
+    prune_ids = []
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        if node.get("class_type") != "SaveImage":
+            continue
+        images_in = node.get("inputs", {}).get("images")
+        if not (isinstance(images_in, list) and images_in):
+            continue
+        upstream_id = images_in[0]
+        upstream = workflow.get(upstream_id)
+        if not isinstance(upstream, dict):
+            continue
+        branch = BRANCH_BY_UPSTREAM_CLASS.get(upstream.get("class_type"))
+        if branch and branch != mode:
+            prune_ids.append(node_id)
+
+    for node_id in prune_ids:
+        del workflow[node_id]
+
+    if prune_ids:
+        print(f"  Mode {mode}: Keeping only {mode.upper()} "
+              f"(removed SaveImage node(s): {', '.join(prune_ids)})")
+    else:
+        print(f"  Mode {mode}: No SaveImage nodes pruned "
+              f"(no {('v1' if mode == 'v2' else 'v2').upper()} branch found)")
+
     return workflow
 
-def remove_background(image_path, text_prompt, mode):
-    """Remove background using ComfyUI RMBG workflow with text prompt"""
 
-    # Prepare workflow based on mode
+# ---------------------------------------------------------------------------
+# Main flow
+# ---------------------------------------------------------------------------
+
+def remove_background(image_path, text_prompt, mode):
     workflow = prepare_workflow(mode)
     if workflow is None:
         return None
 
-    # Upload image with unique name
+    handles = discover_handles(workflow)
+    if not handles:
+        print("Error: Workflow declares no handles to fill.")
+        return None
+
     uploaded_filename = upload_image(image_path)
 
-    # Find and update nodes
-    for node_id, node_data in workflow.items():
-        # Set the image in LoadImage node
-        if node_data.get('class_type') == 'LoadImage':
-            workflow[node_id]['inputs']['image'] = uploaded_filename
+    try:
+        values = build_handle_values(handles, uploaded_filename, text_prompt)
+        fill_handles(workflow, values)
+    except RuntimeError as e:
+        print(f"Error: {e}")
+        return None
 
-        # Set the text prompt in ttN text node
-        if node_data.get('class_type') == 'ttN text':
-            workflow[node_id]['inputs']['text'] = text_prompt
-
-    # Queue workflow
     prompt_id = queue_prompt(workflow)
-
-    # Wait for completion
     history = wait_for_completion(prompt_id)
 
-    # Get output images
     images = get_output_images(history)
     if not images:
         print("Error: No output images generated")
         return None
 
-    # Save output image(s)
     input_path = Path(image_path)
     output_paths = []
 
     for i, image_info in enumerate(images):
-        # Determine suffix based on mode and which node produced it
-        # Since we're removing the SaveImage node, we need to determine which output is which
-        if mode == "v2":
-            suffix = "_nobg.png"
-        elif mode == "v1":
-            suffix = "_nobg.png"
-        elif mode == "both":
-            # First output is V2 (node 4), second is V1 (node 8)
-            if i == 0:
-                suffix = "_nobg_v2.png"
-            else:
-                suffix = "_nobg_v1.png"
+        if mode == "both":
+            suffix = "_nobg_v2.png" if i == 0 else "_nobg_v1.png"
         else:
-            suffix = f"_nobg_{i}.png"
+            suffix = "_nobg.png"
 
         output_path = input_path.parent / f"{input_path.stem}{suffix}"
 
@@ -214,31 +263,28 @@ def remove_background(image_path, text_prompt, mode):
             print(f"Error: Failed to download output image {i+1}")
 
     if output_paths:
-        print(f"✓ Background removed successfully using prompt: '{text_prompt}' (mode: {mode})")
+        print(f"✓ Background removed successfully using prompt: '{text_prompt}' "
+              f"(mode: {mode})")
         print(f"  Generated {len(output_paths)} output image(s)")
         return output_paths
     else:
         print("Error: Failed to download any output images")
         return None
 
+
 def process_image(image_path, text_prompt=None, mode=None):
-    """Main function: remove background only"""
-    # Check if input file exists
     if not os.path.exists(image_path):
         print(f"Error: Input file not found: {image_path}")
         return None
 
-    # Use default prompt if none provided
     if text_prompt is None:
         text_prompt = DEFAULT_PROMPT
         print(f"Using default prompt: '{text_prompt}'")
 
-    # Mode always comes from the DEFAULT_MODE variable
     if mode is None:
         mode = DEFAULT_MODE
         print(f"Using mode from DEFAULT_MODE: '{mode}'")
 
-    # Remove background
     print(f"Removing background from: {image_path}")
     output_paths = remove_background(image_path, text_prompt, mode)
 
@@ -252,8 +298,8 @@ def process_image(image_path, text_prompt=None, mode=None):
         print(f"✗ Failed to process image")
         return None
 
+
 def print_usage():
-    """Print usage information"""
     print("Usage: bg_remove_prompted.py [image_path] [--prompt <text>]")
     print("\nThis script will:")
     print("  1. Remove background using ComfyUI RMBG with text prompt")
@@ -273,41 +319,29 @@ def print_usage():
     print("\n  # Custom prompt")
     print("  bg_remove_prompted.py image.png --prompt 'a person standing'")
 
+
 def main():
-    # Set up argument parser
     parser = argparse.ArgumentParser(
         description="Remove background from image using ComfyUI RMBG",
-        add_help=False  # We'll handle help manually for custom format
+        add_help=False
     )
+    parser.add_argument("image_path", nargs="?", default=None,
+                        help="Path to the input image (overrides IMAGE_PATH variable)")
+    parser.add_argument("--prompt", "-p", default=None,
+                        help=f'Text prompt for segmentation (default: "{DEFAULT_PROMPT}")')
+    parser.add_argument("--help", "-h", action="help",
+                        help="Show this help message and exit")
 
-    # Define arguments
-    parser.add_argument('image_path', nargs='?', default=None,
-                       help='Path to the input image (overrides IMAGE_PATH variable)')
-    parser.add_argument('--prompt', '-p',
-                       help=f'Text prompt for segmentation (default: "{DEFAULT_PROMPT}")',
-                       default=None)
-    parser.add_argument('--help', '-h',
-                       action='help',
-                       help='Show this help message and exit')
-
-    # Parse arguments
     try:
         args = parser.parse_args()
     except SystemExit:
-        # If parse_args fails, show usage and exit
         print_usage()
         sys.exit(1)
 
-    # Use positional argument if provided, otherwise fall back to IMAGE_PATH
     image_path = args.image_path if args.image_path else IMAGE_PATH
-
-    # Process the image (mode comes from DEFAULT_MODE inside process_image)
     output_paths = process_image(image_path, args.prompt)
+    sys.exit(0 if output_paths else 1)
 
-    if output_paths:
-        sys.exit(0)
-    else:
-        sys.exit(1)
 
 if __name__ == "__main__":
     main()

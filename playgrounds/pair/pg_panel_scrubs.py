@@ -12,11 +12,22 @@ FIELDS INSTALLED HERE
     pairMetricBVal      world units per abstract unit along line B
     pairOffsetVal       shift of line B along the direction of line A
     pairGapVal          perpendicular distance between the two lines
+    pairScaleVal        whole-pair zoom factor about the anchor
+                        point (cx, cy); 1 = identity
     pairLoopbackVal     extra abstract distance appended to the
                         pair's axis period (>= 0)
 
 The KRA text-padding field (kraTextPad) is not a scrub field: it is
 read as a plain text input at KRA-export time.
+
+SCALE VERSUS METRIC A / B
+=========================
+Metric A and metric B change ONE line's stretch independently of
+the other.  Scale changes BOTH lines AND the offset AND the gap by
+the same factor, so the pair behaves like a single object drawn at
+a different size.  The two are meant to be used together: the user
+sets the pair's shape with the metrics and offset, then adjusts its
+overall size with the scale.  See pg_core.py, PER-PAIR SCALE.
 """
 
 PANEL_SCRUBS_JS = r"""
@@ -31,6 +42,7 @@ PANEL_SCRUBS_JS = r"""
   const mBEl    = document.getElementById("pairMetricBVal");
   const offEl   = document.getElementById("pairOffsetVal");
   const gapEl   = document.getElementById("pairGapVal");
+  const scaleEl = document.getElementById("pairScaleVal");
   const loopEl  = document.getElementById("pairLoopbackVal");
 
   /* ---- Inclination° — the pair's tilt against the horizontal
@@ -102,6 +114,27 @@ PANEL_SCRUBS_JS = r"""
     write: (raw) => {
       if (selectedPair < 0) return;
       pairs[selectedPair].gap = Math.max(0.01, raw);
+    },
+  });
+
+  /* ---- Scale.  Whole-pair zoom about the anchor point.  Folds
+     into both metrics, the offset, and the gap (see pg_core.py,
+     PER-PAIR SCALE), so a scale of 2 makes the pair look twice
+     as big on the canvas, anchored at (cx, cy); a scale of 0.5
+     halves it.  Snap-snaps to 0.1 on Shift, like the metrics. */
+  if (scaleEl) _installScrubInput(scaleEl, {
+    rate: 0.005,
+    snapStep: 0.1,
+    read: () => {
+      if (selectedPair < 0) return 1;
+      const p = pairs[selectedPair];
+      return (typeof p.scale === "number" && isFinite(p.scale)
+                && p.scale > 0)
+               ? p.scale : 1;
+    },
+    write: (raw) => {
+      if (selectedPair < 0) return;
+      pairs[selectedPair].scale = Math.max(0.05, Math.min(100, raw));
     },
   });
 

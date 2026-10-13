@@ -1,13 +1,16 @@
 """
 pg_export.py — JSON export of the current visual state.
 
-For each pair the export dumps the raw stored fields, the direction
-and perpendicular of its frame, the screen endpoints of both lines,
-and — per segment — the world and screen coordinates of the four
-trapezoid corners, for every wrapped copy.  Diagnostic use: if the
-world corners of a segment are a parallelogram, the metrics are
-equal or the offset is zero; if not, the skew quantifies how far
-the two metrics differ.
+For each pair the export dumps the raw stored fields — including the
+per-pair `scale` — the direction and perpendicular of its frame, the
+screen endpoints of both lines, and — per segment — the world and
+screen coordinates of the four trapezoid corners, for every wrapped
+copy.  Diagnostic use: if the world corners of a segment are a
+parallelogram, the metrics are equal or the offset is zero; if not,
+the skew quantifies how far the two metrics differ.  A pair scale
+different from 1 simply multiplies every world corner's offset from
+the pair's anchor by that factor; the world corners' shape (and the
+parallelogram test) are unchanged.
 """
 
 EXPORT_JS = r"""
@@ -60,6 +63,8 @@ function buildVisualStateExport() {
       gap:     _round3(p.gap),
       loopbackGap: _round3((typeof p.loopbackGap === "number")
                              ? p.loopbackGap : 0),
+      scale:   _round3((typeof p.scale === "number" && isFinite(p.scale)
+                          && p.scale > 0) ? p.scale : 1),
       u:       [_round3(f.ux), _round3(f.uy)],
       v:       [_round3(f.vx), _round3(f.vy)],
       linesScreen: {},

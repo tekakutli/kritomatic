@@ -19,6 +19,12 @@ For each segment of each pair, the client computes:
     a RECT item — the trapezoid itself — that the daemon draws as a
     filled polygon, matching what the canvas band shows.
 
+All exported text is drawn in BLACK.  An earlier revision offered a
+"Text color" dropdown (pair hue vs. black); the pair-hue variant is
+no longer produced, so the option was removed and the color is now
+hard-coded.  See the module docstring of pg_base.py, KRA EXPORT,
+for the current set of KRA-section controls.
+
 THE PARAMETRIC MAP
 ==================
 A segment [a, b] on a pair p is parametrised by two coordinates
@@ -34,8 +40,18 @@ The world position at (s, t) is
     Px = p.cx + u·mA·ux + t·(off + u·(mB − mA))·ux + t·gap·vx
     Py = p.cy + u·mA·uy + t·(off + u·(mB − mA))·uy + t·gap·vy
 
-with (ux, uy) = (cos angle, sin angle), (vx, vy) = (−uy, ux).  This
-is exact for all four corners and matches segmentCornersWorldAt.
+with (ux, uy) = (cos angle, sin angle), (vx, vy) = (−uy, ux), and
+
+    mA  = p.metricA · pairScale
+    mB  = p.metricB · pairScale
+    off = p.offset  · pairScale
+    gap = p.gap     · pairScale
+
+where `pairScale` is the pair's `scale` field (see pg_core.py,
+PER-PAIR SCALE).  The parametric map is exact for all four corners
+and matches segmentCornersWorldAt: a nonzero scale simply multiplies
+every (u·m, off, gap) term by the same factor, so the trapezoid is
+the canvas band's trapezoid, uniformly scaled about the anchor.
 
 THE JACOBIAN AT (s, t)
 ======================
@@ -56,16 +72,72 @@ J maps a small tangent (ds, dt) in the segment's parameter space to
 a screen displacement.  That is precisely the linear map a text
 sitting on the trapezoid should be warped by.
 
-DECOMPOSITION AND NORMALIZATION
-===============================
-J is decomposed into R(θ)·Shx(k)·S(sx, sy), and normalized so
-max(|sx|, |sy|) = 1.  The normalization keeps the text from
-overflowing its font_px bounding box: the longer screen dimension
-reaches font_px, the shorter is proportionally smaller.  The text
-is drawn at font_px = min(W_sq, H_sq) · 0.40, where W_sq and H_sq
-are the trapezoid's average screen-side lengths, and then warped by
-the normalized J.  The result is a text field whose apparent size
-matches the trapezoid and whose orientation matches its edges.
+READING DIRECTION — THE MORE-HORIZONTAL AXIS
+============================================
+Earlier revisions tried two other rules for picking the text's
+local x-axis (its reading direction):
+
+    · always map x to the s-direction — correct only when the
+      pair's lines run more horizontally than vertically on
+      screen; for a near-vertical pair the label comes out
+      rotated 90°.
+
+    · pick the trapezoid edge whose midpoint has the largest
+      screen y (the "lowest" edge) — correct in most cases, but
+      fragile: for a tall thin trapezoid, or one whose shape and
+      position make a vertical edge momentarily the lowest, the
+      picker flips to the wrong axis and the label reads sideways.
+
+The current rule is simpler and does not have those failure modes:
+between the two Jacobian columns — the screen direction of s and
+the screen direction of t — use whichever is MORE HORIZONTAL
+(larger |x-component| relative to its length) as the reading axis.
+A label reads left-to-right by convention, and the trapezoid edge
+whose screen direction is closest to horizontal is the one that
+matches that convention.  For a wide short trapezoid this is the
+t-edge; for a narrow tall one it is the s-edge; for a diagonal
+trapezoid it is whichever of the two happens to lie flatter on
+screen.
+
+HANDEDNESS — THE FRAME MUST NOT MIRROR THE GLYPHS
+=================================================
+SVG's coordinate system has y growing downward.  For a text glyph
+to render unmirrored, the local frame (m11, m12, m21, m22) must
+have a positive determinant:
+
+    det = m11·m22 − m21·m12 > 0.
+
+The world→screen mapping flips the world y-axis (screen y = −world
+y · scale + ty), which inverts the handedness of the (s, t) frame.
+The raw Jacobian therefore gives det < 0 for a wide range of pair
+orientations, and the daemon faithfully applies that reflected
+transform — the glyphs come out mirrored.  The classic symptom is
+a label that "reads backwards" or, combined with a 90° axis
+choice, looks like the text was rotated and flipped.
+
+The fix is to detect the negative determinant and negate the
+y-axis column: (m21, m22) → (−m21, −m22).  That is a reflection
+of the y-axis ALONE, which restores det > 0.  The x-axis — the
+reading direction — is untouched, so the label still lies along
+the trapezoid's chosen reading edge; only the perpendicular
+orientation of the glyphs changes, and only to correct a mirror
+that should never have been there.
+
+After the handedness fix, the reading direction may still point
+leftward on screen; a 180° flip of BOTH columns (which preserves
+det > 0 and therefore does not re-mirror) brings the reading
+direction rightward without disturbing the glyphs.
+
+NORMALIZATION
+=============
+The two Jacobian columns are scaled by `1 / max(|s-column|,
+|t-column|)`, so after normalization the longer column has length
+1.  The text is drawn at font_px = min(W_sq, H_sq) · 0.40 and
+warped by the normalized columns; the longer on-screen dimension
+therefore reaches font_px, the shorter is proportionally smaller,
+and the glyphs fit within a font_px × font_px bounding box without
+overflowing the trapezoid.  Rotation and shear are invariant under
+the normalization, so the shape of the text is preserved.
 
 ANCHOR POINT
 ============
@@ -105,50 +177,6 @@ function _hueToHex(h) {
   return "#" + to2(h.r) + to2(h.g) + to2(h.b);
 }
 
-function _hueToHexLight(h) {
-  const mix = (v) => Math.round(v * 0.5 + 255 * 0.5);
-  const to2 = (v) => v.toString(16).padStart(2, "0");
-  return "#" + to2(mix(h.r)) + to2(mix(h.g)) + to2(mix(h.b));
-}
-
-/* ==========================================================================
-   AFFINE DECOMPOSITION
-   ==========================================================================
-   Any invertible 2x2 matrix M can be written uniquely as
-
-       M = R(theta) * Shx(k) * S(sx, sy)
-
-   where R is a rotation, Shx is a horizontal shear (x gains k*y per
-   unit y), and S is a diagonal scale.  Solving the components:
-
-       sx        = sqrt(M00^2 + M10^2)
-       sy        = det(M) / sx
-       theta_rad = atan2(M10, M00)
-       k         = (M01*M00 + M11*M10) / det
-
-   with M in column-vector form M = [[M00, M01], [M10, M11]].
-
-   Returns null for a degenerate matrix. */
-
-function _decomposeAffineLocal(M00, M01, M10, M11) {
-  const det = M00 * M11 - M01 * M10;
-  const sxRaw = Math.sqrt(M00 * M00 + M10 * M10);
-  if (sxRaw < 1e-9 || Math.abs(det) < 1e-9) return null;
-
-  const syRaw = det / sxRaw;
-  const rotationRad = Math.atan2(M10, M00);
-  const shear = (M01 * M00 + M11 * M10) / det;
-
-  return {
-    rotation_rad: rotationRad,
-    rotation_deg: rotationRad * 180 / Math.PI,
-    shear: shear,
-    scale_x: sxRaw,
-    scale_y: syRaw,
-    det: det,
-  };
-}
-
 /* ==========================================================================
    SEGMENT PARAMETRIC MAP
    ========================================================================== */
@@ -177,11 +205,17 @@ function _computeSegmentKraItem(p, seg, options) {
   const vx = -uy;
   const vy = ux;
 
-  const mA  = p.metricA;
-  const mB  = p.metricB;
-  const off = p.offset;
-  const gap = p.gap;
-  const scale = view.scale;
+  /* The pair's own scale is folded into the four geometric
+     coefficients.  See the module docstring, THE PARAMETRIC MAP.
+     `viewScale` is the canvas's world-to-screen factor and is kept
+     separate so the two scales cannot be confused. */
+  const pairScale = _pairScale(p);
+  const viewScale = view.scale;
+
+  const mA  = p.metricA * pairScale;
+  const mB  = p.metricB * pairScale;
+  const off = p.offset  * pairScale;
+  const gap = p.gap     * pairScale;
 
   /* Trapezoid corners in world and screen space.  Order is
      [A(a), A(b), B(b), B(a)] — the same order the canvas band
@@ -198,7 +232,8 @@ function _computeSegmentKraItem(p, seg, options) {
 
   /* Trapezoid's average screen-side lengths.  W_sq is the average
      of the two "along the lines" sides; H_sq the average of the
-     two "across the gap" sides. */
+     two "across the gap" sides.  Both shrink and grow with the
+     pair scale, so font_px and the flat-frame padding follow. */
   const lenBottom = Math.hypot(c1[0] - c0[0], c1[1] - c0[1]);
   const lenTop    = Math.hypot(c2[0] - c3[0], c2[1] - c3[1]);
   const lenLeft   = Math.hypot(c3[0] - c0[0], c3[1] - c0[1]);
@@ -278,35 +313,66 @@ function _computeSegmentKraItem(p, seg, options) {
   const Ja = k * (mA + t * (mB - mA));
   const Jb = (off + u * (mB - mA));
 
-  const J00 =  scale * Ja * ux;
-  const J10 = -scale * Ja * uy;
-  const J01 =  scale * (Jb * ux + gap * vx);
-  const J11 = -scale * (Jb * uy + gap * vy);
+  const J00 =  viewScale * Ja * ux;
+  const J10 = -viewScale * Ja * uy;
+  const J01 =  viewScale * (Jb * ux + gap * vx);
+  const J11 = -viewScale * (Jb * uy + gap * vy);
 
-  /* Decompose M = J.  No flat rotation: the text reads along the
-     segment's own s-direction, and J carries that direction into
-     screen space for us. */
-  const decomp = _decomposeAffineLocal(J00, J01, J10, J11);
-  if (!decomp) return null;
+  /* ------------------------------------------------------------------
+     NORMALIZATION
 
-  const maxScale = Math.max(Math.abs(decomp.scale_x),
-                            Math.abs(decomp.scale_y));
+     Compute the length of each Jacobian column and scale both by
+     1 / max length, so the longer column reaches length 1. */
+  const sLen = Math.hypot(J00, J10);
+  const tLen = Math.hypot(J01, J11);
+  const maxScale = Math.max(sLen, tLen);
   if (maxScale < 1e-9) return null;
   const invScale = 1 / maxScale;
 
-  const N00 = J00 * invScale;
-  const N01 = J01 * invScale;
-  const N10 = J10 * invScale;
-  const N11 = J11 * invScale;
+  /* ------------------------------------------------------------------
+     READING DIRECTION — the more-horizontal column
+
+     Between the s-column of J and the t-column of J, pick whichever
+     is more horizontal on screen as the text's local x-axis.  See
+     the module docstring, READING DIRECTION — THE MORE-HORIZONTAL
+     AXIS. */
+  const sHoriz = Math.abs(J00) / (sLen || 1);
+  const tHoriz = Math.abs(J01) / (tLen || 1);
+  const readAlongS = (sHoriz >= tHoriz);
+
+  let m11, m12, m21, m22;
+  if (readAlongS) {
+    m11 = J00 * invScale;
+    m12 = J10 * invScale;
+    m21 = J01 * invScale;
+    m22 = J11 * invScale;
+  } else {
+    m11 = J01 * invScale;
+    m12 = J11 * invScale;
+    m21 = J00 * invScale;
+    m22 = J10 * invScale;
+  }
+
+  /* HANDEDNESS — no mirroring.  See the module docstring. */
+  if (m11 * m22 - m21 * m12 < 0) {
+    m21 = -m21;
+    m22 = -m22;
+  }
+
+  /* READING RIGHTWARD.  See the module docstring. */
+  if (m11 < 0) {
+    m11 = -m11; m12 = -m12;
+    m21 = -m21; m22 = -m22;
+  }
 
   /* Translation that fixes the anchor pixel. */
-  const dx = ax - N00 * ax - N01 * ay;
-  const dy = ay - N10 * ax - N11 * ay;
+  const dx = ax - m11 * ax - m21 * ay;
+  const dy = ay - m12 * ax - m22 * ay;
 
-  const hue = pairHue(p);
-  const textColor = (options.text_color_mode === "black")
-    ? "#000000"
-    : _hueToHexLight(hue);
+  /* Every exported text is drawn in black.  The pair hue is used
+     for the trapezoid RECT (below); the label itself is always
+     black so it reads on any pair colour. */
+  const textColor = "#000000";
 
   const textItem = {
     name:      seg.name + "_text",
@@ -317,13 +383,14 @@ function _computeSegmentKraItem(p, seg, options) {
     font_px:   Math.max(6, fontNat),
     alignment: alignment,
     color:     textColor,
-    transform: [N00, N10, N01, N11, dx, dy],
+    transform: [m11, m12, m21, m22, dx, dy],
     inline_size: W_sq,
   };
 
   let rectItem = null;
   const filled = seg.filled !== false;
   if (drawRects && filled) {
+    const hue = pairHue(p);
     rectItem = {
       name:           seg.name + "_rect",
       points:         [c0, c1, c2, c3],
@@ -358,13 +425,16 @@ function buildKraPayload(options) {
 
 /* ==========================================================================
    OPTION READ / WRITE
-   ========================================================================== */
+   ==========================================================================
+   The KRA section controls are: text position, text padding, and the
+   draw-rectangles toggle.  The text color is fixed to black in
+   `_computeSegmentKraItem`, so there is no longer a color option to
+   read or write. */
 
 function readKraOptionsFromDOM() {
   const posEl  = document.getElementById("kraTextPos");
   const padEl  = document.getElementById("kraTextPad");
   const rectEl = document.getElementById("kraDrawRects");
-  const colEl  = document.getElementById("kraTextColor");
 
   const text_position = posEl ? posEl.value : "center";
 
@@ -374,16 +444,10 @@ function readKraOptionsFromDOM() {
 
   const draw_rectangles = rectEl ? !!rectEl.checked : true;
 
-  let text_color_mode = colEl ? colEl.value : "color";
-  if (text_color_mode !== "color" && text_color_mode !== "black") {
-    text_color_mode = "color";
-  }
-
   return {
     text_position:   text_position,
     text_padding:    text_padding,
     draw_rectangles: draw_rectangles,
-    text_color_mode: text_color_mode,
   };
 }
 
@@ -393,7 +457,6 @@ function applyKraOptionsToDOM(opts) {
   const posEl  = document.getElementById("kraTextPos");
   const padEl  = document.getElementById("kraTextPad");
   const rectEl = document.getElementById("kraDrawRects");
-  const colEl  = document.getElementById("kraTextColor");
 
   if (posEl && typeof opts.text_position === "string") {
     posEl.value = opts.text_position;
@@ -404,9 +467,9 @@ function applyKraOptionsToDOM(opts) {
   if (rectEl && typeof opts.draw_rectangles === "boolean") {
     rectEl.checked = opts.draw_rectangles;
   }
-  if (colEl && typeof opts.text_color_mode === "string") {
-    colEl.value = opts.text_color_mode;
-  }
+  /* A `text_color_mode` field may still be present in scene files
+     written before the option was removed; it is accepted silently
+     and ignored. */
 }
 
 /* ==========================================================================

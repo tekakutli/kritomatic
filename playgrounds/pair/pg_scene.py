@@ -15,7 +15,7 @@ The scene file records:
     · segScroll    — the segment view's vertical scroll offset
     · nextPairId, nextSegId
     · pairs        — every pair with its geometry, its loopback
-                     gap, and its segments
+                     gap, its whole-pair scale, and its segments
     · kraOptions   — the .kra export meta-options
 
 LOOPBACK GAP
@@ -26,6 +26,15 @@ written before the field existed simply omit it; the loader
 defaults a missing value to 0, so old scenes load with the
 historic immediate-loopback behaviour.  See pg_core.py,
 LOOPBACK GAP, for the field's meaning.
+
+PER-PAIR SCALE
+==============
+Each pair's `scale` is written alongside its other numeric fields,
+and restored on load with a `[0.05, 100]` clamp.  Files written
+before the field existed simply omit it; the loader defaults a
+missing value to 1, so old scenes load with the pair at its
+historic size.  See pg_core.py, PER-PAIR SCALE, for the field's
+meaning.
 """
 
 SCENE_JS = r"""
@@ -65,6 +74,9 @@ function buildSceneJSON() {
       gap:     p.gap,
       loopbackGap: (typeof p.loopbackGap === "number")
                      ? p.loopbackGap : 0,
+      scale: (typeof p.scale === "number" && isFinite(p.scale)
+                && p.scale > 0)
+               ? p.scale : 1,
       segments: p.segments.map(s => ({
         id:     s.id,
         name:   s.name,
@@ -156,6 +168,9 @@ function applySceneJSON(data) {
       gap:     (typeof p.gap === "number") ? p.gap : 1,
       loopbackGap: (typeof p.loopbackGap === "number")
                      ? Math.max(0, Math.min(1000, p.loopbackGap)) : 0,
+      scale: (typeof p.scale === "number" && isFinite(p.scale)
+                && p.scale > 0)
+               ? Math.max(0.05, Math.min(100, p.scale)) : 1,
       segments: segs,
     });
   }

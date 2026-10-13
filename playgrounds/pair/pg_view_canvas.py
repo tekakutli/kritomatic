@@ -21,6 +21,17 @@ projects its four corners with w2s and fills.  Empty segments are
 drawn as a dashed outline only, so the user can see where they are
 without them reading as solid geometry.
 
+PER-PAIR SCALE
+==============
+Each pair carries a `scale` field (see pg_core.py, PER-PAIR SCALE).
+Because every world position on a pair's lines goes through
+`pointOnPairLine`, this file inherits the scale for free: the two
+lines, the trapezoids, and the anchor marker's neighbours all
+reflect it without an explicit multiply here.  The one place that
+must be told explicitly is the pair's name label, which is placed at
+the visual midpoint of the pair's "patch": it computes that midpoint
+via `pointOnPairLine` so it follows the scale.
+
 OVERLAP MODE
 ============
 When the "Overlap" checkbox is on, every trapezoid whose segment
@@ -274,13 +285,17 @@ function drawSegmentTrapezoid(p, pairIdx, seg, segIdx, hue,
 
 function drawPairLabel(p, selected) {
   const hue = pairHue(p);
-  const f = pairFrame(p);
 
   /* place the label at the midpoint of the patch between the two
-     anchor points, offset a bit along the pair's v axis so it does
-     not sit under the lines themselves. */
-  const mx = p.cx + 0.5 * p.offset * f.ux + 0.5 * p.gap * f.vx;
-  const my = p.cy + 0.5 * p.offset * f.uy + 0.5 * p.gap * f.vy;
+     anchor points.  Both anchors come from pointOnPairLine, so a
+     nonzero pair scale moves the midpoint along with the geometry
+     — a shrunk pair's label sits closer to the shared anchor than
+     an unscaled pair's, and an expanded pair's label is pushed
+     further out. */
+  const A0 = pointOnPairLine(p, "A", 0);
+  const B0 = pointOnPairLine(p, "B", 0);
+  const mx = (A0[0] + B0[0]) / 2;
+  const my = (A0[1] + B0[1]) / 2;
   const [sx, sy] = w2s(mx, my);
 
   const text = p.name;

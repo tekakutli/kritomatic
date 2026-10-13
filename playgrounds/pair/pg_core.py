@@ -9,7 +9,7 @@ Two coordinate systems:
 A PAIR is:
 
     { id, name, cx, cy, angle, metricA, metricB, offset, gap,
-      loopbackGap, segments: [ { id, name, a, b, filled }, ... ] }
+      loopbackGap, scale, segments: [ { id, name, a, b, filled }, ... ] }
 
     cx, cy        anchor point of line A, in world coords
     angle         direction of the lines, radians
@@ -18,20 +18,45 @@ A PAIR is:
     offset        shift of line B along the direction of line A
     gap           perpendicular distance between the lines
     loopbackGap   extra abstract distance before the axis wraps
+    scale         whole-pair zoom factor about (cx, cy); 1 = identity
     segments      abstract 1D intervals along the pair's axis
 
 The unit direction u = (cos angle, sin angle).  The perpendicular is
 v = (-sin angle, cos angle).
 
-    Line A passes through (cx, cy) + u · (t · metricA)
-    Line B passes through (cx, cy) + u · (offset + t · metricB)
-                            + v · gap
+    Line A passes through (cx, cy) + u · (t · metricA · scale)
+    Line B passes through (cx, cy) + u · (offset + t · metricB) · scale
+                            + v · gap · scale
 
 A segment [a, b] becomes the trapezoid with world corners
 
     A(a)  A(b)  B(b)  B(a)
 
 which is what drawSegmentTrapezoid renders, clipped to the viewport.
+
+PER-PAIR SCALE
+==============
+Each pair carries a `scale` field.  It scales the ENTIRE pair about
+its anchor point (cx, cy): both lines, the gap, the offset, and the
+two metrics — and therefore every trapezoid — grow or shrink by
+that factor, as if the canvas zoom applied to that one pair alone.
+The anchor point itself does not move; the pair's position on
+screen is unchanged.  Abstract segment intervals [a, b] never change
+with scale: a segment that spans one abstract unit spans one
+abstract unit, whether the pair is scaled to 0.5, 1, or 3.
+
+The field is a visual transform only.  It does not affect the
+segment view (which is an editor over abstract coordinates), the
+wrap period, the KRA export's trapezoid layout on the .kra page
+(which reproduces the screen footprint at the moment of export), or
+the overlap-resolution search: the latter compares screen-space
+polygons, so a scaled pair simply presents a different footprint to
+the test, and the abstract-unit shift it applies to the lower pair
+is still found by the same coarse-then-binary search.
+
+A missing or invalid scale reads as 1.  This is what every pair
+starts with, and what every scene written before the field existed
+loads as; see pg_scene.py.
 
 THE SEGMENT AXIS IS PERIODIC
 ============================
@@ -170,6 +195,16 @@ function _pairPeriod(p) {
   return SEG_X_SPAN + g;
 }
 
+/* Per-pair whole-pair zoom factor.  See the module docstring,
+   PER-PAIR SCALE.  Missing or invalid values read as 1, so pairs
+   that predate the field — and every fresh pair — behave as if the
+   field were absent. */
+function _pairScale(p) {
+  if (!p) return 1;
+  const s = p.scale;
+  return (typeof s === "number" && isFinite(s) && s > 0) ? s : 1;
+}
+
 /* Iterate every integer k in [−SEGMENT_WRAP_K, +SEGMENT_WRAP_K],
    calling fn(aBase + k·period, bBase + k·period, k).  The period
    comes from the caller so each pair uses its own loopback gap. */
@@ -212,8 +247,13 @@ function _wrapRangeForCanvas(p, seg, cw, ch) {
   const cy0 = (bb0.minY + bb0.maxY) / 2;
 
   const period = _pairPeriod(p);
-  const dxPerK =  period * p.metricA * Math.cos(p.angle) * view.scale;
-  const dyPerK = -period * p.metricA * Math.sin(p.angle) * view.scale;
+  /* The world displacement of one k-step is period · metricA · scale;
+     the world-to-screen factor is view.scale.  The pair scale is
+     folded in here so the on-screen step matches what
+     pointOnPairLine produces for the wrapped copies. */
+  const s      = _pairScale(p);
+  const dxPerK =  period * p.metricA * s * Math.cos(p.angle) * view.scale;
+  const dyPerK = -period * p.metricA * s * Math.sin(p.angle) * view.scale;
   const mag = Math.hypot(dxPerK, dyPerK);
   if (mag < 1e-6) return { min: 0, max: 0 };
 
@@ -281,8 +321,12 @@ function _segmentTrapezoidsOverlap(p1, seg1, p2, seg2) {
 
   const bb2Base = _segAABB(_segPolygonAtK(p2, seg2, 0));
   const period2 = _pairPeriod(p2);
-  const dx2 =  period2 * p2.metricA * Math.cos(p2.angle) * view.scale;
-  const dy2 = -period2 * p2.metricA * Math.sin(p2.angle) * view.scale;
+  /* Same fold-in of the pair scale as in _wrapRangeForCanvas: the
+     screen displacement of one k-step of p2 must account for p2's
+     own scale. */
+  const s2  = _pairScale(p2);
+  const dx2 =  period2 * p2.metricA * s2 * Math.cos(p2.angle) * view.scale;
+  const dy2 = -period2 * p2.metricA * s2 * Math.sin(p2.angle) * view.scale;
 
   for (let k1 = r1.min; k1 <= r1.max; k1++) {
     const poly1 = _segPolygonAtK(p1, seg1, k1);
@@ -483,14 +527,23 @@ function pairFrame(p) {
   };
 }
 
+/* Every world position on either line goes through this function,
+   so it is the single place where the pair's own `scale` is folded
+   into the geometry.  See the module docstring, PER-PAIR SCALE.
+   The anchor point (cx, cy) is the fixed point of the scale: at
+   abstractT = 0 on line A, every factor of scale multiplies zero,
+   so A(0) stays exactly at (cx, cy) for every scale. */
 function pointOnPairLine(p, which, abstractT) {
   const f = pairFrame(p);
+  const s = _pairScale(p);
   if (which === "A") {
-    return [p.cx + abstractT * p.metricA * f.ux,
-            p.cy + abstractT * p.metricA * f.uy];
+    return [p.cx + abstractT * p.metricA * s * f.ux,
+            p.cy + abstractT * p.metricA * s * f.uy];
   }
-  return [p.cx + (p.offset + abstractT * p.metricB) * f.ux + p.gap * f.vx,
-          p.cy + (p.offset + abstractT * p.metricB) * f.uy + p.gap * f.vy];
+  return [p.cx + (p.offset + abstractT * p.metricB) * s * f.ux
+              +  p.gap * s * f.vx,
+          p.cy + (p.offset + abstractT * p.metricB) * s * f.uy
+              +  p.gap * s * f.vy];
 }
 
 function segmentCornersWorldAt(p, a, b) {
@@ -561,6 +614,7 @@ function addPair() {
     offset: 0.0,
     gap: 3.0,
     loopbackGap: 0,
+    scale: 1,
     segments: [],
   });
   selectedPair    = pairs.length - 1;
@@ -583,6 +637,9 @@ function clonePair(idx) {
     gap: src.gap,
     loopbackGap: (typeof src.loopbackGap === "number")
                    ? src.loopbackGap : 0,
+    scale: (typeof src.scale === "number" && isFinite(src.scale)
+              && src.scale > 0)
+             ? src.scale : 1,
     segments: [],
   };
   for (const s of src.segments) {

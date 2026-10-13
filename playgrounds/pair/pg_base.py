@@ -1,10 +1,10 @@
 """
 pg_base.py — palette, stylesheet, HTML head, bootstrap.
 
-The panel carries six scrub inputs for the selected pair
-(inclination, metric A, metric B, offset, gap, loop gap), a pair
-list, a "+ Pair" / "+ Clone" button pair, a Segments section with
-an "Overlap" toggle, a "Draw Segment" toggle, a "Toggle Fill"
+The panel carries seven scrub inputs for the selected pair
+(inclination, metric A, metric B, offset, gap, scale, loop gap), a
+pair list, a "+ Pair" / "+ Clone" button pair, a Segments section
+with an "Overlap" toggle, a "Draw Segment" toggle, a "Toggle Fill"
 button, a "Clear Segments" button and a segment list, an Export
 section, a KRA section, and a help popup.
 
@@ -25,6 +25,20 @@ copies are spaced further apart, so the segment has to travel the
 extra distance before its wrapped copy emerges — a stretch where
 neither the segment nor its copy is on screen.  See the module
 docstring of pg_core.py, LOOPBACK GAP.
+
+PER-PAIR SCALE
+==============
+The "Scale" field scales the ENTIRE pair about its anchor point:
+both lines, the gap, the offset, the two metrics, and every
+trapezoid on the canvas grow or shrink by the field's factor,
+exactly as if the canvas zoom applied to that one pair alone.  The
+anchor point stays put, so the pair's position on screen is
+unchanged.  Abstract segment intervals [a, b] never change with
+scale — a segment that spans one abstract unit still spans one
+abstract unit; only its world size changes.  The field clamps to
+[0.05, 100].  1 is the identity, the value every pair starts with
+and the value every scene written before the field existed loads
+as.  See pg_core.py, PER-PAIR SCALE.
 
 SHIFT-DRAG SET
 ==============
@@ -62,9 +76,21 @@ also reorders the segment-view rows and the canvas's paint order.
 
 KRA EXPORT
 ==========
-The KRA section carries the options for the .kra export; each
-segment gets a text label warped by an affine derived from the
-trapezoid's own local frame.  See pg_kra.py.
+The KRA section carries the options for the .kra export:
+
+    Position     where on each segment's trapezoid the label sits.
+    Padding      inset from the trapezoid's edges.
+    Rectangles   when checked, each filled segment also emits a
+                 filled polygon matching the trapezoid the canvas
+                 draws.  Empty segments never emit a rect.
+
+Every exported text is drawn in BLACK.  An earlier revision also
+offered a "Text color" dropdown (pair hue vs. black); the pair-hue
+variant is no longer produced, so the option was removed and the
+color is hard-coded in pg_kra.py.
+
+Each segment's label is warped by an affine derived from the
+trapezoid's own local frame.  See pg_kra.py for the math.
 """
 
 HTML_HEAD = r"""<!DOCTYPE html>
@@ -486,6 +512,19 @@ HTML_HEAD = r"""<!DOCTYPE html>
                         in world units.">
         </div>
         <div class="field">
+          <label>Scale</label>
+          <input type="text" id="pairScaleVal" class="scrubInput"
+                 value="&#8212;" autocomplete="off" spellcheck="false"
+                 disabled
+                 title="Whole-pair zoom factor about the pair's anchor
+                        point (cx, cy).  Scales both lines, the gap,
+                        the offset, and the two metrics — and therefore
+                        every trapezoid — by the same factor, as if
+                        the canvas zoom applied to this pair alone.
+                        1 = identity.  Abstract segment intervals are
+                        unaffected.">
+        </div>
+        <div class="field">
           <label>Loop gap</label>
           <input type="text" id="pairLoopbackVal" class="scrubInput"
                  value="&#8212;" autocomplete="off" spellcheck="false"
@@ -572,13 +611,6 @@ HTML_HEAD = r"""<!DOCTYPE html>
           <label>Padding</label>
           <input type="text" id="kraTextPad" class="scrubInput"
                  value="0.06" autocomplete="off" spellcheck="false">
-        </div>
-        <div class="field">
-          <label>Text color</label>
-          <select id="kraTextColor">
-            <option value="color">pair hue (light)</option>
-            <option value="black">black</option>
-          </select>
         </div>
         <div class="field">
           <label>Rectangles</label>

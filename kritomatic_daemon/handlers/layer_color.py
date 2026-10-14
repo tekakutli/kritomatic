@@ -1,5 +1,6 @@
 from krita import Krita
 from ..utils.refresh import refresh
+from ..utils.layer_resolve import resolve as resolve_node, register as register_node
 from ..decorators import command, AutoDispatchHandler
 
 
@@ -25,16 +26,15 @@ class LayerColorHandler(AutoDispatchHandler):
             target_color = params.get('target_color', '#ffffff')
             threshold = params.get('threshold', 255)
 
-            target_layer = doc.nodeByName(layer_name)
+            target_layer = resolve_node(doc, layer_name)
             if not target_layer:
                 return {'success': False, 'message': f'Layer "{layer_name}" not found'}
 
-            # Duplicate layer
             dup_layer = target_layer.duplicate()
             dup_layer.setName(f"{layer_name}_alpha")
             target_layer.parentNode().addChildNode(dup_layer, target_layer)
+            register_node(f"{layer_name}_alpha", dup_layer)
 
-            # Apply Color to Alpha filter
             color_filter = app.filter("colortoalpha")
             if not color_filter:
                 return {'success': False, 'message': 'Color to Alpha filter not found'}
@@ -87,7 +87,7 @@ class LayerColorHandler(AutoDispatchHandler):
             target_color = params.get('target_color', '#ffffff')
             threshold = params.get('threshold', 255)
 
-            target_layer = doc.nodeByName(layer_name)
+            target_layer = resolve_node(doc, layer_name)
             if not target_layer:
                 return {'success': False, 'message': f'Layer "{layer_name}" not found'}
 
@@ -115,6 +115,7 @@ class LayerColorHandler(AutoDispatchHandler):
 
             target_layer.addChildNode(filter_mask, None)
             doc.setActiveNode(filter_mask)
+            register_node(mask_name, filter_mask)
             refresh(doc)
 
             return {

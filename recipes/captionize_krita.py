@@ -3,64 +3,134 @@
 captionize_krita.py — Captionize an image by driving Krita via the
 Kritomatic daemon.
 
-Every interaction with Krita goes through the daemon. The only things
+Every interaction with Krita goes through the daemon.  The only things
 this script does locally are: inspect .kra files as zip archives (to
-read their dimensions), measure the caption with Pillow (to pick a font
-size), and copy the input .kra to a temp location so we never mutate
-the user's file.
+read their dimensions), measure the caption with Pillow (to pick a
+font size), copy the input .kra to a temp location so we never mutate
+the user's file, and compute the layout geometry.
 
 EMBED_MODE selects how the source image makes it into the new document:
 
     "file_layer"  (default)
-        External PNG reference. Smallest .kra, but the output depends
+        External PNG reference.  Smallest .kra, but the output depends
         on that PNG staying where it is when the .kra is reopened.
 
     "baked_png"
-        Pixels baked into a paint layer. Self-contained .kra.
+        Pixels baked into a paint layer.  Self-contained .kra.
 
     "kra_group"
-        Source .kra imported as a group. Preserves layers. Self-
-        contained. Skips the flatten-to-PNG stage.
+        Source .kra imported as a group.  Preserves layers.  Self-
+        contained.  Skips the flatten-to-PNG stage.
 
 KEEP_IMAGE_NATIVE_SIZE selects which dimension anchors the layout:
 
     False (default)
-        The canvas anchors. Strip is carved from the top, source
+        The canvas anchors.  Strip is carved from the top, source
         shrinks into the area below it.
 
     True
-        The source anchors. It keeps its native dimensions and the
+        The source anchors.  It keeps its native dimensions and the
         canvas grows downward by the strip height.
 
 ROTATE_BEFORE_PROCESSING mirrors captionize.py's flag of the same name,
-but is implemented differently. Where captionize.py rotates the pixel
+but is implemented differently.  Where captionize.py rotates the pixel
 buffer CW before sizing and CCW after, this script does not rotate any
 image data at all — it computes the layout in the "as if rotated" frame
-and then transforms the resulting geometry into the final frame. The
+and then transforms the resulting geometry into the final frame.  The
 practical result is the same: the label strip ends up as a vertical band
 along the LEFT edge of the final image, with the text reading
 bottom-to-top, and the source in its original orientation.
 
 Why not rotate the document in Krita: Krita's rotate-image action
 rotates each layer's pixel data but leaves transform-mask parameters in
-their original coordinate system. A file layer with a transform mask
-ends up shifted in the wrong direction after the rotation. By keeping
+their original coordinate system.  A file layer with a transform mask
+ends up shifted in the wrong direction after the rotation.  By keeping
 the source in its original orientation and laying out the final frame
 directly, there is no transform mask on the source at all, and the
-problem disappears. The label is the only rotated element, and it is
+problem disappears.  The label is the only rotated element, and it is
 rotated via the SVG transform attribute, which Krita renders correctly
 because it is part of the shape rather than a mask.
 
-Pipeline (each stage is a self-contained batch):
-  0.    (bitmap only) convert the input bitmap to a .kra
-  0.5   flatten the .kra to a PNG (skipped in "kra_group" mode)
-  1.    create the target canvas at the computed size
-  2.    embed the source per EMBED_MODE
-  3.    add the vector label, save as .kra
+LABEL TEXT IS WRITTEN IN KRITA'S SVG 2 "INLINE WRAPPED" MODE
+============================================================
+The label's `add_vector_text` command carries an `inline_size` value,
+which the daemon turns into an SVG 2 inline-wrapped text shape: the
+style attribute carries `inline-size: <W>;white-space: pre-wrap;` and
+the <text> element has NO x/y of its own.  Krita then draws two
+vertical inline-size handles at the left and right edges of that
+wrapping box, and the text wraps inside it.
+
+The two handles sit, in the shape's own frame, at
+
+    T.map(-inline_size/2, 0)   and   T.map(+inline_size/2, 0)
+
+(alignment="center" puts the anchor at the box's midpoint).  With
+`inline_size` set to the full strip axis, those two points land on the
+strip's boundaries along its centreline:
+
+    not rotated   (0, strip_h/2)          and  (canvas_w, strip_h/2)
+    rotated       (strip_h/2, 0)          and  (strip_h/2, canvas_h)
+
+so the wrapping box spans the entire label band, edge to edge.
+
+This is the same convention cone_playground uses for every text it
+exports; see pg_kra.py's INLINE-WRAPPED TEXT section and cone_kra.py's
+`_inline_size_for`, which returns the shape's own natural width with no
+padding.
+
+Font sizing is separate and stays padded: `compute_font_size` measures
+the caption against a safely-inset width, so the glyphs themselves keep
+their usual margin from the strip's edges even though the wrapping box
+does not.
+
+UNIT CONVERSION — POINTS, NOT PIXELS
+====================================
+Krita's vector-shape coordinate system is in POINTS.  When Krita saves
+a .kra whose document is 300 DPI, it writes the vector layer's SVG as
+`<svg width="<N>pt" viewBox="0 0 <N> <M>">`, so one SVG user unit is
+one point, and one document pixel is 72/DEFAULT_RESOLUTION of a user
+unit.  Every value that reaches the shape — position, font size,
+inline-wrapping width — has to be expressed in those units before it is
+sent.
+
+At 72 DPI the two systems coincide, which is why cone_playground's
+exports work without any conversion.  At any other resolution the
+numbers must be scaled by 72/resolution.  `build_label_commands`
+applies `dpi_scale = 72.0 / DEFAULT_RESOLUTION` uniformly.
+
+PIPELINE — ONE BATCH PER RUN
+============================
+The whole daemon-side pipeline is sent as a single batch:
+
+    create source .kra (bitmap input only)
+    flatten source .kra → source.png (skipped in "kra_group" mode)
+    create the target canvas
+    embed the source per EMBED_MODE
+    add the vector label
+    save the target .kra
+    force a fresh composite
+
+Every one of those steps is a command in one `{"id": ..., "commands":
+[...]}` payload.  Everything downstream of the flatten reads
+`geo` (canvas and label geometry, computed locally from the source
+dimensions before the batch is sent), so nothing in the daemon's
+sequence depends on information the script does not already have.
+Sending the whole pipeline as one message means one client
+connection, one batch ID, one defer window, one round trip.
+
+The final `get_document_thumbnail` command is the redraw: it calls
+`doc.projection()` directly, which forces a whole-stack composite,
+without going through the deferred `refresh()` helper that the rest
+of the batch uses.  The daemon's other handlers rely on that helper,
+whose pending queue is dropped at end-of-batch (FLUSH_ON_END=False in
+`kritomatic_daemon/utils/refresh.py`), so without this last command
+the canvas can show stale regions until Krita's own incremental
+repaints catch up.
 """
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -90,22 +160,49 @@ LABEL_VERTICAL_PADDING_FRACTION = 0.15
 
 DEFAULT_RESOLUTION = 300
 
-LABEL_FONT_CANDIDATES = [
-    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/TTF/DejaVuSans.ttf",
-]
-
+# The font family used in the SVG's `font-family` attribute.  Krita
+# resolves this to a system font and renders the text with it.
 LABEL_FONT_FAMILY = "DejaVu Sans"
+
+# Font file paths per family.  `compute_font_size` measures with PIL,
+# which loads exactly one file.  If that file's font does not match the
+# family Krita renders with, the computed size is off by the ratio
+# between the two fonts' advance widths — a few percent, which is
+# enough to overflow the strip (or the canvas axis, in the rotated
+# case) by a visible amount.  The recipe prefers the entry for
+# LABEL_FONT_FAMILY; if that family has no installed file, it falls
+# back to a rough estimate with a wider safety margin.
+LABEL_FONT_FILES = {
+    "DejaVu Sans": [
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu-lgc/DejaVuSans.ttf",
+    ],
+    "Noto Sans": [
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.otf",
+    ],
+}
+
+# Fraction of the axis left as usable space by the font-size recipe.
+# PIL's measurement and Krita's SVG renderer disagree by a percent or
+# two even for the same font file, from hinting and subpixel rounding.
+# Two percent of the axis is invisible in the layout and covers the
+# discrepancy.
+#
+# This factor applies to FONT SIZING only.  The wrapping box (the
+# inline-size) spans the full axis — see compute_inline_size.
+LABEL_FONT_SAFETY = 0.98
 
 # "file_layer" | "baked_png" | "kra_group"
 EMBED_MODE = "file_layer"
 
-# Mirror of captionize.py's flag. When True, the strip appears as a
+# Mirror of captionize.py's flag.  When True, the strip appears as a
 # vertical band along the LEFT edge of the output, with the text
-# reading bottom-to-top. See the module docstring for why we don't
+# reading bottom-to-top.  See the module docstring for why we don't
 # actually rotate anything in Krita.
-ROTATE_BEFORE_PROCESSING = True
+ROTATE_BEFORE_PROCESSING = False
 # ==========================================================
 
 
@@ -165,7 +262,7 @@ def is_kra(path):
 
 def compute_geometry(src_w, src_h):
     """
-    Compute layout. If ROTATE_BEFORE_PROCESSING is True, first computes
+    Compute layout.  If ROTATE_BEFORE_PROCESSING is True, first computes
     everything in the "rotated frame" (as if the source had been rotated
     90 degrees CW), then transforms the geometry into the final frame by
     applying the inverse rotation (90 degrees CCW).
@@ -189,6 +286,7 @@ def compute_geometry(src_w, src_h):
                            bottom-to-top
       label_axis           length of the strip's long axis; used as the
                            text-width constraint when sizing the font
+                           and as the inline-size of the wrapping box
       rotated              True if ROTATE_BEFORE_PROCESSING was applied
     """
     if ROTATE_BEFORE_PROCESSING:
@@ -242,8 +340,8 @@ def compute_geometry(src_w, src_h):
         }
 
     # Transform to the final frame by rotating the rotated-frame layout
-    # 90 degrees CCW. The map (x, y) -> (y, W - 1 - x) on a WxH canvas
-    # gives an HxW output. Applied to the content rect and the label
+    # 90 degrees CCW.  The map (x, y) -> (y, W - 1 - x) on a WxH canvas
+    # gives an HxW output.  Applied to the content rect and the label
     # anchor in turn.
     final_canvas_w = canvas_h
     final_canvas_h = canvas_w
@@ -271,13 +369,39 @@ def compute_geometry(src_w, src_h):
     }
 
 
+def _find_label_font_file():
+    """The font file that matches LABEL_FONT_FAMILY, or None.
+
+    compute_font_size uses PIL to measure the caption.  PIL uses the
+    file it loads.  Krita uses whichever font the SVG's font-family
+    attribute resolves to.  If those two are not the same physical file,
+    the measured width does not match the rendered width, and the
+    recipe picks a size that is systematically off in whichever
+    direction the two fonts' advance widths differ.
+    """
+    for path in LABEL_FONT_FILES.get(LABEL_FONT_FAMILY, []):
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def compute_font_size(text, strip_h, canvas_w):
-    max_w = canvas_w - 2 * LABEL_PADDING_X
+    """Pick a font size that keeps the caption inside the strip.
+
+    The max width used here is PADDED — the caption keeps a margin from
+    the strip's edges even though the inline-wrapping box itself spans
+    the full axis (see compute_inline_size).  Font size and wrapping
+    box are sized independently on purpose: the box says where the text
+    is allowed to wrap, the font size says how big it is, and the two
+    margins do not have to agree.
+    """
+    axis_pad = int(canvas_w * 0.05)   # 5% margin at each end of the axis
+    max_w = int((canvas_w - 2 * max(LABEL_PADDING_X, axis_pad)) * LABEL_FONT_SAFETY)
     max_h = int(strip_h * (1 - 2 * LABEL_VERTICAL_PADDING_FRACTION))
     if max_w <= 0 or max_h <= 0 or not text:
         return 12
 
-    font_path = next((p for p in LABEL_FONT_CANDIDATES if os.path.exists(p)), None)
+    font_path = _find_label_font_file()
     if font_path is not None:
         try:
             from PIL import ImageFont
@@ -301,75 +425,109 @@ def compute_font_size(text, strip_h, canvas_w):
         except Exception:
             pass
 
-    by_width = max_w / max(1, len(text)) / 0.55
+    # Fallback: no font file for the requested family.  Estimate from
+    # average character width with a wider safety margin, because the
+    # estimate cannot know the real font metrics.
+    by_width = (max_w * 0.9) / max(1, len(text)) / 0.55
     by_height = max_h / 1.2
     return max(8, int(min(by_width, by_height)))
 
 
-# --------------------------------------------------------------------------
-#  Batch builders
-# --------------------------------------------------------------------------
+def compute_inline_size(axis_length):
+    """Width of the inline text-wrapping box along the strip's long axis.
 
-def build_convert_bundle(bitmap_path, kra_path, src_w, src_h):
+    The box spans the FULL strip axis — no padding.  The two
+    inline-size handles therefore land exactly on the canvas boundaries
+    along the strip's centreline:
+
+        not rotated   (0, strip_h/2)    and  (canvas_w, strip_h/2)
+        rotated       (strip_h/2, 0)    and  (strip_h/2, canvas_h)
+
+    This matches cone_playground's convention (see `_inline_size_for`
+    in cone_kra.py, which returns the shape's own natural width with no
+    padding).  Font sizing stays padded independently — see
+    compute_font_size — so the caption's glyphs keep their own margin
+    even though the wrapping box does not.
+
+    Returned in DOCUMENT PIXELS.  `build_label_commands` multiplies by
+    the DPI scale before it goes into the SVG.
     """
-    Stage 0 (bitmap inputs only): turn the bitmap into a .kra and close
-    it. Closing is important — the pipeline opens the source .kra again
-    later (for flatten or group import), and a doc left open by this
-    stage would collide with those opens.
+    return max(1, int(axis_length))
+
+
+# --------------------------------------------------------------------------
+#  Command builders — each returns a LIST of commands
+# --------------------------------------------------------------------------
+# Every builder produces plain command dicts.  main() concatenates them
+# into one batch and sends the batch once.  See the module docstring,
+# PIPELINE — ONE BATCH PER RUN.
+# --------------------------------------------------------------------------
+
+def convert_commands(bitmap_path, kra_path, src_w, src_h):
+    """Turn the input bitmap into a .kra, save it, close it.
+
+    Closing is important: the flatten stage that follows re-opens the
+    same path fresh from disk, and a doc left open by this stage would
+    collide with that open.
     """
-    return {
-        "id": "captionize_convert",
-        "commands": [
-            {
-                "type": "create_new_with_dimensions",
-                "name": bitmap_path.stem,
-                "width": src_w,
-                "height": src_h,
-                "resolution": DEFAULT_RESOLUTION,
-            },
-            {
-                "type": "create_file_layer",
-                "name": "source",
-                "file_path": str(bitmap_path),
-            },
-            {
-                "type": "save_document",
-                "file_path": str(kra_path),
-            },
-            {
-                "type": "close_document",
-            },
-        ],
-    }
-
-
-def build_flatten_bundle(kra_path, png_path):
-    """Stage 0.5: flatten the .kra to a PNG, entirely inside Krita."""
-    return {
-        "id": "captionize_flatten",
-        "commands": [{
-            "type": "export_file_to_image",
-            "input_path": str(kra_path),
-            "output_path": str(png_path),
-        }],
-    }
-
-
-def build_canvas_bundle(geo, doc_name):
-    return {
-        "id": "captionize_canvas",
-        "commands": [{
+    return [
+        {
             "type": "create_new_with_dimensions",
-            "name": doc_name,
-            "width": geo["canvas_w"],
-            "height": geo["canvas_h"],
+            "name": bitmap_path.stem,
+            "width": src_w,
+            "height": src_h,
             "resolution": DEFAULT_RESOLUTION,
-        }],
-    }
+        },
+        {
+            "type": "create_file_layer",
+            "name": "source",
+            "file_path": str(bitmap_path),
+        },
+        {
+            "type": "save_document",
+            "file_path": str(kra_path),
+        },
+        {
+            "type": "close_document",
+        },
+    ]
 
 
-def build_embed_bundle(geo, src_png_path, src_kra_path):
-    common = [
+def flatten_commands(kra_path, png_path):
+    """Flatten the source .kra to a PNG, entirely inside Krita.
+
+    One-shot: opens the .kra from disk, exports, closes.  No view is
+    added; the user-facing session is untouched.
+    """
+    return [{
+        "type": "export_file_to_image",
+        "input_path": str(kra_path),
+        "output_path": str(png_path),
+    }]
+
+
+def canvas_commands(geo, doc_name):
+    """Create the target canvas."""
+    return [{
+        "type": "create_new_with_dimensions",
+        "name": doc_name,
+        "width": geo["canvas_w"],
+        "height": geo["canvas_h"],
+        "resolution": DEFAULT_RESOLUTION,
+    }]
+
+
+def embed_commands(geo, src_png_path, src_kra_path, kra_group_scale):
+    """Embed the source into the target document.
+
+    Three modes, matching EMBED_MODE:
+      "file_layer"  — external PNG reference with an auto-created
+                      transform mask that scales+places it.
+      "baked_png"   — pixels copied into a paint layer.
+      "kra_group"   — the source .kra imported as a group, then
+                      resized+placed by a transform mask.
+    """
+    cmds = [
         {
             "type": "create_layer",
             "name": "background",
@@ -384,7 +542,7 @@ def build_embed_bundle(geo, src_png_path, src_kra_path):
     ]
 
     if EMBED_MODE == "file_layer":
-        common.append({
+        cmds.append({
             "type": "create_file_layer",
             "name": "source",
             "file_path": str(src_png_path),
@@ -395,7 +553,7 @@ def build_embed_bundle(geo, src_png_path, src_kra_path):
         })
 
     elif EMBED_MODE == "baked_png":
-        common.append({
+        cmds.append({
             "type": "embed_image_as_layer",
             "name": "source",
             "file_path": str(src_png_path),
@@ -406,34 +564,119 @@ def build_embed_bundle(geo, src_png_path, src_kra_path):
         })
 
     elif EMBED_MODE == "kra_group":
-        common.append({
+        cmds.append({
             "type": "import_kra_as_group",
             "name": "source",
             "file_path": str(src_kra_path),
         })
-        common.append({
+        cmds.append({
             "type": "create_transform_mask",
             "layer_name": "source",
             "mask_name": "source_transform",
         })
-        common.append({
+        cmds.append({
             "type": "transform_mask",
             "mask_name": "source_transform",
-            "scale_x": _KRA_GROUP_SCALE[0],
-            "scale_y": _KRA_GROUP_SCALE[1],
+            "scale_x": kra_group_scale[0],
+            "scale_y": kra_group_scale[1],
             "translate_x": geo["img_x"],
             "translate_y": geo["img_y"],
         })
 
-    return {"id": "captionize_embed", "commands": common}
+    return cmds
 
 
-_KRA_GROUP_SCALE = (1.0, 1.0)
+def label_commands(geo, caption, font_size, out_path):
+    """Draw the caption as inline-wrapped vector text and save the .kra.
 
+    The text is written in Krita's SVG 2 inline-wrapped mode: the
+    daemon builds the shape's style with `inline-size: <W>; white-space:
+    pre-wrap;` and leaves the <text> element itself without x/y.  With
+    alignment="center" and the daemon's dominant-baseline="middle", the
+    text's VISUAL CENTRE sits at the shape's local origin (0, 0).
 
-def build_label_bundle(geo, caption, font_size, out_path):
+    POSITIONING — WHY x/y AND transform BOTH MATTER
+    ===============================================
+    The daemon's add_vector_text, wrapped branch, does two things we
+    have to work with rather than against:
+
+      1.  If the caller passes x == 0 AND y == 0 with alignment ==
+          "center", it REPLACES them with the canvas centre.  So x=0,
+          y=0 does not mean "at the origin" here; it means "let the
+          daemon pick".  We therefore always pass the real target
+          (label_x, label_y) as x, y — both non-zero in every layout
+          this script produces, so the substitution never fires.
+
+      2.  When `transform` is supplied, the daemon computes
+
+              dx2 = m11 * x + m21 * y + dx
+              dy2 = m12 * x + m22 * y + dy
+              t   = QTransform(m11, m12, m21, m22, dx2, dy2)
+
+          and applies t to the shape.  Because t's fixed-point
+          arithmetic maps local (0, 0) to (dx2, dy2), the shape's
+          visual centre lands at (dx2, dy2).  We want that to be
+          (label_x, label_y).  With x = label_x and y = label_y
+          already fed into the formula's first two terms, we set
+
+              dx = label_x - (m11 * label_x + m21 * label_y)
+              dy = label_y - (m12 * label_x + m22 * label_y)
+
+          so that dx2 = label_x and dy2 = label_y.
+
+    The daemon's formula is that of "rotate around (x, y)" applied to
+    a shape whose local origin starts at (0, 0).  Rather than fight
+    it, we use it: the pivot is the anchor and the compensating dx/dy
+    make the pivot itself the fixed point.
+
+    UNIT CONVERSION
+    ===============
+    Every value that reaches the shape is in SVG POINTS, not document
+    pixels.  `dpi_scale = 72 / DEFAULT_RESOLUTION` performs the
+    conversion uniformly.  At 72 DPI the scale is 1 and this is a
+    no-op, which is why cone_playground's exports work without any
+    conversion.  See the module docstring for the full explanation.
+
+    INLINE-SIZE WIDTH
+    =================
+    compute_inline_size returns the full strip axis, no padding, so the
+    two inline-size handles land on the canvas boundaries.  See that
+    function's docstring for the two concrete positions.
+    """
     cmds = []
     if caption and geo["strip_h"] > 0:
+        dpi_scale = 72.0 / DEFAULT_RESOLUTION
+
+        inline_size = compute_inline_size(geo["label_axis"]) * dpi_scale
+
+        # The daemon's schema declares font_size as an int.
+        font_size_svg = max(1, int(round(font_size * dpi_scale)))
+
+        x = geo["label_x"] * dpi_scale
+        y = geo["label_y"] * dpi_scale
+
+        # If x and y both land on zero the daemon treats that as "use
+        # the canvas centre".  Nudge off the exact origin so a label
+        # that legitimately wants to sit at (0, 0) is not overridden.
+        # The shift is sub-pixel in doc units.
+        if x == 0:
+            x = 1e-4
+        if y == 0:
+            y = 1e-4
+
+        theta_rad = math.radians(geo["label_rotation"])
+        cos_t = math.cos(theta_rad)
+        sin_t = math.sin(theta_rad)
+
+        # Qt row-vector order: [m11, m12, m21, m22, dx, dy].
+        # For a rotation by θ in Krita's y-down frame:
+        #   m11 = cos θ, m12 = sin θ, m21 = -sin θ, m22 = cos θ
+        m11, m12, m21, m22 = cos_t, sin_t, -sin_t, cos_t
+
+        dx = x - (m11 * x + m21 * y)
+        dy = y - (m12 * x + m22 * y)
+        transform_array = [m11, m12, m21, m22, dx, dy]
+
         cmds.append({
             "type": "create_layer",
             "name": "label",
@@ -449,27 +692,59 @@ def build_label_bundle(geo, caption, font_size, out_path):
             "layer_name": "label",
             "text": caption,
             "font_family": LABEL_FONT_FAMILY,
-            "font_size": int(font_size),
-            "x": geo["label_x"],
-            "y": geo["label_y"],
-            "rotation": geo["label_rotation"],
+            "font_size": font_size_svg,
+            # Pass the actual desired anchor.  Non-zero x/y with
+            # alignment="center" prevents the daemon from substituting
+            # the canvas centre; the transform's compensating dx/dy
+            # then make this anchor the transform's fixed point.
+            "x": x,
+            "y": y,
+            "rotation": 0.0,
             "alignment": "center",
             "color": LABEL_COLOR,
+            "transform": json.dumps(transform_array),
+            # Full-axis width.  With the anchor at the strip centre,
+            # the two inline-size handles land on the canvas
+            # boundaries: (0, strip_h/2) and (canvas_w, strip_h/2)
+            # not rotated, or (strip_h/2, 0) and (strip_h/2, canvas_h)
+            # rotated.
+            "inline_size": inline_size,
         })
     cmds.append({
         "type": "save_document",
         "file_path": str(out_path),
     })
-    return {"id": "captionize_label", "commands": cmds}
+    return cmds
+
+
+def redraw_commands():
+    """Force a fresh whole-stack composite.
+
+    The daemon's handlers call a `refresh()` helper that, inside a
+    batch, queues the request instead of compositing; end_defer()
+    drops the queue (FLUSH_ON_END=False in
+    kritomatic_daemon/utils/refresh.py), so the canvas can show stale
+    regions until something else triggers a composite.
+
+    `get_document_thumbnail` calls `doc.projection()` directly, which
+    is a synchronous, whole-stack composite that does not go through
+    the refresh() helper.  Sent last in the batch, it composites the
+    finished document once, after every layer has been created.
+    max_size=1 keeps the returned thumbnail itself negligible.
+    """
+    return [{
+        "type": "get_document_thumbnail",
+        "max_size": 1,
+    }]
 
 
 # --------------------------------------------------------------------------
-#  Execution helper
+#  Execution
 # --------------------------------------------------------------------------
 
 def run_batch(bundle, label):
     print(f"\n── {label} ──────────────────────────────────────")
-    print(json.dumps(bundle, indent=2))
+    print(f"   {len(bundle['commands'])} command(s) in one batch")
     executor = BatchExecutor()
     try:
         results = executor.execute(bundle)
@@ -542,8 +817,6 @@ def resolve_caption(args, in_path):
 
 
 def main():
-    global _KRA_GROUP_SCALE
-
     args = parse_args()
 
     if EMBED_MODE not in VALID_EMBED_MODES:
@@ -569,77 +842,65 @@ def main():
     src_kra = assets_dir / "source.kra"
     src_png = assets_dir / "source.png"
 
-    try:
-        # Stage 0: ensure we have a .kra to work with. Always work on a
-        # copy in the assets dir so the user's input file is untouched.
-        if is_kra(in_path):
-            print(f"Input is a .kra: {in_path.name} -> copying to assets")
-            shutil.copyfile(in_path, src_kra)
-        else:
-            src_w, src_h = get_image_dimensions(in_path)
-            print(f"Input is a bitmap: {in_path.name}  ({src_w} x {src_h})")
-            run_batch(
-                build_convert_bundle(in_path, src_kra, src_w, src_h),
-                f"Stage 0: convert {in_path.suffix or 'bitmap'} → .kra",
-            )
-
-        # Dimensions of the .kra we will embed. In the rotated case,
-        # the .kra is still in its original orientation — the geometry
-        # function performs the "as if rotated" reasoning internally.
+    # ---- Locally determine source dimensions, before any daemon work.
+    # Everything downstream — geometry, font size, inline size, the
+    # embed placement — depends only on these, so once they are known
+    # the entire daemon-side pipeline is a single batch.
+    need_convert = not is_kra(in_path)
+    if need_convert:
+        src_w, src_h = get_image_dimensions(in_path)
+        print(f"Input is a bitmap: {in_path.name}  ({src_w} x {src_h})")
+    else:
+        # Work on a copy so the user's input file is never touched.
+        # The daemon reads from the copy, in the batch below.
+        shutil.copyfile(in_path, src_kra)
         src_w, src_h = get_kra_dimensions(src_kra)
-        print(f"Source:  {src_kra.name}  ({src_w} x {src_h})")
+        print(f"Input is a .kra: {in_path.name} -> copied to assets  "
+              f"({src_w} x {src_h})")
 
-        # Stage 0.5: flatten the .kra to a PNG, through the daemon.
-        if EMBED_MODE == "kra_group":
-            print("Embed mode kra_group: skipping flatten-to-PNG stage.")
-        else:
-            run_batch(
-                build_flatten_bundle(src_kra, src_png),
-                "Stage 0.5: flatten .kra → PNG",
-            )
-            if not src_png.is_file():
-                print(f"Error: flatten stage reported success but {src_png} "
-                      f"is missing.")
-                sys.exit(1)
+    # ---- Compute geometry, font size, inline size, all locally.
+    geo = compute_geometry(src_w, src_h)
+    print(f"Canvas:  {geo['canvas_w']} x {geo['canvas_h']}"
+          f"   (strip {geo['strip_h']} px)")
+    print(f"Image:   {geo['scaled_w']} x {geo['scaled_h']}"
+          f" at ({geo['img_x']}, {geo['img_y']})")
+    if KEEP_IMAGE_NATIVE_SIZE:
+        print("Mode:    native-size source, canvas grown by strip")
+    if ROTATE_BEFORE_PROCESSING:
+        print("Rotate:  strip on LEFT edge, text reads bottom-to-top "
+              "(source stays in original orientation)")
 
-        # Geometry + font size.
-        geo = compute_geometry(src_w, src_h)
-        print(f"Canvas:  {geo['canvas_w']} x {geo['canvas_h']}"
-              f"   (strip {geo['strip_h']} px)")
-        print(f"Image:   {geo['scaled_w']} x {geo['scaled_h']}"
-              f" at ({geo['img_x']}, {geo['img_y']})")
-        if KEEP_IMAGE_NATIVE_SIZE:
-            print("Mode:    native-size source, canvas grown by strip")
-        if ROTATE_BEFORE_PROCESSING:
-            print("Rotate:  strip on LEFT edge, text reads bottom-to-top "
-                  "(source stays in original orientation)")
+    kra_group_scale = (
+        geo["scaled_w"] / max(1, src_w),
+        geo["scaled_h"] / max(1, src_h),
+    )
 
-        # For kra_group, the transform mask scale is relative to the
-        # source .kra's own dimensions.
-        _KRA_GROUP_SCALE = (
-            geo["scaled_w"] / max(1, src_w),
-            geo["scaled_h"] / max(1, src_h),
-        )
+    font_size = compute_font_size(caption, geo["strip_h"], geo["label_axis"])
+    inline_size = compute_inline_size(geo["label_axis"])
+    print(f"Caption: {caption!r}  ({caption_source}, font size ~{font_size},"
+          f" inline box {inline_size} px, spans full strip axis)")
+    print(f"Embed:   {EMBED_MODE}")
 
-        font_size = compute_font_size(
-            caption, geo["strip_h"], geo["label_axis"]
-        )
-        print(f"Caption: {caption!r}  ({caption_source}, font size ~{font_size})")
-        print(f"Embed:   {EMBED_MODE}")
+    # ---- Assemble the whole daemon pipeline as one batch.
+    commands = []
 
-        # Stages 1..3.
-        run_batch(
-            build_canvas_bundle(geo, f"Captionized {in_path.stem}"),
-            "Stage 1: create canvas",
-        )
-        run_batch(
-            build_embed_bundle(geo, src_png, src_kra),
-            f"Stage 2: embed source ({EMBED_MODE})",
-        )
-        run_batch(
-            build_label_bundle(geo, caption, font_size, out_path),
-            "Stage 3: label + save",
-        )
+    if need_convert:
+        commands.extend(convert_commands(in_path, src_kra, src_w, src_h))
+
+    if EMBED_MODE == "kra_group":
+        print("Embed mode kra_group: skipping flatten-to-PNG stage.")
+    else:
+        commands.extend(flatten_commands(src_kra, src_png))
+
+    commands.extend(canvas_commands(geo, f"Captionized {in_path.stem}"))
+    commands.extend(embed_commands(geo, src_png, src_kra, kra_group_scale))
+    commands.extend(label_commands(geo, caption, font_size, out_path))
+    commands.extend(redraw_commands())
+
+    bundle = {"id": "captionize", "commands": commands}
+
+    try:
+        run_batch(bundle, "captionize (single batch)")
     except RuntimeError as e:
         print(f"\n✗ {e}")
         sys.exit(1)

@@ -11,11 +11,13 @@ from .document import DocumentHandler
 from .view import ViewHandler
 from .window import WindowHandler
 from .diffusion import DiffusionHandler
+from .comfyui import ComfyUIHandler
 from .introspect import IntrospectHandler
 from .daemon import DaemonHandler
 from ..registry import get_command_registry
 from ..decorators import AutoDispatchHandler
 from ..utils.refresh import begin_defer, end_defer
+from ..utils.layer_resolve import begin_batch, end_batch, set_scope
 
 
 class CommandHandler(AutoDispatchHandler):
@@ -29,12 +31,10 @@ class CommandHandler(AutoDispatchHandler):
             'view': ViewHandler(),
             'window': WindowHandler(),
             'diffusion': DiffusionHandler(),
+            'comfyui': ComfyUIHandler(),
             'introspect': IntrospectHandler(),
             'daemon': DaemonHandler()
         }
-        # Declared so build_handler_map() descends into every
-        # sub-handler and claims each of their commands for the
-        # appropriate instance.
         self._sub_handlers = list(self.handlers.values())
         super().__init__()
 
@@ -81,11 +81,19 @@ class CommandHandler(AutoDispatchHandler):
                 results = []
 
                 begin_defer()
+                begin_batch()
                 seen_docs = {}
                 summary_sent = False
                 try:
                     for i, cmd in enumerate(commands):
                         self._enter_batchmode_for_active_doc(seen_docs)
+
+                        # Each command carries a scope tag; the executor
+                        # assigns it. Commands without one (a bare
+                        # single-command payload, or a caller that did
+                        # not tag) get None, which disables scope
+                        # resolution and falls back to name/UUID lookup.
+                        set_scope(cmd.get('_scope'))
 
                         cmd_type = cmd.get('type')
 
@@ -135,6 +143,11 @@ class CommandHandler(AutoDispatchHandler):
                     except Exception:
                         pass
 
+                    try:
+                        end_batch()
+                    except Exception:
+                        pass
+
                     for doc, prev in seen_docs.values():
                         try:
                             doc.setBatchmode(prev)
@@ -174,9 +187,6 @@ class CommandHandler(AutoDispatchHandler):
     def _dispatch(self, command):
         cmd_type = command.get('type')
 
-        # get_schema is not a @command-decorated method anywhere; it
-        # is generated here so the schema reflects exactly what the
-        # registry knows about.
         if cmd_type == 'get_schema':
             registry = get_command_registry()
             registry_str = json.dumps(registry, sort_keys=True)

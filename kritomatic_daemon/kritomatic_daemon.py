@@ -3,21 +3,42 @@ from .server.socket_server import WebSocketServer
 from .handlers.base import CommandHandler
 from .decorators import command
 from .registry import get_command_registry
+import threading
 
 
 class _HandlerBox:
     """
-    Mutable indirection between the server's command_received signal
-    and the current command handler. The signal is connected to
-    box.dispatch once, at startup. Reloading swaps box.handler in
-    place; the connection never needs to change.
+    Indirection between the server's command_received signal and the
+    current command handler. The signal is connected to box.dispatch
+    once, at startup. Reloading swaps box.handler in place; the
+    connection never needs to change.
+
+    dispatch() runs the handler on a freshly-spawned Python thread
+    rather than on whichever thread Qt invoked it from.
+
+    Why a thread here, and not the invoking thread:
+
+      Qt dispatches a signal-slot connection either directly (the slot
+      runs synchronously on the emitting thread) or via the queue (the
+      slot runs later, on the receiver's thread). Which one Qt picks
+      depends on the connection type, and PyQt6's default for a slot
+      that is a plain Python method has changed across versions. Under
+      Krita 6 with PyQt6, the signal from the server's worker thread
+      is being queued to the GUI thread, so the handler ran on the
+      main thread — and a `comfy_generate` blocking on its generation
+      event then blocked the whole Krita window.
+
+      Rather than depend on a Qt detail we cannot reliably observe,
+      dispatch unconditionally hands the command to a new thread. The
+      GUI thread is never the one that runs a handler. The client
+      worker thread, when the connection happens to be direct, is not
+      blocked either — it returns to its socket read immediately.
 
     Deliberately NOT a QObject. If it were, Qt's thread-affinity rules
-    would apply to the connection and the handler would be queued to
-    the main thread, blocking the UI on every command. As a plain
-    Python object, the connection is direct: the handler runs in the
-    same thread the server emits from, which is the same behavior the
-    daemon had before this indirection existed.
+    would apply to the connection and the receiver would be tied to a
+    specific thread; keeping it a plain Python object means the
+    connection's thread choice cannot leak into the daemon's runtime
+    behavior, because dispatch overrides it either way.
     """
     def __init__(self, handler):
         self.handler = handler
@@ -26,7 +47,12 @@ class _HandlerBox:
         h = self.handler
         if h is None:
             return
-        h.handle_command(command, client_socket)
+        threading.Thread(
+            target=h.handle_command,
+            args=(command, client_socket),
+            name="kritomatic-handler",
+            daemon=True,
+        ).start()
 
 
 class KritomaticDaemon(Extension):

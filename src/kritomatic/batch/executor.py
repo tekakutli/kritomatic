@@ -29,55 +29,39 @@ class BatchExecutor:
         self._include_counter = 0
 
     def _get_current_prefix(self) -> str:
-        """Get the current hierarchical prefix"""
+        """The scope id for commands this executor emits.
+
+        Top-level commands get the bundle id. Commands from an include
+        get `<bundle_id>_inc<depth>_<n>`, and nested includes extend
+        the string. The daemon resolves names against the scope's
+        created-nodes map, so two inclusions of the same macro can both
+        create a layer called `selections` and each reference resolves
+        to its own.
+        """
         return '_'.join(self.prefix_stack)
 
-    def _process_name(self, name: str) -> str:
-        """Add hierarchical prefix to layer/resource names"""
-        if not name:
-            return name
-        current_prefix = self._get_current_prefix()
-        # Don't double-prefix if already prefixed
-        if name.startswith(current_prefix + '_'):
-            return name
-        return f"{current_prefix}_{name}"
-
     def _process_command(self, cmd: Dict[str, Any]) -> Dict[str, Any]:
-        """Process command to add hierarchical prefix to relevant fields"""
-        cmd_type = cmd.get('type', '')
+        """Tag a command with the current scope.
+
+        No names are rewritten. A command's `name`, `layer_name`, and
+        friends carry exactly the string the bundle author wrote; the
+        scope tag is what tells the daemon which namespace to register
+        into and which to resolve against. This is the whole of the
+        executor's interaction with the layer namespace.
+        """
         processed = cmd.copy()
-
-        # Skip processing for include commands (they get their own prefix stack)
-        if cmd_type == 'include':
-            return processed
-
-        # Fields that contain names we want to prefix.
-        #
-        # `name`          the layer being created
-        # `layer_name`    the layer a command targets
-        # `mask_name`     a transform/selection/filter mask by name
-        # `group_name`    the destination of a move-to-group
-        # `reference`     the above_named / below_named anchor
-        # `parent`        the explicit parent group of a create_layer
-        #
-        # Every one of these is a name that refers to a node inside the
-        # document, and the daemon will look it up after the prefix has
-        # been applied to the name it was created with.  The list must
-        # include any argument that carries a node name, or the lookup
-        # uses the bare name and finds nothing.
-        name_fields = [
-            'name', 'layer_name', 'mask_name', 'group_name',
-            'reference', 'parent',
-        ]
-
-        for field in name_fields:
-            if field in processed and processed[field]:
-                processed[field] = self._process_name(processed[field])
-
+        processed['_scope'] = self._get_current_prefix()
         return processed
 
     def _flatten_commands(self, commands: List[Dict], visited: set = None, depth: int = 0) -> List[Dict]:
-        """Flatten includes recursively with hierarchical prefixing"""
+        """Flatten includes recursively, tagging each command with the
+        scope it belongs to. Names are never mangled: an included
+        command carries the same bare names its author wrote, plus a
+        `_scope` tag identifying which inclusion it came from.
+
+        Cycle protection via `visited` is unchanged from the previous
+        implementation.
+        """
         if visited is None:
             visited = set()
 
@@ -89,42 +73,37 @@ class BatchExecutor:
                     print(f"⚠️ Include missing batch name")
                     continue
 
-                # Prevent circular includes
                 if batch_name in visited:
                     print(f"⚠️ Circular include detected: {batch_name}")
                     continue
 
                 visited.add(batch_name)
 
-                # Load the batch
                 batch_data = self.library.load(batch_name)
                 if batch_data:
                     nested_commands = batch_data.get('commands', [])
 
-                    # Create a new prefix for this inclusion
                     self._include_counter += 1
                     include_suffix = f"inc{depth}_{self._include_counter}"
 
-                    # Create a new prefix stack for nested commands
                     nested_prefix_stack = self.prefix_stack + [include_suffix]
 
-                    print(f"  🔄 Including batch '{batch_name}' (suffix: {include_suffix})")
+                    print(f"  🔄 Including batch '{batch_name}' (scope: "
+                          f"{'_'.join(nested_prefix_stack)})")
 
-                    # Create a new executor for the nested batch with its own prefix
                     nested_executor = BatchExecutor(
                         client=self.client,
                         batch_id=self.batch_id,
                         prefix_stack=nested_prefix_stack
                     )
 
-                    # Process nested commands with the nested executor's prefix
                     for nested_cmd in nested_commands:
                         if nested_cmd.get('type') == 'include':
-                            # Recursively flatten nested includes
-                            nested_result = nested_executor._flatten_commands([nested_cmd], visited, depth + 1)
+                            nested_result = nested_executor._flatten_commands(
+                                [nested_cmd], visited, depth + 1
+                            )
                             result.extend(nested_result)
                         else:
-                            # Apply prefix to the command
                             processed_cmd = nested_executor._process_command(nested_cmd)
                             result.append(processed_cmd)
                 else:
@@ -149,12 +128,10 @@ class BatchExecutor:
     def execute(self, batch_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         raw_commands = batch_data.get('commands', [])
 
-        # Reset include counter for this batch run
         self._include_counter = 0
 
-        # Flatten includes before execution
         print(f"📦 Batch ID: {self.batch_id}")
-        print(f"📍 Prefix stack: {' → '.join(self.prefix_stack)}")
+        print(f"📍 Scope stack: {' → '.join(self.prefix_stack)}")
         commands = self._flatten_commands(raw_commands)
 
         if len(raw_commands) != len(commands):
@@ -162,8 +139,8 @@ class BatchExecutor:
 
         total = len(commands)
 
-        # Pre-process every command (apply hierarchical prefix) and build
-        # the single bundled payload. This is the only thing we send.
+        # Pre-process every command (tag with scope) and build the
+        # single bundled payload. This is the only thing we send.
         bundled_commands: List[Dict[str, Any]] = []
         original_names: List[Optional[str]] = []
         for cmd in commands:
@@ -181,7 +158,7 @@ class BatchExecutor:
 
         def handle_progress(index: int, result_entry: Dict[str, Any]):
             processed_cmd = bundled_commands[index] if index < len(bundled_commands) else {}
-            params = {k: v for k, v in processed_cmd.items() if k != 'type'}
+            params = {k: v for k, v in processed_cmd.items() if k not in ('type', '_scope')}
             cmd_type = result_entry.get('command', processed_cmd.get('type'))
             is_success = result_entry.get('status') == 'success'
 
@@ -190,7 +167,7 @@ class BatchExecutor:
                 'command': cmd_type,
                 'original_name': original_names[index] if index < len(original_names) else None,
                 'processed_name': params.get('name') or params.get('layer_name') or params.get('mask_name'),
-                'prefix': self._get_current_prefix(),
+                'scope': processed_cmd.get('_scope'),
                 'status': 'success' if is_success else 'error',
                 'message': result_entry.get('message', ''),
                 'data': result_entry.get('data', None),
@@ -205,8 +182,6 @@ class BatchExecutor:
 
         response = self.client.send_batch(payload, on_progress=handle_progress)
 
-        # Fallback: if for some reason the daemon didn't stream any progress
-        # lines (older daemon), reconstruct results from the final summary.
         if response and not results:
             for r in response.get('results', []):
                 handle_progress(r.get('index', 0), r)

@@ -1,5 +1,6 @@
 from krita import *
 from ..decorators import command, AutoDispatchHandler
+from ..utils.layer_resolve import resolve as resolve_node, register as register_node
 
 
 class MaskHandler(AutoDispatchHandler):
@@ -19,20 +20,16 @@ class MaskHandler(AutoDispatchHandler):
             if not doc:
                 return {'success': False, 'message': 'No active document'}
 
-            target = doc.nodeByName(layer_name)
+            target = resolve_node(doc, layer_name)
             if not target:
                 return {'success': False, 'message': f'Layer "{layer_name}" not found'}
 
             original = doc.activeNode()
             doc.setActiveNode(target)
 
-            # Create transparency mask first (stable)
             Krita.instance().action('add_new_transparency_mask').trigger()
-
-            # Get the newly created mask
             new_mask = doc.activeNode()
 
-            # Set the name BEFORE conversion
             desired_name = f"{layer_name}_selection"
             new_mask.setName(desired_name)
 
@@ -41,17 +38,17 @@ class MaskHandler(AutoDispatchHandler):
                 if selection and not selection.isNull():
                     new_mask.setPixelData(selection.pixelData())
 
-            # Convert to selection mask
             Krita.instance().action('convert_to_selection_mask').trigger()
 
-            # After conversion, the mask is still the active node
-            # Set the name again in case conversion changed it
             doc.activeNode().setName(desired_name)
+            register_node(desired_name, doc.activeNode())
 
             doc.setActiveNode(original)
             doc.refreshProjection()
 
-            return {'success': True, 'message': f'Added selection mask to "{layer_name}"', 'data': {'mask_name': desired_name}}
+            return {'success': True,
+                    'message': f'Added selection mask to "{layer_name}"',
+                    'data': {'mask_name': desired_name}}
         except Exception as e:
             return {'success': False, 'message': str(e)}
 

@@ -1,6 +1,7 @@
 from krita import Krita
 from ..decorators import command, AutoDispatchHandler
 from ..utils.refresh import refresh
+from ..utils.layer_resolve import resolve as resolve_node, register as register_node
 
 
 class LayerBasicHandler(AutoDispatchHandler):
@@ -34,13 +35,13 @@ class LayerBasicHandler(AutoDispatchHandler):
                         parent.addChildNode(new_layer, children[i - 1])
                     break
         elif position_type == 'above_named' and reference_layer_name:
-            ref_layer = doc.nodeByName(reference_layer_name)
+            ref_layer = resolve_node(doc, reference_layer_name)
             if ref_layer:
                 ref_layer.parentNode().addChildNode(new_layer, ref_layer)
             else:
                 return False
         elif position_type == 'below_named' and reference_layer_name:
-            ref_layer = doc.nodeByName(reference_layer_name)
+            ref_layer = resolve_node(doc, reference_layer_name)
             if not ref_layer:
                 return False
             parent = ref_layer.parentNode()
@@ -114,11 +115,7 @@ class LayerBasicHandler(AutoDispatchHandler):
                 new_layer = doc.createNode(name, layer_type)
 
             if parent_name:
-                # Explicit-parent path.  Looks the parent up by name
-                # every time, never reads the active node, so it cannot
-                # be affected by however Krita chose to settle the
-                # active-node state after the previous command.
-                parent = doc.nodeByName(parent_name)
+                parent = resolve_node(doc, parent_name)
                 if not parent:
                     return {'success': False,
                             'message': f'Parent "{parent_name}" not found'}
@@ -131,8 +128,11 @@ class LayerBasicHandler(AutoDispatchHandler):
                     return {'success': False, 'message': f'Failed to insert layer'}
 
             doc.setActiveNode(new_layer)
+            register_node(name, new_layer)
             refresh(doc)
-            return {'success': True, 'message': f'Created {layer_type} "{name}"'}
+            return {'success': True,
+                    'message': f'Created {layer_type} "{name}"',
+                    'data': {'node_uuid': new_layer.uniqueId().toString()}}
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
@@ -172,7 +172,7 @@ class LayerBasicHandler(AutoDispatchHandler):
             if not doc:
                 return {'success': False, 'message': 'No active document'}
             name = params.get('name', '')
-            layer = doc.nodeByName(name)
+            layer = resolve_node(doc, name)
             if not layer:
                 return {'success': False, 'message': f'Layer "{name}" not found'}
             doc.setActiveNode(layer)
@@ -199,6 +199,7 @@ class LayerBasicHandler(AutoDispatchHandler):
                 return {'success': False, 'message': 'No active layer'}
             old = active.name()
             active.setName(new_name)
+            register_node(new_name, active)
             refresh(doc)
             return {'success': True, 'message': f'Renamed from "{old}" to "{new_name}"'}
         except Exception as e:
@@ -219,10 +220,11 @@ class LayerBasicHandler(AutoDispatchHandler):
                 return {'success': False, 'message': 'No active document'}
             old_name = params.get('old_name', '')
             new_name = params.get('new_name', '')
-            layer = doc.nodeByName(old_name)
+            layer = resolve_node(doc, old_name)
             if not layer:
                 return {'success': False, 'message': f'Layer "{old_name}" not found'}
             layer.setName(new_name)
+            register_node(new_name, layer)
             refresh(doc)
             return {'success': True, 'message': f'Renamed "{old_name}" to "{new_name}"'}
         except Exception as e:
@@ -246,11 +248,11 @@ class LayerBasicHandler(AutoDispatchHandler):
             group_name = params.get('group_name', '')
             position = params.get('position', 'inside')
 
-            to_move = doc.nodeByName(layer_name)
+            to_move = resolve_node(doc, layer_name)
             if not to_move:
                 return {'success': False, 'message': f'Layer "{layer_name}" not found'}
 
-            target = doc.nodeByName(group_name)
+            target = resolve_node(doc, group_name)
             if not target:
                 return {'success': False, 'message': f'Group "{group_name}" not found'}
             if target.type() != "grouplayer":

@@ -1,5 +1,6 @@
 from krita import Krita
 from ..utils.refresh import refresh
+from ..utils.layer_resolve import resolve as resolve_node
 from ..decorators import command, AutoDispatchHandler
 
 
@@ -31,7 +32,7 @@ class LayerFillHandler(AutoDispatchHandler):
             use_foreground = params.get('foreground', False)
             use_background = params.get('background', False)
 
-            target_layer = doc.nodeByName(layer_name)
+            target_layer = resolve_node(doc, layer_name)
             if not target_layer:
                 return {'success': False, 'message': f'Layer "{layer_name}" not found'}
 

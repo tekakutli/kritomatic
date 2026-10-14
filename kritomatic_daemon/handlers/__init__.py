@@ -3,6 +3,7 @@ from .brush import BrushHandler
 from .layer import LayerHandler
 from .palette import PaletteHandler
 from .mask import MaskHandler
+from .comfyui import ComfyUIHandler
 from .diffusion import DiffusionHandler
 from .introspect import IntrospectHandler
 from .daemon import DaemonHandler

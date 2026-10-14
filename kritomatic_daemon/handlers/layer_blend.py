@@ -1,5 +1,6 @@
 from krita import Krita
 from ..utils.refresh import refresh
+from ..utils.layer_resolve import register as register_node
 from ..decorators import command, AutoDispatchHandler
 
 
@@ -29,23 +30,19 @@ class LayerBlendHandler(AutoDispatchHandler):
             if not current_layer:
                 return {'success': False, 'message': 'No active layer'}
 
-            # Create new paint layer
             new_layer = doc.createNode(name, "paintlayer")
-
-            # Insert above current layer
             current_layer.parentNode().addChildNode(new_layer, current_layer)
-
-            # Set the blend mode
             new_layer.setBlendingMode(blend_mode.lower())
 
-            # Make it active
             doc.setActiveNode(new_layer)
+            register_node(name, new_layer)
             refresh(doc)
 
             return {
                 'success': True,
                 'message': f'Created layer "{name}" with blend mode {blend_mode}',
-                'data': {'layer_name': name, 'blend_mode': blend_mode}
+                'data': {'layer_name': name, 'blend_mode': blend_mode,
+                         'node_uuid': new_layer.uniqueId().toString()}
             }
         except Exception as e:
             return {'success': False, 'message': str(e)}

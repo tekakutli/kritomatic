@@ -4,6 +4,7 @@ import re
 import xml.etree.ElementTree as ET
 from krita import Krita
 from ..utils.refresh import refresh
+from ..utils.layer_resolve import resolve as resolve_node, register as register_node
 from ..decorators import command, AutoDispatchHandler
 
 
@@ -169,13 +170,14 @@ class LayerTransformHandler(AutoDispatchHandler):
             layer_name = params.get('layer_name', '')
             mask_name = params.get('mask_name', 'Transform Mask')
 
-            target = doc.nodeByName(layer_name)
+            target = resolve_node(doc, layer_name)
             if not target:
                 return {'success': False, 'message': f'Layer "{layer_name}" not found'}
 
             mask = doc.createTransformMask(mask_name)
             target.addChildNode(mask, None)
             doc.setActiveNode(mask)
+            register_node(mask_name, mask)
             refresh(doc)
 
             return {
@@ -215,18 +217,10 @@ class LayerTransformHandler(AutoDispatchHandler):
             sx = params.get('scale_x', 1.0)
             sy = params.get('scale_y', 1.0)
 
-            def find_mask(node, name):
-                if node.type() == "transformmask" and node.name() == name:
-                    return node
-                for child in node.childNodes():
-                    result = find_mask(child, name)
-                    if result:
-                        return result
-                return None
-
-            mask = find_mask(doc.rootNode(), mask_name)
-            if not mask:
-                return {'success': False, 'message': f'Transform mask "{mask_name}" not found'}
+            mask = resolve_node(doc, mask_name)
+            if not mask or mask.type() != "transformmask":
+                return {'success': False,
+                        'message': f'Transform mask "{mask_name}" not found'}
 
             rad = math.radians(rot)
             cos_r = math.cos(rad)
@@ -316,17 +310,8 @@ class LayerTransformHandler(AutoDispatchHandler):
                         'message': 'src_points and dst_points must each have '
                                    'exactly 4 points'}
 
-            def find_mask(node, name):
-                if node.type() == "transformmask" and node.name() == name:
-                    return node
-                for child in node.childNodes():
-                    r = find_mask(child, name)
-                    if r:
-                        return r
-                return None
-
-            mask = find_mask(doc.rootNode(), mask_name)
-            if not mask:
+            mask = resolve_node(doc, mask_name)
+            if not mask or mask.type() != "transformmask":
                 return {'success': False,
                         'message': f'Transform mask "{mask_name}" not found'}
 
@@ -408,7 +393,7 @@ class LayerTransformHandler(AutoDispatchHandler):
 
             layer_name = params.get('layer_name', '')
 
-            target_layer = doc.nodeByName(layer_name)
+            target_layer = resolve_node(doc, layer_name)
             if not target_layer:
                 return {'success': False, 'message': f'Layer "{layer_name}" not found'}
 
@@ -437,8 +422,10 @@ class LayerTransformHandler(AutoDispatchHandler):
             translate_x = final_x - (layer_x * scale)
             translate_y = final_y - (layer_y * scale)
 
-            transform_mask = doc.createTransformMask(f"{layer_name}_fit")
+            mask_name = f"{layer_name}_fit"
+            transform_mask = doc.createTransformMask(mask_name)
             target_layer.addChildNode(transform_mask, None)
+            register_node(mask_name, transform_mask)
 
             # Column-vector form: scale then translate.
             h11 = scale; h12 = 0.0;   h13 = translate_x

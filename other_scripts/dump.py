@@ -39,7 +39,7 @@ DEFAULT_OUT        = "project_dump.md" # output markdown file
 #   .service  systemd unit files
 #   .md       Markdown
 #   .toml     TOML
-DEFAULT_EXTENSIONS = [".py", ".sh", "yaml", ".md", ".conf", ".json"]
+DEFAULT_EXTENSIONS = [".py", ".sh", "yaml", ".md", ".conf", ".json", ".toml", ".js"]
 DEFAULT_AFFIX      = None             # e.g. "_test" (substring matched in filename)
 DEFAULT_RECURSIVE  = False            # descend into subdirectories
 DEFAULT_TREE_ONLY  = False            # only emit the directory tree, no file contents
@@ -66,7 +66,7 @@ DEFAULT_INCLUDE_FILE_SUBSTRINGS = []
 # Filename substrings blacklist: if a filename contains ANY of these
 # (partial match, case-sensitive), the file is skipped.
 # e.g. [".min.", "_test", ".bak"]
-DEFAULT_EXCLUDE_FILE_SUBSTRINGS = ["project_dump", "shrinking"]
+DEFAULT_EXCLUDE_FILE_SUBSTRINGS = ["project_dump", "shrinking", "tests"]
 # ---------------------------------------------------------------------------
 
 HEADER = "=" * 70

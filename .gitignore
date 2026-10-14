@@ -196,4 +196,4 @@ other_scripts/room/room_layout.json
 other_scripts/room/room_walls.json
 other_scripts/room/floor_plan_layout.json
 
-recipes/comfy_panel/
+data/comfy_panel/*

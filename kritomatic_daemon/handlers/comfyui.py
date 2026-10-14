@@ -49,20 +49,40 @@ handler runs two phases:
 
 Concurrent batches
 ==================
-Multiple batches can run at once, each started by a different panel
-or CLI invocation. Their phases may interleave: phase 1 of batch B can
-run while phase 2 of batch A holds the client lock. The client's
-single-flight lock guarantees only one phase 2 is on ComfyUI at a
-time, so the ComfyUI-side work is serialized; the preparation work
-(pixel reads, graph rewrites) is CPU-bound and does not contend.
+Multiple batches can run at once, each started by a different caller.
+Their phases may interleave: phase 1 of batch B can run while phase 2
+of batch A holds the client lock. The client's single-flight lock
+guarantees only one phase 2 is on ComfyUI at a time.
+
+Batch tracking
+==============
+Every `comfy_generate` call registers a `_BatchRecord` in
+`self._batches`, keyed by the batch id the caller supplied. The record
+is visible to `comfy_batches` (and by extension to
+`kritomatic comfyui panel queue`) from the moment the batch starts
+until it returns.
+
+A `_BatchRecord` holds:
+
+  - static: batch_id, workflow_name, requested_count, total_runs,
+    base_seed, output_name, started_at, cancel_event
+  - dynamic: current_phase, current_run_index, and run_records (a list
+    the batch loop appends to as each run reaches a terminal state)
+
+`comfy_cancel` looks up the record by batch id and sets its cancel
+event. `comfy_batches` reads the records to answer "what is running
+right now". The two share `self._batches_lock` for the dict itself;
+individual dynamic fields are read without a lock, which is safe here
+because every one of them is either a scalar (int, str) or a list the
+reader only measures by `len()`.
 
 Cancellation
 ============
-Each batch registers a `threading.Event` in `self._cancel_events`,
-keyed by the batch id. `comfy_cancel --batch_id X` sets only X's
-event; `comfy_cancel` with no id sets all of them. A panel's Ctrl+C
-handler sends its own batch id, so cancelling one batch leaves any
-concurrently-running batch untouched.
+Each batch registers a `threading.Event` inside its `_BatchRecord`.
+`comfy_cancel --batch_id X` sets only X's event; `comfy_cancel` with
+no id sets all of them. A panel's Ctrl+C handler sends its own batch
+id, so cancelling one batch leaves any concurrently-running batch
+untouched.
 
 Both phases observe the batch's own event:
 
@@ -71,16 +91,15 @@ Both phases observe the batch's own event:
 
   Phase 2 passes the event's `is_set` to `client.generate_batch` as
   `should_stop`. The batch loop checks it at the top of every read
-  iteration. Once set, every prompt that has not yet completed is
-  marked cancelled, ComfyUI is asked to interrupt the current prompt
-  and drop the queued ones, and the batch returns.
+  iteration and between lock-acquisition attempts. Once set, every
+  prompt that has not yet completed is marked cancelled, ComfyUI is
+  asked to interrupt the current prompt and drop the queued ones, and
+  the batch returns.
 
 `comfy_cancel` never touches ComfyUI directly for a batch cancel: it
 just sets the flag, and the batch loop calls `interrupt` /
 `cancel_queued` when it notices. This is what keeps two batches from
-interfering with each other's ComfyUI-side work. For async generates
-(`comfy_generate_async` + `comfy_wait`), which are not batch-tracked,
-`comfy_cancel` without a batch id calls `interrupt` itself.
+interfering with each other's ComfyUI-side work.
 
 Cancel is best-effort, not transactional: layers already pasted stay
 in the document. Undo is the user's responsibility.
@@ -107,11 +126,11 @@ full traceback to stdout, and returns an ordinary error response.
 
 Paths
 =====
-The panel script and its data live under `<repo>/recipes/comfy_panel/`:
+The panel script and its data live under `<repo>/data/comfy_panel/`:
 
-    <repo>/recipes/comfy_panel/workflows/*.json     workflow definitions
-    <repo>/recipes/comfy_panel/panel_configs/*.toml panel configs
-    <repo>/recipes/comfy_panel/history/*.json       generation records
+    <repo>/data/comfy_panel/workflows/*.json     workflow definitions
+    <repo>/data/comfy_panel/panel_configs/*.toml panel configs
+    <repo>/data/comfy_panel/history/*.json       generation records
 
 Watcher
 =======
@@ -125,6 +144,7 @@ Command surface
     comfy_connect          --host --port --check --watch
     comfy_watch            --enable
     comfy_status
+    comfy_batches
     comfy_list_workflows
     comfy_load             --name <slug>
     comfy_set_param        --name <param> --value <value>
@@ -194,7 +214,7 @@ from ..utils.comfyui_tooling import (
 
 _HANDLER_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _HANDLER_DIR.parent.parent
-_PANEL_DIR = _REPO_ROOT / "recipes" / "comfy_panel"
+_PANEL_DIR = _REPO_ROOT / "data" / "comfy_panel"
 _WORKFLOW_DIR = _PANEL_DIR / "workflows"
 _HISTORY_DIR = _PANEL_DIR / "history"
 
@@ -204,6 +224,57 @@ _HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 _SEED_PARAMETER_NAME = "seed"
 _CANVAS_SEED_SLOT = 3
+
+
+# ============================================================================
+#  Batch record
+# ============================================================================
+
+class _BatchRecord:
+    """Live state of one `comfy_generate` call.
+
+    Held in `ComfyUIHandler._batches`, keyed by batch id, from the
+    moment the batch starts until the moment it returns. `comfy_batches`
+    reads this to answer "what is currently running", and `comfy_cancel`
+    looks up the cancel event by batch id.
+
+    Static fields are set at construction and never change. Dynamic
+    fields are updated by the batch loop as it moves through phases;
+    they are read by `comfy_batches` from a different thread without a
+    lock. That is safe here because every dynamic field is either a
+    scalar (int, str) or a list the reader only measures by `len()`.
+    Do not promote a dynamic field to a container that the reader
+    would have to iterate or index into; that would need a lock.
+    """
+
+    def __init__(self, batch_id: str, workflow_name: str,
+                 requested_count: int, total_runs: int,
+                 base_seed: int, output_name: Optional[str]):
+        # Static, set once.
+        self.batch_id = batch_id
+        self.workflow_name = workflow_name
+        self.requested_count = requested_count
+        self.total_runs = total_runs
+        self.base_seed = base_seed
+        self.output_name = output_name
+        self.started_at = time.time()
+        self.cancel_event = threading.Event()
+
+        # Dynamic, updated by the batch loop.
+        #
+        # phase runs through:
+        #   "preparing" — phase 1 in progress
+        #   "running"   — phase 2 in progress
+        #   "finalizing" — writing history, building the response
+        #
+        # current_run_index tracks the run being prepared during phase
+        # 1. It is not meaningful in phase 2.
+        #
+        # run_records is the same list the batch loop appends to. The
+        # reader measures it by `len()`; it never iterates it.
+        self.current_phase = "preparing"
+        self.current_run_index = 0
+        self.run_records: list[dict] = []
 
 
 # ============================================================================
@@ -362,12 +433,11 @@ class ComfyUIHandler(AutoDispatchHandler):
         self._client: Optional[ComfyClient] = None
         self._object_info: Optional[dict] = None
 
-        # Cancel events, one per active batch, keyed by the batch id
-        # the caller supplied. Guarded by `_cancel_events_lock` because
-        # batches run on their own handler threads and `comfy_cancel`
-        # runs on yet another one.
-        self._cancel_events: dict[str, threading.Event] = {}
-        self._cancel_events_lock = threading.Lock()
+        # Per-batch records, keyed by batch id. The lock guards the
+        # dict itself; individual record fields are read without a
+        # lock (see _BatchRecord's docstring for why that is safe).
+        self._batches: dict[str, _BatchRecord] = {}
+        self._batches_lock = threading.Lock()
 
         self._active_workflow_name: Optional[str] = None
         self._active_workflow_graph: Optional[dict] = None
@@ -586,8 +656,8 @@ class ComfyUIHandler(AutoDispatchHandler):
         args={},
     )
     def comfy_status(self, params):
-        with self._cancel_events_lock:
-            active_batches = sorted(self._cancel_events.keys())
+        with self._batches_lock:
+            active_batches = sorted(self._batches.keys())
         return {
             "success": True,
             "message": "ComfyUI handler state",
@@ -622,6 +692,49 @@ class ComfyUIHandler(AutoDispatchHandler):
                 "selection_padding": self._selection_padding,
                 "pending": list(self._pending.keys()),
             },
+        }
+
+    @command(
+        category="comfyui",
+        help_text="List the currently-running batches. One batch per "
+                  "comfy_generate call; includes the workflow, phase, "
+                  "run count, base seed, and elapsed time.",
+        args={},
+    )
+    def comfy_batches(self, params):
+        """Return a snapshot of every active batch.
+
+        Reads `self._batches` under the dict lock, then reads each
+        record's fields without a lock. See `_BatchRecord` for why
+        the field reads are safe.
+        """
+        with self._batches_lock:
+            records = list(self._batches.values())
+
+        now = time.time()
+        items = []
+        for r in records:
+            finished = len(r.run_records)
+            items.append({
+                "batch_id": r.batch_id,
+                "workflow": r.workflow_name,
+                "phase": r.current_phase,
+                "requested_count": r.requested_count,
+                "total_runs": r.total_runs,
+                "finished_runs": finished,
+                "current_run_index": r.current_run_index,
+                "base_seed": r.base_seed,
+                "output_name": r.output_name,
+                "started_at": r.started_at,
+                "elapsed_s": round(now - r.started_at, 1),
+            })
+        items.sort(key=lambda x: x["started_at"])
+
+        plural = "batch" if len(items) == 1 else "batches"
+        return {
+            "success": True,
+            "message": f"{len(items)} active {plural}",
+            "data": {"batches": items, "count": len(items)},
         }
 
     # ------------------------------------------------------------------
@@ -908,18 +1021,25 @@ class ComfyUIHandler(AutoDispatchHandler):
             except (TypeError, ValueError):
                 base_seed = int(time.time()) & 0xFFFFFFFF
 
-        # Identify this batch. The executor tags every command with
-        # `_batch_id`; for a direct CLI invocation that has none, we
-        # generate one so the batch still has a stable identity in
-        # `_cancel_events` and in the history record.
         batch_id = params.get("_batch_id") or str(uuid.uuid4())
 
-        # Per-batch cancel event. Registered before any work so
-        # `comfy_cancel --batch_id X` can find it even while phase 1
-        # is running.
-        cancel_event = threading.Event()
-        with self._cancel_events_lock:
-            self._cancel_events[batch_id] = cancel_event
+        # Snapshot the workflow name before anything can change it.
+        workflow_name = self._active_workflow_name or "(unnamed)"
+
+        # Register the batch record before the try block so the batch
+        # is visible to `comfy_batches` from this point on. If an
+        # early return happens (no workflow, no client), the finally
+        # block deregisters.
+        record = _BatchRecord(
+            batch_id=batch_id,
+            workflow_name=workflow_name,
+            requested_count=requested_count,
+            total_runs=requested_count,   # may be clamped below
+            base_seed=base_seed,
+            output_name=output_name,
+        )
+        with self._batches_lock:
+            self._batches[batch_id] = record
 
         try:
             warnings: list[str] = []
@@ -930,8 +1050,6 @@ class ComfyUIHandler(AutoDispatchHandler):
                         "message": "No workflow loaded. Run comfy_load or "
                                    "publish a graph from ComfyUI's browser.",
                         "data": {"batch_id": batch_id}}
-
-            workflow_name = self._active_workflow_name or "(unnamed)"
 
             if self._client is None:
                 return {"success": False,
@@ -954,20 +1072,26 @@ class ComfyUIHandler(AutoDispatchHandler):
                     f"seed input to enable batch generation."
                 )
                 count = 1
+                record.total_runs = 1
 
             batch_started = time.time()
             base_params = dict(self._params)
             original_seed = self._params.get(_SEED_PARAMETER_NAME)
 
             # ---- Phase 1: prepare every run. ----
-
+            #
+            # run_records is the same list the record exposes, so
+            # appending to it here is enough for `comfy_batches` to
+            # see the progress.
             prepared: list[dict] = []
-            run_records: list[dict] = []
+            run_records = record.run_records
+            record.current_phase = "preparing"
 
             for i in range(count):
                 seed_i = (base_seed + i) & 0xFFFFFFFF
+                record.current_run_index = i
 
-                if cancel_event.is_set():
+                if record.cancel_event.is_set():
                     for j in range(i, count):
                         seed_j = (base_seed + j) & 0xFFFFFFFF
                         run_records.append({
@@ -1058,8 +1182,7 @@ class ComfyUIHandler(AutoDispatchHandler):
                 else:
                     self._params[_SEED_PARAMETER_NAME] = original_seed
 
-            # If the cancel fired during phase 1, do not submit anything.
-            if cancel_event.is_set() and prepared:
+            if record.cancel_event.is_set() and prepared:
                 for p in prepared:
                     run_records.append({
                         "seed": p["seed"], "prompt_id": None,
@@ -1073,6 +1196,7 @@ class ComfyUIHandler(AutoDispatchHandler):
             # ---- Phase 2: submit and collect. ----
 
             total_layers = 0
+            record.current_phase = "running"
 
             if prepared:
                 prepared_graphs = [p["graph"] for p in prepared]
@@ -1173,7 +1297,7 @@ class ComfyUIHandler(AutoDispatchHandler):
                         prepared_graphs,
                         timeout=batch_timeout,
                         on_result=on_result,
-                        should_stop=cancel_event.is_set,
+                        should_stop=record.cancel_event.is_set,
                     )
                 except ComfyError as e:
                     recorded_seeds = {r.get("seed") for r in run_records}
@@ -1189,6 +1313,8 @@ class ComfyUIHandler(AutoDispatchHandler):
                 total_layers = sum(
                     len(r.get("layer_names", [])) for r in run_records
                 )
+
+            record.current_phase = "finalizing"
 
             # ---- One history entry for the whole batch. ----
 
@@ -1262,8 +1388,8 @@ class ComfyUIHandler(AutoDispatchHandler):
             return {"success": True, "message": msg, "data": response_data}
 
         finally:
-            with self._cancel_events_lock:
-                self._cancel_events.pop(batch_id, None)
+            with self._batches_lock:
+                self._batches.pop(batch_id, None)
 
     @command(
         category="comfyui",
@@ -1331,39 +1457,33 @@ class ComfyUIHandler(AutoDispatchHandler):
     def comfy_cancel(self, params):
         batch_id = params.get("batch_id") or None
 
-        with self._cancel_events_lock:
+        with self._batches_lock:
             if batch_id:
-                event = self._cancel_events.get(batch_id)
-                if event is None:
+                record = self._batches.get(batch_id)
+                if record is None:
                     return {
                         "success": False,
                         "message": (f"No active batch with id "
                                     f"{batch_id!r}"),
                         "data": {
                             "active_batches": sorted(
-                                self._cancel_events.keys()
+                                self._batches.keys()
                             ),
                         },
                     }
-                event.set()
+                record.cancel_event.set()
                 return {
                     "success": True,
                     "message": f"Cancel requested for batch {batch_id}",
                     "data": {"batch_id": batch_id},
                 }
 
-            # No batch id: cancel every active batch.
-            events = list(self._cancel_events.values())
-            active = sorted(self._cancel_events.keys())
+            records = list(self._batches.values())
+            active = sorted(self._batches.keys())
 
-        for e in events:
-            e.set()
+        for r in records:
+            r.cancel_event.set()
 
-        # Async generates are not batch-tracked (they go through
-        # `_queue_generate` and do not register a cancel event).
-        # Interrupt ComfyUI directly for those. This is a no-op when
-        # no async generates are pending, so a batch-only cancel does
-        # not touch ComfyUI from here.
         async_interrupted = False
         if self._client is not None and self._pending:
             try:
@@ -1374,8 +1494,8 @@ class ComfyUIHandler(AutoDispatchHandler):
                 pass
 
         parts = []
-        if events:
-            parts.append(f"{len(events)} batch(es)")
+        if records:
+            parts.append(f"{len(records)} batch(es)")
         if async_interrupted:
             parts.append(f"{len(self._pending)} async generate(s)")
         if parts:
@@ -1454,10 +1574,6 @@ class ComfyUIHandler(AutoDispatchHandler):
     # ------------------------------------------------------------------
     #  Internal: async generate pipeline (single prompt)
     # ------------------------------------------------------------------
-    #
-    # The batch path bypasses this entirely; it uses client.generate_batch
-    # directly. This remains for comfy_generate_async + comfy_wait, which
-    # are single-prompt by design.
 
     def _queue_generate(self,
                         seed: Optional[int] = None,

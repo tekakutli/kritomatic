@@ -28,10 +28,6 @@ def is_suppress_command():
         if '--json' in sys.argv:
             return True
 
-    # diffusion export_params (when piping JSON)
-    if len(sys.argv) >= 3 and sys.argv[1] == 'diffusion' and sys.argv[2] == 'export_params':
-        return True
-
     return False
 
 
@@ -50,6 +46,19 @@ def main():
             client.close()
         else:
             print("❌ Could not connect to daemon. Make sure Krita is running.")
+        return
+
+    # ========== HANDLE comfyui panel subcommands (client-side only) ==========
+    #
+    # `panel` is a client-side subtree of the `comfyui` category. It is
+    # intercepted here, before the schema-based parser runs, because
+    # the daemon schema does not carry it. `registry.py` injects a
+    # matching `panel` subparser under `comfyui` so that
+    # `kritomatic --help` and `kritomatic comfyui --help` still list
+    # it as a choice.
+    if len(sys.argv) >= 3 and sys.argv[1] == 'comfyui' and sys.argv[2] == 'panel':
+        from comfyui_panel import run_panel_command
+        run_panel_command()
         return
 
     # ========== HANDLE text subcommands (client-side only) ==========

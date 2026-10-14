@@ -8,6 +8,7 @@ from functools import lru_cache
 from kritomatic.helpful_argparse import HelpfulArgumentParser
 from kritomatic.playground_launcher import PLAYGROUNDS
 from kritomatic.xremap_launcher import XREMAP_COMMANDS
+from kritomatic.comfyui_panel.cli import populate_panel_subcommands
 
 
 def _escape_help_for_argparse(text):
@@ -165,6 +166,8 @@ class CommandRegistry:
                    '  kritomatic layer create "My Layer"\n'
                    '  kritomatic batch run \'{"commands": [...]}\'\n'
                    '  kritomatic batch validate \'{"commands": [...]}\'\n'
+                   '  kritomatic comfyui panel run\n'
+                   '  kritomatic comfyui panel preset apply hyper\n'
                    '  kritomatic text dump --output labels.json\n'
                    '  kritomatic text load --input labels.json\n'
                    '  kritomatic playgrounds board\n'
@@ -406,6 +409,27 @@ class CommandRegistry:
                     cmd_parser.add_argument(arg_name, **kwargs)
 
                 cmd_parser.set_defaults(func=None)
+
+            # Client-side subtree injected under `comfyui` for `panel`.
+            # The schema does not carry `panel` — it is intercepted in
+            # main.py before the schema parser runs — but the CLI's
+            # `--help` output lists it as a choice on the same
+            # subparsers object, so users see it alongside the schema
+            # commands. `populate_panel_subcommands` is the same
+            # function the runtime entry point uses; the two stay in
+            # sync because there is only one declaration.
+            if category == 'comfyui':
+                panel_parser = cmd_subparsers.add_parser(
+                    'panel',
+                    help=_escape_help_for_argparse(
+                        'Edit and run per-workflow panel configs'
+                    ),
+                )
+                panel_sub = panel_parser.add_subparsers(
+                    dest='panel_command', metavar='PANEL_COMMAND',
+                    required=True, help='Panel commands',
+                )
+                populate_panel_subcommands(panel_sub)
 
         return parser
 

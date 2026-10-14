@@ -296,7 +296,7 @@ class ComfyClient:
         }
 
         # ---- Watcher state ----
-        self._watch_callbacks: list[Callable[[str, dict], None]] = []
+        self._watch_callbacks: list[Callable[[dict, dict], None]] = []
         self._watch_stop = threading.Event()
         self._watch_thread: Optional[threading.Thread] = None
         self._watch_client_id = str(uuid.uuid4())
@@ -433,9 +433,17 @@ class ComfyClient:
     #  Workflow watcher
     # ------------------------------------------------------------------
 
-    def watch_workflows(self, callback: Callable[[str, dict], None],
+    def watch_workflows(self, callback: Callable[[dict, dict], None],
                         replace: bool = True) -> None:
-        """Register a callback and start the watcher if not running."""
+        """Register a callback and start the watcher if not running.
+
+        The callback receives ``(publisher, graph)``. ``publisher`` is
+        the dict the tooling-nodes extension put on the wire under the
+        ``publisher`` key: it carries both ``name`` (always "ComfyUI
+        Web" for browser publishes) and ``id`` (ComfyUI's per-page-load
+        client id, unique per tab). The graph is the prompt-format
+        workflow dict.
+        """
         if not _WS_AVAILABLE:
             raise ComfyError(
                 "websockets>=12 is required for watch_workflows(). "
@@ -547,7 +555,8 @@ class ComfyClient:
             return
         data = msg.get("data") or {}
         publisher = data.get("publisher") or {}
-        name = publisher.get("name") or publisher.get("id") or "unknown"
+        if not isinstance(publisher, dict):
+            publisher = {}
         graph = data.get("workflow")
         if not isinstance(graph, dict) or not graph:
             return
@@ -555,7 +564,7 @@ class ComfyClient:
             callbacks = list(self._watch_callbacks)
         for cb in callbacks:
             try:
-                cb(name, graph)
+                cb(publisher, graph)
             except Exception:
                 pass
 

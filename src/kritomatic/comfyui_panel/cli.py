@@ -8,17 +8,23 @@ cli.py — command-line interface for the panel.
     kritomatic comfyui panel preset list
     kritomatic comfyui panel queue
     kritomatic comfyui panel cancel [<batch_id>] [--all]
+    kritomatic comfyui panel publishers
+    kritomatic comfyui panel pin        [<key>]
+    kritomatic comfyui panel unpin
 
-`run` requires Krita's daemon and a reachable ComfyUI; `queue` and
-`cancel` require the daemon only, and can be used from any shell while
-other processes are running `comfyui panel run` — all of them share the
-single daemon, so its `_batches` dict is the union of every running
-batch.
+`run` requires Krita's daemon and a reachable ComfyUI; `queue`,
+`cancel`, `publishers`, `pin`, and `unpin` require the daemon only,
+and can be used from any shell while other processes are running
+`comfyui panel run` — all of them share the single daemon, so its
+state is the union of every running batch and every known publisher.
 
 `cancel` is a request, not a synchronous kill: the daemon sets the
 target batch's cancel flag and the batch winds itself down at its next
 check, marking unfinished runs as cancelled. Already-pasted layers stay
 in the document.
+
+`queue`, `publishers`, and their `--json` variants emit JSON on stdout
+so they pipe cleanly into `jq` or a polling loop.
 
 `reset` and `print` require the daemon only when the workflow is not
 named explicitly; `preset apply` with an explicit workflow touches
@@ -627,6 +633,126 @@ def _cancel_all(client) -> int:
     return 1
 
 
+# ----------------------------------------------------------------------------
+#  publishers / pin / unpin
+# ----------------------------------------------------------------------------
+
+def cmd_publishers(args) -> int:
+    """Print every browser publisher the daemon has heard from, as JSON.
+
+    A publisher is a ComfyUI browser tab that has published a graph
+    containing an ETN_KritaOutput node. Each tab gets its own key
+    (ComfyUI's per-page-load client id), so two tabs of the same
+    workflow show up as two entries.
+
+    Read-only: it sends one `comfy_list_publishers` command and prints
+    the reply verbatim as JSON. Output is always JSON, on stdout, so
+    the command pipes cleanly into `jq` or a polling loop. On success
+    the process exits 0; on connection failure or a non-success reply
+    it prints a diagnostic on stderr and exits 1, leaving stdout empty.
+    """
+    client = KritaClient()
+    if not client.connect():
+        print(
+            f"Krita's Kritomatic daemon is not reachable at "
+            f"{client.host}:{client.port}.",
+            file=sys.stderr,
+        )
+        print(
+            "Start Krita with the Kritomatic Daemon plugin enabled.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        resp = client.execute("comfy_list_publishers")
+    finally:
+        client.close()
+
+    if not resp or resp.get("status") != "success":
+        msg = (resp or {}).get("message", "no response from daemon")
+        print(f"Could not fetch publishers: {msg}", file=sys.stderr)
+        return 1
+
+    data = resp.get("data") or {}
+    print(json.dumps(data, indent=2))
+    return 0
+
+
+def cmd_pin(args) -> int:
+    """Pin the active workflow to a browser publisher.
+
+    Without a key, pins whichever publisher is currently active — the
+    one whose graph is driving the handler right now. With a key, pins
+    that specific one. While pinned, publishes from other browser
+    instances are tracked but do not replace the active workflow;
+    publishes from the pinned instance still update it.
+    """
+    client = KritaClient()
+    if not client.connect():
+        print(
+            f"Krita's Kritomatic daemon is not reachable at "
+            f"{client.host}:{client.port}.",
+            file=sys.stderr,
+        )
+        print(
+            "Start Krita with the Kritomatic Daemon plugin enabled.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        if args.key:
+            resp = client.execute("comfy_pin_publisher", key=args.key)
+        else:
+            resp = client.execute("comfy_pin_publisher")
+    finally:
+        client.close()
+
+    if resp and resp.get("status") == "success":
+        print(resp.get("message") or "Pinned")
+        return 0
+
+    msg = (resp or {}).get("message", "no response from daemon")
+    print(f"Pin failed: {msg}", file=sys.stderr)
+    if "comfy_list_publishers" not in msg:
+        print(
+            "  Run `kritomatic comfyui panel publishers` to list "
+            "available keys.",
+            file=sys.stderr,
+        )
+    return 1
+
+
+def cmd_unpin(args) -> int:
+    """Clear the publisher pin."""
+    client = KritaClient()
+    if not client.connect():
+        print(
+            f"Krita's Kritomatic daemon is not reachable at "
+            f"{client.host}:{client.port}.",
+            file=sys.stderr,
+        )
+        print(
+            "Start Krita with the Kritomatic Daemon plugin enabled.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        resp = client.execute("comfy_unpin_publisher")
+    finally:
+        client.close()
+
+    if resp and resp.get("status") == "success":
+        print(resp.get("message") or "Unpinned")
+        return 0
+
+    msg = (resp or {}).get("message", "no response from daemon")
+    print(f"Unpin failed: {msg}", file=sys.stderr)
+    return 1
+
+
 # ============================================================================
 #  Parser
 # ============================================================================
@@ -734,6 +860,31 @@ def populate_panel_subcommands(sub) -> None:
              'daemon is tracking.',
     )
     cancel_p.set_defaults(func=cmd_cancel)
+
+    publishers_p = sub.add_parser(
+        'publishers',
+        help='Print every ComfyUI browser publisher the daemon has '
+             'heard from, as JSON',
+    )
+    publishers_p.set_defaults(func=cmd_publishers)
+
+    pin_p = sub.add_parser(
+        'pin',
+        help='Pin the active workflow to one browser publisher '
+             '(no argument: pin the currently active one)',
+    )
+    pin_p.add_argument(
+        'key', nargs='?', default=None,
+        help='Publisher key from `panel publishers`. Omit to pin '
+             'whichever publisher is currently active.',
+    )
+    pin_p.set_defaults(func=cmd_pin)
+
+    unpin_p = sub.add_parser(
+        'unpin',
+        help='Clear the publisher pin; return to last-publish-wins',
+    )
+    unpin_p.set_defaults(func=cmd_unpin)
 
 
 def build_parser() -> HelpfulArgumentParser:

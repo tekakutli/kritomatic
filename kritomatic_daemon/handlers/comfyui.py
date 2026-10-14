@@ -19,6 +19,24 @@ arrived over the publish bus. `signature` is a hash of the workflow's
 interface — the sorted names of its ETN_Parameter nodes and its
 ETN_KritaOutput nodes.
 
+Publisher tracking and pinning
+==============================
+A ComfyUI browser tab that publishes a graph is a *publisher*. Two
+tabs publishing the same workflow are two distinct publishers, keyed
+by ComfyUI's per-page-load client id (the tooling-nodes extension's
+`publisher.id`). The handler keeps a per-session map of every
+publisher it has heard from, keyed by that id, with the last graph
+each one sent.
+
+By default, the most recent publish wins: editing in any tab takes
+over the active workflow. `comfy_pin_publisher` opts out of that —
+while a pin is set, publishes from other publishers are tracked but
+do not promote to active. Publishes from the pinned publisher still
+update the active graph, so editing that tab continues to work. The
+pin does not survive a daemon reload; `reload_daemon` drops it along
+with the tracked publisher map, and the next publish from any tab
+re-establishes last-publish-wins.
+
 Layer aliases
 =============
 A workflow that uses `ETN_KritaMaskLayer` / `ETN_KritaImageLayer` names
@@ -145,6 +163,9 @@ Command surface
     comfy_watch            --enable
     comfy_status
     comfy_batches
+    comfy_list_publishers
+    comfy_pin_publisher    --key?
+    comfy_unpin_publisher
     comfy_list_workflows
     comfy_load             --name <slug>
     comfy_set_param        --name <param> --value <value>
@@ -453,6 +474,21 @@ class ComfyUIHandler(AutoDispatchHandler):
             "selection_padding": 0,
         }
 
+        # Browser publishers the daemon has heard from this session,
+        # keyed by a stable publisher key (the tooling-nodes extension's
+        # `id`, which is ComfyUI's client id for the browser tab). Each
+        # entry stores the last graph that publisher sent, so pinning
+        # can re-promote it without waiting for a new publish.
+        self._published_publishers: dict[str, dict] = {}
+        # If set, only publishes from this publisher key promote to the
+        # active workflow. Cleared by comfy_unpin_publisher or by a
+        # reload_daemon.
+        self._pinned_publisher_key: Optional[str] = None
+        # Which publisher (if any) is currently driving the active
+        # workflow. None when the active workflow came from a file
+        # (comfy_load) rather than a browser publish.
+        self._active_workflow_publisher_key: Optional[str] = None
+
         self._params: dict = {}
         self._layer_aliases: dict[str, str] = {}
 
@@ -471,12 +507,19 @@ class ComfyUIHandler(AutoDispatchHandler):
     #  Internal: active-workflow assignment
     # ------------------------------------------------------------------
 
-    def _set_active_workflow(self, name: str, graph: dict,
-                             source: str) -> None:
-        """Assign the active workflow and every derived field together."""
+    def _set_active_workflow(self, name: str, graph: dict, source: str,
+                             publisher_key: Optional[str] = None) -> None:
+        """Assign the active workflow and every derived field together.
+
+        `publisher_key` identifies which browser publisher this graph
+        came from, if any. It is None for `comfy_load` (file source),
+        which is correct: a file load is not associated with a
+        browser tab.
+        """
         self._active_workflow_name = name
         self._active_workflow_graph = graph
         self._active_workflow_source = source
+        self._active_workflow_publisher_key = publisher_key
         self._active_workflow_signature = _compute_signature(graph)
         self._active_workflow_parameters = _extract_parameters(graph)
         self._active_workflow_layers = _extract_layer_requirements(graph)
@@ -642,11 +685,48 @@ class ComfyUIHandler(AutoDispatchHandler):
             self._client.unwatch_workflows()
             return {"success": True, "message": "Stopped watching"}
 
-    def _on_workflow_published(self, publisher_name: str, graph: dict):
-        """Watcher callback. Runs on the watcher thread."""
+    @staticmethod
+    def _publisher_key(publisher: dict) -> str:
+        """Stable identity for a browser publisher.
+
+        Prefers the tooling-nodes extension's `id`, which is ComfyUI's
+        per-page-load client id (a fresh value on each tab). Falls
+        back to a name-prefixed key only if the id is missing, which
+        should not happen with a current tooling-nodes extension but
+        keeps the tracking map usable against an older one.
+        """
+        pid = publisher.get("id")
+        if pid:
+            return str(pid)
+        name = publisher.get("name") or "unknown"
+        return f"name:{name}"
+
+    def _on_workflow_published(self, publisher: dict, graph: dict):
+        """Watcher callback. Runs on the watcher thread.
+
+        Records the publisher in `self._published_publishers` and, if
+        no pin is set or the pinned key matches this publisher,
+        promotes its graph to the active workflow.
+        """
+        key = self._publisher_key(publisher)
         signature = _compute_signature(graph)
-        name = f"ComfyUI Web ({publisher_name}, sig={signature})"
-        self._set_active_workflow(name, graph, "browser")
+        display_name = publisher.get("name") or "unknown"
+        full_name = f"ComfyUI Web ({display_name}, sig={signature})"
+
+        self._published_publishers[key] = {
+            "key": key,
+            "publisher_name": display_name,
+            "publisher_id": publisher.get("id"),
+            "signature": signature,
+            "workflow_name": full_name,
+            "graph": graph,
+            "published_at": time.time(),
+        }
+
+        if (self._pinned_publisher_key is None
+                or self._pinned_publisher_key == key):
+            self._set_active_workflow(full_name, graph, "browser",
+                                      publisher_key=key)
 
     @command(
         category="comfyui",
@@ -691,6 +771,10 @@ class ComfyUIHandler(AutoDispatchHandler):
                 "selection_context": self._selection_context,
                 "selection_padding": self._selection_padding,
                 "pending": list(self._pending.keys()),
+                "pinned_publisher": self._pinned_publisher_key,
+                "active_publisher": self._active_workflow_publisher_key,
+                "published_publishers":
+                    sorted(self._published_publishers.keys()),
             },
         }
 
@@ -736,6 +820,117 @@ class ComfyUIHandler(AutoDispatchHandler):
             "message": f"{len(items)} active {plural}",
             "data": {"batches": items, "count": len(items)},
         }
+
+    @command(
+        category="comfyui",
+        help_text="List the browser publishers the daemon has heard from "
+                  "this session, newest publish first. Each entry names "
+                  "the publisher's key, its declared name (always "
+                  "'ComfyUI Web' for browser publishes), the workflow's "
+                  "signature, and when it last published. Entries carry "
+                  "`active` (currently driving the handler) and `pinned` "
+                  "(the current pin target) flags.",
+        args={},
+    )
+    def comfy_list_publishers(self, params):
+        entries = list(self._published_publishers.values())
+        entries.sort(key=lambda e: e["published_at"], reverse=True)
+
+        pinned = self._pinned_publisher_key
+        active = self._active_workflow_publisher_key
+
+        items = []
+        for e in entries:
+            items.append({
+                "key": e["key"],
+                "publisher_name": e["publisher_name"],
+                "publisher_id": e["publisher_id"],
+                "workflow_name": e["workflow_name"],
+                "signature": e["signature"],
+                "published_at": e["published_at"],
+                "pinned": e["key"] == pinned,
+                "active": e["key"] == active,
+            })
+
+        return {
+            "success": True,
+            "message": f"{len(items)} publisher(s)",
+            "data": {
+                "publishers": items,
+                "pinned_key": pinned,
+                "active_key": active,
+            },
+        }
+
+    @command(
+        category="comfyui",
+        help_text="Pin the active workflow to one browser publisher. "
+                  "While pinned, publishes from other browser instances "
+                  "are tracked but do not replace the active workflow. "
+                  "Publishing from the pinned instance still updates "
+                  "the active graph, so editing that tab continues to "
+                  "work as normal. Without --key, pins whichever "
+                  "publisher is currently active.",
+        args={
+            "--key": {"type": "str", "required": False,
+                      "help": "Publisher key to pin. Omit to pin "
+                              "whichever publisher is currently active."},
+        },
+    )
+    def comfy_pin_publisher(self, params):
+        key = params.get("key") or self._active_workflow_publisher_key
+        if not key:
+            return {
+                "success": False,
+                "message": "No key given and no browser publisher is "
+                           "currently active. Run comfy_list_publishers "
+                           "to see available keys, or pass --key.",
+                "data": {
+                    "available": sorted(self._published_publishers.keys()),
+                },
+            }
+
+        entry = self._published_publishers.get(key)
+        if entry is None:
+            return {
+                "success": False,
+                "message": f"No publisher with key {key!r}.",
+                "data": {
+                    "available": sorted(self._published_publishers.keys()),
+                },
+            }
+
+        self._pinned_publisher_key = key
+        self._set_active_workflow(entry["workflow_name"], entry["graph"],
+                                  "browser", publisher_key=key)
+
+        return {
+            "success": True,
+            "message": f"Pinned to publisher {key!r}",
+            "data": {
+                "key": key,
+                "publisher_name": entry["publisher_name"],
+                "workflow": entry["workflow_name"],
+            },
+        }
+
+    @command(
+        category="comfyui",
+        help_text="Clear the publisher pin. Publishes from any browser "
+                  "instance take over the active workflow again — "
+                  "last-publish-wins. The pin does not survive a "
+                  "reload_daemon; reloading the daemon also clears it.",
+        args={},
+    )
+    def comfy_unpin_publisher(self, params):
+        was = self._pinned_publisher_key
+        self._pinned_publisher_key = None
+        if was:
+            return {"success": True,
+                    "message": f"Unpinned (was {was!r})",
+                    "data": {"was": was}}
+        return {"success": True,
+                "message": "No publisher was pinned"}
 
     # ------------------------------------------------------------------
     #  Workflow management
@@ -806,6 +1001,8 @@ class ComfyUIHandler(AutoDispatchHandler):
                 ),
             }
 
+        # File source: publisher_key defaults to None, clearing any
+        # previous browser publisher association on the active workflow.
         self._set_active_workflow(name, workflow, "file")
         self._params = {}
         self._layer_aliases = {}

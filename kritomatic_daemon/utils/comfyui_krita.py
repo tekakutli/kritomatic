@@ -330,13 +330,11 @@ def build_krita_resources(doc,
         try:
             resources.layer_images[name] = read_layer_pixels(doc, actual, crop)
         except ValueError as e:
-            available = [n.name() for n in _all_layers(doc)]
             raise ValueError(
                 f"{e}"
                 + (f"\n  (workflow declares {name!r}, "
                    f"alias resolves to {actual!r})"
                    if actual != name else "")
-                + f"\nLayers in the document: {sorted(available)}"
             ) from e
 
     for name in reqs.layer_masks:
@@ -344,13 +342,11 @@ def build_krita_resources(doc,
         try:
             resources.layer_masks[name] = read_layer_mask(doc, actual, crop)
         except ValueError as e:
-            available = [n.name() for n in _all_layers(doc)]
             raise ValueError(
                 f"{e}"
                 + (f"\n  (workflow declares {name!r}, "
                    f"alias resolves to {actual!r})"
                    if actual != name else "")
-                + f"\nLayers in the document: {sorted(available)}"
             ) from e
 
     return resources
@@ -686,19 +682,3 @@ def _clamp_bounds(bounds: Bounds, container: Bounds) -> Bounds:
         y -= excess
 
     return (x, y, w, h)
-
-
-# ============================================================================
-#  Layer tree walk (used only for error messages)
-# ============================================================================
-
-def _all_layers(doc):
-    """Every named layer under the root, depth-first."""
-    out = []
-    def walk(node):
-        for child in node.childNodes():
-            if child.name():
-                out.append(child)
-            walk(child)
-    walk(doc.rootNode())
-    return out

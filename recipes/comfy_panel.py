@@ -19,38 +19,17 @@ Layout
         ├── panel_configs/                   the .toml files this panel edits
         └── history/                         generation records
 
-The panel's `workflow` field is optional. When blank, the panel relies on
-the browser to publish a graph and the daemon to make it active. When
-set, the panel sends a `comfy_load` first, and the daemon reads
-`workflows/<name>.json`.
-
-How the config is picked
-------------------------
-Before resolving a config path, the panel makes sure the daemon is
-connected to ComfyUI and has had a chance to receive a published
-workflow from the browser.
-
-  * Explicit name given:           panel_configs/<name>.toml
-  * Source is "file":              panel_configs/<workflow-name>.toml
-  * Source is "browser":           the config whose `signature` field
-                                   matches the daemon's reported
-                                   signature.
-
-Layer aliases
--------------
-The template exposes a `[layer_aliases]` table whose keys are the layer
-names the workflow declares (from its ETN_KritaImageLayer and
-ETN_KritaMaskLayer nodes). The value for each key defaults to the key
-itself, meaning "use the document layer whose name matches what the
-workflow declares". Changing a value tells the daemon to read from a
-different layer in the document when the workflow asks for that name;
-the workflow graph is not modified.
-
-Output selection
+Batch generation
 ----------------
-When the workflow declares more than one ETN_KritaOutput node, every
-one is pasted by default. The `output_name` field selects a single one
-by the node's `name` widget. Leave it blank to paste all of them.
+When `count > 1`, the daemon runs the workflow that many times, each
+run with seed `seed + i` for run `i`, and pastes each result with the
+seed in the layer name. This requires the workflow to expose an
+`ETN_Parameter` named exactly `seed` wired to the sampler's seed input;
+without it, the daemon clamps count to 1 and reports the reason.
+
+The `seed` field is the base seed for a batch. Blank means the daemon
+picks a random base. One history record is written per `comfy_generate`
+call, regardless of count, with a `runs` list carrying each run's seed.
 """
 
 from pathlib import Path
@@ -118,26 +97,44 @@ def daemon_status() -> dict | None:
 
 
 def ensure_daemon_ready() -> dict | None:
-    """Bring the daemon to a state where it can report a workflow."""
-    client = _make_client()
-    if client is None:
-        return None
+    """Bring the daemon to a state where it can report a workflow.
+
+    Always issues `comfy_connect`. The daemon caches the ComfyUI
+    client from the last successful connect, so `connected_to` in
+    `comfy_status` can be truthy even when ComfyUI is currently
+    unreachable. Only a fresh `comfy_connect` actually pings it.
+
+    Bails out with a clean message when the environment is not ready:
+
+      - the daemon (Krita's Kritomatic plugin) is not reachable
+      - ComfyUI cannot be contacted
+      - ComfyUI is reachable but the tooling-nodes package is missing
+
+    All are conditions the user has to fix outside the panel, so
+    continuing into the batch would only produce a cascade of
+    downstream errors that obscure the real one.
+    """
+    client = KritaClient()
+    if not client.connect():
+        raise SystemExit(
+            f"Krita's Kritomatic daemon is not reachable at "
+            f"{client.host}:{client.port}.\n"
+            "Start Krita with the Kritomatic Daemon plugin enabled, "
+            "then re-run."
+        )
 
     try:
-        resp = client.execute("comfy_status")
-        status = (resp or {}).get("data") or {}
-
-        if not status.get("connected_to"):
-            print("Daemon not connected; sending comfy_connect ...")
-            connect_resp = client.execute("comfy_connect", watch=True)
-            if not connect_resp or connect_resp.get("status") != "success":
-                msg = (connect_resp or {}).get("message") \
-                    or "unknown error"
-                print(f"  comfy_connect failed: {msg}", file=sys.stderr)
-                return status
-            cr_data = connect_resp.get("data") or {}
-            if cr_data.get("watching") and not cr_data.get("subscribed"):
-                print("  watcher started, subscription pending")
+        print("Connecting to ComfyUI ...")
+        connect_resp = client.execute("comfy_connect", watch=True)
+        if not connect_resp or connect_resp.get("status") != "success":
+            msg = (connect_resp or {}).get("message", "unknown error")
+            raise SystemExit(
+                f"ComfyUI is not reachable.\n  {msg}\n"
+                "Start ComfyUI and re-run."
+            )
+        cr_data = connect_resp.get("data") or {}
+        if cr_data.get("watching") and not cr_data.get("subscribed"):
+            print("  watcher started, subscription pending")
 
         deadline = time.monotonic() + WORKFLOW_WAIT
         while time.monotonic() < deadline:
@@ -304,6 +301,22 @@ def _canvas_selection_block(info: dict) -> list[str]:
     return lines
 
 
+def _batch_block() -> list[str]:
+    return [
+        "# ---- Batch generation -------------------------------------",
+        "#",
+        "# count > 1 runs the workflow that many times, one run per",
+        "# consecutive seed, and pastes each result. The workflow must",
+        "# declare an ETN_Parameter named exactly 'seed' wired to the",
+        "# sampler's seed input; otherwise the daemon clamps count to 1.",
+        "#",
+        "# seed is the base for a batch: run i uses seed+i. Blank means",
+        "# the daemon picks a random base. One history record is written",
+        "# per comfy_generate call, regardless of count, with each run's",
+        "# seed in its runs list.",
+    ]
+
+
 # ---------------------------------------------------------------------------
 #  Template builders
 # ---------------------------------------------------------------------------
@@ -352,6 +365,10 @@ def build_template(workflow_name: str, workflow: dict,
     lines.append('output_name = ""    # paste only this ETN_KritaOutput '
                  'node; blank = all')
     lines.append('')
+    lines += _batch_block()
+    lines.append('count = 1')
+    lines.append('seed = ""          # base seed for a batch; blank = auto')
+    lines.append('')
 
     lines += _layer_aliases_block(info["image_layers"],
                                   info["mask_layers"])
@@ -379,7 +396,8 @@ def build_template(workflow_name: str, workflow: dict,
                  "\"active\" },")
     lines.append("#     { type = \"comfy_set_param\", name = "
                  "\"segmentFurther\", value = \"person\" },")
-    lines.append("#     { type = \"comfy_generate\", timeout = 55.0 },")
+    lines.append("#     { type = \"comfy_generate\", timeout = 55.0, "
+                 "count = 3 },")
     lines.append("# ]")
 
     return "\n".join(lines) + "\n"
@@ -429,6 +447,10 @@ def _build_browser_template_body(status: dict,
     lines.append('timeout = 55.0')
     lines.append('output_name = ""    # paste only this ETN_KritaOutput '
                  'node; blank = all')
+    lines.append('')
+    lines += _batch_block()
+    lines.append('count = 1')
+    lines.append('seed = ""          # base seed for a batch; blank = auto')
     lines.append('')
     lines += _layer_aliases_block(image_layers, mask_layers)
     lines.append('')
@@ -582,11 +604,29 @@ def build_commands(cfg: dict) -> list:
         "type": "comfy_generate",
         "timeout": float(cfg.get("timeout", 55.0)),
     }
+
     output_name = cfg.get("output_name") or ""
     if output_name:
         generate_cmd["output_name"] = str(output_name)
-    cmds.append(generate_cmd)
 
+    count_val = cfg.get("count", 1)
+    try:
+        count = int(count_val)
+    except (TypeError, ValueError):
+        count = 1
+    if count > 1:
+        generate_cmd["count"] = count
+
+    seed_val = cfg.get("seed", "")
+    if seed_val not in ("", None):
+        try:
+            generate_cmd["seed"] = int(seed_val)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"seed must be an integer or blank, got {seed_val!r}"
+            )
+
+    cmds.append(generate_cmd)
     return cmds
 
 
@@ -784,9 +824,30 @@ def main() -> int:
     print(f"Config:   {path}   ({label})")
     print(f"Commands: {len(commands)}\n")
 
+    # Size the client's per-read timeout to the longest single command
+    # the batch can contain. `comfy_generate` with a count > 1 runs
+    # several generations in sequence before it emits its own progress
+    # line; the client must be willing to wait that long.
+    per_run = float(cfg.get("timeout", 55.0))
+    try:
+        count = int(cfg.get("count", 1))
+    except (TypeError, ValueError):
+        count = 1
+    if count < 1:
+        count = 1
+    # Each run can take up to `per_run`; add one more `per_run` of
+    # margin so a slow first run does not eat into the wait for the
+    # last one, and a fixed overhead for connection and setup.
+    read_timeout = per_run * (count + 1) + 60.0
+    print(f"Client read timeout: {read_timeout:.0f}s "
+          f"({count} run(s) × {per_run:.0f}s + margin)\n")
+
     executor = BatchExecutor()
     try:
-        results = executor.execute({"id": "comfy_panel", "commands": commands})
+        results = executor.execute(
+            {"id": "comfy_panel", "commands": commands},
+            timeout=read_timeout,
+        )
         failed = [r for r in results if r["status"] == "error"]
         if failed:
             print(f"\n{len(failed)} command(s) failed:")

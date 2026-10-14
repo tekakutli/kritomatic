@@ -26,21 +26,57 @@ arrives. Registration is asynchronous on the server side: the WS open
 succeeds on the client before the server's `on_open` handler has run.
 
 The client therefore waits for the server's first `status` message on
-each new generate WebSocket before calling `/prompt`. That message is
-sent immediately after registration, so receiving it is proof the
-server now knows this client id.
+each new WebSocket before submitting any prompt. That message is sent
+immediately after registration, so receiving it is proof the server
+now knows this client id.
 
 Two WebSocket connections can be open at once: one persistent watcher
 that receives `etn_workflow_published` events from the browser-side JS,
-and one short-lived per-generate connection that receives execution
-events and preview frames.
+and one short-lived connection per `generate()` or `generate_batch()`
+call that receives execution events and preview frames.
 
-Single-flight generation
-------------------------
-`generate()` holds `self._lock` for its whole duration. Two overlapping
-generates would send previews to whichever WS connected last, so they
-are serialized. `watch_workflows()` also acquires `self._lock`, but only
-for the WS connect, not for the read loop.
+Single-flight
+-------------
+Both `generate()` and `generate_batch()` hold `self._lock` for their
+entire duration. Two overlapping calls would send previews to whichever
+WS connected last, so they are serialized. The watcher also acquires
+the lock, but only for the WS connect, not for its read loop.
+
+Interruptible lock acquisition
+------------------------------
+`generate_batch` acquires `self._lock` in short intervals rather than
+blocking on it. Between intervals it consults the caller's
+`should_stop` callback. This is what lets a cancel request reach a
+batch that is waiting for the lock — a batch that has been queued
+behind another but has not yet been able to submit anything. Without
+this, the waiting batch would sit on `lock.acquire()` until the other
+batch finished, and the user's cancel would only take effect then.
+
+When the stop condition fires while waiting for the lock, the batch
+returns immediately, every prompt marked `CANCELLED`. Nothing was
+submitted to ComfyUI, so nothing needs to be interrupted there.
+
+Batch execution
+---------------
+`generate_batch(graphs, ...)` submits N prompts on one WebSocket and
+reads events until all N have completed. ComfyUI queues the prompts
+and executes them sequentially on a single worker, so events for one
+prompt never interleave with another. The client tracks each prompt
+by the prompt_id it sent; when an `executing` event with a null `node`
+arrives for that prompt, that prompt is done. Binary preview frames
+arrive in execution order and are popped positionally by whichever
+prompt's `executed` event is being processed at that moment.
+
+For each completed prompt the client invokes a caller-supplied
+`on_result(index, result)` callback on the calling thread.
+
+`should_stop` is an optional zero-argument callable consulted at the
+top of every read iteration and every lock-acquisition interval. When
+it returns True, the batch marks every prompt that has not yet
+completed as cancelled, asks ComfyUI to interrupt the currently-
+executing prompt and drop the queued ones, and returns. The read
+timeout in the batch loop is 1 second, and the lock-acquisition poll
+interval is also 1 second, so a stop request is noticed promptly.
 
 HTTP endpoints used
 -------------------
@@ -79,11 +115,6 @@ A workflow may contain several output nodes. Two families are relevant:
     produce an `executed` event whose `output.images` entries carry
     `filename`, `subfolder`, `type`, and no `source`. They write to
     disk; there is nothing for this client to fetch. They are skipped.
-
-When a workflow has more than one tooling-nodes output node, each fires
-its own `executed` event. Images carry an `event_index` recording which
-event produced them, so the caller can group images back into the
-output nodes they came from.
 
 =============================================================================
 WHAT THIS MODULE DOES NOT DO
@@ -128,10 +159,6 @@ except ImportError:  # pragma: no cover
 class JobInfo:
     """One entry from an `executed` event's `output.info` list.
 
-    Emitted by `ETN_KritaOutput`. The tooling node produces a single info
-    dict per executed event, shared by every image the event carries;
-    see `_handle_executed`.
-
     batch_mode: "default" | "images" | "animation" | "layers"
     """
     name: str = ""
@@ -157,11 +184,16 @@ class GenerationResult:
     `images`, `infos`, and `event_index` are parallel lists: entry `i`
     in all three describes the same image. `event_index[i]` is the
     ordinal of the `executed` event that produced that image, counting
-    from 0. Two images with the same event index came from the same
-    output node invocation; two images with different event indices
-    came from different output nodes.
+    from 0 within the prompt.
 
-    `texts` and `warnings` are independent of the image list.
+    `error` is None for a successful run. When set, it holds a
+    human-readable description of why the prompt failed, was
+    interrupted, was cancelled, or produced no usable images. In
+    `generate()` a failure raises; in `generate_batch()` a failure sets
+    this field and the batch continues.
+
+    The literal string `"cancelled"` marks a run that never produced a
+    result because the caller asked the batch to stop.
     """
     prompt_id: str
     images: list[bytes] = field(default_factory=list)
@@ -169,6 +201,10 @@ class GenerationResult:
     event_index: list[int] = field(default_factory=list)
     texts: list[TextOutput] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    error: Optional[str] = None
+
+
+CANCELLED = "cancelled"
 
 
 class ComfyError(Exception):
@@ -267,6 +303,32 @@ class ComfyClient:
         self._watch_state_lock = threading.Lock()
         self._watch_connected = False
         self._watch_subscribed = threading.Event()
+
+    # ------------------------------------------------------------------
+    #  Lock acquisition
+    # ------------------------------------------------------------------
+
+    def _acquire_lock_interruptibly(
+            self,
+            should_stop: Optional[Callable[[], bool]],
+            timeout: float,
+    ) -> bool:
+        """Acquire `self._lock`, polling `should_stop` at intervals.
+
+        Returns True if the lock was acquired, False if `should_stop`
+        returned True while waiting or the timeout expired. The poll
+        interval is one second, so a stop request during the wait is
+        noticed promptly rather than after the current holder finishes.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            if should_stop is not None and should_stop():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self._lock.acquire(timeout=min(1.0, remaining)):
+                return True
 
     # ------------------------------------------------------------------
     #  HTTP helpers
@@ -498,10 +560,7 @@ class ComfyClient:
                 pass
 
     def _subscribe_workflows(self) -> None:
-        """Subscribe this client id. Idempotent: ComfyUI returns 500
-        "Already subscribed" if the id is still registered from a
-        previous WS that dropped without unsubscribing, and that is
-        treated as success."""
+        """Subscribe this client id. Idempotent."""
         try:
             self._json_request(
                 "POST", "api/etn/workflow/subscribe",
@@ -524,7 +583,7 @@ class ComfyClient:
             pass
 
     # ------------------------------------------------------------------
-    #  Generation
+    #  Generation — single prompt
     # ------------------------------------------------------------------
 
     def generate(self, graph: dict, timeout: float = 600.0,
@@ -564,13 +623,7 @@ class ComfyClient:
                 close_timeout=5.0,
                 additional_headers=self._passthrough_headers,
             ) as ws:
-                # Wait for the server's initial `status` message. That
-                # message is sent by the server after it has registered
-                # this WebSocket under `client_id`. Submitting the
-                # prompt before it arrives races with the registration
-                # and can route preview frames to an older WebSocket.
                 self._await_ws_ready(ws)
-
                 self._submit(graph, client_id, prompt_id)
 
                 while not final_node_seen:
@@ -659,21 +712,251 @@ class ComfyClient:
 
         return result
 
-    def _await_ws_ready(self, ws) -> None:
-        """Block until the server's first JSON message arrives.
+    # ------------------------------------------------------------------
+    #  Generation — batch of prompts
+    # ------------------------------------------------------------------
 
-        The server sends `{"type": "status", "data": {...}}` immediately
-        after the WebSocket is registered under our client id. Once that
-        message is received, the server is guaranteed to know the id,
-        and `/prompt` submissions that carry it will route previews
-        back to this connection.
+    def generate_batch(self,
+                       graphs: list[dict],
+                       timeout: float = 600.0,
+                       on_result: Optional[Callable[[int, GenerationResult],
+                                                    None]] = None,
+                       should_stop: Optional[Callable[[], bool]] = None,
+                       ) -> list[GenerationResult]:
+        """Submit multiple prompts and collect their results.
 
-        A short timeout is used. If the message does not arrive, we
-        proceed anyway: the registration may still be pending, in which
-        case the submission's previews route elsewhere and the caller
-        sees an empty image; that failure mode is preferable to hanging
-        generate on a server that never sends status.
+        `graphs` is a list of ComfyUI prompt dicts. They are submitted
+        in order; ComfyUI queues them and executes them sequentially on
+        a single worker. The function reads events from one WebSocket
+        until every prompt has either produced a result or failed, or
+        the total timeout expires.
+
+        `on_result(index, result)` is called as each prompt completes,
+        on the calling thread.
+
+        `should_stop()` is consulted at the top of every read iteration
+        AND between lock-acquisition attempts. When it returns True,
+        all prompts that have not yet completed are marked cancelled
+        (`result.error = CANCELLED`), ComfyUI is asked to interrupt
+        the current prompt and drop the queued ones, and the function
+        returns.
+
+        If the stop condition fires while this call is waiting for
+        `self._lock` (because another batch is currently executing),
+        the function returns immediately without ever submitting: no
+        WebSocket is opened, no prompt reaches ComfyUI, nothing needs
+        to be interrupted there. This is what lets a cancel reach a
+        batch that is queued behind another one.
+
+        Returns a list of `GenerationResult` in the same order as
+        `graphs`. Prompts that failed have their `.error` set.
+
+        Unlike `generate()`, this does not raise on failure of an
+        individual prompt; the caller inspects each result's `.error`.
+        It does raise on WebSocket-level failures that abort the whole
+        batch.
         """
+        if not _WS_AVAILABLE:
+            raise ComfyError(
+                "websockets>=12 is required for generate_batch(). "
+                "Install with: pip install 'websockets>=12'"
+            )
+
+        # Interruptible lock acquisition. When this returns False the
+        # stop condition fired during the wait, or the overall timeout
+        # expired before the lock became available. Either way, no
+        # prompt was submitted: return a cancelled result for each.
+        if not self._acquire_lock_interruptibly(should_stop, timeout):
+            results: list[GenerationResult] = []
+            for i, _ in enumerate(graphs):
+                r = GenerationResult(prompt_id=str(uuid.uuid4()),
+                                     error=CANCELLED)
+                results.append(r)
+                if on_result is not None:
+                    try:
+                        on_result(i, r)
+                    except Exception:
+                        pass
+            return results
+
+        try:
+            return self._generate_batch_locked(
+                graphs, timeout, on_result, should_stop,
+            )
+        finally:
+            self._lock.release()
+
+    def _generate_batch_locked(self,
+                               graphs: list[dict],
+                               timeout: float,
+                               on_result: Optional[Callable[
+                                   [int, GenerationResult], None]],
+                               should_stop: Optional[Callable[[], bool]],
+                               ) -> list[GenerationResult]:
+        if not graphs:
+            return []
+
+        client_id = str(uuid.uuid4())
+        ws_url = f"{self.ws_base}?clientId={client_id}"
+        deadline = time.monotonic() + timeout
+
+        prompts: list[dict] = []
+        pending_previews: list[bytes] = []
+
+        def _finish(entry: dict,
+                    error_msg: Optional[str] = None) -> int:
+            if entry["done"]:
+                return 0
+            r = entry["result"]
+            if error_msg is not None:
+                r.error = error_msg
+            entry["done"] = True
+            if on_result is not None:
+                try:
+                    on_result(entry["index"], r)
+                except Exception:
+                    pass
+            return 1
+
+        try:
+            with _ws_connect(
+                ws_url,
+                max_size=2 ** 30,
+                open_timeout=self.connect_timeout,
+                close_timeout=5.0,
+                additional_headers=self._passthrough_headers,
+            ) as ws:
+                self._await_ws_ready(ws)
+
+                for i, graph in enumerate(graphs):
+                    prompt_id = str(uuid.uuid4())
+                    result = GenerationResult(prompt_id=prompt_id)
+                    entry = {
+                        "index": i,
+                        "prompt_id": prompt_id,
+                        "result": result,
+                        "done": False,
+                        "event_index": 0,
+                    }
+                    try:
+                        self._submit(graph, client_id, prompt_id)
+                    except ComfyError as e:
+                        result.error = f"submit failed: {e}"
+                    prompts.append(entry)
+                    if result.error:
+                        _finish(entry)
+
+                done_count = sum(1 for p in prompts if p["done"])
+                total = len(prompts)
+
+                while done_count < total:
+                    if should_stop is not None and should_stop():
+                        cancel_ids = []
+                        for p in prompts:
+                            if p["done"]:
+                                continue
+                            cancel_ids.append(p["prompt_id"])
+                            done_count += _finish(p, error_msg=CANCELLED)
+                        self.interrupt()
+                        if cancel_ids:
+                            self.cancel_queued(cancel_ids)
+                        break
+
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        for p in prompts:
+                            if not p["done"]:
+                                done_count += _finish(
+                                    p,
+                                    error_msg=f"timed out after "
+                                              f"{timeout:.0f}s",
+                                )
+                        break
+
+                    try:
+                        msg = ws.recv(timeout=min(remaining, 1.0))
+                    except TimeoutError:
+                        continue
+                    except _WSConnectionClosed as e:
+                        for p in prompts:
+                            if not p["done"]:
+                                done_count += _finish(
+                                    p, error_msg=f"WebSocket closed: {e}",
+                                )
+                        break
+
+                    if msg is None:
+                        continue
+
+                    if isinstance(msg, (bytes, bytearray)):
+                        img_bytes = decode_preview_frame(bytes(msg))
+                        if img_bytes is not None:
+                            pending_previews.append(img_bytes)
+                        continue
+
+                    try:
+                        event = json.loads(msg)
+                    except json.JSONDecodeError:
+                        continue
+
+                    ev_type = event.get("type")
+                    ev_data = event.get("data", {}) or {}
+                    ev_pid = ev_data.get("prompt_id")
+
+                    target = next(
+                        (p for p in prompts if p["prompt_id"] == ev_pid),
+                        None,
+                    )
+                    if target is None or target["done"]:
+                        continue
+
+                    if ev_type == "executed":
+                        self._handle_executed(
+                            event, pending_previews,
+                            target["result"], target["event_index"],
+                        )
+                        target["event_index"] += 1
+                    elif ev_type == "execution_error":
+                        err_msg = ev_data.get(
+                            "exception_message", "execution_error",
+                        )
+                        tb = ev_data.get("traceback", "")
+                        done_count += _finish(
+                            target, error_msg=f"{err_msg}\n{tb}".strip(),
+                        )
+                    elif ev_type == "execution_interrupted":
+                        done_count += _finish(
+                            target, error_msg="interrupted",
+                        )
+                    elif ev_type == "executing":
+                        if ev_data.get("node") is None:
+                            r = target["result"]
+                            err = None
+                            if not r.images:
+                                err = (
+                                    "no image produced (the workflow's "
+                                    "output node may be a stock "
+                                    "SaveImage or PreviewImage, which "
+                                    "writes to disk but does not send "
+                                    "the image over the WebSocket)"
+                                )
+                            elif all(len(b) == 0 for b in r.images):
+                                err = "cached execution with no image data"
+                            done_count += _finish(target, error_msg=err)
+
+        except (ComfyError, ComfyTimeout, ComfyCancelled):
+            raise
+        except Exception as e:
+            raise ComfyError(f"generate_batch() failed: {e}") from e
+
+        return [p["result"] for p in prompts]
+
+    # ------------------------------------------------------------------
+    #  Shared internals
+    # ------------------------------------------------------------------
+
+    def _await_ws_ready(self, ws) -> None:
+        """Block until the server's first JSON message arrives."""
         try:
             ws.recv(timeout=3.0)
         except TimeoutError:
@@ -717,18 +1000,7 @@ class ComfyClient:
         ComfyUI's stock output nodes (SaveImage, PreviewImage) emit an
         `executed` event whose `images` entries carry `filename`,
         `subfolder` and `type` keys but no `source`; those are
-        filesystem saves, not something this client fetches. Entries
-        without a recognized source are skipped.
-
-        The tooling-nodes output nodes emit one info dict per executed
-        event, shared by every image the event carries. The event's
-        `info` list therefore has at most one element, and that one
-        element describes every image in `images`.
-
-        `event_index` identifies this event among all the executed
-        events of the prompt. It is recorded once per appended image
-        so the paste step can group images back into their source
-        output node.
+        filesystem saves, not something this client fetches.
         """
         data = event.get("data", {}) or {}
         output = data.get("output") or {}
@@ -737,7 +1009,6 @@ class ComfyClient:
         infos = output.get("info") or []
         texts = output.get("text") or []
 
-        # One info dict for the whole event, shared across images.
         shared_info = JobInfo()
         if infos and isinstance(infos[0], dict):
             info = infos[0]
@@ -761,9 +1032,7 @@ class ComfyClient:
                     result.warnings.append(
                         "ComfyUI sent an `executed` event for a WebSocket "
                         "image but no preview frame arrived on this "
-                        "connection. The image was generated; it was "
-                        "routed to a different WebSocket. Retry the "
-                        "generate."
+                        "connection."
                     )
             elif source == "http":
                 img_id = (img_entry.get("id")
@@ -776,8 +1045,6 @@ class ComfyClient:
                 else:
                     result.images.append(b"")
             else:
-                # Stock SaveImage / PreviewImage. Not addressable from
-                # here; skip.
                 continue
 
             result.infos.append(shared_info)

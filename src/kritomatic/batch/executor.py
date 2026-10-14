@@ -2,9 +2,10 @@
 
 import json
 import random
+import socket
 import string
-from typing import List, Dict, Any, Optional, Callable
 import sys
+from typing import List, Dict, Any, Optional, Callable
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -29,39 +30,26 @@ class BatchExecutor:
         self._include_counter = 0
 
     def _get_current_prefix(self) -> str:
-        """The scope id for commands this executor emits.
-
-        Top-level commands get the bundle id. Commands from an include
-        get `<bundle_id>_inc<depth>_<n>`, and nested includes extend
-        the string. The daemon resolves names against the scope's
-        created-nodes map, so two inclusions of the same macro can both
-        create a layer called `selections` and each reference resolves
-        to its own.
-        """
+        """The scope id for commands this executor emits."""
         return '_'.join(self.prefix_stack)
 
     def _process_command(self, cmd: Dict[str, Any]) -> Dict[str, Any]:
-        """Tag a command with the current scope.
+        """Tag a command with its scope and its batch id.
 
-        No names are rewritten. A command's `name`, `layer_name`, and
-        friends carry exactly the string the bundle author wrote; the
-        scope tag is what tells the daemon which namespace to register
-        into and which to resolve against. This is the whole of the
-        executor's interaction with the layer namespace.
+        `_scope` identifies which nested namespace the command belongs
+        to (bundle id, then include path). `_batch_id` identifies the
+        whole batch, and is what a cancel request targets. Both are
+        stripped by the daemon before dispatch; handlers do not see
+        them.
         """
         processed = cmd.copy()
         processed['_scope'] = self._get_current_prefix()
+        processed['_batch_id'] = self.batch_id
         return processed
 
     def _flatten_commands(self, commands: List[Dict], visited: set = None, depth: int = 0) -> List[Dict]:
         """Flatten includes recursively, tagging each command with the
-        scope it belongs to. Names are never mangled: an included
-        command carries the same bare names its author wrote, plus a
-        `_scope` tag identifying which inclusion it came from.
-
-        Cycle protection via `visited` is unchanged from the previous
-        implementation.
-        """
+        scope it belongs to."""
         if visited is None:
             visited = set()
 
@@ -116,7 +104,6 @@ class BatchExecutor:
         return result
 
     def _is_success(self, result: Dict) -> bool:
-        """Check if a command result indicates success"""
         if not result:
             return False
         if result.get('success') is True:
@@ -125,7 +112,72 @@ class BatchExecutor:
             return True
         return False
 
-    def execute(self, batch_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _send_cancel(self) -> None:
+        """Open a fresh connection to the daemon and send comfy_cancel
+        targeted at this batch.
+
+        The batch id is what disambiguates this batch from any other
+        that happens to be running concurrently; the daemon sets only
+        the event registered under that id, so a cancel here does not
+        affect other batches.
+        """
+        cancel_client = KritaClient(
+            host=self.client.host, port=self.client.port,
+        )
+        if not cancel_client.connect():
+            print("  (could not reach daemon to send cancel)")
+            return
+        try:
+            cancel_client.execute("comfy_cancel", batch_id=self.batch_id)
+        except Exception as e:
+            print(f"  (cancel request failed: {e})")
+        finally:
+            cancel_client.close()
+
+    def _drain_until_summary(self, handle_progress: Callable[[int, Dict],
+                                                             None]
+                             ) -> Optional[Dict]:
+        """Continue reading from the client's socket after a cancel."""
+        try:
+            while True:
+                try:
+                    line = self.client._read_line(timeout=5.0)
+                except socket.timeout:
+                    print("  (waiting for the daemon ...)")
+                    continue
+                except ConnectionError:
+                    print("  (daemon closed the connection before "
+                          "sending a summary)")
+                    return None
+
+                if not line:
+                    continue
+
+                try:
+                    msg = json.loads(line.decode('utf-8'))
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = msg.get('type')
+                if msg_type == 'progress':
+                    handle_progress(msg.get('index', 0),
+                                    msg.get('result', {}))
+                elif (msg_type == 'batch_complete'
+                      or msg.get('status') == 'batch_complete'):
+                    return msg
+        except KeyboardInterrupt:
+            print("\nSecond Ctrl+C; exiting without waiting for the "
+                  "daemon.")
+            sys.exit(130)
+
+    def execute(self, batch_data: Dict[str, Any],
+                timeout: float = 60.0) -> List[Dict[str, Any]]:
+        """Run a batch.
+
+        A first Ctrl+C during the batch sends `comfy_cancel` targeted
+        at this batch's id and continues reading the daemon's summary.
+        A second Ctrl+C exits immediately.
+        """
         raw_commands = batch_data.get('commands', [])
 
         self._include_counter = 0
@@ -139,8 +191,6 @@ class BatchExecutor:
 
         total = len(commands)
 
-        # Pre-process every command (tag with scope) and build the
-        # single bundled payload. This is the only thing we send.
         bundled_commands: List[Dict[str, Any]] = []
         original_names: List[Optional[str]] = []
         for cmd in commands:
@@ -158,7 +208,8 @@ class BatchExecutor:
 
         def handle_progress(index: int, result_entry: Dict[str, Any]):
             processed_cmd = bundled_commands[index] if index < len(bundled_commands) else {}
-            params = {k: v for k, v in processed_cmd.items() if k not in ('type', '_scope')}
+            params = {k: v for k, v in processed_cmd.items()
+                      if k not in ('type', '_scope', '_batch_id')}
             cmd_type = result_entry.get('command', processed_cmd.get('type'))
             is_success = result_entry.get('status') == 'success'
 
@@ -180,7 +231,16 @@ class BatchExecutor:
             for callback in self.callbacks:
                 callback(index + 1, total, cmd_type, result_data)
 
-        response = self.client.send_batch(payload, on_progress=handle_progress)
+        response = None
+        try:
+            response = self.client.send_batch(
+                payload, on_progress=handle_progress, timeout=timeout,
+            )
+        except KeyboardInterrupt:
+            print("\nCancellation requested.")
+            self._send_cancel()
+            print("  Waiting for the daemon to wind down the batch ...")
+            response = self._drain_until_summary(handle_progress)
 
         if response and not results:
             for r in response.get('results', []):

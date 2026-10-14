@@ -17,22 +17,15 @@ summaries (parameters, named-layer requirements, canvas/selection use).
 `source` is "file" when loaded via `comfy_load`, "browser" when a graph
 arrived over the publish bus. `signature` is a hash of the workflow's
 interface — the sorted names of its ETN_Parameter nodes and its
-ETN_KritaOutput nodes — and it is what a caller uses to recognize the
-same workflow across a browser reload, since the publisher name in the
-publish-bus message is a fixed string that does not carry the workflow's
-filename.
+ETN_KritaOutput nodes.
 
 Layer aliases
 =============
 A workflow that uses `ETN_KritaMaskLayer` / `ETN_KritaImageLayer` names
-a layer in the document by a string. A document may not have a layer
-with that exact name. Rather than require the user to rename their
-document, the handler keeps a per-run map from the workflow's declared
-names to actual document names, set by `comfy_bind_layer_alias`. The
-map is consulted when reading the layer out of the document; the
-workflow graph is not touched.
-
-Aliases are cleared by `comfy_load`, matching how params are cleared.
+a layer in the document by a string. The handler keeps a per-run map
+from the workflow's declared names to actual document names, set by
+`comfy_bind_layer_alias`. The map is consulted when reading the layer
+out of the document; the workflow graph is not touched.
 
 Output nodes
 ============
@@ -40,9 +33,77 @@ A workflow may contain more than one ETN_KritaOutput node. Each fires
 its own `executed` event; the client records which event produced each
 image; this handler groups images by that event and pastes each group
 as its own layer (or its own animation, or its own batch of layers).
-A `--output_name` argument on `comfy_generate` and `comfy_wait`
-restricts the paste to a single output node whose `name` widget
-matches.
+
+Batch generation
+================
+`comfy_generate` accepts `--count N` and `--seed S`. When N > 1, the
+handler runs two phases:
+
+  Phase 1 (prepare). For each run, it reads the pixels the workflow
+  needs, rewrites the graph with the run's seed, and uploads every
+  image blob to ComfyUI. Nothing is submitted yet.
+
+  Phase 2 (collect). The prepared graphs are submitted back to back on
+  one WebSocket. As each prompt completes, the client invokes a
+  callback that pastes its result into the document immediately.
+
+Concurrent batches
+==================
+Multiple batches can run at once, each started by a different panel
+or CLI invocation. Their phases may interleave: phase 1 of batch B can
+run while phase 2 of batch A holds the client lock. The client's
+single-flight lock guarantees only one phase 2 is on ComfyUI at a
+time, so the ComfyUI-side work is serialized; the preparation work
+(pixel reads, graph rewrites) is CPU-bound and does not contend.
+
+Cancellation
+============
+Each batch registers a `threading.Event` in `self._cancel_events`,
+keyed by the batch id. `comfy_cancel --batch_id X` sets only X's
+event; `comfy_cancel` with no id sets all of them. A panel's Ctrl+C
+handler sends its own batch id, so cancelling one batch leaves any
+concurrently-running batch untouched.
+
+Both phases observe the batch's own event:
+
+  Phase 1 checks it at the top of each iteration. Once set, the
+  remaining runs are marked cancelled and phase 1 stops.
+
+  Phase 2 passes the event's `is_set` to `client.generate_batch` as
+  `should_stop`. The batch loop checks it at the top of every read
+  iteration. Once set, every prompt that has not yet completed is
+  marked cancelled, ComfyUI is asked to interrupt the current prompt
+  and drop the queued ones, and the batch returns.
+
+`comfy_cancel` never touches ComfyUI directly for a batch cancel: it
+just sets the flag, and the batch loop calls `interrupt` /
+`cancel_queued` when it notices. This is what keeps two batches from
+interfering with each other's ComfyUI-side work. For async generates
+(`comfy_generate_async` + `comfy_wait`), which are not batch-tracked,
+`comfy_cancel` without a batch id calls `interrupt` itself.
+
+Cancel is best-effort, not transactional: layers already pasted stay
+in the document. Undo is the user's responsibility.
+
+Document lifetime
+=================
+Krita recreates the Python `Document` wrapper for the same underlying
+document across certain operations, and it also caches stale wrappers
+for `Krita.instance().activeDocument()` after those recreations. A
+`Document` reference obtained before such an event may point at a
+deleted C++ object and raise "wrapped C/C++ object of type Document has
+been deleted" on the next method call.
+
+The batch holds a document reference for the entire duration of phase
+2. Because phase 2 includes pastes that call `refreshProjection`, the
+reference can become stale between runs. The paste callback re-resolves
+a live document from the (fileName, name) key captured at prepare
+time, falling back to the captured reference only if the fresh lookup
+fails.
+
+`comfy_generate` itself is a thin wrapper around `_comfy_generate_impl`.
+The wrapper catches any exception the implementation raises, prints its
+full traceback to stdout, and returns an ordinary error response.
 
 Paths
 =====
@@ -51,11 +112,6 @@ The panel script and its data live under `<repo>/recipes/comfy_panel/`:
     <repo>/recipes/comfy_panel/workflows/*.json     workflow definitions
     <repo>/recipes/comfy_panel/panel_configs/*.toml panel configs
     <repo>/recipes/comfy_panel/history/*.json       generation records
-
-Workflow definitions are only present when the user has chosen to
-inject a graph from disk rather than follow the browser. The panel
-configs and the history directory are always populated by the panel
-and the daemon respectively.
 
 Watcher
 =======
@@ -78,10 +134,11 @@ Command surface
                            --context entire_image|automatic|mask_bounds
                            --padding <int>
     comfy_generate         --timeout <s>? --output_name <n>?
+                           --count <n>? --seed <s>?
     comfy_generate_async
     comfy_wait             --prompt_id <id> --timeout <s>?
                            --output_name <n>?
-    comfy_cancel
+    comfy_cancel           --batch_id <id>?
     comfy_paste_last       --name? --blend_mode? --output_name?
     comfy_history          --limit <n>?
 
@@ -108,6 +165,7 @@ from krita import Krita
 
 from ..decorators import command, AutoDispatchHandler
 from ..utils.comfyui_client import (
+    CANCELLED,
     ComfyCancelled,
     ComfyClient,
     ComfyError,
@@ -133,15 +191,6 @@ from ..utils.comfyui_tooling import (
 # ============================================================================
 #  Paths
 # ============================================================================
-#
-# The handler lives at <repo>/kritomatic_daemon/handlers/comfyui.py. The
-# panel script and its data live under <repo>/recipes/comfy_panel/. The
-# three directories under it are:
-#
-#     workflows/        JSON workflow definitions; only present when the
-#                       user has chosen to inject a graph from disk
-#     panel_configs/    the .toml files the panel writes and the user edits
-#     history/          one JSON record per generation
 
 _HANDLER_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _HANDLER_DIR.parent.parent
@@ -151,6 +200,10 @@ _HISTORY_DIR = _PANEL_DIR / "history"
 
 _WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
 _HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+_SEED_PARAMETER_NAME = "seed"
+_CANVAS_SEED_SLOT = 3
 
 
 # ============================================================================
@@ -219,6 +272,34 @@ def _extract_canvas_info(graph: dict) -> dict:
     }
 
 
+def _canvas_seed_is_wired(graph: dict) -> bool:
+    """True iff any node consumes the ETN_KritaCanvas seed output."""
+    canvas_ids = {
+        nid for nid, n in graph.items()
+        if n.get("class_type") == "ETN_KritaCanvas"
+    }
+    if not canvas_ids:
+        return False
+
+    def scan(value: Any) -> bool:
+        if (isinstance(value, list) and len(value) == 2
+                and isinstance(value[0], str)
+                and isinstance(value[1], int)
+                and not isinstance(value[1], bool)
+                and value[0] in canvas_ids
+                and value[1] == _CANVAS_SEED_SLOT):
+            return True
+        if isinstance(value, list):
+            return any(scan(x) for x in value)
+        return False
+
+    for node in graph.values():
+        for v in (node.get("inputs") or {}).values():
+            if scan(v):
+                return True
+    return False
+
+
 def _compute_signature(graph: dict) -> str:
     """Stable hash of a workflow's interface."""
     params = sorted(
@@ -261,6 +342,7 @@ class _PendingJob:
         self.result: Optional[GenerationResult] = None
         self.error: Optional[Exception] = None
         self.document = None
+        self.document_key: tuple[str, str] = ("", "")
         self.started_at = time.time()
         self.warnings: list[str] = []
 
@@ -279,6 +361,13 @@ class ComfyUIHandler(AutoDispatchHandler):
         self._port: int = 8188
         self._client: Optional[ComfyClient] = None
         self._object_info: Optional[dict] = None
+
+        # Cancel events, one per active batch, keyed by the batch id
+        # the caller supplied. Guarded by `_cancel_events_lock` because
+        # batches run on their own handler threads and `comfy_cancel`
+        # runs on yet another one.
+        self._cancel_events: dict[str, threading.Event] = {}
+        self._cancel_events_lock = threading.Lock()
 
         self._active_workflow_name: Optional[str] = None
         self._active_workflow_graph: Optional[dict] = None
@@ -386,6 +475,7 @@ class ComfyUIHandler(AutoDispatchHandler):
             info = self._client.object_info()
         except ComfyError as e:
             self._object_info = None
+            self._client = None
             return {"success": False,
                     "message": f"Could not reach ComfyUI at "
                                f"{host}:{port}: {e}"}
@@ -496,6 +586,8 @@ class ComfyUIHandler(AutoDispatchHandler):
         args={},
     )
     def comfy_status(self, params):
+        with self._cancel_events_lock:
+            active_batches = sorted(self._cancel_events.keys())
         return {
             "success": True,
             "message": "ComfyUI handler state",
@@ -512,6 +604,10 @@ class ComfyUIHandler(AutoDispatchHandler):
                     dict(self._active_workflow_layers),
                 "workflow_canvas_info":
                     dict(self._active_workflow_canvas),
+                "workflow_seed_wired": (
+                    _canvas_seed_is_wired(self._active_workflow_graph or {})
+                ),
+                "active_batches": active_batches,
                 "watching": (
                     self._client.is_watching()
                     if self._client is not None else False
@@ -760,42 +856,414 @@ class ComfyUIHandler(AutoDispatchHandler):
 
     @command(
         category="comfyui",
-        help_text="Run the active workflow: read pixels, rewrite the "
-                  "graph, submit to ComfyUI, wait for the result, paste "
-                  "it back as new layer(s). When the workflow has "
-                  "multiple ETN_KritaOutput nodes, every one is pasted; "
-                  "use --output_name to restrict to a single one.",
+        help_text="Run the active workflow. With --count N, run it N "
+                  "times with consecutive seeds. All runs are prepared "
+                  "up front and submitted back to back; each paste "
+                  "happens as soon as its image arrives. All runs share "
+                  "one history entry.",
         args={
             "--timeout": {"type": "float", "default": 55.0,
-                          "help": "Seconds to wait for ComfyUI."},
+                          "help": "Seconds to wait per run for ComfyUI."},
             "--output_name": {"type": "str", "required": False,
                               "help": "Paste only the ETN_KritaOutput "
                                       "node whose `name` widget matches "
-                                      "this value. Omit to paste every "
-                                      "output node's contribution."},
+                                      "this value."},
+            "--count": {"type": "int", "default": 1,
+                        "help": "Number of generations to run."},
+            "--seed": {"type": "int", "required": False,
+                       "help": "Base seed. Run i uses base+i. Omit for "
+                               "a random base."},
         },
     )
     def comfy_generate(self, params):
-        timeout = float(params.get("timeout", 55.0))
-        output_name = params.get("output_name") or None
-        prompt_id, error = self._queue_generate()
-        if error is not None:
-            return error
-
-        pending = self._pending[prompt_id]
-        completed = pending.event.wait(timeout=timeout)
-        if not completed:
+        """Thin wrapper. Any exception the implementation raises is
+        caught here and returned as a normal error response, with a
+        full traceback printed to stdout so the source is visible in
+        Krita's console.
+        """
+        try:
+            return self._comfy_generate_impl(params)
+        except Exception as e:
+            import traceback
+            print("[comfyui] comfy_generate raised:", flush=True)
+            traceback.print_exc()
             return {
                 "success": False,
-                "message": f"Generation {prompt_id} did not complete "
-                           f"within {timeout}s. It may still finish on "
-                           f"the ComfyUI side; use comfy_wait with the "
-                           f"same prompt id to retrieve it later.",
-                "data": {"prompt_id": prompt_id},
+                "message": f"comfy_generate raised: {e}",
+                "data": {},
             }
 
-        return self._finish_pending(prompt_id, paste=True,
-                                    output_name=output_name)
+    def _comfy_generate_impl(self, params):
+        requested_count = max(1, int(params.get("count", 1)))
+        count = requested_count
+        timeout = float(params.get("timeout", 55.0))
+        output_name = params.get("output_name") or None
+
+        raw_seed = params.get("seed")
+        if raw_seed in (None, ""):
+            base_seed = int(time.time()) & 0xFFFFFFFF
+        else:
+            try:
+                base_seed = int(raw_seed) & 0xFFFFFFFF
+            except (TypeError, ValueError):
+                base_seed = int(time.time()) & 0xFFFFFFFF
+
+        # Identify this batch. The executor tags every command with
+        # `_batch_id`; for a direct CLI invocation that has none, we
+        # generate one so the batch still has a stable identity in
+        # `_cancel_events` and in the history record.
+        batch_id = params.get("_batch_id") or str(uuid.uuid4())
+
+        # Per-batch cancel event. Registered before any work so
+        # `comfy_cancel --batch_id X` can find it even while phase 1
+        # is running.
+        cancel_event = threading.Event()
+        with self._cancel_events_lock:
+            self._cancel_events[batch_id] = cancel_event
+
+        try:
+            warnings: list[str] = []
+
+            graph = self._active_workflow_graph
+            if graph is None:
+                return {"success": False,
+                        "message": "No workflow loaded. Run comfy_load or "
+                                   "publish a graph from ComfyUI's browser.",
+                        "data": {"batch_id": batch_id}}
+
+            workflow_name = self._active_workflow_name or "(unnamed)"
+
+            if self._client is None:
+                return {"success": False,
+                        "message": "Not connected; run comfy_connect first",
+                        "data": {"batch_id": batch_id}}
+
+            has_seed_param = any(
+                p["name"] == _SEED_PARAMETER_NAME
+                for p in self._active_workflow_parameters
+            )
+            has_seed_wire = _canvas_seed_is_wired(graph)
+            can_batch = has_seed_param or has_seed_wire
+
+            if count > 1 and not can_batch:
+                warnings.append(
+                    f"count={requested_count} clamped to 1: the active "
+                    f"workflow does not vary its seed between runs. Wire "
+                    f"either an ETN_Parameter named {_SEED_PARAMETER_NAME!r} "
+                    f"or the ETN_KritaCanvas 'seed' output to the sampler's "
+                    f"seed input to enable batch generation."
+                )
+                count = 1
+
+            batch_started = time.time()
+            base_params = dict(self._params)
+            original_seed = self._params.get(_SEED_PARAMETER_NAME)
+
+            # ---- Phase 1: prepare every run. ----
+
+            prepared: list[dict] = []
+            run_records: list[dict] = []
+
+            for i in range(count):
+                seed_i = (base_seed + i) & 0xFFFFFFFF
+
+                if cancel_event.is_set():
+                    for j in range(i, count):
+                        seed_j = (base_seed + j) & 0xFFFFFFFF
+                        run_records.append({
+                            "seed": seed_j, "prompt_id": None,
+                            "status": "cancelled",
+                            "error": "cancelled before submission",
+                        })
+                    warnings.append("batch cancelled during preparation")
+                    break
+
+                if has_seed_param:
+                    self._params[_SEED_PARAMETER_NAME] = seed_i
+
+                print(f"[comfyui] batch {i + 1}/{count}: preparing seed "
+                      f"{seed_i}", flush=True)
+
+                doc = _get_live_active_document()
+                if doc is None:
+                    run_records.append({
+                        "seed": seed_i, "prompt_id": None,
+                        "status": "error",
+                        "error": "no active document",
+                    })
+                    continue
+
+                ok, msg = _check_color_mode(doc)
+                if not ok:
+                    run_records.append({
+                        "seed": seed_i, "prompt_id": None,
+                        "status": "error", "error": msg,
+                    })
+                    continue
+
+                try:
+                    reqs = scan_requirements(graph)
+                    resources = build_krita_resources(
+                        doc, reqs,
+                        selection_context=self._selection_context,
+                        selection_padding=self._selection_padding,
+                        layer_aliases=dict(self._layer_aliases),
+                    )
+                except (ValueError, ExpansionError) as e:
+                    run_records.append({
+                        "seed": seed_i, "prompt_id": None,
+                        "status": "error", "error": str(e),
+                    })
+                    continue
+
+                try:
+                    expansion = expand_custom(
+                        graph, self._params, resources,
+                        seed=seed_i,
+                        node_defs=self._object_info,
+                    )
+                except ExpansionError as e:
+                    run_records.append({
+                        "seed": seed_i, "prompt_id": None,
+                        "status": "error",
+                        "error": f"Workflow rewrite failed: {e}",
+                    })
+                    continue
+
+                upload_error = None
+                for h, data in expansion.image_data.items():
+                    try:
+                        self._client.upload_image(h, data)
+                    except ComfyError as e:
+                        upload_error = f"image upload failed: {e}"
+                        break
+                if upload_error is not None:
+                    run_records.append({
+                        "seed": seed_i, "prompt_id": None,
+                        "status": "error", "error": upload_error,
+                    })
+                    continue
+
+                prepared.append({
+                    "index": i,
+                    "seed": seed_i,
+                    "graph": expansion.graph,
+                    "document": doc,
+                    "document_key": _capture_document_key(doc),
+                })
+
+            if has_seed_param:
+                if original_seed is None:
+                    self._params.pop(_SEED_PARAMETER_NAME, None)
+                else:
+                    self._params[_SEED_PARAMETER_NAME] = original_seed
+
+            # If the cancel fired during phase 1, do not submit anything.
+            if cancel_event.is_set() and prepared:
+                for p in prepared:
+                    run_records.append({
+                        "seed": p["seed"], "prompt_id": None,
+                        "status": "cancelled",
+                        "error": "cancelled before submission",
+                    })
+                prepared = []
+                if "batch cancelled during preparation" not in warnings:
+                    warnings.append("batch cancelled during preparation")
+
+            # ---- Phase 2: submit and collect. ----
+
+            total_layers = 0
+
+            if prepared:
+                prepared_graphs = [p["graph"] for p in prepared]
+                batch_timeout = timeout * count + 60.0
+
+                def on_result(index: int,
+                              result: GenerationResult) -> None:
+                    p = prepared[index]
+                    seed_i = p["seed"]
+
+                    if result.error == CANCELLED:
+                        run_records.append({
+                            "seed": seed_i,
+                            "prompt_id": result.prompt_id,
+                            "status": "cancelled",
+                            "error": "cancelled mid-batch",
+                        })
+                        print(f"[comfyui] batch {index + 1}/{count}: "
+                              f"cancelled", flush=True)
+                        return
+
+                    if result.error:
+                        run_records.append({
+                            "seed": seed_i,
+                            "prompt_id": result.prompt_id,
+                            "status": "error",
+                            "error": result.error,
+                        })
+                        print(f"[comfyui] batch {index + 1}/{count}: "
+                              f"failed: {result.error}", flush=True)
+                        return
+
+                    doc = _resolve_live_document_for_prepared(p)
+                    if doc is None:
+                        run_records.append({
+                            "seed": seed_i,
+                            "prompt_id": result.prompt_id,
+                            "status": "skipped",
+                            "error": "target document not found",
+                        })
+                        print(f"[comfyui] batch {index + 1}/{count}: "
+                              f"skipped (no target document)", flush=True)
+                        return
+
+                    try:
+                        paste_result = self._paste_result(
+                            doc, result,
+                            blend_mode="normal",
+                            output_name=output_name,
+                            seed_suffix=seed_i if count > 1 else None,
+                        )
+                    except Exception as e:
+                        import traceback
+                        print(f"[comfyui] batch {index + 1}/{count}: "
+                              f"paste raised:", flush=True)
+                        traceback.print_exc()
+                        run_records.append({
+                            "seed": seed_i,
+                            "prompt_id": result.prompt_id,
+                            "status": "paste_failed",
+                            "error": f"paste raised: {e}",
+                        })
+                        return
+
+                    if not paste_result.get("success"):
+                        run_records.append({
+                            "seed": seed_i,
+                            "prompt_id": result.prompt_id,
+                            "status": "paste_failed",
+                            "error": paste_result.get("message",
+                                                      "paste failed"),
+                        })
+                        print(f"[comfyui] batch {index + 1}/{count}: "
+                              f"paste failed: "
+                              f"{paste_result.get('message')}", flush=True)
+                        return
+
+                    data = paste_result.get("data", {}) or {}
+                    layer_names = list(data.get("layer_names", []))
+                    run_records.append({
+                        "seed": seed_i,
+                        "prompt_id": result.prompt_id,
+                        "status": "success",
+                        "image_count": len(result.images),
+                        "output_count": data.get("output_count", 0),
+                        "layer_names": layer_names,
+                    })
+                    print(f"[comfyui] batch {index + 1}/{count}: pasted "
+                          f"{len(layer_names)} layer(s) "
+                          f"({', '.join(layer_names) or 'none'})",
+                          flush=True)
+
+                    self._last_result = result
+                    self._last_document = doc
+
+                try:
+                    self._client.generate_batch(
+                        prepared_graphs,
+                        timeout=batch_timeout,
+                        on_result=on_result,
+                        should_stop=cancel_event.is_set,
+                    )
+                except ComfyError as e:
+                    recorded_seeds = {r.get("seed") for r in run_records}
+                    for p in prepared:
+                        if p["seed"] not in recorded_seeds:
+                            run_records.append({
+                                "seed": p["seed"],
+                                "prompt_id": None,
+                                "status": "error",
+                                "error": f"batch transport failed: {e}",
+                            })
+
+                total_layers = sum(
+                    len(r.get("layer_names", [])) for r in run_records
+                )
+
+            # ---- One history entry for the whole batch. ----
+
+            self._write_history_record(
+                batch_id=batch_id,
+                base_seed=base_seed,
+                base_params=base_params,
+                run_records=run_records,
+                warnings=warnings,
+                duration_s=time.time() - batch_started,
+            )
+
+            # ---- Build the response. ----
+
+            successful = sum(1 for r in run_records
+                             if r["status"] == "success")
+            cancelled = sum(1 for r in run_records
+                            if r["status"] == "cancelled")
+            failed = len(run_records) - successful - cancelled
+
+            response_data = {
+                "batch_id": batch_id,
+                "workflow": workflow_name,
+                "count": count,
+                "requested_count": requested_count,
+                "successful": successful,
+                "failed": failed,
+                "cancelled": cancelled,
+                "base_seed": base_seed,
+                "layer_count": total_layers,
+                "layer_names": [
+                    name for r in run_records
+                    for name in r.get("layer_names", [])
+                ],
+                "runs": [_public_run_record(r) for r in run_records],
+            }
+            if warnings:
+                response_data["warnings"] = warnings
+
+            if successful == 0:
+                if cancelled == len(run_records) and cancelled > 0:
+                    msg = (f"Batch cancelled "
+                           f"({cancelled} run(s) not completed)")
+                else:
+                    first_error = next(
+                        (r.get("error") for r in run_records
+                         if r.get("error")
+                         and r["status"] != "cancelled"),
+                        "no successful runs",
+                    )
+                    msg = f"Generation failed: {first_error}"
+                if warnings:
+                    msg += " — " + "; ".join(warnings)
+                return {"success": False,
+                        "message": msg,
+                        "data": response_data}
+
+            if requested_count == 1:
+                msg = f"Pasted {total_layers} layer(s)"
+            else:
+                parts = [f"{successful} succeeded"]
+                if failed:
+                    parts.append(f"{failed} failed")
+                if cancelled:
+                    parts.append(f"{cancelled} cancelled")
+                msg = (f"Batch of {requested_count}: " + ", ".join(parts)
+                       + f"; pasted {total_layers} layer(s)")
+            if warnings:
+                msg += " — " + "; ".join(warnings)
+
+            return {"success": True, "message": msg, "data": response_data}
+
+        finally:
+            with self._cancel_events_lock:
+                self._cancel_events.pop(batch_id, None)
 
     @command(
         category="comfyui",
@@ -841,8 +1309,7 @@ class ComfyUIHandler(AutoDispatchHandler):
                                f"may have been cleared by a daemon "
                                f"reload."}
 
-        completed = pending.event.wait(timeout=timeout)
-        if not completed:
+        if not pending.event.wait(timeout=timeout):
             return {"success": False,
                     "message": f"Generation {prompt_id} still running "
                                f"after {timeout}s"}
@@ -852,17 +1319,76 @@ class ComfyUIHandler(AutoDispatchHandler):
 
     @command(
         category="comfyui",
-        help_text="Interrupt the currently-executing prompt on ComfyUI "
-                  "and clear any queued ones.",
-        args={},
+        help_text="Cancel one or more running batches. With --batch_id, "
+                  "targets a single batch; without, cancels every active "
+                  "batch and any async generates.",
+        args={
+            "--batch_id": {"type": "str", "required": False,
+                           "help": "The batch id to cancel. Omit to "
+                                   "cancel all active batches."},
+        },
     )
     def comfy_cancel(self, params):
-        if self._client is None:
-            return {"success": False, "message": "Not connected"}
-        self._client.interrupt()
-        if self._pending:
-            self._client.cancel_queued(list(self._pending.keys()))
-        return {"success": True, "message": "Cancel requested"}
+        batch_id = params.get("batch_id") or None
+
+        with self._cancel_events_lock:
+            if batch_id:
+                event = self._cancel_events.get(batch_id)
+                if event is None:
+                    return {
+                        "success": False,
+                        "message": (f"No active batch with id "
+                                    f"{batch_id!r}"),
+                        "data": {
+                            "active_batches": sorted(
+                                self._cancel_events.keys()
+                            ),
+                        },
+                    }
+                event.set()
+                return {
+                    "success": True,
+                    "message": f"Cancel requested for batch {batch_id}",
+                    "data": {"batch_id": batch_id},
+                }
+
+            # No batch id: cancel every active batch.
+            events = list(self._cancel_events.values())
+            active = sorted(self._cancel_events.keys())
+
+        for e in events:
+            e.set()
+
+        # Async generates are not batch-tracked (they go through
+        # `_queue_generate` and do not register a cancel event).
+        # Interrupt ComfyUI directly for those. This is a no-op when
+        # no async generates are pending, so a batch-only cancel does
+        # not touch ComfyUI from here.
+        async_interrupted = False
+        if self._client is not None and self._pending:
+            try:
+                self._client.interrupt()
+                self._client.cancel_queued(list(self._pending.keys()))
+                async_interrupted = True
+            except ComfyError:
+                pass
+
+        parts = []
+        if events:
+            parts.append(f"{len(events)} batch(es)")
+        if async_interrupted:
+            parts.append(f"{len(self._pending)} async generate(s)")
+        if parts:
+            msg = "Cancel requested for " + " and ".join(parts)
+        else:
+            msg = "Cancel requested (nothing was running)"
+
+        return {
+            "success": True,
+            "message": msg,
+            "data": {"batches": active,
+                     "async": list(self._pending.keys())},
+        }
 
     # ------------------------------------------------------------------
     #  Result handling
@@ -926,75 +1452,88 @@ class ComfyUIHandler(AutoDispatchHandler):
         }
 
     # ------------------------------------------------------------------
-    #  Internal: generate pipeline
+    #  Internal: async generate pipeline (single prompt)
     # ------------------------------------------------------------------
+    #
+    # The batch path bypasses this entirely; it uses client.generate_batch
+    # directly. This remains for comfy_generate_async + comfy_wait, which
+    # are single-prompt by design.
 
-    def _queue_generate(self) -> tuple[Optional[str], Optional[dict]]:
+    def _queue_generate(self,
+                        seed: Optional[int] = None,
+                        ) -> tuple[Optional[str], Optional[dict]]:
         """Validate state, read pixels, rewrite the graph, and start the
         worker thread. Returns (prompt_id, None) on success, or
         (None, error_dict) on failure.
         """
-        workflow = self._active_workflow_graph
-        if workflow is None:
-            return None, {"success": False,
-                          "message": "No workflow loaded. Run comfy_load "
-                                     "or publish a graph from ComfyUI's "
-                                     "browser."}
-        workflow_name = self._active_workflow_name or "(unnamed)"
-
-        if self._client is None:
-            return None, {"success": False,
-                          "message": "Not connected; run comfy_connect first"}
-
-        doc = Krita.instance().activeDocument()
-        if doc is None:
-            return None, {"success": False,
-                          "message": "No active document"}
-
-        ok, msg = _check_color_mode(doc)
-        if not ok:
-            return None, {"success": False, "message": msg}
-
         try:
-            reqs = scan_requirements(workflow)
-            resources = build_krita_resources(
-                doc, reqs,
-                selection_context=self._selection_context,
-                selection_padding=self._selection_padding,
-                layer_aliases=dict(self._layer_aliases),
-            )
-        except (ValueError, ExpansionError) as e:
-            return None, {"success": False, "message": str(e)}
+            workflow = self._active_workflow_graph
+            if workflow is None:
+                return None, {"success": False,
+                              "message": "No workflow loaded. Run "
+                                         "comfy_load or publish a graph "
+                                         "from ComfyUI's browser."}
+            workflow_name = self._active_workflow_name or "(unnamed)"
 
-        seed = int(time.time()) & 0xFFFFFFFF
-        try:
-            expansion = expand_custom(
-                workflow, self._params, resources,
-                seed=seed,
-                node_defs=self._object_info,
+            if self._client is None:
+                return None, {"success": False,
+                              "message": "Not connected; run "
+                                         "comfy_connect first"}
+
+            doc = _get_live_active_document()
+            if doc is None:
+                return None, {"success": False,
+                              "message": "No active document"}
+
+            ok, msg = _check_color_mode(doc)
+            if not ok:
+                return None, {"success": False, "message": msg}
+
+            try:
+                reqs = scan_requirements(workflow)
+                resources = build_krita_resources(
+                    doc, reqs,
+                    selection_context=self._selection_context,
+                    selection_padding=self._selection_padding,
+                    layer_aliases=dict(self._layer_aliases),
+                )
+            except (ValueError, ExpansionError) as e:
+                return None, {"success": False, "message": str(e)}
+
+            if seed is None:
+                seed = int(time.time()) & 0xFFFFFFFF
+            try:
+                expansion = expand_custom(
+                    workflow, self._params, resources,
+                    seed=seed,
+                    node_defs=self._object_info,
+                )
+            except ExpansionError as e:
+                return None, {"success": False,
+                              "message": f"Workflow rewrite failed: {e}"}
+
+            prompt_id = str(uuid.uuid4())
+            pending = _PendingJob(
+                prompt_id, workflow_name,
+                dict(expansion.parameters), seed,
             )
-        except ExpansionError as e:
+            pending.document = doc
+            pending.document_key = _capture_document_key(doc)
+            pending.warnings = list(expansion.warnings)
+            self._pending[prompt_id] = pending
+
+            thread = threading.Thread(
+                target=self._run_generation,
+                args=(pending, expansion),
+                name=f"comfy-gen-{prompt_id[:8]}",
+                daemon=True,
+            )
+            thread.start()
+
+            return prompt_id, None
+        except Exception as e:
             return None, {"success": False,
-                          "message": f"Workflow rewrite failed: {e}"}
-
-        prompt_id = str(uuid.uuid4())
-        pending = _PendingJob(
-            prompt_id, workflow_name,
-            dict(expansion.parameters), seed,
-        )
-        pending.document = doc
-        pending.warnings = list(expansion.warnings)
-        self._pending[prompt_id] = pending
-
-        thread = threading.Thread(
-            target=self._run_generation,
-            args=(pending, expansion),
-            name=f"comfy-gen-{prompt_id[:8]}",
-            daemon=True,
-        )
-        thread.start()
-
-        return prompt_id, None
+                          "message": f"queue setup failed: {e}"}
 
     def _run_generation(self, pending: _PendingJob, expansion) -> None:
         """Worker thread body: upload images, submit, wait, store result."""
@@ -1017,13 +1556,45 @@ class ComfyUIHandler(AutoDispatchHandler):
 
     def _finish_pending(self, prompt_id: str, paste: bool,
                         output_name: Optional[str] = None) -> dict:
-        """Collect a completed pending job, record history, paste."""
+        """Collect a completed pending job, record history, paste.
+
+        Used by the async path (`comfy_generate_async` + `comfy_wait`).
+        """
         pending = self._pending.pop(prompt_id, None)
         if pending is None:
             return {"success": False,
                     "message": f"No pending job {prompt_id!r}"}
 
+        run_record: dict = {
+            "seed": pending.seed,
+            "prompt_id": prompt_id,
+            "status": "pending",
+        }
+
+        def finalize(status: str, error: Optional[str] = None,
+                     layer_names: Optional[list] = None,
+                     image_count: Optional[int] = None,
+                     output_count: Optional[int] = None) -> None:
+            run_record["status"] = status
+            if error:
+                run_record["error"] = error
+            if layer_names is not None:
+                run_record["layer_names"] = layer_names
+            if image_count is not None:
+                run_record["image_count"] = image_count
+            if output_count is not None:
+                run_record["output_count"] = output_count
+            self._write_history_record(
+                batch_id=prompt_id,
+                base_seed=pending.seed,
+                base_params={},
+                run_records=[run_record],
+                warnings=[],
+                duration_s=time.time() - pending.started_at,
+            )
+
         if pending.error is not None:
+            finalize("error", error=str(pending.error))
             return {"success": False,
                     "message": f"Generation failed: {pending.error}",
                     "data": {"prompt_id": prompt_id,
@@ -1031,56 +1602,60 @@ class ComfyUIHandler(AutoDispatchHandler):
 
         result = pending.result
         if result is None:
+            finalize("error", error="no result")
             return {"success": False,
                     "message": "Generation completed without a result"}
 
         self._last_result = result
         self._last_document = pending.document
 
-        self._write_history(pending, result)
-
-        response_data = {
-            "prompt_id": prompt_id,
-            "workflow": pending.workflow_name,
-            "image_count": len(result.images),
-            "output_count": (
-                len(set(result.event_index))
-                if result.event_index else len(result.images)
-            ),
-            "texts": [{"name": t.name, "text": t.text}
-                      for t in result.texts],
-        }
-        warnings = list(pending.warnings)
-        warnings.extend(result.warnings)
-        if warnings:
-            response_data["warnings"] = warnings
-
         if not paste:
+            finalize("success", image_count=len(result.images))
             return {"success": True,
                     "message": f"Generation complete "
-                               f"({len(result.images)} image(s) in "
-                               f"{response_data['output_count']} "
-                               f"output(s))",
-                    "data": response_data}
+                               f"({len(result.images)} image(s))",
+                    "data": {"prompt_id": prompt_id,
+                             "workflow": pending.workflow_name}}
 
-        doc = pending.document
-        if doc is None or not _document_is_open(doc):
+        doc = _resolve_live_document_for_pending(pending)
+        if doc is None:
+            finalize("skipped", error="target document not found")
             return {"success": True,
-                    "message": f"Generation complete "
-                               f"({len(result.images)} image(s)), "
-                               f"but the target document was closed",
-                    "data": response_data}
+                    "message": "Generation complete but the target "
+                               "document could not be found",
+                    "data": {"prompt_id": prompt_id,
+                             "workflow": pending.workflow_name}}
 
         paste_result = self._paste_result(
             doc, result,
             blend_mode="normal",
             output_name=output_name,
         )
-        response_data.update(paste_result.get("data", {}))
         if not paste_result.get("success"):
+            finalize("paste_failed",
+                     error=paste_result.get("message", "paste failed"))
             return {"success": False,
-                    "message": paste_result.get("message", "paste failed"),
-                    "data": response_data}
+                    "message": paste_result.get("message", "paste failed")}
+
+        data = paste_result.get("data", {}) or {}
+        finalize("success",
+                 layer_names=list(data.get("layer_names", [])),
+                 image_count=len(result.images),
+                 output_count=data.get("output_count", 0))
+
+        response_data = {
+            "prompt_id": prompt_id,
+            "workflow": pending.workflow_name,
+            "image_count": len(result.images),
+            "output_count": data.get("output_count", 0),
+            "texts": [{"name": t.name, "text": t.text}
+                      for t in result.texts],
+            "layer_names": list(data.get("layer_names", [])),
+        }
+        warnings = list(pending.warnings)
+        warnings.extend(result.warnings)
+        if warnings:
+            response_data["warnings"] = warnings
 
         return {
             "success": True,
@@ -1092,25 +1667,9 @@ class ComfyUIHandler(AutoDispatchHandler):
     def _paste_result(self, doc, result: GenerationResult,
                       name_override: Optional[str] = None,
                       blend_mode: str = "normal",
-                      output_name: Optional[str] = None) -> dict:
-        """Paste every output node's contribution into `doc`.
-
-        Each `executed` event is one ETN_KritaOutput node's contribution:
-        one info dict (its name, offset, batch mode) plus one or more
-        images. The result carries an `event_index` per image so this
-        method can reconstruct those groups.
-
-        Groups are pasted in event order. Within a group:
-
-          * batch_mode "animation" with >1 image: import as an animation.
-          * batch_mode "layers" with >1 image: one layer per image,
-            prefixed "[Layer i] ".
-          * otherwise: one layer with the group's first image.
-
-        `output_name`, when given, restricts the paste to groups whose
-        ETN_KritaOutput node carries that name. The name is the node's
-        own `name` widget, not the layer name the daemon generates.
-        """
+                      output_name: Optional[str] = None,
+                      seed_suffix: Optional[int] = None) -> dict:
+        """Paste every output node's contribution into `doc`."""
         if not result.images:
             return {"success": True, "message": "No images to paste"}
 
@@ -1154,6 +1713,8 @@ class ComfyUIHandler(AutoDispatchHandler):
                 group_name = f"[Generated] {result.prompt_id[:8]}"
             elif not group_name.startswith("["):
                 group_name = f"[Generated] {group_name}"
+            if seed_suffix is not None:
+                group_name = f"{group_name} ({seed_suffix})"
 
             if first_info.resize_canvas and entries:
                 w, h = _png_dimensions(entries[0][0])
@@ -1223,28 +1784,45 @@ class ComfyUIHandler(AutoDispatchHandler):
     #  History
     # ------------------------------------------------------------------
 
-    def _write_history(self, pending: _PendingJob,
-                       result: GenerationResult) -> None:
-        """Write a history entry. Best-effort; failures are silent."""
+    def _write_history_record(self,
+                              batch_id: str,
+                              base_seed: int,
+                              base_params: dict,
+                              run_records: list,
+                              warnings: list,
+                              duration_s: float) -> None:
+        """Write one history record for a batch or a single run."""
         try:
-            entry = {
-                "prompt_id": pending.prompt_id,
-                "workflow": pending.workflow_name,
-                "parameters": pending.params,
-                "seed": pending.seed,
-                "image_count": len(result.images),
-                "output_count": (
-                    len(set(result.event_index))
-                    if result.event_index else len(result.images)
-                ),
-                "texts": [{"name": t.name, "text": t.text}
-                          for t in result.texts],
-                "batch_modes": [i.batch_mode for i in result.infos],
+            runs_summary = []
+            for r in run_records:
+                entry = {
+                    "seed": r.get("seed"),
+                    "prompt_id": r.get("prompt_id"),
+                    "status": r.get("status"),
+                }
+                if r.get("error"):
+                    entry["error"] = r["error"]
+                if r.get("image_count") is not None:
+                    entry["image_count"] = r["image_count"]
+                if r.get("output_count") is not None:
+                    entry["output_count"] = r["output_count"]
+                if r.get("layer_names"):
+                    entry["layer_names"] = list(r["layer_names"])
+                runs_summary.append(entry)
+
+            record = {
+                "batch_id": batch_id,
+                "workflow": self._active_workflow_name,
+                "base_seed": base_seed,
+                "count": len(run_records),
+                "runs": runs_summary,
+                "parameters": dict(base_params),
+                "warnings": list(warnings),
                 "finished": datetime.now(timezone.utc).isoformat(),
-                "duration_s": round(time.time() - pending.started_at, 3),
+                "duration_s": round(duration_s, 3),
             }
-            path = _HISTORY_DIR / f"{pending.prompt_id}.json"
-            path.write_text(json.dumps(entry, indent=2),
+            path = _HISTORY_DIR / f"{batch_id}.json"
+            path.write_text(json.dumps(record, indent=2),
                             encoding="utf-8")
         except Exception:
             pass
@@ -1253,6 +1831,107 @@ class ComfyUIHandler(AutoDispatchHandler):
 # ============================================================================
 #  Helpers
 # ============================================================================
+
+def _public_run_record(r: dict) -> dict:
+    """Strip internal keys (leading underscore) from a run record."""
+    return {k: v for k, v in r.items() if not k.startswith("_")}
+
+
+def _get_live_active_document():
+    """Return the active document as a usable reference, or None."""
+    doc = Krita.instance().activeDocument()
+    if doc is not None:
+        try:
+            _ = doc.width()
+            return doc
+        except Exception:
+            pass
+    try:
+        docs = list(Krita.instance().documents())
+    except Exception:
+        return None
+    for d in docs:
+        try:
+            _ = d.width()
+            return d
+        except Exception:
+            continue
+    return None
+
+
+def _capture_document_key(doc) -> tuple[str, str]:
+    """A stable identifier for a document across object recreation."""
+    try:
+        return (doc.fileName() or "", doc.name() or "")
+    except Exception:
+        return ("", "")
+
+
+def _find_document_by_key(key: tuple[str, str]):
+    """Locate the live Document matching a previously-captured key."""
+    if not key or not any(key):
+        return None
+    try:
+        docs = list(Krita.instance().documents())
+    except Exception:
+        return None
+    fn, name = key
+
+    candidates = []
+    for d in docs:
+        try:
+            if fn and d.fileName() == fn:
+                candidates.append(d)
+        except Exception:
+            continue
+    if not candidates and not fn:
+        for d in docs:
+            try:
+                if name and d.name() == name:
+                    candidates.append(d)
+            except Exception:
+                continue
+
+    for d in candidates:
+        try:
+            _ = d.width()
+            return d
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_live_document_for_prepared(prepared_entry: dict):
+    """Return a usable Document for a phase-2 prepared entry."""
+    key = prepared_entry.get("document_key") or ("", "")
+    fresh = _find_document_by_key(key)
+    if fresh is not None:
+        return fresh
+    doc = prepared_entry.get("document")
+    if doc is not None:
+        try:
+            _ = doc.width()
+            return doc
+        except Exception:
+            pass
+    return None
+
+
+def _resolve_live_document_for_pending(pending):
+    """Return a usable Document for a pending job, or None."""
+    key = getattr(pending, "document_key", ("", ""))
+    fresh = _find_document_by_key(key)
+    if fresh is not None:
+        return fresh
+    doc = getattr(pending, "document", None)
+    if doc is not None:
+        try:
+            _ = doc.width()
+            return doc
+        except Exception:
+            pass
+    return None
+
 
 def _check_color_mode(doc) -> tuple[bool, Optional[str]]:
     """Krita's setPixelData requires RGBA/U8."""

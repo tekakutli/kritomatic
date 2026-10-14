@@ -9,6 +9,7 @@ from kritomatic.helpful_argparse import HelpfulArgumentParser
 from kritomatic.playground_launcher import PLAYGROUNDS
 from kritomatic.xremap_launcher import XREMAP_COMMANDS
 from kritomatic.comfyui_panel.cli import populate_panel_subcommands
+from kritomatic.comfy_convert.cli import populate_convert_args
 
 
 def _escape_help_for_argparse(text):
@@ -168,6 +169,7 @@ class CommandRegistry:
                    '  kritomatic batch validate \'{"commands": [...]}\'\n'
                    '  kritomatic comfyui panel run\n'
                    '  kritomatic comfyui panel preset apply hyper\n'
+                   '  kritomatic comfyui convert workflow.json\n'
                    '  kritomatic text dump --output labels.json\n'
                    '  kritomatic text load --input labels.json\n'
                    '  kritomatic playgrounds board\n'
@@ -410,14 +412,15 @@ class CommandRegistry:
 
                 cmd_parser.set_defaults(func=None)
 
-            # Client-side subtree injected under `comfyui` for `panel`.
-            # The schema does not carry `panel` — it is intercepted in
-            # main.py before the schema parser runs — but the CLI's
-            # `--help` output lists it as a choice on the same
-            # subparsers object, so users see it alongside the schema
-            # commands. `populate_panel_subcommands` is the same
-            # function the runtime entry point uses; the two stay in
-            # sync because there is only one declaration.
+            # Client-side subtrees injected under `comfyui`.  Neither
+            # `panel` nor `convert` is in the schema — both are
+            # intercepted in main.py before the schema parser runs —
+            # but the CLI's `--help` output lists them as choices on
+            # the same subparsers object, so users see them alongside
+            # the schema commands.  `populate_panel_subcommands` and
+            # `populate_convert_args` are the same functions the
+            # runtime entry points use; the menus stay in sync because
+            # there is only one declaration.
             if category == 'comfyui':
                 panel_parser = cmd_subparsers.add_parser(
                     'panel',
@@ -430,6 +433,15 @@ class CommandRegistry:
                     required=True, help='Panel commands',
                 )
                 populate_panel_subcommands(panel_sub)
+
+                convert_parser = cmd_subparsers.add_parser(
+                    'convert',
+                    help=_escape_help_for_argparse(
+                        'Convert a ComfyUI UI-format workflow to API '
+                        'format'
+                    ),
+                )
+                populate_convert_args(convert_parser)
 
         return parser
 

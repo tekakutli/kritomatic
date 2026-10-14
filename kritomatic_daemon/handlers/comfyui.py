@@ -958,11 +958,13 @@ class ComfyUIHandler(AutoDispatchHandler):
     @command(
         category="comfyui",
         help_text="Load a workflow by slug from the panel's workflows "
-                  "directory. Clears any parameters and layer aliases "
-                  "set by a previous workflow.",
+                  "directory, or by absolute filesystem path. Clears "
+                  "any parameters and layer aliases set by a previous "
+                  "workflow.",
         args={
             "--name": {"type": "str", "required": True,
-                       "help": "Workflow slug"},
+                       "help": "Workflow slug, or an absolute path to "
+                               "a .json file."},
         },
     )
     def comfy_load(self, params):
@@ -970,50 +972,79 @@ class ComfyUIHandler(AutoDispatchHandler):
         if not name:
             return {"success": False, "message": "No workflow name given"}
 
-        path = _WORKFLOW_DIR / f"{name}.json"
-        if not path.is_file():
-            available = sorted(p.stem for p in _WORKFLOW_DIR.glob("*.json"))
-            return {
-                "success": False,
-                "message": f"Workflow {name!r} not found in "
-                           f"{_WORKFLOW_DIR}",
-                "data": {"available": available},
-            }
+        # A name that starts with '/' or '~' is a filesystem path, not
+        # a slug. The CLI always sends an absolute path when the user
+        # passed a path, so '/'-prefixed is the common case; '~' is
+        # accepted for direct daemon invocations. Slug names never
+        # contain a slash, so the two forms cannot collide.
+        is_path = name.startswith("/") or name.startswith("~")
+
+        if is_path:
+            path = Path(name).expanduser()
+            if not path.is_absolute():
+                return {"success": False,
+                        "message": f"Path must be absolute: {name!r}"}
+            if not path.is_file():
+                return {"success": False,
+                        "message": f"Workflow file not found: {path}"}
+            display_name = path.stem
+        else:
+            path = _WORKFLOW_DIR / f"{name}.json"
+            if not path.is_file():
+                available = sorted(
+                    p.stem for p in _WORKFLOW_DIR.glob("*.json")
+                )
+                return {
+                    "success": False,
+                    "message": f"Workflow {name!r} not found in "
+                               f"{_WORKFLOW_DIR}",
+                    "data": {"available": available},
+                }
+            display_name = name
 
         try:
             workflow = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as e:
             return {"success": False,
-                    "message": f"Workflow {name!r} is not valid JSON: {e}"}
+                    "message": f"Workflow {display_name!r} is not valid "
+                               f"JSON: {e}"}
 
         if not isinstance(workflow, dict) or not workflow:
             return {"success": False,
-                    "message": f"Workflow {name!r} is empty or not an object"}
+                    "message": f"Workflow {display_name!r} is empty or "
+                               f"not an object"}
 
         if "nodes" in workflow or "links" in workflow:
             return {
                 "success": False,
                 "message": (
-                    f"Workflow {name!r} appears to be in ComfyUI's UI "
-                    f"format. Export it via 'Save (API Format)' in the "
-                    f"ComfyUI menu, which produces the prompt format "
-                    f"this handler requires."
+                    f"Workflow {display_name!r} appears to be in "
+                    f"ComfyUI's UI format. Export it via "
+                    f"'Save (API Format)' in the ComfyUI menu, which "
+                    f"produces the prompt format this handler requires."
                 ),
             }
 
         # File source: publisher_key defaults to None, clearing any
         # previous browser publisher association on the active workflow.
-        self._set_active_workflow(name, workflow, "file")
+        self._set_active_workflow(display_name, workflow, "file")
         self._params = {}
         self._layer_aliases = {}
 
+        result_data: dict = {
+            "name": display_name,
+            "node_count": len(workflow),
+            "source": "file",
+            "signature": self._active_workflow_signature,
+        }
+        if is_path:
+            result_data["path"] = str(path)
+
         return {
             "success": True,
-            "message": f"Loaded workflow {name!r} "
+            "message": f"Loaded workflow {display_name!r} "
                        f"({len(workflow)} nodes)",
-            "data": {"name": name, "node_count": len(workflow),
-                     "source": "file",
-                     "signature": self._active_workflow_signature},
+            "data": result_data,
         }
 
     @command(

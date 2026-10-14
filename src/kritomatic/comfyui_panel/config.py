@@ -58,6 +58,31 @@ def _toml_key(k: str) -> str:
 
 
 # ============================================================================
+#  Path-vs-slug detection
+# ============================================================================
+
+def _looks_like_path(s: str) -> bool:
+    """True iff `s` should be interpreted as a filesystem path.
+
+    Slugs are bare names like `kritaRMGB`; paths carry a directory
+    separator, start with `~` or `.`, or end with `.json`. A bare
+    name that happens to end in `.json` is treated as a path — the
+    panel's workflows directory is the only source of truth for
+    slugs, and a slug named `foo.json` would shadow a real file the
+    user is more likely to have meant.
+    """
+    if not s:
+        return False
+    return (
+        "/" in s
+        or "\\" in s
+        or s.startswith("~")
+        or s.startswith(".")
+        or s.lower().endswith(".json")
+    )
+
+
+# ============================================================================
 #  Workflow interface extraction
 # ============================================================================
 
@@ -197,13 +222,21 @@ def _batch_block() -> list[str]:
 #  Template rendering
 # ============================================================================
 
-def _render_file_template(workflow_name: str, workflow: dict) -> str:
+def _render_file_template(workflow_ref: str, workflow: dict) -> str:
+    """Render a template for a file-sourced workflow.
+
+    `workflow_ref` is what goes into the template's `workflow = "..."`
+    field, which `build_commands` in turn feeds to the daemon as the
+    `comfy_load --name` argument. It is either a slug (resolved by the
+    daemon against its workflows directory) or an absolute path
+    (resolved by the daemon directly, no slug lookup).
+    """
     info = extract_workflow(workflow)
 
     lines: list[str] = [
         f'host = "127.0.0.1"',
         f'port = 8188',
-        f'workflow = "{workflow_name}"',
+        f'workflow = "{workflow_ref}"',
         'watch = true',
         '',
     ]
@@ -245,7 +278,7 @@ def _render_file_template(workflow_name: str, workflow: dict) -> str:
     lines.append("#     { type = \"comfy_connect\", host = \"127.0.0.1\", "
                  "port = 8188, check = true, watch = true },")
     lines.append(f"#     {{ type = \"comfy_load\", name = "
-                 f"\"{workflow_name}\" }},")
+                 f"\"{workflow_ref}\" }},")
     lines.append("#     { type = \"comfy_bind_layer_alias\", "
                  "logical_name = \"areaToRMBG\", "
                  "actual_name = \"face\" },")
@@ -313,21 +346,50 @@ def _render_browser_template_body(status: dict,
     return lines
 
 
-def build_file_template(workflow_name: str) -> Optional[str]:
-    """Read workflows/<name>.json, render the template string.
+def build_file_template(workflow_ref: str) -> Optional[str]:
+    """Read a workflow JSON and render the template string.
 
-    Returns None (and prints a diagnostic on stderr) if the workflow
-    file is missing, is not valid JSON, or is in the ComfyUI UI format
-    rather than the API format.
+    `workflow_ref` is either:
+
+      * a slug — resolved as ``workflows/<slug>.json`` under the
+        panel's workflows directory, or
+
+      * a filesystem path — loaded directly. Detected by the presence
+        of a directory separator, a leading ``~`` or ``.``, or a
+        ``.json`` suffix.
+
+    Returns None (and prints a diagnostic on stderr) if the JSON is
+    missing, is not valid JSON, or is in the ComfyUI UI format rather
+    than the API format.
+
+    When a path is given, the rendered template stores the absolute
+    path in its ``workflow = ...`` field. The daemon's ``comfy_load``
+    detects absolute paths and reads from them directly, so no copy
+    into the workflows directory is required.
     """
-    path = WORKFLOW_DIR / f"{workflow_name}.json"
-    if not path.is_file():
-        print(f"Error: workflow file not found: {path}", file=sys.stderr)
-        if WORKFLOW_DIR.is_dir():
-            avail = sorted(p.stem for p in WORKFLOW_DIR.glob("*.json"))
-            if avail:
-                print(f"Available: {', '.join(avail)}", file=sys.stderr)
-        return None
+    if _looks_like_path(workflow_ref):
+        path = Path(workflow_ref).expanduser()
+        if not path.is_file():
+            print(f"Error: workflow file not found: {path}",
+                  file=sys.stderr)
+            return None
+        try:
+            path = path.resolve()
+        except (OSError, RuntimeError):
+            pass
+        toml_ref = str(path)
+    else:
+        path = WORKFLOW_DIR / f"{workflow_ref}.json"
+        if not path.is_file():
+            print(f"Error: workflow file not found: {path}",
+                  file=sys.stderr)
+            if WORKFLOW_DIR.is_dir():
+                avail = sorted(p.stem for p in WORKFLOW_DIR.glob("*.json"))
+                if avail:
+                    print(f"Available: {', '.join(avail)}",
+                          file=sys.stderr)
+            return None
+        toml_ref = workflow_ref
 
     try:
         workflow = json.loads(path.read_text(encoding="utf-8"))
@@ -340,7 +402,7 @@ def build_file_template(workflow_name: str) -> Optional[str]:
               f"format.", file=sys.stderr)
         return None
 
-    return _render_file_template(workflow_name, workflow)
+    return _render_file_template(toml_ref, workflow)
 
 
 def build_browser_template(status: dict,

@@ -197,3 +197,4 @@ other_scripts/room/room_walls.json
 other_scripts/room/floor_plan_layout.json
 
 data/comfy_panel/*
+data/convert/*

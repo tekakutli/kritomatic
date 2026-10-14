@@ -12,6 +12,22 @@ cli.py — command-line interface for the panel.
     kritomatic comfyui panel pin        [<key>]
     kritomatic comfyui panel unpin
 
+The optional `<workflow>` argument on `run`, `reset`, `print`, and
+`preset apply` accepts either:
+
+    * a slug — resolved as workflows/<slug>.json under the panel's
+      workflows directory, or
+
+    * a filesystem path — loaded directly. Any argument containing a
+      directory separator, starting with `~` or `.`, or ending with
+      `.json` is treated as a path.
+
+If the source file is in ComfyUI UI format, it is automatically
+converted to API format before the daemon reads it, via the same
+mechanism as `kritomatic comfyui convert`. The converted file lands
+under `<repo>/data/convert/<source_name>` and is what the panel config
+references; the source JSON is not modified or copied.
+
 `run` requires Krita's daemon and a reachable ComfyUI; `queue`,
 `cancel`, `publishers`, `pin`, and `unpin` require the daemon only,
 and can be used from any shell while other processes are running
@@ -41,6 +57,10 @@ from typing import Optional
 
 from kritomatic.batch import BatchExecutor
 from kritomatic.client import KritaClient
+from kritomatic.comfy_convert.cli import (
+    ConversionError,
+    convert_if_ui,
+)
 from kritomatic.helpful_argparse import HelpfulArgumentParser
 
 from .config import (
@@ -141,6 +161,147 @@ def _ensure_daemon_ready() -> Optional[dict]:
 
 
 # ============================================================================
+#  Workflow argument normalization
+# ============================================================================
+
+def _path_like(s: str) -> bool:
+    """True iff `s` should be interpreted as a filesystem path.
+
+    Slugs are bare names like `kritaRMGB`; paths carry a directory
+    separator, start with `~` or `.`, or end with `.json`. A bare
+    name that happens to end in `.json` is treated as a path — the
+    panel's workflows directory is the only source of truth for
+    slugs, and a slug named `foo.json` would shadow a real file the
+    user is more likely to have meant.
+    """
+    if not s:
+        return False
+    return (
+        "/" in s
+        or "\\" in s
+        or s.startswith("~")
+        or s.startswith(".")
+        or s.lower().endswith(".json")
+    )
+
+
+def _normalize_workflow_arg(
+    workflow_arg: Optional[str],
+) -> tuple[Optional[str], Optional[Path]]:
+    """Split the raw `<workflow>` argument into (slug, path).
+
+    Returns:
+
+        (slug, None)      — argument is a slug; the workflow lives at
+                            ``<workflows_dir>/<slug>.json``.
+
+        (stem, path)      — argument is a filesystem path; the workflow
+                            lives at ``path``. The stem is used as the
+                            panel config's basename, so the same JSON
+                            always maps to the same config file
+                            regardless of how the path was spelled.
+
+        (None, None)      — no argument given. Callers fall back to
+                            consulting the daemon.
+
+    The path need not exist at this point; ``build_file_template`` will
+    print a "file not found" error naming the resolved location. When
+    the path does exist, it is returned absolute so that the generated
+    panel config can be run from any working directory.
+    """
+    if not workflow_arg:
+        return None, None
+    if not _path_like(workflow_arg):
+        return workflow_arg, None
+
+    p = Path(workflow_arg).expanduser()
+    try:
+        p = p.resolve(strict=False)
+    except (OSError, RuntimeError):
+        # Broken symlink, unreadable parent, or similar. Keep the
+        # expanded path as-is so the eventual error names what the
+        # user typed, not what Python guessed.
+        pass
+    return p.stem, p
+
+
+# ============================================================================
+#  Conversion (UI format → API format)
+# ============================================================================
+
+def _prepare_workflow_ref(
+    slug: Optional[str],
+    source_path: Optional[Path],
+    *,
+    comfy_url: Optional[str] = None,
+) -> tuple[Optional[str], bool]:
+    """Resolve the workflow reference the panel config should store.
+
+    Returns ``(workflow_ref, ok)``.
+
+    ``workflow_ref`` is what gets written into the config's
+    ``workflow = "..."`` line: either a slug (daemon resolves it under
+    its workflows directory) or an absolute path (daemon reads the file
+    directly).
+
+    ``ok`` is False when the source is UI format and conversion fails;
+    callers abort with a nonzero exit code in that case.
+
+    Behaviour by argument shape:
+
+      * Slug whose file is API format, or absent:
+        returns the slug unchanged. The template writer's not-found
+        error handles the absent case.
+
+      * Slug whose file is UI format:
+        converts to ``<repo>/data/convert/<slug>.json`` and returns
+        that absolute path.
+
+      * Path whose file is API format:
+        returns the path unchanged.
+
+      * Path whose file is UI format:
+        converts to ``<repo>/data/convert/<basename>`` and returns that
+        absolute path. The source JSON is not modified.
+
+      * No argument (slug is None):
+        returns (None, True). The caller falls back to daemon state.
+    """
+    if slug is None:
+        return None, True
+
+    if source_path is not None:
+        source = source_path
+        is_slug = False
+    else:
+        source = WORKFLOW_DIR / f"{slug}.json"
+        is_slug = True
+
+    if not source.is_file():
+        # Defer to the template writer, which reports the missing
+        # location and lists the workflows directory when relevant.
+        return (slug if is_slug else str(source)), True
+
+    try:
+        converted, records, was_converted = convert_if_ui(
+            source, url=comfy_url or "http://127.0.0.1:8188",
+        )
+    except ConversionError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return None, False
+
+    if not was_converted:
+        return (slug if is_slug else str(source)), True
+
+    print(f"Converted UI-format workflow → {converted}")
+    if records:
+        tokens = ", ".join(r["token"] for r in records)
+        print(f"  {len(records)} handle(s): {tokens}")
+
+    return str(converted), True
+
+
+# ============================================================================
 #  Config resolution
 # ============================================================================
 
@@ -173,21 +334,34 @@ def _explain_no_workflow(status: dict) -> str:
     lines.append("")
     lines.append("Alternatively, name a workflow file directly:")
     lines.append("  kritomatic comfyui panel <command> <workflow-name>")
+    lines.append("  kritomatic comfyui panel <command> /path/to/file.json")
     return "\n".join(lines)
 
 
-def _resolve_config_path(workflow_name: Optional[str]
-                         ) -> tuple[Path, str, Optional[str]]:
-    """Return (path, label, signature).
+def _resolve_config_path(
+    workflow_slug: Optional[str],
+    json_path: Optional[Path] = None,
+) -> tuple[Path, str, Optional[str]]:
+    """Return (config_path, label, signature).
 
-    Explicit name -> path resolved without contacting the daemon.
-    No name -> daemon is consulted for the active workflow; if the
-    daemon is unreachable, fall back to the on-disk configs when there
-    is exactly one.
+    Explicit slug or path → the config file lives at
+    ``<panel_configs>/<slug>.toml``. The path form uses the source
+    JSON's stem as the slug, so a workflow loaded by path and the same
+    workflow loaded by slug share one config file — which is what you
+    want when the file simply happens to live outside the workflows
+    directory.
+
+    No argument → the daemon is consulted for the active workflow; if
+    the daemon is unreachable, fall back to the on-disk configs when
+    there is exactly one.
     """
-    if workflow_name:
-        return (CONFIG_DIR / f"{workflow_name}.toml",
-                f"explicit name {workflow_name!r}", None)
+    if workflow_slug:
+        config_path = CONFIG_DIR / f"{workflow_slug}.toml"
+        if json_path is not None:
+            label = f"file {json_path}"
+        else:
+            label = f"explicit name {workflow_slug!r}"
+        return config_path, label, None
 
     status = _daemon_status()
     if status is None:
@@ -232,19 +406,29 @@ def _resolve_config_path(workflow_name: Optional[str]
 #  Template helpers
 # ============================================================================
 
-def _write_fresh_template(path: Path, workflow_name: Optional[str],
-                          signature: Optional[str]) -> int:
+def _write_fresh_template(
+    path: Path,
+    workflow_ref: Optional[str],
+    signature: Optional[str],
+) -> int:
     """Write a fresh template to `path`. Used by `run` (when the config
     does not exist yet) and by `reset`.
+
+    `workflow_ref` is what goes into the template's ``workflow = "..."``
+    line — a slug, or an absolute path to an API-format file. It has
+    already been through ``_prepare_workflow_ref``, so any UI-format
+    source has been converted and ``workflow_ref`` names the converted
+    file.
     """
     if signature is not None:
         status = _daemon_status() or {}
         template = build_browser_template(status, signature)
     else:
-        if not workflow_name:
-            print("Error: cannot determine workflow name.", file=sys.stderr)
+        if not workflow_ref:
+            print("Error: cannot determine workflow name.",
+                  file=sys.stderr)
             return 1
-        template = build_file_template(workflow_name)
+        template = build_file_template(workflow_ref)
         if template is None:
             return 1
 
@@ -255,15 +439,19 @@ def _write_fresh_template(path: Path, workflow_name: Optional[str],
     return 0
 
 
-def _get_template_string(workflow_name: Optional[str]
-                         ) -> Optional[str]:
+def _get_template_string(workflow_arg: Optional[str]) -> Optional[str]:
     """Return a rendered template string, or None on error.
 
-    Explicit workflow -> read workflows/<name>.json and render.
-    No workflow -> consult the daemon for the active workflow.
+    Explicit slug or path -> render directly, converting UI-format
+    sources to API format first.
+    No argument -> consult the daemon for the active workflow.
     """
-    if workflow_name:
-        return build_file_template(workflow_name)
+    slug, source_path = _normalize_workflow_arg(workflow_arg)
+    if slug is not None:
+        workflow_ref, ok = _prepare_workflow_ref(slug, source_path)
+        if not ok:
+            return None
+        return build_file_template(workflow_ref)
 
     if not _ensure_daemon_reachable():
         return None
@@ -295,14 +483,20 @@ def cmd_run(args) -> int:
     """
     _ensure_daemon_ready()
 
+    slug, source_path = _normalize_workflow_arg(args.workflow)
+
+    workflow_ref, ok = _prepare_workflow_ref(slug, source_path)
+    if not ok:
+        return 1
+
     try:
-        path, label, signature = _resolve_config_path(args.workflow)
+        path, label, signature = _resolve_config_path(slug, source_path)
     except SystemExit as e:
         print(str(e), file=sys.stderr)
         return 1
 
     if not path.exists():
-        return _write_fresh_template(path, args.workflow, signature)
+        return _write_fresh_template(path, workflow_ref, signature)
 
     try:
         cfg = load_config(path)
@@ -351,12 +545,21 @@ def cmd_reset(args) -> int:
     """Regenerate the panel config from the workflow template, without
     a backup. The old file is deleted first; the template writer then
     creates a fresh one.
+
+    UI-format sources are converted to API format before the template
+    is written, exactly as in `cmd_run`.
     """
     if not _ensure_daemon_reachable():
         return 1
 
+    slug, source_path = _normalize_workflow_arg(args.workflow)
+
+    workflow_ref, ok = _prepare_workflow_ref(slug, source_path)
+    if not ok:
+        return 1
+
     try:
-        path, _label, signature = _resolve_config_path(args.workflow)
+        path, _label, signature = _resolve_config_path(slug, source_path)
     except SystemExit as e:
         print(str(e), file=sys.stderr)
         return 1
@@ -364,7 +567,7 @@ def cmd_reset(args) -> int:
     if path.exists():
         path.unlink()
 
-    return _write_fresh_template(path, args.workflow, signature)
+    return _write_fresh_template(path, workflow_ref, signature)
 
 
 def cmd_print(args) -> int:
@@ -389,15 +592,17 @@ def cmd_print(args) -> int:
 def cmd_preset_apply(args) -> int:
     """Apply a preset to a panel config.
 
-    Explicit workflow -> direct path, no daemon. No workflow -> daemon
-    is consulted to identify the active workflow's config.
+    Explicit workflow (slug or path) -> direct path, no daemon. No
+    workflow -> daemon is consulted to identify the active workflow's
+    config.
     """
     preset_path = resolve_preset_path(args.name)
     if preset_path is None:
         return 1
 
     if args.workflow:
-        config_path = CONFIG_DIR / f"{args.workflow}.toml"
+        slug, _ = _normalize_workflow_arg(args.workflow)
+        config_path = CONFIG_DIR / f"{slug}.toml"
     else:
         if not _ensure_daemon_reachable():
             return 1
@@ -771,8 +976,11 @@ def populate_panel_subcommands(sub) -> None:
     )
     run_p.add_argument(
         'workflow', nargs='?', default=None,
-        help='Workflow name; uses panel_configs/<name>.toml. Defaults to '
-             'the daemon-reported active workflow.',
+        help='Workflow name, or a path to a workflow .json file. With a '
+             'name, uses panel_configs/<name>.toml and '
+             'workflows/<name>.json. With a path, reads the JSON from '
+             'where it is. UI-format sources are auto-converted to API '
+             'format. Defaults to the daemon-reported active workflow.',
     )
     run_p.set_defaults(func=cmd_run)
 
@@ -783,8 +991,9 @@ def populate_panel_subcommands(sub) -> None:
     )
     reset_p.add_argument(
         'workflow', nargs='?', default=None,
-        help='Workflow name; uses panel_configs/<name>.toml. Defaults to '
-             'the daemon-reported active workflow.',
+        help='Workflow name, or a path to a workflow .json file. '
+             'UI-format sources are auto-converted to API format. '
+             'Defaults to the daemon-reported active workflow.',
     )
     reset_p.set_defaults(func=cmd_reset)
 
@@ -795,8 +1004,9 @@ def populate_panel_subcommands(sub) -> None:
     )
     print_p.add_argument(
         'workflow', nargs='?', default=None,
-        help='Workflow name. Defaults to the daemon-reported active '
-             'workflow.',
+        help='Workflow name, or a path to a workflow .json file. '
+             'UI-format sources are auto-converted to API format. '
+             'Defaults to the daemon-reported active workflow.',
     )
     print_p.add_argument(
         '--output', '-o', default=None, metavar='PATH',
@@ -823,8 +1033,8 @@ def populate_panel_subcommands(sub) -> None:
     )
     apply_p.add_argument(
         'workflow', nargs='?', default=None,
-        help='Workflow name; uses panel_configs/<name>.toml. Defaults to '
-             'the daemon-reported active workflow.',
+        help='Workflow name, or a path to a workflow .json file. '
+             'Defaults to the daemon-reported active workflow.',
     )
     apply_p.add_argument(
         '--dry-run', action='store_true',

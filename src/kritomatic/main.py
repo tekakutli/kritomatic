@@ -61,6 +61,20 @@ def main():
         run_panel_command()
         return
 
+    # ========== HANDLE comfyui convert (client-side only) ==========
+    #
+    # `convert` is a client-side sibling of `panel` under `comfyui`.
+    # It POSTs to ComfyUI's /workflow/convert endpoint (provided by
+    # the comfyui-workflow-to-api-converter-endpoint custom node) to
+    # turn a UI-format workflow into API format and inject handle
+    # tokens. Like `panel`, it is intercepted here so the schema-based
+    # parser does not try to resolve it; `registry.py` injects a
+    # matching subparser for `--help`.
+    if len(sys.argv) >= 3 and sys.argv[1] == 'comfyui' and sys.argv[2] == 'convert':
+        from comfy_convert import run_convert_command
+        run_convert_command()
+        return
+
     # ========== HANDLE text subcommands (client-side only) ==========
     #
     # Fires whenever the first positional is `text`, with or without

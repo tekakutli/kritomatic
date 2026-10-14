@@ -10,7 +10,6 @@ from .mask import MaskHandler
 from .document import DocumentHandler
 from .view import ViewHandler
 from .window import WindowHandler
-from .diffusion import DiffusionHandler
 from .comfyui import ComfyUIHandler
 from .introspect import IntrospectHandler
 from .daemon import DaemonHandler
@@ -30,7 +29,6 @@ class CommandHandler(AutoDispatchHandler):
             'document': DocumentHandler(),
             'view': ViewHandler(),
             'window': WindowHandler(),
-            'diffusion': DiffusionHandler(),
             'comfyui': ComfyUIHandler(),
             'introspect': IntrospectHandler(),
             'daemon': DaemonHandler()

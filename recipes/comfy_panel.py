@@ -8,6 +8,9 @@ comfy_panel.py — edit a per-workflow panel config, run it against the
     python comfy_panel.py <name>          uses a named config
     python comfy_panel.py --reset         back up and rewrite the template
     python comfy_panel.py --print         dump a template to stdout
+    python comfy_panel.py --preset NAME   apply a preset to the config
+    python comfy_panel.py --preset NAME --dry-run
+                                          show what a preset would do
 
 Layout
 ------
@@ -17,19 +20,49 @@ Layout
         ├── workflows/                       JSON workflow definitions
         │                                    (only present if injected from disk)
         ├── panel_configs/                   the .toml files this panel edits
+        ├── presets/                         preset .toml files
         └── history/                         generation records
 
-Batch generation
-----------------
-When `count > 1`, the daemon runs the workflow that many times, each
-run with seed `seed + i` for run `i`, and pastes each result with the
-seed in the layer name. This requires the workflow to expose an
-`ETN_Parameter` named exactly `seed` wired to the sampler's seed input;
-without it, the daemon clamps count to 1 and reports the reason.
+The panel's `workflow` field is optional. When blank, the panel relies
+on the browser to publish a graph and the daemon to make it active.
+When set, the panel sends a `comfy_load` first, and the daemon reads
+`workflows/<name>.json`.
 
-The `seed` field is the base seed for a batch. Blank means the daemon
-picks a random base. One history record is written per `comfy_generate`
-call, regardless of count, with a `runs` list carrying each run's seed.
+Presets
+-------
+A preset is a `.toml` file in `presets/` that carries a set of values
+to splice into a panel config, section-qualified:
+
+    [params]
+    "cutSelection?" = false
+    segmentFurther = "person"
+
+    [layer_aliases]
+    areaToRMBG = "face"
+
+    [delete]
+    params = ["simpleSegmentation?"]
+    layer_aliases = ["thecanvas"]
+
+Only the sections `[params]` and `[layer_aliases]` are consulted.
+Within a section, a key is applied only if it already exists in the
+target config; unknown keys and unknown sections are skipped silently.
+The `[delete]` section removes keys; a key that is not present is
+skipped. If a key appears in both a value section and `[delete]`, the
+delete wins.
+
+`--preset NAME` writes the changes into the config file directly, with
+no backup: undo is `--reset`, which regenerates the config from the
+workflow. `--dry-run` prints the summary without writing.
+
+Comments, key order, and unrelated values in the target config are
+preserved: `tomlkit` parses the file into a document that retains them,
+and only the changed entries are perturbed on write.
+
+Preset lookup is strict: the argument must be a bare filename, and the
+file must exist under `presets/`. Paths with directory separators are
+rejected so the lookup cannot wander outside that directory. The
+`.toml` extension is optional on the command line.
 """
 
 from pathlib import Path
@@ -41,6 +74,16 @@ try:
     import tomllib
 except ImportError:
     print("This script requires Python 3.11+ (for tomllib).", file=sys.stderr)
+    sys.exit(2)
+
+try:
+    import tomlkit
+except ImportError:
+    print(
+        "This script requires the 'tomlkit' package:\n"
+        "    pip install tomlkit",
+        file=sys.stderr,
+    )
     sys.exit(2)
 
 _HERE = Path(__file__).resolve().parent
@@ -59,14 +102,11 @@ except ImportError:
 # ---------------------------------------------------------------------------
 #  Directories
 # ---------------------------------------------------------------------------
-#
-# Everything the panel owns lives under PANEL_DIR, named after this
-# script. The three subdirectories are fixed; the code below creates the
-# ones it writes to as needed.
 
 PANEL_DIR = _HERE / "comfy_panel"
 WORKFLOW_DIR = PANEL_DIR / "workflows"
 CONFIG_DIR = PANEL_DIR / "panel_configs"
+PRESET_DIR = PANEL_DIR / "presets"
 
 WORKFLOW_WAIT = 3.0
 
@@ -241,13 +281,7 @@ def _params_block(params: dict,
 
 def _layer_aliases_block(image_layers: list[str],
                          mask_layers: list[str]) -> list[str]:
-    """The [layer_aliases] table.
-
-    Keys are the layer names the workflow declares; values are the
-    layer names the daemon should actually read from the document.
-    Defaults are the keys themselves, so an unedited table is the
-    identity mapping.
-    """
+    """The [layer_aliases] table."""
     lines = [
         "# ---- Layer aliases ----------------------------------------",
         "#",
@@ -308,12 +342,12 @@ def _batch_block() -> list[str]:
         "# count > 1 runs the workflow that many times, one run per",
         "# consecutive seed, and pastes each result. The workflow must",
         "# declare an ETN_Parameter named exactly 'seed' wired to the",
-        "# sampler's seed input; otherwise the daemon clamps count to 1.",
+        "# sampler's seed input, or wire the ETN_KritaCanvas 'seed'",
+        "# output; otherwise the daemon clamps count to 1.",
         "#",
         "# seed is the base for a batch: run i uses seed+i. Blank means",
         "# the daemon picks a random base. One history record is written",
-        "# per comfy_generate call, regardless of count, with each run's",
-        "# seed in its runs list.",
+        "# per comfy_generate call, regardless of count.",
     ]
 
 
@@ -604,7 +638,6 @@ def build_commands(cfg: dict) -> list:
         "type": "comfy_generate",
         "timeout": float(cfg.get("timeout", 55.0)),
     }
-
     output_name = cfg.get("output_name") or ""
     if output_name:
         generate_cmd["output_name"] = str(output_name)
@@ -733,23 +766,221 @@ def resolve_path(name: str | None) -> tuple[Path, str, str | None]:
 
 
 # ---------------------------------------------------------------------------
+#  Presets
+# ---------------------------------------------------------------------------
+
+_PRESETTABLE_SECTIONS = ("params", "layer_aliases")
+
+
+def resolve_preset_path(name: str) -> Path:
+    """Return the path to a preset file, given a bare name.
+
+    Presets live only in `presets/`. The name must be a bare filename;
+    paths with directory separators are rejected so the lookup cannot
+    wander outside that directory. The `.toml` extension is optional.
+    """
+    if not name:
+        raise SystemExit("Preset name is required.")
+    if "/" in name or "\\" in name:
+        raise SystemExit(
+            f"Preset name must be a bare filename, not a path: {name!r}\n"
+            f"Presets live in {PRESET_DIR}."
+        )
+    if not name.endswith(".toml"):
+        name = name + ".toml"
+    path = PRESET_DIR / name
+    if not path.is_file():
+        available = []
+        if PRESET_DIR.is_dir():
+            available = sorted(p.name for p in PRESET_DIR.glob("*.toml"))
+        msg = f"Preset {name!r} not found in {PRESET_DIR}."
+        if available:
+            msg += "\nAvailable presets: " + ", ".join(available)
+        raise SystemExit(msg)
+    return path
+
+
+def apply_preset(preset_path: Path, config_path: Path,
+                 dry_run: bool = False) -> int:
+    """Splice a preset's changes into a config file.
+
+    Preset format:
+
+        [params]
+        "cutSelection?" = false
+        segmentFurther = "person"
+
+        [layer_aliases]
+        areaToRMBG = "face"
+
+        [delete]
+        params = ["simpleSegmentation?"]
+        layer_aliases = ["thecanvas"]
+
+    Only `[params]` and `[layer_aliases]` are consulted for value
+    assignments. Unknown sections and unknown keys within known
+    sections are skipped silently. The `[delete]` section removes keys
+    by section; a key not present in the target is skipped. If a key
+    appears in both a value section and `[delete]`, the delete wins.
+
+    Comments, key order, and unrelated values in the target are
+    preserved: tomlkit parses the file into a document that retains
+    them, and only the changed entries are perturbed on write.
+    """
+    try:
+        preset = tomlkit.parse(preset_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"Preset {preset_path} is not valid TOML: {e}",
+              file=sys.stderr)
+        return 1
+
+    try:
+        config = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"Config {config_path} is not valid TOML: {e}",
+              file=sys.stderr)
+        return 1
+
+    applied: list[str] = []
+    skipped: list[str] = []
+    deleted: list[str] = []
+    delete_skipped: list[str] = []
+
+    # ---- Value assignments ----
+    for section_name in _PRESETTABLE_SECTIONS:
+        if section_name not in preset:
+            continue
+        section = preset[section_name]
+        try:
+            section_keys = list(section.keys())
+        except AttributeError:
+            # Not a table (a stray scalar at this position); skip.
+            continue
+        if section_name not in config:
+            for key in section_keys:
+                skipped.append(f"{section_name}.{key}")
+            continue
+        target = config[section_name]
+        for key in section_keys:
+            if key in target:
+                target[key] = section[key]
+                applied.append(f"{section_name}.{key}")
+            else:
+                skipped.append(f"{section_name}.{key}")
+
+    # ---- Deletions ----
+    if "delete" in preset:
+        delete_section = preset["delete"]
+        try:
+            delete_sections = list(delete_section.keys())
+        except AttributeError:
+            delete_sections = []
+        for section_name in delete_sections:
+            if section_name not in _PRESETTABLE_SECTIONS:
+                continue
+            keys = delete_section[section_name]
+            if not isinstance(keys, list):
+                continue
+            if section_name not in config:
+                for key in keys:
+                    delete_skipped.append(f"{section_name}.{key}")
+                continue
+            target = config[section_name]
+            for key in keys:
+                key_str = str(key)
+                if key_str in target:
+                    del target[key_str]
+                    deleted.append(f"{section_name}.{key_str}")
+                else:
+                    delete_skipped.append(f"{section_name}.{key_str}")
+
+    # ---- Report ----
+    print(f"Preset:   {preset_path}")
+    print(f"Target:   {config_path}")
+    print()
+
+    if applied:
+        print(f"Applied ({len(applied)}):")
+        for k in applied:
+            print(f"  {k}")
+    if deleted:
+        print(f"Deleted ({len(deleted)}):")
+        for k in deleted:
+            print(f"  {k}")
+    if skipped:
+        print(f"Skipped ({len(skipped)}) — not present in target:")
+        for k in skipped:
+            print(f"  {k}")
+    if delete_skipped:
+        print(f"Delete skipped ({len(delete_skipped)}) — not present in "
+              f"target:")
+        for k in delete_skipped:
+            print(f"  {k}")
+
+    if not (applied or deleted):
+        print()
+        print("This preset matches nothing in the target config.")
+        print("Check that it is meant for this workflow.")
+
+    if dry_run:
+        print()
+        print("(dry run; file not modified)")
+        return 0
+
+    config_path.write_text(tomlkit.dumps(config), encoding="utf-8")
+    print()
+    print(f"Wrote {config_path}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 #  Entry point
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    p = argparse.ArgumentParser(prog="comfy_panel")
+    p = argparse.ArgumentParser(
+        prog="comfy_panel",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python comfy_panel.py\n"
+            "  python comfy_panel.py kritaRMGB\n"
+            "  python comfy_panel.py --reset\n"
+            "  python comfy_panel.py --print\n"
+            "  python comfy_panel.py --preset hyper\n"
+            "  python comfy_panel.py --preset hyper --dry-run\n"
+        ),
+    )
     p.add_argument("workflow", nargs="?",
                    help="Workflow name; uses panel_configs/<name>.toml. "
                         "Defaults to whatever workflow the daemon reports "
                         "as active.")
-    p.add_argument("--reset", action="store_true",
-                   help="Back up the config and write a fresh template.")
-    p.add_argument("--print", dest="print_only", action="store_true",
-                   help="Print a template to stdout. No files touched.")
+
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--reset", action="store_true",
+                      help="Back up the config and write a fresh template.")
+    mode.add_argument("--print", dest="print_only", action="store_true",
+                      help="Print a template to stdout. No files touched.")
+    mode.add_argument("--preset", metavar="NAME", default=None,
+                      help="Apply a preset from presets/. NAME is a bare "
+                           "filename (with or without .toml). The target "
+                           "config is the one that --reset would touch.")
+
+    p.add_argument("--dry-run", action="store_true",
+                   help="With --preset: print what would change, do not "
+                        "modify the config.")
     p.add_argument("--no-connect", action="store_true",
                    help="Skip the auto-connect step.")
+
     args = p.parse_args()
 
+    if args.dry_run and args.preset is None:
+        print("--dry-run requires --preset.", file=sys.stderr)
+        return 2
+
+    # ------------------------------------------------------------------
+    #  --print mode: stdout only
+    # ------------------------------------------------------------------
     if args.print_only:
         if not args.no_connect:
             ensure_daemon_ready()
@@ -787,6 +1018,35 @@ def main() -> int:
         print(_explain_no_workflow(status), file=sys.stderr)
         return 1
 
+    # ------------------------------------------------------------------
+    #  --preset mode: edit the config, do not run
+    # ------------------------------------------------------------------
+    if args.preset is not None:
+        preset_path = resolve_preset_path(args.preset)
+
+        if not args.no_connect:
+            ensure_daemon_ready()
+
+        try:
+            config_path, _label, _sig = resolve_path(args.workflow)
+        except SystemExit as e:
+            print(str(e), file=sys.stderr)
+            return 1
+
+        if not config_path.exists():
+            print(
+                f"Config {config_path} does not exist yet.\n"
+                f"Run the panel once for this workflow, or "
+                f"`python comfy_panel.py --reset`, to create it.",
+                file=sys.stderr,
+            )
+            return 1
+
+        return apply_preset(preset_path, config_path, args.dry_run)
+
+    # ------------------------------------------------------------------
+    #  Normal run (and --reset)
+    # ------------------------------------------------------------------
     if not args.no_connect:
         ensure_daemon_ready()
 
@@ -797,11 +1057,7 @@ def main() -> int:
         return 1
 
     if args.reset and path.exists():
-        backup = path.with_name(path.name + ".bak")
-        if backup.exists():
-            backup.unlink()
-        path.replace(backup)
-        print(f"Moved existing config to {backup}")
+        path.unlink()
 
     if not path.exists():
         if signature is not None:
@@ -824,10 +1080,6 @@ def main() -> int:
     print(f"Config:   {path}   ({label})")
     print(f"Commands: {len(commands)}\n")
 
-    # Size the client's per-read timeout to the longest single command
-    # the batch can contain. `comfy_generate` with a count > 1 runs
-    # several generations in sequence before it emits its own progress
-    # line; the client must be willing to wait that long.
     per_run = float(cfg.get("timeout", 55.0))
     try:
         count = int(cfg.get("count", 1))
@@ -835,9 +1087,6 @@ def main() -> int:
         count = 1
     if count < 1:
         count = 1
-    # Each run can take up to `per_run`; add one more `per_run` of
-    # margin so a slow first run does not eat into the wait for the
-    # last one, and a fixed overhead for connection and setup.
     read_timeout = per_run * (count + 1) + 60.0
     print(f"Client read timeout: {read_timeout:.0f}s "
           f"({count} run(s) × {per_run:.0f}s + margin)\n")

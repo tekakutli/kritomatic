@@ -52,18 +52,6 @@ def main():
             print("❌ Could not connect to daemon. Make sure Krita is running.")
         return
 
-    # ========== HANDLE diffusion preset subcommands (client-side only) ==========
-    if len(sys.argv) >= 3 and sys.argv[1] == 'diffusion' and sys.argv[2] == 'preset':
-        from diffusion_preset import run_preset_command
-        run_preset_command()
-        return
-
-    # ========== HANDLE diffusion node subcommands (client-side only) ==========
-    if len(sys.argv) >= 3 and sys.argv[1] == 'diffusion' and sys.argv[2] == 'node':
-        from diffusion_node import run_node_command
-        run_node_command()
-        return
-
     # ========== HANDLE text subcommands (client-side only) ==========
     #
     # Fires whenever the first positional is `text`, with or without

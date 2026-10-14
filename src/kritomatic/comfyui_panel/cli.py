@@ -122,6 +122,13 @@ def _ensure_daemon_reachable() -> bool:
 def _ensure_daemon_ready() -> Optional[dict]:
     """Full readiness: daemon up, ComfyUI reachable, and (if possible)
     a workflow published. Used by `run`.
+
+    `comfy_connect --watch true` re-promotes the most recent browser
+    publisher when the active workflow was set by a file load, so the
+    workflow field is populated by the time this returns unless no
+    browser publisher has ever been tracked this session. The poll
+    loop covers the remaining case: a fresh connect with no prior
+    state, where the subscribe replay needs a moment to arrive.
     """
     client = KritaClient()
     if not client.connect():

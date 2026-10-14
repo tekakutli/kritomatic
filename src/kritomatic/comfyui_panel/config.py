@@ -237,6 +237,12 @@ def _render_file_template(workflow_ref: str, workflow: dict) -> str:
         f'host = "127.0.0.1"',
         f'port = 8188',
         f'workflow = "{workflow_ref}"',
+        '# exclusive=true means the daemon loads this file and ignores',
+        '# any graph concurrently published by a ComfyUI browser tab.',
+        '# Without it, a browser republish between load and generate',
+        '# silently replaces the file\'s graph. Set to false to follow',
+        '# the browser instead.',
+        'exclusive = true',
         'watch = true',
         '',
     ]
@@ -278,7 +284,7 @@ def _render_file_template(workflow_ref: str, workflow: dict) -> str:
     lines.append("#     { type = \"comfy_connect\", host = \"127.0.0.1\", "
                  "port = 8188, check = true, watch = true },")
     lines.append(f"#     {{ type = \"comfy_load\", name = "
-                 f"\"{workflow_ref}\" }},")
+                 f"\"{workflow_ref}\", exclusive = true }},")
     lines.append("#     { type = \"comfy_bind_layer_alias\", "
                  "logical_name = \"areaToRMBG\", "
                  "actual_name = \"face\" },")
@@ -399,7 +405,8 @@ def build_file_template(workflow_ref: str) -> Optional[str]:
 
     if "nodes" in workflow or "links" in workflow:
         print(f"Error: {path} is in ComfyUI UI format; export as API "
-              f"format.", file=sys.stderr)
+              f"format, or run `kritomatic comfyui convert` on it first.",
+              file=sys.stderr)
         return None
 
     return _render_file_template(toml_ref, workflow)
@@ -504,7 +511,16 @@ def build_commands(cfg: dict) -> list:
 
     workflow = cfg.get("workflow") or ""
     if workflow:
-        cmds.append({"type": "comfy_load", "name": str(workflow)})
+        load_cmd: dict = {"type": "comfy_load", "name": str(workflow)}
+        # File-sourced workflows default to exclusive: the browser's
+        # last-publish-wins behaviour would otherwise override the
+        # file the user explicitly named. A config can opt out by
+        # setting `exclusive = false`, which restores follow-the-
+        # browser. A config that predates this field is treated as
+        # exclusive — that is the fix this flag exists for.
+        if bool(cfg.get("exclusive", True)):
+            load_cmd["exclusive"] = True
+        cmds.append(load_cmd)
 
     for logical, actual in (cfg.get("layer_aliases") or {}).items():
         cmds.append({

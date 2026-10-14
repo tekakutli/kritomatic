@@ -123,6 +123,49 @@ Everything else
     back over the WebSocket), and all the server-side ETN_* nodes
     (tiling, region masking, translate, NSFW filter, mask application).
 
+Node pruning
+------------
+ComfyUI's UI→API conversion is not perfect. Two classes of problem
+show up in practice, and both would otherwise cause `_remap_value` to
+raise on a dangling edge:
+
+  1. Muted and bypassed nodes are dropped from the API output, but the
+     consumers that were wired to them keep a reference to their id —
+     the browser-side "Save (API Format)" writes the *link* id in that
+     slot; the server-side comfyui-workflow-to-api-converter-endpoint
+     writes the dropped node's id. Either way the referenced key has
+     no entry in the graph.
+
+  2. Authoring-only nodes are not part of the pipeline by construction.
+     Bookmark (rgthree), Note, and floating Reroutes have no forward
+     path to any output; a PrimitiveInt hidden behind a mute switch has
+     none either. These are not graph errors — they are just not part
+     of a runnable workflow — but if they land in the API output with
+     a dangling reference or as a spurious node, the rewrite chokes.
+
+`_prune_graph` handles both before the walk begins, as a fixed-point
+loop over two rules:
+
+    Unreachable
+        A node that cannot reach any output node through its consumers
+        is dropped. This is the general form of "strip UI-only
+        helpers": no class name is hardcoded, only the graph-theoretic
+        property that a pipeline node can reach a sink. Output nodes
+        themselves are identified via `/object_info`'s output flags,
+        with a small fallback set for the case where node_defs is not
+        available.
+
+    Unrunnable
+        A node whose required inputs cannot be satisfied — either the
+        edge dangles after the Unreachable pass, or the input was never
+        provided and the schema offers no default — is dropped. Its
+        own consumers then lose their edge and become unrunnable in
+        turn.
+
+The rules iterate because each can expose the other: dropping an
+unrunnable node can make its former consumers unreachable; dropping
+an unreachable node removes a producer that another node depended on.
+
 Schema defaults and choice validation
 -------------------------------------
 ComfyUI's newer `comfy_api.latest.io` schema (used by tooling-nodes)
@@ -163,6 +206,9 @@ Nodes are processed in dependency order (Kahn's algorithm on the edge
 graph). A cycle, or an edge that references a node id not present in
 the workflow, raises ExpansionError before any node is emitted, so a
 malformed workflow fails loudly rather than producing a partial graph.
+(The pruning pass removes dangling edges before this point, so the
+"edge references nonexistent node" case only surfaces if a caller
+somehow bypasses pruning.)
 
 =============================================================================
 WHAT THIS MODULE DOES NOT DO
@@ -283,11 +329,13 @@ class ExpansionResult:
     # The parameter values that were actually used, after type coercion
     # and default-fallback. Useful for the generation-history record.
     parameters: dict[str, Any]
-    # Diagnostics produced during the rewrite. Currently one kind:
-    # schema-choice substitution, where a workflow value was not in
-    # the node's declared choices and the schema default was used
-    # instead. The handler surfaces these in its response message so
-    # the user can fix the workflow in the browser.
+    # Diagnostics produced during the rewrite. Two kinds:
+    #   * Node prunes: unreachable nodes, unrunnable nodes, and edges
+    #     dropped because they pointed at a muted or bypassed node.
+    #   * Schema substitutions: a workflow value that was not in the
+    #     node's declared choices, replaced by the schema default.
+    # The handler surfaces these in its response message so the user
+    # can tell what happened to a workflow that did not run as drawn.
     warnings: list[str] = field(default_factory=list)
 
 
@@ -296,8 +344,9 @@ class ExpansionError(Exception):
 
     Reasons: missing required resource (canvas, selection, named layer),
     cyclic graph, edge referencing a nonexistent node, duplicate
-    ETN_Parameter name, or use of an unsupported tooling node. Every
-    message names the node id that triggered it.
+    ETN_Parameter name, use of an unsupported tooling node, or a
+    top-level node value that is not an object. Every message names the
+    node id that triggered it.
     """
 
 
@@ -389,7 +438,8 @@ def expand_custom(workflow: dict,
     """Rewrite a custom workflow graph, replacing ETN_* input nodes.
 
     Args:
-        workflow:  the graph to rewrite, in prompt form. Not mutated.
+        workflow:  the graph to rewrite, in prompt form. The caller's
+                   dict is not mutated.
         params:    parameter values keyed by the ETN_Parameter `name`
                    widget. Missing entries fall back to the node's
                    `default`. Values are coerced per the node's `type`.
@@ -406,6 +456,12 @@ def expand_custom(workflow: dict,
                    returned `warnings` list. Pass this whenever the
                    client is connected.
 
+                   It is also used by the pruning pass, both to identify
+                   output nodes (via `is_output_node`/`output_node`) and
+                   to decide whether a missing required input can be
+                   filled from a schema default (and so does not justify
+                   dropping the node).
+
     Returns:
         ExpansionResult with the rewritten graph, image_data to upload,
         the parameters actually used (post-coercion), and any warnings.
@@ -416,6 +472,32 @@ def expand_custom(workflow: dict,
     """
     if not workflow:
         raise ExpansionError("workflow is empty")
+
+    # Reject malformed node values before anything else touches them.
+    # The pruning pass, the schema pass, and the copy helper all
+    # assume every top-level value is an object; checking once here
+    # turns a stray string or list into a clear ExpansionError instead
+    # of an AttributeError from deep inside one of those passes.
+    _check_node_values_are_objects(workflow)
+
+    # Prune first, so downstream passes only ever see a graph whose
+    # edges resolve and whose nodes can reach an output. The copy is
+    # two levels deep — top-level dict plus a fresh `inputs` dict per
+    # node — because those are exactly the two levels the pruning pass
+    # mutates. A bare `dict(workflow)` is not enough: the nested node
+    # dicts would still be shared, and `_prune_unrunnable_nodes` does
+    # `del inputs[key]` on them, silently editing the caller's graph.
+    # `copy.deepcopy` would also work but is needlessly expensive for
+    # graphs whose nodes carry large non-`inputs` payloads.
+    workflow = _copy_for_pruning(workflow)
+    warnings: list[str] = []
+    _prune_graph(workflow, node_defs, warnings)
+
+    if not workflow:
+        raise ExpansionError(
+            "workflow has no runnable nodes after pruning; "
+            + (warnings[0] if warnings else "no reason recorded")
+        )
 
     # ---- Validate up front, before emitting anything ----
     #
@@ -449,12 +531,11 @@ def expand_custom(workflow: dict,
     # that a copied node landed under. Used when a downstream input
     # references a slot that was NOT expanded (a normal node output).
     #
-    # `warnings` accumulates schema-choice substitutions and any other
-    # non-fatal diagnostics the walk produces.
+    # `warnings` was created above so the pruning pass could append to
+    # it; the expansion walk below continues to add to the same list.
     builder = _GraphBuilder()
     outputs: dict[tuple[str, int], Any] = {}
     node_map: dict[str, str] = {}
-    warnings: list[str] = []
 
     for nid in order:
         node = workflow[nid]
@@ -791,8 +872,9 @@ def _remap_value(v: Any,
         correctly.
 
     Raises ExpansionError if an edge points at a node that is not in
-    the workflow at all — that is a malformed workflow, not a runtime
-    surprise we should let through.
+    the workflow at all. In practice the pruning pass removes such
+    edges before this runs, so the raise here is a defensive check
+    against callers that skip pruning.
 
     The edge heuristic (two-element list where the first element is a
     string and the second is an int) is the same one ComfyUI uses in
@@ -991,9 +1073,292 @@ def _schema_default(field: Any) -> Any:
     return None
 
 
+def _has_schema_default(field: Any) -> bool:
+    """True iff the schema field can supply a value on its own.
+
+    Mirrors the fallback logic in `_schema_default`, but returns a
+    bool so callers can ask "would this be filled?" without confusing
+    a legitimate `None` default with "no default at all".
+    """
+    if not isinstance(field, list) or not field:
+        return False
+    field_type = field[0]
+    options = (field[1] if len(field) > 1
+               and isinstance(field[1], dict) else {})
+    if "default" in options:
+        return True
+    if isinstance(field_type, list) and field_type:
+        return True
+    if field_type in ("INT", "FLOAT", "BOOL", "STRING"):
+        return True
+    if field_type == "COMBO":
+        choices = options.get("options") or options.get("choices")
+        if isinstance(choices, list) and choices:
+            return True
+    return False
+
+
+# ============================================================================
+#  Node pruning
+# ============================================================================
+
+# Fallback set for when node_defs is unavailable. Only the classes our
+# own tooling-nodes package guarantees to register as outputs. This is
+# not a "bookmark blacklist" — it is a defensive minimum for the case
+# where the daemon is generating without a cached schema.
+_KNOWN_OUTPUT_CLASSES = frozenset({
+    "ETN_KritaOutput",
+    "ETN_KritaSendText",
+})
+
+
+def _copy_for_pruning(workflow: dict) -> dict:
+    """Return a copy of `workflow` that the pruning pass may mutate.
+
+    The pruning pass does exactly two kinds of edit:
+
+      * `del workflow[nid]` on the top-level dict, and
+      * `del inputs[key]` on a node's `inputs` dict.
+
+    It does not touch `class_type`, `_meta`, or any other field on a
+    node. A two-level copy — top-level dict plus a fresh `inputs` dict
+    per node — is therefore sufficient to leave the caller's graph
+    intact, and cheaper than `copy.deepcopy` for nodes that carry
+    large payloads outside `inputs` (e.g. `_meta.handles` records
+    stamped by `kritomatic comfyui convert`).
+
+    Nodes that are not dicts are passed through unchanged; the pruning
+    pass skips them without mutating, and downstream passes treat the
+    workflow as malformed and raise a clear error rather than trying
+    to fix it here.
+    """
+    out: dict = {}
+    for nid, node in workflow.items():
+        if not isinstance(node, dict):
+            out[nid] = node
+            continue
+        node_copy = dict(node)
+        inputs = node.get("inputs")
+        if isinstance(inputs, dict):
+            node_copy["inputs"] = dict(inputs)
+        out[nid] = node_copy
+    return out
+
+
+def _is_output_class(class_type: str,
+                     node_defs: Optional[dict]) -> bool:
+    """True iff the class is a terminal output node.
+
+    Prefers the schema: ComfyUI's `/object_info` marks every output
+    node with `is_output_node` (newer schema) or `output_node` (older
+    schema). Falls back to a small set of classes from the tooling-
+    nodes package, which our daemon always uses as its terminal nodes
+    and which a stale schema cache may not list.
+    """
+    if isinstance(node_defs, dict):
+        spec = node_defs.get(class_type)
+        if isinstance(spec, dict):
+            if spec.get("is_output_node") or spec.get("output_node"):
+                return True
+    return class_type in _KNOWN_OUTPUT_CLASSES
+
+
+def _prune_unreachable_nodes(workflow: dict,
+                             node_defs: Optional[dict],
+                             warnings: list) -> bool:
+    """Drop every node that cannot reach an output node.
+
+    A node is kept if it either *is* an output, or has a path forward
+    through the graph to some output. This is the general form of
+    "strip UI-only helpers": Bookmark (rgthree) nodes, Note nodes,
+    disconnected Reroutes, orphaned Primitives, and any other node
+    that does not contribute to a result all fail the reachability
+    test and are dropped. No class name appears in the rule.
+
+    Returns True iff anything was dropped, so callers can iterate
+    this together with `_prune_unrunnable_nodes` to a fixed point.
+
+    Mutates `workflow` in place. Callers that need the original
+    intact should pass a two-level copy — see `_copy_for_pruning`.
+    """
+    outputs = {
+        nid for nid, node in workflow.items()
+        if _is_output_class(node.get("class_type", ""), node_defs)
+    }
+    if not outputs:
+        # No output node in the graph — cannot decide what "contributes
+        # to a result" means. Leave the graph alone; the schema-based
+        # required-input check downstream may still prune it.
+        return False
+
+    # Reverse-edge map: for each node, the set of nodes whose outputs
+    # feed its inputs.
+    producers: dict[str, set[str]] = {}
+    for nid, node in workflow.items():
+        ps: set[str] = set()
+        for v in (node.get("inputs") or {}).values():
+            if _is_edge(v) and v[0] in workflow:
+                ps.add(v[0])
+        producers[nid] = ps
+
+    keep = set(outputs)
+    stack = list(outputs)
+    while stack:
+        nid = stack.pop()
+        for producer in producers.get(nid, ()):
+            if producer not in keep:
+                keep.add(producer)
+                stack.append(producer)
+
+    dropped = [nid for nid in workflow if nid not in keep]
+    for nid in dropped:
+        cls = workflow[nid].get("class_type", "?")
+        warnings.append(f"dropped unreachable node {nid} ({cls})")
+        del workflow[nid]
+    return bool(dropped)
+
+
+def _prune_unrunnable_nodes(workflow: dict,
+                            node_defs: Optional[dict],
+                            warnings: list) -> bool:
+    """Drop nodes that cannot run, and their downstream consumers.
+
+    ComfyUI's UI→API conversion (both the browser-side "Save (API
+    Format)" and the server-side comfyui-workflow-to-api-converter-
+    endpoint) leaves dangling references when a muted or bypassed
+    node is dropped from the output but its consumers still hold a
+    pointer to it. In the browser exporter the reference is written
+    as a link id; in the endpoint's output it is written as the
+    muted node's id. Either way, the referenced key has no entry in
+    the graph.
+
+    Two conditions are handled:
+
+      * A node whose input is a two-element edge ``[X, Y]`` where
+        ``X`` is not a key in the graph loses that edge. If the input
+        was required and has no schema default, the node itself is
+        then dropped.
+
+      * A node missing a required input that has no schema default is
+        dropped.
+
+    Dropping a node makes every edge to it dangling, which can mark
+    further nodes as unrunnable. This function makes a single pass
+    over the graph; `_prune_graph` iterates it together with the
+    reachability rule so both conditions reach a fixed point.
+
+    Returns True iff anything was dropped.
+
+    Mutates `workflow` in place. Callers that need the original
+    intact should pass a two-level copy — see `_copy_for_pruning`.
+    """
+    changed = False
+    present = set(workflow.keys())
+    for nid in list(workflow.keys()):
+        if nid not in present:
+            continue
+        node = workflow[nid]
+        cls = node.get("class_type", "")
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+
+        required: dict = {}
+        if isinstance(node_defs, dict):
+            spec = node_defs.get(cls)
+            if isinstance(spec, dict):
+                required = (spec.get("input") or {}).get(
+                    "required"
+                ) or {}
+
+        # Drop edges that point at nodes no longer in the graph.
+        for key in list(inputs.keys()):
+            v = inputs[key]
+            if not _is_edge(v):
+                continue
+            if v[0] in present:
+                continue
+            warnings.append(
+                f"dropped edge {nid}.{key} -> missing node "
+                f"{v[0]!r} (from muted/bypassed source)"
+            )
+            del inputs[key]
+            changed = True
+
+        # If a required input is now missing and cannot be filled from
+        # the schema, drop the node. Its consumers will lose their edge
+        # on the next pass.
+        for key, field in required.items():
+            if key in inputs:
+                continue
+            if _has_schema_default(field):
+                continue
+            warnings.append(
+                f"pruned node {nid} ({cls}): required input "
+                f"{key!r} missing, no schema default"
+            )
+            del workflow[nid]
+            present.discard(nid)
+            changed = True
+            break
+
+    return changed
+
+
+def _prune_graph(workflow: dict,
+                 node_defs: Optional[dict],
+                 warnings: list) -> None:
+    """Apply every pruning rule to a fixed point.
+
+    Two rules run in sequence, repeated until neither drops anything:
+
+      1. Unreachable — no forward path to an output node.
+      2. Unrunnable  — a required input that cannot be satisfied
+         (dangling edge + no schema default), or an edge to a node a
+         previous rule already removed.
+
+    Rule 1 runs first so Rule 2 never sees a fresh dangling edge from
+    the muted-or-bypassed class of failure the earlier fix addresses.
+    Rule 2 can drop additional nodes, which can in turn make further
+    nodes unreachable; the loop reruns Rule 1 to catch that.
+    """
+    while True:
+        before = len(workflow)
+        _prune_unreachable_nodes(workflow, node_defs, warnings)
+        _prune_unrunnable_nodes(workflow, node_defs, warnings)
+        if len(workflow) == before:
+            break
+
+
 # ============================================================================
 #  Validation helpers
 # ============================================================================
+
+def _check_node_values_are_objects(workflow: dict) -> None:
+    """Raise if any top-level node value is not a JSON object.
+
+    The API-format contract is a dict keyed by node id, each value a
+    dict carrying at least `class_type`. A stray string, list, or null
+    where a node should be is a malformed file — most likely a
+    hand-edited workflow, a partial export, or a file that went
+    through a lossy transformation.
+
+    Without this check, the failure surfaces deep inside the pruning
+    pass as `AttributeError: 'str' object has no attribute 'get'`,
+    which names neither the file nor the offending key. Catching it
+    here turns the same failure into a clear ExpansionError.
+
+    Raises ExpansionError naming the first offending key.
+    """
+    for nid, node in workflow.items():
+        if isinstance(node, dict):
+            continue
+        raise ExpansionError(
+            f"node {nid!r} is {type(node).__name__}, not an object; "
+            f"the workflow is not in ComfyUI API format. Each top-level "
+            f"key must map to an object with a 'class_type'."
+        )
+
 
 def _check_duplicate_parameter_names(workflow: dict) -> None:
     """Raise if two ETN_Parameter nodes share a `name` widget value.
@@ -1031,9 +1396,10 @@ def _check_duplicate_parameter_names(workflow: dict) -> None:
 def _topological_order(workflow: dict) -> list[str]:
     """Return node ids in dependency order (Kahn's algorithm).
 
-    Edges to nodes not present in `workflow` are ignored here; they are
-    surfaced later by _remap_value as ExpansionError with the offending
-    node id, which is a more useful message than "cycle detected".
+    Edges to nodes not present in `workflow` are ignored here; the
+    pruning pass removes them beforehand, so this only surfaces if a
+    caller bypasses pruning. `_remap_value` still raises on them if
+    they reach the walk.
 
     A genuine cycle — every remaining node has unresolved dependencies —
     is reported with the full set of stuck node ids.

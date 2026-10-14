@@ -37,6 +37,46 @@ pin does not survive a daemon reload; `reload_daemon` drops it along
 with the tracked publisher map, and the next publish from any tab
 re-establishes last-publish-wins.
 
+Source exclusivity
+==================
+The daemon normally follows the browser: every `etn_workflow_published`
+event promotes that graph to the active workflow, last-publish-wins.
+`comfy_load --exclusive true` opts out of that for the duration of a
+file-sourced batch. It sets `_file_exclusive` before assigning the
+active workflow, and from that point until the lock is cleared, any
+browser publish that arrives is recorded (so `comfy_list_publishers`
+and the pin stay current) but not promoted. Without this, a browser
+republish between `comfy_load` and the following `comfy_generate`
+silently replaces the file's graph, and `comfy_generate` runs whatever
+the browser currently has — which is a different workflow, on a
+different node set, and expansion fails on the first edge that no
+longer resolves.
+
+The lock is cleared by any of:
+
+  * `comfy_connect --watch true`: hands control back to the browser.
+    Clears the lock, and — if the active workflow was set by a file
+    load — re-promotes the most recent tracked browser graph (or the
+    pinned publisher's graph, if a pin is set). This is done from the
+    tracked map rather than by waiting for a subscribe replay,
+    because the subscribe replay only fires when the watcher is
+    (re)started; a connect on an already-running watcher produces no
+    replay, and without this re-promotion the file graph would stay
+    active indefinitely.
+
+    If the active workflow is already browser-sourced, connect leaves
+    it alone: a running browser session is already current. If no
+    browser publisher has been tracked this session, connect leaves
+    the file in place rather than emptying the daemon; clearing would
+    leave `comfy_generate` with nothing to run, which is a worse
+    failure mode than continuing with a file the user did load.
+
+  * `comfy_unlock_file`: clears only the lock. The active workflow is
+    left as-is; the next browser publish promotes as normal.
+
+  * `reload_daemon`: drops the handler instance, resetting all state.
+    Same story as the publisher pin — accepted, not persisted.
+
 Layer aliases
 =============
 A workflow that uses `ETN_KritaMaskLayer` / `ETN_KritaImageLayer` names
@@ -150,6 +190,12 @@ The panel script and its data live under `<repo>/data/comfy_panel/`:
     <repo>/data/comfy_panel/panel_configs/*.toml panel configs
     <repo>/data/comfy_panel/history/*.json       generation records
 
+`comfy_load` accepts either a slug (resolved against the workflows
+directory) or an absolute filesystem path (read directly). The path
+form is what the panel uses when the user names a JSON file outside
+the workflows directory, and it is also how the panel consumes the
+converted API-format output produced by `kritomatic comfyui convert`.
+
 Watcher
 =======
 The tooling-nodes extension broadcasts every browser graph edit over a
@@ -166,8 +212,9 @@ Command surface
     comfy_list_publishers
     comfy_pin_publisher    --key?
     comfy_unpin_publisher
+    comfy_unlock_file
     comfy_list_workflows
-    comfy_load             --name <slug>
+    comfy_load             --name <slug-or-path> --exclusive?
     comfy_set_param        --name <param> --value <value>
     comfy_bind_layer_alias --logical_name <n> --actual_name <n>
     comfy_bind_canvas      --source active|layer --layer_name?
@@ -489,6 +536,13 @@ class ComfyUIHandler(AutoDispatchHandler):
         # (comfy_load) rather than a browser publish.
         self._active_workflow_publisher_key: Optional[str] = None
 
+        # File-exclusive lock. Set by `comfy_load --exclusive true`,
+        # cleared by `comfy_connect --watch true` (which hands control
+        # back to the browser) or by `comfy_unlock_file`. While true,
+        # browser publishes are recorded but not promoted. See the
+        # module docstring, "Source exclusivity".
+        self._file_exclusive: bool = False
+
         self._params: dict = {}
         self._layer_aliases: dict[str, str] = {}
 
@@ -525,6 +579,56 @@ class ComfyUIHandler(AutoDispatchHandler):
         self._active_workflow_layers = _extract_layer_requirements(graph)
         self._active_workflow_canvas = _extract_canvas_info(graph)
 
+    def _release_to_browser(self) -> None:
+        """Hand control back to the browser.
+
+        Called after a successful `comfy_connect --watch true` or
+        `comfy_watch --enable true`. Clears the file-exclusive lock so
+        browser publishes promote again.
+
+        If the active workflow was set by a file load, this
+        re-promotes the most recent tracked browser graph (or the
+        pinned publisher's graph, if a pin is set). It does this from
+        `_published_publishers` rather than by waiting for a subscribe
+        replay, because the subscribe replay only fires when the
+        watcher is (re)started; a connect on an already-running
+        watcher produces no replay, and without this re-promotion the
+        file graph would stay active indefinitely.
+
+        If the active workflow is already browser-sourced, the call
+        returns after clearing the lock: a running browser session is
+        already current with its own publishes.
+
+        If the active workflow is a file and no browser publisher has
+        been tracked this session, the file graph stays active.
+        Clearing to empty would leave `comfy_generate` with nothing to
+        run, which is a worse failure mode than continuing with a file
+        the user did load.
+        """
+        self._file_exclusive = False
+
+        if self._active_workflow_source != "file":
+            return
+
+        entries = list(self._published_publishers.values())
+        if not entries:
+            return
+
+        entries.sort(key=lambda e: e["published_at"], reverse=True)
+        entry = entries[0]
+
+        if self._pinned_publisher_key is not None:
+            pinned = self._published_publishers.get(
+                self._pinned_publisher_key
+            )
+            if pinned is not None:
+                entry = pinned
+
+        self._set_active_workflow(
+            entry["workflow_name"], entry["graph"], "browser",
+            publisher_key=entry["key"],
+        )
+
     # ------------------------------------------------------------------
     #  Connection
     # ------------------------------------------------------------------
@@ -545,7 +649,11 @@ class ComfyUIHandler(AutoDispatchHandler):
             "--watch": {"type": "bool", "default": True,
                         "help": "Subscribe to ComfyUI's workflow publish "
                                 "bus so the daemon follows the browser's "
-                                "current graph"},
+                                "current graph. Also clears any "
+                                "file-exclusive lock; if the active "
+                                "workflow was set by a file load, the "
+                                "most recent browser graph is "
+                                "re-promoted."},
             "--subscribe_timeout": {"type": "float", "default": 5.0,
                                     "help": "Seconds to wait for the "
                                             "watcher subscription to be "
@@ -576,6 +684,7 @@ class ComfyUIHandler(AutoDispatchHandler):
                 except ComfyError as e:
                     return {"success": False,
                             "message": f"Watcher unavailable: {e}"}
+                self._release_to_browser()
             return {
                 "success": True,
                 "message": f"Connected to {host}:{port}",
@@ -628,6 +737,7 @@ class ComfyUIHandler(AutoDispatchHandler):
                              "has_tooling_nodes": True,
                              "watching": False},
                 }
+            self._release_to_browser()
 
         msg = f"Connected to {host}:{port} " \
               f"({len(info)} node classes registered)"
@@ -675,6 +785,7 @@ class ComfyUIHandler(AutoDispatchHandler):
             except ComfyError as e:
                 return {"success": False,
                         "message": f"Watcher could not start: {e}"}
+            self._release_to_browser()
             return {"success": True,
                     "message": "Watching for browser workflow publishes"
                                if subscribed
@@ -704,9 +815,11 @@ class ComfyUIHandler(AutoDispatchHandler):
     def _on_workflow_published(self, publisher: dict, graph: dict):
         """Watcher callback. Runs on the watcher thread.
 
-        Records the publisher in `self._published_publishers` and, if
-        no pin is set or the pinned key matches this publisher,
-        promotes its graph to the active workflow.
+        Records the publisher in `self._published_publishers`. Then,
+        unless the file-exclusive lock is set, promotes the graph to
+        the active workflow — subject to the publisher pin. See the
+        module docstring, "Source exclusivity" and "Publisher tracking
+        and pinning".
         """
         key = self._publisher_key(publisher)
         signature = _compute_signature(graph)
@@ -722,6 +835,9 @@ class ComfyUIHandler(AutoDispatchHandler):
             "graph": graph,
             "published_at": time.time(),
         }
+
+        if self._file_exclusive:
+            return
 
         if (self._pinned_publisher_key is None
                 or self._pinned_publisher_key == key):
@@ -757,6 +873,7 @@ class ComfyUIHandler(AutoDispatchHandler):
                 "workflow_seed_wired": (
                     _canvas_seed_is_wired(self._active_workflow_graph or {})
                 ),
+                "workflow_exclusive": self._file_exclusive,
                 "active_batches": active_batches,
                 "watching": (
                     self._client.is_watching()
@@ -932,6 +1049,27 @@ class ComfyUIHandler(AutoDispatchHandler):
         return {"success": True,
                 "message": "No publisher was pinned"}
 
+    @command(
+        category="comfyui",
+        help_text="Clear the file-exclusive lock. Browser publishes "
+                  "resume promoting to the active workflow on their "
+                  "next publish. Does not change the active workflow "
+                  "right now. The lock is also cleared by "
+                  "comfy_connect --watch true.",
+        args={},
+    )
+    def comfy_unlock_file(self, params):
+        was = self._file_exclusive
+        self._file_exclusive = False
+        if was:
+            return {
+                "success": True,
+                "message": "File lock cleared; browser publishes will "
+                           "promote on next publish",
+            }
+        return {"success": True,
+                "message": "No file lock was set"}
+
     # ------------------------------------------------------------------
     #  Workflow management
     # ------------------------------------------------------------------
@@ -960,17 +1098,31 @@ class ComfyUIHandler(AutoDispatchHandler):
         help_text="Load a workflow by slug from the panel's workflows "
                   "directory, or by absolute filesystem path. Clears "
                   "any parameters and layer aliases set by a previous "
-                  "workflow.",
+                  "workflow. With --exclusive true, browser publishes "
+                  "are recorded but do not replace the active workflow "
+                  "until the lock is cleared.",
         args={
             "--name": {"type": "str", "required": True,
                        "help": "Workflow slug, or an absolute path to "
                                "a .json file."},
+            "--exclusive": {"type": "bool", "default": False,
+                            "help": "If true, treat this file as the "
+                                    "exclusive source: browser publishes "
+                                    "are recorded but do not replace "
+                                    "the active workflow until the lock "
+                                    "is cleared by comfy_connect "
+                                    "--watch true or comfy_unlock_file. "
+                                    "Without this, a browser republish "
+                                    "between load and generate silently "
+                                    "replaces the file's graph."},
         },
     )
     def comfy_load(self, params):
         name = params.get("name", "")
         if not name:
             return {"success": False, "message": "No workflow name given"}
+
+        exclusive = bool(params.get("exclusive", False))
 
         # A name that starts with '/' or '~' is a filesystem path, not
         # a slug. The CLI always sends an absolute path when the user
@@ -1020,10 +1172,17 @@ class ComfyUIHandler(AutoDispatchHandler):
                 "message": (
                     f"Workflow {display_name!r} appears to be in "
                     f"ComfyUI's UI format. Export it via "
-                    f"'Save (API Format)' in the ComfyUI menu, which "
+                    f"'Save (API Format)' in the ComfyUI menu, or run "
+                    f"`kritomatic comfyui convert` on the file, which "
                     f"produces the prompt format this handler requires."
                 ),
             }
+
+        # Set the lock before assigning the active workflow, so a
+        # browser publish arriving in the window between the file read
+        # and the assignment cannot slip in and take over. Once the
+        # lock is true, _on_workflow_published stops promoting.
+        self._file_exclusive = exclusive
 
         # File source: publisher_key defaults to None, clearing any
         # previous browser publisher association on the active workflow.
@@ -1036,6 +1195,7 @@ class ComfyUIHandler(AutoDispatchHandler):
             "node_count": len(workflow),
             "source": "file",
             "signature": self._active_workflow_signature,
+            "exclusive": exclusive,
         }
         if is_path:
             result_data["path"] = str(path)
@@ -1043,7 +1203,8 @@ class ComfyUIHandler(AutoDispatchHandler):
         return {
             "success": True,
             "message": f"Loaded workflow {display_name!r} "
-                       f"({len(workflow)} nodes)",
+                       f"({len(workflow)} nodes)"
+                       + (", exclusive" if exclusive else ""),
             "data": result_data,
         }
 
@@ -1218,7 +1379,7 @@ class ComfyUIHandler(AutoDispatchHandler):
     )
     def comfy_generate(self, params):
         """Thin wrapper. Any exception the implementation raises is
-        caught here and returned as a normal error response, with a
+        caught here and returned as an ordinary error response, with a
         full traceback printed to stdout so the source is visible in
         Krita's console.
         """

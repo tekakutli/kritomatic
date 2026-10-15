@@ -77,6 +77,39 @@ The lock is cleared by any of:
   * `reload_daemon`: drops the handler instance, resetting all state.
     Same story as the publisher pin — accepted, not persisted.
 
+Event bus publishing
+====================
+The handler publishes to the daemon's event bus (see
+`kritomatic_daemon/server/event_bus.py`) after every state-mutating
+command, and after every browser publish. The event bus exists so
+that external processes — most immediately, the standalone web panel
+— can subscribe to a live feed of the daemon's state without polling
+`comfy_status` on a timer.
+
+Two triggers, one bus:
+
+  * `execute()` overrides `AutoDispatchHandler.execute()` and
+    publishes after any command whose name is not in
+    `_READ_ONLY_COMMANDS` and whose dispatch succeeded. This covers
+    `comfy_set_param`, `comfy_bind_layer_alias`, `comfy_bind_canvas`,
+    `comfy_bind_selection`, `comfy_load`, `comfy_pin_publisher`,
+    `comfy_unpin_publisher`, `comfy_unlock_file`, `comfy_connect`,
+    and any future state-mutating command, without the author of each
+    command having to remember to publish.
+
+  * `_on_workflow_published()` publishes explicitly, after it has
+    recorded the publisher and (conditionally) promoted the graph.
+    The watcher thread runs outside `execute()`'s call path, so it
+    cannot rely on the override.
+
+Read-only commands are excluded from the `execute()` publish, both to
+avoid noise (`comfy_batches` from the CLI polls this) and to avoid
+recursion (`comfy_status` publishing on itself while the publish code
+path calls `comfy_status` internally).
+
+Publish failures are swallowed. A failure to notify subscribers must
+never break the command that triggered the notification.
+
 Layer aliases
 =============
 A workflow that uses `ETN_KritaMaskLayer` / `ETN_KritaImageLayer` names
@@ -292,6 +325,18 @@ _HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 _SEED_PARAMETER_NAME = "seed"
 _CANVAS_SEED_SLOT = 3
+
+
+# Commands that read state but do not change anything the web panel
+# cares about. Publishing on these would be noise, and comfy_status
+# publishing on itself would recurse.
+_READ_ONLY_COMMANDS = frozenset({
+    "comfy_status",
+    "comfy_batches",
+    "comfy_list_publishers",
+    "comfy_list_workflows",
+    "comfy_history",
+})
 
 
 # ============================================================================
@@ -558,6 +603,51 @@ class ComfyUIHandler(AutoDispatchHandler):
         self._pending: dict[str, _PendingJob] = {}
 
     # ------------------------------------------------------------------
+    #  Dispatch override: publish state changes to the event bus
+    # ------------------------------------------------------------------
+
+    def execute(self, cmd_type, params):
+        """Dispatch a command, then publish new state to the event bus
+        if the command mutated anything the bus subscribers care about.
+
+        Read-only commands are excluded so that polling clients — the
+        web panel does not poll, but `comfy_batches` from the CLI does —
+        do not generate a spurious publish for every read. The set of
+        excluded commands is `_READ_ONLY_COMMANDS`.
+
+        Publishing happens after the command returns, whether it
+        succeeded or failed. A failed `comfy_load` still leaves state
+        untouched, so publishing is harmless; a successful one changes
+        the active workflow and the subscribers need to know. Simpler
+        to publish on both than to enumerate which failures are
+        no-ops.
+        """
+        result = super().execute(cmd_type, params)
+        if (isinstance(result, dict)
+                and result.get("success")
+                and cmd_type not in _READ_ONLY_COMMANDS):
+            self._publish_state_change()
+        return result
+
+    def _publish_state_change(self):
+        """Broadcast the handler's current status to any subscribers of
+        the daemon's event bus.
+
+        Called after every state-mutating command and after every
+        browser publish. The web panel — a separate process — reads
+        from that bus; no polling anywhere in the pipeline.
+        """
+        try:
+            from ..server.event_bus import get_event_bus
+            status = self.comfy_status({})
+            if isinstance(status, dict) and status.get("success"):
+                get_event_bus().publish("state", status.get("data", {}))
+        except Exception:
+            # Best-effort. A publish failure must never break the
+            # command that triggered it.
+            pass
+
+    # ------------------------------------------------------------------
     #  Internal: active-workflow assignment
     # ------------------------------------------------------------------
 
@@ -817,9 +907,12 @@ class ComfyUIHandler(AutoDispatchHandler):
 
         Records the publisher in `self._published_publishers`. Then,
         unless the file-exclusive lock is set, promotes the graph to
-        the active workflow — subject to the publisher pin. See the
-        module docstring, "Source exclusivity" and "Publisher tracking
-        and pinning".
+        the active workflow — subject to the publisher pin. Either
+        way, the new state is published to the event bus so web panel
+        subscribers see it without polling.
+
+        See the module docstring, "Source exclusivity" and "Publisher
+        tracking and pinning".
         """
         key = self._publisher_key(publisher)
         signature = _compute_signature(graph)
@@ -837,12 +930,18 @@ class ComfyUIHandler(AutoDispatchHandler):
         }
 
         if self._file_exclusive:
+            # State changed (a new publisher was recorded) even though
+            # the active workflow did not. Publish so the panel sees
+            # the publisher appear.
+            self._publish_state_change()
             return
 
         if (self._pinned_publisher_key is None
                 or self._pinned_publisher_key == key):
             self._set_active_workflow(full_name, graph, "browser",
                                       publisher_key=key)
+
+        self._publish_state_change()
 
     @command(
         category="comfyui",

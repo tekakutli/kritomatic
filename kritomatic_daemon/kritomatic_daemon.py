@@ -1,5 +1,6 @@
 from krita import *
 from .server.socket_server import WebSocketServer
+from .server.event_server import EventServer
 from .handlers.base import CommandHandler
 from .decorators import command
 from .registry import get_command_registry
@@ -59,17 +60,44 @@ class KritomaticDaemon(Extension):
     def __init__(self, parent):
         super().__init__(parent)
         self.server = None
+        self.event_server = None
         self.handler_box = _HandlerBox(CommandHandler())
 
     def setup(self):
         pass
 
     def createActions(self, window):
-        self.start_server()
+        self.start_servers()
 
-    def start_server(self):
+    def start_servers(self):
         if not self.server:
             self.server = WebSocketServer()
             self.server.command_received.connect(self.handler_box.dispatch)
             self.server.start()
             print("✓ Kritomatic Daemon loaded")
+
+        if not self.event_server:
+            self.event_server = EventServer(
+                port=12347,
+                state_provider=self._current_status,
+            )
+            self.event_server.start()
+
+    def _current_status(self):
+        """Return the current comfy_status payload, or None.
+
+        Used by the event server to give each new subscriber an initial
+        snapshot. Reads through whatever handler is currently installed
+        in the box, so a reload_daemon that swaps the handler tree is
+        transparently picked up.
+        """
+        handler = self.handler_box.handler
+        if handler is None:
+            return None
+        try:
+            result = handler.execute('comfy_status', {})
+            if isinstance(result, dict) and result.get('success'):
+                return result.get('data', {})
+        except Exception:
+            pass
+        return None

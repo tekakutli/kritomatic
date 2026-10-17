@@ -26,6 +26,27 @@ Cancel therefore uses `DaemonConnection.send_cancel_now`, which opens
 its own socket on a fresh thread and sends `comfy_cancel` directly.
 The daemon receives it while the run is still in flight, sets the
 batch's cancel flag, and the run winds itself down.
+
+Layer list freshness
+====================
+The alias combos need a current layer list. Krita provides no signal
+for layer-tree changes (see layers_watcher.py for the full account),
+so `LayersWatcher` uses five event-driven triggers:
+
+  1. Notifier imageCreated/imageClosed (inside LayersWatcher).
+  2. Panel events — this file schedules a refresh from `_on_panel`.
+  3. Docker focusInEvent — this file schedules a refresh directly.
+  4. Combo showPopup — `PanelRenderer.layerRefreshRequested` routes
+     to `LayersWatcher.schedule`.
+  5. Event socket connected — this file schedules a refresh from
+     `_on_conn_state(True)`.
+
+All five collapse into one debounced `layersChanged`, which routes to
+`DaemonConnection.request_layers`. There is no polling.
+
+The one gap, named in layers_watcher.py, is a native-Krita layer add
+performed while no trigger fires and no other interaction happens;
+the next focus or popup open refreshes.
 """
 
 from __future__ import annotations
@@ -39,6 +60,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .connection import DaemonConnection
+from .layers_watcher import LayersWatcher
 from .renderer import PanelRenderer
 
 
@@ -60,17 +82,11 @@ class KritomaticPanel(QDockWidget):
         root_layout.setContentsMargins(6, 6, 6, 6)
         root_layout.setSpacing(6)
 
-        # Connection status strip.
         self._status = QLabel("Connecting to daemon…")
         self._status.setWordWrap(True)
         self._status.setTextFormat(Qt.TextFormat.RichText)
         root_layout.addWidget(self._status)
 
-        # Workflow hint. Shown only when the panel description carries
-        # no workflow section — that is, when the daemon has no active
-        # workflow loaded. Without this, a freshly-launched Krita shows
-        # only run options and the Run/Cancel buttons with no
-        # explanation, which reads as a broken panel.
         self._hint = QLabel("")
         self._hint.setWordWrap(True)
         self._hint.setTextFormat(Qt.TextFormat.RichText)
@@ -81,7 +97,6 @@ class KritomaticPanel(QDockWidget):
         self._hint.hide()
         root_layout.addWidget(self._hint)
 
-        # Scrollable form.
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -93,7 +108,6 @@ class KritomaticPanel(QDockWidget):
         self._scroll.setWidget(self._form_container)
         root_layout.addWidget(self._scroll, 1)
 
-        # Progress log.
         log_label = QLabel("Log")
         log_label.setStyleSheet(
             "color:#888;font-size:0.72rem;"
@@ -120,29 +134,49 @@ class KritomaticPanel(QDockWidget):
         self._conn.runEventReceived.connect(self._on_run_event)
         self._conn.connectionStateChanged.connect(self._on_conn_state)
         self._conn.commandCompleted.connect(self._on_command_completed)
+        self._conn.layersFetched.connect(self._on_layers_fetched)
         self._conn.start()
+
+        self._layers_watcher = LayersWatcher(self)
+        self._layers_watcher.layersChanged.connect(self._on_layers_changed)
+        self._renderer.layerRefreshRequested.connect(
+            self._layers_watcher.schedule)
+        self._conn.request_layers()
 
     # ---- lifecycle ----
 
     def closeEvent(self, event):
+        try:
+            self._layers_watcher.stop()
+        except Exception:
+            pass
         try:
             self._conn.shutdown()
         except Exception:
             pass
         super().closeEvent(event)
 
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        try:
+            self._layers_watcher.schedule()
+        except Exception:
+            pass
+
     # ---- connection signals ----
 
     def _on_conn_state(self, connected: bool) -> None:
         if connected:
             self._status.setText("Connected to daemon.")
+            try:
+                self._layers_watcher.schedule()
+            except Exception:
+                pass
         else:
             self._status.setText("Waiting for daemon event stream…")
         self._update_run_buttons()
 
     def _on_state(self, data: dict) -> None:
-        # The panel description carries everything the docker shows;
-        # state events are accepted but not otherwise rendered.
         pass
 
     def _on_panel(self, description: dict) -> None:
@@ -152,16 +186,21 @@ class KritomaticPanel(QDockWidget):
             self._append_log("err", f"render error: {e}")
         self._update_workflow_hint(description)
         self._update_run_buttons()
+        try:
+            self._layers_watcher.schedule()
+        except Exception:
+            pass
+
+    def _on_layers_changed(self) -> None:
+        self._conn.request_layers()
+
+    def _on_layers_fetched(self, layers: dict) -> None:
+        try:
+            self._renderer.set_layers(layers)
+        except Exception as e:
+            self._append_log("err", f"layers update error: {e}")
 
     def _update_workflow_hint(self, description) -> None:
-        """Show or hide the "no workflow loaded" hint.
-
-        The daemon emits a `workflow` section (a metadata strip) only
-        when a workflow is loaded. Its absence is the definitive signal
-        that the panel description was built from an empty handler
-        state, and the run-options and Run/Cancel sections shown around
-        it are defaults, not a workflow-specific form.
-        """
         has_workflow = False
         if isinstance(description, dict):
             sections = description.get("sections")
@@ -195,8 +234,6 @@ class KritomaticPanel(QDockWidget):
 
     def _on_command_completed(self, request_id: str, ok: bool,
                               summary: dict) -> None:
-        # Cancel requests get their own request_id ("cancel-...") and
-        # are handled separately from the run's own completion.
         if request_id.startswith("cancel-"):
             msg = summary.get("message", "")
             if ok:
@@ -281,9 +318,6 @@ class KritomaticPanel(QDockWidget):
             self._update_run_buttons()
 
         elif key == "cancel":
-            # Bypass the command queue: the run's own comfy_generate
-            # is holding the worker for the whole run duration. See
-            # the module docstring, "Cancel and the command queue".
             if not self._active_run_request_id:
                 self._append_log(
                     "warn", "No run in progress to cancel.",

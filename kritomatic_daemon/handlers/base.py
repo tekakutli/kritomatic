@@ -36,6 +36,15 @@ class CommandHandler(AutoDispatchHandler):
             'panel': PanelHandler(),
         }
 
+        # The panel handler builds its description from the comfyui
+        # state. It learns that state two ways: bus events fire on every
+        # state-mutating comfyui command (keeps it current during a
+        # session), and this puller, which lets `panel_description`
+        # fetch the current state on demand (covers the fresh-Krita case
+        # where no command has fired yet).
+        #
+        # The lambda is deferred, so the comfyui handler only needs to
+        # exist by the time the panel handler calls it, not now.
         self.handlers['panel'].set_comfy_status_puller(
             lambda: self.handlers['comfyui'].comfy_status({})
         )

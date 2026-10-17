@@ -207,7 +207,7 @@ def _handle_daemon_event(event: dict) -> None:
 #  Daemon command helpers
 # ----------------------------------------------------------------------
 
-def _daemon_call(command: dict) -> tuple[bool, str, dict]:
+def _daemon_call(command: dict) -> tuple:
     """Send one command on a fresh connection. Returns (ok, message, data)."""
     client = KritaClient(host=DAEMON_HOST, port=DAEMON_PORT)
     if not client.connect():
@@ -289,15 +289,12 @@ def _do_run(run_id: str, command: dict) -> None:
 
         succ = summary.get("successful", 0)
         fail = summary.get("failed", 0)
-        results = summary.get("results", []) or []
 
         # A cancelled batch reports success=False and carries a
-        # "cancelled" mention in the failure message — either at the
-        # top level ("Batch cancelled (N run(s) not completed)") or in
-        # the per-run result message for a partial cancellation. When
-        # nothing succeeded and the failure carries that marker, the
-        # honest terminal event is "cancelled", not "done with N
-        # failures".
+        # "cancelled" mention in the failure message. When nothing
+        # succeeded and every error is a cancellation, the honest
+        # terminal event is "cancelled", not "done with N failures".
+        results = summary.get("results", []) or []
         cancelled_count = sum(
             1 for r in results
             if r.get("status") == "error"
@@ -321,7 +318,7 @@ def _do_run(run_id: str, command: dict) -> None:
         print(f"[web_panel] run {run_id} finished")
 
 
-def _send_daemon_cancel(batch_id: str) -> tuple[bool, str]:
+def _send_daemon_cancel(batch_id: str) -> tuple:
     client = KritaClient(host=DAEMON_HOST, port=DAEMON_PORT)
     if not client.connect():
         return False, "could not connect to daemon"
@@ -738,8 +735,6 @@ function toBool(v) {
   return false;
 }
 
-// -- status banner --
-
 function renderStatus(s) {
   const el = document.getElementById("status");
   el.className = "status";
@@ -779,8 +774,6 @@ function renderStatus(s) {
   el.innerHTML = lines.map(l => "<div>" + l + "</div>").join("")
     || '<div class="empty">(no state)</div>';
 }
-
-// -- panel rendering --
 
 function buildSectionHtml(section) {
   const kind = section.kind;
@@ -886,14 +879,12 @@ function rebuildPanel(description) {
     btn.addEventListener("click", () => runAction(btn.getAttribute("data-action-key")));
   });
 
-  // Apply visibility rules to any field that declares one.
   for (const s of app.sectionSpecs) {
     for (const f of (s.fields || [])) {
       if (f.key && f.visible_when) evaluateVisibility(f.key);
     }
   }
 
-  // Reapply the running flag now that the buttons exist.
   setRunning(app.running);
 }
 
@@ -958,8 +949,6 @@ function evaluateVisibility(key) {
   if (container) container.style.display = visible ? "" : "none";
 }
 
-// -- form event handlers --
-
 function onFocusIn(e) {
   const key = e.target && e.target.getAttribute
     && e.target.getAttribute("data-field");
@@ -1007,8 +996,6 @@ function readAllValues() {
   }
   return out;
 }
-
-// -- commits --
 
 function commitField(key) {
   const spec = app.specs.get(key);
@@ -1089,8 +1076,6 @@ function revertFields(keys) {
   for (const k of savedFocus) app.focusKeys.add(k);
   for (const k of savedInFlight) app.inFlight.add(k);
 }
-
-// -- actions --
 
 async function runAction(key) {
   const section = app.sectionSpecs.find(
@@ -1232,8 +1217,6 @@ function handleRunEvent(e) {
   }
 }
 
-// -- event stream --
-
 function connectEvents() {
   const es = new EventSource("/api/events");
 
@@ -1271,12 +1254,9 @@ function connectEvents() {
   es.addEventListener("run", handleRunEvent);
 
   es.onerror = function () {
-    // EventSource reconnects automatically. A fresh initial state and
-    // panel arrive on the next `state`/`panel` events.
+    // EventSource reconnects automatically.
   };
 
-  // If nothing has arrived after a few seconds, replace the placeholder
-  // with something more informative than "Loading…".
   setTimeout(function () {
     if (app.firstPanelReceived) return;
     const form = document.getElementById("config-form");
@@ -1290,12 +1270,6 @@ function connectEvents() {
   }, 4000);
 }
 
-// -- boot --
-
-// Attach the form-level listeners once. They live on the persistent
-// #config-form element; its innerHTML is replaced on every rebuild,
-// but the element itself is not, so the listeners survive rebuilds
-// and must not be re-added.
 (function attachFormListeners() {
   const form = document.getElementById("config-form");
   if (!form) return;
@@ -1305,8 +1279,6 @@ function connectEvents() {
   form.addEventListener("keydown", onKeyDown);
 })();
 
-// Render the initial banner immediately so the page is not blank
-// while the first state event is on its way.
 renderStatus(null);
 
 connectEvents();

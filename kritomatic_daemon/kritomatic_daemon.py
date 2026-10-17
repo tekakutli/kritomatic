@@ -69,9 +69,6 @@ class KritomaticDaemon(Extension):
             )
             self.event_server.start()
 
-        # Auto-pull the currently-published browser workflow exactly
-        # once, after the servers are up. See _auto_pull_on_startup for
-        # why this works and when it does not.
         if not self._auto_pull_started:
             self._auto_pull_started = True
             threading.Thread(
@@ -83,48 +80,14 @@ class KritomaticDaemon(Extension):
     def _auto_pull_on_startup(self):
         """Pull the currently-published browser workflow, once, at startup.
 
-        The daemon's workflow state is in-memory; a Krita restart
-        wipes it. The user's last-used workflow is typically the graph
-        currently published by a ComfyUI browser tab, and the
-        tooling-nodes package's WorkflowExchange will replay that graph
-        to any client that subscribes.
-
-        So: at startup, call comfy_connect with watch=true. The
-        subscribe handshake triggers the replay; the daemon receives
-        `etn_workflow_published`, promotes the graph to active
-        workflow, and the panel description re-publishes with the
-        workflow's parameters. By the time the user looks at the
-        docker, the panel has the workflow's sections.
-
-        This works only when ComfyUI is running and has kept its
-        in-memory publisher record since the last browser publish. If
-        ComfyUI was restarted since then, its `_publishers` dict is
-        empty, nothing is replayed, and the panel stays empty until
-        the browser tab publishes again (which happens on any graph
-        edit). That limitation is in ComfyUI's tooling-nodes package,
-        not here; the daemon cannot conjure a workflow it never saw.
-
-        Retry window
-        ------------
-        ComfyUI may not be up yet when Krita starts: the user may have
-        launched Krita first, or ComfyUI may take longer to initialise.
-        The auto-pull therefore retries for up to 60 seconds (30
-        attempts, 2s apart, plus the 1s initial delay). That covers
-        "user starts ComfyUI within a minute of Krita". Beyond that,
-        the panel logs `gave up` and stays on the "no workflow"
-        message; a manual `kritomatic comfyui panel run` or a browser
-        publish will recover it.
-
-        Once the subscribe succeeds, the replay arrives asynchronously
-        on the daemon's own watcher thread. The wait loop below gives
-        the replay up to 5 seconds to reach `_active_workflow_name`; if
-        it does, this logs the restored workflow. If it doesn't, the
-        subscribe still succeeded, but ComfyUI had nothing cached to
-        replay.
+        See the module's inline comment about the retry window: 30
+        attempts at 2s intervals (plus the 1s startup delay) covers
+        "user starts ComfyUI within ~60 seconds of Krita". After a
+        successful subscribe the method waits up to 5s for the replay
+        to actually reach `_active_workflow_name`, because the replay
+        is asynchronous and can be slow under load.
         """
-        time.sleep(1.0)  # let the event server bind, and let the
-                         # docker's initial connect complete first so
-                         # the panel starts empty and then updates
+        time.sleep(1.0)
 
         handler = self.handler_box.handler
         if handler is None:
@@ -153,11 +116,6 @@ class KritomaticDaemon(Extension):
                 continue
 
             if result.get("success") and (result.get("data") or {}).get("subscribed", False):
-                # Subscribed. Now wait up to 5s for the replay to land
-                # on the daemon's state. The replay is asynchronous and
-                # arrives on the watcher thread; without this wait the
-                # status check below would almost always see an empty
-                # workflow even when a replay is coming.
                 for _ in range(5):
                     time.sleep(1.0)
                     status = comfy.comfy_status({})
@@ -181,13 +139,6 @@ class KritomaticDaemon(Extension):
         print("[kritomatic] auto-pull: gave up after 30 attempts")
 
     def _current_status(self):
-        """Return the current comfy_status payload, or None.
-
-        Used by the event server to give each new subscriber an initial
-        snapshot. Reads through whatever handler is currently installed
-        in the box, so a reload_daemon that swaps the handler tree is
-        transparently picked up.
-        """
         handler = self.handler_box.handler
         if handler is None:
             return None
@@ -200,7 +151,6 @@ class KritomaticDaemon(Extension):
         return None
 
     def _current_panel(self):
-        """Return the current panel description, or None."""
         handler = self.handler_box.handler
         if handler is None:
             return None

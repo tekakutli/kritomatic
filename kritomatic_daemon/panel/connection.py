@@ -17,11 +17,26 @@ The corollary is that a command sent while the worker is busy waits.
 For long-running commands (comfy_generate holds the worker for the
 whole duration of the run), a queued follow-up would never be
 delivered until the run finished — which is exactly wrong for a
-cancel. `send_cancel_now` therefore bypasses the queue entirely: it
-opens its own socket on a fresh thread, sends one `comfy_cancel`,
-reads the single reply, and closes. The daemon's command server is
-per-connection and stateless across calls, so nothing about the run's
-own connection is disturbed.
+cancel or for a read.
+
+Two methods therefore bypass the queue and open their own socket
+per call:
+
+  send_cancel_now(batch_id, request_id)
+  request_layers()
+
+Both run on their own background thread, send one command, read one
+line, and close. The daemon's command server is per-connection and
+stateless across calls, so a fresh socket is safe, and the run's own
+socket is undisturbed.
+
+`request_layers` sends two commands — `list_layers --all` and
+`comfy_list_recent_aliases` — on **two separate sockets**, one after
+the other. That is intentional: the daemon's socket server's inner
+loop parses each received chunk as one JSON object, so two commands
+concatenated on one socket would fail to parse. Two sequential
+sockets avoid the problem with a bounded, negligible cost on
+localhost.
 """
 
 from __future__ import annotations
@@ -32,6 +47,8 @@ import socket
 import threading
 
 from PyQt6.QtCore import QObject, pyqtSignal
+
+from ..utils.layer_types import IMAGE_LAYER_TYPES, MASK_LAYER_TYPES
 
 
 EVENT_HOST = "localhost"
@@ -54,6 +71,8 @@ class DaemonConnection(QObject):
       connectionStateChanged(bool) — event socket up/down
       commandCompleted(str, bool, dict)
                                    — (request_id, ok, summary)
+      layersFetched(dict)          — {"image": [...], "mask": [...],
+                                      "recent": [...]}
     """
 
     stateReceived = pyqtSignal(dict)
@@ -61,6 +80,7 @@ class DaemonConnection(QObject):
     runEventReceived = pyqtSignal(dict)
     connectionStateChanged = pyqtSignal(bool)
     commandCompleted = pyqtSignal(str, bool, dict)
+    layersFetched = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -69,6 +89,8 @@ class DaemonConnection(QObject):
         self._event_thread = None
         self._command_thread = None
         self._shutting_down = False
+
+        self._last_layers: tuple = ()
 
     # -- lifecycle --
 
@@ -98,71 +120,133 @@ class DaemonConnection(QObject):
             return
         self._command_queue.put((request_id, bundle))
 
+    # -- out-of-band single-command fetches --
+
+    @staticmethod
+    def _fetch_one(command_dict: dict, timeout: float = 5.0):
+        """Open a fresh socket, send one command, read one line,
+        close, return the parsed reply or None.
+
+        The daemon's socket server parses each incoming chunk as one
+        JSON object; one command per socket is what it expects. See
+        the module docstring for the two-command case.
+        """
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((COMMAND_HOST, COMMAND_PORT))
+            sock.settimeout(None)
+            sock.sendall(
+                (json.dumps(command_dict) + "\n").encode("utf-8")
+            )
+            buffer = b""
+            while b"\n" not in buffer:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    return None
+                buffer += chunk
+            line = buffer.split(b"\n", 1)[0]
+            return json.loads(line.decode("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
     def send_cancel_now(self, batch_id: str, request_id: str) -> None:
-        """Send a `comfy_cancel` on a fresh socket, on a background thread.
-
-        Bypasses the command queue so the cancel reaches the daemon
-        while a long-running `comfy_generate` is still in flight on the
-        queue's worker. The daemon's command server is per-connection
-        and stateless across calls, so a fresh connection is safe.
-
-        The single-command form (`{"type": "comfy_cancel", "batch_id":
-        ...}`, no `commands` wrapper) is used so the daemon replies with
-        exactly one line. This thread reads that line, emits
-        `commandCompleted`, and exits.
+        """Send a `comfy_cancel` on a fresh socket, on a background
+        thread. Bypasses the command queue so the cancel reaches the
+        daemon while a long-running `comfy_generate` is still in
+        flight.
         """
         def _run():
-            sock = None
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(10.0)
-                sock.connect((COMMAND_HOST, COMMAND_PORT))
-                sock.settimeout(None)
-
-                command = {"type": "comfy_cancel", "batch_id": batch_id}
-                sock.sendall((json.dumps(command) + "\n").encode("utf-8"))
-
-                buffer = b""
-                while b"\n" not in buffer:
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        break
-                    buffer += chunk
-
-                if not buffer:
-                    self.commandCompleted.emit(
-                        request_id, False,
-                        {"status": "error",
-                         "message": "no response from daemon"},
-                    )
-                    return
-
-                line = buffer.split(b"\n", 1)[0]
-                try:
-                    summary = json.loads(line.decode("utf-8"))
-                except Exception:
-                    summary = {"status": "error",
-                               "message": "invalid response from daemon"}
-
-                ok = summary.get("status") == "success"
-                self.commandCompleted.emit(request_id, ok, summary)
-
-            except OSError as e:
+            summary = self._fetch_one(
+                {"type": "comfy_cancel", "batch_id": batch_id}
+            )
+            if summary is None:
                 self.commandCompleted.emit(
                     request_id, False,
                     {"status": "error",
-                     "message": f"cancel socket failed: {e}"},
+                     "message": "no response from daemon"},
                 )
-            finally:
-                if sock is not None:
-                    try:
-                        sock.close()
-                    except OSError:
-                        pass
+                return
+            ok = summary.get("status") == "success"
+            self.commandCompleted.emit(request_id, ok, summary)
 
         threading.Thread(
             target=_run,
             name="kritomatic-cancel",
+            daemon=True,
+        ).start()
+
+    def request_layers(self) -> None:
+        """Fetch the layer list and recent aliases, classify, emit
+        `layersFetched({"image": [...], "mask": [...], "recent": [...]})`.
+
+        Runs on its own background thread. Sends each command on its
+        own socket (see the module docstring) so the two do not
+        concatenate on one wire. Diffed against the last fetched
+        payload to suppress redundant emits when the layer tree and
+        the recent-aliases list are both unchanged.
+
+        `list_layers` is called with `all=True`: the default walk
+        recurses only into groups, which hides masks — a selection
+        mask or a transparency mask is a child of a paint layer, not
+        of a group. Without `all=True` the mask bucket is always empty
+        and mask alias combos have no items.
+        """
+        def _run():
+            layers_resp = self._fetch_one(
+                {"type": "list_layers", "all": True}
+            )
+            recent_resp = self._fetch_one(
+                {"type": "comfy_list_recent_aliases"}
+            )
+
+            image_names: list = []
+            mask_names: list = []
+            if layers_resp is not None:
+                data = layers_resp.get("data") or {}
+                for entry in (data.get("layers") or []):
+                    name = entry.get("name") or ""
+                    ltype = entry.get("type") or ""
+                    if not name:
+                        continue
+                    if ltype in IMAGE_LAYER_TYPES:
+                        image_names.append(name)
+                    elif ltype in MASK_LAYER_TYPES:
+                        mask_names.append(name)
+
+            recent_names: list = []
+            if recent_resp is not None:
+                data = recent_resp.get("data") or {}
+                raw = data.get("recent_aliases") or []
+                if isinstance(raw, list):
+                    recent_names = [str(a) for a in raw
+                                    if isinstance(a, str)]
+
+            new_signature = (
+                tuple(image_names),
+                tuple(mask_names),
+                tuple(recent_names),
+            )
+            if new_signature == self._last_layers:
+                return
+            self._last_layers = new_signature
+
+            self.layersFetched.emit({
+                "image": image_names,
+                "mask": mask_names,
+                "recent": recent_names,
+            })
+
+        threading.Thread(
+            target=_run,
+            name="kritomatic-layers-fetch",
             daemon=True,
         ).start()
 

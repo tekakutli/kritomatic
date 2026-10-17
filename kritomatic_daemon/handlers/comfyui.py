@@ -55,68 +55,42 @@ longer resolves.
 The lock is cleared by any of:
 
   * `comfy_connect --watch true`: hands control back to the browser.
-    Clears the lock, and — if the active workflow was set by a file
-    load — re-promotes the most recent tracked browser graph (or the
-    pinned publisher's graph, if a pin is set). This is done from the
-    tracked map rather than by waiting for a subscribe replay,
-    because the subscribe replay only fires when the watcher is
-    (re)started; a connect on an already-running watcher produces no
-    replay, and without this re-promotion the file graph would stay
-    active indefinitely.
-
-    If the active workflow is already browser-sourced, connect leaves
-    it alone: a running browser session is already current. If no
-    browser publisher has been tracked this session, connect leaves
-    the file in place rather than emptying the daemon; clearing would
-    leave `comfy_generate` with nothing to run, which is a worse
-    failure mode than continuing with a file the user did load.
-
-  * `comfy_unlock_file`: clears only the lock. The active workflow is
-    left as-is; the next browser publish promotes as normal.
-
+  * `comfy_unlock_file`: clears only the lock.
   * `reload_daemon`: drops the handler instance, resetting all state.
-    Same story as the publisher pin — accepted, not persisted.
 
 Event bus publishing
 ====================
-The handler publishes to the daemon's event bus (see
-`kritomatic_daemon/server/event_bus.py`) after every state-mutating
-command, and after every browser publish. The event bus exists so
-that external processes — most immediately, the standalone web panel
-— can subscribe to a live feed of the daemon's state without polling
-`comfy_status` on a timer.
-
-Two triggers, one bus:
+The handler publishes to the daemon's event bus after every
+state-mutating command, and after every browser publish. Two triggers,
+one bus:
 
   * `execute()` overrides `AutoDispatchHandler.execute()` and
     publishes after any command whose name is not in
-    `_READ_ONLY_COMMANDS` and whose dispatch succeeded. This covers
-    `comfy_set_param`, `comfy_bind_layer_alias`, `comfy_bind_canvas`,
-    `comfy_bind_selection`, `comfy_load`, `comfy_pin_publisher`,
-    `comfy_unpin_publisher`, `comfy_unlock_file`, `comfy_connect`,
-    and any future state-mutating command, without the author of each
-    command having to remember to publish.
+    `_READ_ONLY_COMMANDS` and whose dispatch succeeded.
 
   * `_on_workflow_published()` publishes explicitly, after it has
     recorded the publisher and (conditionally) promoted the graph.
-    The watcher thread runs outside `execute()`'s call path, so it
-    cannot rely on the override.
-
-Read-only commands are excluded from the `execute()` publish, both to
-avoid noise (`comfy_batches` from the CLI polls this) and to avoid
-recursion (`comfy_status` publishing on itself while the publish code
-path calls `comfy_status` internally).
 
 Publish failures are swallowed. A failure to notify subscribers must
 never break the command that triggered the notification.
 
-Layer aliases
-=============
+Layer aliases and the recent-aliases file
+=========================================
 A workflow that uses `ETN_KritaMaskLayer` / `ETN_KritaImageLayer` names
 a layer in the document by a string. The handler keeps a per-run map
 from the workflow's declared names to actual document names, set by
-`comfy_bind_layer_alias`. The map is consulted when reading the layer
-out of the document; the workflow graph is not touched.
+`comfy_bind_layer_alias`.
+
+Alongside the per-run map, the handler persists a small global history
+of every *actual_name* the user has typed into an alias field, at
+`<panel_dir>/recent_aliases.json`. The docker's layer-alias dropdowns
+read this via `comfy_list_recent_aliases` and order their items so
+recently-aliased layers appear first. The file survives Krita
+restarts, `comfy_load`, and workflow swaps — it is historical, not
+current. It is capped at 50 entries. There is no per-kind split: the
+docker's dropdowns intersect the flat list against the kind-appropriate
+bucket, so an alias for a mask layer never appears at the top of an
+image dropdown.
 
 Output nodes
 ============
@@ -138,103 +112,32 @@ handler runs two phases:
   one WebSocket. As each prompt completes, the client invokes a
   callback that pastes its result into the document immediately.
 
-Concurrent batches
-==================
-Multiple batches can run at once, each started by a different caller.
-Their phases may interleave: phase 1 of batch B can run while phase 2
-of batch A holds the client lock. The client's single-flight lock
-guarantees only one phase 2 is on ComfyUI at a time.
-
 Batch tracking
 ==============
 Every `comfy_generate` call registers a `_BatchRecord` in
-`self._batches`, keyed by the batch id the caller supplied. The record
-is visible to `comfy_batches` (and by extension to
-`kritomatic comfyui panel queue`) from the moment the batch starts
-until it returns.
-
-A `_BatchRecord` holds:
-
-  - static: batch_id, workflow_name, requested_count, total_runs,
-    base_seed, output_name, started_at, cancel_event
-  - dynamic: current_phase, current_run_index, and run_records (a list
-    the batch loop appends to as each run reaches a terminal state)
-
-`comfy_cancel` looks up the record by batch id and sets its cancel
-event. `comfy_batches` reads the records to answer "what is running
-right now". The two share `self._batches_lock` for the dict itself;
-individual dynamic fields are read without a lock, which is safe here
-because every one of them is either a scalar (int, str) or a list the
-reader only measures by `len()`.
+`self._batches`, keyed by the batch id the caller supplied.
 
 Cancellation
 ============
 Each batch registers a `threading.Event` inside its `_BatchRecord`.
 `comfy_cancel --batch_id X` sets only X's event; `comfy_cancel` with
-no id sets all of them. A panel's Ctrl+C handler sends its own batch
-id, so cancelling one batch leaves any concurrently-running batch
-untouched.
-
-Both phases observe the batch's own event:
-
-  Phase 1 checks it at the top of each iteration. Once set, the
-  remaining runs are marked cancelled and phase 1 stops.
-
-  Phase 2 passes the event's `is_set` to `client.generate_batch` as
-  `should_stop`. The batch loop checks it at the top of every read
-  iteration and between lock-acquisition attempts. Once set, every
-  prompt that has not yet completed is marked cancelled, ComfyUI is
-  asked to interrupt the current prompt and drop the queued ones, and
-  the batch returns.
-
-`comfy_cancel` never touches ComfyUI directly for a batch cancel: it
-just sets the flag, and the batch loop calls `interrupt` /
-`cancel_queued` when it notices. This is what keeps two batches from
-interfering with each other's ComfyUI-side work.
-
-Cancel is best-effort, not transactional: layers already pasted stay
-in the document. Undo is the user's responsibility.
+no id sets all of them. Cancel is best-effort, not transactional:
+layers already pasted stay in the document.
 
 Document lifetime
 =================
 Krita recreates the Python `Document` wrapper for the same underlying
 document across certain operations, and it also caches stale wrappers
-for `Krita.instance().activeDocument()` after those recreations. A
-`Document` reference obtained before such an event may point at a
-deleted C++ object and raise "wrapped C/C++ object of type Document has
-been deleted" on the next method call.
-
-The batch holds a document reference for the entire duration of phase
-2. Because phase 2 includes pastes that call `refreshProjection`, the
-reference can become stale between runs. The paste callback re-resolves
-a live document from the (fileName, name) key captured at prepare
-time, falling back to the captured reference only if the fresh lookup
-fails.
-
-`comfy_generate` itself is a thin wrapper around `_comfy_generate_impl`.
-The wrapper catches any exception the implementation raises, prints its
-full traceback to stdout, and returns an ordinary error response.
+for `Krita.instance().activeDocument()` after those recreations. The
+paste callback re-resolves a live document from the (fileName, name)
+key captured at prepare time.
 
 Paths
 =====
-The panel script and its data live under `<repo>/data/comfy_panel/`:
-
     <repo>/data/comfy_panel/workflows/*.json     workflow definitions
     <repo>/data/comfy_panel/panel_configs/*.toml panel configs
     <repo>/data/comfy_panel/history/*.json       generation records
-
-`comfy_load` accepts either a slug (resolved against the workflows
-directory) or an absolute filesystem path (read directly). The path
-form is what the panel uses when the user names a JSON file outside
-the workflows directory, and it is also how the panel consumes the
-converted API-format output produced by `kritomatic comfyui convert`.
-
-Watcher
-=======
-The tooling-nodes extension broadcasts every browser graph edit over a
-subscription bus. `comfy_connect` starts the watcher and waits for the
-subscription to be live before returning. `comfy_watch --enable false`
-stops it.
+    <repo>/data/comfy_panel/recent_aliases.json  alias history
 
 Command surface
 ===============
@@ -250,6 +153,7 @@ Command surface
     comfy_load             --name <slug-or-path> --exclusive?
     comfy_set_param        --name <param> --value <value>
     comfy_bind_layer_alias --logical_name <n> --actual_name <n>
+    comfy_list_recent_aliases
     comfy_bind_canvas      --source active|layer --layer_name?
     comfy_bind_selection   --source global|none|layer --layer_name?
                            --context entire_image|automatic|mask_bounds
@@ -318,6 +222,7 @@ _REPO_ROOT = _HANDLER_DIR.parent.parent
 _PANEL_DIR = _REPO_ROOT / "data" / "comfy_panel"
 _WORKFLOW_DIR = _PANEL_DIR / "workflows"
 _HISTORY_DIR = _PANEL_DIR / "history"
+_RECENT_ALIASES_PATH = _PANEL_DIR / "recent_aliases.json"
 
 _WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
 _HISTORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -325,6 +230,7 @@ _HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 _SEED_PARAMETER_NAME = "seed"
 _CANVAS_SEED_SLOT = 3
+_RECENT_ALIASES_CAP = 50
 
 
 # Commands that read state but do not change anything the web panel
@@ -336,7 +242,51 @@ _READ_ONLY_COMMANDS = frozenset({
     "comfy_list_publishers",
     "comfy_list_workflows",
     "comfy_history",
+    "comfy_list_recent_aliases",
 })
+
+
+# ============================================================================
+#  Recent-aliases persistence
+# ============================================================================
+
+def _load_recent_aliases() -> list:
+    """Load the recent-alias history from disk.
+
+    Returns an empty list when the file does not exist, when it does
+    not parse, or when its shape is unexpected. A missing or malformed
+    history is a supported state; the docker just shows its dropdowns
+    without ordering.
+    """
+    try:
+        if not _RECENT_ALIASES_PATH.is_file():
+            return []
+        data = json.loads(_RECENT_ALIASES_PATH.read_text(encoding="utf-8"))
+        aliases = data.get("recent_aliases")
+        if isinstance(aliases, list):
+            return [str(a) for a in aliases if isinstance(a, str)][
+                :_RECENT_ALIASES_CAP
+            ]
+    except Exception:
+        pass
+    return []
+
+
+def _save_recent_aliases(aliases: list) -> None:
+    """Persist the recent-alias history. Best-effort; failures are
+    swallowed. The in-memory list remains authoritative for this
+    session even if the write fails."""
+    try:
+        _RECENT_ALIASES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _RECENT_ALIASES_PATH.write_text(
+            json.dumps(
+                {"version": 1, "recent_aliases": list(aliases)},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 
 # ============================================================================
@@ -347,23 +297,12 @@ class _BatchRecord:
     """Live state of one `comfy_generate` call.
 
     Held in `ComfyUIHandler._batches`, keyed by batch id, from the
-    moment the batch starts until the moment it returns. `comfy_batches`
-    reads this to answer "what is currently running", and `comfy_cancel`
-    looks up the cancel event by batch id.
-
-    Static fields are set at construction and never change. Dynamic
-    fields are updated by the batch loop as it moves through phases;
-    they are read by `comfy_batches` from a different thread without a
-    lock. That is safe here because every dynamic field is either a
-    scalar (int, str) or a list the reader only measures by `len()`.
-    Do not promote a dynamic field to a container that the reader
-    would have to iterate or index into; that would need a lock.
+    moment the batch starts until the moment it returns.
     """
 
     def __init__(self, batch_id: str, workflow_name: str,
                  requested_count: int, total_runs: int,
                  base_seed: int, output_name: Optional[str]):
-        # Static, set once.
         self.batch_id = batch_id
         self.workflow_name = workflow_name
         self.requested_count = requested_count
@@ -373,18 +312,6 @@ class _BatchRecord:
         self.started_at = time.time()
         self.cancel_event = threading.Event()
 
-        # Dynamic, updated by the batch loop.
-        #
-        # phase runs through:
-        #   "preparing" — phase 1 in progress
-        #   "running"   — phase 2 in progress
-        #   "finalizing" — writing history, building the response
-        #
-        # current_run_index tracks the run being prepared during phase
-        # 1. It is not meaningful in phase 2.
-        #
-        # run_records is the same list the batch loop appends to. The
-        # reader measures it by `len()`; it never iterates it.
         self.current_phase = "preparing"
         self.current_run_index = 0
         self.run_records: list[dict] = []
@@ -415,8 +342,8 @@ def _extract_parameters(graph: dict) -> list[dict]:
 
 def _extract_layer_requirements(graph: dict) -> dict:
     """Return the named layers the workflow expects in the document."""
-    image_layers: set[str] = set()
-    mask_layers: set[str] = set()
+    image_layers: set = set()
+    mask_layers: set = set()
     for node in graph.values():
         cls = node.get("class_type", "")
         if cls not in ("ETN_KritaImageLayer", "ETN_KritaMaskLayer"):
@@ -526,9 +453,9 @@ class _PendingJob:
         self.result: Optional[GenerationResult] = None
         self.error: Optional[Exception] = None
         self.document = None
-        self.document_key: tuple[str, str] = ("", "")
+        self.document_key: tuple = ("", "")
         self.started_at = time.time()
-        self.warnings: list[str] = []
+        self.warnings: list = []
 
 
 # ============================================================================
@@ -546,17 +473,14 @@ class ComfyUIHandler(AutoDispatchHandler):
         self._client: Optional[ComfyClient] = None
         self._object_info: Optional[dict] = None
 
-        # Per-batch records, keyed by batch id. The lock guards the
-        # dict itself; individual record fields are read without a
-        # lock (see _BatchRecord's docstring for why that is safe).
-        self._batches: dict[str, _BatchRecord] = {}
+        self._batches: dict = {}
         self._batches_lock = threading.Lock()
 
         self._active_workflow_name: Optional[str] = None
         self._active_workflow_graph: Optional[dict] = None
         self._active_workflow_source: Optional[str] = None
         self._active_workflow_signature: Optional[str] = None
-        self._active_workflow_parameters: list[dict] = []
+        self._active_workflow_parameters: list = []
         self._active_workflow_layers: dict = {"image_layers": [],
                                               "mask_layers": []}
         self._active_workflow_canvas: dict = {
@@ -566,30 +490,21 @@ class ComfyUIHandler(AutoDispatchHandler):
             "selection_padding": 0,
         }
 
-        # Browser publishers the daemon has heard from this session,
-        # keyed by a stable publisher key (the tooling-nodes extension's
-        # `id`, which is ComfyUI's client id for the browser tab). Each
-        # entry stores the last graph that publisher sent, so pinning
-        # can re-promote it without waiting for a new publish.
-        self._published_publishers: dict[str, dict] = {}
-        # If set, only publishes from this publisher key promote to the
-        # active workflow. Cleared by comfy_unpin_publisher or by a
-        # reload_daemon.
+        self._published_publishers: dict = {}
         self._pinned_publisher_key: Optional[str] = None
-        # Which publisher (if any) is currently driving the active
-        # workflow. None when the active workflow came from a file
-        # (comfy_load) rather than a browser publish.
         self._active_workflow_publisher_key: Optional[str] = None
 
-        # File-exclusive lock. Set by `comfy_load --exclusive true`,
-        # cleared by `comfy_connect --watch true` (which hands control
-        # back to the browser) or by `comfy_unlock_file`. While true,
-        # browser publishes are recorded but not promoted. See the
-        # module docstring, "Source exclusivity".
         self._file_exclusive: bool = False
 
         self._params: dict = {}
-        self._layer_aliases: dict[str, str] = {}
+        self._layer_aliases: dict = {}
+
+        # Recent-alias history. Loaded once at construction; updated
+        # on every `comfy_bind_layer_alias`. Not cleared on
+        # `comfy_load` or on workflow swap: the ordering it enables is
+        # historical, not tied to the current workflow.
+        self._recent_aliases: list = _load_recent_aliases()
+        self._recent_aliases_lock = threading.Lock()
 
         self._canvas_source: str = "active"
         self._canvas_layer: Optional[str] = None
@@ -600,7 +515,7 @@ class ComfyUIHandler(AutoDispatchHandler):
 
         self._last_result: Optional[GenerationResult] = None
         self._last_document = None
-        self._pending: dict[str, _PendingJob] = {}
+        self._pending: dict = {}
 
     # ------------------------------------------------------------------
     #  Dispatch override: publish state changes to the event bus
@@ -609,18 +524,6 @@ class ComfyUIHandler(AutoDispatchHandler):
     def execute(self, cmd_type, params):
         """Dispatch a command, then publish new state to the event bus
         if the command mutated anything the bus subscribers care about.
-
-        Read-only commands are excluded so that polling clients — the
-        web panel does not poll, but `comfy_batches` from the CLI does —
-        do not generate a spurious publish for every read. The set of
-        excluded commands is `_READ_ONLY_COMMANDS`.
-
-        Publishing happens after the command returns, whether it
-        succeeded or failed. A failed `comfy_load` still leaves state
-        untouched, so publishing is harmless; a successful one changes
-        the active workflow and the subscribers need to know. Simpler
-        to publish on both than to enumerate which failures are
-        no-ops.
         """
         result = super().execute(cmd_type, params)
         if (isinstance(result, dict)
@@ -632,10 +535,6 @@ class ComfyUIHandler(AutoDispatchHandler):
     def _publish_state_change(self):
         """Broadcast the handler's current status to any subscribers of
         the daemon's event bus.
-
-        Called after every state-mutating command and after every
-        browser publish. The web panel — a separate process — reads
-        from that bus; no polling anywhere in the pipeline.
         """
         try:
             from ..server.event_bus import get_event_bus
@@ -643,8 +542,6 @@ class ComfyUIHandler(AutoDispatchHandler):
             if isinstance(status, dict) and status.get("success"):
                 get_event_bus().publish("state", status.get("data", {}))
         except Exception:
-            # Best-effort. A publish failure must never break the
-            # command that triggered it.
             pass
 
     # ------------------------------------------------------------------
@@ -653,30 +550,7 @@ class ComfyUIHandler(AutoDispatchHandler):
 
     def _set_active_workflow(self, name: str, graph: dict, source: str,
                              publisher_key: Optional[str] = None) -> None:
-        """Assign the active workflow and every derived field together.
-
-        `publisher_key` identifies which browser publisher this graph
-        came from, if any. It is None for `comfy_load` (file source),
-        which is correct: a file load is not associated with a
-        browser tab.
-
-        Per-workflow state (`_params`, `_layer_aliases`) is cleared
-        when the incoming graph's signature differs from the current
-        active workflow's signature. Same-signature re-publishes (the
-        browser's `graphChanged` event fires on every node edit, most
-        of which do not change the workflow's interface) preserve the
-        user's typed values; a workflow swap clears them so a value
-        typed under a previous workflow does not silently carry over
-        to a new one whose parameter names happen to overlap.
-
-        This is the single place per-workflow state is reset on a
-        browser-side workflow change. `comfy_load` additionally
-        clears unconditionally after calling this, so "load the same
-        file twice" resets params even when the signature matches —
-        that is the semantic difference between "load" (a fresh
-        session of this workflow) and "publish" (an update to the
-        currently-edited workflow).
-        """
+        """Assign the active workflow and every derived field together."""
         new_signature = _compute_signature(graph)
         if (self._active_workflow_signature is not None
                 and new_signature != self._active_workflow_signature):
@@ -693,31 +567,7 @@ class ComfyUIHandler(AutoDispatchHandler):
         self._active_workflow_canvas = _extract_canvas_info(graph)
 
     def _release_to_browser(self) -> None:
-        """Hand control back to the browser.
-
-        Called after a successful `comfy_connect --watch true` or
-        `comfy_watch --enable true`. Clears the file-exclusive lock so
-        browser publishes promote again.
-
-        If the active workflow was set by a file load, this
-        re-promotes the most recent tracked browser graph (or the
-        pinned publisher's graph, if a pin is set). It does this from
-        `_published_publishers` rather than by waiting for a subscribe
-        replay, because the subscribe replay only fires when the
-        watcher is (re)started; a connect on an already-running
-        watcher produces no replay, and without this re-promotion the
-        file graph would stay active indefinitely.
-
-        If the active workflow is already browser-sourced, the call
-        returns after clearing the lock: a running browser session is
-        already current with its own publishes.
-
-        If the active workflow is a file and no browser publisher has
-        been tracked this session, the file graph stays active.
-        Clearing to empty would leave `comfy_generate` with nothing to
-        run, which is a worse failure mode than continuing with a file
-        the user did load.
-        """
+        """Hand control back to the browser. See module docstring."""
         self._file_exclusive = False
 
         if self._active_workflow_source != "file":
@@ -911,14 +761,7 @@ class ComfyUIHandler(AutoDispatchHandler):
 
     @staticmethod
     def _publisher_key(publisher: dict) -> str:
-        """Stable identity for a browser publisher.
-
-        Prefers the tooling-nodes extension's `id`, which is ComfyUI's
-        per-page-load client id (a fresh value on each tab). Falls
-        back to a name-prefixed key only if the id is missing, which
-        should not happen with a current tooling-nodes extension but
-        keeps the tracking map usable against an older one.
-        """
+        """Stable identity for a browser publisher."""
         pid = publisher.get("id")
         if pid:
             return str(pid)
@@ -926,17 +769,7 @@ class ComfyUIHandler(AutoDispatchHandler):
         return f"name:{name}"
 
     def _on_workflow_published(self, publisher: dict, graph: dict):
-        """Watcher callback. Runs on the watcher thread.
-
-        Records the publisher in `self._published_publishers`. Then,
-        unless the file-exclusive lock is set, promotes the graph to
-        the active workflow — subject to the publisher pin. Either
-        way, the new state is published to the event bus so web panel
-        subscribers see it without polling.
-
-        See the module docstring, "Source exclusivity" and "Publisher
-        tracking and pinning".
-        """
+        """Watcher callback. Runs on the watcher thread."""
         key = self._publisher_key(publisher)
         signature = _compute_signature(graph)
         display_name = publisher.get("name") or "unknown"
@@ -953,9 +786,6 @@ class ComfyUIHandler(AutoDispatchHandler):
         }
 
         if self._file_exclusive:
-            # State changed (a new publisher was recorded) even though
-            # the active workflow did not. Publish so the panel sees
-            # the publisher appear.
             self._publish_state_change()
             return
 
@@ -1025,12 +855,6 @@ class ComfyUIHandler(AutoDispatchHandler):
         args={},
     )
     def comfy_batches(self, params):
-        """Return a snapshot of every active batch.
-
-        Reads `self._batches` under the dict lock, then reads each
-        record's fields without a lock. See `_BatchRecord` for why
-        the field reads are safe.
-        """
         with self._batches_lock:
             records = list(self._batches.values())
 
@@ -1063,12 +887,7 @@ class ComfyUIHandler(AutoDispatchHandler):
     @command(
         category="comfyui",
         help_text="List the browser publishers the daemon has heard from "
-                  "this session, newest publish first. Each entry names "
-                  "the publisher's key, its declared name (always "
-                  "'ComfyUI Web' for browser publishes), the workflow's "
-                  "signature, and when it last published. Entries carry "
-                  "`active` (currently driving the handler) and `pinned` "
-                  "(the current pin target) flags.",
+                  "this session, newest publish first.",
         args={},
     )
     def comfy_list_publishers(self, params):
@@ -1103,13 +922,7 @@ class ComfyUIHandler(AutoDispatchHandler):
 
     @command(
         category="comfyui",
-        help_text="Pin the active workflow to one browser publisher. "
-                  "While pinned, publishes from other browser instances "
-                  "are tracked but do not replace the active workflow. "
-                  "Publishing from the pinned instance still updates "
-                  "the active graph, so editing that tab continues to "
-                  "work as normal. Without --key, pins whichever "
-                  "publisher is currently active.",
+        help_text="Pin the active workflow to one browser publisher.",
         args={
             "--key": {"type": "str", "required": False,
                       "help": "Publisher key to pin. Omit to pin "
@@ -1155,10 +968,7 @@ class ComfyUIHandler(AutoDispatchHandler):
 
     @command(
         category="comfyui",
-        help_text="Clear the publisher pin. Publishes from any browser "
-                  "instance take over the active workflow again — "
-                  "last-publish-wins. The pin does not survive a "
-                  "reload_daemon; reloading the daemon also clears it.",
+        help_text="Clear the publisher pin.",
         args={},
     )
     def comfy_unpin_publisher(self, params):
@@ -1173,11 +983,7 @@ class ComfyUIHandler(AutoDispatchHandler):
 
     @command(
         category="comfyui",
-        help_text="Clear the file-exclusive lock. Browser publishes "
-                  "resume promoting to the active workflow on their "
-                  "next publish. Does not change the active workflow "
-                  "right now. The lock is also cleared by "
-                  "comfy_connect --watch true.",
+        help_text="Clear the file-exclusive lock.",
         args={},
     )
     def comfy_unlock_file(self, params):
@@ -1218,11 +1024,7 @@ class ComfyUIHandler(AutoDispatchHandler):
     @command(
         category="comfyui",
         help_text="Load a workflow by slug from the panel's workflows "
-                  "directory, or by absolute filesystem path. Clears "
-                  "any parameters and layer aliases set by a previous "
-                  "workflow. With --exclusive true, browser publishes "
-                  "are recorded but do not replace the active workflow "
-                  "until the lock is cleared.",
+                  "directory, or by absolute filesystem path.",
         args={
             "--name": {"type": "str", "required": True,
                        "help": "Workflow slug, or an absolute path to "
@@ -1233,10 +1035,7 @@ class ComfyUIHandler(AutoDispatchHandler):
                                     "are recorded but do not replace "
                                     "the active workflow until the lock "
                                     "is cleared by comfy_connect "
-                                    "--watch true or comfy_unlock_file. "
-                                    "Without this, a browser republish "
-                                    "between load and generate silently "
-                                    "replaces the file's graph."},
+                                    "--watch true or comfy_unlock_file."},
         },
     )
     def comfy_load(self, params):
@@ -1246,11 +1045,6 @@ class ComfyUIHandler(AutoDispatchHandler):
 
         exclusive = bool(params.get("exclusive", False))
 
-        # A name that starts with '/' or '~' is a filesystem path, not
-        # a slug. The CLI always sends an absolute path when the user
-        # passed a path, so '/'-prefixed is the common case; '~' is
-        # accepted for direct daemon invocations. Slug names never
-        # contain a slash, so the two forms cannot collide.
         is_path = name.startswith("/") or name.startswith("~")
 
         if is_path:
@@ -1300,14 +1094,8 @@ class ComfyUIHandler(AutoDispatchHandler):
                 ),
             }
 
-        # Set the lock before assigning the active workflow, so a
-        # browser publish arriving in the window between the file read
-        # and the assignment cannot slip in and take over. Once the
-        # lock is true, _on_workflow_published stops promoting.
         self._file_exclusive = exclusive
 
-        # File source: publisher_key defaults to None, clearing any
-        # previous browser publisher association on the active workflow.
         self._set_active_workflow(display_name, workflow, "file")
         self._params = {}
         self._layer_aliases = {}
@@ -1333,8 +1121,7 @@ class ComfyUIHandler(AutoDispatchHandler):
     @command(
         category="comfyui",
         help_text="Set a value for an ETN_Parameter in the active "
-                  "workflow. Values are coerced to the parameter's "
-                  "declared type at generate time.",
+                  "workflow.",
         args={
             "--name": {"type": "str", "required": True,
                        "help": "Parameter name (the node's `name` widget)"},
@@ -1375,8 +1162,7 @@ class ComfyUIHandler(AutoDispatchHandler):
     @command(
         category="comfyui",
         help_text="Map a layer name the workflow declares to a different "
-                  "layer in the document. The workflow graph is not "
-                  "modified; the mapping applies when the layer is read.",
+                  "layer in the document.",
         args={
             "--logical_name": {"type": "str", "required": True,
                                "help": "The name the workflow declares "
@@ -1400,12 +1186,48 @@ class ComfyUIHandler(AutoDispatchHandler):
                                "required"}
 
         self._layer_aliases[logical] = actual
+        self._record_recent_alias(actual)
         return {
             "success": True,
             "message": f"{logical} -> {actual}",
             "data": {"logical_name": logical, "actual_name": actual,
                      "layer_aliases": dict(self._layer_aliases)},
         }
+
+    @command(
+        category="comfyui",
+        help_text="Return the most recently used layer alias targets, "
+                  "most recent first. Used by the docker's alias "
+                  "dropdowns to order their items.",
+        args={},
+    )
+    def comfy_list_recent_aliases(self, params):
+        with self._recent_aliases_lock:
+            snapshot = list(self._recent_aliases)
+        return {
+            "success": True,
+            "message": f"{len(snapshot)} recent alias(es)",
+            "data": {"recent_aliases": snapshot},
+        }
+
+    def _record_recent_alias(self, actual: str) -> None:
+        """Prepend `actual` to the recent-alias list, dedupe, cap, save.
+
+        Under `_recent_aliases_lock` so a concurrent
+        `comfy_list_recent_aliases` read sees a consistent snapshot.
+        The disk write is best-effort and swallowed inside
+        `_save_recent_aliases`; the in-memory list remains
+        authoritative for this session even if the write fails.
+        """
+        if not actual:
+            return
+        with self._recent_aliases_lock:
+            updated = [actual] + [
+                a for a in self._recent_aliases if a != actual
+            ]
+            del updated[_RECENT_ALIASES_CAP:]
+            self._recent_aliases = updated
+            _save_recent_aliases(updated)
 
     # ------------------------------------------------------------------
     #  Binding canvas / selection sources
@@ -1481,10 +1303,7 @@ class ComfyUIHandler(AutoDispatchHandler):
     @command(
         category="comfyui",
         help_text="Run the active workflow. With --count N, run it N "
-                  "times with consecutive seeds. All runs are prepared "
-                  "up front and submitted back to back; each paste "
-                  "happens as soon as its image arrives. All runs share "
-                  "one history entry.",
+                  "times with consecutive seeds.",
         args={
             "--timeout": {"type": "float", "default": 55.0,
                           "help": "Seconds to wait per run for ComfyUI."},
@@ -1500,11 +1319,6 @@ class ComfyUIHandler(AutoDispatchHandler):
         },
     )
     def comfy_generate(self, params):
-        """Thin wrapper. Any exception the implementation raises is
-        caught here and returned as an ordinary error response, with a
-        full traceback printed to stdout so the source is visible in
-        Krita's console.
-        """
         try:
             return self._comfy_generate_impl(params)
         except Exception as e:
@@ -1534,18 +1348,13 @@ class ComfyUIHandler(AutoDispatchHandler):
 
         batch_id = params.get("_batch_id") or str(uuid.uuid4())
 
-        # Snapshot the workflow name before anything can change it.
         workflow_name = self._active_workflow_name or "(unnamed)"
 
-        # Register the batch record before the try block so the batch
-        # is visible to `comfy_batches` from this point on. If an
-        # early return happens (no workflow, no client), the finally
-        # block deregisters.
         record = _BatchRecord(
             batch_id=batch_id,
             workflow_name=workflow_name,
             requested_count=requested_count,
-            total_runs=requested_count,   # may be clamped below
+            total_runs=requested_count,
             base_seed=base_seed,
             output_name=output_name,
         )
@@ -1553,7 +1362,7 @@ class ComfyUIHandler(AutoDispatchHandler):
             self._batches[batch_id] = record
 
         try:
-            warnings: list[str] = []
+            warnings: list = []
 
             graph = self._active_workflow_graph
             if graph is None:
@@ -1589,12 +1398,7 @@ class ComfyUIHandler(AutoDispatchHandler):
             base_params = dict(self._params)
             original_seed = self._params.get(_SEED_PARAMETER_NAME)
 
-            # ---- Phase 1: prepare every run. ----
-            #
-            # run_records is the same list the record exposes, so
-            # appending to it here is enough for `comfy_batches` to
-            # see the progress.
-            prepared: list[dict] = []
+            prepared: list = []
             run_records = record.run_records
             record.current_phase = "preparing"
 
@@ -1703,8 +1507,6 @@ class ComfyUIHandler(AutoDispatchHandler):
                 prepared = []
                 if "batch cancelled during preparation" not in warnings:
                     warnings.append("batch cancelled during preparation")
-
-            # ---- Phase 2: submit and collect. ----
 
             total_layers = 0
             record.current_phase = "running"
@@ -1827,8 +1629,6 @@ class ComfyUIHandler(AutoDispatchHandler):
 
             record.current_phase = "finalizing"
 
-            # ---- One history entry for the whole batch. ----
-
             self._write_history_record(
                 batch_id=batch_id,
                 base_seed=base_seed,
@@ -1837,8 +1637,6 @@ class ComfyUIHandler(AutoDispatchHandler):
                 warnings=warnings,
                 duration_s=time.time() - batch_started,
             )
-
-            # ---- Build the response. ----
 
             successful = sum(1 for r in run_records
                              if r["status"] == "success")
@@ -2021,10 +1819,6 @@ class ComfyUIHandler(AutoDispatchHandler):
                      "async": list(self._pending.keys())},
         }
 
-    # ------------------------------------------------------------------
-    #  Result handling
-    # ------------------------------------------------------------------
-
     @command(
         category="comfyui",
         help_text="Re-paste the most recent generation's result as new "
@@ -2088,11 +1882,7 @@ class ComfyUIHandler(AutoDispatchHandler):
 
     def _queue_generate(self,
                         seed: Optional[int] = None,
-                        ) -> tuple[Optional[str], Optional[dict]]:
-        """Validate state, read pixels, rewrite the graph, and start the
-        worker thread. Returns (prompt_id, None) on success, or
-        (None, error_dict) on failure.
-        """
+                        ) -> tuple:
         try:
             workflow = self._active_workflow_graph
             if workflow is None:
@@ -2163,7 +1953,6 @@ class ComfyUIHandler(AutoDispatchHandler):
                           "message": f"queue setup failed: {e}"}
 
     def _run_generation(self, pending: _PendingJob, expansion) -> None:
-        """Worker thread body: upload images, submit, wait, store result."""
         try:
             for h, data in expansion.image_data.items():
                 self._client.upload_image(h, data)
@@ -2183,10 +1972,6 @@ class ComfyUIHandler(AutoDispatchHandler):
 
     def _finish_pending(self, prompt_id: str, paste: bool,
                         output_name: Optional[str] = None) -> dict:
-        """Collect a completed pending job, record history, paste.
-
-        Used by the async path (`comfy_generate_async` + `comfy_wait`).
-        """
         pending = self._pending.pop(prompt_id, None)
         if pending is None:
             return {"success": False,
@@ -2296,11 +2081,10 @@ class ComfyUIHandler(AutoDispatchHandler):
                       blend_mode: str = "normal",
                       output_name: Optional[str] = None,
                       seed_suffix: Optional[int] = None) -> dict:
-        """Paste every output node's contribution into `doc`."""
         if not result.images:
             return {"success": True, "message": "No images to paste"}
 
-        groups: dict[int, list[tuple[bytes, JobInfo]]] = {}
+        groups: dict = {}
         for i, (img, info) in enumerate(zip(result.images, result.infos)):
             ev = (result.event_index[i]
                   if i < len(result.event_index) else i)
@@ -2327,9 +2111,9 @@ class ComfyUIHandler(AutoDispatchHandler):
                 }
             groups = filtered
 
-        pasted_layers: list[str] = []
+        pasted_layers: list = []
         pasted_frames = 0
-        failures: list[str] = []
+        failures: list = []
 
         for ev in sorted(groups):
             entries = groups[ev]
@@ -2418,7 +2202,6 @@ class ComfyUIHandler(AutoDispatchHandler):
                               run_records: list,
                               warnings: list,
                               duration_s: float) -> None:
-        """Write one history record for a batch or a single run."""
         try:
             runs_summary = []
             for r in run_records:
@@ -2460,12 +2243,10 @@ class ComfyUIHandler(AutoDispatchHandler):
 # ============================================================================
 
 def _public_run_record(r: dict) -> dict:
-    """Strip internal keys (leading underscore) from a run record."""
     return {k: v for k, v in r.items() if not k.startswith("_")}
 
 
 def _get_live_active_document():
-    """Return the active document as a usable reference, or None."""
     doc = Krita.instance().activeDocument()
     if doc is not None:
         try:
@@ -2486,16 +2267,14 @@ def _get_live_active_document():
     return None
 
 
-def _capture_document_key(doc) -> tuple[str, str]:
-    """A stable identifier for a document across object recreation."""
+def _capture_document_key(doc) -> tuple:
     try:
         return (doc.fileName() or "", doc.name() or "")
     except Exception:
         return ("", "")
 
 
-def _find_document_by_key(key: tuple[str, str]):
-    """Locate the live Document matching a previously-captured key."""
+def _find_document_by_key(key: tuple):
     if not key or not any(key):
         return None
     try:
@@ -2529,7 +2308,6 @@ def _find_document_by_key(key: tuple[str, str]):
 
 
 def _resolve_live_document_for_prepared(prepared_entry: dict):
-    """Return a usable Document for a phase-2 prepared entry."""
     key = prepared_entry.get("document_key") or ("", "")
     fresh = _find_document_by_key(key)
     if fresh is not None:
@@ -2545,7 +2323,6 @@ def _resolve_live_document_for_prepared(prepared_entry: dict):
 
 
 def _resolve_live_document_for_pending(pending):
-    """Return a usable Document for a pending job, or None."""
     key = getattr(pending, "document_key", ("", ""))
     fresh = _find_document_by_key(key)
     if fresh is not None:
@@ -2560,8 +2337,7 @@ def _resolve_live_document_for_pending(pending):
     return None
 
 
-def _check_color_mode(doc) -> tuple[bool, Optional[str]]:
-    """Krita's setPixelData requires RGBA/U8."""
+def _check_color_mode(doc) -> tuple:
     model = doc.colorModel()
     depth = doc.colorDepth()
     if model != "RGBA":
@@ -2578,7 +2354,6 @@ def _check_color_mode(doc) -> tuple[bool, Optional[str]]:
 
 
 def _document_is_open(doc) -> bool:
-    """True iff `doc` is still among the open documents."""
     try:
         for d in Krita.instance().documents():
             if d == doc:
@@ -2588,8 +2363,7 @@ def _document_is_open(doc) -> bool:
     return False
 
 
-def _png_dimensions(png_bytes: bytes) -> tuple[int, int]:
-    """Return (width, height) of a PNG without fully decoding it."""
+def _png_dimensions(png_bytes: bytes) -> tuple:
     if len(png_bytes) < 24 or png_bytes[:8] != b"\x89PNG\r\n\x1a\n":
         raise ValueError("Not a valid PNG")
     import struct

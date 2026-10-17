@@ -84,6 +84,7 @@ from PyQt6.QtGui import QImage
 
 from .comfyui_tooling import EncodedImage, KritaResources, WorkflowRequirements
 from .layer_resolve import resolve as resolve_node
+from .layer_types import IMAGE_LAYER_TYPES, MASK_LAYER_TYPES
 from .refresh import refresh
 
 
@@ -193,7 +194,7 @@ def read_layer_pixels(doc, layer_name: str, bounds: Bounds) -> EncodedImage:
         raise ValueError(f"Layer not found: {layer_name!r}")
 
     node_type = node.type()
-    if node_type not in _IMAGE_LAYER_TYPES:
+    if node_type not in IMAGE_LAYER_TYPES:
         raise ValueError(
             f"Layer {layer_name!r} is type {node_type!r}, which does not "
             f"contain color pixels. Use read_layer_mask for mask-only "
@@ -232,7 +233,7 @@ def read_layer_mask(doc, layer_name: str, bounds: Bounds) -> EncodedImage:
     x, y, w, h = bounds
     node_type = node.type()
 
-    if node_type in _MASK_LAYER_TYPES:
+    if node_type in MASK_LAYER_TYPES:
         raw = bytes(node.pixelData(x, y, w, h))
         if len(raw) != w * h:
             raise ValueError(
@@ -244,7 +245,7 @@ def read_layer_mask(doc, layer_name: str, bounds: Bounds) -> EncodedImage:
             width=w, height=h, is_mask=True,
         )
 
-    if node_type in _IMAGE_LAYER_TYPES:
+    if node_type in IMAGE_LAYER_TYPES:
         raw = bytes(node.projectionPixelData(x, y, w, h))
         if len(raw) != w * h * 4:
             raise ValueError(
@@ -606,26 +607,6 @@ def _qimage_to_argb32_bytes(img: QImage) -> bytes:
             f"expected {expected}"
         )
     return bytes(out)
-
-
-# ============================================================================
-#  Layer type sets
-# ============================================================================
-
-_IMAGE_LAYER_TYPES = frozenset({
-    "paintlayer",
-    "grouplayer",
-    "filelayer",
-    "vectorlayer",
-    "clonelayer",
-    "filllayer",
-    "filterlayer",
-})
-
-_MASK_LAYER_TYPES = frozenset({
-    "transparencymask",
-    "selectionmask",
-})
 
 
 # ============================================================================

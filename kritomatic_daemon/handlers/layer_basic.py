@@ -139,25 +139,46 @@ class LayerBasicHandler(AutoDispatchHandler):
     @command(
         category='layer',
         help_text='List all layers in the current document',
-        args={}
+        args={
+            '--all': {
+                'type': 'bool', 'default': False,
+                'help': 'Recurse into every node, including mask children '
+                        '(transparencymask, selectionmask, transformmask, '
+                        'filtermask). Without this, only child layers of '
+                        'groups are returned and masks are hidden — masks '
+                        'are children of paint layers, not of groups.'
+            },
+        }
     )
-    def list_layers(self):
+    def list_layers(self, params):
         try:
             doc = Krita.instance().activeDocument()
             if not doc:
                 return {'success': False, 'message': 'No active document'}
             layers = []
-            self._collect_layer_data(doc.rootNode(), layers, 0)
-            return {'success': True, 'message': f'Found {len(layers)} layers', 'data': {'layers': layers}}
+            recurse_all = bool(params.get('all', False))
+            self._collect_layer_data(
+                doc.rootNode(), layers, 0, recurse_all=recurse_all
+            )
+            return {'success': True,
+                    'message': f'Found {len(layers)} layers',
+                    'data': {'layers': layers}}
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
-    def _collect_layer_data(self, node, layers, indent):
+    def _collect_layer_data(self, node, layers, indent, recurse_all=False):
         layer_info = {'name': node.name(), 'type': node.type(), 'indent': indent}
         layers.append(layer_info)
-        if node.type() == "grouplayer":
+        # Historically this recursed only into groups, which hides
+        # masks: a selection mask or a transparency mask is a child of
+        # a paint layer, not of a group. `recurse_all` opens the walk
+        # to every node so callers that need mask names (the docker's
+        # alias dropdowns) can see them.
+        if recurse_all or node.type() == "grouplayer":
             for child in node.childNodes():
-                self._collect_layer_data(child, layers, indent + 1)
+                self._collect_layer_data(
+                    child, layers, indent + 1, recurse_all=recurse_all
+                )
 
     @command(
         category='layer',

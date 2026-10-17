@@ -23,11 +23,52 @@ auto-pull's subsequent state push arrives a beat later and rebuilds
 the tree.
 
 `_rebuild` therefore captures the focused field's key and (for text
-inputs) its cursor position before the teardown, and restores both
-after the rebuild if that field still exists in the new description.
-A field that no longer exists is not restored; the user's focus is
-allowed to fall wherever Qt puts it, which is what the user would
-expect when the field they were editing has gone away.
+inputs and editable combos) its cursor position before the teardown,
+and restores both after the rebuild if that field still exists in the
+new description.
+
+Layer alias combos
+==================
+A text field whose spec carries `kind_hint: "image"` or `"mask"` is
+rendered as an editable `_LayerComboBox` with a contains-match,
+case-insensitive completer. The combo's current text is the alias
+value (the actual string the daemon will use); the dropdown is a
+hint. Typed text that does not match any item still commits, so
+free-form entry is preserved.
+
+Commit triggers
+---------------
+The commit fires on `activated` (a dropdown pick) and on
+`lineEdit().editingFinished` (blur or Enter on the line edit).
+`currentTextChanged` is deliberately NOT connected: it fires on
+every keystroke, so an editable combo connected to it would send one
+`comfy_bind_layer_alias` per character — including the empty string
+after a backspace — and the daemon would reject each empty as
+"Both --logical_name and --actual_name are required."
+
+`_on_text_commit` updates the spec's cached `value` optimistically
+before sending, so a `activated` followed by an `editingFinished` on
+blur does not fire two commits of the same value. The next panel
+event overwrites the cached value with the authoritative one.
+
+Layout
+------
+A `QComboBox`'s default horizontal size policy is `Preferred`, while
+`QLineEdit`'s is `Expanding`. The form uses
+`QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow`, so line edits
+fill their row and combos do not. `_LayerComboBox` is given an
+`Expanding` policy at construction so it lines up with the other
+fields.
+
+Recent-alias prioritization
+===========================
+`set_layers` orders the item list so that layer names from the
+daemon's recent-alias history appear first, in recency order,
+followed by the rest in tree order. The recent list is flat
+(kind-agnostic); the intersection with the current bucket is what
+keeps a mask alias out of an image dropdown. See handlers/comfyui.py's
+"Layer aliases and the recent-aliases file" section for the daemon
+side.
 """
 
 from __future__ import annotations
@@ -37,7 +78,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QLabel, QLineEdit, QPlainTextEdit, QCheckBox, QRadioButton,
     QButtonGroup, QComboBox, QSpinBox, QDoubleSpinBox, QPushButton,
-    QFrame,
+    QFrame, QSizePolicy,
 )
 
 
@@ -58,8 +99,59 @@ class _CommittableTextEdit(QPlainTextEdit):
         self.commitRequested.emit(self.toPlainText())
 
 
+class _LayerComboBox(QComboBox):
+    """Editable combo used for layer-alias fields.
+
+    Properties by design:
+      * The current text is the alias value — a free string, not a
+        whitelist. Picking from the dropdown is a convenience; typing
+        a name that is not in the list still commits.
+      * The completer matches on substring (MatchContains) and
+        case-insensitively.
+      * `popupAboutToShow` fires before the popup opens so the docker
+        can schedule a layer-list refresh.
+      * `_popup_open` tracks whether the popup is currently visible so
+        `set_layers` can skip this combo without disrupting the user's
+        view.
+      * Horizontal size policy is Expanding, matching QLineEdit, so
+        the field fills its row under
+        `QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow`.
+    """
+
+    popupAboutToShow = pyqtSignal()
+
+    def __init__(self, kind_hint: str, parent=None):
+        super().__init__(parent)
+        self._kind_hint = kind_hint
+        self._popup_open = False
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        completer = self.completer()
+        if completer is not None:
+            completer.setCaseSensitivity(
+                Qt.CaseSensitivity.CaseInsensitive)
+            completer.setFilterMode(Qt.MatchFlag.MatchContains)
+
+    def showPopup(self):
+        self._popup_open = True
+        self.popupAboutToShow.emit()
+        super().showPopup()
+
+    def hidePopup(self):
+        super().hidePopup()
+        self._popup_open = False
+
+    def is_popup_open(self) -> bool:
+        return self._popup_open
+
+
 class PanelRenderer(QObject):
     """Renders a panel description into a container layout."""
+
+    layerRefreshRequested = pyqtSignal()
 
     def __init__(self, container_layout, commit_callback, action_callback):
         super().__init__()
@@ -84,9 +176,6 @@ class PanelRenderer(QObject):
     # ---- rebuild ----
 
     def _rebuild(self, description: dict) -> None:
-        # Capture focus before teardown so it can be restored after the
-        # new tree exists. See the module docstring, "Focus preservation
-        # across rebuilds".
         focused_key, focused_cursor = self._capture_focus()
 
         for w in self._section_widgets:
@@ -102,7 +191,6 @@ class PanelRenderer(QObject):
             widget = self._build_section(section)
             if widget is None:
                 continue
-            # Insert before the trailing stretch if there is one.
             count = self._layout.count()
             insert_at = count
             for i in range(count):
@@ -118,12 +206,6 @@ class PanelRenderer(QObject):
     # ---- focus capture / restore ----
 
     def _capture_focus(self):
-        """Return (field_key, cursor) for the currently-focused field.
-
-        `cursor` is a ("line", position) or ("plain", position) tuple
-        when the focused widget is a text input, else None. If no field
-        is focused, returns (None, None).
-        """
         for key, widget in self._field_widgets.items():
             if widget.hasFocus():
                 return key, self._read_cursor(widget)
@@ -139,6 +221,10 @@ class PanelRenderer(QObject):
                 return ("line", widget.cursorPosition())
             if isinstance(widget, QPlainTextEdit):
                 return ("plain", widget.textCursor().position())
+            if isinstance(widget, QComboBox) and widget.isEditable():
+                le = widget.lineEdit()
+                if le is not None:
+                    return ("combo", le.cursorPosition())
         except Exception:
             pass
         return None
@@ -164,19 +250,17 @@ class PanelRenderer(QObject):
                 cur = target.textCursor()
                 cur.setPosition(pos)
                 target.setTextCursor(cur)
+            elif (kind == "combo"
+                  and isinstance(target, QComboBox)
+                  and target.isEditable()):
+                le = target.lineEdit()
+                if le is not None:
+                    le.setCursorPosition(min(pos, len(le.text())))
         except Exception:
             pass
 
     @staticmethod
     def _find_focusable_leaf(widget):
-        """Return the concrete input widget a field's outer container
-        wraps, preferring the widget itself when it is a leaf type.
-
-        A field's registered widget is sometimes a QLineEdit or
-        QSpinBox directly, sometimes a QWidget wrapper holding radio
-        buttons. Only the leaf types can receive keyboard focus and
-        cursor positions, so those are what we return.
-        """
         leaf_types = (
             QLineEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox,
             QComboBox, QCheckBox,
@@ -251,6 +335,29 @@ class PanelRenderer(QObject):
         value = f.get("value")
 
         if ftype == "text":
+            kind_hint = f.get("kind_hint")
+            if kind_hint in ("image", "mask"):
+                w = _LayerComboBox(kind_hint)
+                w.setCurrentText("" if value is None else str(value))
+                # Commit on dropdown pick.
+                w.activated.connect(
+                    lambda _i, k=key, w=w: self._on_text_commit(
+                        k, w.currentText()
+                    )
+                )
+                # Commit on blur or Enter in the line edit.
+                le = w.lineEdit()
+                if le is not None:
+                    le.editingFinished.connect(
+                        lambda k=key, w=w: self._on_text_commit(
+                            k, w.currentText()
+                        )
+                    )
+                w.popupAboutToShow.connect(
+                    self.layerRefreshRequested.emit
+                )
+                return w
+
             w = QLineEdit()
             w.setText("" if value is None else str(value))
             w.editingFinished.connect(
@@ -383,12 +490,23 @@ class PanelRenderer(QObject):
     # ---- commits ----
 
     def _on_text_commit(self, key: str, new_value: str) -> None:
+        """Route a text-widget edit to the field's commit command.
+
+        Called from `activated` (dropdown pick), `editingFinished`
+        (blur or Enter on a line edit), and the text-area's
+        focus-out signal. The spec's cached `value` is updated
+        optimistically so an `activated` immediately followed by an
+        `editingFinished` on the same widget does not fire two
+        commits of the same value; the next panel event overwrites
+        the cached value with the authoritative one.
+        """
         spec = self._field_specs.get(key)
         if spec is None:
             return
         old_value = spec.get("value")
         if str(new_value) == str(old_value if old_value is not None else ""):
             return
+        spec["value"] = new_value
         self._on_field_commit(key, new_value)
 
     def _on_field_commit(self, key: str, value) -> None:
@@ -422,6 +540,8 @@ class PanelRenderer(QObject):
         ftype = spec.get("type", "text")
         try:
             if ftype == "text":
+                if isinstance(widget, QComboBox):
+                    return widget.currentText()
                 return widget.text()
             if ftype == "textarea":
                 return widget.toPlainText()
@@ -477,7 +597,6 @@ class PanelRenderer(QObject):
             self._apply_value(spec, widget)
             self._field_specs[key] = spec
 
-        # Refresh the section_specs from the new description too
         self._section_specs = description.get("sections", []) or []
         self._reevaluate_visibility()
 
@@ -499,10 +618,16 @@ class PanelRenderer(QObject):
         try:
             if ftype == "text":
                 target = "" if value is None else str(value)
-                if widget.text() != target:
-                    widget.blockSignals(True)
-                    widget.setText(target)
-                    widget.blockSignals(False)
+                if isinstance(widget, QComboBox):
+                    if widget.currentText() != target:
+                        widget.blockSignals(True)
+                        widget.setCurrentText(target)
+                        widget.blockSignals(False)
+                else:
+                    if widget.text() != target:
+                        widget.blockSignals(True)
+                        widget.setText(target)
+                        widget.blockSignals(False)
             elif ftype == "textarea":
                 target = "" if value is None else str(value)
                 if widget.toPlainText() != target:
@@ -577,3 +702,66 @@ class PanelRenderer(QObject):
         btn = self._action_buttons.get(key)
         if btn is not None:
             btn.setEnabled(bool(enabled))
+
+    # ---- layer list ----
+
+    def set_layers(self, layers: dict) -> None:
+        """Update every live layer-alias combo's item list.
+
+        `layers` is {"image": [...], "mask": [...], "recent": [...]}
+        as emitted by `DaemonConnection.request_layers`. Every combo
+        whose spec has a matching `kind_hint` gets its items replaced;
+        the current text is preserved so an in-progress edit (or a
+        value that does not appear in the list) survives the swap.
+
+        Item ordering: recent aliases first (in recency order,
+        intersected with the current bucket), then the rest in tree
+        order. The intersection is what keeps a mask alias out of an
+        image dropdown; the recent list is flat and kind-agnostic.
+
+        Combos whose popup is currently open are skipped: refreshing
+        their items mid-view would disrupt the user's filter and
+        selection. The next popup open schedules a new fetch, so the
+        view on that next open is fresh.
+
+        Signals are blocked around the swap so any connection on
+        `currentTextChanged`, `activated`, or the line edit's
+        `editingFinished` does not fire a spurious commit while the
+        model is being repopulated.
+        """
+        image_list = layers.get("image") or []
+        mask_list = layers.get("mask") or []
+        recent = layers.get("recent") or []
+
+        for key, widget in self._field_widgets.items():
+            if not isinstance(widget, _LayerComboBox):
+                continue
+            if widget.is_popup_open():
+                continue
+            spec = self._field_specs.get(key) or {}
+            hint = spec.get("kind_hint")
+            if hint == "image":
+                bucket = image_list
+            elif hint == "mask":
+                bucket = mask_list
+            else:
+                continue
+            bucket_set = set(bucket)
+            recent_in_bucket = [a for a in recent if a in bucket_set]
+            recent_set = set(recent_in_bucket)
+            rest = [b for b in bucket if b not in recent_set]
+            new_list = recent_in_bucket + rest
+
+            current_text = widget.currentText()
+            widget.blockSignals(True)
+            le = widget.lineEdit()
+            if le is not None:
+                le.blockSignals(True)
+            try:
+                widget.clear()
+                widget.addItems(new_list)
+                widget.setCurrentText(current_text)
+            finally:
+                if le is not None:
+                    le.blockSignals(False)
+                widget.blockSignals(False)

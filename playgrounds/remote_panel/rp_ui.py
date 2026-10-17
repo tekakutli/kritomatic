@@ -3,21 +3,27 @@ rp_ui.py — the remote panel's DOM wiring.
 
 Two jobs:
 
-    · the header's Connect / Disconnect / preset dropdown, and the
-      Commands block;
-    · `rpRebuildPanel` and `rpRenderLog`, which the client calls
-      after receiving state / schema / log updates.
+    · the top bar's Connect / Disconnect / preset dropdown, the
+      two collapse toggles (actions, log), and the modal's
+      Cancel / Send / Enter / Escape / backdrop bindings;
 
-`rpRebuildPanel` groups fields by their top-level prefix
-(`pair`, `ui`, `kra`, ...) into one collapsible `<details>` per
-group, and calls `rpBuildFieldRow` (in rp_client.py) for each
-field.  Rebuilds are debounced by `rpScheduleRebuild` so a `state`
-and `schema` arriving one tick apart produce one rebuild, not two.
+    · `rpRebuildPanel`, which re-renders the action groups and the
+      field cards from the current `_rp.values` and `_rp.schema`,
+      and `rpRenderLog`.
 
-The panel is not rebuilt on every state update — only when the set
-of field *names* changes.  Ordinary state refreshes update each
-widget in place via `rpUpdateWidget`, preserving focus and
-avoiding flicker.
+`rpRebuildPanel` splits schema entries by `kind`:
+
+    kind === "action"        → an action button, grouped into the
+                               action panel by `meta.section`
+
+    anything else            → a field, rendered as an input /
+                               select / checkbox, grouped into the
+                               fields panel by prefix or
+                               `meta.section`
+
+The actions panel auto-shows on first content arrival unless the
+user has explicitly hidden it; the fields panel preserves each
+card's open/closed state across rebuilds.
 """
 
 RP_UI_JS = r"""
@@ -26,55 +32,108 @@ RP_UI_JS = r"""
    ========================================================================== */
 
 function rpRebuildPanel() {
-  const container = document.getElementById("rpFields");
-  if (!container) return;
+  rpRebuildActions();
+  rpRebuildFields();
+}
 
-  if (Object.keys(_rp.values).length === 0) {
-    container.innerHTML =
-      '<div class="empty">waiting for state\u2026</div>';
-    _rp.widgets = {};
+function rpRebuildActions() {
+  const body  = document.getElementById("rpActionsBody");
+  const panel = document.getElementById("actionsPanel");
+  const btn   = document.getElementById("rpActionsToggle");
+  if (!body || !panel) return;
+  body.innerHTML = "";
+  _rp.actions = {};
+
+  const bySection = new Map();
+  for (const name in _rp.schema) {
+    const meta = _rp.schema[name];
+    if (!meta || meta.kind !== "action") continue;
+    const section = meta.section || "actions";
+    if (!bySection.has(section)) bySection.set(section, []);
+    bySection.get(section).push(name);
+  }
+
+  if (bySection.size === 0) {
+    panel.classList.add("collapsed");
+    if (btn) btn.textContent = "Show";
     return;
   }
 
-  /* Group fields by prefix.  Fields without a dot form a "general"
-     group.  Groups are ordered by first appearance in the sorted
-     field list. */
-  const groups = new Map();
-  const names = Object.keys(_rp.values).sort();
-  for (const name of names) {
-    const dot = name.indexOf(".");
-    const prefix = dot >= 0 ? name.slice(0, dot) : "general";
-    if (!groups.has(prefix)) groups.set(prefix, []);
-    groups.get(prefix).push(name);
+  if (!_rp.actionsCollapsedByUser) {
+    panel.classList.remove("collapsed");
+    if (btn) btn.textContent = "Hide";
   }
 
-  /* Preserve each section's open/closed state across the rebuild. */
+  const sections = Array.from(bySection.keys()).sort();
+  for (const section of sections) {
+    const group = document.createElement("div");
+    group.className = "action-group";
+
+    const h4 = document.createElement("h4");
+    h4.textContent = _rpSectionLabel(section);
+    group.appendChild(h4);
+
+    const btns = document.createElement("div");
+    btns.className = "btns";
+    for (const name of bySection.get(section).sort()) {
+      btns.appendChild(rpBuildActionButton(name));
+    }
+    group.appendChild(btns);
+    body.appendChild(group);
+  }
+}
+
+function rpRebuildFields() {
+  const container = document.getElementById("fieldsPanel");
+  if (!container) return;
+
+  const bySection = new Map();
+  for (const name in _rp.values) {
+    const meta = _rp.schema[name] || {};
+    if (meta.kind === "action") continue;
+    const section = _rpSectionForField(name, meta);
+    if (!bySection.has(section)) bySection.set(section, []);
+    bySection.get(section).push(name);
+  }
+
+  if (bySection.size === 0) {
+    container.innerHTML =
+      '<div class="empty">not connected</div>';
+    _rp.fields = {};
+    return;
+  }
+
+  /* Preserve which field cards were open. */
   const openState = {};
-  container.querySelectorAll("details.section").forEach((d) => {
+  container.querySelectorAll("details.field-card").forEach((d) => {
     const s = d.querySelector("summary");
     if (s) openState[s.textContent] = d.open;
   });
 
   container.innerHTML = "";
-  _rp.widgets = {};
+  _rp.fields = {};
 
-  for (const [prefix, fieldNames] of groups) {
-    const details = document.createElement("details");
-    details.className = "section";
-    details.open = openState[prefix] !== false;
+  const sections = Array.from(bySection.keys()).sort();
+  for (const section of sections) {
+    const card = document.createElement("details");
+    card.className = "field-card";
+    card.open = openState[_rpSectionLabel(section)] !== false;
 
     const summary = document.createElement("summary");
-    summary.textContent = prefix;
-    details.appendChild(summary);
+    summary.textContent = _rpSectionLabel(section);
+    const h4 = document.createElement("h4");
+    h4.textContent = _rpSectionLabel(section);
+    h4.style.cursor = "pointer";
+    summary.remove();
+    card.appendChild(h4);
 
     const body = document.createElement("div");
-    body.className = "section-body";
-    details.appendChild(body);
-
-    for (const name of fieldNames) {
+    body.className = "field-body";
+    for (const name of bySection.get(section).sort()) {
       body.appendChild(rpBuildFieldRow(name));
     }
-    container.appendChild(details);
+    card.appendChild(body);
+    container.appendChild(card);
   }
 }
 
@@ -83,16 +142,28 @@ function rpRebuildPanel() {
    ========================================================================== */
 
 function rpRenderLog() {
-  const el = document.getElementById("rpLog");
+  const el = document.getElementById("rpLogBody");
   if (!el) return;
   el.innerHTML = "";
   for (const entry of _rp.log) {
     const line = document.createElement("div");
-    line.className = "rp-log-line rp-log-" + entry.kind;
+    line.className = "log-line log-" + entry.kind;
     line.textContent = "[" + entry.ts + "] " + entry.text;
     el.appendChild(line);
   }
   el.scrollTop = el.scrollHeight;
+}
+
+/* ==========================================================================
+   PANEL COLLAPSE TOGGLES
+   ========================================================================== */
+
+function _rpTogglePanel(panelId, btnId, shownLabel, hiddenLabel) {
+  const panel = document.getElementById(panelId);
+  const btn   = document.getElementById(btnId);
+  if (!panel || !btn) return;
+  const isCollapsed = panel.classList.toggle("collapsed");
+  btn.textContent = isCollapsed ? shownLabel : hiddenLabel;
 }
 
 /* ==========================================================================
@@ -104,21 +175,22 @@ function rpRenderLog() {
   const presetEl   = document.getElementById("rpPreset");
   const connectBtn = document.getElementById("rpConnectBtn");
   const discBtn    = document.getElementById("rpDisconnectBtn");
-  const cmdKindEl  = document.getElementById("rpCmdKind");
-  const cmdBodyEl  = document.getElementById("rpCmdPayload");
-  const cmdBtn     = document.getElementById("rpCmdBtn");
+  const actionsBtn = document.getElementById("rpActionsToggle");
+  const logBtn     = document.getElementById("rpLogToggle");
+  const logClear   = document.getElementById("rpLogClear");
 
-  /* Restore last target from localStorage; default to pair if none. */
   let saved = null;
   try { saved = localStorage.getItem("rp.target"); } catch (e) {}
   const initial = saved || "ws://127.0.0.1:8767/remote";
   if (targetEl) targetEl.value = initial;
   if (presetEl) {
-    /* If the initial value matches a preset, select it.  Otherwise
-       leave the "custom" option selected. */
     let matched = false;
     for (const opt of presetEl.options) {
-      if (opt.value && opt.value === initial) { opt.selected = true; matched = true; break; }
+      if (opt.value && opt.value === initial) {
+        opt.selected = true;
+        matched = true;
+        break;
+      }
     }
     if (!matched) presetEl.value = "";
   }
@@ -128,7 +200,6 @@ function rpRenderLog() {
   });
 
   if (targetEl) targetEl.addEventListener("input", () => {
-    /* Deselect the preset if the user typed something else. */
     if (presetEl && targetEl.value !== presetEl.value) presetEl.value = "";
   });
 
@@ -140,26 +211,50 @@ function rpRenderLog() {
 
   if (discBtn) discBtn.addEventListener("click", rpDisconnect);
 
-  if (cmdBtn) cmdBtn.addEventListener("click", () => {
-    const kind = (cmdKindEl.value || "").trim();
-    if (!kind) return;
-    let payload = {};
-    const raw = (cmdBodyEl.value || "").trim();
-    if (raw) {
-      try { payload = JSON.parse(raw); }
-      catch (e) {
-        rpLog("error", "bad command payload JSON: " + e.message);
-        return;
-      }
-    }
-    const id = rpSendCommand(kind, payload);
-    rpLog("cmd", "sent  " + kind + "  (" + id + ")");
+  if (actionsBtn) actionsBtn.addEventListener("click", () => {
+    const panel = document.getElementById("actionsPanel");
+    const isCollapsed = panel.classList.toggle("collapsed");
+    _rp.actionsCollapsedByUser = isCollapsed;
+    actionsBtn.textContent = isCollapsed ? "Show" : "Hide";
   });
 
-  /* Don't auto-connect.  A fresh page shows the target and lets the
-     user click Connect once they know a playground is running.  If
-     they've connected before, the target is restored so it's one
-     click away. */
-  rpSetStatus("disconnected", false);
+  if (logBtn) logBtn.addEventListener("click", () => {
+    _rpTogglePanel("logPanel", "rpLogToggle", "Show", "Hide");
+  });
+
+  if (logClear) logClear.addEventListener("click", () => {
+    _rp.log = [];
+    rpRenderLog();
+  });
+
+  /* ---- modal bindings ------------------------------------------ */
+
+  const modalCancel = document.getElementById("rpModalCancel");
+  const modalSend   = document.getElementById("rpModalSend");
+  const modalBkdrp  = document.getElementById("rpModalBackdrop");
+
+  if (modalCancel) modalCancel.addEventListener("click", rpCancelActionForm);
+  if (modalSend)   modalSend.addEventListener("click", rpCommitActionForm);
+  if (modalBkdrp) {
+    modalBkdrp.addEventListener("click", (e) => {
+      if (e.target === modalBkdrp) rpCancelActionForm();
+    });
+  }
+
+  /* Enter sends, Escape cancels — only while a pending action form
+     is open, so intercepting these globally is safe. */
+  window.addEventListener("keydown", (e) => {
+    if (!_rp._pendingAction) return;
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const sendBtn = document.getElementById("rpModalSend");
+      if (sendBtn && !sendBtn.disabled) rpCommitActionForm();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      rpCancelActionForm();
+    }
+  });
+
+  rpSetStatus("disconnected");
 })();
 """

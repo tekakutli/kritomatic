@@ -1,29 +1,82 @@
 """
-pg_panel_bindings.py — every non-scrub panel control binding.
+pg_panel_bindings.py — every non-scrub panel control binding, plus
+the pair playground's registered actions.
 
-The buttons, the checkboxes, and the two KRA selects.  Buttons are
-local-only (they are not registered over the remote API).  The
-values that remote clients can read or write are the two UI flags
-and the two KRA options:
+Each button in the panel has two entry points: a local
+addEventListener bound to the button itself, and a
+`pgkitRegisterAction` declaration that makes it invokable by name
+from a remote client.  Both entry points call the same underlying
+function, so behaviour cannot drift.
 
-    ui.overlapHighlight   overlap-marking mode
-    ui.drawSegmentMode    draw-segment tool active
-    kra.textPosition      label position on the trapezoid
-    kra.drawRects         whether filled trapezoids are emitted
-
-Each of them calls `pgkitNotifyLocal("...")` at the end of its
-change handler so the wire sees the new value.  The Esc-key path
-that cancels Draw Segment mode does the same.  There is no polling
-anywhere in the kit; if a value changes and no notify fires, the
-wire does not see it.
-
-Buttons whose effect is to change a registered *value* — the pair
-list's own controls, the + Pair / + Clone buttons — notify via
-`pgkitNotifyAll()` inside their underlying model functions in
-`pg_core.py`, not here.
+Actions that need user-supplied values before they can run declare
+`requires` in their meta.  A remote client gathers those values
+(where the click gesture is present, so file pickers and prompts
+work) and sends them in the command's payload.  The action's
+`run(payload)` reads them and, when absent, falls back to the
+original local path.
 """
 
 PANEL_BINDINGS_JS = r"""
+/* ==========================================================================
+   ACTION HELPERS
+   ========================================================================== */
+
+function _addPairAction() {
+  addPair();
+}
+
+function _cloneSelectedPairAction() {
+  if (selectedPair < 0 || selectedPair >= pairs.length) {
+    flashStatus("No pair selected", "warn");
+    return;
+  }
+  clonePair(selectedPair);
+}
+
+function _deleteSelectedPairAction() {
+  if (selectedPair < 0 || selectedPair >= pairs.length) {
+    flashStatus("No pair selected", "warn");
+    return;
+  }
+  deletePair(selectedPair);
+}
+
+function _moveSelectedPairUpAction() {
+  if (selectedPair <= 0) return;
+  movePair(selectedPair, -1);
+}
+
+function _moveSelectedPairDownAction() {
+  if (selectedPair < 0 || selectedPair >= pairs.length - 1) return;
+  movePair(selectedPair, +1);
+}
+
+function _toggleFillSelectedAction() {
+  if (!selectedSegment) {
+    flashStatus("No segment selected", "warn");
+    return;
+  }
+  const p = pairs[selectedSegment.pairIdx];
+  if (!p) return;
+  const seg = p.segments[selectedSegment.segIdx];
+  if (!seg) return;
+  seg.filled = !(seg.filled !== false);
+  syncPairList();
+  draw();
+}
+
+function _clearSelectedPairSegmentsAction() {
+  if (selectedPair < 0) {
+    flashStatus("No pair selected", "warn");
+    return;
+  }
+  pairs[selectedPair].segments.length = 0;
+  selectedSegment = null;
+  _clearShiftDragSet();
+  syncPairList();
+  draw();
+}
+
 /* ==========================================================================
    PANEL BINDINGS
    ========================================================================== */
@@ -44,47 +97,17 @@ PANEL_BINDINGS_JS = r"""
   const kraTextPosEl   = document.getElementById("kraTextPos");
   const kraDrawRectsEl = document.getElementById("kraDrawRects");
 
-  /* ---- buttons (local only; the notifies live in pg_core.py) ----- */
+  /* ---- local button bindings ------------------------------------ */
 
-  if (addBtn)     addBtn.addEventListener("click", addPair);
-  if (cloneBtn)   cloneBtn.addEventListener("click", () => {
-    if (selectedPair < 0 || selectedPair >= pairs.length) {
-      flashStatus("No pair selected", "warn");
-      return;
-    }
-    clonePair(selectedPair);
-  });
+  if (addBtn)         addBtn.addEventListener("click", _addPairAction);
+  if (cloneBtn)       cloneBtn.addEventListener("click", _cloneSelectedPairAction);
+  if (toggleFillBtn)  toggleFillBtn.addEventListener("click", _toggleFillSelectedAction);
+  if (clearSegBtn)    clearSegBtn.addEventListener("click", _clearSelectedPairSegmentsAction);
 
   if (drawSegBtn) drawSegBtn.addEventListener("click", () => {
     state.drawSegmentMode = !state.drawSegmentMode;
     drawSegBtn.classList.toggle("active", state.drawSegmentMode);
     pgkitNotifyLocal("ui.drawSegmentMode");
-    draw();
-  });
-
-  if (toggleFillBtn) toggleFillBtn.addEventListener("click", () => {
-    if (!selectedSegment) {
-      flashStatus("No segment selected", "warn");
-      return;
-    }
-    const p = pairs[selectedSegment.pairIdx];
-    if (!p) return;
-    const seg = p.segments[selectedSegment.segIdx];
-    if (!seg) return;
-    seg.filled = !(seg.filled !== false);
-    syncPairList();
-    draw();
-  });
-
-  if (clearSegBtn) clearSegBtn.addEventListener("click", () => {
-    if (selectedPair < 0) {
-      flashStatus("No pair selected", "warn");
-      return;
-    }
-    pairs[selectedPair].segments.length = 0;
-    selectedSegment = null;
-    _clearShiftDragSet();
-    syncPairList();
     draw();
   });
 
@@ -95,7 +118,7 @@ PANEL_BINDINGS_JS = r"""
   if (generateKraBtn) generateKraBtn.addEventListener("click",
                                                  generateKraFromScene);
 
-  /* ---- overlap toggle ------------------------------------------- */
+  /* ---- checkbox / select bindings ------------------------------- */
 
   if (overlapEl) overlapEl.addEventListener("change", () => {
     state.overlapHighlight = !!overlapEl.checked;
@@ -103,8 +126,6 @@ PANEL_BINDINGS_JS = r"""
     syncPairList();
     draw();
   });
-
-  /* ---- KRA option controls -------------------------------------- */
 
   if (kraTextPosEl) {
     kraTextPosEl.addEventListener("change", () => {
@@ -125,18 +146,12 @@ PANEL_BINDINGS_JS = r"""
     + "Each pair is two parallel lines.  Click a line or a trapezoid\n"
     + "to select that pair; drag anywhere on the canvas to move the\n"
     + "whole pair.\n\n"
-    + "The panel's fields control the pair: inclination, the two\n"
-    + "metrics, offset, gap, whole-pair scale, and loop gap.\n\n"
     + "SHIFT-DRAG SET — hold Shift and click segment bodies in the\n"
     + "segment view to build a persistent set; shift-drag any member\n"
     + "to move every member together.  Releasing Shift keeps the set;\n"
     + "a plain (non-shift) canvas click clears it.\n\n"
-    + "OVERLAP MODE — the Overlap checkbox highlights segments whose\n"
-    + "trapezoids overlap a trapezoid on another pair.  While on, a\n"
-    + "make-room button appears on any segment row that overlaps a\n"
-    + "segment on the pair below.\n\n"
-    + "REMOTE API — every value field in this panel is also\n"
-    + "published at /remote.  When a remote client connects, the\n"
+    + "REMOTE API — every value field and every button in this panel\n"
+    + "is published at /remote.  When a remote client connects, the\n"
     + "panel hides and a 'Controlled remotely' banner appears."
     );
   });
@@ -159,22 +174,18 @@ PANEL_BINDINGS_JS = r"""
     if (e.altKey && !e.ctrlKey && !e.metaKey) {
       if (e.key === "ArrowUp") {
         e.preventDefault();
-        if (selectedPair > 0) movePair(selectedPair, -1);
+        _moveSelectedPairUpAction();
         return;
       }
       if (e.key === "ArrowDown") {
         e.preventDefault();
-        if (selectedPair >= 0 && selectedPair < pairs.length - 1) {
-          movePair(selectedPair, +1);
-        }
+        _moveSelectedPairDownAction();
         return;
       }
     }
   });
 
-  /* ---- remote registrations -------------------------------------
-     The scrub inputs are registered in pg_panel_scrubs.py.  These
-     are the remaining value fields: two UI flags, two KRA options. */
+  /* ---- remote field registrations ------------------------------- */
 
   pgkitRegisterField("ui.overlapHighlight", {
     get: () => !!state.overlapHighlight,
@@ -220,6 +231,118 @@ PANEL_BINDINGS_JS = r"""
       if (kraDrawRectsEl) kraDrawRectsEl.checked = !!v;
     },
     meta: { kind: "bool", label: "KRA rectangles" },
+  });
+
+  /* ---- remote action registrations ------------------------------
+     Each action is registered exactly once.  The two that need
+     user-supplied values (loadScene, generateKra) declare a
+     `requires` array; a remote client gathers those values on its
+     side and sends them in the payload.  Absent a payload, each
+     falls back to its local prompt. */
+
+  pgkitRegisterAction("action.addPair", {
+    label: "+ Pair",
+    run: _addPairAction,
+    meta: { section: "pair", variant: "primary" },
+  });
+
+  pgkitRegisterAction("action.clonePair", {
+    label: "+ Clone",
+    run: _cloneSelectedPairAction,
+    meta: { section: "pair", variant: "primary" },
+  });
+
+  pgkitRegisterAction("action.deletePair", {
+    label: "Delete",
+    run: _deleteSelectedPairAction,
+    meta: { section: "pair", variant: "danger" },
+  });
+
+  pgkitRegisterAction("action.movePairUp", {
+    label: "\u2191",
+    run: _moveSelectedPairUpAction,
+    meta: { section: "pair", variant: "plain" },
+  });
+
+  pgkitRegisterAction("action.movePairDown", {
+    label: "\u2193",
+    run: _moveSelectedPairDownAction,
+    meta: { section: "pair", variant: "plain" },
+  });
+
+  pgkitRegisterAction("action.toggleFill", {
+    label: "Toggle Fill",
+    run: _toggleFillSelectedAction,
+    meta: { section: "segments", variant: "plain" },
+  });
+
+  pgkitRegisterAction("action.clearSegments", {
+    label: "Clear Segments",
+    run: _clearSelectedPairSegmentsAction,
+    meta: { section: "segments", variant: "danger" },
+  });
+
+  pgkitRegisterAction("action.saveScene", {
+    label: "Save scene",
+    run: () => saveSceneJSON(),
+    meta: { section: "export", variant: "plain" },
+  });
+
+  pgkitRegisterAction("action.loadScene", {
+    label: "Load scene",
+    run: (payload) => {
+      if (payload && typeof payload.scene_json === "string") {
+        const ok = loadSceneFromText(payload.scene_json);
+        if (!ok && typeof flashStatus === "function") {
+          flashStatus("Remote load failed", "bad");
+        }
+      } else {
+        promptLoadScene();
+      }
+    },
+    meta: {
+      section: "export",
+      variant: "plain",
+      requires: [
+        {
+          name:   "scene_json",
+          kind:   "file",
+          label:  "scene file",
+          accept: ".json,application/json",
+        },
+      ],
+    },
+  });
+
+  pgkitRegisterAction("action.exportVisual", {
+    label: "Export visual state",
+    run: () => exportVisualStateJSON(),
+    meta: { section: "export", variant: "plain" },
+  });
+
+  pgkitRegisterAction("action.generateKra", {
+    label: "Generate .kra",
+    run: (payload) => {
+      const path = payload && typeof payload.output_path === "string"
+        ? payload.output_path.trim() : "";
+      if (path) {
+        generateKraToPath(path);
+      } else {
+        generateKraFromScene();
+      }
+    },
+    meta: {
+      section: "export",
+      variant: "danger",
+      requires: [
+        {
+          name:    "output_path",
+          kind:    "text",
+          label:   "path",
+          default: "/tmp/pair_scene.kra",
+        },
+      ],
+    },
   });
 
 })();

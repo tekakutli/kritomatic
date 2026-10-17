@@ -13,9 +13,18 @@ it.  A `command` sent by a remote client is relayed to the
 browser, which applies it and sends a `command_result` back; the
 hub relays that too.
 
-That thinness is deliberate.  It means the hub has no schema to
-maintain, no version to bump when a field is added, and no way to
-diverge from what the browser actually holds.
+FORWARDED MESSAGE TYPES
+=======================
+The hub relays any of:
+
+    patch, command, command_result, state, state_request, schema
+
+`schema` carries the field and action metadata the browser
+advertises alongside its state dump; see pgkit/remote_client.py.
+Without `schema` in this list, the browser's schema message is
+silently dropped at the hub, and a remote client that relies on
+it (like remote_panel) sees an empty action list even though the
+browser registered the actions correctly.
 """
 
 import json
@@ -25,6 +34,16 @@ from . import ws as _ws
 from . import PROTOCOL_VERSION
 
 
+_FORWARDED_TYPES = (
+    "patch",
+    "command",
+    "command_result",
+    "state",
+    "state_request",
+    "schema",
+)
+
+
 class Client:
     """One connected WebSocket peer."""
 
@@ -32,7 +51,7 @@ class Client:
         self.sock      = sock
         self.peer      = peer
         self.id        = "c-%x" % id(self)
-        self.role      = None   # set on hello: "browser" or "remote"
+        self.role      = None
         self.send_lock = threading.Lock()
 
     def send(self, msg):
@@ -44,9 +63,9 @@ class Client:
         opcode, payload = _ws.read_frame(self.sock)
         if opcode is None:
             return None
-        if opcode == 0x08:                 # close
+        if opcode == 0x08:
             return None
-        if opcode == 0x01:                 # text
+        if opcode == 0x01:
             try:
                 return payload.decode("utf-8")
             except Exception:
@@ -104,9 +123,6 @@ def handle_message(hub, client, msg):
             "clientId": client.id,
             "protocol": PROTOCOL_VERSION,
         })
-        # A new browser gets an immediate state_request so it sends
-        # its state right away.  A new remote triggers a
-        # state_request broadcast; the browser answers.
         if client.role == "browser":
             client.send({"type": "state_request"})
         else:
@@ -114,9 +130,6 @@ def handle_message(hub, client, msg):
         hub._broadcast_presence()
         return
 
-    if t in ("patch", "command", "command_result", "state",
-             "state_request"):
+    if t in _FORWARDED_TYPES:
         hub.broadcast(msg, exclude=client)
         return
-
-    # Unknown message types are dropped silently.

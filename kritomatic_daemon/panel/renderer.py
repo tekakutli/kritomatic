@@ -94,9 +94,19 @@ Deliberately NOT touched on the companion:
     Cancel), and the overlap does the fusing.
   * `font-family`, `font-size`, `font-weight` — inherited, so the
     letterforms match Cancel's.
-  * `background`, `color` — inherited from the same palette entry as
-    Cancel, and passed through with the identical syntax Cancel
-    uses, so both buttons go through the same QSS rendering path.
+
+Disabled state
+==============
+Every action button has its stylesheet written with a `QPushButton`
+rule for the enabled state and a `QPushButton:disabled` rule for the
+disabled state. Without the latter, a button whose stylesheet sets
+`background:` would render *identically* when disabled — Qt's default
+disabled palette is not applied once the widget owns a stylesheet
+background. The `:disabled` rule is what gives Cancel and Cancel-All
+their visible "grayed out" appearance when their respective
+preconditions are not met. `set_action_enabled(key, enabled)` on the
+renderer toggles `setEnabled()`; the visuals follow from the QSS
+pseudo-state, no per-toggle stylesheet juggling needed.
 """
 
 from __future__ import annotations
@@ -115,6 +125,33 @@ def _esc(text) -> str:
             .replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;"))
+
+
+# Shared QSS for the enabled/disabled pair. The enabled rule carries
+# the palette (danger/primary background), the disabled rule paints a
+# neutral gray so the button visibly reads as unavailable. The
+# `QPushButton` selector prefix is required so the rules form a matched
+# pair — mixing implicit-property syntax (`background: red;`) with an
+# explicit `QPushButton:disabled` selector in the same stylesheet makes
+# the disabled rule apply but the enabled rule ambiguous on some Qt
+# versions.
+_DISABLED_QSS = (
+    "QPushButton:disabled { background:#c8c8c8;color:#f0f0f0; }"
+)
+
+
+def _qss_danger(padding: str) -> str:
+    return (
+        f"QPushButton {{ background:#c5221f;color:white;padding:{padding}; }}"
+        + _DISABLED_QSS
+    )
+
+
+def _qss_primary(padding: str) -> str:
+    return (
+        f"QPushButton {{ background:#1a73e8;color:white;padding:{padding}; }}"
+        + _DISABLED_QSS
+    )
 
 
 class _CommittableTextEdit(QPlainTextEdit):
@@ -519,32 +556,27 @@ class PanelRenderer(QObject):
             style = item.get("style")
 
             if style == "primary":
-                btn.setStyleSheet(
-                    "background:#1a73e8;color:white;padding:6px 14px;"
-                )
+                btn.setStyleSheet(_qss_primary("6px 14px"))
             elif style == "danger":
                 if is_thin:
-                    # Same stylesheet as Cancel, in the same exact
-                    # syntax — same background, same text colour. Only
-                    # the horizontal padding is narrowed so the short
-                    # "ALL" label does not leave the button looking
-                    # starved. Width is pinned via setFixedWidth (a
-                    # widget property, not a QSS declaration), which
-                    # does not alter rendering.
+                    # Same QSS pairing as Cancel, in the same exact
+                    # syntax — same background, same text colour,
+                    # same disabled-state rule. Only the horizontal
+                    # padding is narrowed so the short "ALL" label
+                    # does not leave the button looking starved.
+                    # Width is pinned via setFixedWidth (a widget
+                    # property, not a QSS declaration), which does
+                    # not alter rendering.
                     #
                     # No border-*-radius, no border, no border-left.
                     # Any of those would flip this button into
-                    # stylesheet-only rendering, which drops the
-                    # style's shading and makes it look flat next to
-                    # Cancel — the exact failure this fix addresses.
+                    # stylesheet-only rendering and drop its
+                    # disabled-state pairing — the exact failure mode
+                    # documented in the module docstring.
                     btn.setFixedWidth(40)
-                    btn.setStyleSheet(
-                        "background:#c5221f;color:white;padding:6px 4px;"
-                    )
+                    btn.setStyleSheet(_qss_danger("6px 4px"))
                 else:
-                    btn.setStyleSheet(
-                        "background:#c5221f;color:white;padding:6px 14px;"
-                    )
+                    btn.setStyleSheet(_qss_danger("6px 14px"))
 
             self._action_buttons[key] = btn
             btn.clicked.connect(

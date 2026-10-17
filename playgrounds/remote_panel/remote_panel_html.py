@@ -1,11 +1,10 @@
 """
 remote_panel_html.py — assemble the remote panel's HTML page.
 
-The page uses pgkit's `page()` helper for the shell (head, shared
-CSS, panel wrapper, status line, restore button, presence banner,
-`<canvas>`).  The canvas is unused here and is hidden by the local
-CSS in rp_base.py.  The panel body comes from rp_base.py; the script
-is the concatenation of rp_client.py and rp_ui.py.
+The remote panel is not a playground.  It has no canvas, no sidebar,
+and no pgkit shell.  This module writes its own page: RP_CSS from
+rp_base.py, RP_BODY from rp_base.py, and the concatenation of the
+two JS modules.
 """
 
 import os
@@ -17,21 +16,29 @@ for _p in (_HERE, _PARENT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from rp_base   import RP_CSS, RP_PANEL_BODY
+from rp_base   import RP_CSS, RP_BODY
 from rp_client import RP_CLIENT_JS
 from rp_ui     import RP_UI_JS
 
-from pgkit.html_shell import page
-
 
 def render():
-    script = RP_CLIENT_JS + RP_UI_JS
-    return page(
-        title         = "Remote panel",
-        panel_title   = "Remote panel",
-        panel_body    = RP_PANEL_BODY,
-        script        = script,
-        extra_css     = RP_CSS,
-        status_text   = "",
-        boot_sync_fn  = "",
+    return (
+        "<!DOCTYPE html>\n"
+        "<html lang=\"en\">\n"
+        "<head>\n"
+        "<meta charset=\"utf-8\">\n"
+        "<title>Remote panel</title>\n"
+        "<style>\n"
+        + RP_CSS + "\n"
+        "</style>\n"
+        "</head>\n"
+        "<body>\n"
+        + RP_BODY + "\n"
+        "<script>\n"
+        '"use strict";\n'
+        + RP_CLIENT_JS + "\n"
+        + RP_UI_JS
+        + "\n</script>\n"
+        "</body>\n"
+        "</html>\n"
     )

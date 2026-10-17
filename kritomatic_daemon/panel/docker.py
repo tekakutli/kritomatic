@@ -32,6 +32,48 @@ but with a `None` batch id, which the daemon interprets as
 "cancel every active batch". That is exactly the `panel cancel
 --all` behaviour from the CLI, exposed here as a click.
 
+Cancel-All availability (cross-client, no polling)
+==================================================
+Cancel-All's precondition is not "this docker has a run in flight"
+— it is "any client has a batch in flight". The daemon publishes a
+`state` event at every batch boundary:
+
+  * at batch *start* (see `handlers/comfyui.py` —
+    `_publish_state_change` is called when the batch is registered),
+  * at batch *end* (via `execute()`'s wrapper when `comfy_generate`
+    returns),
+  * and on connect (the event server sends a `state` snapshot as its
+    first write to every new subscriber).
+
+Each of those pushes carries `active_batches: [...]`, the live list
+of running batches across every client. The docker's `_on_state`
+reads that field and stores its length in `_active_batches_count`.
+`_update_run_buttons` OR's it with `self._running` and calls
+`set_action_enabled("cancel_all", …)` accordingly.
+
+No `comfy_batches` fetch, no timer, no interval. The state event
+stream is the sole source of truth. This matches the web panel's
+approach exactly: both clients derive the button's enabled state
+from the same channel the daemon already uses to publish workflow
+state.
+
+Ordering note: a local batch's `batch_complete` message (arriving on
+the command socket) and the end-of-batch `state` push (arriving on
+the event socket) are on two different sockets and may land in
+either order. Both orderings are safe:
+
+  * state first: `_on_state` sees `active_batches=[]`, but
+    `_running` is still true, so both Cancel and Cancel-All remain
+    enabled until `_on_command_completed` clears `_running`. No
+    flicker.
+
+  * completion first: `_on_command_completed` clears `_running`, so
+    Cancel disables. Cancel-All stays enabled on the stale count
+    from the previous state push until the new one arrives
+    (milliseconds later). If the user clicks in that window, the
+    daemon's `comfy_cancel` (no `batch_id`) returns
+    "Cancel requested (nothing was running)" — a harmless no-op.
+
 Layer list freshness
 ====================
 The alias combos need a current layer list. Krita provides no signal
@@ -81,6 +123,7 @@ class KritomaticPanel(QDockWidget):
 
         self._running = False
         self._active_run_request_id = None
+        self._active_batches_count = 0
 
         root = QWidget()
         root_layout = QVBoxLayout(root)
@@ -147,6 +190,7 @@ class KritomaticPanel(QDockWidget):
         self._renderer.layerRefreshRequested.connect(
             self._layers_watcher.schedule)
         self._conn.request_layers()
+        self._update_run_buttons()
 
     # ---- lifecycle ----
 
@@ -179,10 +223,26 @@ class KritomaticPanel(QDockWidget):
                 pass
         else:
             self._status.setText("Waiting for daemon event stream…")
+            # No connection, no batches known to us. Resetting to 0
+            # disables Cancel-All honestly rather than leaving it lit
+            # against stale data. The event server re-sends a full
+            # `state` snapshot on reconnect, so `_on_state` restores
+            # the correct value automatically.
+            self._active_batches_count = 0
         self._update_run_buttons()
 
     def _on_state(self, data: dict) -> None:
-        pass
+        # `active_batches` is the daemon's live list of running
+        # batches, across all clients. The daemon publishes a state
+        # event at every batch boundary (see the module docstring's
+        # "Cancel-All availability" section), so this is always
+        # current — no polling, no fetch.
+        try:
+            batches = data.get("active_batches") or []
+            self._active_batches_count = len(batches)
+        except Exception:
+            pass
+        self._update_run_buttons()
 
     def _on_panel(self, description: dict) -> None:
         try:
@@ -245,6 +305,12 @@ class KritomaticPanel(QDockWidget):
                 self._append_log("warn", f"Cancel sent: {msg}")
             else:
                 self._append_log("err", f"Cancel failed: {msg}")
+            # No fetch here. If the cancel actually stopped a batch,
+            # the daemon's end-of-batch state push will update
+            # `_active_batches_count` when it fires. If it was a
+            # cancel-all against another client's batch, the same
+            # applies — the state push fires from `execute()`'s
+            # wrapper when that batch returns.
             return
 
         if request_id != self._active_run_request_id:
@@ -348,9 +414,18 @@ class KritomaticPanel(QDockWidget):
             self._append_log("hdr", f"Action {key} sent.")
 
     def _update_run_buttons(self) -> None:
+        # Run: enabled when this docker is idle.
         self._renderer.set_action_enabled("run", not self._running)
+        # Cancel: targets this docker's own batch. Enabled strictly
+        # when this docker has one in flight — it has nothing to do
+        # otherwise.
         self._renderer.set_action_enabled("cancel", self._running)
-        self._renderer.set_action_enabled("cancel_all", self._running)
+        # Cancel-All: targets every batch on the daemon. Enabled when
+        # either this docker has a local run (covers the brief window
+        # before the first state push arrives) or the daemon reports
+        # any active batch from any client.
+        any_batch = self._running or self._active_batches_count > 0
+        self._renderer.set_action_enabled("cancel_all", any_batch)
 
     def _append_log(self, kind: str, text: str) -> None:
         color = {

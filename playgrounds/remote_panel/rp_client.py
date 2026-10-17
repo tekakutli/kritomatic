@@ -1,54 +1,60 @@
 """
 rp_client.py — the remote panel's WebSocket client.
 
-BROWSER-SIDE, connecting TO a playground.  This is distinct from
-pgkit's remote_client, which runs INSIDE a playground and connects
-to that playground's own server.  Here, the page that runs this
-code is itself the remote client.
+BROWSER-SIDE, connecting TO a playground.  Distinct from pgkit's
+remote_client (which runs inside a playground and connects to that
+playground's own server).  Here, this page is the remote client.
 
 STATE
 =====
-The client holds three maps:
+    _rp.values       {name: current_value}   from `state` messages
+    _rp.schema       {name: meta}            from `schema` messages
+    _rp.fields       {name: DOM entry}       one per non-action field
+    _rp.actions      {name: DOM entry}       one per action
+    _rp._pendingAction   the in-flight action form, if any
 
-    _rp.values    {name: current_value}      from the last `state`
-    _rp.schema    {name: meta}               from the last `schema`
-    _rp.widgets   {name: DOM entry}          built by rp_ui.js
-
-The schema message is optional (older playgrounds don't send it);
-when absent, rp_ui infers a widget type from the value's JS type.
+The `schema` message carries both fields (kind is `"number"`,
+`"bool"`, or `"enum"`) and actions (kind is `"action"`).  Actions
+may additionally carry a `requires` array describing values the
+user must supply; see ACTION INVOCATION below.
 
 MESSAGES SENT
 =============
-    hello
-    state_request          on connect; debounced after edits
-    patch                  on every widget change
-    command                from the Commands section
+    hello, state_request
+    patch             on every field edit
+    command           on every action-button click
 
 MESSAGES RECEIVED
 =================
-    hello_ack              {clientId}
-    presence               {browser, remote}
-    state                  {values}
-    schema                 {fields}
-    patch                  {values}   (from the browser's local user,
-                                       not our own — see note below)
-    command_result         {id, ok, error}
+    hello_ack, presence, state, schema, patch, command_result
 
 ECHO BEHAVIOUR
 ==============
 The playground suppresses re-broadcast during a remote patch's
-application, so the meta-panel does not receive a `patch` echo of
-its own writes.  What it does receive is `patch` messages triggered
-by the playground's local user.  Those are applied to `_rp.values`
-and to any widget not currently focused.
+application, so this page does not receive a `patch` echo of its
+own field writes.  Patch messages from the playground's *local*
+user do arrive; they update `_rp.values` and each widget not
+currently focused.
 
 STATE REFRESH
 =============
 After sending a patch, the client schedules a `state_request` 500ms
-later.  That lets the panel discover whether the playground actually
-accepted the value (some fields require a selected object and reject
-the write silently).  On a scrub-like edit with many writes, the
-debounce collapses them into one confirmation at the end.
+later.  That lets the panel discover whether the playground
+accepted the write (some fields reject silently when no object is
+selected).  On a scrub-like edit with many writes, the debounce
+collapses them into one confirmation.
+
+ACTION INVOCATION
+=================
+An action whose meta carries a non-empty `requires` array needs
+user-supplied values before it can run.  The values are gathered
+on this page — where the click gesture is present, so the browser
+will open a file picker or focus a text input without complaint —
+and sent with the command payload.
+
+An action without `requires` is dispatched immediately: this page
+sends `{type:"command", kind: name, payload: {}}` and the
+playground's registered action runs with no arguments.
 """
 
 RP_CLIENT_JS = r"""
@@ -58,6 +64,7 @@ RP_CLIENT_JS = r"""
 
 const _rp = {
   socket:          null,
+  actionsCollapsedByUser: false,
   clientId:        null,
   connected:       false,
   everConnected:   false,
@@ -65,17 +72,19 @@ const _rp = {
   seq:             0,
   values:          {},
   schema:          {},
-  widgets:         {},
+  fields:          {},   /* name -> { row, widget, kind } */
+  actions:         {},   /* name -> { btn, meta } */
   presence:        null,
   reconnectTimer:  null,
   reconnectMs:     1000,
   stateTimer:      null,
   rebuildTimer:    null,
   log:             [],
+  _pendingAction:  null,
 };
 
 const RP_PROTOCOL_VERSION = 1;
-const RP_MAX_LOG           = 200;
+const RP_MAX_LOG           = 300;
 const RP_STATE_DEBOUNCE_MS = 500;
 const RP_REBUILD_DEBOUNCE_MS = 50;
 
@@ -104,7 +113,7 @@ function rpConnect(target) {
   try { sock = new WebSocket(target); }
   catch (e) {
     rpLog("error", "invalid target: " + e.message);
-    rpSetStatus("disconnected", false);
+    rpSetStatus("disconnected");
     return;
   }
   _rp.socket = sock;
@@ -113,7 +122,7 @@ function rpConnect(target) {
     _rp.connected     = true;
     _rp.everConnected = true;
     _rp.reconnectMs   = 1000;
-    rpSetStatus("connecting", false);
+    rpSetStatus("connecting");
     rpSend({
       type:     "hello",
       role:     "remote",
@@ -131,7 +140,7 @@ function rpConnect(target) {
   sock.addEventListener("close", () => {
     _rp.connected = false;
     _rp.clientId  = null;
-    rpSetStatus("disconnected", false);
+    rpSetStatus("disconnected");
     rpLog("info", "disconnected");
     rpScheduleReconnect();
   });
@@ -157,16 +166,13 @@ function rpDisconnect() {
 }
 
 function rpScheduleReconnect() {
-  /* Reconnect only if we were previously connected — a network blip
-     recovers, but a failed first attempt stays failed until the user
-     acts. */
   if (!_rp.everConnected) return;
   if (!_rp.target) return;
   if (_rp.reconnectTimer) return;
   _rp.reconnectTimer = setTimeout(() => {
     _rp.reconnectTimer = null;
     if (!_rp.connected && _rp.target) {
-      rpLog("info", "reconnecting to " + _rp.target + "…");
+      rpLog("info", "reconnecting to " + _rp.target + "\u2026");
       rpConnect(_rp.target);
     }
   }, _rp.reconnectMs);
@@ -231,8 +237,7 @@ function rpHandle(msg) {
         remote:  msg.remote  || 0,
       };
       rpSetStatus(
-        _rp.presence.browser > 0 ? "connected" : "no-browser",
-        _rp.presence.browser > 0
+        _rp.presence.browser > 0 ? "connected" : "no-browser"
       );
       rpRenderPresence();
       rpLog("info", "presence: browser=" + _rp.presence.browser
@@ -282,15 +287,14 @@ function rpOnSchema(newSchema) {
   const oldNames = Object.keys(_rp.schema).sort();
   const changed  = !_rpNamesEqual(newNames, oldNames);
   _rp.schema = newSchema;
-  rpLog("schema", newNames.length + " entr" + (newNames.length === 1 ? "y" : "ies"));
+  rpLog("schema", newNames.length + " entr"
+                  + (newNames.length === 1 ? "y" : "ies"));
   if (changed) rpScheduleRebuild();
 }
 
 function _rpNamesEqual(a, b) {
   if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) return false;
-  }
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
   return true;
 }
 
@@ -300,6 +304,21 @@ function rpScheduleRebuild() {
     _rp.rebuildTimer = null;
     rpRebuildPanel();
   }, RP_REBUILD_DEBOUNCE_MS);
+}
+
+/* ==========================================================================
+   SECTION HELPERS
+   ========================================================================== */
+
+function _rpSectionForField(name, meta) {
+  if (meta && meta.section) return meta.section;
+  const dot = name.indexOf(".");
+  return dot >= 0 ? name.slice(0, dot) : "general";
+}
+
+function _rpSectionLabel(section) {
+  if (!section) return "General";
+  return section.charAt(0).toUpperCase() + section.slice(1);
 }
 
 /* ==========================================================================
@@ -315,7 +334,7 @@ function rpBuildFieldRow(name) {
   const label = meta.label || short;
 
   const row = document.createElement("div");
-  row.className = "field";
+  row.className = "field-row";
 
   const lbl = document.createElement("label");
   lbl.textContent = label;
@@ -378,7 +397,6 @@ function rpBuildFieldRow(name) {
     });
     widget.addEventListener("blur", commit);
   } else {
-    /* String / unknown.  Free-form text input. */
     widget = document.createElement("input");
     widget.type = "text";
     widget.value = String(value == null ? "" : value);
@@ -401,12 +419,12 @@ function rpBuildFieldRow(name) {
 
   widget.dataset.rpField = name;
   row.appendChild(widget);
-  _rp.widgets[name] = { row, widget, kind };
+  _rp.fields[name] = { row, widget, kind };
   return row;
 }
 
 function rpUpdateWidget(name) {
-  const entry = _rp.widgets[name];
+  const entry = _rp.fields[name];
   if (!entry) return;
   const { widget, kind } = entry;
   if (document.activeElement === widget) return;
@@ -427,17 +445,179 @@ function _rpInferKind(value) {
 }
 
 /* ==========================================================================
+   ACTION BUTTONS
+   ========================================================================== */
+
+function rpBuildActionButton(name) {
+  const meta  = _rp.schema[name] || {};
+  const label = meta.label || name;
+  const btn   = document.createElement("button");
+  btn.type = "button";
+  btn.className = "action-btn";
+  if (meta.variant === "primary") btn.classList.add("primary");
+  else if (meta.variant === "danger") btn.classList.add("danger");
+  btn.textContent = label;
+  btn.title = name;
+  btn.addEventListener("click", () => rpActionClick(name));
+  _rp.actions[name] = { btn, meta };
+  return btn;
+}
+
+/* ==========================================================================
+   ACTION INVOCATION — with payload gathering
+   ==========================================================================
+   An action whose meta carries a non-empty `requires` array needs
+   user-supplied values before it can run.  The values are gathered
+   on this page (where the click gesture is present) and sent with
+   the command payload.
+
+   An action without `requires` is dispatched immediately. */
+
+function rpActionClick(name) {
+  const meta = _rp.schema[name] || {};
+  const requires = Array.isArray(meta.requires) ? meta.requires : [];
+  if (requires.length === 0) {
+    const id = rpSendCommand(name, {});
+    rpLog("cmd", "\u25B6 " + (meta.label || name) + "  (" + id + ")");
+    return;
+  }
+  rpShowActionForm(name, requires);
+}
+
+function rpShowActionForm(name, requires) {
+  const meta     = _rp.schema[name] || {};
+  const backdrop = document.getElementById("rpModalBackdrop");
+  const title    = document.getElementById("rpModalTitle");
+  const body     = document.getElementById("rpModalBody");
+  if (!backdrop || !title || !body) return;
+
+  title.textContent = meta.label || name;
+  body.innerHTML = "";
+
+  const values = {};
+
+  for (const req of requires) {
+    const row = document.createElement("div");
+    row.className = "rp-modal-field";
+
+    const lbl = document.createElement("label");
+    lbl.textContent = req.label || req.name;
+    row.appendChild(lbl);
+
+    if (req.kind === "file") {
+      const wrap = document.createElement("div");
+      wrap.className = "rp-modal-file-wrap";
+
+      const fileBtn = document.createElement("button");
+      fileBtn.type = "button";
+      fileBtn.className = "rp-modal-file-btn";
+      fileBtn.textContent = "Choose file\u2026";
+
+      const status = document.createElement("span");
+      status.className = "rp-modal-file-status";
+      status.textContent = "(none)";
+
+      const hidden = document.createElement("input");
+      hidden.type = "file";
+      hidden.style.display = "none";
+      if (req.accept) hidden.accept = req.accept;
+
+      hidden.addEventListener("change", () => {
+        const f = hidden.files && hidden.files[0];
+        if (!f) return;
+        status.textContent = f.name;
+        const reader = new FileReader();
+        reader.onload = () => {
+          values[req.name] = String(reader.result || "");
+          fileBtn.classList.add("chosen");
+          rpValidateModal();
+        };
+        reader.onerror = () => {
+          status.textContent = "(read failed)";
+          delete values[req.name];
+          rpValidateModal();
+        };
+        reader.readAsText(f);
+      });
+      fileBtn.addEventListener("click", () => hidden.click());
+
+      wrap.appendChild(fileBtn);
+      wrap.appendChild(status);
+      wrap.appendChild(hidden);
+      row.appendChild(wrap);
+    } else {
+      const input = document.createElement("input");
+      input.type = "text";
+      input.value = req.default != null ? String(req.default) : "";
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      input.addEventListener("input", () => {
+        values[req.name] = input.value;
+        rpValidateModal();
+      });
+      values[req.name] = input.value;
+      row.appendChild(input);
+    }
+
+    body.appendChild(row);
+  }
+
+  _rp._pendingAction = { name, requires, values };
+  backdrop.hidden = false;
+  rpValidateModal();
+  const firstInput = body.querySelector("input[type=text]");
+  if (firstInput) firstInput.focus();
+}
+
+function rpValidateModal() {
+  const sendBtn = document.getElementById("rpModalSend");
+  if (!sendBtn) return;
+  if (!_rp._pendingAction) { sendBtn.disabled = true; return; }
+  const { requires, values } = _rp._pendingAction;
+  let ok = true;
+  for (const req of requires) {
+    if (req.kind === "file") {
+      if (typeof values[req.name] !== "string") { ok = false; break; }
+    } else {
+      if (typeof values[req.name] !== "string"
+          || values[req.name].trim() === "") {
+        ok = false;
+        break;
+      }
+    }
+  }
+  sendBtn.disabled = !ok;
+}
+
+function rpCommitActionForm() {
+  if (!_rp._pendingAction) return;
+  const { name, values } = _rp._pendingAction;
+  const meta = _rp.schema[name] || {};
+  _rp._pendingAction = null;
+  const backdrop = document.getElementById("rpModalBackdrop");
+  if (backdrop) backdrop.hidden = true;
+  const id = rpSendCommand(name, values);
+  rpLog("cmd", "\u25B6 " + (meta.label || name) + "  (" + id + ")");
+}
+
+function rpCancelActionForm() {
+  _rp._pendingAction = null;
+  const backdrop = document.getElementById("rpModalBackdrop");
+  if (backdrop) backdrop.hidden = true;
+}
+
+/* ==========================================================================
    STATUS
    ========================================================================== */
 
-function rpSetStatus(state, hasBrowser) {
+function rpSetStatus(state) {
   const el = document.getElementById("rpStatus");
   if (!el) return;
   let text, cls;
-  if (state === "connecting")    { text = "connecting\u2026";        cls = ""; }
-  else if (state === "connected") { text = "connected";                cls = "ok"; }
-  else if (state === "no-browser"){ text = "connected (no browser)";   cls = "warn"; }
-  else                            { text = "disconnected";             cls = "bad"; }
+  if (state === "connecting")     { text = "connecting\u2026";       cls = ""; }
+  else if (state === "connected") { text = "connected";              cls = "ok"; }
+  else if (state === "no-browser"){ text = "connected (no browser)"; cls = "warn"; }
+  else                             { text = "disconnected";          cls = "bad"; }
   el.textContent = text;
   el.className   = cls;
 

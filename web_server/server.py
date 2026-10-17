@@ -25,6 +25,72 @@ Run it
     WEB_PANEL_PORT=8289 python web_server/server.py
 
 Then open http://127.0.0.1:8189/.
+
+Cancel-All's precondition, and why there is no polling
+======================================================
+The button is enabled when *any* client has a batch in flight on the
+daemon (this browser, the Krita docker, the CLI). The daemon's
+`comfy_status` payload carries `active_batches: [...]` — the live
+list of running batches from all clients.
+
+The browser derives `activeBatchesCount` directly from the SSE
+`state` events the daemon pushes. For that to be complete, the
+daemon has to publish a state event at *batch start*: `execute()`
+only publishes after each state-mutating command returns, and
+`comfy_generate` blocks until the run finishes. That's why
+`handlers/comfyui.py` calls `self._publish_state_change()` at batch
+registration — it is what makes the batch visible in the SSE stream
+while it is running. The end-of-batch publish already happens via
+`execute()`'s wrapper when `comfy_generate` returns (unconditionally,
+including on cancellation or failure; see that method's docstring).
+
+Given both ends of that lifecycle are pushed, the browser needs no
+fetch of its own: every state event carries the current
+`active_batches`, and every change to that list triggers a fresh
+state event. There is therefore no timer, no interval, no manual
+`/api/batches` fetch in the JS below.
+
+Button refresh is unconditional on both event types
+===================================================
+Docker's `_on_state` and `_on_panel` both call `_update_run_buttons()`
+on every event, with no early-out. That is what makes the docker's
+button state always consistent with the daemon's view: even if
+`active_batches` hasn't changed, the button is re-evaluated.
+
+The web panel used to have `if (batches !== app.activeBatchesCount)
+setRunning(...)`, which was an optimization that turned into a bug
+in one specific class of failure: if `activeBatchesCount` ever
+drifted out of sync with the daemon's real batch list (a dropped
+state event during SSE reconnect, a transient race between batch
+start and a fresh subscription), the `!==` guard would skip the
+`setRunning` call on every subsequent event whose count matched the
+stale one — leaving the button permanently out of sync with
+reality. `syncValues` had the same issue: it ran on every
+value-only panel event but never refreshed button enabled state,
+so a panel event could arrive without any button update if the
+state event that would have updated buttons had been missed.
+
+Both are fixed: the `state` handler unconditionally calls
+`setRunning`, and `syncValues` calls it at the end. This mirrors the
+docker exactly and eliminates the entire class of stale-count bugs.
+
+Why `cancelRun` does not set `running = true`
+=============================================
+`app.running` is "this browser started a batch that has not yet
+finished". It is set by `startRun()` and cleared by the terminal
+run events (`"done"`, `"cancelled"`, `"error"`). It is NOT touched
+by `cancelRun` on a successful cancel, because:
+
+  * Local run: `running` is already true; sending the cancel changes
+    nothing about who started it. The run is still in flight on the
+    daemon until it winds itself down, at which point `"cancelled"`
+    or `"done"` fires and clears `running`.
+
+  * Other-client run (Cancel All when this browser did not start a
+    batch): `running` was never true, and nothing in this browser
+    will ever fire a terminal run event for that batch. Setting
+    `running = true` here would leave it stuck forever, permanently
+    enabling Cancel and Cancel All.
 """
 
 import json
@@ -338,6 +404,29 @@ def _send_daemon_cancel(batch_id) -> tuple:
     return True, resp.get("message", "cancel requested")
 
 
+def _fetch_batches() -> list:
+    """Query `comfy_batches` for the live batch list.
+
+    Kept for the `/api/batches` endpoint as an escape hatch for
+    debugging and scripted use. The browser does *not* use it — the
+    JS below reads `active_batches` from the SSE `state` stream, which
+    the daemon publishes at batch boundaries.
+    """
+    client = KritaClient(host=DAEMON_HOST, port=DAEMON_PORT)
+    if not client.connect():
+        return []
+    try:
+        resp = client.execute("comfy_batches")
+    except Exception:
+        return []
+    finally:
+        client.close()
+    if not resp or resp.get("status") != "success":
+        return []
+    data = resp.get("data") or {}
+    return list(data.get("batches") or [])
+
+
 # ----------------------------------------------------------------------
 #  HTTP handler
 # ----------------------------------------------------------------------
@@ -397,6 +486,11 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/state":
                 with _state_lock:
                     self._send_json(dict(_state))
+            elif self.path == "/api/batches":
+                # Live batch list. The browser does not use this
+                # (see the module docstring); it is kept for scripts
+                # and manual debugging.
+                self._send_json({"batches": _fetch_batches()})
             elif self.path == "/api/events":
                 self._handle_events()
             else:
@@ -699,7 +793,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   button.primary { background: #1a73e8; color: white; }
   button.danger { background: #c5221f; color: white; }
-  button:disabled { background: #aaa; cursor: not-allowed; }
+  button:disabled { background: #c8c8c8; color: #f0f0f0;
+                    cursor: not-allowed; }
 
   .progress { margin-top: 0.9rem; }
   .progress .row {
@@ -744,6 +839,7 @@ const app = {
   inFlight: new Set(),
   commitQueue: Promise.resolve(),
   running: false,
+  activeBatchesCount: 0,
   eventsConnected: false,
   firstPanelReceived: false,
 };
@@ -768,6 +864,10 @@ function toBool(v) {
     return low === "true" || low === "1";
   }
   return false;
+}
+
+function isCancelAllItem(item) {
+  return item && (item.cancel_all === true || item.key === "cancel_all");
 }
 
 function renderStatus(s) {
@@ -967,6 +1067,12 @@ function syncValues(description) {
       if (f.key && f.visible_when) evaluateVisibility(f.key);
     }
   }
+  // Refresh button enabled state from the current
+  // `activeBatchesCount`, matching docker's `_on_panel` (which
+  // unconditionally calls `_update_run_buttons()`). `rebuildPanel`
+  // already does this on structure changes; this closes the same
+  // gap on value-only panel events.
+  setRunning(app.running);
 }
 
 function evaluateVisibility(key) {
@@ -1145,7 +1251,7 @@ async function runAction(key) {
     }
   }
 
-  const cancelAll = key === "cancel_all" || item.cancel_all === true;
+  const cancelAll = isCancelAllItem(item);
 
   if (key === "run") {
     await startRun(command);
@@ -1166,15 +1272,25 @@ function rowDiv(cls, text) {
 
 function setRunning(running) {
   app.running = running;
+  const anyBatch = running || (app.activeBatchesCount > 0);
   for (const s of app.sectionSpecs) {
     if (s.kind !== "actions") continue;
     for (const item of (s.items || [])) {
       const btn = document.querySelector(
         `[data-action-key="${cssEsc(item.key)}"]`);
       if (!btn) continue;
-      if (item.key === "run") btn.disabled = running;
-      else if (item.key === "cancel" || item.key === "cancel_all")
+      if (item.key === "run") {
+        btn.disabled = running;
+      } else if (item.key === "cancel") {
+        // Cancel targets *this* client's run. Enabled strictly when
+        // this client has one in flight.
         btn.disabled = !running;
+      } else if (isCancelAllItem(item)) {
+        // Cancel-All targets every batch on the daemon, from any
+        // client. Enabled whenever there is anything anywhere to
+        // cancel, whether or not this client started it.
+        btn.disabled = !anyBatch;
+      }
     }
   }
 }
@@ -1215,7 +1331,12 @@ async function startRun(command) {
 
 async function cancelRun(command, scope) {
   const log = document.getElementById("progress");
-  setRunning(true);
+  // This function sends a cancel request; it does not mutate
+  // `app.running`. For a local run, `running` is already true and
+  // will be cleared by the terminal run event. For another client's
+  // run (Cancel All with no local run), setting `running = true`
+  // here would leave it stuck forever — nothing in this browser
+  // fires a terminal event for that batch.
   let resp;
   try {
     resp = await fetch("/api/cancel", {
@@ -1225,14 +1346,21 @@ async function cancelRun(command, scope) {
     });
   } catch (e) {
     log.appendChild(rowDiv("err", "Cancel request failed: " + e.message));
-    setRunning(false);
     return;
   }
   if (!resp.ok) {
     let msg = "HTTP " + resp.status;
     try { const b = await resp.json(); if (b && b.error) msg = b.error; } catch (_) {}
     log.appendChild(rowDiv("err", "Cannot cancel: " + msg));
-    if (resp.status === 409) setRunning(false);
+    if (resp.status === 409) {
+      // Server says there is no run in progress. If `running` was
+      // stuck true, reset it — nothing else will unstick it.
+      app.running = false;
+      setRunning(false);
+    }
+  } else {
+    log.appendChild(rowDiv("warn",
+      scope === "all" ? "Cancel All sent." : "Cancel sent."));
   }
 }
 
@@ -1274,6 +1402,29 @@ function connectEvents() {
     try {
       const s = JSON.parse(e.data);
       app.latestState = s;
+      // Full sync of `activeBatchesCount` from the daemon's state
+      // payload. The daemon publishes a `state` event at every
+      // batch boundary (see handlers/comfyui.py — `_publish_state_change`
+      // is called at batch registration and again by `execute()`'s
+      // wrapper when `comfy_generate` returns, unconditionally,
+      // including on cancellation or failure).
+      //
+      // `setRunning` is called unconditionally, not only when the
+      // count changes. Docker's `_on_state` does the same (it calls
+      // `_update_run_buttons()` unconditionally), and that is what
+      // makes its button state always consistent with the daemon's
+      // view. The `!==` guard this used to have was an optimization
+      // that could leave the button stale if `activeBatchesCount`
+      // had ever drifted out of sync (a missed state event during
+      // SSE reconnect, a transient race between batch start and a
+      // fresh subscription) — because then a "same count" check
+      // would short-circuit the only thing that would have repaired
+      // it.
+      const batches = (s && s.daemon
+                       && Array.isArray(s.daemon.active_batches))
+        ? s.daemon.active_batches.length : 0;
+      app.activeBatchesCount = batches;
+      setRunning(app.running);
       renderStatus(s);
     } catch (err) {
       console.error("state parse error", err);
@@ -1300,7 +1451,9 @@ function connectEvents() {
   es.addEventListener("run", handleRunEvent);
 
   es.onerror = function () {
-    // EventSource reconnects automatically.
+    // EventSource reconnects automatically. On reconnect the server
+    // sends a full `state` snapshot via `_handle_events`'s initial
+    // write, so `activeBatchesCount` re-syncs without any polling.
   };
 
   setTimeout(function () {

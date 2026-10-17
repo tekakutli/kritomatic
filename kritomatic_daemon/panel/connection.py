@@ -37,6 +37,17 @@ loop parses each received chunk as one JSON object, so two commands
 concatenated on one socket would fail to parse. Two sequential
 sockets avoid the problem with a bounded, negligible cost on
 localhost.
+
+There is deliberately no `request_batches()` here. The docker used
+to poll `comfy_batches` on events to keep the Cancel-All button's
+precondition fresh, but that is unnecessary now: the daemon
+publishes a `state` event at batch *start* (see
+`handlers/comfyui.py` — `_publish_state_change` is called at batch
+registration) and again at batch *end* (via `execute()`'s wrapper
+when `comfy_generate` returns). The `active_batches` field in those
+state events is the sole source of truth for "is anything running
+anywhere", and the docker's `_on_state` handler reads it directly.
+No fetch, no timer.
 """
 
 from __future__ import annotations

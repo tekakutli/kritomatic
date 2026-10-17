@@ -61,12 +61,20 @@ The lock is cleared by any of:
 Event bus publishing
 ====================
 The handler publishes to the daemon's event bus after every
-state-mutating command, and after every browser publish. Two triggers,
-one bus:
+state-mutating command. Two triggers, one bus:
 
   * `execute()` overrides `AutoDispatchHandler.execute()` and
-    publishes after any command whose name is not in
-    `_READ_ONLY_COMMANDS` and whose dispatch succeeded.
+    publishes after any non-read-only command, whether it succeeded
+    or failed. Publishing on failure is not a courtesy — it is what
+    keeps the `active_batches` field in state payloads accurate.
+    `comfy_generate` registers its batch in `self._batches` at start
+    (and publishes a state event explicitly there, so the batch is
+    visible to subscribers *while it runs*); when the run ends — for
+    any reason, including cancellation or error — the `finally`
+    block pops the batch. If the failure path did not publish, the
+    last state subscribers saw would show the (now-gone) batch as
+    still active, and Cancel-All buttons on clients gated on
+    `active_batches` would stay enabled forever.
 
   * `_on_workflow_published()` publishes explicitly, after it has
     recorded the publisher and (conditionally) promoted the graph.
@@ -522,12 +530,30 @@ class ComfyUIHandler(AutoDispatchHandler):
     # ------------------------------------------------------------------
 
     def execute(self, cmd_type, params):
-        """Dispatch a command, then publish new state to the event bus
-        if the command mutated anything the bus subscribers care about.
+        """Dispatch a command, then publish new state to the event bus.
+
+        Publishes after every non-read-only command, whether it
+        succeeded or failed. The alternative — publishing only on
+        success — leaves subscribers with stale state when a command
+        partially completed its work.
+
+        The concrete case that motivated unconditional publish:
+        `comfy_generate` registers its batch in `self._batches` at
+        start, so `active_batches` in the state payload shows it as
+        running. When the run ends — for *any* reason, including
+        cancellation or error — the `finally` block removes the batch
+        from `self._batches`. If the failure path did not publish,
+        subscribers (Krita docker, web panel) would keep the last
+        successful state event's `active_batches: [batch_id]`, and
+        any Cancel-All button gated on `active_batches` would stay
+        enabled forever, with nothing left to cancel.
+
+        Publishing unconditionally after non-read-only commands
+        reflects reality (the batch is gone) and is harmless when
+        nothing changed — subscribers just see identical state.
         """
         result = super().execute(cmd_type, params)
         if (isinstance(result, dict)
-                and result.get("success")
                 and cmd_type not in _READ_ONLY_COMMANDS):
             self._publish_state_change()
         return result
@@ -1375,6 +1401,18 @@ class ComfyUIHandler(AutoDispatchHandler):
                 return {"success": False,
                         "message": "Not connected; run comfy_connect first",
                         "data": {"batch_id": batch_id}}
+
+            # Announce the batch start. `execute()` publishes a state
+            # change after every state-mutating command, but
+            # `_comfy_generate_impl` doesn't return until the run
+            # finishes — so without this publish, subscribers (docker,
+            # web panel) never see the batch while it is running. That
+            # leaves any `cancel_all` button gated on `active_batches`
+            # dark for the entire duration of the run, even though the
+            # daemon knows about the batch and would happily cancel it.
+            # The completion publish still fires normally, via
+            # `execute()`'s wrapper when this method returns.
+            self._publish_state_change()
 
             has_seed_param = any(
                 p["name"] == _SEED_PARAMETER_NAME

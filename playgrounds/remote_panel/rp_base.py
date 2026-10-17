@@ -1,236 +1,672 @@
 """
-rp_base.py — the remote panel's panel body and local CSS.
+rp_base.py — the remote panel's CSS and HTML structure.
 
-The shell comes from pgkit's html_shell.page().  This file supplies:
+No pgkit `page()` helper here.  The remote panel is not a
+playground: it has no canvas, no sidebar, and its whole viewport
+is a control surface.  pgkit's shell assumes a canvas and a
+panel, so the remote panel writes its own page.  The style is
+self-contained and shares nothing with the playgrounds' CSS, by
+design — a distinct tool should look like a distinct tool.
 
-    RP_PANEL_BODY    the connection block, the field container
-                     (filled from the playground's schema), the
-                     command block, and the message log
+LAYOUT
+======
+A single CSS Grid fills the viewport:
 
-    RP_CSS           styles that extend the shared stylesheet:
-                     the connection strip, the field container,
-                     the message log, and the rules that hide the
-                     unused canvas and pgkit's help button
+    row 1: top bar        title · connection strip · presence
+    row 2: actions panel  grouped button grids
+    row 3: fields panel   responsive card grid (this row is 1fr)
+    row 4: log panel      collapsible message log
 
-The connection block is at the top of the panel body and can be
-collapsed with the whole panel — that's the expected behaviour;
-when you collapse the remote panel, you're not using it.
+The middle row is `1fr`, so the fields region expands to fill
+whatever the actions, top bar, and log leave unused.
+
+ACTIONS PANEL — AUTO-SHOW
+=========================
+The actions panel is shown by default at page load: the HTML
+does not carry the `collapsed` class.  Before the browser sends
+its schema the panel body is empty, and `rpRebuildActions`
+(in rp_ui.py) hides the panel if no actions were registered.  So
+the visible states are:
+
+    page just loaded          panel visible, empty body
+    connected, actions exist  panel visible, populated
+    connected, no actions     panel collapsed (old playground)
+    user clicked Hide         panel collapsed until they click
+                              Show again
+
+The toggle button starts labelled "Hide" to match the initial
+visible state.
+
+ACTION-PAYLOAD MODAL
+====================
+A small modal (#rpModalBackdrop) is used by actions whose meta
+carries a `requires` array — a list of values the user must
+supply before the action can run.  The modal's fields are built
+by rpShowActionForm (in rp_client.py).  The modal is hidden by
+the `hidden` attribute; rpShowActionForm sets it to false,
+rpCommitActionForm and rpCancelActionForm set it to true.
 """
 
 RP_CSS = r"""
-  /* This page has no canvas of its own — the playgrounds it talks to
-     do.  Hide pgkit's <canvas>.  Also hide pgkit's help button; a
-     remote panel has nothing useful to say in a help popup, and the
-     space is better used by the connect strip. */
-  canvas#c     { display: none; }
-  #ui #helpBtn { display: none; }
-
-  /* The connection strip: target input, preset dropdown, connect and
-     disconnect buttons.  Visually a full-width row of controls at the
-     top of the panel body. */
-  #rpConn {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding-bottom: 6px;
-    border-bottom: 1px solid #1e2836;
-    margin-bottom: 6px;
+  :root {
+    --bg:        #0a0e14;
+    --bg-panel:  #0b1018;
+    --bg-card:   #0e1622;
+    --bg-input:  #0d1219;
+    --border:    #1e2836;
+    --border-2:  #223040;
+    --border-3:  #34445a;
+    --text:      #dce6f2;
+    --text-dim:  #a8b5c4;
+    --text-mute: #5a6774;
+    --text-faint:#3d4756;
+    --accent:    #00e5ff;
+    --accent-2:  #b8ecff;
+    --danger:    #d48590;
+    --danger-b:  #ffb0bc;
+    --danger-a:  #ff5a69;
+    --warn:      #ffe600;
+    --ok:        #00e5ff;
+    --mono: 'JetBrains Mono', 'Fira Code', 'Consolas',
+            'SF Mono', monospace;
   }
-  #rpConn .row { margin: 2px 0; }
-  #rpConn input[type=text] {
-    background: transparent;
-    border: 0;
-    border-bottom: 1px solid #223040;
-    color: #00e5ff;
-    font-family: inherit;
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  body {
+    display: grid;
+    grid-template-rows: auto auto 1fr auto;
+    height: 100vh;
+  }
+
+  /* ---- top bar ------------------------------------------------- */
+
+  #topbar {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 10px 16px;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  #topbar .title {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--text);
+    white-space: nowrap;
+  }
+  #topbar .conn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1 1 auto;
+    min-width: 240px;
+  }
+  #topbar input[type=text] {
+    flex: 1 1 auto;
+    min-width: 0;
+    background: var(--bg-input);
+    color: var(--accent);
+    border: 1px solid var(--border-2);
+    border-radius: 2px;
+    padding: 5px 8px;
+    font-family: var(--mono);
     font-size: 11px;
     font-weight: 700;
-    padding: 3px 4px;
     outline: none;
-    width: 100%;
-    box-sizing: border-box;
   }
-  #rpConn input[type=text]:focus { border-bottom-color: #00e5ff; }
-  #rpConn select {
-    background: #0e1622;
-    color: #b8c4d2;
-    border: 1px solid #223040;
-    font-family: inherit;
+  #topbar input[type=text]:focus { border-color: var(--accent); }
+  #topbar select {
+    background: var(--bg-input);
+    color: var(--text-dim);
+    border: 1px solid var(--border-2);
+    border-radius: 2px;
+    padding: 5px 6px;
+    font-family: var(--mono);
     font-size: 11px;
-    padding: 2px 4px;
-    border-radius: 2px;
     outline: none;
     cursor: pointer;
-    width: 100%;
-    box-sizing: border-box;
   }
-  #rpConn button {
-    padding: 5px 10px;
+  #topbar select:hover { border-color: var(--border-3); }
+  #topbar button {
+    padding: 5px 12px;
     cursor: pointer;
-    border: 1px solid #223040;
+    border: 1px solid var(--border-2);
     background: transparent;
-    color: #b8c4d2;
+    color: var(--text-dim);
     border-radius: 2px;
-    font-family: inherit;
+    font-family: var(--mono);
     font-size: 10px;
     letter-spacing: 0.10em;
     text-transform: uppercase;
     font-weight: 700;
-    flex: 1 1 auto;
+    white-space: nowrap;
+    transition: background 0.08s ease, border-color 0.08s ease;
   }
-  #rpConn button:hover {
-    border-color: #34445a;
-    color: #dce6f2;
-    background: rgba(220, 230, 242, 0.03);
+  #topbar button:hover {
+    border-color: var(--border-3);
+    color: var(--text);
+    background: rgba(220,230,242,0.03);
   }
-  #rpConn button:disabled {
-    color: #3d4756;
-    border-color: #1e2836;
+  #topbar button:disabled {
+    color: var(--text-faint);
+    border-color: var(--border);
     cursor: not-allowed;
   }
-  #rpConn #rpConnectBtn    { border-color: rgba(0, 229, 255, 0.55); color: #b8ecff; }
-  #rpConn #rpDisconnectBtn { border-color: rgba(255, 105, 125, 0.55); color: #ffb0bc; }
+  #topbar #rpConnectBtn {
+    border-color: rgba(0,229,255,0.55);
+    color: var(--accent-2);
+  }
+  #topbar #rpConnectBtn:hover:not(:disabled) {
+    border-color: var(--accent);
+    background: rgba(0,229,255,0.08);
+  }
+  #topbar #rpDisconnectBtn {
+    border-color: rgba(255,105,125,0.55);
+    color: var(--danger-b);
+  }
+  #topbar #rpDisconnectBtn:hover:not(:disabled) {
+    border-color: var(--danger-a);
+    background: rgba(255,90,105,0.08);
+  }
 
-  #rpStatusStrip {
+  #topbar .status {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    padding: 4px 0;
+    gap: 10px;
+    white-space: nowrap;
+  }
+  #rpStatus {
     font-size: 10px;
-    color: #7b8794;
-    letter-spacing: 0.06em;
+    font-weight: 700;
+    letter-spacing: 0.10em;
     text-transform: uppercase;
+    color: var(--text-mute);
   }
-  #rpStatusStrip #rpStatus {
-    font-weight: 700;
-    color: #5a6774;
-  }
-  #rpStatusStrip #rpStatus.ok   { color: #00e5ff; }
-  #rpStatusStrip #rpStatus.warn { color: #ffe600; }
-  #rpStatusStrip #rpStatus.bad  { color: #d48590; }
-  #rpStatusStrip #rpPresence {
-    color: #5a6774;
-    font-weight: 700;
+  #rpStatus.ok   { color: var(--accent); }
+  #rpStatus.warn { color: var(--warn); }
+  #rpStatus.bad  { color: var(--danger); }
+  #rpPresence {
+    font-size: 10px;
+    color: var(--text-mute);
     letter-spacing: 0.02em;
-    text-transform: none;
   }
 
-  /* The field container.  Its per-field rows use pgkit's .field
-     styling.  Number inputs re-use pgkit's .scrubInput look so the
-     panel visually matches the playground's. */
-  #rpFields .empty {
-    font-size: 10px;
-    color: #3d4756;
-    font-style: italic;
-    padding: 3px 4px;
+  /* ---- actions panel ------------------------------------------ */
+
+  #actionsPanel {
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
   }
-  #rpFields .field input[type=text] {
+  #actionsPanel.collapsed .body { display: none; }
+  #actionsPanel .header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 16px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-mute);
+    border-bottom: 1px solid var(--border);
+  }
+  #actionsPanel .header .label { flex: 1 1 auto; }
+  #actionsPanel .header button {
+    padding: 2px 8px;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-mute);
+    border-radius: 2px;
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    font-weight: 700;
+  }
+  #actionsPanel .header button:hover {
+    border-color: var(--border-3);
+    color: var(--text-dim);
+  }
+  #actionsPanel .body {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 10px 16px;
+  }
+  .action-group {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 8px 10px;
+  }
+  .action-group h4 {
+    margin: 0 0 6px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-mute);
+  }
+  .action-group .btns {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .action-btn {
+    padding: 4px 10px;
+    cursor: pointer;
+    border: 1px solid var(--border-2);
+    background: transparent;
+    color: var(--text-dim);
+    border-radius: 2px;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    font-weight: 700;
+    white-space: nowrap;
+    transition: background 0.08s ease, border-color 0.08s ease,
+                color 0.08s ease;
+  }
+  .action-btn:hover {
+    border-color: var(--border-3);
+    color: var(--text);
+    background: rgba(220,230,242,0.03);
+  }
+  .action-btn:active {
+    background: rgba(220,230,242,0.08);
+  }
+  .action-btn.primary {
+    border-color: rgba(0,229,255,0.55);
+    color: var(--accent-2);
+  }
+  .action-btn.primary:hover {
+    border-color: var(--accent);
+    background: rgba(0,229,255,0.08);
+    color: #d8f4ff;
+  }
+  .action-btn.danger {
+    border-color: rgba(255,105,125,0.55);
+    color: var(--danger-b);
+  }
+  .action-btn.danger:hover {
+    border-color: var(--danger-a);
+    background: rgba(255,90,105,0.08);
+    color: #ffd0d8;
+  }
+
+  /* ---- fields panel ------------------------------------------ */
+
+  #fieldsPanel {
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 12px 16px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    grid-auto-rows: min-content;
+    gap: 12px;
+    align-content: start;
+  }
+  #fieldsPanel::-webkit-scrollbar { width: 8px; }
+  #fieldsPanel::-webkit-scrollbar-track { background: transparent; }
+  #fieldsPanel::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 4px;
+  }
+  #fieldsPanel::-webkit-scrollbar-thumb:hover {
+    background: var(--border-3);
+  }
+
+  #fieldsPanel .empty {
+    grid-column: 1 / -1;
+    font-size: 11px;
+    color: var(--text-faint);
+    font-style: italic;
+    padding: 24px;
+    text-align: center;
+    letter-spacing: 0.04em;
+  }
+
+  .field-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .field-card h4 {
+    margin: 0;
+    padding: 6px 12px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    background: rgba(0,229,255,0.04);
+    border-bottom: 1px solid var(--border);
+  }
+  .field-card .field-body {
+    padding: 8px 12px;
+  }
+  .field-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 6px 0;
+  }
+  .field-row label {
+    flex: 0 0 100px;
+    font-size: 9px;
+    color: var(--text-mute);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    font-weight: 700;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .field-row input[type=text] {
     flex: 1 1 auto;
     min-width: 0;
-    background: transparent;
-    border: 0;
-    border-bottom: 1px solid #223040;
-    color: #00e5ff;
-    font-family: inherit;
+    background: var(--bg-input);
+    color: var(--accent);
+    border: 1px solid var(--border-2);
+    border-radius: 2px;
+    padding: 4px 8px;
+    font-family: var(--mono);
     font-size: 12px;
     font-weight: 700;
-    font-variant-numeric: tabular-nums;
     text-align: right;
-    padding: 2px 4px;
-    margin: 0;
     outline: none;
     transition: border-color 0.1s ease;
   }
-  #rpFields .field input[type=text]:focus {
-    border-bottom-color: #00e5ff;
-  }
-  #rpFields .field select {
+  .field-row input[type=text]:focus { border-color: var(--accent); }
+  .field-row select {
     flex: 1 1 auto;
     min-width: 0;
-    background: #0e1622;
-    color: #b8c4d2;
-    border: 1px solid #223040;
-    font-family: inherit;
-    font-size: 11px;
-    padding: 2px 4px;
+    background: var(--bg-input);
+    color: var(--text-dim);
+    border: 1px solid var(--border-2);
     border-radius: 2px;
+    padding: 4px 6px;
+    font-family: var(--mono);
+    font-size: 11px;
     outline: none;
     cursor: pointer;
   }
+  .field-row select:focus { border-color: var(--accent); }
+  .field-row input[type=checkbox] {
+    flex: 0 0 auto;
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
 
-  /* The message log.  A small scrollable strip near the bottom. */
-  .rp-log {
-    max-height: 140px;
+  /* ---- log panel --------------------------------------------- */
+
+  #logPanel {
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-panel);
+    border-top: 1px solid var(--border);
+    max-height: 32vh;
+  }
+  #logPanel.collapsed {
+    max-height: none;
+  }
+  #logPanel.collapsed .body { display: none; }
+  #logPanel .header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 16px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-mute);
+    border-bottom: 1px solid var(--border);
+  }
+  #logPanel .header .label { flex: 1 1 auto; }
+  #logPanel .header button {
+    padding: 2px 8px;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-mute);
+    border-radius: 2px;
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    font-weight: 700;
+  }
+  #logPanel .header button:hover {
+    border-color: var(--border-3);
+    color: var(--text-dim);
+  }
+  #logPanel .body {
     overflow-y: auto;
+    padding: 6px 16px 8px;
     font-size: 10px;
-    color: #7b8794;
     line-height: 1.5;
+    color: var(--text-dim);
     font-variant-numeric: tabular-nums;
-    padding-right: 4px;
   }
-  .rp-log::-webkit-scrollbar { width: 6px; }
-  .rp-log::-webkit-scrollbar-thumb {
-    background: #1e2836;
-    border-radius: 3px;
+  #logPanel .body::-webkit-scrollbar { width: 8px; }
+  #logPanel .body::-webkit-scrollbar-track { background: transparent; }
+  #logPanel .body::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 4px;
   }
-  .rp-log-line { white-space: pre-wrap; }
-  .rp-log-info    { color: #7b8794; }
-  .rp-log-state   { color: #7b8794; }
-  .rp-log-schema  { color: #7b8794; }
-  .rp-log-patch   { color: #00e5ff; }
-  .rp-log-cmd     { color: #ffe600; }
-  .rp-log-error   { color: #d48590; }
+  .log-line {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .log-info    { color: var(--text-mute); }
+  .log-state   { color: var(--text-dim); }
+  .log-schema  { color: var(--text-dim); }
+  .log-patch   { color: var(--accent); }
+  .log-cmd     { color: var(--warn); }
+  .log-error   { color: var(--danger); }
+
+  /* ---- action-payload modal ---------------------------------- */
+
+  #rpModalBackdrop {
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #rpModalBackdrop[hidden] { display: none; }
+
+  .rp-modal {
+    background: var(--bg-panel);
+    border: 1px solid var(--border-2);
+    border-radius: 4px;
+    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.7);
+    min-width: 380px;
+    max-width: 520px;
+    padding: 16px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .rp-modal-title {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 8px;
+  }
+  #rpModalBody {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .rp-modal-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .rp-modal-field label {
+    font-size: 9px;
+    color: var(--text-mute);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    font-weight: 700;
+  }
+  .rp-modal-field input[type=text] {
+    background: var(--bg-input);
+    color: var(--accent);
+    border: 1px solid var(--border-2);
+    border-radius: 2px;
+    padding: 6px 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 700;
+    outline: none;
+  }
+  .rp-modal-field input[type=text]:focus { border-color: var(--accent); }
+  .rp-modal-file-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .rp-modal-file-btn {
+    padding: 5px 12px;
+    cursor: pointer;
+    border: 1px solid var(--accent);
+    background: transparent;
+    color: var(--accent);
+    border-radius: 2px;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-weight: 700;
+  }
+  .rp-modal-file-btn:hover { background: rgba(0,229,255,0.08); }
+  .rp-modal-file-btn.chosen {
+    border-color: var(--border-3);
+    color: var(--text-dim);
+  }
+  .rp-modal-file-status {
+    font-size: 11px;
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .rp-modal-buttons {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding-top: 6px;
+    border-top: 1px solid var(--border);
+  }
+  .rp-modal-buttons button {
+    padding: 6px 14px;
+    cursor: pointer;
+    border: 1px solid var(--border-2);
+    background: transparent;
+    color: var(--text-dim);
+    border-radius: 2px;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    font-weight: 700;
+  }
+  .rp-modal-buttons button:hover {
+    border-color: var(--border-3);
+    color: var(--text);
+    background: rgba(220,230,242,0.03);
+  }
+  .rp-modal-buttons button:disabled {
+    color: var(--text-faint);
+    border-color: var(--border);
+    cursor: not-allowed;
+  }
+  #rpModalSend {
+    border-color: rgba(0,229,255,0.55);
+    color: var(--accent-2);
+  }
+  #rpModalSend:hover:not(:disabled) {
+    border-color: var(--accent);
+    background: rgba(0,229,255,0.08);
+  }
 """
 
-RP_PANEL_BODY = r"""
-    <div id="rpConn">
-      <input type="text" id="rpTarget" placeholder="ws://127.0.0.1:8767/remote"
-             autocomplete="off" spellcheck="false">
-      <select id="rpPreset">
-        <option value="ws://127.0.0.1:8767/remote">pair</option>
-        <option value="ws://127.0.0.1:8766/remote">cone</option>
-        <option value="ws://127.0.0.1:8770/remote">board</option>
-        <option value="ws://127.0.0.1:8771/remote">text_board</option>
-        <option value="">custom</option>
-      </select>
-      <div class="row">
-        <button id="rpConnectBtn">Connect</button>
-        <button id="rpDisconnectBtn" disabled>Disconnect</button>
-      </div>
+RP_BODY = r"""
+<div id="topbar">
+  <div class="title">Remote panel</div>
+  <div class="conn">
+    <input type="text" id="rpTarget"
+           placeholder="ws://127.0.0.1:8767/remote"
+           autocomplete="off" spellcheck="false">
+    <select id="rpPreset">
+      <option value="ws://127.0.0.1:8767/remote">pair</option>
+      <option value="ws://127.0.0.1:8766/remote">cone</option>
+      <option value="ws://127.0.0.1:8770/remote">board</option>
+      <option value="ws://127.0.0.1:8771/remote">text_board</option>
+      <option value="">custom</option>
+    </select>
+    <button id="rpConnectBtn">Connect</button>
+    <button id="rpDisconnectBtn" disabled>Disconnect</button>
+  </div>
+  <div class="status">
+    <span id="rpStatus">disconnected</span>
+    <span id="rpPresence"></span>
+  </div>
+</div>
+
+<div id="actionsPanel">
+  <div class="header">
+    <span class="label">Actions</span>
+    <button id="rpActionsToggle" title="Show / hide actions">Hide</button>
+  </div>
+  <div class="body" id="rpActionsBody"></div>
+</div>
+
+<div id="fieldsPanel">
+  <div class="empty">not connected</div>
+</div>
+
+<div id="logPanel" class="collapsed">
+  <div class="header">
+    <span class="label">Log</span>
+    <button id="rpLogToggle" title="Show / hide log">Show</button>
+    <button id="rpLogClear" title="Clear the log">Clear</button>
+  </div>
+  <div class="body" id="rpLogBody"></div>
+</div>
+
+<div id="rpModalBackdrop" hidden>
+  <div class="rp-modal">
+    <div class="rp-modal-title" id="rpModalTitle">Action</div>
+    <div id="rpModalBody"></div>
+    <div class="rp-modal-buttons">
+      <button id="rpModalCancel">Cancel</button>
+      <button id="rpModalSend" disabled>Send</button>
     </div>
-
-    <div id="rpStatusStrip">
-      <span id="rpStatus">disconnected</span>
-      <span id="rpPresence"></span>
-    </div>
-
-    <details class="section" open>
-      <summary>Commands</summary>
-      <div class="section-body">
-        <div class="field">
-          <label>kind</label>
-          <input type="text" id="rpCmdKind"
-                 placeholder="reset_view | deselect | ..."
-                 autocomplete="off" spellcheck="false">
-        </div>
-        <div class="field">
-          <label>payload</label>
-          <input type="text" id="rpCmdPayload"
-                 placeholder='{"optional": "json"}'
-                 autocomplete="off" spellcheck="false">
-        </div>
-        <div class="row">
-          <button id="rpCmdBtn">Send command</button>
-        </div>
-      </div>
-    </details>
-
-    <div id="rpFields"></div>
-
-    <details class="section" open>
-      <summary>Log</summary>
-      <div class="section-body">
-        <div id="rpLog" class="rp-log"></div>
-      </div>
-    </details>
+  </div>
+</div>
 """

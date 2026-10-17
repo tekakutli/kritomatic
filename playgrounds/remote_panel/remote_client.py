@@ -2,8 +2,9 @@
 pgkit.remote_client — the browser's WebSocket client.
 
 On page load it opens a WebSocket to the playground's server.  Every
-value field registered via `pgkitRegisterField` is published under
-its dotted name and can be written from any other connected client.
+value field registered via `pgkitRegisterField` and every action
+registered via `pgkitRegisterAction` is published under its dotted
+name and can be driven from any other connected client.
 
 STATE PUBLICATION — NOTIFICATION, NOT POLLING
 =============================================
@@ -13,53 +14,40 @@ The project tells the kit when a value changed:
     pgkitNotifyAll()          queue every registered field's current
                               value
 
-Each notification reads the field's getter and stores the value in a
-per-field pending map.  The first queued value in a frame schedules
-a `requestAnimationFrame` callback that flushes the pending map in
-one `patch` message.  Subsequent notifications in the same frame
-overwrite their own field's pending entry.
+There is no timer, no polling.  Actions are not included in state.
 
-There is no `setInterval`, no timer, no polling.  A message is sent
-if and only if something told the kit that a value changed.
+SCHEMA PUBLICATION — FIELDS AND ACTIONS
+=======================================
+On a `state_request` the kit answers with `state` and `schema`.
+Field entries have `kind` of `"number"`, `"bool"`, or `"enum"`.
+Action entries have `kind: "action"`.
 
-SCHEMA PUBLICATION
-==================
-When the kit receives a `state_request`, it now answers with *two*
-messages rather than one:
+ACTION PAYLOADS
+===============
+An action may declare `requires` in its meta: an array of
+`{name, kind, label, default?, accept?}` entries describing what
+the user must supply.  `kind` is `"text"` or `"file"`.  The kit
+itself does not gather those values — a remote client does, and
+sends them in the `command` message's `payload`.  The action's
+`run(payload)` receives the payload.  An action that can be
+invoked with no arguments (a purely local operation, or one that
+can prompt via a browser dialog on the playground side) declares
+no `requires` and simply receives `{}`.
 
-    state     {seq, values: {name: current_value, ...}}
-    schema    {fields: {name: {kind, label, min, max, options}, ...}}
-
-`state` is what a peer needs to know the current values.  `schema`
-is what a peer needs to render a UI for them: kind (number / bool /
-enum), label, optional min/max, optional enum options.  Both come
-from the same registry.
-
-Sending `schema` alongside `state` is backward-compatible at the
-wire: an existing client that only knows about `state` receives the
-`schema` message, does not recognize its `type`, and ignores it.
-The hub relays it like any other message once it is added to the
-forward list (see pgkit/remote_hub.py).
+The `command_result` echoes back the value returned by `run`, if
+any, in its `result` field.  A synchronous return is available to
+the remote client; an async action's eventual result is not (the
+handler returns before the promise settles).
 
 ECHO SUPPRESSION
 ================
 Each patch carries a monotonic `seq` and the sender's `origin`
 client id.  The receiving side ignores any patch whose `origin`
-matches its own id.  `_pgkitApplyingRemote` is a second guard,
-active only during `pgkitRemoteApplyPatch`, so a `set` that
-internally calls another registered setter does not re-broadcast.
+matches its own id.
 
 PANEL VISIBILITY
 ================
-Presence-driven.  When at least one non-browser client is
-connected, `#ui` is hidden and `#remoteBanner` is shown.
-
-COMMANDS
-========
-Remote clients can send a `command` message.  The handler here
-recognizes a small set of built-ins (`reset_view`, `deselect`) and
-asks the project to handle anything else via an optional
-`pgkitHandleExtraCommand(kind, payload)` function.
+Presence-driven.
 """
 
 REMOTE_CLIENT_JS = r"""
@@ -89,17 +77,39 @@ let _pgkitFlushScheduled = false;
    ========================================================================== */
 
 function pgkitRegisterField(name, opts) {
+  if (!name) throw new Error("pgkitRegisterField: name required");
+  if (_pgkitRemote.registry[name]) {
+    throw new Error("pgkitRegisterField: duplicate " + name);
+  }
   _pgkitRemote.registry[name] = {
-    get:  opts.get,
-    set:  opts.set,
+    isAction: false,
+    get: opts.get,
+    set: opts.set,
     meta: opts.meta || {},
+  };
+}
+
+function pgkitRegisterAction(name, opts) {
+  if (!name) throw new Error("pgkitRegisterAction: name required");
+  if (_pgkitRemote.registry[name]) {
+    throw new Error("pgkitRegisterAction: duplicate " + name);
+  }
+  _pgkitRemote.registry[name] = {
+    isAction: true,
+    run: opts.run,
+    meta: Object.assign(
+      { kind: "action", label: opts.label || name },
+      opts.meta || {}
+    ),
   };
 }
 
 function pgkitDumpState() {
   const out = {};
   for (const name in _pgkitRemote.registry) {
-    try { out[name] = _pgkitRemote.registry[name].get(); }
+    const r = _pgkitRemote.registry[name];
+    if (r.isAction) continue;
+    try { out[name] = r.get(); }
     catch (e) {}
   }
   return out;
@@ -122,7 +132,7 @@ function pgkitNotifyLocal(name) {
   if (!_pgkitRemote.connected) return;
   if (!_pgkitRemote.clientId) return;
   const f = _pgkitRemote.registry[name];
-  if (!f) return;
+  if (!f || f.isAction) return;
   try { _pgkitNotifyPending[name] = f.get(); }
   catch (e) { return; }
   _pgkitScheduleFlush();
@@ -133,7 +143,9 @@ function pgkitNotifyAll() {
   if (!_pgkitRemote.connected) return;
   if (!_pgkitRemote.clientId) return;
   for (const name in _pgkitRemote.registry) {
-    try { _pgkitNotifyPending[name] = _pgkitRemote.registry[name].get(); }
+    const r = _pgkitRemote.registry[name];
+    if (r.isAction) continue;
+    try { _pgkitNotifyPending[name] = r.get(); }
     catch (e) {}
   }
   _pgkitScheduleFlush();
@@ -255,7 +267,7 @@ function pgkitRemoteApplyPatch(values) {
   try {
     for (const name in values) {
       const f = _pgkitRemote.registry[name];
-      if (!f) continue;
+      if (!f || f.isAction) continue;
       try { f.set(values[name]); } catch (e) {}
     }
   } finally {
@@ -272,9 +284,20 @@ function pgkitRemoteApplyPatch(values) {
 function pgkitRemoteHandleCommand(msg) {
   let ok = true;
   let error = null;
+  let result;
+
   try {
-    const kind = msg.kind;
-    if (kind === "reset_view" && typeof resetView === "function") {
+    const kind  = msg.kind;
+    const entry = _pgkitRemote.registry[kind];
+
+    if (entry && entry.isAction) {
+      try {
+        result = entry.run(msg.payload || {});
+      } catch (e) {
+        ok = false;
+        error = String(e);
+      }
+    } else if (kind === "reset_view" && typeof resetView === "function") {
       resetView();
     } else if (kind === "deselect") {
       if (typeof selectedPair   !== "undefined") selectedPair = -1;
@@ -296,12 +319,15 @@ function pgkitRemoteHandleCommand(msg) {
     ok = false;
     error = String(e);
   }
-  pgkitRemoteSend({
+
+  const reply = {
     type:  "command_result",
     id:    msg.id,
     ok:    ok,
     error: error,
-  });
+  };
+  if (result !== undefined) reply.result = result;
+  pgkitRemoteSend(reply);
 }
 
 /* ==========================================================================

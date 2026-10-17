@@ -2,8 +2,9 @@
 pgkit.remote_client — the browser's WebSocket client.
 
 On page load it opens a WebSocket to the playground's server.  Every
-value field registered via `pgkitRegisterField` is published under
-its dotted name and can be written from any other connected client.
+value field registered via `pgkitRegisterField` and every action
+registered via `pgkitRegisterAction` is published under its dotted
+name and can be driven from any other connected client.
 
 STATE PUBLICATION — NOTIFICATION, NOT POLLING
 =============================================
@@ -17,54 +18,46 @@ Each notification reads the field's getter and stores the value in a
 per-field pending map.  The first queued value in a frame schedules
 a `requestAnimationFrame` callback that flushes the pending map in
 one `patch` message.  Subsequent notifications in the same frame
-overwrite their own field's pending entry — the map always holds the
-*latest* value for each field, so a scrub drag's continuous writes
-coalesce to one message per animation frame without dropping any
-intermediate value from the model's point of view.
+overwrite their own field's pending entry.  There is no timer, no
+polling.  Actions are not included in state and do not participate
+in notifications.
 
-There is no `setInterval`, no timer, no polling.  A message is sent
-if and only if something told the kit that a value changed.
+SCHEMA PUBLICATION — FIELDS AND ACTIONS
+=======================================
+On a `state_request` the kit answers with two messages:
 
-WHICH PROJECT PATHS NOTIFY
-==========================
-Every project that uses the kit must call:
+    state     {seq, values: {name: current_value, ...}}
+    schema    {fields: {name: {kind, label, ...}, ...}}
 
-    pgkitNotifyLocal(name)    in every scrub input's `write` callback
-                              and every checkbox/select's change
-                              handler.
-
-    pgkitNotifyAll()          after every operation that changes
-                              the *selection* or replaces the model
-                              wholesale: pair/segment row clicks,
-                              add/clone/delete, scene load, and any
-                              future action whose effect ripples
-                              through more than one registered field.
-
-The pair playground's notify sites are listed in
-`pg_panel_scrubs.py` and `pg_panel_bindings.py`; the other three
-follow the same pattern (see `pgkit/MIGRATION.md`).
+Field entries have `kind` of `"number"`, `"bool"`, or `"enum"`.
+Action entries have `kind: "action"`.  A peer that renders the
+schema can distinguish them by that field.  Both come from the
+same registry; actions carry the extra metadata the project
+declared (label, section, variant) but no `get`/`set`.
 
 ECHO SUPPRESSION
 ================
 Each patch carries a monotonic `seq` and the sender's `origin`
 client id.  The receiving side ignores any patch whose `origin`
-matches its own id, so the classic local → broadcast → echo →
-reapply loop cannot happen.  `_pgkitApplyingRemote` is a second
-guard, active only during `pgkitRemoteApplyPatch`, so a `set` that
-internally calls another registered setter does not re-broadcast.
+matches its own id.  `_pgkitApplyingRemote` is a second guard,
+active only during `pgkitRemoteApplyPatch`.
 
 PANEL VISIBILITY
 ================
 Presence-driven.  When at least one non-browser client is
-connected, `#ui` is hidden and `#remoteBanner` is shown.  When the
-last such client disconnects, the panel comes back.
+connected, `#ui` is hidden and `#remoteBanner` is shown.
 
 COMMANDS
 ========
-Remote clients can send a `command` message.  The handler here
-recognizes a small set of built-ins (`reset_view`, `deselect`) and
-asks the project to handle anything else via an optional
-`pgkitHandleExtraCommand(kind, payload)` function.
+A remote client sends a `command` message with a `kind` naming an
+entry.  The handler dispatches in this order:
+
+    1. a registered action whose name equals `kind`
+    2. the built-ins (`reset_view`, `deselect`)
+    3. `pgkitHandleExtraCommand(kind, payload)` if the project
+       defines one
+
+An unknown `kind` returns `{"ok": false, "error": "unknown command"}`.
 """
 
 REMOTE_CLIENT_JS = r"""
@@ -86,9 +79,6 @@ const _pgkitRemote = {
 
 let _pgkitApplyingRemote = false;
 
-/* Values queued for the next animation frame.  Per-field, so a
-   repeated notification in the same frame only keeps the last
-   value for that field. */
 let _pgkitNotifyPending = {};
 let _pgkitFlushScheduled = false;
 
@@ -97,24 +87,54 @@ let _pgkitFlushScheduled = false;
    ========================================================================== */
 
 function pgkitRegisterField(name, opts) {
+  if (!name) throw new Error("pgkitRegisterField: name required");
+  if (_pgkitRemote.registry[name]) {
+    throw new Error("pgkitRegisterField: duplicate " + name);
+  }
   _pgkitRemote.registry[name] = {
-    get:  opts.get,
-    set:  opts.set,
+    isAction: false,
+    get: opts.get,
+    set: opts.set,
     meta: opts.meta || {},
+  };
+}
+
+function pgkitRegisterAction(name, opts) {
+  if (!name) throw new Error("pgkitRegisterAction: name required");
+  if (_pgkitRemote.registry[name]) {
+    throw new Error("pgkitRegisterAction: duplicate " + name);
+  }
+  _pgkitRemote.registry[name] = {
+    isAction: true,
+    run: opts.run,
+    meta: Object.assign(
+      { kind: "action", label: opts.label || name },
+      opts.meta || {}
+    ),
   };
 }
 
 function pgkitDumpState() {
   const out = {};
   for (const name in _pgkitRemote.registry) {
-    try { out[name] = _pgkitRemote.registry[name].get(); }
+    const r = _pgkitRemote.registry[name];
+    if (r.isAction) continue;
+    try { out[name] = r.get(); }
     catch (e) {}
   }
   return out;
 }
 
+function pgkitDumpSchema() {
+  const out = {};
+  for (const name in _pgkitRemote.registry) {
+    out[name] = _pgkitRemote.registry[name].meta || {};
+  }
+  return out;
+}
+
 /* ==========================================================================
-   NOTIFICATION — the only way a change reaches the wire
+   NOTIFICATION
    ========================================================================== */
 
 function pgkitNotifyLocal(name) {
@@ -122,7 +142,7 @@ function pgkitNotifyLocal(name) {
   if (!_pgkitRemote.connected) return;
   if (!_pgkitRemote.clientId) return;
   const f = _pgkitRemote.registry[name];
-  if (!f) return;
+  if (!f || f.isAction) return;
   try { _pgkitNotifyPending[name] = f.get(); }
   catch (e) { return; }
   _pgkitScheduleFlush();
@@ -133,7 +153,9 @@ function pgkitNotifyAll() {
   if (!_pgkitRemote.connected) return;
   if (!_pgkitRemote.clientId) return;
   for (const name in _pgkitRemote.registry) {
-    try { _pgkitNotifyPending[name] = _pgkitRemote.registry[name].get(); }
+    const r = _pgkitRemote.registry[name];
+    if (r.isAction) continue;
+    try { _pgkitNotifyPending[name] = r.get(); }
     catch (e) {}
   }
   _pgkitScheduleFlush();
@@ -227,6 +249,10 @@ function pgkitRemoteHandle(msg) {
         seq:    _pgkitRemote.seq,
         values: pgkitDumpState(),
       });
+      pgkitRemoteSend({
+        type:   "schema",
+        fields: pgkitDumpSchema(),
+      });
       break;
 
     case "patch":
@@ -251,7 +277,7 @@ function pgkitRemoteApplyPatch(values) {
   try {
     for (const name in values) {
       const f = _pgkitRemote.registry[name];
-      if (!f) continue;
+      if (!f || f.isAction) continue;
       try { f.set(values[name]); } catch (e) {}
     }
   } finally {
@@ -262,15 +288,25 @@ function pgkitRemoteApplyPatch(values) {
 }
 
 /* ==========================================================================
-   COMMANDS
+   COMMANDS — registered actions first, then built-ins, then the
+   project's extra handler.
    ========================================================================== */
 
 function pgkitRemoteHandleCommand(msg) {
   let ok = true;
   let error = null;
   try {
-    const kind = msg.kind;
-    if (kind === "reset_view" && typeof resetView === "function") {
+    const kind  = msg.kind;
+    const entry = _pgkitRemote.registry[kind];
+
+    if (entry && entry.isAction) {
+      try {
+        entry.run(msg.payload || {});
+      } catch (e) {
+        ok = false;
+        error = String(e);
+      }
+    } else if (kind === "reset_view" && typeof resetView === "function") {
       resetView();
     } else if (kind === "deselect") {
       if (typeof selectedPair   !== "undefined") selectedPair = -1;

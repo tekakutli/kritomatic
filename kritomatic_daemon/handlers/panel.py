@@ -444,6 +444,30 @@ class RunActionsProvider:
                     "style": "danger",
                     "command": {"type": "comfy_cancel"},
                 },
+                {
+                    "key": "cancel_all",
+                    "label": "ALL",
+                    "style": "danger",
+                    "command": {"type": "comfy_cancel"},
+                    # `thin` + `attach_to` render the button as a small
+                    # companion fused to the preceding Cancel button.
+                    # The renderer touches only the minimum needed for
+                    # the narrow form (width, small padding, small
+                    # font, squared left corners) and leaves the rest
+                    # of the appearance inherited from Cancel, so the
+                    # colour and shading match. See
+                    # panel/renderer.py._build_actions.
+                    #
+                    # `cancel_all` is a semantic marker: this action
+                    # cancels every active batch, not just the one
+                    # this client started. The daemon dispatches it
+                    # the same way as `cancel` — `comfy_cancel` with
+                    # no batch id is already "cancel all" — so the
+                    # marker is only a hint to the frontends.
+                    "thin": True,
+                    "attach_to": "cancel",
+                    "cancel_all": True,
+                },
             ],
         })
 

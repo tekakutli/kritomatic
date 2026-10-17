@@ -27,6 +27,11 @@ its own socket on a fresh thread and sends `comfy_cancel` directly.
 The daemon receives it while the run is still in flight, sets the
 batch's cancel flag, and the run winds itself down.
 
+The same path is used by the thin "ALL" companion next to Cancel,
+but with a `None` batch id, which the daemon interprets as
+"cancel every active batch". That is exactly the `panel cancel
+--all` behaviour from the CLI, exposed here as a click.
+
 Layer list freshness
 ====================
 The alias combos need a current layer list. Krita provides no signal
@@ -234,7 +239,7 @@ class KritomaticPanel(QDockWidget):
 
     def _on_command_completed(self, request_id: str, ok: bool,
                               summary: dict) -> None:
-        if request_id.startswith("cancel-"):
+        if request_id.startswith(("cancel-", "cancel_all-")):
             msg = summary.get("message", "")
             if ok:
                 self._append_log("warn", f"Cancel sent: {msg}")
@@ -328,6 +333,14 @@ class KritomaticPanel(QDockWidget):
                 self._active_run_request_id, request_id,
             )
 
+        elif key == "cancel_all":
+            # Same out-of-band path as `cancel`, but with no batch id,
+            # so the daemon cancels every active batch — including
+            # ones launched from the CLI or another panel — and any
+            # async generates.
+            request_id = f"cancel_all-{int(time.time() * 1000)}"
+            self._conn.send_cancel_now(None, request_id)
+
         else:
             request_id = f"action-{key}-{int(time.time() * 1000)}"
             bundle = {"id": request_id, "commands": [command]}
@@ -337,6 +350,7 @@ class KritomaticPanel(QDockWidget):
     def _update_run_buttons(self) -> None:
         self._renderer.set_action_enabled("run", not self._running)
         self._renderer.set_action_enabled("cancel", self._running)
+        self._renderer.set_action_enabled("cancel_all", self._running)
 
     def _append_log(self, kind: str, text: str) -> None:
         color = {

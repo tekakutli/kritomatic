@@ -157,16 +157,21 @@ class DaemonConnection(QObject):
                 except OSError:
                     pass
 
-    def send_cancel_now(self, batch_id: str, request_id: str) -> None:
+    def send_cancel_now(self, batch_id, request_id: str) -> None:
         """Send a `comfy_cancel` on a fresh socket, on a background
         thread. Bypasses the command queue so the cancel reaches the
         daemon while a long-running `comfy_generate` is still in
         flight.
+
+        When `batch_id` is falsy, the `batch_id` key is omitted from
+        the payload, and the daemon cancels *every* active batch —
+        the same path the CLI's `panel cancel --all` uses.
         """
         def _run():
-            summary = self._fetch_one(
-                {"type": "comfy_cancel", "batch_id": batch_id}
-            )
+            cmd = {"type": "comfy_cancel"}
+            if batch_id:
+                cmd["batch_id"] = batch_id
+            summary = self._fetch_one(cmd)
             if summary is None:
                 self.commandCompleted.emit(
                     request_id, False,

@@ -69,6 +69,34 @@ followed by the rest in tree order. The recent list is flat
 keeps a mask alias out of an image dropdown. See handlers/comfyui.py's
 "Layer aliases and the recent-aliases file" section for the daemon
 side.
+
+Action-button fusion
+====================
+An action item may carry `thin: true` and `attach_to: "<key>"`. The
+renderer draws it as a small companion button directly beside the
+item named by `attach_to`: their gap is negative (-2px), so the two
+buttons tuck tight against each other and read as one unit. The
+*visual style* of the companion is inherited from the same palette
+entry as its target (`style: "danger"` → the same `#c5221f`) — only
+the horizontal padding is narrowed and the width is fixed via
+`setFixedWidth`, which is a widget property, not a stylesheet
+declaration.
+
+Deliberately NOT touched on the companion:
+
+  * `border`, `border-left`, `border-*-radius` — any border or
+    radius declaration on a `QPushButton` forces Qt into
+    stylesheet-only rendering, which discards the theme's native
+    shading. The button then renders as a solid flat rectangle,
+    visibly different from its neighbour. This is why the fusion
+    is expressed through the -2px gap alone rather than by squaring
+    the companion's corners: the corners stay rounded (matching
+    Cancel), and the overlap does the fusing.
+  * `font-family`, `font-size`, `font-weight` — inherited, so the
+    letterforms match Cancel's.
+  * `background`, `color` — inherited from the same palette entry as
+    Cancel, and passed through with the identical syntax Cancel
+    uses, so both buttons go through the same QSS rendering path.
 """
 
 from __future__ import annotations
@@ -465,19 +493,59 @@ class PanelRenderer(QObject):
         container = QWidget()
         h = QHBoxLayout(container)
         h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(6)
-        for item in section.get("items", []) or []:
-            btn = QPushButton(item.get("label") or item.get("key", ""))
+        # Inter-button gap is inserted manually below: a thin
+        # companion wants -2px (it tucks tight against the previous
+        # button), the rest want the standard +6px. QBoxLayout's
+        # setSpacing is global per-layout, not per-pair.
+        h.setSpacing(0)
+
+        items = section.get("items", []) or []
+        added_any = False
+
+        for item in items:
+            key = item.get("key") or ""
+            is_thin = bool(item.get("thin", False))
+            attaches = is_thin and bool(item.get("attach_to"))
+
+            if added_any:
+                # -2 tucks the companion tight against the previous
+                # button; positive 6 is the standard gap. This is the
+                # ONLY mechanism used to fuse the pair — no border or
+                # corner-radius overrides on either button. See the
+                # module docstring's "Action-button fusion" section.
+                h.addSpacing(-2 if attaches else 6)
+
+            btn = QPushButton(item.get("label") or key)
             style = item.get("style")
+
             if style == "primary":
                 btn.setStyleSheet(
                     "background:#1a73e8;color:white;padding:6px 14px;"
                 )
             elif style == "danger":
-                btn.setStyleSheet(
-                    "background:#c5221f;color:white;padding:6px 14px;"
-                )
-            key = item.get("key") or ""
+                if is_thin:
+                    # Same stylesheet as Cancel, in the same exact
+                    # syntax — same background, same text colour. Only
+                    # the horizontal padding is narrowed so the short
+                    # "ALL" label does not leave the button looking
+                    # starved. Width is pinned via setFixedWidth (a
+                    # widget property, not a QSS declaration), which
+                    # does not alter rendering.
+                    #
+                    # No border-*-radius, no border, no border-left.
+                    # Any of those would flip this button into
+                    # stylesheet-only rendering, which drops the
+                    # style's shading and makes it look flat next to
+                    # Cancel — the exact failure this fix addresses.
+                    btn.setFixedWidth(40)
+                    btn.setStyleSheet(
+                        "background:#c5221f;color:white;padding:6px 4px;"
+                    )
+                else:
+                    btn.setStyleSheet(
+                        "background:#c5221f;color:white;padding:6px 14px;"
+                    )
+
             self._action_buttons[key] = btn
             btn.clicked.connect(
                 lambda _checked=False, it=item: self._action(
@@ -485,6 +553,8 @@ class PanelRenderer(QObject):
                 )
             )
             h.addWidget(btn)
+            added_any = True
+
         return container
 
     # ---- commits ----

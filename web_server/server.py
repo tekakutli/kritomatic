@@ -318,7 +318,7 @@ def _do_run(run_id: str, command: dict) -> None:
         print(f"[web_panel] run {run_id} finished")
 
 
-def _send_daemon_cancel(batch_id: str) -> tuple:
+def _send_daemon_cancel(batch_id) -> tuple:
     client = KritaClient(host=DAEMON_HOST, port=DAEMON_PORT)
     if not client.connect():
         return False, "could not connect to daemon"
@@ -521,6 +521,41 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"run_id": run_id})
 
     def _handle_cancel_post(self):
+        body = self._read_json_body()
+        if not isinstance(body, dict):
+            body = {}
+
+        scope = body.get("scope", "current")
+
+        if scope == "all":
+            # Cancel every batch the daemon knows about — including
+            # ones launched from the CLI or another panel — plus any
+            # async generates. Mark our own run as cancelling so the
+            # UI status flips, then send the cancel-all command with
+            # no batch id.
+            with _runs_lock:
+                run_id = None
+                for rid, r in _runs.items():
+                    if r.get("status") == "running":
+                        run_id = rid
+                        r["cancel_requested"] = True
+                        break
+
+            if run_id:
+                _broadcast("run", {"run_id": run_id,
+                                   "status": "cancelling"})
+
+            ok, msg = _send_daemon_cancel(None)
+            if not ok:
+                print(f"[web_panel] cancel_all failed: {msg}")
+                self._send_error_json(msg, status=502)
+                return
+
+            print("[web_panel] cancel_all requested")
+            self._send_json({"status": "cancelling_all", "message": msg})
+            return
+
+        # scope == "current" — the original behaviour.
         with _runs_lock:
             run_id = None
             for rid, r in _runs.items():
@@ -798,9 +833,17 @@ function buildSectionHtml(section) {
   if (kind === "actions") {
     let html = `<div class="config-section actions-section">`;
     for (const item of (section.items || [])) {
-      const cls = item.style === "danger" ? "danger"
-                : (item.style === "primary" ? "primary" : "");
-      html += `<button class="${cls}" data-action-key="${escAttr(item.key)}">${esc(item.label || item.key)}</button>`;
+      let cls = "";
+      if (item.style === "danger") cls = "danger";
+      else if (item.style === "primary") cls = "primary";
+      // Every action renders as a normal button. The docker is where
+      // "ALL" reads naturally as a compact companion next to Cancel;
+      // in the web panel there is room, and a label of "ALL" alone
+      // does not say what it cancels. `cancel_all` therefore gets the
+      // full "Cancel All" label here.
+      let label = item.label || item.key;
+      if (item.cancel_all) label = "Cancel All";
+      html += `<button class="${cls}" data-action-key="${escAttr(item.key)}">${esc(label)}</button>`;
     }
     html += `</div>`;
     return html;
@@ -1102,10 +1145,12 @@ async function runAction(key) {
     }
   }
 
+  const cancelAll = key === "cancel_all" || item.cancel_all === true;
+
   if (key === "run") {
     await startRun(command);
-  } else if (key === "cancel") {
-    await cancelRun(command);
+  } else if (key === "cancel" || cancelAll) {
+    await cancelRun(command, cancelAll ? "all" : "current");
   } else {
     const requestId = "action:" + key;
     await sendCommand(requestId, command, []);
@@ -1128,7 +1173,8 @@ function setRunning(running) {
         `[data-action-key="${cssEsc(item.key)}"]`);
       if (!btn) continue;
       if (item.key === "run") btn.disabled = running;
-      else if (item.key === "cancel") btn.disabled = !running;
+      else if (item.key === "cancel" || item.key === "cancel_all")
+        btn.disabled = !running;
     }
   }
 }
@@ -1167,7 +1213,7 @@ async function startRun(command) {
   log.appendChild(rowDiv("hdr", "Run " + body.run_id + " started."));
 }
 
-async function cancelRun(command) {
+async function cancelRun(command, scope) {
   const log = document.getElementById("progress");
   setRunning(true);
   let resp;
@@ -1175,7 +1221,7 @@ async function cancelRun(command) {
     resp = await fetch("/api/cancel", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({command: command}),
+      body: JSON.stringify({command: command, scope: scope || "current"}),
     });
   } catch (e) {
     log.appendChild(rowDiv("err", "Cancel request failed: " + e.message));

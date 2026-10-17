@@ -659,12 +659,35 @@ class ComfyUIHandler(AutoDispatchHandler):
         came from, if any. It is None for `comfy_load` (file source),
         which is correct: a file load is not associated with a
         browser tab.
+
+        Per-workflow state (`_params`, `_layer_aliases`) is cleared
+        when the incoming graph's signature differs from the current
+        active workflow's signature. Same-signature re-publishes (the
+        browser's `graphChanged` event fires on every node edit, most
+        of which do not change the workflow's interface) preserve the
+        user's typed values; a workflow swap clears them so a value
+        typed under a previous workflow does not silently carry over
+        to a new one whose parameter names happen to overlap.
+
+        This is the single place per-workflow state is reset on a
+        browser-side workflow change. `comfy_load` additionally
+        clears unconditionally after calling this, so "load the same
+        file twice" resets params even when the signature matches —
+        that is the semantic difference between "load" (a fresh
+        session of this workflow) and "publish" (an update to the
+        currently-edited workflow).
         """
+        new_signature = _compute_signature(graph)
+        if (self._active_workflow_signature is not None
+                and new_signature != self._active_workflow_signature):
+            self._params = {}
+            self._layer_aliases = {}
+
         self._active_workflow_name = name
         self._active_workflow_graph = graph
         self._active_workflow_source = source
         self._active_workflow_publisher_key = publisher_key
-        self._active_workflow_signature = _compute_signature(graph)
+        self._active_workflow_signature = new_signature
         self._active_workflow_parameters = _extract_parameters(graph)
         self._active_workflow_layers = _extract_layer_requirements(graph)
         self._active_workflow_canvas = _extract_canvas_info(graph)

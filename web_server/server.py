@@ -289,7 +289,28 @@ def _do_run(run_id: str, command: dict) -> None:
 
         succ = summary.get("successful", 0)
         fail = summary.get("failed", 0)
-        emit("done", successful=succ, failed=fail)
+        results = summary.get("results", []) or []
+
+        # A cancelled batch reports success=False and carries a
+        # "cancelled" mention in the failure message — either at the
+        # top level ("Batch cancelled (N run(s) not completed)") or in
+        # the per-run result message for a partial cancellation. When
+        # nothing succeeded and the failure carries that marker, the
+        # honest terminal event is "cancelled", not "done with N
+        # failures".
+        cancelled_count = sum(
+            1 for r in results
+            if r.get("status") == "error"
+            and "cancelled" in (r.get("message") or "").lower()
+        )
+        if cancelled_count > 0 and succ == 0:
+            emit("cancelled",
+                 successful=succ, failed=fail,
+                 cancelled=cancelled_count)
+        else:
+            emit("done",
+                 successful=succ, failed=fail,
+                 cancelled=cancelled_count)
 
     except Exception as e:
         traceback.print_exc()
@@ -326,7 +347,7 @@ def _send_daemon_cancel(batch_id: str) -> tuple[bool, str]:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "KritomaticWebPanel/2.1"
+    server_version = "KritomaticWebPanel/2.2"
 
     def log_message(self, fmt, *args):
         pass
@@ -522,7 +543,14 @@ class Handler(BaseHTTPRequestHandler):
         _broadcast("run", {"run_id": run_id, "status": "cancelling"})
         print(f"[web_panel] cancel requested for run {run_id}")
 
-        ok, msg = _send_daemon_cancel(run_id)   # run_id IS the batch id
+        # `_do_run` sends the bundle with `id=run_id`, and
+        # `handlers/base.py` propagates that id to each command as
+        # `_batch_id`; `comfy_generate` uses `_batch_id` as its
+        # registered batch id. So `run_id` here is the same value the
+        # daemon has registered as the active batch's id. Cancel is
+        # issued on a fresh connection (`_send_daemon_cancel`), which
+        # is safe to do while the run's own socket is mid-read.
+        ok, msg = _send_daemon_cancel(run_id)
         if not ok:
             print(f"[web_panel] cancel for {run_id} failed: {msg}")
 
@@ -1189,11 +1217,14 @@ function handleRunEvent(e) {
   } else if (s.status === "cancelling") {
     log.appendChild(rowDiv("warn", "Cancelling\u2026"));
   } else if (s.status === "cancelled") {
-    log.appendChild(rowDiv("warn", "Cancelled."));
+    const n = s.cancelled != null ? s.cancelled : "";
+    log.appendChild(rowDiv("warn",
+      "Cancelled. " + n + " run(s) not completed."));
     setRunning(false);
   } else if (s.status === "done") {
-    log.appendChild(rowDiv("hdr",
-      "Done. " + s.successful + " ok, " + s.failed + " failed."));
+    let text = "Done. " + s.successful + " ok, " + s.failed + " failed.";
+    if (s.cancelled) text += " (" + s.cancelled + " cancelled)";
+    log.appendChild(rowDiv("hdr", text));
     setRunning(false);
   } else if (s.status === "error") {
     log.appendChild(rowDiv("err", "Run failed: " + (s.error || "unknown")));

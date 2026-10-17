@@ -8,8 +8,29 @@ loopback TCP, exactly like the browser panel and the Emacs client.
 
 The docker is on reload_daemon's keep-list. Do not move it under a
 module that reload drops.
+
+Cancel and the command queue
+============================
+The command worker in DaemonConnection is single-threaded by design:
+it serialises state-mutating commands so a field edit is committed
+before the next command reaches the daemon. That is what makes "edit
+a parameter then click Run" reliable.
+
+`comfy_generate` holds the worker for the entire duration of the run,
+though — its `batch_complete` message does not arrive until the run
+finishes. A queued follow-up (the cancel request) would sit behind it
+and reach the daemon only after the run completed, at which point the
+cancel has nothing to target.
+
+Cancel therefore uses `DaemonConnection.send_cancel_now`, which opens
+its own socket on a fresh thread and sends `comfy_cancel` directly.
+The daemon receives it while the run is still in flight, sets the
+batch's cancel flag, and the run winds itself down.
 """
+
 from __future__ import annotations
+
+import time
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
@@ -20,7 +41,6 @@ from PyQt6.QtWidgets import (
 from .connection import DaemonConnection
 from .renderer import PanelRenderer
 
-import time
 
 class KritomaticPanel(QDockWidget):
 
@@ -175,18 +195,43 @@ class KritomaticPanel(QDockWidget):
 
     def _on_command_completed(self, request_id: str, ok: bool,
                               summary: dict) -> None:
-        if request_id == self._active_run_request_id:
-            self._active_run_request_id = None
-            self._running = False
-            if summary.get("status") == "batch_complete":
-                succ = summary.get("successful", 0)
-                fail = summary.get("failed", 0)
-                self._append_log(
-                    "hdr", f"Run done: {succ} ok, {fail} failed."
-                )
+        # Cancel requests get their own request_id ("cancel-...") and
+        # are handled separately from the run's own completion.
+        if request_id.startswith("cancel-"):
+            msg = summary.get("message", "")
+            if ok:
+                self._append_log("warn", f"Cancel sent: {msg}")
             else:
-                self._append_log("hdr", "Run done.")
-            self._update_run_buttons()
+                self._append_log("err", f"Cancel failed: {msg}")
+            return
+
+        if request_id != self._active_run_request_id:
+            return
+
+        self._active_run_request_id = None
+        self._running = False
+
+        results = summary.get("results", []) or []
+        cancelled_count = sum(
+            1 for r in results
+            if r.get("status") == "error"
+            and "cancelled" in (r.get("message") or "").lower()
+        )
+        succ = summary.get("successful", 0)
+        fail = summary.get("failed", 0)
+
+        if cancelled_count > 0 and succ == 0:
+            self._append_log(
+                "warn",
+                f"Run cancelled. {cancelled_count} run(s) not completed.",
+            )
+        elif summary.get("status") == "batch_complete":
+            self._append_log(
+                "hdr", f"Run done: {succ} ok, {fail} failed."
+            )
+        else:
+            self._append_log("hdr", "Run done.")
+        self._update_run_buttons()
 
     # ---- command submission ----
 
@@ -234,18 +279,23 @@ class KritomaticPanel(QDockWidget):
             self._conn.enqueue(request_id, bundle)
             self._append_log("hdr", "Run started.")
             self._update_run_buttons()
+
         elif key == "cancel":
-            command_with_batch = dict(command)
-            if self._active_run_request_id:
-                command_with_batch["batch_id"] = self._active_run_request_id
+            # Bypass the command queue: the run's own comfy_generate
+            # is holding the worker for the whole run duration. See
+            # the module docstring, "Cancel and the command queue".
+            if not self._active_run_request_id:
+                self._append_log(
+                    "warn", "No run in progress to cancel.",
+                )
+                return
             request_id = f"cancel-{int(time.time() * 1000)}"
-            bundle = {"id": request_id, "commands": [command]}
-            self._conn.enqueue(request_id, bundle)
-            self._append_log("warn", "Cancel requested.")
-        else:
-            request_id = (
-                f"action-{key}-{int(time.time() * 1000)}"
+            self._conn.send_cancel_now(
+                self._active_run_request_id, request_id,
             )
+
+        else:
+            request_id = f"action-{key}-{int(time.time() * 1000)}"
             bundle = {"id": request_id, "commands": [command]}
             self._conn.enqueue(request_id, bundle)
             self._append_log("hdr", f"Action {key} sent.")

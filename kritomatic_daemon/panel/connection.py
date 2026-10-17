@@ -8,6 +8,20 @@ requests, each on its own fresh connection (port 12346).
 Everything runs on plain Python threads and communicates with the
 GUI thread through Qt signals. No widget is ever touched off the
 GUI thread.
+
+The single command worker is by design: it serialises state-mutating
+commands so an edit is committed before the next command reaches the
+daemon. That is what makes "edit a parameter then click Run" reliable.
+
+The corollary is that a command sent while the worker is busy waits.
+For long-running commands (comfy_generate holds the worker for the
+whole duration of the run), a queued follow-up would never be
+delivered until the run finished — which is exactly wrong for a
+cancel. `send_cancel_now` therefore bypasses the queue entirely: it
+opens its own socket on a fresh thread, sends one `comfy_cancel`,
+reads the single reply, and closes. The daemon's command server is
+per-connection and stateless across calls, so nothing about the run's
+own connection is disturbed.
 """
 
 from __future__ import annotations
@@ -83,6 +97,74 @@ class DaemonConnection(QObject):
         if self._shutting_down:
             return
         self._command_queue.put((request_id, bundle))
+
+    def send_cancel_now(self, batch_id: str, request_id: str) -> None:
+        """Send a `comfy_cancel` on a fresh socket, on a background thread.
+
+        Bypasses the command queue so the cancel reaches the daemon
+        while a long-running `comfy_generate` is still in flight on the
+        queue's worker. The daemon's command server is per-connection
+        and stateless across calls, so a fresh connection is safe.
+
+        The single-command form (`{"type": "comfy_cancel", "batch_id":
+        ...}`, no `commands` wrapper) is used so the daemon replies with
+        exactly one line. This thread reads that line, emits
+        `commandCompleted`, and exits.
+        """
+        def _run():
+            sock = None
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(10.0)
+                sock.connect((COMMAND_HOST, COMMAND_PORT))
+                sock.settimeout(None)
+
+                command = {"type": "comfy_cancel", "batch_id": batch_id}
+                sock.sendall((json.dumps(command) + "\n").encode("utf-8"))
+
+                buffer = b""
+                while b"\n" not in buffer:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    buffer += chunk
+
+                if not buffer:
+                    self.commandCompleted.emit(
+                        request_id, False,
+                        {"status": "error",
+                         "message": "no response from daemon"},
+                    )
+                    return
+
+                line = buffer.split(b"\n", 1)[0]
+                try:
+                    summary = json.loads(line.decode("utf-8"))
+                except Exception:
+                    summary = {"status": "error",
+                               "message": "invalid response from daemon"}
+
+                ok = summary.get("status") == "success"
+                self.commandCompleted.emit(request_id, ok, summary)
+
+            except OSError as e:
+                self.commandCompleted.emit(
+                    request_id, False,
+                    {"status": "error",
+                     "message": f"cancel socket failed: {e}"},
+                )
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+
+        threading.Thread(
+            target=_run,
+            name="kritomatic-cancel",
+            daemon=True,
+        ).start()
 
     # -- event loop --
 

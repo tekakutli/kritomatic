@@ -51,6 +51,31 @@ What does NOT get reloaded:
       new handlers will repopulate, and every already-connected client
       sees the next published event as though nothing happened.
 
+Side effects before the module drop
+===================================
+Two teardown steps must run *before* the module drop, against the
+modules that are still loaded:
+
+  1. Event-bus listener cleanup. The old PanelHandler subscribed to
+     the bus in __init__; without this it keeps receiving events after
+     being replaced, and `panel_rebuild` at the end of this function
+     would publish to a duplicate listener.
+
+  2. Shared ComfyUI client shutdown. `kritomatic_daemon.utils.comfyui_client`
+     holds a module-level `_shared_client` whose `_watch_thread` is an
+     open WebSocket reader against the running ComfyUI server. Dropping
+     the module orphans that thread; the thread itself keeps running
+     (it is a daemon thread) and keeps the connection alive. On the
+     next comfy_connect, a second client is built and a second watcher
+     is started; both stay open against ComfyUI indefinitely. Repeated
+     reloads accumulate orphaned connections.
+
+     `reset_client()` (from the same module) unwatches the client,
+     joins the watcher thread up to 5 seconds, and clears `_shared_client`.
+     After the drop, the new module's `_shared_client` starts as None,
+     and the next `get_client()` builds a single fresh client. The
+     watcher thread started by the old client is gone.
+
 After the reload, the next `kritomatic` CLI invocation will see a
 schema-version mismatch and auto-refresh its cache if the schema
 changed.
@@ -83,37 +108,33 @@ class DaemonHandler(AutoDispatchHandler):
         ext._reload_in_progress = True
 
         try:
-            # 1. Clear event-bus listeners. The old PanelHandler subscribed
-            #    in its __init__; without this, the old instance keeps
-            #    receiving bus events after being dropped.
-            #
-            #    Because we do NOT drop kritomatic_daemon.server.*, this
-            #    call resolves against the same bus the running event
-            #    server is subscribed to and the freshly-built handlers
-            #    will subscribe to. Only the callback listener list is
-            #    cleared; queue subscribers (already-connected clients)
-            #    are untouched.
+            # ---- Pre-drop teardown, against the modules still loaded ----
+
+            # 1. Clear event-bus listeners. The old PanelHandler
+            #    subscribed in its __init__; without this it keeps
+            #    receiving bus events after being dropped, and the
+            #    panel_rebuild at the end of this function publishes
+            #    to a duplicate listener.
             try:
                 from ..server.event_bus import get_event_bus
                 get_event_bus().clear_listeners()
             except Exception:
                 pass
 
-            # 2. Drop submodules. Four must be preserved:
-            #
-            #      kritomatic_daemon
-            #          its __init__ calls addExtension + addDockWidgetFactory
-            #
-            #      kritomatic_daemon.kritomatic_daemon
-            #          the extension class
-            #
-            #      kritomatic_daemon.panel[.*]
-            #          live QDockWidget instances are bound to these classes
-            #
-            #      kritomatic_daemon.server[.*]
-            #          long-lived QThread / EventServer instances, plus the
-            #          event_bus `_bus` singleton that publishers and
-            #          subscribers must share across the reload
+            # 2. Shut down the shared ComfyUI client so its watcher
+            #    thread stops. Without this, dropping the
+            #    comfyui_client module orphans the thread and every
+            #    subsequent comfy_connect opens a second WebSocket to
+            #    ComfyUI. reset_client() is a no-op when the client
+            #    was never built.
+            try:
+                from ..utils.comfyui_client import reset_client
+                reset_client()
+            except Exception:
+                traceback.print_exc()
+
+            # ---- Drop submodules ----
+
             keep = {
                 'kritomatic_daemon',
                 'kritomatic_daemon.kritomatic_daemon',
@@ -140,11 +161,13 @@ class DaemonHandler(AutoDispatchHandler):
             for name in to_drop:
                 del sys.modules[name]
 
-            # 3. Fresh handler tree.
+            # ---- Fresh handler tree ----
+
             from kritomatic_daemon.handlers.base import CommandHandler
             new_handler = CommandHandler()
 
-            # 4. Swap the handler behind the extension's box.
+            # ---- Swap the handler behind the extension's box ----
+
             box = getattr(ext, 'handler_box', None)
             if box is None:
                 ext._reload_in_progress = False
@@ -162,13 +185,13 @@ class DaemonHandler(AutoDispatchHandler):
 
         ext._reload_in_progress = False
 
-        # 5. Best-effort republish of the panel description, so any
-        #    already-connected docker or web panel sees a fresh panel
-        #    event immediately instead of waiting for the next state
-        #    mutation to trigger one. Failure here does not invalidate
-        #    the reload — the next user interaction will refresh them
-        #    anyway — so a raised exception is logged but the reload is
-        #    still reported as successful.
+        # Best-effort republish of the panel description, so any
+        # already-connected docker or web panel sees a fresh panel
+        # event immediately instead of waiting for the next state
+        # mutation to trigger one. Failure here does not invalidate
+        # the reload — the next user interaction will refresh them
+        # anyway — so a raised exception is logged but the reload is
+        # still reported as successful.
         try:
             new_handler.execute('panel_rebuild', {})
         except Exception:

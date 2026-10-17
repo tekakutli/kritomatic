@@ -36,15 +36,6 @@ class CommandHandler(AutoDispatchHandler):
             'panel': PanelHandler(),
         }
 
-        # The panel handler builds its description from the comfyui
-        # state. It learns that state two ways: bus events fire on every
-        # state-mutating comfyui command (keeps it current during a
-        # session), and this puller, which lets `panel_description`
-        # fetch the current state on demand (covers the fresh-Krita case
-        # where no command has fired yet).
-        #
-        # The lambda is deferred, so the comfyui handler only needs to
-        # exist by the time the panel handler calls it, not now.
         self.handlers['panel'].set_comfy_status_puller(
             lambda: self.handlers['comfyui'].comfy_status({})
         )
@@ -100,7 +91,26 @@ class CommandHandler(AutoDispatchHandler):
                 summary_sent = False
                 try:
                     for i, cmd in enumerate(commands):
+                        # Defensive copy: the batch loop mutates its
+                        # per-command dict below (adds `_batch_id`), and
+                        # callers that reuse a bundle dict must not see
+                        # their entries acquire keys they did not put
+                        # there.
+                        cmd = dict(cmd)
+
                         self._enter_batchmode_for_active_doc(seen_docs)
+
+                        # Propagate the bundle id to each command as
+                        # `_batch_id`, so handlers that need a per-batch
+                        # identifier (notably comfy_generate, and by
+                        # extension comfy_cancel targeting it) see the
+                        # same id the caller used to open the batch.
+                        # Commands that already carry their own
+                        # `_batch_id` (the CLI sets one on every command
+                        # in BatchExecutor._process_command) are left
+                        # alone; the caller knows best.
+                        if batch_id and '_batch_id' not in cmd:
+                            cmd['_batch_id'] = batch_id
 
                         set_scope(cmd.get('_scope'))
 

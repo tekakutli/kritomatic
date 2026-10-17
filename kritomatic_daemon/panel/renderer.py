@@ -12,6 +12,22 @@ layout. On a new description:
 Edits are routed to a commit callback. Actions are routed to an action
 callback. The renderer knows nothing about comfyui; it knows field
 types and command names.
+
+Focus preservation across rebuilds
+==================================
+A structural change destroys and recreates every field widget. Without
+intervention that would steal focus from a field the user is typing
+into — visible on a Krita startup where the daemon publishes an empty
+panel (no workflow), the user clicks into a run-option field, and the
+auto-pull's subsequent state push arrives a beat later and rebuilds
+the tree.
+
+`_rebuild` therefore captures the focused field's key and (for text
+inputs) its cursor position before the teardown, and restores both
+after the rebuild if that field still exists in the new description.
+A field that no longer exists is not restored; the user's focus is
+allowed to fall wherever Qt puts it, which is what the user would
+expect when the field they were editing has gone away.
 """
 
 from __future__ import annotations
@@ -68,6 +84,11 @@ class PanelRenderer(QObject):
     # ---- rebuild ----
 
     def _rebuild(self, description: dict) -> None:
+        # Capture focus before teardown so it can be restored after the
+        # new tree exists. See the module docstring, "Focus preservation
+        # across rebuilds".
+        focused_key, focused_cursor = self._capture_focus()
+
         for w in self._section_widgets:
             w.setParent(None)
             w.deleteLater()
@@ -91,6 +112,81 @@ class PanelRenderer(QObject):
                     break
             self._layout.insertWidget(insert_at, widget)
             self._section_widgets.append(widget)
+
+        self._restore_focus(focused_key, focused_cursor)
+
+    # ---- focus capture / restore ----
+
+    def _capture_focus(self):
+        """Return (field_key, cursor) for the currently-focused field.
+
+        `cursor` is a ("line", position) or ("plain", position) tuple
+        when the focused widget is a text input, else None. If no field
+        is focused, returns (None, None).
+        """
+        for key, widget in self._field_widgets.items():
+            if widget.hasFocus():
+                return key, self._read_cursor(widget)
+            for child in widget.findChildren(QWidget):
+                if child.hasFocus():
+                    return key, self._read_cursor(child)
+        return None, None
+
+    @staticmethod
+    def _read_cursor(widget):
+        try:
+            if isinstance(widget, QLineEdit):
+                return ("line", widget.cursorPosition())
+            if isinstance(widget, QPlainTextEdit):
+                return ("plain", widget.textCursor().position())
+        except Exception:
+            pass
+        return None
+
+    def _restore_focus(self, key, cursor) -> None:
+        if not key or key not in self._field_widgets:
+            return
+        widget = self._field_widgets[key]
+        target = self._find_focusable_leaf(widget)
+        if target is None:
+            return
+        try:
+            target.setFocus()
+        except Exception:
+            return
+        if cursor is None:
+            return
+        kind, pos = cursor
+        try:
+            if kind == "line" and isinstance(target, QLineEdit):
+                target.setCursorPosition(pos)
+            elif kind == "plain" and isinstance(target, QPlainTextEdit):
+                cur = target.textCursor()
+                cur.setPosition(pos)
+                target.setTextCursor(cur)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _find_focusable_leaf(widget):
+        """Return the concrete input widget a field's outer container
+        wraps, preferring the widget itself when it is a leaf type.
+
+        A field's registered widget is sometimes a QLineEdit or
+        QSpinBox directly, sometimes a QWidget wrapper holding radio
+        buttons. Only the leaf types can receive keyboard focus and
+        cursor positions, so those are what we return.
+        """
+        leaf_types = (
+            QLineEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox,
+            QComboBox, QCheckBox,
+        )
+        if isinstance(widget, leaf_types):
+            return widget
+        for child in widget.findChildren(QWidget):
+            if isinstance(child, leaf_types):
+                return child
+        return None
 
     def _build_section(self, section: dict):
         kind = section.get("kind")

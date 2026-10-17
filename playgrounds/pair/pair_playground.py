@@ -6,61 +6,65 @@ pair_playground.py — pairs of parallel lines with 1D segment layouts.
 The canvas shows a set of PAIRS.  A pair is two parallel lines that
 run from one edge of the viewport to the other, together with a 1D
 layout of SEGMENTS along the pair's abstract axis.  Each pair has
-its own direction (angle / inclination), gap (perpendicular distance
-between the two lines), offset (shift of line B along the direction
-of line A), and a per-line metric (metricA on line A, metricB on
-line B).
+its own direction, gap, offset, per-line metric, whole-pair scale,
+and loopback gap; see pg_core.py for the model.
 
-A segment is an abstract interval [a, b].  On the canvas it becomes
-a trapezoid whose top edge is that interval drawn on line A (scaled
-by metricA) and whose bottom edge is the same interval drawn on line
-B (scaled by metricB, shifted by offset).  When the two metrics are
-equal and the offset is zero, the trapezoid degenerates into a
-parallelogram; when they differ it narrows or widens across the gap.
+The bottom band is the SEGMENT VIEW: one row per pair, each row an
+axis along which the pair's segments are laid out as bars.  Edges
+drag to widen or shrink; bodies drag to translate every segment in
+the pair together (or, with Shift held, to build a growing set of
+segments and drag them together).
 
-The abstract segment axis is periodic with period SEG_X_SPAN.  A
-segment [a, b] and every [a + k·SEG_X_SPAN, b + k·SEG_X_SPAN] are
-the same physical segment; both views draw every wrapped copy that
-intersects their own visible region, so a segment dragged past one
-end reappears on the other — on the segment view and, correspondingly,
-at the opposite end of the pair of lines.
+The panel is a shared shell provided by `pgkit` — shared CSS, panel
+primitives, HTML scaffolding, the WebSocket server, and the
+browser-side remote client.  The project supplies its model, views,
+scene format, KRA export, and — in `pg_panel_scrubs.py` and
+`pg_panel_bindings.py` — the registration of its value fields with
+`pgkitRegisterField`.  See `pgkit/MIGRATION.md`.
 
-The bottom band is the SEGMENT VIEW.  It shows one row per pair.
-Each row is a 1D axis; a segment is a filled bar along that axis.
-Drag a segment's edges to widen or shrink it; drag its body to
-translate every segment in the pair together; click Draw Segment to
-place a new segment anywhere in a row.
+REMOTE API
+==========
+Every value field declared in `pg_panel_scrubs.py` and
+`pg_panel_bindings.py` is published over the WebSocket at `/remote`.
+A remote client — a CLI, another browser tab, a script — reads the
+current state on connect and can write any registered field by name.
+When at least one remote client is connected, the panel hides and
+the "Controlled remotely" banner appears.  There is no polling: a
+value is published only when its own write path calls
+`pgkitNotifyLocal` or when a wholesale model change calls
+`pgkitNotifyAll`.
 
-The panel also carries a KRA export section:  each segment (filled
-or empty) becomes a text label, and each filled segment also emits
-a filled trapezoid.  The label's affine is derived from the
-trapezoid's own local Jacobian, so it warps as if it were painted
-on the trapezoid's plane — matching cone_playground's text-shear
-export.
+THIS FILE
+=========
+The entry point.  It sets up `sys.path` so both the playground's
+own modules and the sibling `pgkit` package resolve, writes the
+HTML page (assembled by `pair_html.py`), and starts the shared
+HTTP+WebSocket server with the one pair-specific route — the KRA
+export at `/generate-kra`.
 
-IMPORT PATH
-===========
-This script imports sibling modules (pair_html, pair_server, and the
-pg_* family through pair_html).  To make those imports resolve no
-matter how the script is invoked — plain `python pair_playground.py`,
-`python /abs/path/pair_playground.py`, or with PYTHONSAFEPATH=1 —
-the script's own directory is inserted into sys.path before the
-first sibling import.  See the top of the module.
+There is no separate `pair_server.py`.  After the pgkit migration
+the server side of this project is one `pgkit.server.serve(...)`
+call with one route; a whole module for that call would be a
+wrapper around a wrapper.
 """
 
 import os
 import sys
 
-# Put this script's directory on sys.path before any sibling import.
-# Idempotent: if the directory is already present (the common case),
-# nothing is inserted twice.  This lets the script be run from any
-# working directory, and survives PYTHONSAFEPATH=1 / python -P.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+# Both this directory and its parent (which contains pgkit/) need to
+# be importable, so the project's own modules and the shared package
+# resolve regardless of the working directory or of
+# PYTHONSAFEPATH / `python -P`.
+_HERE   = os.path.dirname(os.path.abspath(__file__))
+_PARENT = os.path.dirname(_HERE)
+for _p in (_HERE, _PARENT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import pair_html
-import pair_server
+import pair_kra
+
+from pgkit.server import serve as kit_serve
 
 
 HTML_FILE    = "pair_playground.html"
@@ -77,13 +81,15 @@ def main():
     print("  band split   : canvas (upper) + segment view (lower)")
     print("  interactions : drag pairs in the canvas · drag segment "
           "edges or bodies in the segment view · H collapses the panel")
+    print(f"  remote api   : ws://127.0.0.1:{PORT}/remote")
 
     if SERVE:
         print()
-        pair_server.serve(
+        kit_serve(
             port         = PORT,
             open_browser = OPEN_BROWSER,
             html_file    = HTML_FILE,
+            routes       = {"/generate-kra": pair_kra.generate},
         )
     else:
         print(f"  open : file://{os.path.abspath(HTML_FILE)}")

@@ -4,177 +4,72 @@ pg_dispatch.py — draw() and the canvas event listeners.
 Two bands, one canvas:
 
     top        click a pair's anchor to start a pair drag; click a
-               segment's trapezoid (any of its wrapped copies) or
-               either of the pair's lines to select that pair (and,
-               when the click landed on a trapezoid, that segment
-               too) and start the same pair drag; drag moves the
-               whole pair — both lines and every segment — together;
-               wheel zooms the view.
+               segment's trapezoid or either of the pair's lines to
+               select that pair and start the same pair drag.
 
     bottom     drag a segment's left/right edge to widen / shrink;
                drag a segment's BODY to translate the pair's
                segments; click a segment's body to select it; click
                a row to select its pair; wheel scrolls through rows.
 
-Draw-Segment mode (panel button) diverts top-band interactions too:
-a click in the segment view creates a segment, a click in the canvas
-band does nothing.  Escape or a second press of the button cancels.
-
 PAIR DRAG — ONE BEHAVIOUR, THREE ENTRY POINTS
 =============================================
 A pair is a single abstract object: two parallel lines plus the 1D
 layout of segments between them.  Every drag that moves a pair moves
-the WHOLE pair, because the underlying state (`p.cx`, `p.cy`) is a
-single anchor point that the lines, the trapezoids, and the segment
-view all derive from.
+the WHOLE pair.
 
-Three different clicks start a pair drag:
-
-    1. the pair's anchor marker, which is only drawn for the
-       selected pair;
-
-    2. one of the pair's two lines, within a few pixels of it;
-
-    3. a segment's trapezoid — the filled (or dashed) quadrilateral
-       on the canvas, at any wrapped copy.
-
-(2) and (3) also SELECT the pair they landed on, and (3) selects the
-segment as well.
+Three different clicks start a pair drag: the pair's anchor marker,
+either of its two lines, or a segment's trapezoid.  (2) and (3) also
+SELECT the pair they landed on.
 
 SEGMENT-BODY DRAG — TWO MODES
 =============================
-A press inside a segment's body in the SEGMENT VIEW (not on its
-edges) starts a dragSegmentBody.  The state captures, at mousedown
-time,
-
-    the pair index
-    the index of the grabbed segment
-    the pixel x of the press
-    the abstract segment-x under the press
-    a snapshot of every segment's (a, b) in that pair
-    the drag mode (whole-row or set-drag)
-
-On each mousemove the delta in abstract segment-x is computed from
-the press's own starting segment-x, and the pair's segments are
-written back from the snapshot.  Which segments get the delta is
-decided by the drag mode captured at mousedown:
-
-    whole-row (no Shift at mousedown)   every segment in the pair
-                                        is written as
-                                        `snapshot + delta`.
-
-    set-drag (Shift at mousedown)       only the segments that are
-                                        members of the SHIFT-DRAG
-                                        SET at mousedown get the
-                                        delta; the rest are reset
-                                        to their snapshot.
-
-A tiny pixel threshold (SEGMENT_BODY_DRAG_THRESHOLD) keeps a plain
-click from registering as a zero-distance drag.
-
-PER-ROW VISUAL SCALE
-====================
-The segment view maps a row's pixels to abstract units over that
-row's OWN abstract span — one period of the pair the row belongs
-to.  A pair with a nonzero loopbackGap therefore has a wider
-abstract range in the same pixel width than a pair without one, and
-the same pixel column means a different abstract coordinate on
-each row.  Every conversion between screen x and abstract segment-x
-in this file must therefore be told WHICH pair's row it is talking
-about; there is no single global scale.  The two that matter are:
-
-    · the cursor readout in updateStatus(), which reports the
-      coordinate on the SELECTED pair's row;
-
-    · the drag handlers, which capture `startSegX` from the
-      grabbed row's pair at mousedown and use the same pair on
-      every mousemove.  Because the delta is computed against the
-      same pair's scale at both ends, the drag is stable even
-      though the scale differs from row to row.
-
-See pg_view_segments.py, THE AXIS IS PERIODIC, for the mapping and
-`segXToScreen` / `segScreenToX` for the two functions that own it.
+A press inside a segment's body in the SEGMENT VIEW starts a
+dragSegmentBody.  The mousedown captures a snapshot of every
+segment's (a, b); each mousemove writes back from that snapshot.
+The drag mode is decided at mousedown: whole-row (no Shift) moves
+every segment; set-drag (Shift held) moves only the members of the
+shift-drag set.
 
 SHIFT-DRAG SET — ACCUMULATING MEMBERS
 =====================================
-While the user holds Shift, successive shift-clicks on segment
-bodies accumulate into a persistent set.  The set lives in
-`state.shiftDragSet` and remembers one pair at a time:
-
-    { pairIdx: number, members: Set<number> }
-
-The rules:
-
-    · Shift + click on segment A   adds A to the set.  If no set
-                                   existed yet AND a segment was
-                                   already selected on the same
-                                   pair, that selected segment is
-                                   seeded into the new set as
-                                   well — so the very first shift-
-                                   click on a fresh set includes
-                                   the segment you had already
-                                   selected.
-
-    · Shift + click on segment B   adds B; the set grows.
-
-    · Shift + drag any member      moves every member of the set
-                                   by the same delta, along the
-                                   pair's own abstract axis.
-
-    · Release Shift                nothing happens — the set
-                                   persists.  The whole point of
-                                   the accumulation is that the
-                                   set outlives the modifier.
-
-    · Non-shift click anywhere     clears the set.
-      on the canvas
-
-    · Switch to another pair and   the set is replaced when a
-      shift-click on it            shift-click targets a different
-                                   pair.  A set is meaningful only
-                                   on one pair.
-
-    · Delete a member segment      the set is cleared.
-
-The set is a pure UI affordance — it is not persisted in the scene
-file, and it is reset on scene load.
+While Shift is held, successive shift-clicks on segment bodies
+accumulate into a persistent set.  A shift-drag on any member moves
+the whole set.  Releasing Shift keeps the set; a plain (non-shift)
+canvas click clears it.
 
 EDGE DRAG — DELTA-BASED, WRAP-AWARE
 ===================================
-An edge drag captures the drag-start cursor position, the segment's
-start a and start b, and the side ("a" or "b").  Each mousemove
-computes the delta in abstract coordinates from the drag-start
-cursor position and applies it to the correct base endpoint.  The
-delta is measured with the row's own pair as the scale, so it is
-unaffected by any other row's loopbackGap.
+An edge drag captures the drag-start cursor position and the
+segment's start a and b.  Each mousemove applies a delta from
+drag-start, so the drag is correct when the user grabbed a wrapped
+copy of the edge.
 
 PAIR BODY HIT TEST — SEGMENT OR LINE, ONE CALL
 ==============================================
 `pairBodyHitTest` returns
-
-    { pairIdx, segIdx }    when the cursor is inside any wrapped
-                           copy of a segment's trapezoid
-    { pairIdx, segIdx:-1 } when the cursor is within a few pixels of
-                           one of the pair's two lines
+    { pairIdx, segIdx }    for a segment trapezoid hit
+    { pairIdx, segIdx:-1 } for a line hit
     null                   otherwise.
 
 LOOPBACK GAP
 ============
-`_pairPeriod(p)` returns the pair's own period of the abstract
-axis: `SEG_X_SPAN + max(0, p.loopbackGap || 0)`.  Every place this
-file wraps a segment — `pairBodyHitTest`, the segment-view drag
-handlers, the pair-drag hit tests — passes that period, not the
-raw span, so the wrapped copies land where the renderers draw them.
-
-See pg_core.py, LOOPBACK GAP, for the field's meaning.
+`_pairPeriod(p)` returns the pair's own period of the abstract axis.
 
 OVERLAP MODE
 ============
 `state.overlapHighlight` is a global viewing flag toggled by the
-"Overlap" checkbox in the Segments section.  When true, both view
-renderers draw a red dashed overlay on any segment that overlaps a
-segment on another pair, and the panel's lists mark overlapping
-rows.  See pg_core.py, `_segmentOverlapsOtherPair`.
+"Overlap" checkbox in the Segments section.
+
+MOUSEMOVE FAST PATH
+===================
+The `mousemove` handler only calls `draw()` when a drag is active or
+the draw-segment tool is on.  When nothing is dragging and no tool
+is active, only `state.mouse` has changed — the canvas is
+pixel-identical to the previous frame — so we update the status
+readout and return, without touching the renderers.  The per-frame
+overlap memo is also reset only inside `draw()`, so it survives
+across the fast path without staleness.
 """
 
 DISPATCH_JS = r"""
@@ -192,23 +87,14 @@ const state = {
   segScroll: 0,
   drawSegmentMode: false,
   overlapHighlight: false,
-
-  /* Shift-drag set: { pairIdx, members: Set<number> } | null.  See
-     the module docstring, SHIFT-DRAG SET. */
   shiftDragSet: null,
 };
 
-/* True iff the segment at (pairIdx, segIdx) is currently a member
-   of the shift-drag set.  Called by the two view renderers and by
-   the panel's list builder to decide whether to draw the member
-   marker. */
 function _isShiftSetMember(pairIdx, segIdx) {
   const s = state.shiftDragSet;
   return !!(s && s.pairIdx === pairIdx && s.members.has(segIdx));
 }
 
-/* Drop the shift-drag set, if any, and re-render so its member
-   markers disappear.  No-op when the set is already null. */
 function _clearShiftDragSet() {
   if (state.shiftDragSet) {
     state.shiftDragSet = null;
@@ -221,6 +107,11 @@ function _clearShiftDragSet() {
    ========================================================================== */
 
 function draw() {
+  /* Fresh per-frame memo for the overlap test.  Both renderers
+     consult _cachedSegmentOverlaps; the memo makes each distinct
+     (pair, segment) query happen once per frame instead of twice. */
+  _overlapMemo = new Map();
+
   const cw = window.innerWidth;
   const ch = window.innerHeight;
 
@@ -306,11 +197,6 @@ function updateStatus() {
   }
 
   if (state.mouse.inside && state.mouse.sy >= layout.reservedY) {
-    /* The abstract segment-x readout is reported in the SELECTED
-       pair's own scale, since the status line names that pair.
-       Rows with a different loopbackGap have a different abstract
-       span, so the same pixel x is a different abstract x on each
-       row; passing `p` is what makes the number meaningful. */
     const x = segScreenToX(state.mouse.sx, p);
     el.textContent = p.name + "  ·  segment-x = " + x.toFixed(3)
                    + "  ·  segments: " + p.segments.length;
@@ -369,10 +255,6 @@ function _ptInPolygon(px, py, poly) {
   return inside;
 }
 
-/* Every wrapped copy of every segment is considered.  The period
-   passed to forEachSegmentCopy is the pair's own, so a nonzero
-   loopbackGap shifts the wrapped copies exactly as far as the
-   renderers draw them. */
 function pairBodyHitTest(sx, sy) {
   const cw = window.innerWidth;
   const ch = layout.topH;
@@ -448,9 +330,6 @@ canvas.addEventListener("mousedown", (e) => {
     }
 
     if (hit.kind === "edge") {
-      /* Edge drag is inherently a one-segment operation; the set
-         is preserved across an edge drag so a user who is mid-set
-         can still tweak an edge without losing the accumulation. */
       selectedPair    = hit.pairIdx;
       selectedSegment = { pairIdx: hit.pairIdx, segIdx: hit.segIdx };
       const p = pairs[hit.pairIdx];
@@ -459,10 +338,6 @@ canvas.addEventListener("mousedown", (e) => {
         pairIdx: hit.pairIdx,
         segIdx:  hit.segIdx,
         side:    hit.side,
-        /* Both startX and every mousemove's x must be converted
-           with the SAME row's pair — otherwise the delta would
-           carry a scale factor of the wrong row.  See the module
-           docstring, PER-ROW VISUAL SCALE. */
         startX:  segScreenToX(sx, p),
         startA:  seg.a,
         startB:  seg.b,
@@ -473,10 +348,6 @@ canvas.addEventListener("mousedown", (e) => {
     }
 
     if (hit.kind === "body") {
-      /* Capture the PREVIOUS selection BEFORE overwriting it — the
-         shift-drag set seeding needs to know which segment the
-         user had selected before this click, and the assignment
-         below obliterates that information. */
       const prevSel = selectedSegment;
 
       selectedPair    = hit.pairIdx;
@@ -488,12 +359,6 @@ canvas.addEventListener("mousedown", (e) => {
 
       if (e.shiftKey) {
         setDrag = true;
-
-        /* A set is meaningful only on one pair.  If no set exists,
-           or the existing one belongs to a different pair, start a
-           fresh set for this pair and seed it with the segment
-           that was selected BEFORE this shift-click — but only
-           when that segment lived on the same pair. */
         if (!state.shiftDragSet ||
             state.shiftDragSet.pairIdx !== hit.pairIdx) {
           state.shiftDragSet = {
@@ -507,8 +372,6 @@ canvas.addEventListener("mousedown", (e) => {
         state.shiftDragSet.members.add(hit.segIdx);
         dragMembers = Array.from(state.shiftDragSet.members);
       } else {
-        /* Non-shift body press: a fresh whole-row drag begins and
-           the set is dropped. */
         state.shiftDragSet = null;
       }
 
@@ -516,8 +379,6 @@ canvas.addEventListener("mousedown", (e) => {
         pairIdx:     hit.pairIdx,
         segIdx:      hit.segIdx,
         startX:      sx,
-        /* Captured with the grabbed row's pair — see the module
-           docstring, PER-ROW VISUAL SCALE. */
         startSegX:   segScreenToX(sx, p),
         moved:       false,
         setDrag:     setDrag,
@@ -587,6 +448,14 @@ canvas.addEventListener("mousedown", (e) => {
   draw();
 });
 
+/* ==========================================================================
+   MOUSEMOVE — fast path
+   ==========================================================================
+   Only a drag or the draw-segment tool changes the canvas.  When
+   neither is active, the renderers are skipped and only the status
+   readout is refreshed.  See the module docstring, MOUSEMOVE FAST
+   PATH. */
+
 window.addEventListener("mousemove", (e) => {
   const rect = canvas.getBoundingClientRect();
   const sx = e.clientX - rect.left;
@@ -611,8 +480,6 @@ window.addEventListener("mousemove", (e) => {
       if (!seg) {
         state.dragSegmentEdge = null;
       } else {
-        /* Same pair as startX — see the module docstring,
-           PER-ROW VISUAL SCALE. */
         const x = segScreenToX(sx, p);
         const d = x - ds.startX;
         if (ds.side === "a") {
@@ -635,19 +502,12 @@ window.addEventListener("mousemove", (e) => {
       const dxPix = sx - ds.startX;
       if (!ds.moved &&
           Math.abs(dxPix) < SEGMENT_BODY_DRAG_THRESHOLD) {
-        /* still inside the click tolerance; nothing has moved yet */
+        /* click tolerance */
       } else {
         ds.moved = true;
-        /* Both endpoints of the subtraction use the same pair, so
-           the delta is scale-free with respect to the row's own
-           span.  See the module docstring, PER-ROW VISUAL SCALE. */
         const delta = segScreenToX(sx, p) - ds.startSegX;
 
-        /* The drag mode was captured at mousedown: a set-drag
-           moves only the members of the shift-set; a whole-row
-           drag moves every segment.  The branch is not re-
-           evaluated from the current Shift state. */
-        let moveSet = null;  /* null means "all" */
+        let moveSet = null;
         if (ds.setDrag && ds.dragMembers) {
           moveSet = new Set(ds.dragMembers);
         }
@@ -684,7 +544,10 @@ window.addEventListener("mousemove", (e) => {
     return;
   }
 
-  draw();
+  /* Nothing is dragging and no tool is active: only state.mouse
+     changed.  Update the status readout and return — the canvas is
+     pixel-identical to the previous frame. */
+  updateStatus();
 });
 
 window.addEventListener("mouseup", () => {
@@ -696,10 +559,6 @@ window.addEventListener("mouseup", () => {
     state.dragSegmentBody = null;
     canvas.style.cursor = "crosshair";
   }
-
-  /* The shift-drag set is intentionally NOT cleared here.  It
-     survives both mouseup and Shift keyup, and only goes away on a
-     non-shift canvas click, on segment deletion, or on scene load. */
 });
 
 canvas.addEventListener("wheel", (e) => {

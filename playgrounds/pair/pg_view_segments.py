@@ -6,133 +6,34 @@ mapped linearly to the row's pixel width.  Each segment is a bar
 along that axis.  Filled segments are drawn solid; empty ones are
 drawn as an outline only.
 
-THE AXIS IS PERIODIC — AND EACH ROW SCALES TO ITS OWN PERIOD
-============================================================
-See pg_core.py, THE SEGMENT AXIS IS PERIODIC, and LOOPBACK GAP.  A
-segment whose abstract [a, b] crosses either end of the row's range
-is drawn at both ends: its k = 0 copy is clipped at the boundary,
-and its k = -1 or k = +1 copy appears on the opposite side.  The
-step between copies is the pair's own period, `_pairPeriod(p)`,
-which is `SEG_X_SPAN + max(0, p.loopbackGap || 0)`.
+PER-ROW WRAPPING
+================
+The row's visible abstract range is one period of its own pair,
+[-period/2, +period/2].  Segment copies are laid out at a + k·period
+and b + k·period; only k's whose copy intersects the visible range
+are iterated.  `_kRangeForSegmentInSegmentView` (in pg_core.py)
+computes that range — typically 2–5 k's instead of the full 41.
 
-    loopbackGap = 0   the historic behaviour: copies are one
-                      SEG_X_SPAN apart, and the row spans exactly
-                      SEG_X_SPAN, so a segment dragged past one
-                      edge immediately has its wrapped copy at
-                      the other.
-
-    loopbackGap > 0   the copies are further apart.  If the row
-                      kept the historic SEG_X_SPAN span, there
-                      would be a stretch of the abstract axis where
-                      neither the segment nor its wrapped copy lay
-                      inside the visible range — the "hidden gap"
-                      the field names.
-
-To keep every segment on a pair visible, EACH ROW scales
-independently to span exactly one period of ITS OWN pair:
-
-    row abstract range  =  [-_pairPeriod(p)/2, +_pairPeriod(p)/2]
-
-At loopbackGap = 0 on a pair, this collapses to the historic
-[-SEG_X_SPAN/2, +SEG_X_SPAN/2] = [SEG_X_MIN, SEG_X_MAX], so a pair
-without a gap looks exactly as it did before.  A pair with a gap
-gets a proportionally wider abstract range in the same pixel
-width, so its wrapped copies sit exactly one row-width apart and
-no segment can fall into a stretch where neither it nor its
-wrapped copy is on screen.
-
-Rows therefore do NOT share a horizontal scale: a segment at
-abstract coordinate x sits at a different pixel column on a pair
-with a gap than it does on a pair without one.  That is the point
-of the field — the gap is a property of the pair's own axis, not
-of the view.  A pair with a gap and a pair without one keep their
-own zoom side by side.
-
-`segXToScreen(x, p)` and `segScreenToX(sx, p)` are the only two
-functions that know about the per-pair span.  When `p` is null
-they fall back to the base SEG_X_SPAN — which is what the segment
-view's top ruler uses, so that ruler still reads as the historic
-[-6, +6] reference.  Rows with a gap will not line up with that
-ruler; their own axis line at the row's vertical centre is what
-tells the user where they are on that pair's scale.
-
-EDGE-HIT THRESHOLD IS IN PIXELS, NOT ABSTRACT UNITS
-===================================================
-`SEG_EDGE_HIT_PX` is the pixel distance from a segment's edge within
-which a click counts as an edge grab rather than a body grab.  The
-hit test converts it to abstract units on the fly, using the row's
-current width and the row's own pair, so the threshold stays a
-constant number of pixels regardless of the row's width or its
-abstract span.
-
-HIT PRIORITY WITHIN A ROW
-=========================
-The hit test iterates every segment in the clicked row, not just
-until it finds a match.  Among all edges within the pixel threshold,
-the closest one wins; the closest edge, if any, beats every body
-hit.  Only when no edge is within range does the segment whose body
-contains the cursor get selected.
-
-OVERLAP MODE
-============
-When the "Overlap" checkbox is on, every segment that shares
-screen-space territory with a segment on a different pair gets a
-red dashed outline over its usual stroke — drawn per wrapped copy.
-See pg_core.py, OVERLAP BETWEEN SEGMENTS ON DIFFERENT PAIRS.
-
-SHIFT-DRAG SET MARKER
-=====================
-When a segment is a member of the current shift-drag set
-(`state.shiftDragSet`), its bar is drawn a second time with a
-bright white dashed outline.  See pg_dispatch.py, SHIFT-DRAG SET.
-
-Interaction:
-
-    click on a segment's left or right edge   drag to widen / shrink
-    click on a segment's body                 select it, then drag
-                                              the whole pair's segment
-                                              row together.  With
-                                              Shift held, the press
-                                              adds the segment to
-                                              the shift-drag set and
-                                              the drag moves only the
-                                              set's members.
-    click on empty space in a row             select the pair
-    Draw Segment mode                         click anywhere in a
-                                              row to drop a segment
-                                              of default width there
-
-The band is scrollable with the wheel; state.segScroll holds the
-vertical offset in pixels.
+PER-FRAME OVERLAP MEMO
+======================
+`_cachedSegmentOverlaps` (in pg_core.py) memoizes the SAT overlap
+test within one frame, shared with pg_view_canvas.py.  Same result
+as before, half the cost.
 """
 
 SEGMENTS_VIEW_JS = r"""
 /* ==========================================================================
    SEGMENT VIEW — mapping
-   ==========================================================================
-   SEG_X_MIN, SEG_X_MAX and SEG_X_SPAN are defined in pg_core.py.
-   The per-pair period is `_pairPeriod(p)`.  Each row maps one
-   period of ITS OWN pair to the row's pixel width, so pairs with
-   different loopback gaps scale independently of one another.  See
-   the module docstring, THE AXIS IS PERIODIC. */
+   ========================================================================== */
 
 const ROW_HEIGHT = 28;
 const ROW_GAP    = 4;
 const ROW_STRIDE = ROW_HEIGHT + ROW_GAP;
 
-/* Edge-hit radius, in PIXELS.  The hit test converts this to
-   abstract units using the row's current width and the row's own
-   pair. */
 const SEG_EDGE_HIT_PX = 8;
 
 const DEFAULT_SEGMENT_HALF_WIDTH = 0.8;
 
-/* Abstract span of the row for pair `p`.  At loopbackGap = 0 this
-   is SEG_X_SPAN; a nonzero loopbackGap widens it by exactly the
-   gap, so the pair's wrapped copies land one row-width apart and
-   no segment enters a hidden stretch of the axis.  When `p` is
-   null — the top ruler, and any caller without a pair in hand —
-   the base span SEG_X_SPAN is used. */
 function _pairSpan(p) {
   if (!p) return SEG_X_SPAN;
   return _pairPeriod(p);
@@ -151,11 +52,6 @@ function segRect() {
   return { x0, y0, w, h };
 }
 
-/* Both directions need the same pair context.  Passing the row's
-   own pair keeps the abstract-to-pixel mapping consistent between
-   the drawing pass, the hit test, and the drag arithmetic — all
-   three call these two functions with the same `p`, so a drag
-   delta is the same number at mousedown and at every mousemove. */
 function segXToScreen(x, p) {
   const r = segRect();
   const span = _pairSpan(p);
@@ -196,13 +92,6 @@ function drawSegmentsView() {
   ctx.lineWidth = 1;
   ctx.strokeRect(r.x0 + 0.5, r.y0 + 0.5, r.w - 1, r.h - 1);
 
-  /* Top ruler.  This is the historic, base-scale reference at
-     SEG_X_SPAN; it is NOT the scale of every row.  Rows carrying a
-     nonzero loopbackGap have their own wider abstract range and do
-     not line up with these ticks — the row's own axis line is what
-     tells the user where they are on that pair's scale.  The
-     ruler exists so that a workspace with no gaps anywhere still
-     reads exactly as it always did. */
   ctx.font = "700 9px 'JetBrains Mono', 'Fira Code', monospace";
   ctx.textAlign = "center";
   ctx.textBaseline = "bottom";
@@ -248,10 +137,6 @@ function drawSegmentsView() {
 
   ctx.restore();
 
-  /* Draw-mode cursor hint.  The preview copies must use the period
-     AND the abstract-to-pixel scale of the row the cursor is over.
-     Between rows, fall back to the base span so the hint still
-     reads as a plausible placement on the historic scale. */
   if (state.drawSegmentMode &&
       state.mouse.inside && state.mouse.sy >= layout.reservedY) {
     const sx = state.mouse.sx;
@@ -332,26 +217,19 @@ function drawSegmentBar(p, seg, hue, top, pairIdx, segIdx, isSelPair) {
   const y1 = top + ROW_HEIGHT - 4;
   const filled = seg.filled !== false;
 
-  const period = _pairPeriod(p);
-  const vMin   = _pairViewMin(p);
-  const vMax   = _pairViewMax(p);
+  const vMin = _pairViewMin(p);
+  const vMax = _pairViewMax(p);
 
   const overlapOn = state.overlapHighlight &&
-                    _segmentOverlapsOtherPair(pairIdx, segIdx);
+                    _cachedSegmentOverlaps(pairIdx, segIdx);
 
-  /* Set-member marker, orthogonal to the selected and overlap
-     markers.  See the module docstring, SHIFT-DRAG SET MARKER. */
   const isSetMember = _isShiftSetMember(pairIdx, segIdx);
 
-  /* Every wrapped copy of the segment that intersects this row's
-     own visible abstract range.  Because the range is exactly one
-     period of `p`, the pair's wrapped copies sit one row-width
-     apart: for any position on the pair's axis, at least one copy
-     is on screen, so no segment can be lost inside a hidden gap.
-     The same `forEachSegmentCopy` and the same `_pairPeriod(p)` are
-     used here as on the canvas — this file simply maps the copies
-     with the pair's own span instead of a global one. */
-  forEachSegmentCopy(period, seg.a, seg.b, (a, b, k) => {
+  const kRange = _kRangeForSegmentInSegmentView(p, seg);
+  if (kRange.min > kRange.max) return;
+
+  forEachSegmentCopyInRange(_pairPeriod(p), seg.a, seg.b,
+                            kRange.min, kRange.max, (a, b, k) => {
     if (b < vMin || a > vMax) return;
     const aCl = Math.max(a, vMin);
     const bCl = Math.min(b, vMax);
@@ -379,7 +257,6 @@ function drawSegmentBar(p, seg, hue, top, pairIdx, segIdx, isSelPair) {
       ctx.setLineDash([]);
     }
 
-    /* Overlap overlay: red dashed outline. */
     if (overlapOn) {
       ctx.save();
       ctx.setLineDash([4, 3]);
@@ -390,7 +267,6 @@ function drawSegmentBar(p, seg, hue, top, pairIdx, segIdx, isSelPair) {
       ctx.restore();
     }
 
-    /* Set-member overlay: bright white dashed outline, inset. */
     if (isSetMember) {
       ctx.save();
       ctx.setLineDash([6, 3]);
@@ -402,11 +278,6 @@ function drawSegmentBar(p, seg, hue, top, pairIdx, segIdx, isSelPair) {
       ctx.restore();
     }
 
-    /* Edge handles, drawn when the segment is selected.  Handles
-       appear on the actual abstract endpoints (a and b of this
-       copy) whenever those endpoints lie inside this row's own
-       visible range.  A clipped edge (an end outside the range)
-       is not drawn. */
     if (isSel) {
       if (a >= vMin && a <= vMax) {
         const ex = segXToScreen(a, p);
@@ -437,17 +308,11 @@ function drawSegmentBar(p, seg, hue, top, pairIdx, segIdx, isSelPair) {
 /* ==========================================================================
    SEGMENT VIEW — hit testing
    ==========================================================================
-   A cursor near any wrapped copy of a segment hits that segment.  An
-   edge hit reports which abstract endpoint (a or b) of the base
-   segment is being grabbed; the caller applies the drag as a delta,
-   so it does not matter which lap the cursor was on.
-
-   Wrapped copies are spaced by the pair's own period; the row's
-   visible abstract range is exactly that period, so for every pair
-   the copies are one row-width apart and at least one copy is
-   always on screen.  Only endpoints that lie inside the visible
-   range are grabbable; an endpoint clipped at a row boundary is
-   not. */
+   Hit testing iterates the full [-SEGMENT_WRAP_K, +SEGMENT_WRAP_K]
+   range because it must find the *grabbable* copy nearest the
+   cursor, and edge handles on wrapped copies are grabbable at any
+   lap that lands inside the row.  The per-iteration body is cheap
+   (two comparisons and a distance), so the cost is negligible. */
 
 function segmentHitTest(sx, sy) {
   const r = segRect();
@@ -481,9 +346,6 @@ function segmentHitTest(sx, sy) {
     forEachSegmentCopy(period, seg.a, seg.b, (a, b) => {
       if (b < vMin || a > vMax) return;
 
-      /* Edge candidates: only abstract endpoints that lie inside
-         this row's own visible range.  A clipped endpoint (outside
-         the range) is not directly grabbable. */
       if (a >= vMin && a <= vMax) {
         const d = Math.abs(xc - a);
         if (d < bestEdgeDist) {
@@ -501,9 +363,6 @@ function segmentHitTest(sx, sy) {
         }
       }
 
-      /* Body candidates: the cursor inside the visible portion of
-         this copy.  The first segment whose body contains the
-         cursor claims the body slot. */
       if (bodySeg < 0) {
         const aCl = Math.max(a, vMin);
         const bCl = Math.min(b, vMax);

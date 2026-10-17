@@ -34,107 +34,43 @@ A segment [a, b] becomes the trapezoid with world corners
 
 which is what drawSegmentTrapezoid renders, clipped to the viewport.
 
-PER-PAIR SCALE
+REMOTE NOTIFICATION
+===================
+The four lifecycle functions — addPair, clonePair, deletePair,
+movePair — change which pair `selectedPair` names, and therefore
+change every value that the `pair.*` API getters return.  Each of
+them ends with `pgkitNotifyAll()`.  The single-pair operations that
+do not touch the selection (addSegmentToPair, deleteSegment) do not
+need a notify, because no registered field depends on the segments
+array's contents.
+
+RENDER HELPERS
 ==============
-Each pair carries a `scale` field.  It scales the ENTIRE pair about
-its anchor point (cx, cy): both lines, the gap, the offset, and the
-two metrics — and therefore every trapezoid — grow or shrink by
-that factor, as if the canvas zoom applied to that one pair alone.
-The anchor point itself does not move; the pair's position on
-screen is unchanged.  Abstract segment intervals [a, b] never change
-with scale: a segment that spans one abstract unit spans one
-abstract unit, whether the pair is scaled to 0.5, 1, or 3.
+Three per-frame optimizations live near the end of this file.  None
+of them changes the projection or the overlap test; they only cut
+the amount of work the renderers do.
 
-The field is a visual transform only.  It does not affect the
-segment view (which is an editor over abstract coordinates), the
-wrap period, the KRA export's trapezoid layout on the .kra page
-(which reproduces the screen footprint at the moment of export), or
-the overlap-resolution search: the latter compares screen-space
-polygons, so a scaled pair simply presents a different footprint to
-the test, and the abstract-unit shift it applies to the lower pair
-is still found by the same coarse-then-binary search.
+    _overlapMemo / _cachedSegmentOverlaps
+        A per-frame memo.  `draw()` (in pg_dispatch.py) resets
+        `_overlapMemo` to a fresh Map at the top of every frame, and
+        the two view renderers consult `_cachedSegmentOverlaps`
+        instead of `_segmentOverlapsOtherPair` directly.  Because
+        both renderers ask about the same (pairIdx, segIdx) pairs,
+        the memo halves the total SAT cost per frame — every
+        distinct pair is tested once instead of twice — with zero
+        risk of staleness since the memo never outlives a frame.
 
-A missing or invalid scale reads as 1.  This is what every pair
-starts with, and what every scene written before the field existed
-loads as; see pg_scene.py.
-
-THE SEGMENT AXIS IS PERIODIC
-============================
-Each pair has its own abstract period:
-
-    period(p) = SEG_X_SPAN + max(0, p.loopbackGap || 0)
-
-A segment [a, b] and every [a + k·period(p), b + k·period(p)] for
-integer k describe the same physical segment; only the choice of
-"which lap" differs.  Both the segment view and the canvas view
-draw every copy that intersects their own visible region, so a
-segment dragged past the right edge of the segment view reappears
-on the left, and the corresponding trapezoid on the pair of lines
-likewise reappears at the opposite end.
-
-`forEachSegmentCopy(period, aBase, bBase, fn)` iterates every k in
-[−SEGMENT_WRAP_K, +SEGMENT_WRAP_K] and calls fn with the shifted
-a and b.  The period is passed in (not read from a global) so that
-each pair's own loopback gap is honoured.  SEGMENT_WRAP_K is
-generous enough for every realistic metric / view-scale combination
-in this playground.
-
-`segmentCornersWorldAt(p, a, b)` returns the four world corners of
-a trapezoid whose abstract endpoints are explicitly (a, b); the
-`segmentCornersWorld(p, seg)` form is a convenience for the k = 0
-copy.  Drags and copies alike call the explicit form so the wrapped
-geometry is always computed from the same three lines of math.
-
-LOOPBACK GAP
-============
-The `loopbackGap` field extends the pair's period from SEG_X_SPAN
-to SEG_X_SPAN + loopbackGap.  At 0 the historic behaviour applies:
-copies are spaced one visible-span apart, so a segment dragged past
-one end of the visible window immediately has a wrapped copy at the
-other end.  As the value rises, the copies spread further apart, and
-a segment dragged past the right edge of the segment view has to
-travel the extra distance before its k = −1 copy emerges from the
-left edge.  There is a stretch of that length where neither the
-segment nor its copy is on screen — the "imaginary" gap the field
-names.
-
-The value is per-pair and expressed in abstract units.  It affects:
-
-    * the segment view (drawing and hit testing of every copy);
-    * the canvas (drawing and hit testing of every trapezoid copy);
-    * the overlap detection and resolution, since those compare the
-      screen-space positions of the wrapped copies;
-    * the panel's saved scene, which round-trips the value.
-
-It does NOT affect the KRA export, which writes the k = 0 copy of
-each segment as it always did, nor the pair's geometry (its lines,
-its metrics, its offset, its gap).
-
-SEGMENT LIFECYCLE AND THE PANEL LISTS
-=====================================
-`addSegmentToPair` and `deleteSegment` are the only two operations
-that change the segments array's length.  Both end with a call to
-`syncPairList()`, which rebuilds the pair list, the segment list,
-and the scrub fields in one go.
-
-PAIR ORDER
-==========
-The order of the `pairs` array is the pair hierarchy.  Every view
-that renders the pairs iterates the array in index order, so
-rearranging the array rearranges every view at once.  A pair's hue
-is derived from `p.id`, not from its array position.
-
-OVERLAP BETWEEN SEGMENTS ON DIFFERENT PAIRS
-===========================================
-`_segmentOverlapsOtherPair(pairIdx, segIdx)` is a screen-space
-polygon-polygon test over the visible wrapped copies.  See the
-implementation comments for the SAT math and the cost-bounding
-tricks.  Two segments on the same pair are never compared.
-
-OVERLAP RESOLUTION — "MAKE ROOM"
-================================
-`_makeRoomInferior(pairIdx, segIdx)` backs the panel's "make room"
-button.  See the implementation comments for the algorithm.
+    _kRangeForSegmentInBand
+    _kRangeForSegmentInSegmentView
+        Compute a k-range for wrapped-copy iteration.  The default
+        `forEachSegmentCopy` iterates k ∈ [-20, 20]; for typical
+        metrics and zoom levels only 2–8 of those can be on-screen.
+        These helpers invert the abstract-to-screen mapping enough
+        to say "here is the closed interval of k whose wrapped copy
+        could intersect the visible region", with one period of
+        slack on each side to cover the A/B corner split and the
+        segment's own width.  The range is clamped to
+        SEGMENT_WRAP_K so the outer bound never grows.
 """
 
 CORE_JS = r"""
@@ -174,9 +110,7 @@ function s2w(sx, sy) { return [(sx - view.tx) / view.scale,
 
 /* ==========================================================================
    SEGMENT AXIS — PERIOD AND WRAP HELPERS
-   ==========================================================================
-   See the module docstring, THE SEGMENT AXIS IS PERIODIC, and
-   LOOPBACK GAP. */
+   ========================================================================== */
 
 const SEG_X_MIN  = -6;
 const SEG_X_MAX  =  6;
@@ -184,10 +118,6 @@ const SEG_X_SPAN = SEG_X_MAX - SEG_X_MIN;
 
 const SEGMENT_WRAP_K = 20;
 
-/* Per-pair period of the segment axis.  See the module docstring,
-   LOOPBACK GAP.  Falls back to the raw span when the pair or its
-   gap is missing, so callers that pass null get the historic
-   behaviour. */
 function _pairPeriod(p) {
   if (!p) return SEG_X_SPAN;
   const g = (typeof p.loopbackGap === "number" && p.loopbackGap > 0)
@@ -195,21 +125,23 @@ function _pairPeriod(p) {
   return SEG_X_SPAN + g;
 }
 
-/* Per-pair whole-pair zoom factor.  See the module docstring,
-   PER-PAIR SCALE.  Missing or invalid values read as 1, so pairs
-   that predate the field — and every fresh pair — behave as if the
-   field were absent. */
 function _pairScale(p) {
   if (!p) return 1;
   const s = p.scale;
   return (typeof s === "number" && isFinite(s) && s > 0) ? s : 1;
 }
 
-/* Iterate every integer k in [−SEGMENT_WRAP_K, +SEGMENT_WRAP_K],
-   calling fn(aBase + k·period, bBase + k·period, k).  The period
-   comes from the caller so each pair uses its own loopback gap. */
 function forEachSegmentCopy(period, aBase, bBase, fn) {
   for (let k = -SEGMENT_WRAP_K; k <= SEGMENT_WRAP_K; k++) {
+    fn(aBase + k * period, bBase + k * period, k);
+  }
+}
+
+/* Same as forEachSegmentCopy but over a caller-provided k-range.
+   Used by the two view renderers after they've computed a range via
+   _kRangeForSegmentInBand / _kRangeForSegmentInSegmentView. */
+function forEachSegmentCopyInRange(period, aBase, bBase, kMin, kMax, fn) {
+  for (let k = kMin; k <= kMax; k++) {
     fn(aBase + k * period, bBase + k * period, k);
   }
 }
@@ -247,10 +179,6 @@ function _wrapRangeForCanvas(p, seg, cw, ch) {
   const cy0 = (bb0.minY + bb0.maxY) / 2;
 
   const period = _pairPeriod(p);
-  /* The world displacement of one k-step is period · metricA · scale;
-     the world-to-screen factor is view.scale.  The pair scale is
-     folded in here so the on-screen step matches what
-     pointOnPairLine produces for the wrapped copies. */
   const s      = _pairScale(p);
   const dxPerK =  period * p.metricA * s * Math.cos(p.angle) * view.scale;
   const dyPerK = -period * p.metricA * s * Math.sin(p.angle) * view.scale;
@@ -321,9 +249,6 @@ function _segmentTrapezoidsOverlap(p1, seg1, p2, seg2) {
 
   const bb2Base = _segAABB(_segPolygonAtK(p2, seg2, 0));
   const period2 = _pairPeriod(p2);
-  /* Same fold-in of the pair scale as in _wrapRangeForCanvas: the
-     screen displacement of one k-step of p2 must account for p2's
-     own scale. */
   const s2  = _pairScale(p2);
   const dx2 =  period2 * p2.metricA * s2 * Math.cos(p2.angle) * view.scale;
   const dy2 = -period2 * p2.metricA * s2 * Math.sin(p2.angle) * view.scale;
@@ -527,12 +452,6 @@ function pairFrame(p) {
   };
 }
 
-/* Every world position on either line goes through this function,
-   so it is the single place where the pair's own `scale` is folded
-   into the geometry.  See the module docstring, PER-PAIR SCALE.
-   The anchor point (cx, cy) is the fixed point of the scale: at
-   abstractT = 0 on line A, every factor of scale multiplies zero,
-   so A(0) stays exactly at (cx, cy) for every scale. */
 function pointOnPairLine(p, which, abstractT) {
   const f = pairFrame(p);
   const s = _pairScale(p);
@@ -568,6 +487,101 @@ function lineEndpointsWorld(p, which) {
     [ax - LINE_REACH * f.ux, ay - LINE_REACH * f.uy],
     [ax + LINE_REACH * f.ux, ay + LINE_REACH * f.uy],
   ];
+}
+
+/* ==========================================================================
+   RENDER HELPERS
+   ========================================================================== */
+
+/* Per-frame overlap memo.  Reset by draw() at the top of every
+   frame; queried by both view renderers via _cachedSegmentOverlaps.
+   See the module docstring, RENDER HELPERS. */
+let _overlapMemo = null;
+
+function _cachedSegmentOverlaps(pairIdx, segIdx) {
+  if (!_overlapMemo) _overlapMemo = new Map();
+  const key = pairIdx + ":" + segIdx;
+  if (_overlapMemo.has(key)) return _overlapMemo.get(key);
+  const r = _segmentOverlapsOtherPair(pairIdx, segIdx);
+  _overlapMemo.set(key, r);
+  return r;
+}
+
+/* Return the k-range whose wrapped copy could intersect the visible
+   region of the CANVAS band [0, cw] × [0, bandTop].
+
+   The abstract-to-screen map for line A is linear in abstract t:
+       screenX(t) = x0 + t·slopeX
+       screenY(t) = y0 + t·slopeY
+   Solving each inequality for t gives the [tMin, tMax] interval of
+   abstract coordinates whose projection is on-screen.  A one-period
+   margin on each side covers the perpendicular offset of line B
+   (whose visible t-range differs from A's by less than a period at
+   typical metrics) and the segment's own width.
+
+   The range is clamped to [-SEGMENT_WRAP_K, +SEGMENT_WRAP_K] so the
+   outer bound can never grow beyond the original iteration limit. */
+function _kRangeForSegmentInBand(p, seg, cw, bandTop) {
+  const f = pairFrame(p);
+  const period = _pairPeriod(p);
+  const m = p.metricA * _pairScale(p);
+  const sc = view.scale;
+
+  const x0 = p.cx * sc + view.tx;
+  const y0 = -p.cy * sc + view.ty;
+  const slopeX =  m * f.ux * sc;
+  const slopeY = -m * f.uy * sc;
+
+  let txMin = -Infinity, txMax = Infinity;
+  if (Math.abs(slopeX) > 1e-9) {
+    const tA = (0  - x0) / slopeX;
+    const tB = (cw - x0) / slopeX;
+    txMin = Math.min(tA, tB);
+    txMax = Math.max(tA, tB);
+  } else if (x0 < 0 || x0 > cw) {
+    return { min: 0, max: -1 };
+  }
+
+  let tyMin = -Infinity, tyMax = Infinity;
+  if (Math.abs(slopeY) > 1e-9) {
+    const tA = (0       - y0) / slopeY;
+    const tB = (bandTop - y0) / slopeY;
+    tyMin = Math.min(tA, tB);
+    tyMax = Math.max(tA, tB);
+  } else if (y0 < 0 || y0 > bandTop) {
+    return { min: 0, max: -1 };
+  }
+
+  const tMin = Math.max(txMin, tyMin) - period;
+  const tMax = Math.min(txMax, tyMax) + period;
+  if (tMin > tMax) return { min: 0, max: -1 };
+
+  const kMin = Math.ceil((tMin - seg.b) / period);
+  const kMax = Math.floor((tMax - seg.a) / period);
+
+  return {
+    min: Math.max(-SEGMENT_WRAP_K, kMin),
+    max: Math.min( SEGMENT_WRAP_K, kMax),
+  };
+}
+
+/* Return the k-range whose wrapped copy could intersect the visible
+   region of one row in the SEGMENT VIEW.  The row's abstract range
+   is [-period/2, +period/2] by construction (each row scales to one
+   period of its own pair); one period of margin on each side covers
+   any segment that straddles a boundary. */
+function _kRangeForSegmentInSegmentView(p, seg) {
+  const period = _pairPeriod(p);
+  const tMin = -period / 2 - period;
+  const tMax =  period / 2 + period;
+
+  const kMin = Math.ceil((tMin - seg.b) / period);
+  const kMax = Math.floor((tMax - seg.a) / period);
+
+  return {
+    min: Math.max(-SEGMENT_WRAP_K, kMin),
+    max: Math.min( SEGMENT_WRAP_K, kMax),
+  };
 }
 
 /* ==========================================================================
@@ -621,6 +635,7 @@ function addPair() {
   selectedSegment = null;
   syncPairList();
   draw();
+  pgkitNotifyAll();
 }
 
 function clonePair(idx) {
@@ -655,6 +670,7 @@ function clonePair(idx) {
   selectedSegment = null;
   syncPairList();
   draw();
+  pgkitNotifyAll();
 }
 
 function deletePair(idx) {
@@ -664,6 +680,7 @@ function deletePair(idx) {
   selectedSegment = null;
   syncPairList();
   draw();
+  pgkitNotifyAll();
 }
 
 function movePair(idx, delta) {
@@ -683,11 +700,11 @@ function movePair(idx, delta) {
     else if (selectedSegment.pairIdx === j) selectedSegment.pairIdx = idx;
   }
 
-  /* Reordering can invalidate a shift-drag set's membership. */
   if (typeof _clearShiftDragSet === "function") _clearShiftDragSet();
 
   syncPairList();
   draw();
+  pgkitNotifyAll();
 }
 
 function addSegmentToPair(pairIdx, a, b) {
@@ -723,8 +740,6 @@ function deleteSegment(pairIdx, segIdx) {
     }
   }
 
-  /* The segment that was in the shift-drag set is gone (or the
-     indices in the set are stale); drop the set. */
   if (typeof _clearShiftDragSet === "function") _clearShiftDragSet();
 
   syncPairList();

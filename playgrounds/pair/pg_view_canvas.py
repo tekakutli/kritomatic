@@ -8,50 +8,25 @@ marker that can be dragged.
 
 THE TRAPEZOIDS WRAP
 ===================
-A segment lives on the pair's periodic abstract axis.  On the canvas
-its trapezoid is drawn once per lap of the axis whose screen
-bounding box intersects the top band: the k = 0 copy at the segment's
-own abstract position, and every wrapped copy at a + k·span, b +
-k·span.  A segment dragged off one end of the visible portion of the
-pair therefore reappears at the other end, in lock-step with the
-segment view.
+A segment lives on the pair's periodic abstract axis.  Its wrapped
+copies are drawn once per k whose copy could intersect the top band.
+The k-range is computed by `_kRangeForSegmentInBand` (in pg_core.py)
+rather than iterating the full [-20, +20]; for typical metrics and
+zoom levels only 2–8 of those copies are on screen.
 
-The trapezoid is a quadrilateral in world coords; the drawing code
-projects its four corners with w2s and fills.  Empty segments are
-drawn as a dashed outline only, so the user can see where they are
-without them reading as solid geometry.
+PER-FRAME OVERLAP MEMO
+======================
+`_cachedSegmentOverlaps` (in pg_core.py) memoizes the SAT overlap
+test within one frame.  Both this file and pg_view_segments.py query
+the same (pairIdx, segIdx) pairs, so the memo halves the total cost
+without any risk of staleness — the memo is reset at the top of
+every draw() in pg_dispatch.py.
 
-PER-PAIR SCALE
-==============
-Each pair carries a `scale` field (see pg_core.py, PER-PAIR SCALE).
-Because every world position on a pair's lines goes through
-`pointOnPairLine`, this file inherits the scale for free: the two
-lines, the trapezoids, and the anchor marker's neighbours all
-reflect it without an explicit multiply here.  The one place that
-must be told explicitly is the pair's name label, which is placed at
-the visual midpoint of the pair's "patch": it computes that midpoint
-via `pointOnPairLine` so it follows the scale.
-
-OVERLAP MODE
-============
-When the "Overlap" checkbox is on, every trapezoid whose segment
-shares abstract interval space with a segment on a different pair
-is drawn a second time as a red dashed outline over its usual
-stroke.  See pg_core.py, OVERLAP BETWEEN SEGMENTS ON DIFFERENT
-PAIRS.  The overlay is drawn per wrapped copy, so a wrapping
-segment that overlaps on one lap but not another shows the red
-outline only on the laps where the overlap actually happens.
-
-SEGMENT DRAG IN THE CANVAS BAND
-===============================
-A segment's trapezoid (any of its wrapped copies) is clickable-and-
-draggable, and dragging it moves the whole pair — both lines and
-every segment — by the same world translation.  This is the same
-pair drag the anchor marker and the two lines start; see
-pg_dispatch.py, PAIR DRAG.  The segment's trapezoid being a
-first-class target means the user does not have to find a thin line
-to grab the pair; clicking the filled (or dashed) shape on the
-canvas is enough.
+GRID BATCHING
+=============
+The background grid is drawn as a single path of small 1×1 rects
+filled once, rather than as thousands of per-rect fillRect calls.
+The result is pixel-identical and much faster.
 """
 
 CANVAS_VIEW_JS = r"""
@@ -59,12 +34,11 @@ function drawCanvasView() {
   const cw = window.innerWidth;
   const ch = layout.topH;
 
-  /* background */
-  ctx.fillStyle = "#0a0e14";
-  ctx.fillRect(0, 0, cw, ch);
+  /* Background is cleared by the caller (pg_dispatch.py's draw()).
+     No second clear here. */
 
-  /* world grid — a light dot pattern every ~5 world units, so the
-     canvas has a sense of scale without competing with the pairs. */
+  /* World grid — one path of 1×1 rects, filled once.  See the
+     module docstring, GRID BATCHING. */
   {
     const step = 5;
     const [sx0, sy0] = w2s(0, 0);
@@ -73,11 +47,13 @@ function drawCanvasView() {
       const offX = ((sx0 % spx) + spx) % spx;
       const offY = ((sy0 % spx) + spx) % spx;
       ctx.fillStyle = "rgba(30, 40, 54, 0.5)";
+      ctx.beginPath();
       for (let x = offX; x < cw; x += spx) {
         for (let y = offY; y < ch; y += spx) {
-          ctx.fillRect(x, y, 1, 1);
+          ctx.rect(x, y, 1, 1);
         }
       }
+      ctx.fill();
     }
   }
 
@@ -113,7 +89,7 @@ function drawCanvasView() {
   }
 }
 
-/* `pairIdx` is passed so the overlap test can identify the pair
+/* `pairIdx` is passed so the overlap memo can identify the pair
    without an O(n) lookup per segment; the caller already iterates
    the pairs array with the index in hand. */
 function drawPair(p, pairIdx, selected) {
@@ -123,7 +99,7 @@ function drawPair(p, pairIdx, selected) {
   drawPairLine(p, "A", hue, selected);
   drawPairLine(p, "B", hue, selected);
 
-  /* trapezoids for the segments, one per wrapped copy */
+  /* trapezoids for the segments, one per on-screen wrapped copy */
   for (let j = 0; j < p.segments.length; j++) {
     const seg = p.segments[j];
     const isSelSeg = selectedSegment &&
@@ -165,28 +141,14 @@ function drawPairLine(p, which, hue, selected) {
 /* ==========================================================================
    TRAPEZOID DRAWING — WITH WRAPPING
    ==========================================================================
-   For each integer k in [-SEGMENT_WRAP_K, +SEGMENT_WRAP_K], compute
-   the trapezoid whose abstract endpoints are seg.a + k·SEG_X_SPAN and
-   seg.b + k·SEG_X_SPAN.  Skip it when its screen bounding box does
-   not intersect the top band.  Draw the rest.  A segment dragged off
-   the visible end of the pair reappears at the other end because some
-   of its wrapped copies land back inside the viewport.
-
-   The overlap overlay, when the mode is on and the segment overlaps
-   a segment on another pair, is drawn per wrapped copy as well: the
-   red outline appears only on the laps whose abstract range actually
-   contains the overlap.  This is why the overlay is inside the
-   per-copy loop rather than after it. */
+   The k-range is computed once per (pair, segment) via
+   _kRangeForSegmentInBand; the loop only iterates the copies that
+   could be on-screen.  The overlap overlay, when the mode is on and
+   the segment overlaps a segment on another pair, is drawn per
+   wrapped copy so only the laps that contain the actual overlap are
+   marked. */
 
 const TRAPEZOID_MARGIN_PX = 24;
-
-function _trapezoidScreenCornersForK(p, seg, k) {
-  const period = _pairPeriod(p);
-  const a = seg.a + k * period;
-  const b = seg.b + k * period;
-  const corners = segmentCornersWorldAt(p, a, b);
-  return corners.map(([wx, wy]) => w2s(wx, wy));
-}
 
 function _screenBBox(screen) {
   let minX =  Infinity, maxX = -Infinity;
@@ -215,9 +177,13 @@ function drawSegmentTrapezoid(p, pairIdx, seg, segIdx, hue,
   const filled = seg.filled !== false;
 
   const overlapOn = state.overlapHighlight &&
-                    _segmentOverlapsOtherPair(pairIdx, segIdx);
+                    _cachedSegmentOverlaps(pairIdx, segIdx);
 
-  forEachSegmentCopy(_pairPeriod(p), seg.a, seg.b, (a, b, k) => {
+  const kRange = _kRangeForSegmentInBand(p, seg, cw, ch);
+  if (kRange.min > kRange.max) return;
+
+  forEachSegmentCopyInRange(_pairPeriod(p), seg.a, seg.b,
+                            kRange.min, kRange.max, (a, b, k) => {
     const w = segmentCornersWorldAt(p, a, b);
     const screen = w.map(([wx, wy]) => w2s(wx, wy));
     const bb = _screenBBox(screen);
@@ -248,9 +214,6 @@ function drawSegmentTrapezoid(p, pairIdx, seg, segIdx, hue,
       ctx.setLineDash([]);
     }
 
-    /* Overlap overlay: red dashed outline drawn over the segment's
-       own stroke.  Drawn per copy, so only the laps that contain
-       the actual overlap are marked. */
     if (overlapOn) {
       ctx.save();
       ctx.setLineDash([6, 4]);
@@ -266,7 +229,6 @@ function drawSegmentTrapezoid(p, pairIdx, seg, segIdx, hue,
       ctx.restore();
     }
 
-    /* corner tick marks when the segment is selected */
     if (segSelected) {
       for (const [sx, sy] of screen) {
         ctx.beginPath();
@@ -286,12 +248,6 @@ function drawSegmentTrapezoid(p, pairIdx, seg, segIdx, hue,
 function drawPairLabel(p, selected) {
   const hue = pairHue(p);
 
-  /* place the label at the midpoint of the patch between the two
-     anchor points.  Both anchors come from pointOnPairLine, so a
-     nonzero pair scale moves the midpoint along with the geometry
-     — a shrunk pair's label sits closer to the shared anchor than
-     an unscaled pair's, and an expanded pair's label is pushed
-     further out. */
   const A0 = pointOnPairLine(p, "A", 0);
   const B0 = pointOnPairLine(p, "B", 0);
   const mx = (A0[0] + B0[0]) / 2;

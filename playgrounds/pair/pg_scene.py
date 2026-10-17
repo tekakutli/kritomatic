@@ -7,34 +7,25 @@ geometry and its 1D layout exactly.  The pair's id counters are
 saved so newly-added pairs after a load do not collide with the
 existing ones.
 
+REMOTE NOTIFICATION
+===================
+`applySceneJSON` replaces the entire model.  Every value that any
+registered field reads changes as a result.  It ends with
+`pgkitNotifyAll()`, so remote clients receive a single patch with
+the new state on the next animation frame.  `buildSceneJSON` and
+`saveSceneJSON` are read-only from the model's perspective and do
+not notify.
+
 SCENE CONTENTS
 ==============
-The scene file records:
+    view         — scale, pan, zoom
+    segScroll    — segment view's vertical scroll offset
+    nextPairId, nextSegId
+    pairs        — every pair with its geometry and its segments
+    kraOptions   — .kra export meta-options
 
-    · view         — scale, pan, zoom
-    · segScroll    — the segment view's vertical scroll offset
-    · nextPairId, nextSegId
-    · pairs        — every pair with its geometry, its loopback
-                     gap, its whole-pair scale, and its segments
-    · kraOptions   — the .kra export meta-options
-
-LOOPBACK GAP
-============
-Each pair's `loopbackGap` is written alongside its other numeric
-fields, and restored on load with a `[0, 1000]` clamp.  Files
-written before the field existed simply omit it; the loader
-defaults a missing value to 0, so old scenes load with the
-historic immediate-loopback behaviour.  See pg_core.py,
-LOOPBACK GAP, for the field's meaning.
-
-PER-PAIR SCALE
-==============
-Each pair's `scale` is written alongside its other numeric fields,
-and restored on load with a `[0.05, 100]` clamp.  Files written
-before the field existed simply omit it; the loader defaults a
-missing value to 1, so old scenes load with the pair at its
-historic size.  See pg_core.py, PER-PAIR SCALE, for the field's
-meaning.
+LOOPBACK GAP, PER-PAIR SCALE, etc. all round-trip through this file
+with the same defaulting and clamping rules as before.
 """
 
 SCENE_JS = r"""
@@ -197,6 +188,7 @@ function applySceneJSON(data) {
   fitView();
   syncPairList();
   draw();
+  pgkitNotifyAll();
 }
 
 function loadSceneFromText(text) {

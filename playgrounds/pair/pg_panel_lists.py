@@ -7,67 +7,18 @@ segments.  Each row shows a hue swatch, an editable name field, and
 a delete button; the pair rows additionally carry two small up/down
 arrows for reordering; clicking the row selects.
 
-SHIFT-DRAG SET MARKER
-=====================
-A segment that is a member of the current shift-drag set (see
-pg_dispatch.py, SHIFT-DRAG SET) gets the CSS class `shiftMember` on
-its row.  The class paints a soft cyan inset outline, distinct from
-the bright-cyan `.selected` row (which shows the last-clicked
-segment) and from the red `.overlapRow` mark.  A row can carry any
-combination of the three.
+REMOTE NOTIFICATION
+===================
+Selecting a different pair from the list changes every value that
+`pair.*` getters return, because those getters read
+`pairs[selectedPair]` and `selectedPair` just changed.  The pair
+row's click handler therefore ends with `pgkitNotifyAll()`, which
+queues every registered field's current value for the next patch.
 
-"MAKE ROOM" BUTTON
-==================
-When the global Overlap mode is on, a segment row that overlaps a
-segment on the pair immediately below it also gets a small amber
-`⇣` button.  Clicking it runs `_makeRoomInferior(selectedPair, j)`,
-which shifts the offending segment on the lower pair — plus every
-segment that follows it in the same direction — so the upper
-segment's trapezoid stops overlapping the lower one.  See
-pg_core.py, OVERLAP RESOLUTION — "MAKE ROOM".
-
-The button is only shown when:
-
-    · Overlap mode is on;
-    · the selected pair is not the last pair (there is a pair below);
-    · the row's segment has at least one visible overlap with a
-      segment on that pair below.
-
-The existence check the row build uses is the cheap one
-(`_segmentOverlapsPairBelow`); the shift-solving work happens only
-when the button is actually clicked.
-
-OVERLAP MARKING
-===============
-When Overlap mode is on, a row is given the CSS class `overlapRow`
-if the row's data participates in a cross-pair overlap:
-
-    * in the pair list, a pair is marked if at least one of its
-      segments overlaps a segment on a different pair;
-    * in the segment list, a segment is marked if it overlaps a
-      segment on a different pair.
-
-PAIR REORDERING
-===============
-The up/down arrows on each pair row call `movePair(i, ∓1)`, which
-swaps the pair with its neighbour and repairs `selectedPair` and
-`selectedSegment.pairIdx` so the two selections follow their pairs
-across the swap.
-
-SEGMENT LIST
-============
-Mirrors cone_playground's square list:
-
-    * it shows only the segments of the currently-selected pair;
-    * a solid swatch means the segment is filled, a hollow swatch
-      means it is empty;
-    * the row highlights in cyan when the segment is the currently-
-      selected one;
-    * the delete button calls `deleteSegment(selectedPair, j)`.
-
-Both lists are rebuilt from scratch on every sync.  `syncPairList`
-is called from every place the selection or the model changes;
-it calls `syncSegmentList` first.
+The segment row's click handler does not notify: no currently-
+registered field depends on `selectedSegment`.  If a future field
+does, that handler must add its own `pgkitNotifyLocal(...)` or
+`pgkitNotifyAll()`.
 """
 
 PANEL_LISTS_JS = r"""
@@ -76,8 +27,7 @@ PANEL_LISTS_JS = r"""
    ==========================================================================
    A list of every segment on the currently-selected pair.  Rows are
    built the same way as the pair list's, with a hollow swatch for
-   empty segments and a solid one for filled segments.  See the
-   module docstring. */
+   empty segments and a solid one for filled segments. */
 
 function syncSegmentList() {
   const list = document.getElementById("segmentList");
@@ -306,6 +256,11 @@ function syncPairList() {
       selectedSegment = null;
       syncPairList();
       draw();
+      /* Selecting a different pair changes every value that the
+         pair.* getters return, because those getters read
+         pairs[selectedPair].  Notify-all so remote clients see
+         the new state. */
+      pgkitNotifyAll();
     });
 
     list.appendChild(row);

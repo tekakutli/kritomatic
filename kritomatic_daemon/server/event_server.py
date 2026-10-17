@@ -4,40 +4,21 @@ event_server.py — the daemon's event stream socket.
 A second TCP server alongside the command server. Where the command
 server is request/response (one command in, one reply out, then the
 connection may close), the event server is a one-way push channel:
-the client connects, receives an initial state snapshot, and then
-receives every subsequent state event until it disconnects.
+the client connects, receives an initial snapshot (state + panel),
+and then receives every subsequent event until it disconnects.
 
 Protocol: newline-delimited JSON. Each event is one line:
 
     {"type": "state", "data": {...comfy_status payload...}}
+    {"type": "panel", "data": {...panel description...}}
+    {"type": "run",   "data": {...run progress...}}
 
 The client sends nothing. There is no handshake beyond the initial
-snapshot the server sends on connect.
-
-Wake discipline
----------------
-The per-client loop blocks in `select` on two descriptors: the client
-socket (to detect disconnect) and the subscription's signal socket (to
-detect a new event). It has no timeout. There is no poll interval and
-no timer anywhere on this path.
-
-When the bus publishes, it writes a byte to the subscription's signal
-socket. The loop wakes, drains the pipe, drains the queue, sends each
-event, and returns to select. When the client disconnects, the loop
-wakes on the client socket, peeks, sees EOF, and exits. When the
-server is stopped, `stop()` closes every active subscription's write
-end, which makes each consumer's read end readable and wakes it.
+snapshots the server sends on connect.
 
 Reconnection is the client's responsibility. When Krita restarts, the
-connection drops; the client retries and receives a fresh initial
-snapshot on the new connection.
-
-Multiple clients can connect at once. Each gets its own subscription
-from the event bus and its own initial snapshot.
-
-The port is separate from the command server's (12347 vs 12346) so
-the two can be firewalled or proxied independently, and so a client
-that only wants events never has to speak the command protocol.
+connection drops; the client retries and receives fresh initial
+snapshots on the new connection.
 """
 
 from __future__ import annotations
@@ -54,23 +35,23 @@ from .event_bus import Subscription, get_event_bus
 
 
 class EventServer(threading.Thread):
-    """One-way push channel for daemon state events."""
 
     StateProvider = Callable[[], Optional[dict]]
+    PanelProvider = Callable[[], Optional[dict]]
 
     def __init__(self, port: int = 12347,
-                 state_provider: Optional[StateProvider] = None):
+                 state_provider: Optional[StateProvider] = None,
+                 panel_provider: Optional[PanelProvider] = None):
         super().__init__(daemon=True, name="kritomatic-event-server")
         self.port = port
         self.state_provider = state_provider
+        self.panel_provider = panel_provider
         self.running = True
         self._server_socket: Optional[socket.socket] = None
-        self._active_subs: set[Subscription] = set()
+        self._active_subs: set = set()
         self._active_subs_lock = threading.Lock()
 
-    # ------------------------------------------------------------------
-    #  Lifecycle
-    # ------------------------------------------------------------------
+    # -- lifecycle --
 
     def run(self) -> None:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -92,12 +73,6 @@ class EventServer(threading.Thread):
                 )
                 t.start()
             except socket.timeout:
-                # Only the accept loop polls, and only for the shutdown
-                # flag: Python cannot select on both an accept socket
-                # and a "stop" signal without a self-pipe of its own.
-                # A 1 s accept timeout is the least intrusive way to
-                # notice `stop()` on this thread. Nothing downstream
-                # of accept polls.
                 continue
             except OSError:
                 if self.running:
@@ -113,14 +88,7 @@ class EventServer(threading.Thread):
             pass
 
     def stop(self) -> None:
-        """Signal shutdown.
-
-        Closes every active subscription's write end, which wakes every
-        consumer's select immediately. Also closes the accept socket,
-        which wakes the accept loop.
-        """
         self.running = False
-
         with self._active_subs_lock:
             subs = list(self._active_subs)
         for sub in subs:
@@ -128,16 +96,13 @@ class EventServer(threading.Thread):
                 sub.signal_w.close()
             except OSError:
                 pass
-
         try:
             if self._server_socket is not None:
                 self._server_socket.close()
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    #  Per-client loop
-    # ------------------------------------------------------------------
+    # -- per-client loop --
 
     def _serve_client(self, client: socket.socket) -> None:
         bus = get_event_bus()
@@ -147,14 +112,18 @@ class EventServer(threading.Thread):
             self._active_subs.add(sub)
 
         try:
-            # Initial snapshot, before entering select. A client that
-            # opened the connection and is waiting for the first byte
-            # gets state immediately, without needing a subsequent
-            # publish to be woken by.
-            initial = self._fetch_initial_state()
-            if initial is not None:
+            # Initial snapshots, before entering select.
+            initial_state = self._fetch_initial_state()
+            if initial_state is not None:
                 try:
-                    self._send(client, {"type": "state", "data": initial})
+                    self._send(client, {"type": "state", "data": initial_state})
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+
+            initial_panel = self._fetch_initial_panel()
+            if initial_panel is not None:
+                try:
+                    self._send(client, {"type": "panel", "data": initial_panel})
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     return
 
@@ -170,28 +139,19 @@ class EventServer(threading.Thread):
                     return
 
                 if client in readable:
-                    # Either the client sent something (unexpected —
-                    # the protocol is one-way) or it closed. Peek
-                    # without consuming to tell the two apart; a
-                    # well-behaved client produces EOF here.
                     try:
                         peek = client.recv(1, socket.MSG_PEEK)
                     except (ConnectionResetError, OSError):
                         return
                     if not peek:
                         return
-                    # Client sent a byte. Drain and ignore, so select
-                    # does not spin on the same readability.
                     try:
                         client.recv(65536)
                     except (ConnectionResetError, OSError):
                         return
 
                 if sub.signal_r in readable:
-                    # Drain the wake signal. The queue is the delivery
-                    # channel; the pipe byte was only a hint.
                     sub.drain_signal()
-
                     while True:
                         try:
                             event = sub.queue.get_nowait()
@@ -222,15 +182,22 @@ class EventServer(threading.Thread):
             except Exception:
                 pass
 
-    # ------------------------------------------------------------------
-    #  Helpers
-    # ------------------------------------------------------------------
+    # -- helpers --
 
     def _fetch_initial_state(self) -> Optional[dict]:
         if self.state_provider is None:
             return None
         try:
             return self.state_provider()
+        except Exception:
+            traceback.print_exc()
+            return None
+
+    def _fetch_initial_panel(self) -> Optional[dict]:
+        if self.panel_provider is None:
+            return None
+        try:
+            return self.panel_provider()
         except Exception:
             traceback.print_exc()
             return None

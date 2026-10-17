@@ -15,7 +15,10 @@ The scanned directory is always recorded at the top of the output, and
 its basename is appended to the output filename (e.g. project_dump.md
 becomes project_dump_myproject.md when scanning ".../myproject").
 When recursion is enabled (-r or DEFAULT_RECURSIVE = True), a directory
-tree of the dumped files is also prepended.
+tree of the scanned directory is also prepended. The tree shows every
+directory under the scanned root (even ones excluded from dumping),
+minus anything listed in DEFAULT_TREE_EXCLUDE_DIRS; only files that were
+actually dumped are listed inside it.
 
 With -t/--tree-only the file contents are omitted: only the directory
 tree is written. This flag implies recursion.
@@ -43,10 +46,31 @@ DEFAULT_EXTENSIONS = [".py", ".sh", "yaml", ".md", ".conf", ".json", ".toml", ".
 DEFAULT_AFFIX      = None             # e.g. "_test" (substring matched in filename)
 DEFAULT_RECURSIVE  = False            # descend into subdirectories
 DEFAULT_TREE_ONLY  = False            # only emit the directory tree, no file contents
-# Directory names to skip entirely (exact match on the directory basename,
-# at any depth). Add your own as needed.
-# DEFAULT_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules"]
-DEFAULT_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules", "kritomatic_xremap", "other_scripts", "playgrounds"]
+
+# Directories to skip when dumping files. Two kinds of entries are supported:
+#   - Plain names (no "/"), e.g. "node_modules": matches a directory with that
+#     basename at ANY depth.
+#   - Relative paths, e.g. "thisDirectory/thatDirectory": matched against the
+#     directory's path RELATIVE TO THE SCANNED DIRECTORY, so only that exact
+#     directory (and its subtree) is skipped — siblings of "thatDirectory"
+#     inside "thisDirectory" are still dumped.
+# Directories skipped here still appear in the DIRECTORY TREE, unless they are
+# also listed in DEFAULT_TREE_EXCLUDE_DIRS below.
+DEFAULT_EXCLUDE_DIRS = [
+    ".git", "__pycache__", ".venv", "venv", "node_modules",
+    "kritomatic_xremap", "other_scripts", "playgrounds",
+    "data/comfy_panel",
+    # e.g. "src/vendor" to skip only ./src/vendor
+]
+
+# Directories to hide from the DIRECTORY TREE. Same matching rules as
+# DEFAULT_EXCLUDE_DIRS (plain name = basename at any depth; entry containing
+# a "/" = path relative to the scanned directory). This only affects the tree
+# rendering — it never changes which files are dumped. An empty list means
+# every directory is shown in the tree.
+DEFAULT_TREE_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules",
+                             "data/comfy_panel", "other_scripts/room/leader_optimizer",
+]
 
 # Directory names whitelist: if NON-EMPTY, only descend into subdirectories
 # whose basename is in this list (exact match, case-sensitive). Matching is
@@ -84,11 +108,35 @@ def normalize_ext(ext: str) -> str | None:
     return ext
 
 
+def dir_matches(rel_dir: Path, name: str, patterns: list[str]) -> bool:
+    """Return True if a directory matches one of the exclusion patterns.
+
+    `rel_dir` is the directory's path relative to the scan root, `name` is
+    its basename.
+
+    - Patterns containing a path separator (e.g. "a/b") are matched against
+      `rel_dir`, i.e. they are relative to the scanned directory.
+    - Plain patterns (e.g. "build") match a directory with that basename at
+      any depth.
+    """
+    for raw in patterns:
+        pat = raw.strip()
+        if not pat:
+            continue
+        pat_path = Path(pat)
+        if len(pat_path.parts) > 1:
+            if rel_dir == pat_path:
+                return True
+        elif name == pat_path.name:
+            return True
+    return False
+
+
 def find_files(
     root: Path,
     extensions: list[str],
     affix: str | None,
-    exclude_dirs: set[str],
+    exclude_dirs: list[str],
     include_dirs: set[str],
     include_file_substrings: list[str],
     exclude_file_substrings: list[str],
@@ -96,8 +144,13 @@ def find_files(
 ) -> list[Path]:
     results: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = Path(os.path.relpath(dirpath, root))
+
         # prune excluded directories in-place so os.walk skips them
-        dirnames[:] = [d for d in dirnames if d not in exclude_dirs]
+        dirnames[:] = [
+            d for d in dirnames
+            if not dir_matches(rel_dir / d, d, exclude_dirs)
+        ]
 
         # if a whitelist of directories was provided, only descend into
         # those (checked at every level); empty list = descend into all
@@ -128,24 +181,6 @@ def find_files(
     return results
 
 
-def build_tree(rel_paths: list[Path]) -> dict:
-    """Build a nested dict from relative paths.
-
-    Directories map to sub-dicts; the files of a directory live under the
-    special `_FILES` key as a list of names.
-    """
-    tree: dict = {}
-    for p in rel_paths:
-        parts = p.parts
-        if not parts:
-            continue
-        node = tree
-        for part in parts[:-1]:
-            node = node.setdefault(part, {})
-        node.setdefault(_FILES, []).append(parts[-1])
-    return tree
-
-
 def _render_tree(node: dict, prefix: str) -> list[str]:
     lines: list[str] = []
     dirs = sorted(k for k in node if k != _FILES)
@@ -164,12 +199,53 @@ def _render_tree(node: dict, prefix: str) -> list[str]:
     return lines
 
 
-def render_tree(files: list[Path], root: Path) -> str:
-    """Return a unix-`tree`-style rendering of the given files."""
-    rel_paths = [Path(os.path.relpath(f, root)) for f in files]
-    tree = build_tree(rel_paths)
+def build_tree(
+    root: Path,
+    include_dirs: set[str],
+    tree_exclude_dirs: list[str],
+    dumped_files: list[Path],
+) -> dict:
+    """Build a nested dict describing the directory structure under `root`.
 
-    label = str(root)
+    Every directory found under `root` is included — including directories
+    that were excluded from dumping — except those matching
+    `tree_exclude_dirs`. The files listed inside each directory are only the
+    ones that were actually dumped.
+
+    Directories map to sub-dicts; the files of a directory live under the
+    special `_FILES` key as a list of names.
+    """
+    dumped = {Path(os.path.relpath(f, root)) for f in dumped_files}
+    tree: dict = {}
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = Path(os.path.relpath(dirpath, root))
+        rel_parts = () if rel_dir == Path(".") else rel_dir.parts
+
+        # Hide tree-excluded directories (but do NOT apply the dumping
+        # exclude list here — excluded dirs should still show up).
+        dirnames[:] = [
+            d for d in dirnames
+            if not dir_matches(rel_dir / d, d, tree_exclude_dirs)
+        ]
+
+        # Keep the tree scoped to the include whitelist, if one is set.
+        if include_dirs:
+            dirnames[:] = [d for d in dirnames if d in include_dirs]
+
+        node = tree
+        for part in rel_parts:
+            node = node.setdefault(part, {})
+
+        for name in filenames:
+            if (Path(*rel_parts) / name) in dumped:
+                node.setdefault(_FILES, []).append(name)
+
+    return tree
+
+
+def render_tree(tree: dict, label: str) -> str:
+    """Return a unix-`tree`-style rendering of a tree dict."""
     if label in ("", "."):
         label = "."
 
@@ -207,7 +283,7 @@ def main() -> int:
     parser.add_argument(
         "-r", "--recursive", action="store_true", default=None,
         help=("Recurse into subdirectories. Also prepends a directory tree "
-              "of the dumped files to the output. "
+              "of the scanned directory to the output. "
               f"(hardcoded default: {DEFAULT_RECURSIVE})"),
     )
     parser.add_argument(
@@ -222,7 +298,8 @@ def main() -> int:
     out = Path(DEFAULT_OUT)
 
     extensions = [e for e in (normalize_ext(x) for x in DEFAULT_EXTENSIONS) if e]
-    exclude_dirs = {d for d in DEFAULT_EXCLUDE_DIRS if d}
+    exclude_dirs = [d for d in DEFAULT_EXCLUDE_DIRS if d]
+    tree_exclude_dirs = [d for d in DEFAULT_TREE_EXCLUDE_DIRS if d]
     include_dirs = {d for d in DEFAULT_INCLUDE_DIRS if d}
     include_file_substrings = [s for s in DEFAULT_INCLUDE_FILE_SUBSTRINGS if s]
     exclude_file_substrings = [s for s in DEFAULT_EXCLUDE_FILE_SUBSTRINGS if s]
@@ -281,7 +358,8 @@ def main() -> int:
             fh.write("DIRECTORY TREE\n")
             fh.write(HEADER + "\n")
             fh.write("```\n")
-            fh.write(render_tree(files, root) + "\n")
+            tree = build_tree(root, include_dirs, tree_exclude_dirs, files)
+            fh.write(render_tree(tree, str(root)) + "\n")
             fh.write("```\n\n")
 
         # Skip the file contents entirely in tree-only mode

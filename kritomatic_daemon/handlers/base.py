@@ -13,6 +13,7 @@ from .window import WindowHandler
 from .comfyui import ComfyUIHandler
 from .introspect import IntrospectHandler
 from .daemon import DaemonHandler
+from .panel import PanelHandler
 from ..registry import get_command_registry
 from ..decorators import AutoDispatchHandler
 from ..utils.refresh import begin_defer, end_defer
@@ -31,8 +32,23 @@ class CommandHandler(AutoDispatchHandler):
             'window': WindowHandler(),
             'comfyui': ComfyUIHandler(),
             'introspect': IntrospectHandler(),
-            'daemon': DaemonHandler()
+            'daemon': DaemonHandler(),
+            'panel': PanelHandler(),
         }
+
+        # The panel handler builds its description from the comfyui
+        # state. It learns that state two ways: bus events fire on every
+        # state-mutating comfyui command (keeps it current during a
+        # session), and this puller, which lets `panel_description`
+        # fetch the current state on demand (covers the fresh-Krita case
+        # where no command has fired yet).
+        #
+        # The lambda is deferred, so the comfyui handler only needs to
+        # exist by the time the panel handler calls it, not now.
+        self.handlers['panel'].set_comfy_status_puller(
+            lambda: self.handlers['comfyui'].comfy_status({})
+        )
+
         self._sub_handlers = list(self.handlers.values())
         super().__init__()
 
@@ -86,11 +102,6 @@ class CommandHandler(AutoDispatchHandler):
                     for i, cmd in enumerate(commands):
                         self._enter_batchmode_for_active_doc(seen_docs)
 
-                        # Each command carries a scope tag; the executor
-                        # assigns it. Commands without one (a bare
-                        # single-command payload, or a caller that did
-                        # not tag) get None, which disables scope
-                        # resolution and falls back to name/UUID lookup.
                         set_scope(cmd.get('_scope'))
 
                         cmd_type = cmd.get('type')

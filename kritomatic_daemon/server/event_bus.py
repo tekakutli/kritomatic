@@ -2,31 +2,33 @@
 event_bus.py — a process-wide pub/sub bus for daemon state events.
 
 Any part of the daemon can publish to the bus; any part can subscribe.
-Publishing is fire-and-forget: a slow subscriber cannot block the
-publisher, because publishes go through per-subscriber queues and a
-full queue is drained rather than blocking.
+Two subscription styles:
 
-Subscribers are woken by a signal socket. Each subscription owns a
-`socketpair`; the bus writes one byte to the write end on every publish,
-and the subscriber's consumer loop selects on the read end alongside its
-transport socket. A subscriber that is idle blocks in `select` with no
-timeout; it wakes only when there is an event or when the bus is shut
-down.
+  * Queue-based subscriptions (`subscribe`/`unsubscribe`) are used by
+    the event server, which needs to block in `select` on a signal
+    socket and drain per-subscriber queues at its own pace.
+
+  * Listener callbacks (`add_listener`/`remove_listener`) are used by
+    in-process consumers — the panel handler — that want each event
+    delivered as a function call. Callbacks are invoked synchronously
+    on the publishing thread and must not block.
+
+Publishing is fire-and-forget for the queue subscribers: a slow
+subscriber cannot block the publisher, because publishes go through
+per-subscriber queues and a full queue is drained rather than blocking.
 
 Delivery guarantees:
 
-  * At most one copy per subscriber per publish. If the queue is full,
-    the oldest pending event is dropped to make room for the newest.
-    State events are idempotent, so this is the right trade-off: a
-    slow subscriber misses intermediate states but always sees the
-    newest.
+  * Queue subscribers: at most one copy per subscriber per publish.
+    If the queue is full, the oldest pending event is dropped to make
+    room for the newest. State events are idempotent, so this is the
+    right trade-off.
 
-  * Thread-safe. Publishing from any thread is fine.
+  * Listener callbacks: exactly once per publish, called in registration
+    order. Exceptions from a listener are swallowed so one broken
+    consumer cannot break the publish path for the others.
 
-  * Wake signals are advisory. The queue is the delivery channel; the
-    socket byte is a "there may be something to drain" hint. A skipped
-    write (already-closed socket, non-blocking EAGAIN) is not a lost
-    event — the consumer drains the queue directly.
+Thread-safe. Publishing from any thread is fine.
 """
 
 from __future__ import annotations
@@ -34,22 +36,13 @@ from __future__ import annotations
 import queue
 import socket
 import threading
-from typing import Any
+from typing import Any, Callable
 
 
 class Subscription:
-    """One subscriber's channel: a bounded queue of events, plus a
-    socketpair whose read end becomes readable whenever the queue is
+    """One queue subscriber's channel: a bounded queue of events, plus
+    a socketpair whose read end becomes readable whenever the queue is
     non-empty.
-
-    Ownership:
-
-      * The bus writes to `signal_w` on every publish and closes it on
-        unsubscribe (which wakes any consumer blocked in select).
-
-      * The consumer selects on `signal_r` and drains both `queue` and
-        `signal_r` each time it wakes. It closes both ends when it
-        exits; closing an already-closed end is a no-op.
     """
 
     def __init__(self, queue_size: int):
@@ -61,10 +54,6 @@ class Subscription:
         self.signal_w: socket.socket = w
 
     def drain_signal(self) -> None:
-        """Read and discard everything currently buffered on the read
-        end. Called by the consumer after being woken, so the socket
-        stops being readable and select does not immediately re-fire.
-        """
         while True:
             try:
                 chunk = self.signal_r.recv(65536)
@@ -83,18 +72,21 @@ class Subscription:
                 pass
 
 
+Listener = Callable[[str, Any], None]
+
+
 class EventBus:
     """Pub/sub bus for in-process state events."""
 
-    # Bounded so a dead-but-not-yet-detected subscriber cannot grow
-    # memory without limit. 256 is generous: one state event is a few
-    # KB, so this caps per-subscriber memory in the low megabytes.
     DEFAULT_QUEUE_SIZE = 256
 
     def __init__(self, queue_size: int = DEFAULT_QUEUE_SIZE):
         self._queue_size = queue_size
         self._lock = threading.Lock()
-        self._subscribers: list[Subscription] = []
+        self._subscribers: list = []
+        self._listeners: list = []
+
+    # -- queue subscribers --
 
     def subscribe(self) -> Subscription:
         sub = Subscription(self._queue_size)
@@ -103,13 +95,6 @@ class EventBus:
         return sub
 
     def unsubscribe(self, sub: Subscription) -> None:
-        """Remove `sub` from the list and close its write end.
-
-        Closing the write end makes the read end readable (EOF), which
-        wakes any consumer blocked in select. The consumer's own
-        cleanup closes both ends; closing an already-closed socket is
-        a no-op.
-        """
         with self._lock:
             if sub in self._subscribers:
                 self._subscribers.remove(sub)
@@ -118,16 +103,35 @@ class EventBus:
         except OSError:
             pass
 
+    # -- listener callbacks --
+
+    def add_listener(self, callback: Listener) -> None:
+        with self._lock:
+            if callback not in self._listeners:
+                self._listeners.append(callback)
+
+    def remove_listener(self, callback: Listener) -> None:
+        with self._lock:
+            if callback in self._listeners:
+                self._listeners.remove(callback)
+
+    def clear_listeners(self) -> None:
+        with self._lock:
+            self._listeners = []
+
+    # -- publishing --
+
     def publish(self, event_type: str, data: Any) -> None:
         event = {"type": event_type, "data": data}
+
         with self._lock:
             subs = list(self._subscribers)
+            listeners = list(self._listeners)
+
         for sub in subs:
             try:
                 sub.queue.put_nowait(event)
             except queue.Full:
-                # Drop the oldest and retry once. A subscriber this far
-                # behind does not want any event older than the current.
                 try:
                     sub.queue.get_nowait()
                 except queue.Empty:
@@ -136,18 +140,17 @@ class EventBus:
                     sub.queue.put_nowait(event)
                 except queue.Full:
                     pass
-            # Wake the consumer. A write failure is not a lost event:
-            # the queue put above already happened, and the consumer
-            # drains the queue whenever it wakes — either on a
-            # previously-pending signal byte, or on the current one if
-            # the write succeeded.
             try:
                 sub.signal_w.send(b"\x01")
             except (BlockingIOError, InterruptedError):
                 pass
             except OSError:
-                # The subscription was torn down concurrently. Nothing
-                # to signal.
+                pass
+
+        for cb in listeners:
+            try:
+                cb(event_type, data)
+            except Exception:
                 pass
 
     def subscriber_count(self) -> int:

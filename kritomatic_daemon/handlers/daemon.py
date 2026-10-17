@@ -8,33 +8,52 @@ server thread is left alone, and its signal connection to the box is
 never touched.
 
 What gets reloaded:
-  - every kritomatic_daemon.* submodule EXCEPT the two below
+  - every kritomatic_daemon.* submodule EXCEPT the modules below
   - the command handler tree (rebuilt from disk)
 
 What does NOT get reloaded:
   - kritomatic_daemon/__init__.py
-      Its import side effect is addExtension(), which registers the
-      extension with Krita. Re-running it would double-register.
+      Its import side effect is addExtension() + addDockWidgetFactory(),
+      both of which must run exactly once per Krita session.
+
   - kritomatic_daemon/kritomatic_daemon.py
       The extension class itself.  The live instance's methods are
       bound to this class, and reloading it would silently orphan the
-      running instance.  The _HandlerBox class lives here too, and
-      the box instance created at startup stays alive across reloads.
+      running instance.
+
+  - kritomatic_daemon/panel.*
+      Live QDockWidget instances reference the docker, renderer, and
+      connection classes directly.  Dropping the modules would leave
+      those instances pointing at stale class objects; new widget
+      constructions from the factory would use old code, and any late
+      attribute lookups would be confusing to debug.  The panel's
+      *handler* (kritomatic_daemon.handlers.panel) is not kept — it is
+      where provider logic lives, and where hot-reload matters most.
+
+  - kritomatic_daemon.server.*
+      The server subtree owns long-lived objects: a running QThread
+      (WebSocketServer), a running EventServer thread, and — most
+      importantly — the event_bus module-level `_bus` singleton.
+
+      The event bus is the cooperative channel between publishers
+      (ComfyUIHandler, PanelHandler) and subscribers (EventServer's
+      per-client reader threads).  If the bus module were dropped and
+      re-imported, publishers would write to a new `_bus` while every
+      already-connected EventServer client stayed subscribed to the
+      old one.  Events published by the freshly-built handlers would
+      never reach any connected docker or web panel until that client
+      disconnected and reconnected — which, on an idle healthy socket,
+      they never do.  Silent, permanent staleness is the failure mode.
+
+      Keeping this subtree means the new handlers and the old
+      subscribers meet at the same `_bus`, `clear_listeners()` at the
+      top of the reload correctly empties the listener list that the
+      new handlers will repopulate, and every already-connected client
+      sees the next published event as though nothing happened.
 
 After the reload, the next `kritomatic` CLI invocation will see a
 schema-version mismatch and auto-refresh its cache if the schema
-changed.  If the edits only affect handler logic, no refresh occurs.
-
-A note on the previous implementation
-=====================================
-Earlier versions of this file tried to attach a NEW _HandlerBox to
-the extension, using `ext._handler_box` as the marker for "have we
-done this already".  The extension stored its box on `ext.handler_box`
-(no underscore), so the marker was never seen and every reload created
-another box, which was then also connected to the server's signal.
-The old box stayed connected too, so commands ran twice and edits
-appeared not to take effect.  The fix is to reuse the single box the
-extension owns and swap only its `.handler` attribute.
+changed.
 """
 
 import sys
@@ -64,35 +83,68 @@ class DaemonHandler(AutoDispatchHandler):
         ext._reload_in_progress = True
 
         try:
-            # 1. Drop submodules. Two must be preserved:
+            # 1. Clear event-bus listeners. The old PanelHandler subscribed
+            #    in its __init__; without this, the old instance keeps
+            #    receiving bus events after being dropped.
+            #
+            #    Because we do NOT drop kritomatic_daemon.server.*, this
+            #    call resolves against the same bus the running event
+            #    server is subscribed to and the freshly-built handlers
+            #    will subscribe to. Only the callback listener list is
+            #    cleared; queue subscribers (already-connected clients)
+            #    are untouched.
+            try:
+                from ..server.event_bus import get_event_bus
+                get_event_bus().clear_listeners()
+            except Exception:
+                pass
+
+            # 2. Drop submodules. Four must be preserved:
+            #
             #      kritomatic_daemon
-            #          its __init__ calls addExtension, which must not
-            #          run a second time
+            #          its __init__ calls addExtension + addDockWidgetFactory
+            #
             #      kritomatic_daemon.kritomatic_daemon
-            #          the extension class; the live instance is bound
-            #          to it, and the _HandlerBox class lives here
-            keep = {'kritomatic_daemon', 'kritomatic_daemon.kritomatic_daemon'}
-            to_drop = [
-                name for name in list(sys.modules.keys())
-                if name.startswith('kritomatic_daemon.') and name not in keep
-            ]
+            #          the extension class
+            #
+            #      kritomatic_daemon.panel[.*]
+            #          live QDockWidget instances are bound to these classes
+            #
+            #      kritomatic_daemon.server[.*]
+            #          long-lived QThread / EventServer instances, plus the
+            #          event_bus `_bus` singleton that publishers and
+            #          subscribers must share across the reload
+            keep = {
+                'kritomatic_daemon',
+                'kritomatic_daemon.kritomatic_daemon',
+            }
+            keep_prefixes = (
+                'kritomatic_daemon.panel.',
+                'kritomatic_daemon.server.',
+            )
+            keep_exact = {
+                'kritomatic_daemon.panel',
+                'kritomatic_daemon.server',
+            }
+            to_drop = []
+            for name in list(sys.modules.keys()):
+                if not name.startswith('kritomatic_daemon.'):
+                    continue
+                if name in keep:
+                    continue
+                if name in keep_exact:
+                    continue
+                if any(name.startswith(p) for p in keep_prefixes):
+                    continue
+                to_drop.append(name)
             for name in to_drop:
                 del sys.modules[name]
 
-            # 2. Fresh handler tree. Importing base re-imports every
-            #    handler module transitively, so the new tree reflects
-            #    whatever is on disk right now.  The @command decorators
-            #    re-register themselves against the freshly-imported
-            #    registry as a side effect.
+            # 3. Fresh handler tree.
             from kritomatic_daemon.handlers.base import CommandHandler
             new_handler = CommandHandler()
 
-            # 3. Swap the handler behind the extension's box.  The box
-            #    was created in KritomaticDaemon.__init__ and its
-            #    `dispatch` method is what the server's signal has been
-            #    connected to since startup.  Replacing `.handler`
-            #    inside it means the next command the signal dispatches
-            #    goes through the new tree; nothing else needs to move.
+            # 4. Swap the handler behind the extension's box.
             box = getattr(ext, 'handler_box', None)
             if box is None:
                 ext._reload_in_progress = False
@@ -109,6 +161,19 @@ class DaemonHandler(AutoDispatchHandler):
             return {'success': False, 'message': f'Reload failed: {e}'}
 
         ext._reload_in_progress = False
+
+        # 5. Best-effort republish of the panel description, so any
+        #    already-connected docker or web panel sees a fresh panel
+        #    event immediately instead of waiting for the next state
+        #    mutation to trigger one. Failure here does not invalidate
+        #    the reload — the next user interaction will refresh them
+        #    anyway — so a raised exception is logged but the reload is
+        #    still reported as successful.
+        try:
+            new_handler.execute('panel_rebuild', {})
+        except Exception:
+            traceback.print_exc()
+
         print(f"✅ Kritomatic daemon reloaded ({len(to_drop)} module(s) dropped)")
         return {
             'success': True,

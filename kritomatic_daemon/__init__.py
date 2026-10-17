@@ -10,7 +10,7 @@
 # The guard exists so the module can be imported from a plain Python
 # interpreter — for example, by a small helper script that wants to
 # reach the daemon's event stream — without triggering Krita-only
-# side effects (systemd sync, addExtension).
+# side effects (systemd sync, addExtension, addDockWidgetFactory).
 
 import os
 import subprocess
@@ -51,3 +51,12 @@ if _KRITA_AVAILABLE:
     from .registry import get_command_registry, register_command
 
     Krita.instance().addExtension(KritomaticDaemon(Krita.instance()))
+
+    # Register the panel docker factory. This must run exactly once per
+    # Krita session; this module is on the reload_daemon keep-list, so
+    # it is imported once and never dropped.
+    try:
+        from .panel import register_dock_widget
+        register_dock_widget()
+    except Exception as _e:
+        print(f"[kritomatic-panel] registration failed: {_e}")

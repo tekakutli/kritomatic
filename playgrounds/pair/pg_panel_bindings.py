@@ -1,19 +1,21 @@
 """
 pg_panel_bindings.py — every non-scrub panel control binding, plus
-the pair playground's registered actions.
+the pair playground's registered levels, fields, and actions.
 
-Each button in the panel has two entry points: a local
-addEventListener bound to the button itself, and a
-`pgkitRegisterAction` declaration that makes it invokable by name
-from a remote client.  Both entry points call the same underlying
-function, so behaviour cannot drift.
+LEVELS
+======
+Two: `pairs` (root) and `segments` (nested under the selected pair).
 
-Actions that need user-supplied values before they can run declare
-`requires` in their meta.  A remote client gathers those values
-(where the click gesture is present, so file pickers and prompts
-work) and sends them in the command's payload.  The action's
-`run(payload)` reads them and, when absent, falls back to the
-original local path.
+ACTION SCOPES
+=============
+    global      Save scene, Load scene, Export visual, Generate .kra
+    all         + Pair
+    selection   + Clone, Delete, ↑, ↓  (on pairs)
+                Toggle Fill, Clear Segments (on segments)
+    row         make room (⇣)  on segments that overlap a lower pair
+
+`pgkitHandleSelect(level, name)` translates the remote panel's
+`select` command into a change to `selectedPair` or `selectedSegment`.
 """
 
 PANEL_BINDINGS_JS = r"""
@@ -75,6 +77,43 @@ function _clearSelectedPairSegmentsAction() {
   _clearShiftDragSet();
   syncPairList();
   draw();
+}
+
+/* ==========================================================================
+   SELECT COMMAND
+   ==========================================================================
+   The remote panel's item click sends a `select` command with a
+   level and a name.  We translate it to the pair model's selection
+   and re-sync the lists. */
+
+function pgkitHandleSelect(level, name) {
+  if (typeof name !== "string") return false;
+
+  if (level === "pairs") {
+    const prefix = "pair.";
+    if (!name.startsWith(prefix)) return false;
+    const idx = parseInt(name.slice(prefix.length), 10);
+    if (!(idx >= 0 && idx < pairs.length)) return false;
+    selectedPair    = idx;
+    selectedSegment = null;
+    syncPairList();
+    draw();
+    return true;
+  }
+
+  if (level === "segments") {
+    const prefix = "segment.";
+    if (!name.startsWith(prefix)) return false;
+    const idx = parseInt(name.slice(prefix.length), 10);
+    if (selectedPair < 0) return false;
+    if (!(idx >= 0 && idx < pairs[selectedPair].segments.length)) return false;
+    selectedSegment = { pairIdx: selectedPair, segIdx: idx };
+    syncSegmentList();
+    draw();
+    return true;
+  }
+
+  return false;
 }
 
 /* ==========================================================================
@@ -148,11 +187,14 @@ function _clearSelectedPairSegmentsAction() {
     + "whole pair.\n\n"
     + "SHIFT-DRAG SET — hold Shift and click segment bodies in the\n"
     + "segment view to build a persistent set; shift-drag any member\n"
-    + "to move every member together.  Releasing Shift keeps the set;\n"
-    + "a plain (non-shift) canvas click clears it.\n\n"
-    + "REMOTE API — every value field and every button in this panel\n"
-    + "is published at /remote.  When a remote client connects, the\n"
-    + "panel hides and a 'Controlled remotely' banner appears."
+    + "to move every member together.\n\n"
+    + "OVERLAP MODE — the Overlap checkbox highlights segments whose\n"
+    + "trapezoids overlap a trapezoid on another pair.  While on, a\n"
+    + "make-room button appears on any segment row that overlaps a\n"
+    + "segment on the pair below.\n\n"
+    + "REMOTE API — every value field and every action is published\n"
+    + "at /remote, organised by entity level.  When a remote client\n"
+    + "connects, the panel hides."
     );
   });
 
@@ -183,6 +225,36 @@ function _clearSelectedPairSegmentsAction() {
         return;
       }
     }
+  });
+
+  /* ---- remote levels -------------------------------------------- */
+
+  pgkitRegisterLevel("pairs", {
+    label: "Pairs",
+    items: () => pairs.map((p, i) => ({
+      name: "pair." + i,
+      label: p.name,
+    })),
+    selected: () => selectedPair >= 0 ? "pair." + selectedPair : null,
+  });
+
+  pgkitRegisterLevel("segments", {
+    label: "Segments",
+    parent: () => selectedPair >= 0
+      ? { level: "pairs", name: "pair." + selectedPair }
+      : null,
+    items: () => {
+      if (selectedPair < 0) return [];
+      const p = pairs[selectedPair];
+      return p.segments.map((s, i) => ({
+        name: "segment." + i,
+        label: s.name,
+        extra: { filled: s.filled !== false },
+      }));
+    },
+    selected: () => selectedSegment
+      ? "segment." + selectedSegment.segIdx
+      : null,
   });
 
   /* ---- remote field registrations ------------------------------- */
@@ -233,63 +305,18 @@ function _clearSelectedPairSegmentsAction() {
     meta: { kind: "bool", label: "KRA rectangles" },
   });
 
-  /* ---- remote action registrations ------------------------------
-     Each action is registered exactly once.  The two that need
-     user-supplied values (loadScene, generateKra) declare a
-     `requires` array; a remote client gathers those values on its
-     side and sends them in the payload.  Absent a payload, each
-     falls back to its local prompt. */
-
-  pgkitRegisterAction("action.addPair", {
-    label: "+ Pair",
-    run: _addPairAction,
-    meta: { section: "pair", variant: "primary" },
-  });
-
-  pgkitRegisterAction("action.clonePair", {
-    label: "+ Clone",
-    run: _cloneSelectedPairAction,
-    meta: { section: "pair", variant: "primary" },
-  });
-
-  pgkitRegisterAction("action.deletePair", {
-    label: "Delete",
-    run: _deleteSelectedPairAction,
-    meta: { section: "pair", variant: "danger" },
-  });
-
-  pgkitRegisterAction("action.movePairUp", {
-    label: "\u2191",
-    run: _moveSelectedPairUpAction,
-    meta: { section: "pair", variant: "plain" },
-  });
-
-  pgkitRegisterAction("action.movePairDown", {
-    label: "\u2193",
-    run: _moveSelectedPairDownAction,
-    meta: { section: "pair", variant: "plain" },
-  });
-
-  pgkitRegisterAction("action.toggleFill", {
-    label: "Toggle Fill",
-    run: _toggleFillSelectedAction,
-    meta: { section: "segments", variant: "plain" },
-  });
-
-  pgkitRegisterAction("action.clearSegments", {
-    label: "Clear Segments",
-    run: _clearSelectedPairSegmentsAction,
-    meta: { section: "segments", variant: "danger" },
-  });
+  /* ---- remote global actions ------------------------------------ */
 
   pgkitRegisterAction("action.saveScene", {
     label: "Save scene",
+    scope: "global",
     run: () => saveSceneJSON(),
-    meta: { section: "export", variant: "plain" },
+    meta: { variant: "plain" },
   });
 
   pgkitRegisterAction("action.loadScene", {
     label: "Load scene",
+    scope: "global",
     run: (payload) => {
       if (payload && typeof payload.scene_json === "string") {
         const ok = loadSceneFromText(payload.scene_json);
@@ -301,7 +328,6 @@ function _clearSelectedPairSegmentsAction() {
       }
     },
     meta: {
-      section: "export",
       variant: "plain",
       requires: [
         {
@@ -316,12 +342,14 @@ function _clearSelectedPairSegmentsAction() {
 
   pgkitRegisterAction("action.exportVisual", {
     label: "Export visual state",
+    scope: "global",
     run: () => exportVisualStateJSON(),
-    meta: { section: "export", variant: "plain" },
+    meta: { variant: "plain" },
   });
 
   pgkitRegisterAction("action.generateKra", {
     label: "Generate .kra",
+    scope: "global",
     run: (payload) => {
       const path = payload && typeof payload.output_path === "string"
         ? payload.output_path.trim() : "";
@@ -332,7 +360,6 @@ function _clearSelectedPairSegmentsAction() {
       }
     },
     meta: {
-      section: "export",
       variant: "danger",
       requires: [
         {
@@ -343,6 +370,110 @@ function _clearSelectedPairSegmentsAction() {
         },
       ],
     },
+  });
+
+  /* ---- remote pairs-level actions ------------------------------- */
+
+  pgkitRegisterAction("action.addPair", {
+    label: "+ Pair",
+    scope: "all",
+    level: "pairs",
+    run: _addPairAction,
+    meta: { variant: "primary" },
+  });
+
+  pgkitRegisterAction("action.clonePair", {
+    label: "+ Clone",
+    scope: "selection",
+    level: "pairs",
+    run: _cloneSelectedPairAction,
+    meta: { variant: "primary" },
+  });
+
+  pgkitRegisterAction("action.deletePair", {
+    label: "Delete",
+    scope: "selection",
+    level: "pairs",
+    run: _deleteSelectedPairAction,
+    meta: { variant: "danger" },
+  });
+
+  pgkitRegisterAction("action.movePairUp", {
+    label: "\u2191",
+    scope: "selection",
+    level: "pairs",
+    run: _moveSelectedPairUpAction,
+    meta: { variant: "plain" },
+  });
+
+  pgkitRegisterAction("action.movePairDown", {
+    label: "\u2193",
+    scope: "selection",
+    level: "pairs",
+    run: _moveSelectedPairDownAction,
+    meta: { variant: "plain" },
+  });
+
+  /* ---- remote segments-level actions ---------------------------- */
+
+  pgkitRegisterAction("action.toggleFill", {
+    label: "Toggle Fill",
+    scope: "selection",
+    level: "segments",
+    run: _toggleFillSelectedAction,
+    meta: { variant: "plain" },
+  });
+
+  pgkitRegisterAction("action.clearSegments", {
+    label: "Clear Segments",
+    scope: "selection",
+    level: "segments",
+    run: _clearSelectedPairSegmentsAction,
+    meta: { variant: "danger" },
+  });
+
+  /* ---- remote segments-level ROW actions ------------------------ */
+
+  pgkitRegisterAction("action.makeRoom", {
+    label: "\u21E3",
+    scope: "row",
+    level: "segments",
+    appliesTo: (item) => {
+      if (selectedPair < 0) return false;
+      if (typeof item.name !== "string") return false;
+      const prefix = "segment.";
+      if (!item.name.startsWith(prefix)) return false;
+      const idx = parseInt(item.name.slice(prefix.length), 10);
+      if (!(idx >= 0 && idx < pairs[selectedPair].segments.length)) return false;
+      return _segmentOverlapsPairBelow(selectedPair, idx);
+    },
+    run: (payload) => {
+      let idx = selectedSegment ? selectedSegment.segIdx : -1;
+      if (payload && payload.target && payload.target.level === "segments") {
+        const prefix = "segment.";
+        if (typeof payload.target.name === "string"
+            && payload.target.name.startsWith(prefix)) {
+          idx = parseInt(payload.target.name.slice(prefix.length), 10);
+        }
+      }
+      if (idx < 0) {
+        flashStatus("No segment to make room for", "warn");
+        return;
+      }
+      const moved = _makeRoomInferior(selectedPair, idx);
+      if (moved > 0) {
+        syncPairList();
+        draw();
+        const lowerName = (selectedPair + 1 < pairs.length)
+          ? pairs[selectedPair + 1].name : "the pair below";
+        flashStatus("Made room on " + lowerName
+                    + " (" + moved + " shift"
+                    + (moved === 1 ? "" : "s") + ")", "ok");
+      } else {
+        flashStatus("Could not resolve overlap", "warn");
+      }
+    },
+    meta: { variant: "primary" },
   });
 
 })();

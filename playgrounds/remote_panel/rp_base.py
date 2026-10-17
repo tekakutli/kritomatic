@@ -1,50 +1,13 @@
 """
 rp_base.py — the remote panel's CSS and HTML structure.
 
-No pgkit `page()` helper here.  The remote panel is not a
-playground: it has no canvas, no sidebar, and its whole viewport
-is a control surface.  pgkit's shell assumes a canvas and a
-panel, so the remote panel writes its own page.  The style is
-self-contained and shares nothing with the playgrounds' CSS, by
-design — a distinct tool should look like a distinct tool.
-
-LAYOUT
-======
-A single CSS Grid fills the viewport:
-
-    row 1: top bar        title · connection strip · presence
-    row 2: actions panel  grouped button grids
-    row 3: fields panel   responsive card grid (this row is 1fr)
-    row 4: log panel      collapsible message log
-
-The middle row is `1fr`, so the fields region expands to fill
-whatever the actions, top bar, and log leave unused.
-
-ACTIONS PANEL — AUTO-SHOW
-=========================
-The actions panel is shown by default at page load: the HTML
-does not carry the `collapsed` class.  Before the browser sends
-its schema the panel body is empty, and `rpRebuildActions`
-(in rp_ui.py) hides the panel if no actions were registered.  So
-the visible states are:
-
-    page just loaded          panel visible, empty body
-    connected, actions exist  panel visible, populated
-    connected, no actions     panel collapsed (old playground)
-    user clicked Hide         panel collapsed until they click
-                              Show again
-
-The toggle button starts labelled "Hide" to match the initial
-visible state.
-
-ACTION-PAYLOAD MODAL
-====================
-A small modal (#rpModalBackdrop) is used by actions whose meta
-carries a `requires` array — a list of values the user must
-supply before the action can run.  The modal's fields are built
-by rpShowActionForm (in rp_client.py).  The modal is hidden by
-the `hidden` attribute; rpShowActionForm sets it to false,
-rpCommitActionForm and rpCancelActionForm set it to true.
+This revision adds a state-viewer modal (`#rpStateModal`) opened by
+a "State JSON" button in the top bar.  The modal shows a pretty-
+printed dump of everything the panel currently knows — connection
+state, values, schema, entities — with Copy and Download buttons.
+It's a debug view: what the panel *sees*, not what the playground
+*holds*.  The latter is available from the playground's own
+"Export visual state" action.
 """
 
 RP_CSS = r"""
@@ -86,8 +49,6 @@ RP_CSS = r"""
     grid-template-rows: auto auto 1fr auto;
     height: 100vh;
   }
-
-  /* ---- top bar ------------------------------------------------- */
 
   #topbar {
     display: flex;
@@ -180,6 +141,14 @@ RP_CSS = r"""
     border-color: var(--danger-a);
     background: rgba(255,90,105,0.08);
   }
+  #topbar #rpStateBtn {
+    border-color: rgba(0,229,255,0.35);
+    color: var(--accent-2);
+  }
+  #topbar #rpStateBtn:hover:not(:disabled) {
+    border-color: var(--accent);
+    background: rgba(0,229,255,0.08);
+  }
 
   #topbar .status {
     display: flex;
@@ -202,8 +171,6 @@ RP_CSS = r"""
     color: var(--text-mute);
     letter-spacing: 0.02em;
   }
-
-  /* ---- actions panel ------------------------------------------ */
 
   #actionsPanel {
     background: var(--bg-panel);
@@ -253,6 +220,7 @@ RP_CSS = r"""
     border: 1px solid var(--border);
     border-radius: 3px;
     padding: 8px 10px;
+    min-width: 200px;
   }
   .action-group h4 {
     margin: 0 0 6px;
@@ -260,13 +228,52 @@ RP_CSS = r"""
     font-weight: 700;
     letter-spacing: 0.14em;
     text-transform: uppercase;
-    color: var(--text-mute);
+    color: var(--accent);
   }
   .action-group .btns {
     display: flex;
     flex-wrap: wrap;
     gap: 4px;
   }
+  .action-group .action-items {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-top: 6px;
+    border-top: 1px solid var(--border);
+    padding-top: 6px;
+  }
+  .action-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 4px;
+    border-radius: 2px;
+    font-size: 10px;
+  }
+  .action-item:hover {
+    background: rgba(220, 230, 242, 0.04);
+  }
+  .action-item.selected {
+    background: rgba(0, 229, 255, 0.08);
+    color: var(--accent-2);
+  }
+  .action-item-label {
+    flex: 1 1 auto;
+    cursor: pointer;
+    color: var(--text-dim);
+    font-weight: 700;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .action-item.selected .action-item-label {
+    color: var(--accent-2);
+  }
+  .action-item-label:hover {
+    color: var(--text);
+  }
+
   .action-btn {
     padding: 4px 10px;
     cursor: pointer;
@@ -282,19 +289,28 @@ RP_CSS = r"""
     transition: background 0.08s ease, border-color 0.08s ease,
                 color 0.08s ease;
   }
-  .action-btn:hover {
+  .action-btn:hover:not(:disabled) {
     border-color: var(--border-3);
     color: var(--text);
     background: rgba(220,230,242,0.03);
   }
-  .action-btn:active {
+  .action-btn:active:not(:disabled) {
     background: rgba(220,230,242,0.08);
+  }
+  .action-btn:disabled {
+    color: var(--text-faint);
+    border-color: var(--border);
+    cursor: not-allowed;
+  }
+  .action-btn.small {
+    padding: 1px 6px;
+    font-size: 10px;
   }
   .action-btn.primary {
     border-color: rgba(0,229,255,0.55);
     color: var(--accent-2);
   }
-  .action-btn.primary:hover {
+  .action-btn.primary:hover:not(:disabled) {
     border-color: var(--accent);
     background: rgba(0,229,255,0.08);
     color: #d8f4ff;
@@ -303,13 +319,11 @@ RP_CSS = r"""
     border-color: rgba(255,105,125,0.55);
     color: var(--danger-b);
   }
-  .action-btn.danger:hover {
+  .action-btn.danger:hover:not(:disabled) {
     border-color: var(--danger-a);
     background: rgba(255,90,105,0.08);
     color: #ffd0d8;
   }
-
-  /* ---- fields panel ------------------------------------------ */
 
   #fieldsPanel {
     overflow-y: auto;
@@ -416,8 +430,6 @@ RP_CSS = r"""
     cursor: pointer;
   }
 
-  /* ---- log panel --------------------------------------------- */
-
   #logPanel {
     display: flex;
     flex-direction: column;
@@ -477,23 +489,24 @@ RP_CSS = r"""
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
-  .log-info    { color: var(--text-mute); }
-  .log-state   { color: var(--text-dim); }
-  .log-schema  { color: var(--text-dim); }
-  .log-patch   { color: var(--accent); }
-  .log-cmd     { color: var(--warn); }
-  .log-error   { color: var(--danger); }
+  .log-info      { color: var(--text-mute); }
+  .log-state     { color: var(--text-dim); }
+  .log-schema    { color: var(--text-dim); }
+  .log-entities  { color: var(--text-dim); }
+  .log-patch     { color: var(--accent); }
+  .log-cmd       { color: var(--warn); }
+  .log-error     { color: var(--danger); }
 
-  /* ---- action-payload modal ---------------------------------- */
-
-  #rpModalBackdrop {
+  #rpModalBackdrop,
+  #rpStateModal {
     position: fixed; inset: 0; z-index: 100;
     background: rgba(0, 0, 0, 0.55);
     display: flex;
     align-items: center;
     justify-content: center;
   }
-  #rpModalBackdrop[hidden] { display: none; }
+  #rpModalBackdrop[hidden],
+  #rpStateModal[hidden] { display: none; }
 
   .rp-modal {
     background: var(--bg-panel);
@@ -506,6 +519,10 @@ RP_CSS = r"""
     display: flex;
     flex-direction: column;
     gap: 14px;
+  }
+  #rpStateModal .rp-modal {
+    width: 80vw;
+    max-width: 900px;
   }
   .rp-modal-title {
     font-size: 11px;
@@ -605,13 +622,37 @@ RP_CSS = r"""
     border-color: var(--border);
     cursor: not-allowed;
   }
-  #rpModalSend {
+  #rpModalSend,
+  #rpStateDownload {
     border-color: rgba(0,229,255,0.55);
     color: var(--accent-2);
   }
-  #rpModalSend:hover:not(:disabled) {
+  #rpModalSend:hover:not(:disabled),
+  #rpStateDownload:hover:not(:disabled) {
     border-color: var(--accent);
     background: rgba(0,229,255,0.08);
+  }
+
+  .rp-state-body {
+    margin: 0;
+    padding: 10px 14px;
+    max-height: 60vh;
+    overflow: auto;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 1.4;
+    color: var(--accent);
+    white-space: pre;
+    font-variant-numeric: tabular-nums;
+  }
+  .rp-state-body::-webkit-scrollbar { width: 8px; height: 8px; }
+  .rp-state-body::-webkit-scrollbar-track { background: transparent; }
+  .rp-state-body::-webkit-scrollbar-thumb {
+    background: var(--border-3);
+    border-radius: 4px;
   }
 """
 
@@ -631,6 +672,7 @@ RP_BODY = r"""
     </select>
     <button id="rpConnectBtn">Connect</button>
     <button id="rpDisconnectBtn" disabled>Disconnect</button>
+    <button id="rpStateBtn" title="Show everything the panel knows">State JSON</button>
   </div>
   <div class="status">
     <span id="rpStatus">disconnected</span>
@@ -666,6 +708,18 @@ RP_BODY = r"""
     <div class="rp-modal-buttons">
       <button id="rpModalCancel">Cancel</button>
       <button id="rpModalSend" disabled>Send</button>
+    </div>
+  </div>
+</div>
+
+<div id="rpStateModal" hidden>
+  <div class="rp-modal">
+    <div class="rp-modal-title">State JSON</div>
+    <pre id="rpStateBody" class="rp-state-body">{}</pre>
+    <div class="rp-modal-buttons">
+      <button id="rpStateCopy">Copy</button>
+      <button id="rpStateDownload">Download</button>
+      <button id="rpStateClose">Close</button>
     </div>
   </div>
 </div>

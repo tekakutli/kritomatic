@@ -7,24 +7,28 @@ handshake: it assigns each client an id, remembers its role
 (`browser` or `remote`), and re-broadcasts presence.
 
 Everything else is forwarded verbatim.  The hub does not maintain
-playground state; the browser does.  A `patch` sent by one client
-is relayed to every other client and applied by whoever consumes
-it.  A `command` sent by a remote client is relayed to the
-browser, which applies it and sends a `command_result` back; the
-hub relays that too.
+playground state; the browser does.
 
 FORWARDED MESSAGE TYPES
 =======================
 The hub relays any of:
 
-    patch, command, command_result, state, state_request, schema
+    patch, command, command_result, state, state_request, schema,
+    entities
 
 `schema` carries the field and action metadata the browser
-advertises alongside its state dump; see pgkit/remote_client.py.
-Without `schema` in this list, the browser's schema message is
-silently dropped at the hub, and a remote client that relies on
-it (like remote_panel) sees an empty action list even though the
-browser registered the actions correctly.
+advertises alongside its state dump; `entities` carries the
+per-level item lists, the current selection per level, and the
+per-item `applies` map for row-scope actions.  Both come from the
+browser's `state_request` handler.  A remote client that does not
+understand either receives them and ignores them, exactly as it
+would ignore any other unrecognized `type`.
+
+An earlier revision of this module listed only `state`, `schema`,
+`state_request`, `patch`, `command`, and `command_result`.  Because
+`entities` was not in the list, the browser's entities message was
+silently dropped at the hub, and clients that render per-level
+sections saw no levels at all.
 """
 
 import json
@@ -41,6 +45,7 @@ _FORWARDED_TYPES = (
     "state",
     "state_request",
     "schema",
+    "entities",
 )
 
 

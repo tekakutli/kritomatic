@@ -1,33 +1,16 @@
 """
 pg_panel_lists.py — the two panel lists.
 
-The Pair section carries a scrollable list of every pair; the
-Segments section carries a scrollable list of the selected pair's
-segments.  Each row shows a hue swatch, an editable name field, and
-a delete button; the pair rows additionally carry two small up/down
-arrows for reordering; clicking the row selects.
-
-REMOTE NOTIFICATION
-===================
-Selecting a different pair from the list changes every value that
-`pair.*` getters return, because those getters read
-`pairs[selectedPair]` and `selectedPair` just changed.  The pair
-row's click handler therefore ends with `pgkitNotifyAll()`, which
-queues every registered field's current value for the next patch.
-
-The segment row's click handler does not notify: no currently-
-registered field depends on `selectedSegment`.  If a future field
-does, that handler must add its own `pgkitNotifyLocal(...)` or
-`pgkitNotifyAll()`.
+Rebuilt from scratch on every sync.  Each rebuild also triggers an
+entities refresh (`pgkitNotifyEntities()`), because the list reflects
+which items exist and which is selected — both of which the remote
+panel's entities view depends on.
 """
 
 PANEL_LISTS_JS = r"""
 /* ==========================================================================
    SEGMENT LIST
-   ==========================================================================
-   A list of every segment on the currently-selected pair.  Rows are
-   built the same way as the pair list's, with a hollow swatch for
-   empty segments and a solid one for filled segments. */
+   ========================================================================== */
 
 function syncSegmentList() {
   const list = document.getElementById("segmentList");
@@ -39,6 +22,7 @@ function syncSegmentList() {
     e.className = "empty";
     e.textContent = "select a pair";
     list.appendChild(e);
+    pgkitNotifyEntities();
     return;
   }
 
@@ -48,6 +32,7 @@ function syncSegmentList() {
     e.className = "empty";
     e.textContent = "no segments on " + p.name + " yet";
     list.appendChild(e);
+    pgkitNotifyEntities();
     return;
   }
 
@@ -154,6 +139,8 @@ function syncSegmentList() {
 
     list.appendChild(row);
   }
+
+  pgkitNotifyEntities();
 }
 
 /* ==========================================================================
@@ -172,6 +159,7 @@ function syncPairList() {
     e.className = "empty";
     e.textContent = "no pairs yet";
     list.appendChild(e);
+    pgkitNotifyEntities();
     return;
   }
 
@@ -256,14 +244,12 @@ function syncPairList() {
       selectedSegment = null;
       syncPairList();
       draw();
-      /* Selecting a different pair changes every value that the
-         pair.* getters return, because those getters read
-         pairs[selectedPair].  Notify-all so remote clients see
-         the new state. */
       pgkitNotifyAll();
     });
 
     list.appendChild(row);
   }
+
+  pgkitNotifyEntities();
 }
 """

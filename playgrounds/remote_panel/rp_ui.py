@@ -1,29 +1,15 @@
 """
 rp_ui.py — the remote panel's DOM wiring.
 
-Two jobs:
+Adds:
 
-    · the top bar's Connect / Disconnect / preset dropdown, the
-      two collapse toggles (actions, log), and the modal's
-      Cancel / Send / Enter / Escape / backdrop bindings;
+    rpRenderStateJSON()    dump of everything the panel knows
+    rpOpenStateModal()     opens the modal, fills in the JSON
+    rpCloseStateModal()    closes it
+    rpCopyState()          copy to clipboard
+    rpDownloadState()      download as remote_panel_state.json
 
-    · `rpRebuildPanel`, which re-renders the action groups and the
-      field cards from the current `_rp.values` and `_rp.schema`,
-      and `rpRenderLog`.
-
-`rpRebuildPanel` splits schema entries by `kind`:
-
-    kind === "action"        → an action button, grouped into the
-                               action panel by `meta.section`
-
-    anything else            → a field, rendered as an input /
-                               select / checkbox, grouped into the
-                               fields panel by prefix or
-                               `meta.section`
-
-The actions panel auto-shows on first content arrival unless the
-user has explicitly hidden it; the fields panel preserves each
-card's open/closed state across rebuilds.
+Plus the "State JSON" button binding.
 """
 
 RP_UI_JS = r"""
@@ -44,16 +30,27 @@ function rpRebuildActions() {
   body.innerHTML = "";
   _rp.actions = {};
 
-  const bySection = new Map();
+  const byLevel = new Map();
+  const globalActions = [];
   for (const name in _rp.schema) {
     const meta = _rp.schema[name];
     if (!meta || meta.kind !== "action") continue;
-    const section = meta.section || "actions";
-    if (!bySection.has(section)) bySection.set(section, []);
-    bySection.get(section).push(name);
+    const scope = meta.scope || "global";
+    const level = meta.level || null;
+
+    if (scope === "global" || !level) {
+      globalActions.push(name);
+      continue;
+    }
+    if (!byLevel.has(level)) {
+      byLevel.set(level, { all: [], selection: [], row: [] });
+    }
+    const bucket = byLevel.get(level);
+    if (bucket[scope]) bucket[scope].push(name);
   }
 
-  if (bySection.size === 0) {
+  const anyActions = globalActions.length > 0 || byLevel.size > 0;
+  if (!anyActions) {
     panel.classList.add("collapsed");
     if (btn) btn.textContent = "Show";
     return;
@@ -64,21 +61,96 @@ function rpRebuildActions() {
     if (btn) btn.textContent = "Hide";
   }
 
-  const sections = Array.from(bySection.keys()).sort();
-  for (const section of sections) {
+  /* 1. Global actions. */
+  if (globalActions.length > 0) {
     const group = document.createElement("div");
     group.className = "action-group";
 
     const h4 = document.createElement("h4");
-    h4.textContent = _rpSectionLabel(section);
+    h4.textContent = "Global";
     group.appendChild(h4);
 
     const btns = document.createElement("div");
     btns.className = "btns";
-    for (const name of bySection.get(section).sort()) {
-      btns.appendChild(rpBuildActionButton(name));
+    for (const name of globalActions.sort()) {
+      btns.appendChild(rpBuildActionButton(name, false));
     }
     group.appendChild(btns);
+    body.appendChild(group);
+  }
+
+  /* 2. Level sections. */
+  if (!_rp.entities) return;
+  for (const levelName of _rp.entityOrder) {
+    const level = _rp.entities[levelName];
+    if (!level) continue;
+    const scopeInfo = byLevel.get(levelName)
+      || { all: [], selection: [], row: [] };
+
+    const hasHeaderButtons =
+      scopeInfo.all.length > 0 || scopeInfo.selection.length > 0;
+
+    if (level.items.length === 0 && !hasHeaderButtons) continue;
+
+    const group = document.createElement("div");
+    group.className = "action-group";
+
+    const h4 = document.createElement("h4");
+    h4.textContent = level.label || levelName;
+    group.appendChild(h4);
+
+    if (hasHeaderButtons) {
+      const header = document.createElement("div");
+      header.className = "btns";
+      header.style.marginBottom = "6px";
+
+      const hasSelection =
+        level.selected !== null && level.selected !== undefined;
+
+      for (const name of scopeInfo.all.sort()) {
+        header.appendChild(rpBuildActionButton(name, false));
+      }
+      for (const name of scopeInfo.selection.sort()) {
+        header.appendChild(rpBuildActionButton(name, !hasSelection));
+      }
+      group.appendChild(header);
+    }
+
+    if (level.items.length > 0) {
+      const itemList = document.createElement("div");
+      itemList.className = "action-items";
+
+      for (const item of level.items) {
+        const row = document.createElement("div");
+        row.className = "action-item";
+        if (item.name === level.selected) {
+          row.classList.add("selected");
+        }
+
+        const lbl = document.createElement("span");
+        lbl.className = "action-item-label";
+        lbl.textContent = item.label || item.name;
+        lbl.title = item.name;
+        lbl.addEventListener("click", () => {
+          rpSelectItem(levelName, item.name);
+        });
+        row.appendChild(lbl);
+
+        for (const name of scopeInfo.row.slice().sort()) {
+          const applies = item.applies && item.applies[name];
+          if (!applies) continue;
+          const btn = rpBuildRowActionButton(name, {
+            level: levelName,
+            name:  item.name,
+          });
+          row.appendChild(btn);
+        }
+
+        itemList.appendChild(row);
+      }
+      group.appendChild(itemList);
+    }
+
     body.appendChild(group);
   }
 }
@@ -103,7 +175,6 @@ function rpRebuildFields() {
     return;
   }
 
-  /* Preserve which field cards were open. */
   const openState = {};
   container.querySelectorAll("details.field-card").forEach((d) => {
     const s = d.querySelector("summary");
@@ -119,12 +190,9 @@ function rpRebuildFields() {
     card.className = "field-card";
     card.open = openState[_rpSectionLabel(section)] !== false;
 
-    const summary = document.createElement("summary");
-    summary.textContent = _rpSectionLabel(section);
     const h4 = document.createElement("h4");
     h4.textContent = _rpSectionLabel(section);
     h4.style.cursor = "pointer";
-    summary.remove();
     card.appendChild(h4);
 
     const body = document.createElement("div");
@@ -167,6 +235,81 @@ function _rpTogglePanel(panelId, btnId, shownLabel, hiddenLabel) {
 }
 
 /* ==========================================================================
+   STATE JSON MODAL
+   ==========================================================================
+   Renders the panel's current knowledge as pretty-printed JSON:
+   connection, values, schema, entities, entity order.  Rebuilt on
+   every open so the view is always fresh — no polling, no
+   subscription.  Download and Copy operate on the same text. */
+
+function rpBuildStateJSON() {
+  return {
+    connected:    _rp.connected,
+    target:       _rp.target,
+    clientId:     _rp.clientId,
+    presence:     _rp.presence,
+    entityOrder:  _rp.entityOrder,
+    entities:     _rp.entities,
+    schema:       _rp.schema,
+    values:       _rp.values,
+  };
+}
+
+function rpRenderStateJSON() {
+  const el = document.getElementById("rpStateBody");
+  if (!el) return;
+  try {
+    el.textContent = JSON.stringify(rpBuildStateJSON(), null, 2);
+  } catch (e) {
+    el.textContent = "// state JSON failed: " + e.message;
+  }
+}
+
+function rpOpenStateModal() {
+  const modal = document.getElementById("rpStateModal");
+  if (!modal) return;
+  rpRenderStateJSON();
+  modal.hidden = false;
+}
+
+function rpCloseStateModal() {
+  const modal = document.getElementById("rpStateModal");
+  if (!modal) return;
+  modal.hidden = true;
+}
+
+function rpCopyState() {
+  const el = document.getElementById("rpStateBody");
+  if (!el) return;
+  const text = el.textContent || "";
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(
+      () => rpLog("info", "state JSON copied"),
+      (e) => rpLog("error", "copy failed: " + (e.message || e))
+    );
+  } else {
+    rpLog("error", "clipboard API unavailable");
+  }
+}
+
+function rpDownloadState() {
+  const el = document.getElementById("rpStateBody");
+  if (!el) return;
+  const text = el.textContent || "{}";
+  const blob = new Blob([text], { type: "application/json" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href = url;
+  a.download = "remote_panel_state.json";
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  rpLog("info", "state JSON downloaded");
+}
+
+/* ==========================================================================
    INSTALL
    ========================================================================== */
 
@@ -178,6 +321,7 @@ function _rpTogglePanel(panelId, btnId, shownLabel, hiddenLabel) {
   const actionsBtn = document.getElementById("rpActionsToggle");
   const logBtn     = document.getElementById("rpLogToggle");
   const logClear   = document.getElementById("rpLogClear");
+  const stateBtn   = document.getElementById("rpStateBtn");
 
   let saved = null;
   try { saved = localStorage.getItem("rp.target"); } catch (e) {}
@@ -227,7 +371,25 @@ function _rpTogglePanel(panelId, btnId, shownLabel, hiddenLabel) {
     rpRenderLog();
   });
 
-  /* ---- modal bindings ------------------------------------------ */
+  /* ---- state modal bindings ------------------------------------ */
+
+  if (stateBtn) stateBtn.addEventListener("click", rpOpenStateModal);
+
+  const stateClose = document.getElementById("rpStateClose");
+  const stateCopy  = document.getElementById("rpStateCopy");
+  const stateDl    = document.getElementById("rpStateDownload");
+  const stateModal = document.getElementById("rpStateModal");
+
+  if (stateClose) stateClose.addEventListener("click", rpCloseStateModal);
+  if (stateCopy)  stateCopy.addEventListener("click", rpCopyState);
+  if (stateDl)    stateDl.addEventListener("click", rpDownloadState);
+  if (stateModal) {
+    stateModal.addEventListener("click", (e) => {
+      if (e.target === stateModal) rpCloseStateModal();
+    });
+  }
+
+  /* ---- action form modal bindings ------------------------------ */
 
   const modalCancel = document.getElementById("rpModalCancel");
   const modalSend   = document.getElementById("rpModalSend");
@@ -241,9 +403,15 @@ function _rpTogglePanel(panelId, btnId, shownLabel, hiddenLabel) {
     });
   }
 
-  /* Enter sends, Escape cancels — only while a pending action form
-     is open, so intercepting these globally is safe. */
   window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      if (!_rp._pendingAction &&
+          stateModal && !stateModal.hidden) {
+        e.preventDefault();
+        rpCloseStateModal();
+        return;
+      }
+    }
     if (!_rp._pendingAction) return;
     if (e.key === "Enter") {
       e.preventDefault();

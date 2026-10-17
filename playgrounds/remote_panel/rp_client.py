@@ -1,60 +1,24 @@
 """
 rp_client.py — the remote panel's WebSocket client.
 
-BROWSER-SIDE, connecting TO a playground.  Distinct from pgkit's
-remote_client (which runs inside a playground and connects to that
-playground's own server).  Here, this page is the remote client.
+BROWSER-SIDE, connecting TO a playground.  Receives `state`,
+`schema`, and `entities`.  Sends `patch` and `command`.
 
-STATE
-=====
-    _rp.values       {name: current_value}   from `state` messages
-    _rp.schema       {name: meta}            from `schema` messages
-    _rp.fields       {name: DOM entry}       one per non-action field
-    _rp.actions      {name: DOM entry}       one per action
-    _rp._pendingAction   the in-flight action form, if any
+ENTITIES
+========
+The `entities` message carries every level the playground declares,
+with its items, its selected item, and (for each row-scope action)
+whether the action applies to that item.  The client stores the
+message in `_rp.entities` and `_rp.entityOrder`, then triggers a
+panel rebuild — the layout is derived from the entities, not from
+the schema alone.
 
-The `schema` message carries both fields (kind is `"number"`,
-`"bool"`, or `"enum"`) and actions (kind is `"action"`).  Actions
-may additionally carry a `requires` array describing values the
-user must supply; see ACTION INVOCATION below.
-
-MESSAGES SENT
-=============
-    hello, state_request
-    patch             on every field edit
-    command           on every action-button click
-
-MESSAGES RECEIVED
-=================
-    hello_ack, presence, state, schema, patch, command_result
-
-ECHO BEHAVIOUR
-==============
-The playground suppresses re-broadcast during a remote patch's
-application, so this page does not receive a `patch` echo of its
-own field writes.  Patch messages from the playground's *local*
-user do arrive; they update `_rp.values` and each widget not
-currently focused.
-
-STATE REFRESH
-=============
-After sending a patch, the client schedules a `state_request` 500ms
-later.  That lets the panel discover whether the playground
-accepted the write (some fields reject silently when no object is
-selected).  On a scrub-like edit with many writes, the debounce
-collapses them into one confirmation.
-
-ACTION INVOCATION
-=================
-An action whose meta carries a non-empty `requires` array needs
-user-supplied values before it can run.  The values are gathered
-on this page — where the click gesture is present, so the browser
-will open a file picker or focus a text input without complaint —
-and sent with the command payload.
-
-An action without `requires` is dispatched immediately: this page
-sends `{type:"command", kind: name, payload: {}}` and the
-playground's registered action runs with no arguments.
+SELECT
+======
+Clicking an item in the remote panel sends a `select` command with
+`{level, name}`.  The playground's `pgkitHandleSelect` translates
+that to its own selection.  A subsequent entities refresh shows the
+new selection.
 """
 
 RP_CLIENT_JS = r"""
@@ -72,8 +36,10 @@ const _rp = {
   seq:             0,
   values:          {},
   schema:          {},
-  fields:          {},   /* name -> { row, widget, kind } */
-  actions:         {},   /* name -> { btn, meta } */
+  entities:        null,
+  entityOrder:     [],
+  fields:          {},
+  actions:         {},
   presence:        null,
   reconnectTimer:  null,
   reconnectMs:     1000,
@@ -252,6 +218,10 @@ function rpHandle(msg) {
       rpOnSchema(msg.fields || {});
       break;
 
+    case "entities":
+      rpOnEntities(msg.levels || {}, msg.order || []);
+      break;
+
     case "patch": {
       const vals = msg.values || {};
       for (const k in vals) {
@@ -290,6 +260,13 @@ function rpOnSchema(newSchema) {
   rpLog("schema", newNames.length + " entr"
                   + (newNames.length === 1 ? "y" : "ies"));
   if (changed) rpScheduleRebuild();
+}
+
+function rpOnEntities(levels, order) {
+  _rp.entities    = levels;
+  _rp.entityOrder = order;
+  rpLog("entities", order.length + " level(s)");
+  rpScheduleRebuild();
 }
 
 function _rpNamesEqual(a, b) {
@@ -448,7 +425,7 @@ function _rpInferKind(value) {
    ACTION BUTTONS
    ========================================================================== */
 
-function rpBuildActionButton(name) {
+function rpBuildActionButton(name, disabled) {
   const meta  = _rp.schema[name] || {};
   const label = meta.label || name;
   const btn   = document.createElement("button");
@@ -458,33 +435,50 @@ function rpBuildActionButton(name) {
   else if (meta.variant === "danger") btn.classList.add("danger");
   btn.textContent = label;
   btn.title = name;
-  btn.addEventListener("click", () => rpActionClick(name));
+  if (disabled) btn.disabled = true;
+  btn.addEventListener("click", () => rpActionClick(name, null));
   _rp.actions[name] = { btn, meta };
   return btn;
 }
 
+function rpBuildRowActionButton(name, target) {
+  const meta  = _rp.schema[name] || {};
+  const label = meta.label || name;
+  const btn   = document.createElement("button");
+  btn.type = "button";
+  btn.className = "action-btn small";
+  if (meta.variant === "primary") btn.classList.add("primary");
+  else if (meta.variant === "danger") btn.classList.add("danger");
+  btn.textContent = label;
+  btn.title = name;
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    rpActionClick(name, target);
+  });
+  return btn;
+}
+
 /* ==========================================================================
-   ACTION INVOCATION — with payload gathering
+   ACTION INVOCATION
    ==========================================================================
-   An action whose meta carries a non-empty `requires` array needs
-   user-supplied values before it can run.  The values are gathered
-   on this page (where the click gesture is present) and sent with
-   the command payload.
+   A row action receives `target = {level, name}`.  A header or
+   global action receives null.  If the action declares `requires`,
+   the modal gathers the payload, merging in the target if any. */
 
-   An action without `requires` is dispatched immediately. */
-
-function rpActionClick(name) {
+function rpActionClick(name, target) {
   const meta = _rp.schema[name] || {};
   const requires = Array.isArray(meta.requires) ? meta.requires : [];
+  const initialPayload = target ? { target } : {};
+
   if (requires.length === 0) {
-    const id = rpSendCommand(name, {});
+    const id = rpSendCommand(name, initialPayload);
     rpLog("cmd", "\u25B6 " + (meta.label || name) + "  (" + id + ")");
     return;
   }
-  rpShowActionForm(name, requires);
+  rpShowActionForm(name, requires, initialPayload);
 }
 
-function rpShowActionForm(name, requires) {
+function rpShowActionForm(name, requires, initialPayload) {
   const meta     = _rp.schema[name] || {};
   const backdrop = document.getElementById("rpModalBackdrop");
   const title    = document.getElementById("rpModalTitle");
@@ -562,7 +556,10 @@ function rpShowActionForm(name, requires) {
     body.appendChild(row);
   }
 
-  _rp._pendingAction = { name, requires, values };
+  _rp._pendingAction = {
+    name, requires, values,
+    initialPayload: initialPayload || {},
+  };
   backdrop.hidden = false;
   rpValidateModal();
   const firstInput = body.querySelector("input[type=text]");
@@ -591,12 +588,13 @@ function rpValidateModal() {
 
 function rpCommitActionForm() {
   if (!_rp._pendingAction) return;
-  const { name, values } = _rp._pendingAction;
+  const { name, values, initialPayload } = _rp._pendingAction;
   const meta = _rp.schema[name] || {};
+  const payload = Object.assign({}, initialPayload || {}, values);
   _rp._pendingAction = null;
   const backdrop = document.getElementById("rpModalBackdrop");
   if (backdrop) backdrop.hidden = true;
-  const id = rpSendCommand(name, values);
+  const id = rpSendCommand(name, payload);
   rpLog("cmd", "\u25B6 " + (meta.label || name) + "  (" + id + ")");
 }
 
@@ -604,6 +602,16 @@ function rpCancelActionForm() {
   _rp._pendingAction = null;
   const backdrop = document.getElementById("rpModalBackdrop");
   if (backdrop) backdrop.hidden = true;
+}
+
+/* ==========================================================================
+   SELECT
+   ========================================================================== */
+
+function rpSelectItem(level, name) {
+  if (!level || !name) return;
+  rpSendCommand("select", { level, name });
+  rpLog("info", "select " + level + "." + name);
 }
 
 /* ==========================================================================

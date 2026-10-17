@@ -551,13 +551,17 @@ window.addEventListener("mousemove", (e) => {
 });
 
 window.addEventListener("mouseup", () => {
-  if (state.dragPairAnchor ||
-      state.dragSegmentEdge ||
-      state.dragSegmentBody) {
+  const hadDrag = !!(state.dragPairAnchor ||
+                     state.dragSegmentEdge ||
+                     state.dragSegmentBody);
+  if (hadDrag) {
     state.dragPairAnchor  = null;
     state.dragSegmentEdge = null;
     state.dragSegmentBody = null;
     canvas.style.cursor = "crosshair";
+    /* Segment or pair positions moved → the row-scope actions'
+       appliesTo predicates may now differ. */
+    pgkitNotifyEntities();
   }
 });
 

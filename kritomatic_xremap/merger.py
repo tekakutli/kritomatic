@@ -154,6 +154,7 @@ def merge_configs():
     repo_dir = env_vars.get("REPODIR", "")
     target_device = env_vars.get("TARGET_DEVICE", "")
     personal_config = env_vars.get("PERSONAL_CONFIG", "")
+    personal_devices = env_vars.get("PERSONAL_DEVICES", "")
 
     if not repo_dir:
         print("Error: REPODIR not found in .env file.")
@@ -179,8 +180,11 @@ def merge_configs():
                 continue
 
             for km in data["keymap"]:
-                if target_device and target_device.lower() != "null":
-                    km["device"] = {"only": target_device}
+                # Respect an explicit device: block from the source YAML.
+                # Only fall back to TARGET_DEVICE when the entry has none.
+                if "device" not in km:
+                    if target_device and target_device.lower() != "null":
+                        km["device"] = {"only": target_device}
                 merged_data["keymap"].append(km)
 
         except Exception as e:
@@ -189,7 +193,17 @@ def merge_configs():
     # 4. Wait for device (optional, non-fatal)
     wait_for_device(target_device, timeout=5)
 
-    # 5. Write temp config and launch xremap
+    # 5. Build the --device list for xremap.
+    #    TARGET_DEVICE first, then any extras from PERSONAL_DEVICES (comma-separated).
+    devices = []
+    if target_device and target_device.lower() != "null":
+        devices.append(target_device)
+    if personal_devices:
+        devices.extend(d.strip() for d in personal_devices.split(",") if d.strip())
+    seen = set()
+    devices = [d for d in devices if not (d in seen or seen.add(d))]
+
+    # 6. Write temp config and launch xremap
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as tmp:
         yaml.dump(merged_data, tmp, sort_keys=False)
         tmp_path = tmp.name
@@ -204,10 +218,10 @@ def merge_configs():
         custom_env.setdefault("DISPLAY", os.environ.get("DISPLAY", ":0"))
 
         cmd = ['xremap', tmp_path]
-        if target_device and target_device.lower() != "null":
-            cmd.extend(['--device', target_device])
+        for d in devices:
+            cmd.extend(['--device', d])
 
-        print(f"🚀 Launching xremap (device: {target_device or 'auto'})")
+        print(f"🚀 Launching xremap (devices: {', '.join(devices) or 'auto'})")
         process = subprocess.Popen(cmd, env=custom_env)
         process.wait()
 

@@ -1,6 +1,8 @@
 keymap:
   # BLOCK 1: Global Keybindings
   - name: Global Krita Shortcuts
+    device:
+      only: kanata ministeren
     remap:
       n:
         launch: ["python", "__CLIPBOARD2KRITA_SCRIPT__"]

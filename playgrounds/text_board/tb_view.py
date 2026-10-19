@@ -12,6 +12,33 @@ document anchor inside the card.
 
 Before the cards, one dashed rectangle per document is drawn at that
 document's canvas extent in board-space coordinates.
+
+PERFORMANCE
+===========
+    VIEWPORT CULLING
+        A card fully outside the visible viewport is not drawn.
+
+    SHADOW-ONLY-WHEN-SELECTED
+        `shadowBlur` is applied only to the selected card; every
+        other card gets a cheap flat offset rect.
+
+    BATCHED GRID
+        The background dot grid is a single path filled once.
+
+    LABEL-WIDTH CACHE
+        `measureText` runs only when the label text changed.
+
+    CACHED DOCUMENT LAYOUT
+        `_drawDocumentBounds` iterates `_docLayout()` (see
+        tb_core.py) rather than re-sorting `_documentSlots` per
+        frame.
+
+    HOISTED docToScreen
+        `_drawItemCard`'s word-box loop uses precomputed `ox`, `oy`,
+        and `s` instead of per-corner closure calls + `b2s()` +
+        array allocations.  The per-card setup is three arithmetic
+        expressions; the loop body is two multiplications and two
+        additions per corner, no allocation.
 """
 
 VIEW_JS = r"""
@@ -20,24 +47,13 @@ VIEW_JS = r"""
    ========================================================================== */
 
 function _drawDocumentBounds() {
-  if (_documentSlots.size === 0) return;
+  const layout = _docLayout();
+  if (layout.length === 0) return;
 
-  const sorted = Array.from(_documentSlots.values())
-    .sort((a, b) => a.index - b.index);
-
-  const rowW = _slotRowWidth();
-  const rowLeft = -rowW / 2;
-
-  let x = rowLeft;
-  for (const s of sorted) {
-    const sx = x;
-    const sy = -(s.docH * _boardScale) / 2;
-    const sw = s.docW * _boardScale;
-    const sh = s.docH * _boardScale;
-
-    const [x0, y0] = b2s(sx, sy);
-    const x1 = x0 + sw * view.zoom;
-    const y1 = y0 + sh * view.zoom;
+  for (const entry of layout) {
+    const [x0, y0] = b2s(entry.bx, entry.by);
+    const x1 = x0 + entry.bw * view.zoom;
+    const y1 = y0 + entry.bh * view.zoom;
 
     ctx.save();
 
@@ -55,18 +71,19 @@ function _drawDocumentBounds() {
       ctx.textAlign    = "left";
       ctx.textBaseline = "bottom";
       ctx.fillStyle = "rgba(0, 229, 255, 0.55)";
-      ctx.fillText(s.docW + " \u00d7 " + s.docH, x0 + 2, y0 - 4);
+      ctx.fillText(entry.docW + " \u00d7 " + entry.docH, x0 + 2, y0 - 4);
     }
 
     ctx.restore();
-
-    x += s.docW * _boardScale + DOCUMENT_GAP;
   }
 }
 
 /* ==========================================================================
    BACKGROUND GRID
-   ========================================================================== */
+   ==========================================================================
+   One path, one fill.  The per-cell arithmetic is hoisted out of the
+   inner loop; `b2s()` would be a function call per cell otherwise.
+   Pixel-identical to the previous per-`fillRect` version. */
 
 function _drawBoardGrid() {
   const cw = window.innerWidth;
@@ -81,14 +98,20 @@ function _drawBoardGrid() {
   const endBx   = (cw - view.panX) / view.zoom + step;
   const endBy   = (ch - view.panY) / view.zoom + step;
 
+  const z  = view.zoom;
+  const px = view.panX;
+  const py = view.panY;
+
   ctx.save();
   ctx.fillStyle = "rgba(0, 229, 255, 0.10)";
+  ctx.beginPath();
   for (let bx = startBx; bx < endBx; bx += step) {
+    const sx = bx * z + px;
     for (let by = startBy; by < endBy; by += step) {
-      const [sx, sy] = b2s(bx, by);
-      ctx.fillRect(sx, sy, 1.1, 1.1);
+      ctx.rect(sx, by * z + py, 1.1, 1.1);
     }
   }
+  ctx.fill();
   ctx.restore();
 }
 
@@ -160,24 +183,65 @@ function _lightenForDarkCard(c, fallback, minLum) {
   return "rgb(" + r + ", " + g + ", " + b + ")";
 }
 
+/* Label-width cache.  Transient fields on the item; not in the scene,
+   not in the export.  Self-invalidating when the label text changes.
+   Requires `ctx.font` to be already set to the label font; the caller
+   (`_drawItemCard`) sets it once before calling in. */
+
+const _CARD_LABEL_FONT = "700 11px 'JetBrains Mono', 'Fira Code', monospace";
+
+function _cardLabelWidth(it, label) {
+  if (it._labelText === label && typeof it._labelWidth === "number") {
+    return it._labelWidth;
+  }
+  const w = ctx.measureText(label).width;
+  it._labelText  = label;
+  it._labelWidth = w;
+  return w;
+}
+
 function _drawItemCard(it, isSelected) {
-  const hue = it.colorRGB || board.palette[0];
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
 
   const [csx, csy] = b2s(it.bx, it.by);
   const sw = it.bw * view.zoom;
   const sh = it.bh * view.zoom;
+
+  // Viewport cull.  The label is drawn below the card at
+  // (csx, csy + sh + 6) with height 18; 26 covers the card body
+  // plus the label plus a small margin.
+  const CULL_LABEL_MARGIN = 26;
+  if (csx + sw < 0 || csy + sh + CULL_LABEL_MARGIN < 0 ||
+      csx > cw || csy > ch) {
+    return;
+  }
+
+  const hue = it.colorRGB || board.palette[0];
   const RADIUS = 3;
 
-  // Card body.
-  ctx.save();
-  ctx.shadowColor   = "rgba(0, 0, 0, 0.55)";
-  ctx.shadowBlur    = 16;
-  ctx.shadowOffsetY = 4;
-  ctx.fillStyle     = "#0e1622";
-  ctx.beginPath();
-  _roundRect(csx, csy, sw, sh, RADIUS);
-  ctx.fill();
-  ctx.restore();
+  // Depth cue.  Blur only on the selected card (bounded cost);
+  // everyone else gets a flat offset rect.  Same visual read.
+  if (isSelected) {
+    ctx.save();
+    ctx.shadowColor   = "rgba(0, 0, 0, 0.55)";
+    ctx.shadowBlur    = 16;
+    ctx.shadowOffsetY = 4;
+    ctx.fillStyle     = "#0e1622";
+    ctx.beginPath();
+    _roundRect(csx, csy, sw, sh, RADIUS);
+    ctx.fill();
+    ctx.restore();
+  } else {
+    ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
+    ctx.beginPath();
+    _roundRect(csx + 2, csy + 3, sw, sh, RADIUS);
+    ctx.fill();
+    ctx.fillStyle = "#0e1622";
+    ctx.beginPath();
+    _roundRect(csx, csy, sw, sh, RADIUS);
+    ctx.fill();
+  }
 
   // Border.  Dimmed: the outline is a spatial cue, not a highlight.
   // Selection re-asserts the full-strength colour.
@@ -203,19 +267,26 @@ function _drawItemCard(it, isSelected) {
     ctx.restore();
   }
 
-  // Helper: convert a point from the shape's DOCUMENT space to SCREEN.
-  // The card is at (it.bx, it.by) in board space; a document point p
-  // sits at (it.bx + (p.x - shapeBounds.x) * scale,
-  //          it.by + (p.y - shapeBounds.y) * scale).
-  const sb = it.shapeBounds;
-  const docToScreen = (px, py) => {
-    const bx = it.bx + (px - sb.x) * _boardScale;
-    const by = it.by + (py - sb.y) * _boardScale;
-    return b2s(bx, by);
-  };
-
-  // Word boxes: doc-space quads, mapped through the same helper.
+  // Word boxes: doc-space quads, mapped to screen with a hoisted
+  // affine.  The three pre-computed constants below are all that
+  // varies across the four corners of every word on this card:
+  //
+  //     screen_x = ox + doc_x * s
+  //     screen_y = oy + doc_y * s
+  //
+  // where  s  = _boardScale * view.zoom
+  //        ox = (it.bx - sb.x * _boardScale) * view.zoom + view.panX
+  //        oy = (it.by - sb.y * _boardScale) * view.zoom + view.panY
+  //
+  // This replaces a per-corner closure call + b2s() + a 2-element
+  // array allocation.  For a board with W word boxes it is W × 4
+  // fewer allocations per frame.
   if (board.showWordBoxes && it.wordBoxes && it.wordBoxes.length) {
+    const sb = it.shapeBounds;
+    const s  = _boardScale * view.zoom;
+    const ox = (it.bx - sb.x * _boardScale) * view.zoom + view.panX;
+    const oy = (it.by - sb.y * _boardScale) * view.zoom + view.panY;
+
     ctx.save();
     ctx.strokeStyle = "rgba(0, 229, 255, 0.85)";
     ctx.lineWidth   = 1.4;
@@ -224,7 +295,8 @@ function _drawItemCard(it, isSelected) {
       if (!corners || corners.length < 4) continue;
       ctx.beginPath();
       for (let k = 0; k < 4; k++) {
-        const [dx, dy] = docToScreen(corners[k][0], corners[k][1]);
+        const dx = ox + corners[k][0] * s;
+        const dy = oy + corners[k][1] * s;
         if (k === 0) ctx.moveTo(dx, dy);
         else         ctx.lineTo(dx, dy);
       }
@@ -236,12 +308,12 @@ function _drawItemCard(it, isSelected) {
 
   // Label under the card.
   if (sw > 40) {
-    ctx.font = "700 11px 'JetBrains Mono', 'Fira Code', monospace";
+    ctx.font = _CARD_LABEL_FONT;
     ctx.textAlign    = "left";
     ctx.textBaseline = "top";
     const label = (it.layerName || it.documentName || "?") + " \u00b7 " +
                   (it.text || "").slice(0, 40);
-    const labelW = ctx.measureText(label).width;
+    const labelW = _cardLabelWidth(it, label);
     const padX = 6;
     const lh   = 18;
     const lx   = csx;

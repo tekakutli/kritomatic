@@ -17,6 +17,21 @@ to a document and reports the document-space coordinates.
 
 Keyboard: R refresh, G grid, F fit, W toggle word boxes, O open all
 picked files, H toggle panel.
+
+MOUSEMOVE FAST PATH
+===================
+`draw()` runs only when the canvas is actually going to change.
+Pure hover — the mouse moving over the canvas with no button held —
+updates the cursor readout (pure DOM) and the CSS cursor style
+(a CSS property, not a canvas drawing), and nothing else.
+
+CURSOR STYLE — SET ONLY ON CHANGE
+=================================
+`canvas.style.cursor = X` triggers a style recalc even when X equals
+the current value, and the hover handler fires on every mousemove.
+`_setCursor()` tracks the last value in JS and only writes when it
+changes.  The hit test behind the decision is `_anyItemHitTest` (see
+tb_core.py) — boolean, no allocation, no z-sort.
 """
 
 DISPATCH_JS = r"""
@@ -27,6 +42,16 @@ const state = {
   dragItem:   null,
   mouse:      { sx: 0, sy: 0, inside: false },
 };
+
+/* Cursor state tracked here so `canvas.style.cursor` is only written
+   when it actually changes.  The default on startup is "default". */
+let _lastCursor = "default";
+
+function _setCursor(c) {
+  if (c === _lastCursor) return;
+  canvas.style.cursor = c;
+  _lastCursor = c;
+}
 
 /* ==========================================================================
    DRAW
@@ -66,8 +91,10 @@ function updateStatus() {
   if (closed > 0) {
     parts.push(closed + " closed file" + (closed === 1 ? "" : "s"));
   }
-  el.textContent = parts.join("  \u00b7  ");
-  el.className = closed > 0 ? "warn" : "";
+  const text = parts.join("  \u00b7  ");
+  if (el.textContent !== text) el.textContent = text;
+  const cls = closed > 0 ? "warn" : "";
+  if (el.className !== cls) el.className = cls;
 }
 
 /* ==========================================================================
@@ -93,7 +120,7 @@ canvas.addEventListener("mousedown", (e) => {
       startBy:   it.by,
       moved:     false,
     };
-    canvas.style.cursor = "grabbing";
+    _setCursor("grabbing");
     syncItemList();
     _syncEditor();
     draw();
@@ -107,7 +134,7 @@ canvas.addEventListener("mousedown", (e) => {
     startPanX: view.panX,
     startPanY: view.panY,
   };
-  canvas.style.cursor = "grabbing";
+  _setCursor("grabbing");
   syncItemList();
   _syncEditor();
   draw();
@@ -122,11 +149,8 @@ window.addEventListener("mousemove", (e) => {
   state.mouse.inside = (sx >= 0 && sy >= 0 &&
                         sx < window.innerWidth && sy < window.innerHeight);
 
-  if (state.mouse.inside) {
-    updateCursorReadout(sx, sy);
-  } else {
-    clearCursorReadout();
-  }
+  if (state.mouse.inside) updateCursorReadout(sx, sy);
+  else                    clearCursorReadout();
 
   if (state.dragItem) {
     const di = state.dragItem;
@@ -138,23 +162,36 @@ window.addEventListener("mousemove", (e) => {
       it.bx = di.startBx + dx / view.zoom;
       it.by = di.startBy + dy / view.zoom;
     }
-  } else if (state.dragCanvas) {
+    draw();
+    return;
+  }
+
+  if (state.dragCanvas) {
     const dc = state.dragCanvas;
     view.panX = dc.startPanX + (sx - dc.startSx);
     view.panY = dc.startPanY + (sy - dc.startSy);
-  } else {
-    if (itemHitTest(sx, sy) >= 0) canvas.style.cursor = "grab";
-    else                          canvas.style.cursor = "default";
+    draw();
+    return;
   }
 
-  draw();
+  // Pure hover: only the CSS cursor style can change.  `_anyItemHitTest`
+  // is a boolean scan with no allocation and no z-sort; `_setCursor`
+  // only writes `style.cursor` when the value actually differs from
+  // the previous frame.  No `draw()` — the canvas is pixel-identical.
+  _setCursor(_anyItemHitTest(sx, sy) ? "grab" : "default");
 });
 
 window.addEventListener("mouseup", () => {
+  const hadDrag = !!(state.dragItem || state.dragCanvas);
   state.dragItem   = null;
   state.dragCanvas = null;
-  canvas.style.cursor = "default";
-  draw();
+  _setCursor("default");
+  if (hadDrag) {
+    pgkitNotifyEntities();
+    pgkitNotifyLocal("view.panX");
+    pgkitNotifyLocal("view.panY");
+    draw();
+  }
 });
 
 canvas.addEventListener("wheel", (e) => {
@@ -169,6 +206,9 @@ canvas.addEventListener("wheel", (e) => {
 
   view.panX = mx - bx * view.zoom;
   view.panY = my - by * view.zoom;
+  pgkitNotifyLocal("view.zoom");
+  pgkitNotifyLocal("view.panX");
+  pgkitNotifyLocal("view.panY");
   draw();
 }, { passive: false });
 
@@ -204,9 +244,8 @@ window.addEventListener("keydown", (e) => {
     board.showWordBoxes = !board.showWordBoxes;
     const cb = document.getElementById("wordBoxToggle");
     if (cb) cb.checked = board.showWordBoxes;
+    pgkitNotifyLocal("board.showWordBoxes");
     draw();
   }
 });
-
-canvas.style.cursor = "default";
 """

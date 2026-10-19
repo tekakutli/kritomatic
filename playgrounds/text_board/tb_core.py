@@ -13,6 +13,36 @@ daemon reports for the shape.
 The card's rectangle is exactly the shape's text area — no padding,
 no rotation.  The text label is drawn as an indication on top and is
 allowed to overflow.
+
+DOCUMENT SLOT LAYOUT CACHE
+==========================
+`documentAtBoardPoint` runs on every mousemove (via
+`updateCursorReadout`), and `_drawDocumentBounds` runs on every
+frame.  Both need the sorted slot list plus each slot's board-space
+box.  Both would otherwise pay `Array.from(_documentSlots.values())`
++ `.sort()` + `_slotRowWidth()` per call.
+
+`_docLayout()` caches the result.  The cache is invalidated by
+`_invalidateDocLayout()`, called from exactly two places:
+
+    _rebaseAllItems       runs after any scale change and after
+                          every mergeIncomingShapes, which is the
+                          only path that adds or updates slots.
+    _clearBoardAction     empties `_documentSlots` directly.
+
+Each slot object carries its own path, so `_docLayout()` produces
+the path per entry and `_sortedDocumentPaths()` is a simple `.map`.
+The pre-migration version did an O(N²) reverse lookup — one
+`_documentSlots` scan per layout entry — which would run on every
+`documents` entities flush and on every document-level row action.
+
+HOVER CURSOR — ANY-HIT SHORT-CIRCUIT
+====================================
+`itemHitTest` returns the *topmost* card, which requires sorting by
+`bz`.  The hover cursor only needs "is there a card under the
+pointer" — a boolean.  `_anyItemHitTest` does an unordered linear
+scan with early exit and no allocation.  The selection path still
+uses `itemHitTest`.
 """
 
 CORE_JS = r"""
@@ -78,6 +108,8 @@ const _documentSlots = new Map();
 
 const DOCUMENT_GAP = 60;   // board units between adjacent slots
 
+let _docLayoutCache = null;
+
 function _slotHash(docPath) {
   let h = 0;
   for (let i = 0; i < docPath.length; i++) {
@@ -112,6 +144,10 @@ function _documentOrigin(docPath, docW, docH) {
       docW:  docW,
       docH:  docH,
       name:  _pathBasename(docPath),
+      /* Cache the path on the slot so `_docLayout` can produce it
+         without an O(N) reverse lookup per entry.  See the module
+         docstring, DOCUMENT SLOT LAYOUT CACHE. */
+      path:  docPath,
     });
   } else {
     const slot = _documentSlots.get(docPath);
@@ -132,38 +168,56 @@ function _slotRowWidth() {
   return total;
 }
 
+function _invalidateDocLayout() {
+  _docLayoutCache = null;
+}
+
+function _docLayout() {
+  if (_docLayoutCache !== null) return _docLayoutCache;
+
+  const sorted = Array.from(_documentSlots.values())
+    .sort((a, b) => a.index - b.index);
+
+  const rowW = _slotRowWidth();
+  let x = -rowW / 2;
+
+  const layout = [];
+  for (const s of sorted) {
+    const bw = s.docW * _boardScale;
+    const bh = s.docH * _boardScale;
+    layout.push({
+      slot: s,
+      path: s.path,
+      bx: x,
+      by: -bh / 2,
+      bw: bw,
+      bh: bh,
+      docW: s.docW,
+      docH: s.docH,
+    });
+    x += bw + DOCUMENT_GAP;
+  }
+
+  _docLayoutCache = layout;
+  return layout;
+}
+
 /* ==========================================================================
    DOCUMENT HIT-TEST AND COORDINATE MAPPING
    ========================================================================== */
 
 function documentAtBoardPoint(bx, by) {
-  const sorted = Array.from(_documentSlots.values())
-    .sort((a, b) => a.index - b.index);
-
-  const rowW = _slotRowWidth();
-  const rowLeft = -rowW / 2;
-
-  let x = rowLeft;
-  for (const s of sorted) {
-    const sx = x;
-    const sy = -(s.docH * _boardScale) / 2;
-    const sw = s.docW * _boardScale;
-    const sh = s.docH * _boardScale;
-
-    if (bx >= sx && bx <= sx + sw &&
-        by >= sy && by <= sy + sh) {
-      const dx = (bx - sx) / _boardScale;
-      const dy = (by - sy) / _boardScale;
+  for (const entry of _docLayout()) {
+    if (bx >= entry.bx && bx <= entry.bx + entry.bw &&
+        by >= entry.by && by <= entry.by + entry.bh) {
       return {
-        slot: s,
-        docX: dx,
-        docY: dy,
-        docW: s.docW,
-        docH: s.docH,
+        slot: entry.slot,
+        docX: (bx - entry.bx) / _boardScale,
+        docY: (by - entry.by) / _boardScale,
+        docW: entry.docW,
+        docH: entry.docH,
       };
     }
-
-    x += s.docW * _boardScale + DOCUMENT_GAP;
   }
   return null;
 }
@@ -227,11 +281,7 @@ function _findItemById(id) {
 
 /* ==========================================================================
    CARD GEOMETRY
-   ==========================================================================
-   The card is exactly the shape's document-space AABB.  No padding is
-   applied: shape_bounds already comes from Krita's own boundingBox,
-   transformed into document space.  The text label is drawn as an
-   indication on top and is allowed to overflow the card. */
+   ========================================================================== */
 
 function _cardSizeFor(shapeBounds) {
   const wpx = Math.max(MIN_SHAPE_PX_W, shapeBounds.w || 1);
@@ -290,6 +340,8 @@ function makeItemFromRecord(rec) {
    ========================================================================== */
 
 function _rebaseAllItems() {
+  _invalidateDocLayout();
+
   const sorted = Array.from(_documentSlots.values())
     .sort((a, b) => a.index - b.index);
 
@@ -369,6 +421,8 @@ function mergeIncomingShapes(shapes) {
 
   _rebaseAllItems();
   _markWantedPathsFromItems();
+
+  pgkitNotifyAll();
 }
 
 /* ==========================================================================
@@ -450,31 +504,19 @@ function groupByFormat() {
 
 /* ==========================================================================
    CONTENT BOUNDS
-   ==========================================================================
-   The union of every document rectangle and every card, in board
-   coordinates.  fitAll frames this so the user sees whole documents
-   with their cards inside, not just a cluster of cards floating in
-   space. */
+   ========================================================================== */
 
 function _contentBounds() {
   let minX =  Infinity, minY =  Infinity;
   let maxX = -Infinity, maxY = -Infinity;
   let any = false;
 
-  const sorted = Array.from(_documentSlots.values())
-    .sort((a, b) => a.index - b.index);
-  const rowW = _slotRowWidth();
-  let sx = -rowW / 2;
-  for (const s of sorted) {
-    const sy = -(s.docH * _boardScale) / 2;
-    const ex = sx + s.docW * _boardScale;
-    const ey = sy + s.docH * _boardScale;
-    minX = Math.min(minX, sx);
-    minY = Math.min(minY, sy);
-    maxX = Math.max(maxX, ex);
-    maxY = Math.max(maxY, ey);
+  for (const entry of _docLayout()) {
+    minX = Math.min(minX, entry.bx);
+    minY = Math.min(minY, entry.by);
+    maxX = Math.max(maxX, entry.bx + entry.bw);
+    maxY = Math.max(maxY, entry.by + entry.bh);
     any = true;
-    sx += s.docW * _boardScale + DOCUMENT_GAP;
   }
 
   for (const it of board.items) {
@@ -555,6 +597,15 @@ function itemHitTest(sx, sy) {
     if (_pointInItem(board.items[i], bx, by)) return i;
   }
   return -1;
+}
+
+function _anyItemHitTest(sx, sy) {
+  const bx = (sx - view.panX) / view.zoom;
+  const by = (sy - view.panY) / view.zoom;
+  for (let i = 0; i < board.items.length; i++) {
+    if (_pointInItem(board.items[i], bx, by)) return true;
+  }
+  return false;
 }
 
 function bringToTop(idx) {

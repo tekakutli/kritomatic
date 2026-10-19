@@ -58,7 +58,7 @@ DEFAULT_TREE_ONLY  = False            # only emit the directory tree, no file co
 # also listed in DEFAULT_TREE_EXCLUDE_DIRS below.
 DEFAULT_EXCLUDE_DIRS = [
     ".git", "__pycache__", ".venv", "venv", "node_modules",
-    "kritomatic_xremap", "other_scripts", "playgrounds",
+    "kritomatic_xremap", "other_scripts", "playgr0unds",
     "data/comfy_panel",
     # e.g. "src/vendor" to skip only ./src/vendor
 ]

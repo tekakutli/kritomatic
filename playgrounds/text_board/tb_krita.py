@@ -6,6 +6,15 @@ POSTed to /log so it appears on the terminal that serves the board.
 After the first successful refresh, if nothing has been fit yet, the
 board fits to content once; after that the user's zoom and pan are
 authoritative.
+
+CONSOLE LOGGING
+===============
+Every refresh attempt prints one line on entry, one line on the
+response, and one line on error.  Open DevTools (F12) → Console to
+see them.  If you click "Refresh from Krita" and no line appears,
+the button isn't firing; if the entry line appears but no response
+line does, the POST is failing at the network layer; if the response
+line shows `success: false`, the daemon is the problem.
 """
 
 KRITA_JS = r"""
@@ -41,8 +50,12 @@ window.addEventListener("unhandledrejection", (e) => {
 let _refreshInFlight = false;
 
 async function refreshFromKrita() {
-  if (_refreshInFlight) return;
+  if (_refreshInFlight) {
+    console.log("[refresh] already in flight, skipping");
+    return;
+  }
   _refreshInFlight = true;
+  console.log("[refresh] → POST /krita/dump_text");
 
   const statusEl = document.getElementById("status");
   if (statusEl) {
@@ -57,8 +70,10 @@ async function refreshFromKrita() {
       headers: { "Content-Type": "application/json" },
       body:    "{}",
     });
+    console.log("[refresh] ← HTTP " + res.status);
     payload = await res.json();
   } catch (err) {
+    console.error("[refresh] fetch or parse failed:", err);
     reportError("refresh", err.message);
     if (statusEl) {
       statusEl.textContent = "Request failed: " + err.message;
@@ -69,9 +84,11 @@ async function refreshFromKrita() {
   }
 
   _refreshInFlight = false;
+  console.log("[refresh] payload:", payload);
 
   if (!payload || !payload.success) {
     const msg = (payload && payload.message) ? payload.message : "unknown error";
+    console.error("[refresh] daemon reported error:", msg);
     reportError("refresh", msg);
     if (statusEl) {
       statusEl.textContent = "Krita: " + msg;
@@ -88,20 +105,15 @@ async function refreshFromKrita() {
     statusEl.className   = "ok";
     setTimeout(updateStatus, 1600);
   }
+  console.log("[refresh] merged " + board.items.length + " item(s)");
 
   syncItemList();
   _syncEditor();
   draw();
 
-  // Auto-fit only the first time the board actually has content.
-  // An empty first refresh must not consume the auto-fit flag, or
-  // a slow daemon leaves the view parked at the wrong place for the
-  // rest of the session.
   if (!board._autoFitDone && board.items.length > 0) {
     board._autoFitDone = true;
     fitAll();
-    console.log("[board] auto-fit on first non-empty refresh;",
-                "items =", board.items.length);
   }
 }
 

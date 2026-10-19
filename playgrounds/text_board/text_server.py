@@ -1,24 +1,21 @@
 """
-text_server.py — threaded HTTP server for the text board.
+text_server.py — route handlers for the text board's HTTP endpoints.
 
-    POST /krita/dump_text      { }                 pull every text shape
-    POST /krita/patch_text     { document_path, layer_name, text_index, patch }
-    POST /krita/activate       { name }
-    POST /krita/pick_files     { }                 native file picker
-    POST /krita/open           { path, add_view }  open a .kra in Krita
-    POST /log                  { tag, message }
+`pgkit.server.serve()` owns the actual HTTP server; this module supplies
+the routes dict it dispatches through.
 
-Every request and response is logged to the terminal; the /log
-endpoint lets the browser forward its own caught errors here.
+    /log                 { tag, message }                browser error log
+    /debug               {}                              diagnostic dump
+    /krita/dump_text     {}                              pull every text shape
+    /krita/patch_text    { document_path, layer_name, text_index, patch }
+    /krita/activate      { name }
+    /krita/pick_files    {}                              native file picker
+    /krita/open          { path, add_view }              open a .kra in Krita
 """
 
 import datetime
-import json
 import os
-import threading
-import traceback
-import webbrowser
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import socket
 
 import text_krita
 
@@ -28,131 +25,101 @@ def _log(msg):
     print(f"[{ts}] text: {msg}", flush=True)
 
 
-def serve(port=8771, open_browser=True, html_file="text_board.html"):
+# ----------------------------------------------------------------------------
+#  Handlers — each takes a parsed JSON payload dict and returns a
+#  response dict.  `pgkit.server.serve` handles the wire.
+# ----------------------------------------------------------------------------
 
-    class Handler(SimpleHTTPRequestHandler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, directory=os.getcwd(), **kwargs)
+def handle_log(payload):
+    tag = payload.get("tag", "js")
+    msg = payload.get("message", "")
+    ts  = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] js/{tag}: {msg}", flush=True)
+    return {"success": True}
 
-        def log_message(self, *args):
-            pass
 
-        def _read_json(self):
-            length = int(self.headers.get("Content-Length", "0"))
-            body   = self.rfile.read(length).decode("utf-8") if length else ""
-            return json.loads(body) if body else {}
+def handle_debug(payload):
+    """Diagnostic: report daemon reachability and route table.
 
-        def _serve_json(self, code, data):
-            body = json.dumps(data).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_POST(self):
-            try:
-                if self.path == "/log":
-                    payload = self._read_json()
-                    tag = payload.get("tag", "js")
-                    msg = payload.get("message", "")
-                    ts  = datetime.datetime.now().strftime("%H:%M:%S")
-                    print(f"[{ts}] js/{tag}: {msg}", flush=True)
-                    self._serve_json(200, {"success": True})
-                    return
-
-                if self.path == "/krita/dump_text":
-                    _log("dump_text")
-                    result = text_krita.dump_text_shapes()
-                    if not result.get("success"):
-                        _log(f"dump_text FAILED: {result.get('message')}")
-                    else:
-                        _log(f"dump_text ok: "
-                             f"{len(result.get('shapes', []))} shape(s)")
-                    self._serve_json(200, result)
-                    return
-
-                if self.path == "/krita/patch_text":
-                    payload = self._read_json()
-                    doc   = payload.get("document_path", "")
-                    layer = payload.get("layer_name", "")
-                    idx   = int(payload.get("text_index", 0))
-                    patch = payload.get("patch", {})
-                    _log(f"patch_text: doc={doc!r} layer={layer!r} "
-                         f"idx={idx} keys={sorted(patch.keys())}")
-                    result = text_krita.patch_text_shape(doc, layer, idx, patch)
-                    if not result.get("success"):
-                        _log(f"patch_text FAILED: {result.get('message')}")
-                    self._serve_json(200, result)
-                    return
-
-                if self.path == "/krita/activate":
-                    payload = self._read_json()
-                    name = payload.get("name", "")
-                    _log(f"activate: {name!r}")
-                    result = text_krita.activate_document(name)
-                    self._serve_json(200, result)
-                    return
-
-                if self.path == "/krita/pick_files":
-                    _log("pick_files: opening native dialog")
-                    result = text_krita.pick_files()
-                    if not result.get("success"):
-                        _log(f"pick_files FAILED: {result.get('message')}")
-                    else:
-                        _log(f"pick_files ok: "
-                             f"{len(result.get('paths', []))} path(s)")
-                    self._serve_json(200, result)
-                    return
-
-                if self.path == "/krita/open":
-                    payload = self._read_json()
-                    path = payload.get("path", "")
-                    add_view = bool(payload.get("add_view", True))
-                    if not path:
-                        self._serve_json(400,
-                                         {"success": False,
-                                          "message": "no path"})
-                        return
-                    _log(f"open: {path!r} add_view={add_view}")
-                    result = text_krita.open_file(path, add_view)
-                    if not result.get("success"):
-                        _log(f"open FAILED: {result.get('message')}")
-                    else:
-                        _log(f"open ok: name={result.get('name')!r}")
-                    self._serve_json(200, result)
-                    return
-
-                self.send_error(404)
-            except Exception as e:
-                traceback.print_exc()
-                _log(f"unhandled error: {e}")
-                self._serve_json(500, {"success": False, "message": str(e)})
-
-    httpd = None
-    used_port = None
-    for p in range(port, port + 20):
-        try:
-            httpd = ThreadingHTTPServer(("127.0.0.1", p), Handler)
-            used_port = p
-            break
-        except OSError:
-            continue
-    if httpd is None:
-        print(f"Could not find a free port in [{port}, {port + 20}).")
-        return
-
-    url = f"http://127.0.0.1:{used_port}/{html_file}"
-    print(f"Serving {os.getcwd()}")
-    print(f"  -> open  {url}")
-    print("  Press Ctrl+C to stop.")
-
-    if open_browser:
-        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
-
+    Hit this from a browser:  fetch('/debug', {method:'POST', body:'{}'})
+    or from curl:             curl -s -X POST http://127.0.0.1:8771/debug
+    """
+    info = {
+        "success": True,
+        "cwd":     os.getcwd(),
+        "routes":  sorted(ROUTES.keys()),
+    }
     try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopped.")
-    finally:
-        httpd.server_close()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect(("127.0.0.1", 12346))
+        s.close()
+        info["daemon_reachable"] = True
+    except OSError as e:
+        info["daemon_reachable"] = False
+        info["daemon_error"]     = str(e)
+    return info
+
+
+def handle_dump_text(payload):
+    _log("dump_text")
+    result = text_krita.dump_text_shapes()
+    if not result.get("success"):
+        _log(f"dump_text FAILED: {result.get('message')}")
+    else:
+        _log(f"dump_text ok: {len(result.get('shapes', []))} shape(s)")
+    return result
+
+
+def handle_patch_text(payload):
+    doc   = payload.get("document_path", "")
+    layer = payload.get("layer_name", "")
+    idx   = int(payload.get("text_index", 0))
+    patch = payload.get("patch", {})
+    _log(f"patch_text: doc={doc!r} layer={layer!r} "
+         f"idx={idx} keys={sorted(patch.keys())}")
+    result = text_krita.patch_text_shape(doc, layer, idx, patch)
+    if not result.get("success"):
+        _log(f"patch_text FAILED: {result.get('message')}")
+    return result
+
+
+def handle_activate(payload):
+    name = payload.get("name", "")
+    _log(f"activate: {name!r}")
+    return text_krita.activate_document(name)
+
+
+def handle_pick_files(payload):
+    _log("pick_files: opening native dialog")
+    result = text_krita.pick_files()
+    if not result.get("success"):
+        _log(f"pick_files FAILED: {result.get('message')}")
+    else:
+        _log(f"pick_files ok: {len(result.get('paths', []))} path(s)")
+    return result
+
+
+def handle_open(payload):
+    path     = payload.get("path", "")
+    add_view = bool(payload.get("add_view", True))
+    if not path:
+        return {"success": False, "message": "no path"}
+    _log(f"open: {path!r} add_view={add_view}")
+    result = text_krita.open_file(path, add_view)
+    if not result.get("success"):
+        _log(f"open FAILED: {result.get('message')}")
+    else:
+        _log(f"open ok: name={result.get('name')!r}")
+    return result
+
+
+ROUTES = {
+    "/log":               handle_log,
+    "/debug":             handle_debug,
+    "/krita/dump_text":   handle_dump_text,
+    "/krita/patch_text":  handle_patch_text,
+    "/krita/activate":    handle_activate,
+    "/krita/pick_files":  handle_pick_files,
+    "/krita/open":        handle_open,
+}

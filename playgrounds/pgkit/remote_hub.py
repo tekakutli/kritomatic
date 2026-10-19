@@ -24,11 +24,11 @@ browser's `state_request` handler.  A remote client that does not
 understand either receives them and ignores them, exactly as it
 would ignore any other unrecognized `type`.
 
-An earlier revision of this module listed only `state`, `schema`,
-`state_request`, `patch`, `command`, and `command_result`.  Because
-`entities` was not in the list, the browser's entities message was
-silently dropped at the hub, and clients that render per-level
-sections saw no levels at all.
+A missing entry in this list means the message is silently dropped
+by the hub — it never reaches any client.  This is the single most
+likely failure mode when a new message type is introduced; if a
+level or a field shows up on the browser but not on the remote
+panel, this tuple is the first place to check.
 """
 
 import json

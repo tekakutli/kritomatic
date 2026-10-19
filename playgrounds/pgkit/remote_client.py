@@ -1,68 +1,104 @@
 """
 pgkit.remote_client — the browser's WebSocket client.
 
-On page load it opens a WebSocket to the playground's server.  Fields
-(`pgkitRegisterField`), actions (`pgkitRegisterAction`), and levels
-(`pgkitRegisterLevel`) are all published over the wire.
+On page load it opens a WebSocket to the playground's server.  Every
+value field registered via `pgkitRegisterField`, every action
+registered via `pgkitRegisterAction`, and every level registered via
+`pgkitRegisterLevel` is published under its dotted name and can be
+driven from any other connected client.
 
 STATE PUBLICATION — NOTIFICATION, NOT POLLING
 =============================================
-The project calls `pgkitNotifyLocal(name)` or `pgkitNotifyAll()` when
-a value or a selection changes.  Notifications coalesce to one patch
-per animation frame.
+The project tells the kit when a value changed:
 
-ENTITIES — THE HIERARCHY OF ITEMS
+    pgkitNotifyLocal(name)    queue one field's current value
+    pgkitNotifyAll()          queue every registered field's current
+                              value
+    pgkitNotifyEntities()     queue the entity tree (levels, items,
+                              selection, applies)
+
+There is no timer, no polling.  Actions are not included in state.
+
+CHANGE DEDUPLICATION — FLUSH TIME
 =================================
-A playground registers one level per entity kind: `pairs`, `squares`,
-`files`, `documents`, `items`.  Each level declares:
+`_pgkitLastSent` holds, per field, the last value the wire actually
+carried.  It is updated in exactly three places:
 
-    label      display name (e.g. "Pairs")
-    items()    → [{name, label, extra?}]
-    selected() → the name of the currently-selected item, or null
-    parent()   → {level, name} or null (for nested levels like
-                 segments-under-a-selected-pair)
+    _pgkitFlush              every value we just sent
+    pgkitRemoteApplyPatch    every value a peer just told us they
+                             believe we hold
+    state_request handler    every value in the state dump — the hub
+                             broadcasts that dump to all peers, so
+                             after it every peer holds these values
 
-`pgkitDumpEntities()` walks every level and produces
+`_pgkitFlush` compares each queued value against `_pgkitLastSent`
+and skips matches.
 
-    {levels: {name: {label, selected, parent, items}}, order: [...]}
+The *notify* functions do NOT consult `_pgkitLastSent`.  An earlier
+revision did, and it was a bug: a notify A→B→A sequence that fires
+inside one animation frame would leave a stale B in
+`_pgkitNotifyPending` that the notify-time check could not see (it
+compared against `_pgkitLastSent`, not against the pending queue).
+The stale value then went on the wire on the next flush even
+though the current state was A.  Moving the check to flush time
+fixes this with no extra state — the pending queue is drained
+completely, and only its post-dedup contents reach the wire.
 
-The `applies` map on each item is populated by running every row-
-scope action's `appliesTo(item)` predicate for that level.  The map
-is what a remote client uses to decide whether to render the row
-button.  `pgkitNotifyEntities()` schedules an entities refresh;
-`pgkitNotifyAll()` triggers it as a side effect.
+`pgkitRemoteApplyPatch` records `_pgkitLastSent[name]` *before* the
+equality check — the incoming value is what the peers believe we
+hold, whether or not it differs from our current value.  That way
+a skipped `set` still advances the dedup state.
 
-ACTION SCOPES
-=============
-Every action declares `scope`:
+On socket close, `_pgkitLastSent` is cleared so the next connect's
+state_request handler performs a full refresh of the map.
 
-    "global"     shown at the root; no level; no selection.
-    "all"        shown in a level's header; always enabled.
-    "selection"  shown in a level's header; disabled when the level's
-                 selected is null.
-    "row"        shown on every item of its level for which
-                 `appliesTo(item)` returns true.  `run(payload)` gets
-                 `payload.target = {level, name}` when invoked from a
-                 row button, and can also use the level's current
-                 selection if no target is provided.
+SCHEMA PUBLICATION — FIELDS, ACTIONS, LEVELS
+============================================
+On a `state_request` the kit answers with `state`, `schema`, and
+`entities`:
 
-SELECTION
-=========
-A remote client can select a level's item by sending a `select`
-command with `{level, name}`.  The playground's `pgkitHandleSelect`
-translates this to its model.  Pair uses it to select a pair or a
-segment without needing the panel's list.
+    state       {seq, values} — current value of every field
+    schema      {fields} — metadata: kind, label, options, plus
+                action meta (scope, level, requires, variant) and
+                level meta (label)
+    entities    {levels, order} — per-level items, selection, and
+                per-item `applies` maps for row-scope actions
+
+LEVELS
+======
+A level is one kind of entity in the model.  `pgkitRegisterLevel`
+takes {label, items, selected, parent}.  `items()` returns
+[{name, label, extra?}]; `selected()` returns the currently-
+selected item's name or null; `parent()` returns {level, name} for
+nested levels or null.  `pgkitDumpEntities` walks every level and
+populates `applies` for each row-scope action by running its
+`appliesTo(item)` predicate once per item.
+
+SELECT COMMAND
+==============
+A `select` command with `{level, name}` is dispatched to
+`pgkitHandleSelect(level, name)`, which each project implements to
+translate into its own selection state.  After a successful select,
+the kit queues an entities refresh.
+
+ACTION PAYLOADS
+===============
+An action may declare `requires` in its meta: an array of
+`{name, kind, label, default?, accept?}` entries describing what
+the user must supply.  `kind` is `"text"` or `"file"`.  The kit
+itself does not gather those values — a remote client does, and
+sends them in the `command` message's `payload`.
 
 ECHO SUPPRESSION
 ================
 Each patch carries a monotonic `seq` and the sender's `origin`
-client id.  `_pgkitApplyingRemote` is a second guard, active only
-during `pgkitRemoteApplyPatch`.
+client id.  The receiving side ignores any patch whose `origin`
+matches its own id.  `_pgkitApplyingRemote` is a second guard,
+active only during `pgkitRemoteApplyPatch`.
 
 PANEL VISIBILITY
 ================
-Presence-driven.  When at least one non-browser client is connected,
-`#ui` is hidden and `#remoteBanner` is shown.
+Presence-driven.
 """
 
 REMOTE_CLIENT_JS = r"""
@@ -83,14 +119,33 @@ const _pgkitRemote = {
   protocolVersion: 1,
 };
 
-let _pgkitApplyingRemote   = false;
-let _pgkitNotifyPending    = {};
-let _pgkitFlushScheduled   = false;
-let _pgkitEntitiesPending  = false;
-let _pgkitLastEntitiesSig  = null;
+let _pgkitApplyingRemote = false;
+
+let _pgkitNotifyPending   = {};
+let _pgkitFlushScheduled  = false;
+let _pgkitEntitiesPending = false;
+let _pgkitLastEntitiesSig = null;
+
+/* Field name → last value the wire carried.  Populated by
+   _pgkitFlush, pgkitRemoteApplyPatch, and the state_request handler;
+   cleared on socket close.  See the module docstring,
+   CHANGE DEDUPLICATION — FLUSH TIME. */
+let _pgkitLastSent = {};
 
 /* ==========================================================================
-   REGISTRY — fields
+   VALUE EQUALITY
+   ========================================================================== */
+
+function _pgkitValuesEqual(a, b) {
+  if (a === b) return true;
+  if (a == null || b == null) return a === b;
+  if (typeof a !== "object" || typeof b !== "object") return false;
+  try { return JSON.stringify(a) === JSON.stringify(b); }
+  catch (e) { return false; }
+}
+
+/* ==========================================================================
+   REGISTRY — FIELDS
    ========================================================================== */
 
 function pgkitRegisterField(name, opts) {
@@ -107,12 +162,11 @@ function pgkitRegisterField(name, opts) {
 }
 
 /* ==========================================================================
-   REGISTRY — actions
+   REGISTRY — ACTIONS
    ==========================================================================
    `scope` is one of "global" | "all" | "selection" | "row".
    `level` is required for every scope except "global".
-   `appliesTo(item)` is required only for "row" scope; it must be
-   cheap (it runs once per item per entities refresh). */
+   `appliesTo(item)` is required only for "row" scope. */
 
 function pgkitRegisterAction(name, opts) {
   if (!name) throw new Error("pgkitRegisterAction: name required");
@@ -147,7 +201,7 @@ function pgkitRegisterAction(name, opts) {
 }
 
 /* ==========================================================================
-   REGISTRY — levels
+   REGISTRY — LEVELS
    ========================================================================== */
 
 function pgkitRegisterLevel(name, opts) {
@@ -235,7 +289,10 @@ function pgkitDumpEntities() {
 
 /* ==========================================================================
    NOTIFICATION
-   ========================================================================== */
+   ==========================================================================
+   The notify functions always queue.  Deduplication happens at
+   flush time, against `_pgkitLastSent`.  See the module docstring,
+   CHANGE DEDUPLICATION — FLUSH TIME. */
 
 function pgkitNotifyLocal(name) {
   if (_pgkitApplyingRemote) return;
@@ -243,8 +300,9 @@ function pgkitNotifyLocal(name) {
   if (!_pgkitRemote.clientId) return;
   const f = _pgkitRemote.registry[name];
   if (!f || f.isAction) return;
-  try { _pgkitNotifyPending[name] = f.get(); }
-  catch (e) { return; }
+  let v;
+  try { v = f.get(); } catch (e) { return; }
+  _pgkitNotifyPending[name] = v;
   _pgkitScheduleFlush();
 }
 
@@ -255,8 +313,9 @@ function pgkitNotifyAll() {
   for (const name in _pgkitRemote.registry) {
     const r = _pgkitRemote.registry[name];
     if (r.isAction) continue;
-    try { _pgkitNotifyPending[name] = r.get(); }
-    catch (e) {}
+    let v;
+    try { v = r.get(); } catch (e) { continue; }
+    _pgkitNotifyPending[name] = v;
   }
   _pgkitEntitiesPending = true;
   _pgkitScheduleFlush();
@@ -283,16 +342,27 @@ function _pgkitScheduleFlush() {
 function _pgkitFlush() {
   _pgkitFlushScheduled = false;
 
-  const n = Object.keys(_pgkitNotifyPending).length;
-  if (n > 0) {
-    const values = _pgkitNotifyPending;
-    _pgkitNotifyPending = {};
+  const pending = _pgkitNotifyPending;
+  _pgkitNotifyPending = {};
+
+  const toSend = {};
+  let any = false;
+  for (const k in pending) {
+    if (!(k in _pgkitLastSent)
+        || !_pgkitValuesEqual(_pgkitLastSent[k], pending[k])) {
+      toSend[k] = pending[k];
+      any = true;
+    }
+  }
+
+  if (any) {
+    for (const k in toSend) _pgkitLastSent[k] = toSend[k];
     _pgkitRemote.seq++;
     pgkitRemoteSend({
       type:   "patch",
       origin: _pgkitRemote.clientId,
       seq:    _pgkitRemote.seq,
-      values: values,
+      values: toSend,
     });
   }
 
@@ -331,7 +401,7 @@ function pgkitRemoteConnect() {
   _pgkitRemote.socket = socket;
 
   socket.addEventListener("open", () => {
-    _pgkitRemote.connected     = true;
+    _pgkitRemote.connected = true;
     _pgkitRemote.reconnectDelay = 500;
     pgkitRemoteSend({
       type:     "hello",
@@ -347,14 +417,15 @@ function pgkitRemoteConnect() {
   });
 
   socket.addEventListener("close", () => {
-    _pgkitRemote.connected    = false;
-    _pgkitRemote.clientId     = null;
+    _pgkitRemote.connected = false;
+    _pgkitRemote.clientId  = null;
     _pgkitRemote.remoteCount  = 0;
     _pgkitRemote.browserCount = 0;
-    _pgkitNotifyPending       = {};
-    _pgkitFlushScheduled      = false;
-    _pgkitEntitiesPending     = false;
-    _pgkitLastEntitiesSig     = null;
+    _pgkitNotifyPending   = {};
+    _pgkitFlushScheduled  = false;
+    _pgkitEntitiesPending = false;
+    _pgkitLastEntitiesSig = null;
+    _pgkitLastSent        = {};
     _pgkitUpdatePanelVisibility();
     setTimeout(pgkitRemoteConnect, _pgkitRemote.reconnectDelay);
     _pgkitRemote.reconnectDelay = Math.min(
@@ -371,10 +442,11 @@ function pgkitRemoteHandle(msg) {
       break;
 
     case "state_request": {
+      const values = pgkitDumpState();
       pgkitRemoteSend({
         type:   "state",
         seq:    _pgkitRemote.seq,
-        values: pgkitDumpState(),
+        values: values,
       });
       pgkitRemoteSend({
         type:   "schema",
@@ -387,6 +459,11 @@ function pgkitRemoteHandle(msg) {
         levels: dump.levels,
         order:  dump.order,
       });
+      /* The hub broadcasts this state dump to every peer (not just
+         the requester), so after it every peer holds these values.
+         Update `_pgkitLastSent` accordingly so the next flush
+         dedupes against reality instead of against stale entries. */
+      for (const name in values) _pgkitLastSent[name] = values[name];
       break;
     }
 
@@ -413,6 +490,16 @@ function pgkitRemoteApplyPatch(values) {
     for (const name in values) {
       const f = _pgkitRemote.registry[name];
       if (!f || f.isAction) continue;
+
+      /* Record before the equality check: the incoming value is
+         now what the peers believe we hold, whether or not we
+         actually apply it. */
+      _pgkitLastSent[name] = values[name];
+
+      let cur;
+      try { cur = f.get(); } catch (e) { cur = undefined; }
+      if (_pgkitValuesEqual(cur, values[name])) continue;
+
       try { f.set(values[name]); } catch (e) {}
     }
   } finally {
@@ -451,10 +538,10 @@ function pgkitRemoteHandleCommand(msg) {
     } else if (kind === "reset_view" && typeof resetView === "function") {
       resetView();
     } else if (kind === "deselect") {
-      if (typeof selectedPair   !== "undefined") selectedPair = -1;
+      if (typeof selectedPair    !== "undefined") selectedPair = -1;
       if (typeof selectedSegment !== "undefined") selectedSegment = null;
-      if (typeof selectedQuad   !== "undefined") selectedQuad = -1;
-      if (typeof selectedSquare !== "undefined") selectedSquare = -1;
+      if (typeof selectedQuad    !== "undefined") selectedQuad = -1;
+      if (typeof selectedSquare  !== "undefined") selectedSquare = -1;
       if (typeof syncPairList === "function") syncPairList();
       if (typeof syncQuadList === "function") syncQuadList();
       if (typeof draw === "function") draw();

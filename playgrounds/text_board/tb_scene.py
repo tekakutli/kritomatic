@@ -7,6 +7,15 @@ rectangle.  Content is always pulled fresh from Krita on load, and
 positions are recomputed from the documents' current shapes via
 `_rebaseAllItems`, so a saved board is a set of settings, not a
 snapshot of a layout that will go stale.
+
+REMOTE NOTIFICATION
+===================
+`applyBoardScene` replaces the entire board's settings and view state.
+Every value that any registered field reads changes as a result.  It
+ends with `pgkitNotifyAll()`, so remote clients receive a single patch
+with the new state on the next animation frame.  `buildBoardScene` and
+`saveBoardJSON` are read-only from the model's perspective and do not
+notify.
 """
 
 SCENE_JS = r"""
@@ -70,7 +79,7 @@ function applyBoardScene(data) {
     if (typeof data.board.boardScale === "number")
       _boardScale = data.board.boardScale;
     else
-      _boardScale = _boardScaleForWidth(board.defaultWidth);
+      _boardScale = _computeBoardScale();
   }
   if (data.view) {
     if (typeof data.view.zoom === "number") view.zoom = data.view.zoom;
@@ -102,6 +111,7 @@ function applyBoardScene(data) {
   syncItemList();
   _syncEditor();
   draw();
+  pgkitNotifyAll();
 }
 
 async function loadBoardFromText(text) {

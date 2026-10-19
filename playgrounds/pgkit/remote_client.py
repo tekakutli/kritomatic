@@ -52,6 +52,18 @@ a skipped `set` still advances the dedup state.
 On socket close, `_pgkitLastSent` is cleared so the next connect's
 state_request handler performs a full refresh of the map.
 
+SELECT COMMAND — FIELDS REFRESH TOO
+===================================
+A `select` command changes `board.selectedIdx` / `selectedPair` /
+`selectedQuad`, which in turn changes the value of every
+selection-scoped getter on the kit (`item.*` in text_board,
+`pair.*` in pair, `card.*` in board).  `select` therefore calls
+`pgkitNotifyAll()` — not `pgkitNotifyEntities()` — so the remote
+panel's field widgets update as well.  `pgkitNotifyAll` sets
+`_pgkitEntitiesPending` itself, so entities still refresh; the
+dedup at flush time means only fields whose values actually
+changed reach the wire.
+
 SCHEMA PUBLICATION — FIELDS, ACTIONS, LEVELS
 ============================================
 On a `state_request` the kit answers with `state`, `schema`, and
@@ -74,13 +86,6 @@ nested levels or null.  `pgkitDumpEntities` walks every level and
 populates `applies` for each row-scope action by running its
 `appliesTo(item)` predicate once per item.
 
-SELECT COMMAND
-==============
-A `select` command with `{level, name}` is dispatched to
-`pgkitHandleSelect(level, name)`, which each project implements to
-translate into its own selection state.  After a successful select,
-the kit queues an entities refresh.
-
 ACTION PAYLOADS
 ===============
 An action may declare `requires` in its meta: an array of
@@ -98,7 +103,11 @@ active only during `pgkitRemoteApplyPatch`.
 
 PANEL VISIBILITY
 ================
-Presence-driven.
+Presence-driven.  When a remote client is connected, the panel is
+hidden AND the local restore button is hidden.  Without this,
+the restore button (shown when the local user collapsed the
+panel) and the "Controlled remotely" banner both sit at
+`top:12px; left:12px` and overlap.
 """
 
 REMOTE_CLIENT_JS = r"""
@@ -163,10 +172,7 @@ function pgkitRegisterField(name, opts) {
 
 /* ==========================================================================
    REGISTRY — ACTIONS
-   ==========================================================================
-   `scope` is one of "global" | "all" | "selection" | "row".
-   `level` is required for every scope except "global".
-   `appliesTo(item)` is required only for "row" scope. */
+   ========================================================================== */
 
 function pgkitRegisterAction(name, opts) {
   if (!name) throw new Error("pgkitRegisterAction: name required");
@@ -291,8 +297,7 @@ function pgkitDumpEntities() {
    NOTIFICATION
    ==========================================================================
    The notify functions always queue.  Deduplication happens at
-   flush time, against `_pgkitLastSent`.  See the module docstring,
-   CHANGE DEDUPLICATION — FLUSH TIME. */
+   flush time, against `_pgkitLastSent`. */
 
 function pgkitNotifyLocal(name) {
   if (_pgkitApplyingRemote) return;
@@ -459,10 +464,6 @@ function pgkitRemoteHandle(msg) {
         levels: dump.levels,
         order:  dump.order,
       });
-      /* The hub broadcasts this state dump to every peer (not just
-         the requester), so after it every peer holds these values.
-         Update `_pgkitLastSent` accordingly so the next flush
-         dedupes against reality instead of against stale entries. */
       for (const name in values) _pgkitLastSent[name] = values[name];
       break;
     }
@@ -491,9 +492,6 @@ function pgkitRemoteApplyPatch(values) {
       const f = _pgkitRemote.registry[name];
       if (!f || f.isAction) continue;
 
-      /* Record before the equality check: the incoming value is
-         now what the peers believe we hold, whether or not we
-         actually apply it. */
       _pgkitLastSent[name] = values[name];
 
       let cur;
@@ -530,7 +528,7 @@ function pgkitRemoteHandleCommand(msg) {
       if (typeof pgkitHandleSelect === "function") {
         const selOk = pgkitHandleSelect(payload.level, payload.name);
         if (!selOk) { ok = false; error = "select failed"; }
-        else { pgkitNotifyEntities(); }
+        else { pgkitNotifyAll(); }
       } else {
         ok = false;
         error = "no select handler";
@@ -570,11 +568,25 @@ function pgkitRemoteHandleCommand(msg) {
 
 /* ==========================================================================
    PRESENCE → PANEL VISIBILITY
-   ========================================================================== */
+   ==========================================================================
+   Two elements compete for `top:12px; left:12px`: #restoreBtn (shown
+   when the local user collapses the panel) and #remoteBanner (shown
+   when a remote client is connected).  Without coordination both can
+   be visible at once — the restore button stays visible from the
+   user's earlier collapse, the banner appears when the remote
+   connects, and they overlap.
+
+   Resolution: presence wins.  When a remote client is connected the
+   panel is hidden (as before) and #restoreBtn is also hidden — the
+   local user should not be re-opening the panel while a remote is
+   driving.  When the remote disconnects, the panel comes back and
+   the restore button stays hidden (it is only needed when the panel
+   is collapsed). */
 
 function _pgkitUpdatePanelVisibility() {
-  const ui     = document.getElementById("ui");
-  const banner = document.getElementById("remoteBanner");
+  const ui         = document.getElementById("ui");
+  const banner     = document.getElementById("remoteBanner");
+  const restoreBtn = document.getElementById("restoreBtn");
   if (!ui) return;
 
   const hide = _pgkitRemote.connected && _pgkitRemote.remoteCount > 0;
@@ -582,6 +594,7 @@ function _pgkitUpdatePanelVisibility() {
   if (hide) {
     ui.classList.add("collapsed");
     if (banner) banner.classList.add("visible");
+    if (restoreBtn) restoreBtn.classList.remove("visible");
   } else {
     ui.classList.remove("collapsed");
     if (banner) banner.classList.remove("visible");

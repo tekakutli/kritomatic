@@ -1,5 +1,5 @@
 """
-pg_core.py — canvas, view, board state, file model.
+pg_core.py — canvas, view, board state, item model.
 
 A file on the board is:
 
@@ -20,6 +20,34 @@ A file on the board is:
                   wins and refresh no longer touches h.
       color, open, active, modified, missing, kritaName,
     }
+
+HOVER CURSOR — ANY-HIT SHORT-CIRCUIT
+====================================
+`fileHitTest` returns the *topmost* card, which requires sorting by
+`z`.  The hover handler does not need the topmost card; it needs to
+know which cursor to display.  `_hoverCursorAt` is a single linear
+pass that tracks the highest-z corner hit and the highest-z body
+hit, without sorting and without allocation.  The result is one of:
+
+    "grab"                 over the body of any card, or over the
+                           rotate handle of the selected card
+    "nwse-resize"          over a diagonal corner
+    "nesw-resize"          over an anti-diagonal corner
+    "default"              over empty space
+
+`_cardCornersBoard` allocates one 4-element array and calls
+`_rotateOffset` four times; `_hoverCursorAt` adds an O(1)
+centre-and-radius pre-check per card so a card that cannot be under
+the pointer (its rotated AABB does not reach) is skipped before any
+corner arithmetic runs.
+
+THUMBNAIL LOAD COALESCING
+=========================
+Loading a thumbnail fires its own `Image.onload`.  Every onload
+used to call draw() directly; a "Refresh from Krita" that flipped
+ten data-URLs to new thumbnails triggered ten staggered draw()
+calls, each redrawing the whole board — 10x the necessary work.
+`_scheduleDraw` coalesces those into a single rAF.
 """
 
 CORE_JS = r"""
@@ -197,14 +225,33 @@ function bringToTop(idx) {
 
 /* ==========================================================================
    THUMBNAIL CACHE
-   ========================================================================== */
+   ==========================================================================
+   Loading a thumbnail fires its own `Image.onload`.  Every onload
+   used to call draw() directly; a "Refresh from Krita" that flipped
+   ten data-URLs to new thumbnails triggered ten staggered draw()
+   calls, each redrawing the whole board — 10x the necessary work.
+   `_scheduleDraw` coalesces those into a single rAF, so the board
+   redraws once (or twice, if the loads are staggered across frames)
+   instead of N times. */
+
+let _drawScheduled = false;
+
+function _scheduleDraw() {
+  if (_drawScheduled) return;
+  _drawScheduled = true;
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(() => { _drawScheduled = false; draw(); });
+  } else {
+    setTimeout(() => { _drawScheduled = false; draw(); }, 16);
+  }
+}
 
 function ensureThumbLoaded(file) {
   if (!file.thumb) return null;
   if (file.img && file.imgUrl === file.thumb) return file.img;
   const img = new Image();
-  img.onload  = () => draw();
-  img.onerror = () => draw();
+  img.onload  = _scheduleDraw;
+  img.onerror = _scheduleDraw;
   img.src = file.thumb;
   file.img = img;
   file.imgUrl = file.thumb;
@@ -355,6 +402,57 @@ function _resizeCursorFor(corner) {
   return (corner === 0 || corner === 2) ? "nwse-resize" : "nesw-resize";
 }
 
+/* Hover cursor — one pass, no sort, no allocation beyond the small
+   per-card arrays that _fileCornerScreen already allocates.
+   See the module docstring, HOVER CURSOR — ANY-HIT SHORT-CIRCUIT. */
+
+function _hoverCursorAt(sx, sy) {
+  if (rotateHandleHitTest(sx, sy)) return "grab";
+
+  const [bx, by] = s2b(sx, sy);
+
+  let bestCornerZ = -Infinity;
+  let bestCorner  = -1;
+  let bestBodyZ   = -Infinity;
+
+  for (let i = 0; i < board.files.length; i++) {
+    const f = board.files[i];
+    const z = f.z || 0;
+
+    // Fast skip: any point of this rotated card sits within
+    // half-diagonal of its centre in screen space.  If the cursor is
+    // farther than that (plus the hit radius), the corners and body
+    // are unreachable without further arithmetic.  The centre is
+    // computed inline — b2s() would allocate a 2-element array per
+    // card per hover, which adds up on a hover-heavy board.
+    const csx =  (f.x + f.w / 2) * view.zoom + view.panX;
+    const csy = -(f.y + f.h / 2) * view.zoom + view.panY;
+    const halfDiag   = (Math.hypot(f.w, f.h) / 2) * view.zoom;
+    if (Math.hypot(sx - csx, sy - csy) > halfDiag + CARD_HIT_R) {
+      continue;
+    }
+
+    if (z > bestCornerZ) {
+      for (let c = 0; c < 4; c++) {
+        const [cx, cy] = _fileCornerScreen(f, c);
+        if (Math.hypot(sx - cx, sy - cy) <= CARD_HIT_R) {
+          bestCornerZ = z;
+          bestCorner  = c;
+          break;
+        }
+      }
+    }
+
+    if (z > bestBodyZ && _boardPointInCard(f, bx, by)) {
+      bestBodyZ = z;
+    }
+  }
+
+  if (bestCorner >= 0) return _resizeCursorFor(bestCorner);
+  if (bestBodyZ > -Infinity) return "grab";
+  return "default";
+}
+
 /* ==========================================================================
    RESIZE — rotation-aware
    ========================================================================== */
@@ -445,22 +543,12 @@ function removeFile(idx) {
   else if (board.selectedIdx > idx) board.selectedIdx -= 1;
   syncFileList();
   draw();
+  pgkitNotifyAll();
 }
 
 /* ==========================================================================
    RECTANGLE AND POLYGON OVERLAP
-   ==========================================================================
-   _rectsOverlap is the cheap AABB test used for early filters.
-
-   _polygonsOverlap is the actual test between two rotated cards: it
-   returns true iff the two convex quads share any area.  A pair of
-   rotated rects whose AABBs overlap but whose edges do not actually
-   cross is not an overlap, and nothing should be pasted. */
-
-function _rectsOverlap(x1, y1, w1, h1, x2, y2, w2, h2) {
-  return !(x1 + w1 <= x2 || x2 + w2 <= x1 ||
-           y1 + h1 <= y2 || y2 + h2 <= y1);
-}
+   ========================================================================== */
 
 function _pointInPoly(p, poly) {
   let inside = false;
@@ -502,39 +590,9 @@ function _polygonsOverlap(polyA, polyB) {
 
 /* ==========================================================================
    PROJECTION TRANSFORM
-   ==========================================================================
-   Compute the affine map from the SOURCE document's pixel space to
-   the TARGET document's pixel space, taking both cards' positions
-   and rotations into account.
-
-   The chain is:
-
-       A_doc pixels
-           → A card's local unrotated frame    (scale + offset)
-           → board space                       (rotate by A, translate)
-           → B card's local unrotated frame    (translate, rotate by -B)
-           → B_doc pixels                      (scale + offset)
-
-   Both the source and the target images are stretched on the board
-   to fill their cards; if the card's aspect has been changed away
-   from the document's, that stretch is baked into the transform.
-   Whatever the user sees overlapping on the board is what ends up
-   pasted into the target document.
-
-   The result is a 2×3 affine map in column-vector form:
-
-       [x_B]   [a c e] [x_A]
-       [y_B] = [b d f] [y_A]
-       [ 1 ]   [0 0 1] [ 1 ]
-
-   The daemon builds a QTransform out of (a, b, c, d, e, f) and
-   applies it to the source document's composite.  QTransform's
-   constructor takes (m11, m12, m13, m21, m22, m23, m31, m32, m33);
-   mapping to our (a..f) means m11=a, m12=b, m21=c, m22=d, m31=e,
-   m32=f, and the rest zero/one. */
+   ========================================================================== */
 
 function _mat3mul(A, B) {
-  // Column-vector 3×3 multiply: returns A · B.
   const C = [[0,0,0],[0,0,0],[0,0,0]];
   for (let i = 0; i < 3; i++) {
     for (let j = 0; j < 3; j++) {
@@ -558,32 +616,21 @@ function _buildProjectionTransform(A, B) {
   const cosA = Math.cos(A.rotation), sinA = Math.sin(A.rotation);
   const cosB = Math.cos(B.rotation), sinB = Math.sin(B.rotation);
 
-  // A_doc → A_local:  scale by (Aw/A_W, Ah/A_H), then translate by
-  // (-Aw/2, -Ah/2), so A_doc (0,0) → A_local (-Aw/2, -Ah/2).
   const M1 = [
     [Aw / A_W,        0, -Aw / 2],
     [       0, Ah / A_H, -Ah / 2],
     [       0,        0,       1],
   ];
-
-  // A_local → board:  rotate by A.rotation, then translate by
-  // (A_cx, A_cy).
   const M2 = [
     [cosA, -sinA, A_cx],
     [sinA,  cosA, A_cy],
     [   0,     0,    1],
   ];
-
-  // board → B_local:  translate by (-B_cx, -B_cy), then rotate by
-  // -B.rotation.
   const M3 = [
     [ cosB, sinB, -cosB * B_cx - sinB * B_cy],
     [-sinB, cosB,  sinB * B_cx - cosB * B_cy],
     [    0,    0,                          1],
   ];
-
-  // B_local → B_doc:  translate by (Bw/2, Bh/2), then scale by
-  // (B_W/Bw, B_H/Bh).
   const M4 = [
     [B_W / Bw,        0, B_W / 2],
     [       0, B_H / Bh, B_H / 2],
@@ -602,17 +649,7 @@ function _buildProjectionTransform(A, B) {
 
 /* ==========================================================================
    OVERLAP REGIONS
-   ==========================================================================
-   Given the currently-selected file A, find every other file B whose
-   card's rotated rectangle overlaps A's, and compute for each the
-   affine transform that maps A's document pixels to B's.
-
-   Overlap is decided on the actual rotated quads, not on their
-   AABBs: two cards whose bounding boxes overlap but whose edges do
-   not cross have no visual overlap and nothing should be pasted.
-
-   Closed targets are counted (they cannot receive a paste) and
-   reported; the caller surfaces the count in the status line. */
+   ========================================================================== */
 
 function computeProjectionRegions() {
   if (board.selectedIdx < 0 || board.selectedIdx >= board.files.length) {

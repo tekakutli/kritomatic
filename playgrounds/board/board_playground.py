@@ -4,26 +4,25 @@ knows about on a single canvas.
 
     python board_playground.py     → writes board_playground.html and serves it
 
-The board persists a list of file paths — the .kra files the user
-wants on the board — and lays one card per file.  Loading a board
-opens the missing files in Krita; refreshing asks Krita which of the
-board's files are currently open, and updates the cards accordingly.
-Files closed in Krita stay on the board, marked closed, ready to be
-re-opened from the panel.
-
-No polling anywhere.  Every state transition is a manual action:
-open the browser, press R, click a card, click the panel button.
+After the pgkit migration the whole server side of this project is
+one `pgkit.server.serve(...)` call with a JSON routes dict and a
+raw-body routes dict, matching the shape of text_playground.py and
+pair_playground.py.
 """
 
 import os
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+_PARENT = os.path.dirname(_HERE)
+for _p in (_HERE, _PARENT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import board_html
 import board_server
+
+from pgkit.server import serve as kit_serve
 
 
 HTML_FILE    = "board_playground.html"
@@ -43,13 +42,16 @@ def main():
     print(f"                 scroll to zoom · drag empty space to pan ·")
     print(f"                 R refresh · G grid · F fit · O open all ·")
     print(f"                 P project overlaps · H toggle panel")
+    print(f"  remote api   : ws://127.0.0.1:{PORT}/remote")
 
     if SERVE:
         print()
-        board_server.serve(
+        kit_serve(
             port         = PORT,
             open_browser = OPEN_BROWSER,
             html_file    = HTML_FILE,
+            routes       = board_server.ROUTES,
+            raw_routes   = board_server.RAW_ROUTES,
         )
     else:
         print(f"  open : file://{os.path.abspath(HTML_FILE)}")

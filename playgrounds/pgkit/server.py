@@ -9,6 +9,21 @@ the canonical example — are registered as a dict of
 `path -> handler(payload) -> response_dict` and dispatched through
 the same handler class.
 
+RAW-BODY ROUTES
+===============
+The `raw_routes` dict handles POSTs that carry non-JSON bodies
+(file uploads, binary payloads, `application/octet-stream`).  Each
+entry is `path -> handler(headers: dict, body: bytes) ->
+response_dict`.  The handler is responsible for its own parsing;
+`serve()` reads the body off the socket and hands it over
+unmodified.  The response dict is JSON-serialised exactly as for a
+JSON route, so the caller sees the same shape either way.
+
+Raw routes take precedence over JSON routes when both declare the
+same path.  Registering a path twice is a project-side bug, not a
+kit-side one — the last dict definition wins at Python level, and
+raw-before-JSON ordering just makes the intent explicit.
+
 Port selection is the same loop the pair and cone servers use: try
 `port`, `port + 1`, …, `port + 19`, take the first free one.
 Opening the browser is optional and off a short timer so the
@@ -28,9 +43,16 @@ from .remote_hub import Client, Hub, handle_message
 
 def serve(*, port=8766, open_browser=True,
           html_file="playground.html",
-          routes=None, hub=None):
-    """Start the HTTP + WebSocket server and block until Ctrl+C."""
-    routes = routes or {}
+          routes=None, raw_routes=None, hub=None):
+    """Start the HTTP + WebSocket server and block until Ctrl+C.
+
+    `routes` is `path -> handler(payload: dict) -> response_dict` for
+    JSON POSTs.  `raw_routes` is `path -> handler(headers: dict,
+    body: bytes) -> response_dict` for binary POSTs.  Both are
+    optional; a project supplies only what it needs.
+    """
+    routes     = routes or {}
+    raw_routes = raw_routes or {}
     if hub is None:
         hub = Hub()
 
@@ -49,6 +71,9 @@ def serve(*, port=8766, open_browser=True,
             super().do_GET()
 
         def do_POST(self):
+            if self.path in raw_routes:
+                self._handle_raw_post(raw_routes[self.path])
+                return
             handler = routes.get(self.path)
             if handler is None:
                 self.send_error(404)
@@ -65,6 +90,30 @@ def serve(*, port=8766, open_browser=True,
                 return
             try:
                 result = handler(payload)
+            except Exception as e:
+                traceback.print_exc()
+                result = {
+                    "success": False,
+                    "message": "Server error: %s" % e,
+                }
+            self._send_json(200, result)
+
+        def _handle_raw_post(self, handler):
+            """Read the body off the socket as raw bytes; hand it to
+            the caller with the request headers.  The body is not
+            decoded, parsed, or validated; that is the handler's
+            problem."""
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length) if length else b""
+            except Exception as e:
+                self._send_json(400, {
+                    "success": False,
+                    "message": "Bad request: %s" % e,
+                })
+                return
+            try:
+                result = handler(dict(self.headers), body)
             except Exception as e:
                 traceback.print_exc()
                 result = {

@@ -1,134 +1,25 @@
 """
-pg_base.py — palette, stylesheet, HTML head, bootstrap.
+pg_base.py — board's project CSS and panel content.
 
-The panel has two Krita-facing sync actions (Refresh, Retrieve open),
-one disk-facing add action (+ Add files…), one Krita-open action (Open
-all), one content-transfer action (Project overlaps), two layout
-actions, one view reset, a card-width slider, two per-card scrub
-inputs (Scale, Rotation), a file list, and a save/load row.
+The shared shell (head, panel wrapper, status line, restore button,
+"controlled remotely" banner, `<canvas>`) is provided by
+`pgkit.html_shell.page()`.  This file supplies:
 
-The Scale and Rotation fields follow the selected card: they grey out
-when nothing is selected, and reflect the selected card's own values
-otherwise.  Both support scrub-drag; Rotation snaps to 15° with
-Shift held.
+    PG_CSS          board-specific CSS beyond pgkit's SHELL_CSS:
+                    the file-row list, the coloured accent buttons,
+                    the drop overlay.
 
-Dropping files from the OS onto the page is treated exactly like
-picking them through "+ Add files…": the same code path adds the
-path to the board, then a normal refresh runs.  A translucent
-overlay appears while a drag is hovering over the page.
+    PG_PANEL_BODY   the panel's field groups, lists, and buttons.
+
+The drop overlay is created by JS on load (see pg_krita.py) rather
+than sitting in the panel body.  It needs to be a sibling of
+`<canvas>`, not a child of `#ui` — a child would inherit the
+panel's `display: none` when a remote client connects, hiding the
+drop target exactly when someone on the playground machine wants
+to drop a file.
 """
 
-HTML_HEAD = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Board — files on a canvas</title>
-<style>
-  html, body {
-    margin:0; padding:0; height:100%; overflow:hidden;
-    background:#0a0e14; color:#dce6f2;
-    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas',
-                 'SF Mono', monospace;
-  }
-
-  #ui {
-    position:absolute; top:12px; left:12px; z-index:10;
-    background:#0b1018;
-    padding:12px 14px;
-    border:1px solid #1e2836;
-    border-radius:3px;
-    box-shadow:0 6px 28px rgba(0,0,0,0.65);
-    font-size:11px; color:#a8b5c4;
-    user-select:none;
-    width:320px; box-sizing:border-box;
-  }
-  #ui.collapsed { display:none; }
-
-  #ui h3 {
-    display:flex; align-items:center; gap:6px;
-    margin:0 0 10px; padding:0 0 8px;
-    border-bottom:1px solid #1e2836;
-    font-size:11px; font-weight:700;
-    letter-spacing:0.16em; text-transform:uppercase;
-    color:#dce6f2;
-  }
-
-  #ui .field { display:flex; align-items:center; gap:8px; margin:7px 0; }
-  #ui .field label {
-    flex:0 0 88px;
-    font-size:9px; color:#5a6774;
-    letter-spacing:0.14em; text-transform:uppercase;
-    font-weight:700;
-  }
-  #ui .field input[type=range] {
-    flex:1 1 auto; min-width:0;
-    accent-color:#00e5ff;
-  }
-  #ui .field .val {
-    flex:0 0 44px;
-    font-size:11px; color:#00e5ff;
-    text-align:right; font-weight:700;
-    font-variant-numeric: tabular-nums;
-  }
-
-  /* Scrub input: a text field the user drags horizontally to change.
-     Clicking once focuses it for typing; dragging sideways scrubs. */
-  #ui .field input.scrubInput {
-    flex:1 1 auto;
-    min-width:0;
-    background:transparent;
-    border:0;
-    border-bottom:1px solid #223040;
-    color:#00e5ff;
-    font-family:inherit;
-    font-size:12px;
-    font-weight:700;
-    font-variant-numeric: tabular-nums;
-    text-align:right;
-    padding:2px 4px;
-    margin:0;
-    outline:none;
-    cursor:ew-resize;
-    user-select:none;
-    transition: border-color 0.1s ease;
-  }
-  #ui .field input.scrubInput:hover {
-    border-bottom-color:#34445a;
-  }
-  #ui .field input.scrubInput:focus {
-    border-bottom-color:#00e5ff;
-    cursor:text;
-    user-select:text;
-  }
-  #ui .field input.scrubInput:disabled {
-    color:#3d4756;
-    border-bottom-color:#1e2836;
-    cursor:not-allowed;
-  }
-
-  #ui .row { display:flex; gap:6px; margin:6px 0; }
-  #ui .row button { flex:1 1 auto; }
-
-  #ui button {
-    padding:5px 10px; cursor:pointer;
-    border:1px solid #223040; background:transparent;
-    color:#b8c4d2; border-radius:2px;
-    font-family:inherit; font-size:10px;
-    letter-spacing:0.10em; text-transform:uppercase;
-    font-weight:700;
-    transition: background 0.08s ease, border-color 0.08s ease;
-  }
-  #ui button:hover {
-    border-color:#34445a; color:#dce6f2;
-    background:rgba(220,230,242,0.03);
-  }
-  #ui button:active { background:rgba(220,230,242,0.07); }
-  #ui button:disabled {
-    color:#3d4756;
-    border-color:#1e2836;
-    cursor:not-allowed;
-  }
-
+PG_CSS = r"""
   #ui button#refreshBtn {
     border-color: rgba(0, 229, 255, 0.72);
     color: #b8ecff;
@@ -138,7 +29,6 @@ HTML_HEAD = r"""<!DOCTYPE html>
     background: rgba(0, 229, 255, 0.10);
     color: #d8f4ff;
   }
-
   #ui button#retrieveBtn {
     border-color: rgba(120, 220, 255, 0.72);
     color: #b8ecff;
@@ -148,7 +38,6 @@ HTML_HEAD = r"""<!DOCTYPE html>
     background: rgba(120, 220, 255, 0.10);
     color: #d8f4ff;
   }
-
   #ui button#openAllBtn {
     border-color: rgba(255, 200, 90, 0.72);
     color: #ffd89b;
@@ -158,7 +47,6 @@ HTML_HEAD = r"""<!DOCTYPE html>
     background: rgba(255, 200, 90, 0.10);
     color: #ffe6b8;
   }
-
   #ui button#projectBtn {
     border-color: rgba(255, 130, 210, 0.72);
     color: #ffb0e6;
@@ -168,8 +56,6 @@ HTML_HEAD = r"""<!DOCTYPE html>
     background: rgba(255, 130, 210, 0.10);
     color: #ffd0f0;
   }
-
-  #ui hr { border:0; border-top:1px solid #1e2836; margin:10px 0; }
 
   .fileList {
     display:flex; flex-direction:column;
@@ -184,7 +70,6 @@ HTML_HEAD = r"""<!DOCTYPE html>
     font-size:10px; color:#3d4756;
     font-style:italic; padding:3px 4px;
   }
-
   .fileRow {
     display:flex; align-items:center; gap:7px;
     padding:3px 6px;
@@ -215,7 +100,6 @@ HTML_HEAD = r"""<!DOCTYPE html>
     border-color: rgba(232, 160, 168, 0.85);
     color: #e8a0a8;
   }
-
   .fileSwatch {
     width:9px; height:9px;
     border-radius:1px;
@@ -234,7 +118,6 @@ HTML_HEAD = r"""<!DOCTYPE html>
   .fileState.open    { color:#00e5ff; }
   .fileState.closed  { color:#5a6774; }
   .fileState.missing { color:#d48590; }
-
   .fileAct {
     width:auto !important;
     padding:1px 7px !important;
@@ -266,36 +149,6 @@ HTML_HEAD = r"""<!DOCTYPE html>
     color:#e8a0a8 !important;
   }
 
-  #status {
-    margin-top:10px; padding-top:8px;
-    border-top:1px solid #1e2836;
-    font-size:10px; color:#7b8794;
-    min-height:14px;
-    font-variant-numeric: tabular-nums;
-    overflow-wrap:anywhere; line-height:1.5;
-  }
-  #status.ok   { color:#00e5ff; }
-  #status.bad  { color:#d48590; }
-  #status.warn { color:#ffe600; }
-
-  canvas { display:block; touch-action:none; background:#0a0e14; }
-
-  #restoreBtn {
-    position:absolute; top:12px; left:12px; z-index:10;
-    display:none;
-    padding:6px 12px; cursor:pointer;
-    border:1px solid #1e2836; background:#0b1018;
-    border-radius:3px; box-shadow:0 6px 28px rgba(0,0,0,0.65);
-    font-family:inherit;
-    font-size:10px; font-weight:700; letter-spacing:0.10em;
-    text-transform:uppercase; color:#a8b5c4;
-  }
-  #restoreBtn:hover { border-color:#34445a; color:#dce6f2; }
-  #restoreBtn.visible { display:block; }
-
-  /* Drop overlay: shown while a filesystem drag is hovering over
-     the page.  pointer-events:none so the dragleave event isn't
-     swallowed by this layer. */
   #dropOverlay {
     position:fixed; inset:0; z-index:100;
     display:none;
@@ -304,152 +157,92 @@ HTML_HEAD = r"""<!DOCTYPE html>
     box-sizing:border-box;
     pointer-events:none;
     align-items:center; justify-content:center;
-    font-family:inherit; font-size:14px; font-weight:700;
+    font-family:'JetBrains Mono','Fira Code','Consolas','SF Mono',
+                 monospace;
+    font-size:14px; font-weight:700;
     color:#b8ecff;
     letter-spacing:0.16em; text-transform:uppercase;
     text-shadow:0 0 12px rgba(0,229,255,0.55);
   }
   #dropOverlay.visible { display:flex; }
-</style>
-</head>
-<body>
-
-<div id="ui">
-  <h3>Board
-    <button id="collapseBtn" title="Collapse (H)"
-      style="margin-left:auto; width:auto; padding:0 6px;
-             height:20px; font-size:11px; line-height:1;">−</button>
-  </h3>
-
-  <div class="row">
-    <button id="refreshBtn" title="Ask Krita which of the board's files are open (R)">
-      Refresh from Krita
-    </button>
-  </div>
-
-  <div class="row">
-    <button id="addFilesBtn" title="Pick .kra (or other image) files to put on the board">
-      + Add files…
-    </button>
-    <button id="retrieveBtn" title="Add every document currently open in Krita to the board">
-      Retrieve open
-    </button>
-  </div>
-
-  <div class="row">
-    <button id="openAllBtn" title="Open every closed file in Krita (O)">
-      Open all
-    </button>
-  </div>
-
-  <div class="row">
-    <button id="projectBtn" title="Copy the selected card's overlapping region into every overlapped Krita document as a new layer (P)">
-      Project overlaps
-    </button>
-  </div>
-
-  <div class="row">
-    <button id="gridBtn"  title="Rearrange cards into a grid (G)">Arrange grid</button>
-    <button id="fitBtn"   title="Fit every card in view (F)">Fit</button>
-  </div>
-
-  <div class="row">
-    <button id="resetBtn" title="Reset zoom and pan to the origin">Reset view</button>
-  </div>
-
-  <hr>
-
-  <div class="field">
-    <label>Card width</label>
-    <input type="range" id="cardWSlider"
-           min="120" max="720" step="10" value="320"
-           title="Reference width for the board.  Existing cards are
-                  rescaled proportionally, so their relative sizes
-                  are preserved.">
-    <span class="val" id="cardWVal">320</span>
-  </div>
-
-  <div class="field">
-    <label>Scale</label>
-    <input type="text" id="cardScaleVal" class="scrubInput"
-           value="—" autocomplete="off" spellcheck="false" disabled
-           title="Selected card's scale relative to the reference width.
-                  Drag sideways to scrub; hold Shift to snap.">
-  </div>
-
-  <div class="field">
-    <label>Rotation</label>
-    <input type="text" id="cardRotVal" class="scrubInput"
-           value="—" autocomplete="off" spellcheck="false" disabled
-           title="Selected card's rotation in degrees.  Drag sideways
-                  to scrub; hold Shift to snap to 15°.">
-  </div>
-
-  <hr>
-
-  <div class="field" style="margin-bottom:2px;">
-    <label>Files</label>
-    <button id="clearBtn"
-            title="Empty the board.  Does not touch Krita."
-            style="flex:0 0 auto;">Clear</button>
-  </div>
-  <div id="fileList" class="fileList"></div>
-
-  <hr>
-
-  <div class="row">
-    <button id="saveSceneBtn">Save board</button>
-    <button id="loadSceneBtn">Load board</button>
-  </div>
-
-  <div id="status">ready</div>
-</div>
-
-<button id="restoreBtn" title="Show panel (H)">☰ Show panel</button>
-
-<canvas id="c"></canvas>
-
-<div id="dropOverlay">Drop files to add them to the board</div>
 """
 
 
-HTML_TAIL = r"""</script>
-</body>
-</html>
-"""
+PG_PANEL_BODY = r"""
+    <div class="row">
+      <button id="refreshBtn" title="Ask Krita which of the board's files are open (R)">
+        Refresh from Krita
+      </button>
+    </div>
 
+    <div class="row">
+      <button id="addFilesBtn" title="Pick .kra (or other image) files to put on the board">
+        + Add files…
+      </button>
+      <button id="retrieveBtn" title="Add every document currently open in Krita to the board">
+        Retrieve open
+      </button>
+    </div>
 
-BOOT_JS = r"""
-(function installShellControls() {
-  const ui          = document.getElementById("ui");
-  const restoreBtn  = document.getElementById("restoreBtn");
-  const collapseBtn = document.getElementById("collapseBtn");
+    <div class="row">
+      <button id="openAllBtn" title="Open every closed file in Krita (O)">
+        Open all
+      </button>
+    </div>
 
-  const collapse = () => {
-    ui.classList.add("collapsed");
-    restoreBtn.classList.add("visible");
-  };
-  const restore = () => {
-    ui.classList.remove("collapsed");
-    restoreBtn.classList.remove("visible");
-  };
+    <div class="row">
+      <button id="projectBtn" title="Copy the selected card's overlapping region into every overlapped Krita document as a new layer (P)">
+        Project overlaps
+      </button>
+    </div>
 
-  collapseBtn.addEventListener("click", collapse);
-  restoreBtn.addEventListener("click", restore);
+    <div class="row">
+      <button id="gridBtn"  title="Rearrange cards into a grid (G)">Arrange grid</button>
+      <button id="fitBtn"   title="Fit every card in view (F)">Fit</button>
+    </div>
 
-  window.addEventListener("keydown", (e) => {
-    const t = e.target;
-    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
-    if (e.key === "h" || e.key === "H") {
-      if (ui.classList.contains("collapsed")) restore();
-      else                                     collapse();
-    }
-  });
-})();
+    <div class="row">
+      <button id="resetBtn" title="Reset zoom and pan to the origin">Reset view</button>
+    </div>
 
-syncPanelSliders();
-syncFileList();
-resize();
+    <hr>
 
-refreshFromKrita();
+    <div class="field">
+      <label>Card width</label>
+      <input type="range" id="cardWSlider"
+             min="120" max="720" step="10" value="320"
+             title="Reference width for the board.  Existing cards are rescaled proportionally, so their relative sizes are preserved.">
+      <span class="val" id="cardWVal">320</span>
+    </div>
+
+    <div class="field">
+      <label>Scale</label>
+      <input type="text" id="cardScaleVal" class="scrubInput"
+             value="—" autocomplete="off" spellcheck="false" disabled
+             title="Selected card's scale relative to the reference width. Drag sideways to scrub; hold Shift to snap.">
+    </div>
+
+    <div class="field">
+      <label>Rotation</label>
+      <input type="text" id="cardRotVal" class="scrubInput"
+             value="—" autocomplete="off" spellcheck="false" disabled
+             title="Selected card's rotation in degrees.  Drag sideways to scrub; hold Shift to snap to 15°.">
+    </div>
+
+    <hr>
+
+    <div class="field" style="margin-bottom:2px;">
+      <label>Files</label>
+      <button id="clearBtn"
+              title="Empty the board.  Does not touch Krita."
+              style="flex:0 0 auto;">Clear</button>
+    </div>
+    <div id="fileList" class="fileList"></div>
+
+    <hr>
+
+    <div class="row">
+      <button id="saveSceneBtn">Save board</button>
+      <button id="loadSceneBtn">Load board</button>
+    </div>
 """

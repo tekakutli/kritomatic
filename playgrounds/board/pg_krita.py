@@ -5,9 +5,36 @@ Every caught error and every unhandled error or rejection is also
 POSTed to /log on the local server, so it appears on the same
 terminal that serves the board.  The browser console keeps the
 original error; the terminal gets a copy.
+
+DROP PAYLOAD — RAW BYTES
+=======================
+The `/krita/drop_file` endpoint receives the file's raw bytes; the
+filename travels in the X-Filename header (URL-encoded).  This is
+the pre-migration wire format; `pgkit.server.serve()` gained
+`raw_routes` support precisely so board could keep it.
+
+DROP OVERLAY — CREATED VIA JS
+=============================
+The overlay div needs to be a sibling of `<canvas>`, not a child of
+`#ui`, so a remote client connecting (which hides the panel via the
+presence rule) does not hide the drop target.  pgkit's page() has
+no slot for post-canvas elements, so the overlay is created by
+`installDropOverlay`, which runs synchronously on script execution.
 """
 
 KRITA_JS = r"""
+/* ==========================================================================
+   DROP OVERLAY — CREATED HERE
+   ========================================================================== */
+
+(function installDropOverlay() {
+  if (document.getElementById("dropOverlay")) return;
+  const el = document.createElement("div");
+  el.id = "dropOverlay";
+  el.textContent = "Drop files to add them to the board";
+  document.body.appendChild(el);
+})();
+
 /* ==========================================================================
    ERROR REPORTING
    ========================================================================== */
@@ -185,10 +212,10 @@ async function retrieveOpenFromKrita() {
    MERGE POLICY
    ==========================================================================
    On refresh, a card that the user has never resized by hand keeps
-   its height locked to width · aspect, so it mirrors the document's
-   own proportions.  Once the user has dragged a corner on the card
-   (`userSized === true`), the user's size wins and refresh only
-   updates metadata. */
+   its height locked to width · aspect.  Once the user has dragged a
+   corner (`userSized === true`), the user's size wins.
+
+   Ends with pgkitNotifyAll() so every registered field is re-read. */
 
 function mergeIncoming(payload) {
   const results = payload.results || [];
@@ -215,8 +242,6 @@ function mergeIncoming(payload) {
         f.docWidth  = doc.width;
         f.docHeight = doc.height;
         f.aspect    = doc.height / doc.width;
-        // Preserve the user's size once they have set it.  Until
-        // then, the card mirrors its document's own proportions.
         if (!f.userSized) {
           f.h = Math.round(f.w * f.aspect);
         }
@@ -228,6 +253,8 @@ function mergeIncoming(payload) {
       f.missing  = !!r.missing;
     }
   }
+
+  pgkitNotifyAll();
 }
 
 /* ==========================================================================
@@ -364,7 +391,11 @@ async function pickFilesViaServer() {
     statusEl.className   = "";
   }
   try {
-    const res = await fetch("/krita/pick_files", { method: "POST" });
+    const res = await fetch("/krita/pick_files", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
     const payload = await res.json();
     if (!payload || !payload.success) {
       const msg = (payload && payload.message) ? payload.message : "unknown";
@@ -400,34 +431,28 @@ async function pickFilesViaServer() {
 /* ==========================================================================
    DROPPED FILES
    ==========================================================================
-   Called from the drop handler in pg_dispatch.py.  Two paths:
+   Two paths:
 
-     * Some browser contexts (Electron, some Chromium builds, file://
-       pages with the right permissions) expose the original
-       filesystem path on the File object.  When they do, use it
-       directly — that is the true source, and Krita can open it
-       as-is.
+     * Some browser contexts (Electron, some Chromium builds) expose
+       the original filesystem path on the File object.  When they
+       do, use it directly.
 
      * Standard browsers strip the path.  In that case the bytes are
-       streamed to the local server via /krita/drop_file, which saves
-       them under board_drops/ next to the module and returns the
-       saved path.  That path is what goes on the board.
-
-   Either way the return value is the same: true if a card was added
-   (or reused), false otherwise.  The caller runs a single refresh
-   afterwards to pick up open/thumbnail state. */
+       streamed to the local server via /krita/drop_file (a raw-body
+       POST — see board_server.handle_drop_file), saved under
+       board_drops/ next to the module, and the saved path goes on
+       the board.  The filename travels in the X-Filename header,
+       URL-encoded, because header values cannot contain arbitrary
+       bytes. */
 
 async function importDroppedFile(file) {
   if (!file) return false;
 
-  // Preferred case: the browser knows the real path.
   if (typeof file.path === "string" && file.path) {
     const idx = addFileByPath(file.path);
     return idx >= 0;
   }
 
-  // Fallback: stream the bytes to the server, which stores them and
-  // returns the on-disk path it used.
   let res;
   try {
     res = await fetch("/krita/drop_file", {
@@ -463,16 +488,7 @@ async function importDroppedFile(file) {
 
 /* ==========================================================================
    PROJECT OVERLAPS
-   ==========================================================================
-   Sends one batch of transform-based paste commands.  Each command
-   tells the daemon: "take this document, apply this affine map, and
-   paste the result into that document".  The daemon composites the
-   source, transforms it, clips to the target's canvas, and adds the
-   result as a new paint layer.
-
-   On failure, the first error message is shown on the status line
-   and the full response is logged to the console.  The same messages
-   appear on the terminal that serves the board. */
+   ========================================================================== */
 
 async function projectSelectedOntoOverlaps() {
   try {

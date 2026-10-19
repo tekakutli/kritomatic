@@ -25,8 +25,7 @@ TWO INPUT FORMS
         opaque `text_board.html`.
 
         Prefer this form whenever the project already knows its
-        source files; pair is the only caller still using the legacy
-        form because it was written before the split.
+        source files.
 
 SYNTAX CHECK
 ============
@@ -49,8 +48,7 @@ A `JsSyntaxError` raised by either check propagates to the caller
 uncaught.  The caller decides whether to attribute, print, or exit
 — `text_board_html.render()` does all three.
 
-`check_syntax=False` disables both checks.  Only use it when the
-caller knows better, which in practice means never.
+`check_syntax=False` disables both checks.
 
 The shell does NOT emit a help button.  An earlier revision did, and
 it was dead on every project that used `page()` without also wiring

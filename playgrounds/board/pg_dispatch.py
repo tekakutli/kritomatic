@@ -9,20 +9,16 @@ Four drag modes, mutually exclusive:
     dragFile     rotate the card (drag on the rotate handle;
                  mode="rotate")
 
-The rotate handle is offered only on the selected card and sits
-above its top edge.  During a rotate drag, holding Shift snaps the
-rotation to 15° increments.  During a resize drag, holding Shift
-preserves the card's aspect ratio as it was at drag start.
+MOUSEMOVE FAST PATH
+===================
+`draw()` runs only when the canvas is actually going to change:
+during a card drag, during a canvas pan, on wheel zoom, on mouseup
+after a drag, and on every model mutation.
 
-Keyboard: R refresh, G grid, F fit, O open-all-missing, P project
-overlaps, H toggle panel.
-
-Filesystem drops: dragging a file (or several) from the OS onto the
-page imports each one exactly like the "+ Add files…" button — the
-path (or the saved copy for browsers that hide it) goes onto the
-board and a normal refresh runs afterwards.  A translucent overlay
-appears while a drag hovers over the page so the drop target is
-obvious.
+Pure hover — the mouse moving over the canvas with no button held —
+only updates the CSS cursor style.  `_hoverCursorAt` (see
+pg_core.py) is a single linear pass; `_setCursor` writes
+`style.cursor` only when the value actually differs.
 """
 
 DISPATCH_JS = r"""
@@ -33,6 +29,13 @@ const state = {
   dragFile:   null,
   mouse:      { sx: 0, sy: 0, inside: false },
 };
+
+let _lastCursor = "default";
+function _setCursor(c) {
+  if (c === _lastCursor) return;
+  canvas.style.cursor = c;
+  _lastCursor = c;
+}
 
 /* ==========================================================================
    DRAW
@@ -67,8 +70,10 @@ function updateStatus() {
   ];
   if (miss) parts.push(miss + " missing");
   parts.push("zoom " + (view.zoom * 100).toFixed(0) + "%");
-  el.textContent = parts.join("  ·  ");
-  el.className = "";
+  const text = parts.join("  ·  ");
+  if (el.textContent !== text) el.textContent = text;
+  const cls = "";
+  if (el.className !== cls) el.className = cls;
 }
 
 /* ==========================================================================
@@ -94,7 +99,7 @@ canvas.addEventListener("mousedown", (e) => {
       startRotation: f.rotation,
       moved:    false,
     };
-    canvas.style.cursor = "grabbing";
+    _setCursor("grabbing");
     draw();
     return;
   }
@@ -107,10 +112,6 @@ canvas.addEventListener("mousedown", (e) => {
     const f = board.files[cornerHit.idx];
     f.userSized = true;
 
-    // Anchor: the diagonally-opposite corner in world space.  Its
-    // offset from the centre, in the card's unrotated frame, is
-    // (−dsx · w/2, −dsy · h/2); rotate that offset by the card's
-    // rotation to get the world offset.
     const [dsx, dsy] = CORNER_SIGNS[cornerHit.corner];
     const cx = f.x + f.w / 2;
     const cy = f.y + f.h / 2;
@@ -131,7 +132,7 @@ canvas.addEventListener("mousedown", (e) => {
       startSy:     sy,
       moved:       false,
     };
-    canvas.style.cursor = _resizeCursorFor(cornerHit.corner);
+    _setCursor(_resizeCursorFor(cornerHit.corner));
     syncFileList();
     draw();
     return;
@@ -152,7 +153,7 @@ canvas.addEventListener("mousedown", (e) => {
       startFileY: f.y,
       moved:      false,
     };
-    canvas.style.cursor = "grabbing";
+    _setCursor("grabbing");
     syncFileList();
     draw();
     return;
@@ -166,7 +167,7 @@ canvas.addEventListener("mousedown", (e) => {
     startPanX: view.panX,
     startPanY: view.panY,
   };
-  canvas.style.cursor = "grabbing";
+  _setCursor("grabbing");
   syncFileList();
   draw();
 });
@@ -205,35 +206,31 @@ window.addEventListener("mousemove", (e) => {
         f.y = df.startFileY + dy / view.zoom;
       }
     }
-  } else if (state.dragCanvas) {
+    draw();
+    return;
+  }
+
+  if (state.dragCanvas) {
     const dc = state.dragCanvas;
     view.panX = dc.startPanX + (sx - dc.startSx);
     view.panY = dc.startPanY + (sy - dc.startSy);
-  } else {
-    // Idle: pick the cursor that matches what a mousedown here would
-    // start.  Rotate handle over corner over body over empty.
-    if (rotateHandleHitTest(sx, sy)) {
-      canvas.style.cursor = "grab";
-    } else {
-      const cornerHit = fileCornerHitTest(sx, sy);
-      if (cornerHit) {
-        canvas.style.cursor = _resizeCursorFor(cornerHit.corner);
-      } else if (fileHitTest(sx, sy) >= 0) {
-        canvas.style.cursor = "grab";
-      } else {
-        canvas.style.cursor = "default";
-      }
-    }
+    draw();
+    return;
   }
 
-  draw();
+  // Pure hover: only the CSS cursor style changes.
+  _setCursor(_hoverCursorAt(sx, sy));
 });
 
 window.addEventListener("mouseup", () => {
+  const hadDrag = !!(state.dragFile || state.dragCanvas);
   state.dragFile   = null;
   state.dragCanvas = null;
-  canvas.style.cursor = "default";
-  draw();
+  _setCursor("default");
+  if (hadDrag) {
+    pgkitNotifyAll();
+    draw();
+  }
 });
 
 canvas.addEventListener("wheel", (e) => {
@@ -249,6 +246,9 @@ canvas.addEventListener("wheel", (e) => {
   view.panX = mx - bx * view.zoom;
   view.panY = my - by * view.zoom;
 
+  pgkitNotifyLocal("view.zoom");
+  pgkitNotifyLocal("view.panX");
+  pgkitNotifyLocal("view.panY");
   draw();
 }, { passive: false });
 
@@ -276,110 +276,6 @@ window.addEventListener("keydown", (e) => {
       e.preventDefault();
       removeFile(board.selectedIdx);
     }
-  }
-});
-
-canvas.style.cursor = "default";
-
-/* ==========================================================================
-   FILESYSTEM DROP
-   ==========================================================================
-   Dragging files from the OS onto the page is treated exactly like
-   clicking "+ Add files…": every dropped file is added to the board
-   through importDroppedFile() (which resolves a real path when the
-   browser exposes one, and otherwise uploads the bytes to the local
-   server), then a single refresh pulls state from Krita.
-
-   A drag-depth counter keeps the overlay visible while the pointer
-   is over any descendant of the window — dragleave fires every time
-   the pointer crosses an element boundary, so we increment on
-   dragenter and decrement on dragleave, and only hide the overlay
-   once the depth reaches zero. */
-
-let _dropDepth = 0;
-
-function _hasFiles(dt) {
-  if (!dt) return false;
-  const types = dt.types || [];
-  for (let i = 0; i < types.length; i++) {
-    if (types[i] === "Files") return true;
-  }
-  return false;
-}
-
-function _dropOverlay() {
-  return document.getElementById("dropOverlay");
-}
-
-window.addEventListener("dragenter", (e) => {
-  if (!_hasFiles(e.dataTransfer)) return;
-  e.preventDefault();
-  _dropDepth++;
-  const o = _dropOverlay();
-  if (o) o.classList.add("visible");
-});
-
-window.addEventListener("dragover", (e) => {
-  if (!_hasFiles(e.dataTransfer)) return;
-  e.preventDefault();
-  try { e.dataTransfer.dropEffect = "copy"; } catch (_) {}
-});
-
-window.addEventListener("dragleave", (e) => {
-  if (!_hasFiles(e.dataTransfer)) return;
-  _dropDepth = Math.max(0, _dropDepth - 1);
-  if (_dropDepth === 0) {
-    const o = _dropOverlay();
-    if (o) o.classList.remove("visible");
-  }
-});
-
-window.addEventListener("drop", async (e) => {
-  if (!_hasFiles(e.dataTransfer)) return;
-  e.preventDefault();
-  _dropDepth = 0;
-  const o = _dropOverlay();
-  if (o) o.classList.remove("visible");
-
-  const files = Array.from(e.dataTransfer.files || []);
-  if (files.length === 0) return;
-
-  const statusEl = document.getElementById("status");
-  if (statusEl) {
-    statusEl.textContent =
-      "importing " + files.length + " dropped file" +
-      (files.length === 1 ? "" : "s") + "\u2026";
-    statusEl.className = "";
-  }
-
-  let added = 0, failed = 0;
-  for (const f of files) {
-    try {
-      const ok = await importDroppedFile(f);
-      if (ok) added++; else failed++;
-    } catch (err) {
-      reportError("drop", (err && err.message) ? err.message : String(err));
-      failed++;
-    }
-  }
-
-  if (added > 0) {
-    await refreshFromKrita();
-  }
-
-  syncFileList();
-  draw();
-
-  if (statusEl) {
-    if (failed === 0) {
-      statusEl.textContent =
-        "imported " + added + " dropped file" + (added === 1 ? "" : "s");
-      statusEl.className = "ok";
-    } else {
-      statusEl.textContent = "imported " + added + ", failed " + failed;
-      statusEl.className   = "bad";
-    }
-    setTimeout(updateStatus, 1800);
   }
 });
 """

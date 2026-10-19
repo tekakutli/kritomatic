@@ -42,7 +42,7 @@ DEFAULT_OUT        = "project_dump.md" # output markdown file
 #   .service  systemd unit files
 #   .md       Markdown
 #   .toml     TOML
-DEFAULT_EXTENSIONS = [".py", ".sh", "yaml", ".md", ".conf", ".json", ".toml", ".js"]
+DEFAULT_EXTENSIONS = [".py", ".sh", "yaml", ".md", ".conf", ".json", ".toml", ".js", ".el"]
 DEFAULT_AFFIX      = None             # e.g. "_test" (substring matched in filename)
 DEFAULT_RECURSIVE  = False            # descend into subdirectories
 DEFAULT_TREE_ONLY  = False            # only emit the directory tree, no file contents

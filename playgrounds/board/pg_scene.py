@@ -14,28 +14,14 @@ On load, three things happen in order:
     3.  A single refresh picks up thumbnails and state for everything
         that just opened.
 
-File shape:
-
-    {
-      "sceneVersion": 4,
-      "type":         "board_scene",
-      "generatedAt":  "2026-...",
-      "board": { "defaultWidth": 320, "gridGap": 24 },
-      "view":  { "zoom": ..., "panX": ..., "panY": ... },
-      "files": [
-        { "path": ..., "name": ..., "x": ..., "y": ...,
-          "w": ..., "aspect": ..., "z": ..., "rotation": ...,
-          "color": { "r": ..., "g": ..., "b": ... } },
-        ...
-      ]
-    }
+REMOTE NOTIFICATION
+===================
+`applyBoardScene` replaces the whole model.  It ends with
+`pgkitNotifyAll()`, so remote clients receive a single patch with
+the new state on the next animation frame.
 """
 
 SCENE_JS = r"""
-/* ==========================================================================
-   SCENE SAVE / LOAD
-   ========================================================================== */
-
 const SCENE_VERSION = 4;
 const SCENE_TYPE    = "board_scene";
 const SCENE_FILE    = "board_scene.json";
@@ -141,6 +127,7 @@ function applyBoardScene(data) {
   syncPanelSliders();
   syncFileList();
   draw();
+  pgkitNotifyAll();
 }
 
 async function loadBoardFromText(text) {

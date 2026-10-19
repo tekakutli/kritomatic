@@ -2,22 +2,23 @@
 pg_view_board.py — draw the board.
 
 Cards are drawn in `_zSortedIndices()` order, ascending, so a
-selected card sits above whatever it was overlapping.  Each card is
-drawn inside a translate-and-rotate transform centred on the card's
-own centre; the image, border, state icon, corner handles, and the
-rotate handle all rotate with the card.
+selected card sits above whatever it was overlapping.
 
-The thumbnail is stretched to fill the card.  If the card's w/h
-ratio has been changed away from the document's own ratio, the
-image is squashed or stretched to match — the card is the region of
-interest, and a letterbox gap would misrepresent where the document
-ends.
+PERFORMANCE
+===========
+    VIEWPORT CULLING
+        A card whose rotated AABB (plus its label margin) does not
+        intersect the visible viewport is not drawn.
 
-State rendering:
+    SHADOW-ONLY-WHEN-SELECTED
+        `shadowBlur` is applied only to the selected card; every
+        other card gets a cheap flat offset rect.
 
-    open       full border, full body, image at full strength
-    closed     dimmed border, dimmed body, image at reduced opacity
-    missing    red-tinted border, "file missing" placeholder
+    BATCHED GRID
+        The background dot grid is a single path filled once.
+
+    LABEL-WIDTH CACHE
+        `measureText` runs only when the label text changed.
 """
 
 VIEW_BOARD_JS = r"""
@@ -38,14 +39,20 @@ function _drawBoardGrid() {
   const endBx   = (cw - view.panX) / view.zoom + step;
   const endBy   = (ch - view.panY) / view.zoom + step;
 
+  const z  = view.zoom;
+  const px = view.panX;
+  const py = view.panY;
+
   ctx.save();
   ctx.fillStyle = "rgba(0, 229, 255, 0.10)";
+  ctx.beginPath();
   for (let bx = startBx; bx < endBx; bx += step) {
+    const sx = bx * z + px;
     for (let by = startBy; by < endBy; by += step) {
-      const [sx, sy] = b2s(bx, by);
-      ctx.fillRect(sx, sy, 1.1, 1.1);
+      ctx.rect(sx, by * z + py, 1.1, 1.1);
     }
   }
+  ctx.fill();
   ctx.restore();
 }
 
@@ -53,7 +60,21 @@ function _drawBoardGrid() {
    CARD
    ========================================================================== */
 
+const _CARD_LABEL_FONT = "700 11px 'JetBrains Mono', 'Fira Code', monospace";
+
+function _cardLabelWidth(file, label) {
+  if (file._labelText === label && typeof file._labelWidth === "number") {
+    return file._labelWidth;
+  }
+  const w = ctx.measureText(label).width;
+  file._labelText  = label;
+  file._labelWidth = w;
+  return w;
+}
+
 function _drawFileCard(file, isSelected) {
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
   const hue   = file.color || board.palette[0];
   const state = fileState(file);
 
@@ -64,22 +85,37 @@ function _drawFileCard(file, isSelected) {
   const sh = file.h * view.zoom;
   const RADIUS = 3;
 
+  const halfDiag = Math.hypot(sw, sh) / 2 + 30;
+  if (csx + halfDiag < 0 || csx - halfDiag > cw ||
+      csy + halfDiag < 0 || csy - halfDiag > ch) {
+    return;
+  }
+
   ctx.save();
   ctx.translate(csx, csy);
   ctx.rotate(file.rotation);
 
-  // Shadow.
-  ctx.save();
-  ctx.shadowColor = "rgba(0, 0, 0, 0.55)";
-  ctx.shadowBlur = 18;
-  ctx.shadowOffsetY = 4;
-  ctx.fillStyle = "#0e1622";
-  ctx.beginPath();
-  _roundRect(-sw / 2, -sh / 2, sw, sh, RADIUS);
-  ctx.fill();
-  ctx.restore();
+  if (isSelected) {
+    ctx.save();
+    ctx.shadowColor   = "rgba(0, 0, 0, 0.55)";
+    ctx.shadowBlur    = 18;
+    ctx.shadowOffsetY = 4;
+    ctx.fillStyle     = "#0e1622";
+    ctx.beginPath();
+    _roundRect(-sw / 2, -sh / 2, sw, sh, RADIUS);
+    ctx.fill();
+    ctx.restore();
+  } else {
+    ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
+    ctx.beginPath();
+    _roundRect(-sw / 2 + 2, -sh / 2 + 3, sw, sh, RADIUS);
+    ctx.fill();
+    ctx.fillStyle = "#0e1622";
+    ctx.beginPath();
+    _roundRect(-sw / 2, -sh / 2, sw, sh, RADIUS);
+    ctx.fill();
+  }
 
-  // Body.
   ctx.save();
   ctx.beginPath();
   _roundRect(-sw / 2, -sh / 2, sw, sh, RADIUS);
@@ -92,10 +128,6 @@ function _drawFileCard(file, isSelected) {
                     :                        0.20;
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "high";
-    // Stretch the image to fill the card completely.  If the card's
-    // aspect no longer matches the document's, the image is
-    // squashed or stretched rather than letterboxed; a gap would
-    // misrepresent where the document ends.
     ctx.drawImage(img, -sw / 2, -sh / 2, sw, sh);
     ctx.globalAlpha = 1.0;
   } else {
@@ -115,7 +147,6 @@ function _drawFileCard(file, isSelected) {
   }
   ctx.restore();
 
-  // Border.
   let borderColor, borderAlpha, borderW;
   if (state === "missing") {
     borderColor = { r: 212, g: 133, b: 144 };
@@ -148,7 +179,6 @@ function _drawFileCard(file, isSelected) {
     ctx.restore();
   }
 
-  // State icon, top-right of the rotated card.
   if (sw > 40 && sh > 24) {
     const ix = sw / 2 - 12;
     const iy = -sh / 2 + 12;
@@ -176,7 +206,6 @@ function _drawFileCard(file, isSelected) {
     }
   }
 
-  // Corner handles on the selected card.
   if (isSelected && sw > 20 && sh > 20) {
     const hw = sw / 2, hh = sh / 2;
     for (const [sx, sy] of CORNER_SIGNS) {
@@ -190,7 +219,6 @@ function _drawFileCard(file, isSelected) {
     }
   }
 
-  // Rotate handle: above the card's top edge, rotated with the card.
   if (isSelected && sw > 20 && sh > 20) {
     const hy = -sh / 2 - ROTATE_HANDLE_OFFSET;
     ctx.beginPath();
@@ -215,13 +243,12 @@ function _drawFileCard(file, isSelected) {
     ctx.stroke();
   }
 
-  // Label — drawn inside the transform, so it rotates with the card.
   if (sw > 60) {
-    ctx.font = "700 11px 'JetBrains Mono', 'Fira Code', monospace";
+    ctx.font = _CARD_LABEL_FONT;
     ctx.textAlign    = "left";
     ctx.textBaseline = "top";
     const label = file.name;
-    const labelW = ctx.measureText(label).width;
+    const labelW = _cardLabelWidth(file, label);
     const padX = 6;
     const lh   = 18;
     const lx   = -sw / 2;

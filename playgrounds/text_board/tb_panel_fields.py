@@ -1,76 +1,25 @@
 """
-tb_panel_fields.py — editor semantics, the per-item debounce buffer,
-and the card-width slider's DOM sync.
+tb_panel_fields.py — editor semantics and the per-item debounce buffer.
 
-This is the file the buffered-editor refactor touched most: it holds
-the code that replaces the "Apply changes" button.  Every editor
-field applies on commit (blur / Enter), the wire sees the change on
-the next frame, and the Krita round-trip is batched per item.
-
-THE DEBOUNCE RULE
-=================
-Every edit through `_applyItemField` does three things:
-
-    1. Mutates board.items[i][key] immediately.
-    2. Queues a single-key patch into `_pendingTextEdits` keyed by
-       item.id, and resets that item's 250ms timer.  When the timer
-       fires, one POST goes to /krita/patch_text carrying every
-       merged edit for that item.
-    3. Calls pgkitNotifyLocal("item.<key>").  The wire therefore sees
-       the change within one animation frame — before the Krita
-       round-trip even starts.
-
-The refresh that follows the patch is debounced globally: the first
-timer to fire wins, and all edits made in the last 250ms share one
-refresh.  See `_scheduleGlobalRefresh`.
-
-SLIDER DOM SYNC
-===============
-`syncPanelSliders` and `updatePanelLabels` keep the card-width
-slider and its numeric label in agreement with `board.defaultWidth`.
-They are called by `pgkitBootSync` at startup and after any scale
-change.  These functions were dropped in an earlier revision of the
-migration split; the boot script's very first call to
-`syncPanelSliders()` was throwing ReferenceError, which aborted the
-rest of the boot and left the canvas and item list empty.
-
-EDITOR SYNC — DOM-WRITE GUARDS
-==============================
-`_syncEditor` runs on every field change, every selection change,
-and every refresh.  It used to look up all six editor elements with
-`document.getElementById` each call and assign to `.value` /
-`.disabled` unconditionally.
-
-Two fixes, both local:
-
-    · Element references are cached the first time `_syncEditor`
-      runs, in `_editorEls`.  They do not need invalidation — the
-      panel DOM is not rebuilt at runtime.
-
-    · Each write is guarded by an equality check: if the DOM
-      already holds the target value, the assignment is skipped.
-      During a field edit, the just-edited input already has the
-      user's typed value, so `_syncEditor` no longer re-writes it
-      (which would steal the cursor).
-
-The visual result is identical; the DOM mutation count per commit
-drops from O(6) to O(1) — the one field that actually moved.
+Exports: installEditorBindings, _syncEditor, applyItemField,
+syncPanelSliders, updatePanelLabels.
 """
 
 TB_PANEL_FIELDS_JS = r"""
+import { board, itemId } from "./tb_core.js";
+import { pgkitNotifyLocal, pgkitNotifyEntities } from "./pgkit/remote_client.js";
+
 /* ==========================================================================
    SLIDER SYNC
-   ==========================================================================
-   Called at boot (via pgkitBootSync) and after any scale change.
-   The slider value and its numeric label must match `board.defaultWidth`. */
+   ========================================================================== */
 
-function syncPanelSliders() {
+export function syncPanelSliders() {
   const s = document.getElementById("cardWSlider");
   if (s) s.value = board.defaultWidth;
   updatePanelLabels();
 }
 
-function updatePanelLabels() {
+export function updatePanelLabels() {
   const v = document.getElementById("cardWVal");
   if (v) v.textContent = String(board.defaultWidth);
 }
@@ -116,11 +65,11 @@ async function _flushItemTextEdits(itemId) {
     });
     const payload = await res.json();
     if (!payload || !payload.success) {
-      reportError("patch", (payload && payload.message) || "patch_text failed");
+      console.error("[patch]", (payload && payload.message) || "patch_text failed");
       return;
     }
   } catch (e) {
-    reportError("patch", e.message);
+    console.error("[patch]", e.message);
     return;
   }
   _scheduleGlobalRefresh();
@@ -130,37 +79,26 @@ function _scheduleGlobalRefresh() {
   if (_globalRefreshTimer) clearTimeout(_globalRefreshTimer);
   _globalRefreshTimer = setTimeout(() => {
     _globalRefreshTimer = null;
-    refreshFromKrita();
+    // Deferred to avoid a static import cycle with tb_krita.
+    import("./tb_krita.js").then(m => m.refreshFromKrita()).catch(() => {});
   }, TEXT_DEBOUNCE_MS);
 }
 
 /* ==========================================================================
    UNIFIED ITEM FIELD APPLIER
-   ==========================================================================
-   Used from both the editor's onchange handler and the field's
-   `set` (which the remote client calls when a patch arrives).
-   pgkitNotifyLocal is safe on the remote path because pgkit's
-   `_pgkitApplyingRemote` guard returns early.  The Krita patch is
-   still queued: a remote edit is a real edit of the shape. */
+   ========================================================================== */
 
-function _applyItemField(item, key, value) {
+export function applyItemField(item, key, value) {
   item[key] = value;
   _queueItemTextPatch(item.id, key, value);
   pgkitNotifyLocal("item." + key);
   _syncEditor();
-  draw();
+  // draw is called by the caller (via panel_scrubs set wrappers).
 }
 
 /* ==========================================================================
-   EDITOR SYNC (DOM ← MODEL)
-   ==========================================================================
-   Push the selected item's current values into the editor inputs.
-   Called on every draw and after every selection change.
-
-   Element references are cached lazily on the first call (they never
-   change).  Every write is equality-guarded: if the DOM already
-   holds the target value, no assignment happens.  See the module
-   docstring, EDITOR SYNC — DOM-WRITE GUARDS. */
+   EDITOR SYNC
+   ========================================================================== */
 
 let _editorEls = null;
 
@@ -178,9 +116,11 @@ function _getEditorEls() {
   return _editorEls;
 }
 
-function _syncEditor() {
+export function _syncEditor() {
   const els = _getEditorEls();
-  const it  = selectedItem();
+  const idx = board.selectedIdx;
+  const it  = (idx >= 0 && idx < board.items.length)
+              ? board.items[idx] : null;
 
   if (!it) {
     if (els.text)  { els.text.disabled = true;  if (els.text.value  !== "") els.text.value  = ""; }
@@ -242,22 +182,23 @@ function _syncEditor() {
 }
 
 /* ==========================================================================
-   EDITOR BINDINGS (user edit → MODEL)
-   ==========================================================================
-   Every editor field applies on commit: onchange fires on blur or
-   Enter, which is the same contract every scrub input honours.  The
-   Apply button has been removed. */
+   EDITOR BINDINGS
+   ========================================================================== */
 
-function _installEditorBindings() {
+export function installEditorBindings() {
   const els = _getEditorEls();
-  const it  = () => selectedItem();
+  const it  = () => {
+    const idx = board.selectedIdx;
+    return (idx >= 0 && idx < board.items.length) ? board.items[idx] : null;
+  };
 
   if (els.text) els.text.addEventListener("change", () => {
     const item = it();
     if (!item) return;
     const v = els.text.value;
     if (v === item.text) return;
-    _applyItemField(item, "text", v);
+    applyItemField(item, "text", v);
+    import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
   });
 
   if (els.font) els.font.addEventListener("change", () => {
@@ -265,7 +206,8 @@ function _installEditorBindings() {
     if (!item) return;
     const v = els.font.value.trim();
     if (!v || v === item.fontFamily) return;
-    _applyItemField(item, "fontFamily", v);
+    applyItemField(item, "fontFamily", v);
+    import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
   });
 
   if (els.size) els.size.addEventListener("change", () => {
@@ -273,7 +215,8 @@ function _installEditorBindings() {
     if (!item) return;
     const v = parseFloat(els.size.value);
     if (!isFinite(v) || v === item.fontSize) return;
-    _applyItemField(item, "fontSize", v);
+    applyItemField(item, "fontSize", v);
+    import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
   });
 
   if (els.color) els.color.addEventListener("change", () => {
@@ -281,7 +224,8 @@ function _installEditorBindings() {
     if (!item) return;
     const v = els.color.value.trim();
     if (!v || v === item.color) return;
-    _applyItemField(item, "color", v);
+    applyItemField(item, "color", v);
+    import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
   });
 
   if (els.align) els.align.addEventListener("change", () => {
@@ -289,7 +233,8 @@ function _installEditorBindings() {
     if (!item) return;
     const v = els.align.value;
     if (!v || v === item.alignment) return;
-    _applyItemField(item, "alignment", v);
+    applyItemField(item, "alignment", v);
+    import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
   });
 
   if (els.rot) els.rot.addEventListener("change", () => {
@@ -297,14 +242,8 @@ function _installEditorBindings() {
     if (!item) return;
     const v = parseFloat(els.rot.value);
     if (!isFinite(v) || Math.abs(v - item.rotationDeg) < 0.01) return;
-    _applyItemField(item, "rotationDeg", v);
+    applyItemField(item, "rotationDeg", v);
+    import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
   });
-}
-
-/* Install once, after the DOM is parsed. */
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", _installEditorBindings);
-} else {
-  _installEditorBindings();
 }
 """

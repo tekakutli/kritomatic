@@ -4,10 +4,8 @@ knows about on a single canvas.
 
     python board_playground.py     → writes board_playground.html and serves it
 
-After the pgkit migration the whole server side of this project is
-one `pgkit.server.serve(...)` call with a JSON routes dict and a
-raw-body routes dict, matching the shape of text_playground.py and
-pair_playground.py.
+The module_sources dict built by `board_html.module_sources()` is
+passed to both `page()` and `kit_serve()`.
 """
 
 import os
@@ -42,16 +40,17 @@ def main():
     print(f"                 scroll to zoom · drag empty space to pan ·")
     print(f"                 R refresh · G grid · F fit · O open all ·")
     print(f"                 P project overlaps · H toggle panel")
-    print(f"  remote api   : ws://127.0.0.1:{PORT}/remote")
+    print(f"  routes       : {', '.join(sorted(list(board_server.ROUTES) + list(board_server.RAW_ROUTES)))}")
 
     if SERVE:
         print()
         kit_serve(
-            port         = PORT,
-            open_browser = OPEN_BROWSER,
-            html_file    = HTML_FILE,
-            routes       = board_server.ROUTES,
-            raw_routes   = board_server.RAW_ROUTES,
+            port           = PORT,
+            open_browser   = OPEN_BROWSER,
+            html_file      = HTML_FILE,
+            routes         = board_server.ROUTES,
+            raw_routes     = board_server.RAW_ROUTES,
+            module_sources = board_html.module_sources(),
         )
     else:
         print(f"  open : file://{os.path.abspath(HTML_FILE)}")

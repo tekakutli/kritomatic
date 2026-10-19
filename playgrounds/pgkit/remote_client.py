@@ -1,113 +1,20 @@
 """
-pgkit.remote_client — the browser's WebSocket client.
+pgkit.remote_client — the browser's WebSocket client, as an ES module.
 
-On page load it opens a WebSocket to the playground's server.  Every
-value field registered via `pgkitRegisterField`, every action
-registered via `pgkitRegisterAction`, and every level registered via
-`pgkitRegisterLevel` is published under its dotted name and can be
-driven from any other connected client.
+The module exports its register/notify functions.  Three things that
+used to rely on globals are now injected at boot:
 
-STATE PUBLICATION — NOTIFICATION, NOT POLLING
-=============================================
-The project tells the kit when a value changed:
+    setRemoteDraw(fn)            — called from pgkitRemoteApplyPatch
+    setRemoteSelect(fn)          — dispatches `select` commands
+    setRemoteDeselect(fn)        — dispatches `deselect` commands
+    setRemoteExtraCommand(fn)    — dispatches playground-specific
+                                   command kinds
 
-    pgkitNotifyLocal(name)    queue one field's current value
-    pgkitNotifyAll()          queue every registered field's current
-                              value
-    pgkitNotifyEntities()     queue the entity tree (levels, items,
-                              selection, applies)
-
-There is no timer, no polling.  Actions are not included in state.
-
-CHANGE DEDUPLICATION — FLUSH TIME
-=================================
-`_pgkitLastSent` holds, per field, the last value the wire actually
-carried.  It is updated in exactly three places:
-
-    _pgkitFlush              every value we just sent
-    pgkitRemoteApplyPatch    every value a peer just told us they
-                             believe we hold
-    state_request handler    every value in the state dump — the hub
-                             broadcasts that dump to all peers, so
-                             after it every peer holds these values
-
-`_pgkitFlush` compares each queued value against `_pgkitLastSent`
-and skips matches.
-
-The *notify* functions do NOT consult `_pgkitLastSent`.  An earlier
-revision did, and it was a bug: a notify A→B→A sequence that fires
-inside one animation frame would leave a stale B in
-`_pgkitNotifyPending` that the notify-time check could not see (it
-compared against `_pgkitLastSent`, not against the pending queue).
-The stale value then went on the wire on the next flush even
-though the current state was A.  Moving the check to flush time
-fixes this with no extra state — the pending queue is drained
-completely, and only its post-dedup contents reach the wire.
-
-`pgkitRemoteApplyPatch` records `_pgkitLastSent[name]` *before* the
-equality check — the incoming value is what the peers believe we
-hold, whether or not it differs from our current value.  That way
-a skipped `set` still advances the dedup state.
-
-On socket close, `_pgkitLastSent` is cleared so the next connect's
-state_request handler performs a full refresh of the map.
-
-SELECT COMMAND — FIELDS REFRESH TOO
-===================================
-A `select` command changes `board.selectedIdx` / `selectedPair` /
-`selectedQuad`, which in turn changes the value of every
-selection-scoped getter on the kit (`item.*` in text_board,
-`pair.*` in pair, `card.*` in board).  `select` therefore calls
-`pgkitNotifyAll()` — not `pgkitNotifyEntities()` — so the remote
-panel's field widgets update as well.  `pgkitNotifyAll` sets
-`_pgkitEntitiesPending` itself, so entities still refresh; the
-dedup at flush time means only fields whose values actually
-changed reach the wire.
-
-SCHEMA PUBLICATION — FIELDS, ACTIONS, LEVELS
-============================================
-On a `state_request` the kit answers with `state`, `schema`, and
-`entities`:
-
-    state       {seq, values} — current value of every field
-    schema      {fields} — metadata: kind, label, options, plus
-                action meta (scope, level, requires, variant) and
-                level meta (label)
-    entities    {levels, order} — per-level items, selection, and
-                per-item `applies` maps for row-scope actions
-
-LEVELS
-======
-A level is one kind of entity in the model.  `pgkitRegisterLevel`
-takes {label, items, selected, parent}.  `items()` returns
-[{name, label, extra?}]; `selected()` returns the currently-
-selected item's name or null; `parent()` returns {level, name} for
-nested levels or null.  `pgkitDumpEntities` walks every level and
-populates `applies` for each row-scope action by running its
-`appliesTo(item)` predicate once per item.
-
-ACTION PAYLOADS
-===============
-An action may declare `requires` in its meta: an array of
-`{name, kind, label, default?, accept?}` entries describing what
-the user must supply.  `kind` is `"text"` or `"file"`.  The kit
-itself does not gather those values — a remote client does, and
-sends them in the `command` message's `payload`.
-
-ECHO SUPPRESSION
-================
-Each patch carries a monotonic `seq` and the sender's `origin`
-client id.  The receiving side ignores any patch whose `origin`
-matches its own id.  `_pgkitApplyingRemote` is a second guard,
-active only during `pgkitRemoteApplyPatch`.
-
-PANEL VISIBILITY
-================
-Presence-driven.  When a remote client is connected, the panel is
-hidden AND the local restore button is hidden.  Without this,
-the restore button (shown when the local user collapsed the
-panel) and the "Controlled remotely" banner both sit at
-`top:12px; left:12px` and overlap.
+The module's boot IIFE at the bottom still runs at module load,
+opening the WebSocket.  All cross-module injectors are set by the
+boot module *after* this one is imported — but before any command
+arrives over the socket, since the WebSocket handshake takes at
+least one round trip.
 """
 
 REMOTE_CLIENT_JS = r"""
@@ -135,11 +42,18 @@ let _pgkitFlushScheduled  = false;
 let _pgkitEntitiesPending = false;
 let _pgkitLastEntitiesSig = null;
 
-/* Field name → last value the wire carried.  Populated by
-   _pgkitFlush, pgkitRemoteApplyPatch, and the state_request handler;
-   cleared on socket close.  See the module docstring,
-   CHANGE DEDUPLICATION — FLUSH TIME. */
 let _pgkitLastSent = {};
+
+/* Injectable handlers.  Set at boot by the project's boot module. */
+let _drawFn            = null;
+let _selectFn          = null;
+let _deselectFn        = null;
+let _extraCommandFn    = null;
+
+export function setRemoteDraw(fn)         { _drawFn = fn; }
+export function setRemoteSelect(fn)       { _selectFn = fn; }
+export function setRemoteDeselect(fn)     { _deselectFn = fn; }
+export function setRemoteExtraCommand(fn) { _extraCommandFn = fn; }
 
 /* ==========================================================================
    VALUE EQUALITY
@@ -157,7 +71,7 @@ function _pgkitValuesEqual(a, b) {
    REGISTRY — FIELDS
    ========================================================================== */
 
-function pgkitRegisterField(name, opts) {
+export function pgkitRegisterField(name, opts) {
   if (!name) throw new Error("pgkitRegisterField: name required");
   if (_pgkitRemote.registry[name]) {
     throw new Error("pgkitRegisterField: duplicate " + name);
@@ -174,7 +88,7 @@ function pgkitRegisterField(name, opts) {
    REGISTRY — ACTIONS
    ========================================================================== */
 
-function pgkitRegisterAction(name, opts) {
+export function pgkitRegisterAction(name, opts) {
   if (!name) throw new Error("pgkitRegisterAction: name required");
   if (_pgkitRemote.registry[name]) {
     throw new Error("pgkitRegisterAction: duplicate " + name);
@@ -210,7 +124,7 @@ function pgkitRegisterAction(name, opts) {
    REGISTRY — LEVELS
    ========================================================================== */
 
-function pgkitRegisterLevel(name, opts) {
+export function pgkitRegisterLevel(name, opts) {
   if (!name) throw new Error("pgkitRegisterLevel: name required");
   if (_pgkitRemote.levels[name]) {
     throw new Error("pgkitRegisterLevel: duplicate " + name);
@@ -295,11 +209,9 @@ function pgkitDumpEntities() {
 
 /* ==========================================================================
    NOTIFICATION
-   ==========================================================================
-   The notify functions always queue.  Deduplication happens at
-   flush time, against `_pgkitLastSent`. */
+   ========================================================================== */
 
-function pgkitNotifyLocal(name) {
+export function pgkitNotifyLocal(name) {
   if (_pgkitApplyingRemote) return;
   if (!_pgkitRemote.connected) return;
   if (!_pgkitRemote.clientId) return;
@@ -311,7 +223,7 @@ function pgkitNotifyLocal(name) {
   _pgkitScheduleFlush();
 }
 
-function pgkitNotifyAll() {
+export function pgkitNotifyAll() {
   if (_pgkitApplyingRemote) return;
   if (!_pgkitRemote.connected) return;
   if (!_pgkitRemote.clientId) return;
@@ -326,7 +238,7 @@ function pgkitNotifyAll() {
   _pgkitScheduleFlush();
 }
 
-function pgkitNotifyEntities() {
+export function pgkitNotifyEntities() {
   if (_pgkitApplyingRemote) return;
   if (!_pgkitRemote.connected) return;
   if (!_pgkitRemote.clientId) return;
@@ -363,7 +275,7 @@ function _pgkitFlush() {
   if (any) {
     for (const k in toSend) _pgkitLastSent[k] = toSend[k];
     _pgkitRemote.seq++;
-    pgkitRemoteSend({
+    _pgkitRemoteSend({
       type:   "patch",
       origin: _pgkitRemote.clientId,
       seq:    _pgkitRemote.seq,
@@ -377,7 +289,7 @@ function _pgkitFlush() {
     const sig  = JSON.stringify(dump);
     if (sig !== _pgkitLastEntitiesSig) {
       _pgkitLastEntitiesSig = sig;
-      pgkitRemoteSend({
+      _pgkitRemoteSend({
         type:   "entities",
         levels: dump.levels,
         order:  dump.order,
@@ -390,7 +302,7 @@ function _pgkitFlush() {
    WIRE
    ========================================================================== */
 
-function pgkitRemoteSend(msg) {
+function _pgkitRemoteSend(msg) {
   const s = _pgkitRemote.socket;
   if (!s || s.readyState !== WebSocket.OPEN) return;
   s.send(JSON.stringify(msg));
@@ -408,7 +320,7 @@ function pgkitRemoteConnect() {
   socket.addEventListener("open", () => {
     _pgkitRemote.connected = true;
     _pgkitRemote.reconnectDelay = 500;
-    pgkitRemoteSend({
+    _pgkitRemoteSend({
       type:     "hello",
       role:     "browser",
       protocol: _pgkitRemote.protocolVersion,
@@ -448,18 +360,18 @@ function pgkitRemoteHandle(msg) {
 
     case "state_request": {
       const values = pgkitDumpState();
-      pgkitRemoteSend({
+      _pgkitRemoteSend({
         type:   "state",
         seq:    _pgkitRemote.seq,
         values: values,
       });
-      pgkitRemoteSend({
+      _pgkitRemoteSend({
         type:   "schema",
         fields: pgkitDumpSchema(),
       });
       const dump = pgkitDumpEntities();
       _pgkitLastEntitiesSig = JSON.stringify(dump);
-      pgkitRemoteSend({
+      _pgkitRemoteSend({
         type:   "entities",
         levels: dump.levels,
         order:  dump.order,
@@ -503,8 +415,7 @@ function pgkitRemoteApplyPatch(values) {
   } finally {
     _pgkitApplyingRemote = false;
   }
-  if (typeof draw === "function") draw();
-  if (typeof pgkitSyncSchemaDom === "function") pgkitSyncSchemaDom();
+  if (_drawFn) _drawFn();
 }
 
 /* ==========================================================================
@@ -525,27 +436,22 @@ function pgkitRemoteHandleCommand(msg) {
       catch (e) { ok = false; error = String(e); }
     } else if (kind === "select") {
       const payload = msg.payload || {};
-      if (typeof pgkitHandleSelect === "function") {
-        const selOk = pgkitHandleSelect(payload.level, payload.name);
+      if (_selectFn) {
+        const selOk = _selectFn(payload.level, payload.name);
         if (!selOk) { ok = false; error = "select failed"; }
         else { pgkitNotifyAll(); }
       } else {
         ok = false;
         error = "no select handler";
       }
+    } else if (kind === "deselect") {
+      if (_deselectFn) _deselectFn();
+      if (_drawFn) _drawFn();
+      pgkitNotifyAll();
     } else if (kind === "reset_view" && typeof resetView === "function") {
       resetView();
-    } else if (kind === "deselect") {
-      if (typeof selectedPair    !== "undefined") selectedPair = -1;
-      if (typeof selectedSegment !== "undefined") selectedSegment = null;
-      if (typeof selectedQuad    !== "undefined") selectedQuad = -1;
-      if (typeof selectedSquare  !== "undefined") selectedSquare = -1;
-      if (typeof syncPairList === "function") syncPairList();
-      if (typeof syncQuadList === "function") syncQuadList();
-      if (typeof draw === "function") draw();
-      pgkitNotifyAll();
-    } else if (typeof pgkitHandleExtraCommand === "function") {
-      const handled = pgkitHandleExtraCommand(kind, msg.payload || {});
+    } else if (_extraCommandFn) {
+      const handled = _extraCommandFn(kind, msg.payload || {});
       if (!handled) { ok = false; error = "unknown command"; }
     } else {
       ok = false;
@@ -563,25 +469,12 @@ function pgkitRemoteHandleCommand(msg) {
     error: error,
   };
   if (result !== undefined) reply.result = result;
-  pgkitRemoteSend(reply);
+  _pgkitRemoteSend(reply);
 }
 
 /* ==========================================================================
    PRESENCE → PANEL VISIBILITY
-   ==========================================================================
-   Two elements compete for `top:12px; left:12px`: #restoreBtn (shown
-   when the local user collapses the panel) and #remoteBanner (shown
-   when a remote client is connected).  Without coordination both can
-   be visible at once — the restore button stays visible from the
-   user's earlier collapse, the banner appears when the remote
-   connects, and they overlap.
-
-   Resolution: presence wins.  When a remote client is connected the
-   panel is hidden (as before) and #restoreBtn is also hidden — the
-   local user should not be re-opening the panel while a remote is
-   driving.  When the remote disconnects, the panel comes back and
-   the restore button stays hidden (it is only needed when the panel
-   is collapsed). */
+   ========================================================================== */
 
 function _pgkitUpdatePanelVisibility() {
   const ui         = document.getElementById("ui");
@@ -602,7 +495,7 @@ function _pgkitUpdatePanelVisibility() {
 }
 
 /* ==========================================================================
-   BOOT
+   BOOT — opens the WebSocket at module load
    ========================================================================== */
 
 (function pgkitRemoteBoot() {

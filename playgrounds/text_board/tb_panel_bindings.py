@@ -1,56 +1,39 @@
 """
-tb_panel_bindings.py — button bindings, remote actions, remote
-levels, and pgkitHandleSelect.
+tb_panel_bindings.py — buttons, remote actions, remote levels,
+pgkitHandleSelect, and pgkitBootSync.
 
-LEVELS
-======
-    documents   one item per `.kra` on the board.  selected() is
-                null: no document-level selection exists.
-    items       one item per text shape.  selected() reflects
-                board.selectedIdx.  parent() reports the parent
-                document of the selected item.
-
-ACTION SCOPES
-=============
-    global      refreshFromKrita, addFiles, addFilesWithPaths,
-                openAll, arrangeGrid, fit, resetView, groupByFormat,
-                exportCanvasJSON, saveBoard, loadBoard (requires
-                board_json file), clearBoard
-
-    all         (on items) none
-
-    selection   (on items) activateSelected
-
-    row         (on items) activateItem, deleteItem
-                (on documents) openDocument
-
-BOOT DIAGNOSTICS
-================
-`pgkitBootSync` is wrapped in try/catch with per-step logging.  The
-boot script runs it as the last thing before `resize()`.  Before
-this wrapper was added, a single missing function anywhere in the
-boot chain would throw out of `pgkitBootSync` and skip `resize()`
-— leaving the canvas blank, the item list empty, and no obvious
-error unless the browser console was open.  Now each step logs
-success or failure, and the outer catch logs the final state.
+Exports: installPanelBindings, pgkitHandleSelect, pgkitBootSync,
+plus helper functions the boot module's actions use.
 """
 
 TB_PANEL_BINDINGS_JS = r"""
+import {
+  board, view, bringToTop, arrangeGrid, fitAll, groupByFormat,
+  _documentSlots, _invalidateDocLayout, _docLayout, _pathBasename,
+  addWantedPath,
+} from "./tb_core.js";
+import { syncItemList, exportCanvasJSON, clearCursorReadout } from "./tb_panel_lists.js";
+import { _syncEditor, syncPanelSliders } from "./tb_panel_fields.js";
+import {
+  refreshFromKrita, pickFilesViaServer, openAllClosed,
+  activateItemDocument, openOneFileInKrita,
+} from "./tb_krita.js";
+import {
+  saveBoardJSON, promptLoadBoard, loadBoardFromText,
+} from "./tb_scene.js";
+import {
+  pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyLocal,
+  pgkitNotifyAll,
+} from "./pgkit/remote_client.js";
+import { flashStatus } from "./pgkit/panel_core.js";
+
 /* ==========================================================================
-   ACTION HELPERS
+   HELPERS
    ========================================================================== */
-
-function _addFilesAction() {
-  pickFilesViaServer();
-}
-
-function _openAllAction() {
-  openAllClosed();
-}
 
 function _arrangeGridAction() {
   arrangeGrid();
-  draw();
+  import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
   flashStatus("arranged " + board.items.length + " card(s)", "ok");
 }
 
@@ -66,16 +49,8 @@ function _resetViewAction() {
 
 function _groupByFormatAction() {
   groupByFormat();
-  draw();
+  import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
   flashStatus("grouped by format", "ok");
-}
-
-function _exportCanvasAction() {
-  exportCanvasJSON();
-}
-
-function _saveBoardAction() {
-  saveBoardJSON();
 }
 
 function _clearBoardAction() {
@@ -89,16 +64,14 @@ function _clearBoardAction() {
   syncItemList();
   _syncEditor();
   clearCursorReadout();
-  draw();
+  import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
   flashStatus("board cleared", "ok");
 }
 
 function _activateSelectedAction() {
-  const it = selectedItem();
-  if (!it) {
-    flashStatus("no card selected", "warn");
-    return;
-  }
+  const idx = board.selectedIdx;
+  const it = (idx >= 0 && idx < board.items.length) ? board.items[idx] : null;
+  if (!it) { flashStatus("no card selected", "warn"); return; }
   activateItemDocument(it);
   flashStatus("activating " + (it.documentName || "document"), "ok");
 }
@@ -111,7 +84,6 @@ function _activateItemByTarget(payload) {
   const idx = parseInt(name.slice(prefix.length), 10);
   if (!(idx >= 0 && idx < board.items.length)) return;
   activateItemDocument(board.items[idx]);
-  flashStatus("activating " + (board.items[idx].documentName || "document"), "ok");
 }
 
 function _deleteItemByTarget(payload) {
@@ -126,8 +98,7 @@ function _deleteItemByTarget(payload) {
   else if (board.selectedIdx > idx) board.selectedIdx -= 1;
   syncItemList();
   _syncEditor();
-  draw();
-  flashStatus("removed from board", "ok");
+  import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
 }
 
 function _openDocumentByTarget(payload) {
@@ -146,7 +117,7 @@ function _addFilesWithPaths(payload) {
   const parts = payload.paths.split(";").map(s => s.trim()).filter(Boolean);
   for (const p of parts) addWantedPath(p);
   syncItemList();
-  draw();
+  import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
   openAllClosed();
 }
 
@@ -155,13 +126,13 @@ function _loadBoardFromPayload(payload) {
   loadBoardFromText(payload.board_json);
 }
 
-/* ==========================================================================
-   REMOTE LEVELS
-   ========================================================================== */
-
 function _sortedDocumentPaths() {
   return _docLayout().map(e => e.path);
 }
+
+/* ==========================================================================
+   REMOTE LEVELS
+   ========================================================================== */
 
 pgkitRegisterLevel("documents", {
   label: "Documents",
@@ -183,31 +154,26 @@ pgkitRegisterLevel("items", {
   label: "Items",
   items: () => board.items.map((it, i) => ({
     name:  "item." + i,
-    label: (it.layerName || "?") + " \u00b7 "
-           + (it.text || "").slice(0, 40),
-    extra: {
-      documentName: it.documentName,
-      layerName:    it.layerName,
-    },
+    label: (it.layerName || "?") + " \u00b7 " + (it.text || "").slice(0, 40),
+    extra: { documentName: it.documentName, layerName: it.layerName },
   })),
-  selected: () => board.selectedIdx >= 0
-    ? "item." + board.selectedIdx
-    : null,
+  selected: () => board.selectedIdx >= 0 ? "item." + board.selectedIdx : null,
   parent: () => {
-    const it = selectedItem();
+    const idx = board.selectedIdx;
+    const it  = (idx >= 0 && idx < board.items.length) ? board.items[idx] : null;
     if (!it) return null;
     const paths = _sortedDocumentPaths();
-    const idx = paths.indexOf(it.documentPath);
-    if (idx < 0) return null;
-    return { level: "documents", name: "document." + idx };
+    const di = paths.indexOf(it.documentPath);
+    if (di < 0) return null;
+    return { level: "documents", name: "document." + di };
   },
 });
 
 /* ==========================================================================
-   SELECT COMMAND
+   SELECT HANDLER
    ========================================================================== */
 
-function pgkitHandleSelect(level, name) {
+export function pgkitHandleSelect(level, name) {
   if (typeof name !== "string") return false;
 
   if (level === "documents") {
@@ -223,7 +189,7 @@ function pgkitHandleSelect(level, name) {
         bringToTop(i);
         syncItemList();
         _syncEditor();
-        draw();
+        import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
         return true;
       }
     }
@@ -239,7 +205,7 @@ function pgkitHandleSelect(level, name) {
     bringToTop(idx);
     syncItemList();
     _syncEditor();
-    draw();
+    import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
     return true;
   }
 
@@ -250,7 +216,7 @@ function pgkitHandleSelect(level, name) {
    BUTTON BINDINGS
    ========================================================================== */
 
-(function installPanelBindings() {
+export function installPanelBindings() {
   const refreshBtn    = document.getElementById("refreshBtn");
   const addFilesBtn   = document.getElementById("addFilesBtn");
   const openAllBtn    = document.getElementById("openAllBtn");
@@ -264,20 +230,20 @@ function pgkitHandleSelect(level, name) {
   const exportJsonBtn = document.getElementById("exportJsonBtn");
 
   if (refreshBtn)    refreshBtn.addEventListener("click", refreshFromKrita);
-  if (addFilesBtn)   addFilesBtn.addEventListener("click", _addFilesAction);
-  if (openAllBtn)    openAllBtn.addEventListener("click", _openAllAction);
+  if (addFilesBtn)   addFilesBtn.addEventListener("click", pickFilesViaServer);
+  if (openAllBtn)    openAllBtn.addEventListener("click", openAllClosed);
   if (gridBtn)       gridBtn.addEventListener("click", _arrangeGridAction);
   if (fitBtn)        fitBtn.addEventListener("click", _fitAction);
   if (resetBtn)      resetBtn.addEventListener("click", _resetViewAction);
   if (groupBtn)      groupBtn.addEventListener("click", _groupByFormatAction);
   if (clearBtn)      clearBtn.addEventListener("click", _clearBoardAction);
-  if (saveBtn)       saveBtn.addEventListener("click", _saveBoardAction);
-  if (loadBtn)       loadBtn.addEventListener("click", promptLoadBoard);
-  if (exportJsonBtn) exportJsonBtn.addEventListener("click", _exportCanvasAction);
-})();
+  if (saveBtn)       saveBtn.addEventListener("click", saveBoardJSON);
+  if (loadBtn)       loadBtn.addEventListener("click", () => promptLoadBoard());
+  if (exportJsonBtn) exportJsonBtn.addEventListener("click", exportCanvasJSON);
+}
 
 /* ==========================================================================
-   REMOTE ACTION REGISTRATIONS
+   ACTIONS
    ========================================================================== */
 
 pgkitRegisterAction("action.refreshFromKrita", {
@@ -288,14 +254,12 @@ pgkitRegisterAction("action.refreshFromKrita", {
 });
 
 pgkitRegisterAction("action.addFiles", {
-  label: "+ Add files\u2026",
+  label: "+ Add files…",
   scope: "global",
-  run: _addFilesAction,
+  run: pickFilesViaServer,
   meta: {
     variant: "plain",
-    description: "Opens the native file picker on the server machine. " +
-                 "Use action.addFilesWithPaths to add files by path " +
-                 "from a remote client.",
+    description: "Opens the native file picker on the server machine. Use action.addFilesWithPaths to add files by path from a remote client.",
   },
 });
 
@@ -307,62 +271,37 @@ pgkitRegisterAction("action.addFilesWithPaths", {
   meta: {
     variant: "primary",
     requires: [
-      {
-        name:  "paths",
-        kind:  "text",
-        label: "paths (semicolon-separated)",
-      },
+      { name: "paths", kind: "text", label: "paths (semicolon-separated)" },
     ],
   },
 });
 
 pgkitRegisterAction("action.openAll", {
-  label: "Open all",
-  scope: "global",
-  run: _openAllAction,
-  meta: { variant: "plain" },
+  label: "Open all", scope: "global", run: openAllClosed, meta: { variant: "plain" },
 });
 
 pgkitRegisterAction("action.arrangeGrid", {
-  label: "Arrange grid",
-  scope: "global",
-  run: _arrangeGridAction,
-  meta: { variant: "plain" },
+  label: "Arrange grid", scope: "global", run: _arrangeGridAction, meta: { variant: "plain" },
 });
 
 pgkitRegisterAction("action.fit", {
-  label: "Fit",
-  scope: "global",
-  run: _fitAction,
-  meta: { variant: "plain" },
+  label: "Fit", scope: "global", run: _fitAction, meta: { variant: "plain" },
 });
 
 pgkitRegisterAction("action.resetView", {
-  label: "Reset view",
-  scope: "global",
-  run: _resetViewAction,
-  meta: { variant: "plain" },
+  label: "Reset view", scope: "global", run: _resetViewAction, meta: { variant: "plain" },
 });
 
 pgkitRegisterAction("action.groupByFormat", {
-  label: "Group by format",
-  scope: "global",
-  run: _groupByFormatAction,
-  meta: { variant: "plain" },
+  label: "Group by format", scope: "global", run: _groupByFormatAction, meta: { variant: "plain" },
 });
 
 pgkitRegisterAction("action.exportCanvasJSON", {
-  label: "Export canvas JSON",
-  scope: "global",
-  run: _exportCanvasAction,
-  meta: { variant: "plain" },
+  label: "Export canvas JSON", scope: "global", run: exportCanvasJSON, meta: { variant: "plain" },
 });
 
 pgkitRegisterAction("action.saveBoard", {
-  label: "Save board",
-  scope: "global",
-  run: _saveBoardAction,
-  meta: { variant: "plain" },
+  label: "Save board", scope: "global", run: saveBoardJSON, meta: { variant: "plain" },
 });
 
 pgkitRegisterAction("action.loadBoard", {
@@ -372,109 +311,43 @@ pgkitRegisterAction("action.loadBoard", {
   meta: {
     variant: "plain",
     requires: [
-      {
-        name:   "board_json",
-        kind:   "file",
-        label:  "board JSON",
-        accept: ".json,application/json",
-      },
+      { name: "board_json", kind: "file", label: "board JSON", accept: ".json,application/json" },
     ],
   },
 });
 
 pgkitRegisterAction("action.clearBoard", {
-  label: "Clear board",
-  scope: "global",
-  run: _clearBoardAction,
-  meta: { variant: "danger" },
+  label: "Clear board", scope: "global", run: _clearBoardAction, meta: { variant: "danger" },
 });
 
 pgkitRegisterAction("action.activateSelected", {
-  label: "Activate selected",
-  scope: "selection",
-  level: "items",
-  run: _activateSelectedAction,
-  meta: { variant: "plain" },
+  label: "Activate selected", scope: "selection", level: "items",
+  run: _activateSelectedAction, meta: { variant: "plain" },
 });
 
-/* ---- row actions on items ---------------------------------------- */
-
 pgkitRegisterAction("action.activateItem", {
-  label: "Open",
-  scope: "row",
-  level: "items",
-  appliesTo: () => true,
-  run: _activateItemByTarget,
-  meta: { variant: "primary" },
+  label: "Open", scope: "row", level: "items",
+  appliesTo: () => true, run: _activateItemByTarget, meta: { variant: "primary" },
 });
 
 pgkitRegisterAction("action.deleteItem", {
-  label: "\u00d7",
-  scope: "row",
-  level: "items",
-  appliesTo: () => true,
-  run: _deleteItemByTarget,
-  meta: { variant: "danger" },
+  label: "\u00d7", scope: "row", level: "items",
+  appliesTo: () => true, run: _deleteItemByTarget, meta: { variant: "danger" },
 });
 
-/* ---- row actions on documents ------------------------------------ */
-
 pgkitRegisterAction("action.openDocument", {
-  label: "Open",
-  scope: "row",
-  level: "documents",
-  appliesTo: () => true,
-  run: _openDocumentByTarget,
-  meta: { variant: "primary" },
+  label: "Open", scope: "row", level: "documents",
+  appliesTo: () => true, run: _openDocumentByTarget, meta: { variant: "primary" },
 });
 
 /* ==========================================================================
-   BOOT HOOK — WITH PER-STEP DIAGNOSTICS
-   ==========================================================================
-   Called by page() after installShellControls and before resize().
-   Each step is logged; failures do not prevent subsequent steps from
-   running, so a single missing function cannot kill the whole boot
-   (which is what happened when `syncPanelSliders` was dropped from an
-   earlier version of this migration).
+   BOOT HOOK
+   ========================================================================== */
 
-   What to look for in the browser console on page load:
-
-       [boot] start                            — script parsed, boot began
-       [boot] syncPanelSliders ok              — card-width slider synced
-       [boot] syncItemList ok                  — item list populated
-       [boot] _syncEditor ok                   — editor DOM synced
-       [boot] complete                         — refreshFromKrita() fired
-
-   If the boot stops between two lines, the failing step is named in
-   the error log for that step.  If no `[boot]` line appears at all,
-   the script did not parse — look for a `SyntaxError` at the top of
-   the console. */
-
-function pgkitBootSync() {
-  console.log("[boot] start");
-  try {
-    try {
-      syncPanelSliders();
-      console.log("[boot] syncPanelSliders ok");
-    } catch (e) {
-      console.error("[boot] syncPanelSliders failed:", e);
-    }
-    try {
-      syncItemList();
-      console.log("[boot] syncItemList ok");
-    } catch (e) {
-      console.error("[boot] syncItemList failed:", e);
-    }
-    try {
-      _syncEditor();
-      console.log("[boot] _syncEditor ok");
-    } catch (e) {
-      console.error("[boot] _syncEditor failed:", e);
-    }
-    refreshFromKrita();
-    console.log("[boot] complete");
-  } catch (e) {
-    console.error("[boot] pgkitBootSync failed:", e);
-  }
+export function pgkitBootSync() {
+  syncPanelSliders();
+  syncItemList();
+  _syncEditor();
+  refreshFromKrita();
 }
 """

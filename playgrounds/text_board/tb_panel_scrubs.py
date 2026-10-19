@@ -1,30 +1,20 @@
 """
-tb_panel_scrubs.py — pgkit field registrations and small DOM bindings.
+tb_panel_scrubs.py — field registrations and DOM bindings.
 
-Every field the remote panel sees is registered here, in one place:
-
-    board.cardWidth       number, via the slider below.
-    board.showWordBoxes   bool, via the checkbox below.
-    view.zoom             number, driven by the wheel.
-    view.panX, view.panY  number, driven by canvas pan.
-    item.text             text, follows selection.
-    item.fontFamily       text, follows selection.
-    item.fontSize         number, follows selection.
-    item.color            text, follows selection.
-    item.alignment        enum (left|center|right), follows selection.
-    item.rotationDeg      number, follows selection.
-
-The item.* getters return empty / zero when nothing is selected.
-The item.* setters route through `_applyItemField` in
-tb_panel_fields.py, which mutates the model, queues the Krita
-patch, and fires pgkitNotifyLocal — safe on both the local and
-remote path thanks to pgkit's `_pgkitApplyingRemote` guard.
-
-The slider and checkbox bindings live here too, since they drive
-the two board.* fields.
+Pure side effect at module load: registers every field, installs the
+slider and word-box checkbox listeners.  No exports — the boot
+module imports it bare to trigger the registrations.
 """
 
 TB_PANEL_SCRUBS_JS = r"""
+import {
+  board, view, selectedItem, _computeBoardScale, _rebaseAllItems,
+} from "./tb_core.js";
+import { applyItemField, updatePanelLabels } from "./tb_panel_fields.js";
+import {
+  pgkitRegisterField, pgkitNotifyLocal,
+} from "./pgkit/remote_client.js";
+
 /* ==========================================================================
    BOARD.* FIELDS
    ========================================================================== */
@@ -36,12 +26,12 @@ pgkitRegisterField("board.cardWidth", {
     if (!isFinite(n) || n <= 0) return;
     board.defaultWidth  = n;
     board._scaleUserSet = true;
-    _boardScale         = _computeBoardScale();
+    board.scale         = _computeBoardScale();
     _rebaseAllItems();
     updatePanelLabels();
     const s = document.getElementById("cardWSlider");
     if (s && document.activeElement !== s) s.value = n;
-    draw();
+    import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
   },
   meta: { kind: "number", label: "Card width", min: 120, max: 720 },
 });
@@ -52,19 +42,14 @@ pgkitRegisterField("board.showWordBoxes", {
     board.showWordBoxes = !!v;
     const cb = document.getElementById("wordBoxToggle");
     if (cb && document.activeElement !== cb) cb.checked = board.showWordBoxes;
-    draw();
+    import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
   },
   meta: { kind: "bool", label: "Word boxes" },
 });
 
 /* ==========================================================================
    VIEW.* FIELDS
-   ==========================================================================
-   The model lives in `view`; the canvas wheel and pan handlers are
-   the only writers, and both already call pgkitNotifyLocal after
-   their mutation (see tb_dispatch.py).  The `set` here is a plain
-   model write followed by a draw — sufficient for the remote-patch
-   path. */
+   ========================================================================== */
 
 pgkitRegisterField("view.zoom", {
   get: () => view.zoom,
@@ -72,7 +57,7 @@ pgkitRegisterField("view.zoom", {
     const n = parseFloat(v);
     if (!isFinite(n)) return;
     view.zoom = Math.max(0.05, Math.min(8, n));
-    draw();
+    import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
   },
   meta: { kind: "number", label: "Zoom", min: 0.05, max: 8 },
 });
@@ -83,7 +68,7 @@ pgkitRegisterField("view.panX", {
     const n = parseFloat(v);
     if (!isFinite(n)) return;
     view.panX = n;
-    draw();
+    import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
   },
   meta: { kind: "number", label: "Pan X" },
 });
@@ -94,28 +79,24 @@ pgkitRegisterField("view.panY", {
     const n = parseFloat(v);
     if (!isFinite(n)) return;
     view.panY = n;
-    draw();
+    import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
   },
   meta: { kind: "number", label: "Pan Y" },
 });
 
 /* ==========================================================================
-   ITEM.* FIELDS — FOLLOW SELECTION
-   ==========================================================================
-   The getters return the selected item's value, or the field's
-   natural empty ("" / 0) when nothing is selected.  The setters
-   route through _applyItemField in tb_panel_fields.py, which handles
-   the model write, the Krita patch, and the notify. */
+   ITEM.* FIELDS
+   ========================================================================== */
 
 function _itemGet(key, dflt) {
   const it = selectedItem();
   return it ? it[key] : dflt;
 }
-
 function _itemSet(key, value) {
   const it = selectedItem();
   if (!it) return;
-  _applyItemField(it, key, value);
+  applyItemField(it, key, value);
+  import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
 }
 
 pgkitRegisterField("item.text", {
@@ -149,11 +130,7 @@ pgkitRegisterField("item.color", {
 pgkitRegisterField("item.alignment", {
   get: () => _itemGet("alignment", "left"),
   set: (v) => _itemSet("alignment", String(v == null ? "left" : v)),
-  meta: {
-    kind: "enum",
-    label: "Alignment",
-    options: ["left", "center", "right"],
-  },
+  meta: { kind: "enum", label: "Alignment", options: ["left", "center", "right"] },
 });
 
 pgkitRegisterField("item.rotationDeg", {
@@ -170,26 +147,24 @@ pgkitRegisterField("item.rotationDeg", {
    SLIDER + CHECKBOX DOM BINDINGS
    ========================================================================== */
 
-(function installSliderAndCheckboxBindings() {
-  const slider   = document.getElementById("cardWSlider");
-  const wbToggle = document.getElementById("wordBoxToggle");
+const slider   = document.getElementById("cardWSlider");
+const wbToggle = document.getElementById("wordBoxToggle");
 
-  if (slider) slider.addEventListener("input", () => {
-    const v = parseInt(slider.value, 10);
-    if (!isFinite(v) || v <= 0) return;
-    board.defaultWidth  = v;
-    board._scaleUserSet = true;
-    _boardScale         = _computeBoardScale();
-    _rebaseAllItems();
-    updatePanelLabels();
-    pgkitNotifyLocal("board.cardWidth");
-    draw();
-  });
+if (slider) slider.addEventListener("input", () => {
+  const v = parseInt(slider.value, 10);
+  if (!isFinite(v) || v <= 0) return;
+  board.defaultWidth  = v;
+  board._scaleUserSet = true;
+  board.scale         = _computeBoardScale();
+  _rebaseAllItems();
+  updatePanelLabels();
+  pgkitNotifyLocal("board.cardWidth");
+  import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
+});
 
-  if (wbToggle) wbToggle.addEventListener("change", () => {
-    board.showWordBoxes = !!wbToggle.checked;
-    pgkitNotifyLocal("board.showWordBoxes");
-    draw();
-  });
-})();
+if (wbToggle) wbToggle.addEventListener("change", () => {
+  board.showWordBoxes = !!wbToggle.checked;
+  pgkitNotifyLocal("board.showWordBoxes");
+  import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
+});
 """

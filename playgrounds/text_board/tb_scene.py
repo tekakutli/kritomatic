@@ -1,29 +1,29 @@
 """
 tb_scene.py — save and load the board.
 
-Only presentation is persisted: board settings, view state, the
-current board scale, and — for reference — each item's board
-rectangle.  Content is always pulled fresh from Krita on load, and
-positions are recomputed from the documents' current shapes via
-`_rebaseAllItems`, so a saved board is a set of settings, not a
-snapshot of a layout that will go stale.
-
-REMOTE NOTIFICATION
-===================
-`applyBoardScene` replaces the entire board's settings and view state.
-Every value that any registered field reads changes as a result.  It
-ends with `pgkitNotifyAll()`, so remote clients receive a single patch
-with the new state on the next animation frame.  `buildBoardScene` and
-`saveBoardJSON` are read-only from the model's perspective and do not
-notify.
+Exports: buildBoardScene, saveBoardJSON, applyBoardScene,
+loadBoardFromText, promptLoadBoard.
 """
 
 SCENE_JS = r"""
+import {
+  board, view, _rebaseAllItems, _computeBoardScale,
+  addFileByPath_unused,
+} from "./tb_core.js";
+import { syncItemList } from "./tb_panel_lists.js";
+import { _syncEditor, syncPanelSliders } from "./tb_panel_fields.js";
+import { pgkitNotifyAll } from "./pgkit/remote_client.js";
+import { flashStatus } from "./pgkit/panel_core.js";
+
+/* addFileByPath is used below; alias-imported by the boot via the
+   real export name from tb_core.js. */
+import { addFileByPath } from "./tb_core.js";
+
 const SCENE_VERSION = 2;
 const SCENE_TYPE    = "text_board_scene";
 const SCENE_FILE    = "text_board_scene.json";
 
-function buildBoardScene() {
+export function buildBoardScene() {
   return {
     sceneVersion: SCENE_VERSION,
     type:         SCENE_TYPE,
@@ -32,26 +32,18 @@ function buildBoardScene() {
       defaultWidth:  board.defaultWidth,
       gridGap:       board.gridGap,
       showWordBoxes: board.showWordBoxes,
-      boardScale:    _boardScale,
+      boardScale:    board.scale,
     },
-    view: {
-      zoom: view.zoom,
-      panX: view.panX,
-      panY: view.panY,
-    },
+    view: { zoom: view.zoom, panX: view.panX, panY: view.panY },
     items: board.items.map(it => ({
-      id: it.id,
-      bx: it.bx, by: it.by,
-      bw: it.bw, bh: it.bh,
-      bz: it.bz,
+      id: it.id, bx: it.bx, by: it.by, bw: it.bw, bh: it.bh, bz: it.bz,
     })),
   };
 }
 
-function saveBoardJSON() {
+export function saveBoardJSON() {
   const text = JSON.stringify(buildBoardScene(), null, 2);
-  const url  = "data:application/json;charset=utf-8," +
-               encodeURIComponent(text);
+  const url  = "data:application/json;charset=utf-8," + encodeURIComponent(text);
   const a = document.createElement("a");
   a.href = url;
   a.download = SCENE_FILE;
@@ -62,24 +54,17 @@ function saveBoardJSON() {
   flashStatus("saved " + board.items.length + " item(s)", "ok");
 }
 
-function applyBoardScene(data) {
+export function applyBoardScene(data) {
   if (!data || typeof data !== "object") throw new Error("not an object");
-  if (data.type && data.type !== SCENE_TYPE)
-    throw new Error("wrong type '" + data.type + "'");
-  if (data.sceneVersion !== SCENE_VERSION)
-    throw new Error("unsupported sceneVersion " + data.sceneVersion);
+  if (data.type && data.type !== SCENE_TYPE) throw new Error("wrong type '" + data.type + "'");
+  if (data.sceneVersion !== SCENE_VERSION) throw new Error("unsupported sceneVersion " + data.sceneVersion);
 
   if (data.board) {
-    if (typeof data.board.defaultWidth === "number")
-      board.defaultWidth = data.board.defaultWidth;
-    if (typeof data.board.gridGap === "number")
-      board.gridGap = data.board.gridGap;
-    if (typeof data.board.showWordBoxes === "boolean")
-      board.showWordBoxes = data.board.showWordBoxes;
-    if (typeof data.board.boardScale === "number")
-      _boardScale = data.board.boardScale;
-    else
-      _boardScale = _computeBoardScale();
+    if (typeof data.board.defaultWidth === "number") board.defaultWidth = data.board.defaultWidth;
+    if (typeof data.board.gridGap === "number") board.gridGap = data.board.gridGap;
+    if (typeof data.board.showWordBoxes === "boolean") board.showWordBoxes = data.board.showWordBoxes;
+    if (typeof data.board.boardScale === "number") board.scale = data.board.boardScale;
+    else board.scale = _computeBoardScale();
   }
   if (data.view) {
     if (typeof data.view.zoom === "number") view.zoom = data.view.zoom;
@@ -87,8 +72,6 @@ function applyBoardScene(data) {
     if (typeof data.view.panY === "number") view.panY = data.view.panY;
   }
 
-  // bz is preserved across a load so a user's manual stacking
-  // survives; positions are recomputed from the documents.
   const savedBz = new Map();
   for (const s of (data.items || [])) {
     if (s && s.id && typeof s.bz === "number") savedBz.set(s.id, s.bz);
@@ -110,11 +93,11 @@ function applyBoardScene(data) {
   syncPanelSliders();
   syncItemList();
   _syncEditor();
-  draw();
+  import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
   pgkitNotifyAll();
 }
 
-async function loadBoardFromText(text) {
+export async function loadBoardFromText(text) {
   let data;
   try { data = JSON.parse(text); }
   catch (e) { flashStatus("Load failed: not valid JSON", "bad"); return false; }
@@ -122,8 +105,8 @@ async function loadBoardFromText(text) {
   try { applyBoardScene(data); }
   catch (e) { flashStatus("Load failed: " + e.message, "bad"); return false; }
 
-  // Refresh to pick up content, then re-apply the settings.
-  await refreshFromKrita();
+  const m = await import("./tb_krita.js");
+  await m.refreshFromKrita();
   try { applyBoardScene(data); }
   catch (e) { /* already reported */ }
 
@@ -157,7 +140,7 @@ function _installBoardFileInput() {
   return inp;
 }
 
-function promptLoadBoard() {
+export function promptLoadBoard() {
   _installBoardFileInput().click();
 }
 """

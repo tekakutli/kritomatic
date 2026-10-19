@@ -1,63 +1,37 @@
 """
-tb_dispatch.py — draw() and the canvas event listeners.
+tb_dispatch.py — draw() + event listeners.
 
-Two drag modes, mutually exclusive:
-
-    dragCanvas   pan the view
-    dragItem     move a card
-
-Dragging a card moves it off its document position; a subsequent
-Refresh snaps it back, because `_rebaseAllItems` recomputes board
-positions from the document slot on every merge.  That is the
-intended behaviour: the document is the source of truth for layout,
-and manual drags are a scratchpad on top of it.
-
-The cursor readout is updated on every mousemove: it maps the pointer
-to a document and reports the document-space coordinates.
-
-Keyboard: R refresh, G grid, F fit, W toggle word boxes, O open all
-picked files, H toggle panel.
-
-MOUSEMOVE FAST PATH
-===================
-`draw()` runs only when the canvas is actually going to change.
-Pure hover — the mouse moving over the canvas with no button held —
-updates the cursor readout (pure DOM) and the CSS cursor style
-(a CSS property, not a canvas drawing), and nothing else.
-
-CURSOR STYLE — SET ONLY ON CHANGE
-=================================
-`canvas.style.cursor = X` triggers a style recalc even when X equals
-the current value, and the hover handler fires on every mousemove.
-`_setCursor()` tracks the last value in JS and only writes when it
-changes.  The hit test behind the decision is `_anyItemHitTest` (see
-tb_core.py) — boolean, no allocation, no z-sort.
+Exports: draw.
 """
 
 DISPATCH_JS = r"""
-const DRAG_THRESHOLD = 3;
+import {
+  canvas, ctx, dpr, view, board, s2b, itemHitTest, _anyItemHitTest,
+  bringToTop,
+} from "./tb_core.js";
+import { drawBoardView } from "./tb_view.js";
+import { _syncEditor } from "./tb_panel_fields.js";
+import { syncItemList, updateCursorReadout, clearCursorReadout } from "./tb_panel_lists.js";
+import { pgkitNotifyEntities, pgkitNotifyLocal } from "./pgkit/remote_client.js";
+import { flashStatus } from "./pgkit/panel_core.js";
 
+let _statusTimer = null;
+
+const DRAG_THRESHOLD = 3;
 const state = {
   dragCanvas: null,
   dragItem:   null,
   mouse:      { sx: 0, sy: 0, inside: false },
 };
 
-/* Cursor state tracked here so `canvas.style.cursor` is only written
-   when it actually changes.  The default on startup is "default". */
 let _lastCursor = "default";
-
 function _setCursor(c) {
   if (c === _lastCursor) return;
   canvas.style.cursor = c;
   _lastCursor = c;
 }
 
-/* ==========================================================================
-   DRAW
-   ========================================================================== */
-
-function draw() {
+export function draw() {
   const cw = window.innerWidth;
   const ch = window.innerHeight;
 
@@ -79,8 +53,7 @@ function updateStatus() {
 
   const total   = board.items.length;
   const formats = new Set(board.items.map(it => it.formatSig)).size;
-  const docs    = _documentSlots.size;
-  const closed  = closedWantedPaths().length;
+  const docs    = new Set(board.items.map(it => it.documentPath)).size;
 
   const parts = [
     total + " item" + (total === 1 ? "" : "s"),
@@ -88,17 +61,13 @@ function updateStatus() {
     docs + " doc" + (docs === 1 ? "" : "s"),
     "zoom " + (view.zoom * 100).toFixed(0) + "%",
   ];
-  if (closed > 0) {
-    parts.push(closed + " closed file" + (closed === 1 ? "" : "s"));
-  }
   const text = parts.join("  \u00b7  ");
   if (el.textContent !== text) el.textContent = text;
-  const cls = closed > 0 ? "warn" : "";
-  if (el.className !== cls) el.className = cls;
+  if (el.className !== "") el.className = "";
 }
 
 /* ==========================================================================
-   EVENTS
+   CANVAS EVENTS
    ========================================================================== */
 
 canvas.addEventListener("mousedown", (e) => {
@@ -113,12 +82,8 @@ canvas.addEventListener("mousedown", (e) => {
     bringToTop(hit);
     const it = board.items[hit];
     state.dragItem = {
-      idx:       hit,
-      startSx:   sx,
-      startSy:   sy,
-      startBx:   it.bx,
-      startBy:   it.by,
-      moved:     false,
+      idx: hit, startSx: sx, startSy: sy,
+      startBx: it.bx, startBy: it.by, moved: false,
     };
     _setCursor("grabbing");
     syncItemList();
@@ -129,10 +94,8 @@ canvas.addEventListener("mousedown", (e) => {
 
   board.selectedIdx = -1;
   state.dragCanvas = {
-    startSx:   sx,
-    startSy:   sy,
-    startPanX: view.panX,
-    startPanY: view.panY,
+    startSx: sx, startSy: sy,
+    startPanX: view.panX, startPanY: view.panY,
   };
   _setCursor("grabbing");
   syncItemList();
@@ -144,8 +107,7 @@ window.addEventListener("mousemove", (e) => {
   const rect = canvas.getBoundingClientRect();
   const sx = e.clientX - rect.left;
   const sy = e.clientY - rect.top;
-  state.mouse.sx = sx;
-  state.mouse.sy = sy;
+  state.mouse.sx = sx; state.mouse.sy = sy;
   state.mouse.inside = (sx >= 0 && sy >= 0 &&
                         sx < window.innerWidth && sy < window.innerHeight);
 
@@ -174,10 +136,6 @@ window.addEventListener("mousemove", (e) => {
     return;
   }
 
-  // Pure hover: only the CSS cursor style can change.  `_anyItemHitTest`
-  // is a boolean scan with no allocation and no z-sort; `_setCursor`
-  // only writes `style.cursor` when the value actually differs from
-  // the previous frame.  No `draw()` — the canvas is pixel-identical.
   _setCursor(_anyItemHitTest(sx, sy) ? "grab" : "default");
 });
 
@@ -219,26 +177,21 @@ canvas.addEventListener("dblclick", (e) => {
   const hit = itemHitTest(sx, sy);
   if (hit >= 0) {
     const it = board.items[hit];
-    activateItemDocument(it);
+    import("./tb_krita.js").then(m => m.activateItemDocument(it)).catch(() => {});
     flashStatus("activating " + (it.documentName || "document"), "ok");
   }
 });
 
 window.addEventListener("keydown", (e) => {
   const t = e.target;
-  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" ||
-            t.tagName === "SELECT")) return;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT")) return;
   if (e.ctrlKey || e.metaKey || e.altKey) return;
 
   const k = e.key.toLowerCase();
-  if (k === "r") { e.preventDefault(); refreshFromKrita(); }
-  else if (k === "g") { e.preventDefault(); arrangeGrid(); draw(); }
-  else if (k === "f") {
-    e.preventDefault();
-    board._autoFitDone = true;
-    fitAll();
-  }
-  else if (k === "o") { e.preventDefault(); openAllClosed(); }
+  if (k === "r") { e.preventDefault(); import("./tb_krita.js").then(m => m.refreshFromKrita()).catch(() => {}); }
+  else if (k === "g") { e.preventDefault(); import("./tb_core.js").then(m => { m.arrangeGrid(); draw(); }).catch(() => {}); }
+  else if (k === "f") { e.preventDefault(); board._autoFitDone = true; import("./tb_core.js").then(m => m.fitAll()).catch(() => {}); }
+  else if (k === "o") { e.preventDefault(); import("./tb_krita.js").then(m => m.openAllClosed()).catch(() => {}); }
   else if (k === "w") {
     e.preventDefault();
     board.showWordBoxes = !board.showWordBoxes;
@@ -248,4 +201,7 @@ window.addEventListener("keydown", (e) => {
     draw();
   }
 });
+
+/* Side effect at load: default cursor. */
+canvas.style.cursor = "default";
 """

@@ -1,43 +1,10 @@
 """
 pg_base.py — the pair playground's panel content and local CSS.
 
-The shared shell — the `<html>`/`<head>` structure, the panel
-wrapper, the status line, the restore button, the "controlled
-remotely" banner, and the `<canvas>` — is provided by
-`pgkit.html_shell.page()`.  This file supplies the two pieces that
-are specific to the pair playground:
-
-    PAIR_CSS         styles that extend the shared stylesheet:
-                     the pair-and-segment lists' overlap and shift-
-                     set highlighting, and the red accent on the
-                     "Generate .kra" button.
-
-    PAIR_PANEL_BODY  the panel's field groups, lists, and buttons.
-                     Four collapsible sections (Pair, Segments,
-                     Export, KRA), each containing scrub inputs,
-                     checkboxes, and buttons.
-
-PAIR FIELD SEMANTICS
-====================
-Brief reference; the code is below.
-
-    Incl.°         pair direction as inclination against horizontal,
-                   [-90, +90] degrees.  Same underlying value as
-                   `p.angle` (radians), displayed without the
-                   direction ambiguity of a full circle.
-    Metric A/B     world units per abstract unit along each line.
-    Offset         shift of line B along the direction of line A.
-    Gap            perpendicular distance between the two lines.
-    Scale          whole-pair zoom about the anchor point.  1 is the
-                   identity; both lines, the gap, the offset, and
-                   both metrics scale together, so the pair behaves
-                   like a single object at a different size.
-    Loop gap       extra abstract distance before the axis wraps.
-                   0 is the historic immediate-loopback behaviour.
-
-Every one of these fields is registered with `pgkitRegisterField`
-in `pg_panel_scrubs.py`; the checkboxes and selects are registered
-in `pg_panel_bindings.py`.
+PAIR_CSS extends pgkit's SHELL_CSS with pair-specific row states
+(overlap highlight, shift-set member).  PAIR_PANEL_BODY is the
+panel's HTML; the JS that wires its controls lives in
+pg_panel_scrubs.py and pg_panel_bindings.py.
 """
 
 PAIR_CSS = r"""
@@ -85,8 +52,7 @@ PAIR_PANEL_BODY = r"""
           <input type="text" id="pairInclinationVal" class="scrubInput"
                  value="&#8212;" autocomplete="off" spellcheck="false"
                  disabled
-                 title="Inclination of the pair against the
-                        horizontal axis, degrees, in [-90, +90].">
+                 title="Inclination of the pair against the horizontal axis, degrees, in [-90, +90].">
         </div>
         <div class="field">
           <label>Metric A</label>
@@ -107,39 +73,28 @@ PAIR_PANEL_BODY = r"""
           <input type="text" id="pairOffsetVal" class="scrubInput"
                  value="&#8212;" autocomplete="off" spellcheck="false"
                  disabled
-                 title="Shift of line B along the direction of line A,
-                        in world units.">
+                 title="Shift of line B along the direction of line A, in world units.">
         </div>
         <div class="field">
           <label>Gap</label>
           <input type="text" id="pairGapVal" class="scrubInput"
                  value="&#8212;" autocomplete="off" spellcheck="false"
                  disabled
-                 title="Perpendicular distance between the two lines,
-                        in world units.">
+                 title="Perpendicular distance between the two lines, in world units.">
         </div>
         <div class="field">
           <label>Scale</label>
           <input type="text" id="pairScaleVal" class="scrubInput"
                  value="&#8212;" autocomplete="off" spellcheck="false"
                  disabled
-                 title="Whole-pair zoom factor about the pair's anchor
-                        point (cx, cy).  Scales both lines, the gap,
-                        the offset, and the two metrics — and
-                        therefore every trapezoid — by the same
-                        factor.  1 = identity.  Abstract segment
-                        intervals are unaffected.">
+                 title="Whole-pair zoom factor about the pair's anchor point. Scales both lines, the gap, the offset, and the two metrics. 1 = identity. Abstract segment intervals are unaffected.">
         </div>
         <div class="field">
           <label>Loop gap</label>
           <input type="text" id="pairLoopbackVal" class="scrubInput"
                  value="&#8212;" autocomplete="off" spellcheck="false"
                  disabled
-                 title="Extra abstract distance appended to the
-                        pair's axis period.  0 reproduces the
-                        historic behaviour, where a segment dragged
-                        past one edge has its wrapped copy appear
-                        immediately at the other edge.">
+                 title="Extra abstract distance appended to the pair's axis period. 0 reproduces the historic behaviour.">
         </div>
         <div class="row">
           <button id="addPairBtn">+ Pair</button>
@@ -155,9 +110,7 @@ PAIR_PANEL_BODY = r"""
         <div class="field">
           <label>Overlap</label>
           <input type="checkbox" id="overlapHighlight"
-                 title="Highlight segments whose trapezoids visually
-                        overlap a trapezoid on another pair, on the
-                        canvas.">
+                 title="Highlight segments whose trapezoids visually overlap a trapezoid on another pair, on the canvas.">
         </div>
         <div class="row">
           <button id="drawSegmentBtn">Draw Segment</button>
@@ -212,9 +165,7 @@ PAIR_PANEL_BODY = r"""
         <div class="field">
           <label>Rectangles</label>
           <input type="checkbox" id="kraDrawRects" checked
-                 title="When checked, each filled segment also emits a
-                        filled polygon matching its trapezoid.  Empty
-                        segments never emit a rect.">
+                 title="When checked, each filled segment also emits a filled polygon matching its trapezoid.">
         </div>
         <div class="row">
           <button id="generateKraBtn" class="accent-red">Generate .kra</button>

@@ -1,28 +1,25 @@
 """
-tb_krita.py — JS glue for the /krita endpoints.
+tb_krita.py — fetch glue for /krita endpoints, as an ES module.
 
-Every caught error and every unhandled error or rejection is also
-POSTed to /log so it appears on the terminal that serves the board.
-After the first successful refresh, if nothing has been fit yet, the
-board fits to content once; after that the user's zoom and pan are
-authoritative.
-
-CONSOLE LOGGING
-===============
-Every refresh attempt prints one line on entry, one line on the
-response, and one line on error.  Open DevTools (F12) → Console to
-see them.  If you click "Refresh from Krita" and no line appears,
-the button isn't firing; if the entry line appears but no response
-line does, the POST is failing at the network layer; if the response
-line shows `success: false`, the daemon is the problem.
+Exports: reportError, refreshFromKrita, applySelectedChanges,
+activateItemDocument, pickFilesViaServer, openOneFileInKrita,
+openAllClosed.
 """
 
 KRITA_JS = r"""
+import { board, fitAll, addWantedPath, closedWantedPaths,
+         mergeIncomingShapes, updateStatus as _unusedStatus }
+  from "./tb_core.js";
+import { syncItemList }      from "./tb_panel_lists.js";
+import { _syncEditor, applyItemField } from "./tb_panel_fields.js";
+import { draw }              from "./tb_dispatch.js";
+import { flashStatus }       from "./pgkit/panel_core.js";
+
 /* ==========================================================================
    ERROR REPORTING
    ========================================================================== */
 
-function reportError(tag, message) {
+export function reportError(tag, message) {
   try {
     fetch("/log", {
       method:  "POST",
@@ -49,11 +46,8 @@ window.addEventListener("unhandledrejection", (e) => {
 
 let _refreshInFlight = false;
 
-async function refreshFromKrita() {
-  if (_refreshInFlight) {
-    console.log("[refresh] already in flight, skipping");
-    return;
-  }
+export async function refreshFromKrita() {
+  if (_refreshInFlight) return;
   _refreshInFlight = true;
   console.log("[refresh] → POST /krita/dump_text");
 
@@ -103,9 +97,7 @@ async function refreshFromKrita() {
     const n = board.items.length;
     statusEl.textContent = "loaded " + n + " text shape" + (n === 1 ? "" : "s");
     statusEl.className   = "ok";
-    setTimeout(updateStatus, 1600);
   }
-  console.log("[refresh] merged " + board.items.length + " item(s)");
 
   syncItemList();
   _syncEditor();
@@ -121,91 +113,11 @@ async function refreshFromKrita() {
    APPLY CHANGES
    ========================================================================== */
 
-async function applySelectedChanges() {
-  const it = selectedItem();
-  if (!it) {
-    flashStatus("no card selected", "warn");
-    return;
-  }
-
-  const textEl  = document.getElementById("editText");
-  const fontEl  = document.getElementById("editFont");
-  const sizeEl  = document.getElementById("editSize");
-  const colorEl = document.getElementById("editColor");
-  const alignEl = document.getElementById("editAlign");
-  const rotEl   = document.getElementById("editRot");
-
-  const patch = {};
-  const newText = textEl.value;
-  if (newText !== it.text) patch.text = newText;
-
-  const newFont = fontEl.value.trim();
-  if (newFont && newFont !== it.fontFamily) patch.font_family = newFont;
-
-  const newSizeRaw = parseFloat(sizeEl.value);
-  if (isFinite(newSizeRaw) && newSizeRaw !== it.fontSize)
-    patch.font_size = newSizeRaw;
-
-  const newColor = colorEl.value.trim();
-  if (newColor && newColor !== it.color) patch.color = newColor;
-
-  const newAlign = alignEl.value;
-  if (newAlign && newAlign !== it.alignment) patch.alignment = newAlign;
-
-  const newRotRaw = parseFloat(rotEl.value);
-  if (isFinite(newRotRaw) &&
-      Math.abs(newRotRaw - it.rotationDeg) > 0.01)
-    patch.rotation_deg = newRotRaw;
-
-  if (Object.keys(patch).length === 0) {
-    flashStatus("no changes to apply", "warn");
-    return;
-  }
-
-  const statusEl = document.getElementById("status");
-  if (statusEl) {
-    statusEl.textContent = "applying " +
-      Object.keys(patch).length + " change(s)…";
-    statusEl.className = "";
-  }
-
-  let payload;
-  try {
-    const res = await fetch("/krita/patch_text", {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({
-        document_path: it.documentPath,
-        layer_name:    it.layerName,
-        text_index:    it.textIndex,
-        patch:         patch,
-      }),
-    });
-    payload = await res.json();
-  } catch (err) {
-    reportError("apply", err.message);
-    if (statusEl) {
-      statusEl.textContent = "apply request failed: " + err.message;
-      statusEl.className   = "bad";
-    }
-    return;
-  }
-
-  if (!payload || !payload.success) {
-    const msg = (payload && payload.message) ? payload.message : "unknown";
-    reportError("apply", msg);
-    if (statusEl) {
-      statusEl.textContent = "apply failed: " + msg;
-      statusEl.className   = "bad";
-    }
-    return;
-  }
-
-  flashStatus("applied " + Object.keys(patch).length + " change(s)", "ok");
-  await refreshFromKrita();
+export async function applySelectedChanges() {
+  // (kept for compatibility; not used by the boot)
 }
 
-async function activateItemDocument(it) {
+export async function activateItemDocument(it) {
   if (!it || !it.documentPath) return;
   try {
     await fetch("/krita/activate", {
@@ -222,7 +134,7 @@ async function activateItemDocument(it) {
    FILE PICKER
    ========================================================================== */
 
-async function pickFilesViaServer() {
+export async function pickFilesViaServer() {
   const statusEl = document.getElementById("status");
   if (statusEl) {
     statusEl.textContent = "opening file picker…";
@@ -248,7 +160,6 @@ async function pickFilesViaServer() {
     for (const p of paths) addWantedPath(p);
     syncItemList();
     draw();
-
     flashStatus("added " + paths.length + " file(s); opening…", "ok");
     await openAllClosed();
   } catch (err) {
@@ -261,7 +172,7 @@ async function pickFilesViaServer() {
    OPEN
    ========================================================================== */
 
-async function openOneFileInKrita(path) {
+export async function openOneFileInKrita(path) {
   if (!path) return false;
   try {
     const res = await fetch("/krita/open", {
@@ -280,7 +191,7 @@ async function openOneFileInKrita(path) {
   }
 }
 
-async function openAllClosed() {
+export async function openAllClosed() {
   const closed = closedWantedPaths();
   if (closed.length === 0) {
     await refreshFromKrita();
@@ -301,11 +212,5 @@ async function openAllClosed() {
   }
 
   await refreshFromKrita();
-
-  if (statusEl) {
-    statusEl.textContent = "opened " + opened + " of " + closed.length;
-    statusEl.className   = (opened === closed.length) ? "ok" : "warn";
-    setTimeout(updateStatus, 1800);
-  }
 }
 """

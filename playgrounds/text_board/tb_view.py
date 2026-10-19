@@ -1,47 +1,18 @@
 """
 tb_view.py — draw the board.
 
-Cards are drawn in `_zSortedIndices()` order.  The card rectangle is
-the axis-aligned document-space AABB of the text shape, exactly as the
-daemon reports it.  Word boxes are drawn from their document-space
-corners.
-
-The shape's text is shown once: in the caption below its card, as
-`<layerName> · <text>`.  It is not also drawn rotated at the shape's
-document anchor inside the card.
-
-Before the cards, one dashed rectangle per document is drawn at that
-document's canvas extent in board-space coordinates.
-
-PERFORMANCE
-===========
-    VIEWPORT CULLING
-        A card fully outside the visible viewport is not drawn.
-
-    SHADOW-ONLY-WHEN-SELECTED
-        `shadowBlur` is applied only to the selected card; every
-        other card gets a cheap flat offset rect.
-
-    BATCHED GRID
-        The background dot grid is a single path filled once.
-
-    LABEL-WIDTH CACHE
-        `measureText` runs only when the label text changed.
-
-    CACHED DOCUMENT LAYOUT
-        `_drawDocumentBounds` iterates `_docLayout()` (see
-        tb_core.py) rather than re-sorting `_documentSlots` per
-        frame.
-
-    HOISTED docToScreen
-        `_drawItemCard`'s word-box loop uses precomputed `ox`, `oy`,
-        and `s` instead of per-corner closure calls + `b2s()` +
-        array allocations.  The per-card setup is three arithmetic
-        expressions; the loop body is two multiplications and two
-        additions per corner, no allocation.
+Imports come from tb_core (`board`, `view`, `ctx`, `b2s`,
+`_docLayout`, `_zSortedIndices`, `_rgba`, `board.scale`,
+`DOCUMENT_GAP`, `ensureThumbLoaded`, `fileState`, `_cardLabelWidth`
+is defined locally).  Exports `drawBoardView`.
 """
 
 VIEW_JS = r"""
+import {
+  b2s, view, ctx, board, _zSortedIndices, _rgba, _rgbaLight,
+  _docLayout, DOCUMENT_GAP, ensureThumbLoaded,
+} from "./tb_core.js";
+
 /* ==========================================================================
    DOCUMENT BOUNDS
    ========================================================================== */
@@ -56,7 +27,6 @@ function _drawDocumentBounds() {
     const y1 = y0 + entry.bh * view.zoom;
 
     ctx.save();
-
     ctx.fillStyle = "rgba(0, 229, 255, 0.025)";
     ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
 
@@ -73,17 +43,13 @@ function _drawDocumentBounds() {
       ctx.fillStyle = "rgba(0, 229, 255, 0.55)";
       ctx.fillText(entry.docW + " \u00d7 " + entry.docH, x0 + 2, y0 - 4);
     }
-
     ctx.restore();
   }
 }
 
 /* ==========================================================================
    BACKGROUND GRID
-   ==========================================================================
-   One path, one fill.  The per-cell arithmetic is hoisted out of the
-   inner loop; `b2s()` would be a function call per cell otherwise.
-   Pixel-identical to the previous per-`fillRect` version. */
+   ========================================================================== */
 
 function _drawBoardGrid() {
   const cw = window.innerWidth;
@@ -130,16 +96,6 @@ function _roundRect(x, y, w, h, r) {
   ctx.closePath();
 }
 
-/* ==========================================================================
-   COLOUR SANITISATION
-   ==========================================================================
-   The colour Krita reports for a text shape is whatever the SVG carries.
-   That is frequently "#000000", occasionally "none", and sometimes a
-   named colour.  Canvas silently ignores any value it does not
-   understand, which produces a fill or stroke in whatever the previous
-   colour was — very often the page background.  Normalise everything
-   here so the drawing code never has to think about it. */
-
 function _parseHexColor(c) {
   if (!c || c[0] !== "#") return null;
   const hex = c.slice(1);
@@ -183,11 +139,6 @@ function _lightenForDarkCard(c, fallback, minLum) {
   return "rgb(" + r + ", " + g + ", " + b + ")";
 }
 
-/* Label-width cache.  Transient fields on the item; not in the scene,
-   not in the export.  Self-invalidating when the label text changes.
-   Requires `ctx.font` to be already set to the label font; the caller
-   (`_drawItemCard`) sets it once before calling in. */
-
 const _CARD_LABEL_FONT = "700 11px 'JetBrains Mono', 'Fira Code', monospace";
 
 function _cardLabelWidth(it, label) {
@@ -208,9 +159,6 @@ function _drawItemCard(it, isSelected) {
   const sw = it.bw * view.zoom;
   const sh = it.bh * view.zoom;
 
-  // Viewport cull.  The label is drawn below the card at
-  // (csx, csy + sh + 6) with height 18; 26 covers the card body
-  // plus the label plus a small margin.
   const CULL_LABEL_MARGIN = 26;
   if (csx + sw < 0 || csy + sh + CULL_LABEL_MARGIN < 0 ||
       csx > cw || csy > ch) {
@@ -220,8 +168,6 @@ function _drawItemCard(it, isSelected) {
   const hue = it.colorRGB || board.palette[0];
   const RADIUS = 3;
 
-  // Depth cue.  Blur only on the selected card (bounded cost);
-  // everyone else gets a flat offset rect.  Same visual read.
   if (isSelected) {
     ctx.save();
     ctx.shadowColor   = "rgba(0, 0, 0, 0.55)";
@@ -243,8 +189,6 @@ function _drawItemCard(it, isSelected) {
     ctx.fill();
   }
 
-  // Border.  Dimmed: the outline is a spatial cue, not a highlight.
-  // Selection re-asserts the full-strength colour.
   const borderAlpha = isSelected ? 0.95 : 0.30;
   const borderW     = Math.max(1.0, isSelected ? 2.4 : 1.1);
   ctx.strokeStyle = _rgba(hue, borderAlpha);
@@ -267,25 +211,11 @@ function _drawItemCard(it, isSelected) {
     ctx.restore();
   }
 
-  // Word boxes: doc-space quads, mapped to screen with a hoisted
-  // affine.  The three pre-computed constants below are all that
-  // varies across the four corners of every word on this card:
-  //
-  //     screen_x = ox + doc_x * s
-  //     screen_y = oy + doc_y * s
-  //
-  // where  s  = _boardScale * view.zoom
-  //        ox = (it.bx - sb.x * _boardScale) * view.zoom + view.panX
-  //        oy = (it.by - sb.y * _boardScale) * view.zoom + view.panY
-  //
-  // This replaces a per-corner closure call + b2s() + a 2-element
-  // array allocation.  For a board with W word boxes it is W × 4
-  // fewer allocations per frame.
   if (board.showWordBoxes && it.wordBoxes && it.wordBoxes.length) {
     const sb = it.shapeBounds;
-    const s  = _boardScale * view.zoom;
-    const ox = (it.bx - sb.x * _boardScale) * view.zoom + view.panX;
-    const oy = (it.by - sb.y * _boardScale) * view.zoom + view.panY;
+    const s  = board.scale * view.zoom;
+    const ox = (it.bx - sb.x * board.scale) * view.zoom + view.panX;
+    const oy = (it.by - sb.y * board.scale) * view.zoom + view.panY;
 
     ctx.save();
     ctx.strokeStyle = "rgba(0, 229, 255, 0.85)";
@@ -306,7 +236,6 @@ function _drawItemCard(it, isSelected) {
     ctx.restore();
   }
 
-  // Label under the card.
   if (sw > 40) {
     ctx.font = _CARD_LABEL_FONT;
     ctx.textAlign    = "left";
@@ -333,7 +262,7 @@ function _drawItemCard(it, isSelected) {
    VIEW
    ========================================================================== */
 
-function drawBoardView() {
+export function drawBoardView() {
   const cw = window.innerWidth;
   const ch = window.innerHeight;
 

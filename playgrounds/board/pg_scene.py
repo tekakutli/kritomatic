@@ -1,94 +1,49 @@
-"""
-pg_scene.py — save and load the board.
-
-The saved board is a list of file paths, the layout the user has
-arranged on the canvas, and each card's z and rotation.  Thumbnails
-are not saved — they are pulled fresh from Krita.
-
-On load, three things happen in order:
-
-    1.  Paths, layout, z, and rotation are applied.
-    2.  Every file whose path is not currently open in Krita is opened
-        in Krita, sequentially, via the same endpoint the per-row
-        "Open" button uses.
-    3.  A single refresh picks up thumbnails and state for everything
-        that just opened.
-
-REMOTE NOTIFICATION
-===================
-`applyBoardScene` replaces the whole model.  It ends with
-`pgkitNotifyAll()`, so remote clients receive a single patch with
-the new state on the next animation frame.
-"""
-
 SCENE_JS = r"""
-const SCENE_VERSION = 4;
-const SCENE_TYPE    = "board_scene";
-const SCENE_FILE    = "board_scene.json";
+import { board, view, addFileByPath } from "./pg_core.js";
+import { syncFileList } from "./pg_panel_lists.js";
+import { syncPanelSliders } from "./pg_panel_scrubs.js";
+import { draw } from "./pg_dispatch.js";
+import { openAllMissing, refreshFromKrita } from "./pg_krita.js";
+import { pgkitNotifyAll } from "./pgkit/remote_client.js";
+import { flashStatus } from "./pgkit/panel_core.js";
 
-function buildBoardScene() {
+const SCENE_VERSION = 4;
+const SCENE_TYPE = "board_scene";
+const SCENE_FILE = "board_scene.json";
+
+export function buildBoardScene() {
   return {
     sceneVersion: SCENE_VERSION,
-    type:         SCENE_TYPE,
-    generatedAt:  new Date().toISOString(),
-    board: {
-      defaultWidth: board.defaultWidth,
-      gridGap:      board.gridGap,
-    },
-    view: {
-      zoom: view.zoom,
-      panX: view.panX,
-      panY: view.panY,
-    },
+    type: SCENE_TYPE,
+    generatedAt: new Date().toISOString(),
+    board: { defaultWidth: board.defaultWidth, gridGap: board.gridGap },
+    view: { zoom: view.zoom, panX: view.panX, panY: view.panY },
     files: board.files.map(f => ({
-      path:     f.path,
-      name:     f.name,
-      x:        f.x,
-      y:        f.y,
-      w:        f.w,
-      aspect:   f.aspect,
-      z:        f.z,
-      rotation: f.rotation,
-      color:    f.color ? { r: f.color.r, g: f.color.g, b: f.color.b } : null,
+      path: f.path, name: f.name, x: f.x, y: f.y, w: f.w,
+      aspect: f.aspect, z: f.z, rotation: f.rotation,
+      color: f.color ? { r: f.color.r, g: f.color.g, b: f.color.b } : null,
     })),
   };
 }
 
-function saveBoardJSON() {
+export function saveBoardJSON() {
   const text = JSON.stringify(buildBoardScene(), null, 2);
-  const url  = "data:application/json;charset=utf-8,"
-             + encodeURIComponent(text);
+  const url = "data:application/json;charset=utf-8," + encodeURIComponent(text);
   const a = document.createElement("a");
-  a.href = url;
-  a.download = SCENE_FILE;
-  a.style.display = "none";
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+  a.href = url; a.download = SCENE_FILE; a.style.display = "none";
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
   flashStatus("saved " + board.files.length + " file path(s)", "ok");
 }
 
-function applyBoardScene(data) {
-  if (!data || typeof data !== "object") {
-    throw new Error("board: not an object");
-  }
-  if (data.type && data.type !== SCENE_TYPE) {
-    throw new Error("board: wrong type '" + data.type
-                    + "' (expected '" + SCENE_TYPE + "')");
-  }
-  if (data.sceneVersion !== SCENE_VERSION) {
-    throw new Error("board: unsupported sceneVersion " + data.sceneVersion);
-  }
+export function applyBoardScene(data) {
+  if (!data || typeof data !== "object") throw new Error("board: not an object");
+  if (data.type && data.type !== SCENE_TYPE) throw new Error("board: wrong type '" + data.type + "'");
+  if (data.sceneVersion !== SCENE_VERSION) throw new Error("board: unsupported sceneVersion " + data.sceneVersion);
 
   if (data.board && typeof data.board === "object") {
-    if (typeof data.board.defaultWidth === "number") {
-      board.defaultWidth = data.board.defaultWidth;
-    }
-    if (typeof data.board.gridGap === "number") {
-      board.gridGap = data.board.gridGap;
-    }
+    if (typeof data.board.defaultWidth === "number") board.defaultWidth = data.board.defaultWidth;
+    if (typeof data.board.gridGap === "number") board.gridGap = data.board.gridGap;
   }
-
   if (data.view && typeof data.view === "object") {
     if (typeof data.view.zoom === "number") view.zoom = data.view.zoom;
     if (typeof data.view.panX === "number") view.panX = data.view.panX;
@@ -112,16 +67,12 @@ function applyBoardScene(data) {
     f.h = Math.round(f.w * (f.aspect || 1));
     if (typeof s.z === "number") f.z = s.z;
     if (typeof s.rotation === "number") f.rotation = s.rotation;
-    if (s.color && typeof s.color.r === "number") {
-      f.color = { r: s.color.r, g: s.color.g, b: s.color.b };
-    }
+    if (s.color && typeof s.color.r === "number") f.color = { r: s.color.r, g: s.color.g, b: s.color.b };
     if (typeof s.name === "string" && s.name) f.name = s.name;
   }
 
   let maxZ = 0;
-  for (const f of board.files) {
-    if (typeof f.z === "number" && f.z > maxZ) maxZ = f.z;
-  }
+  for (const f of board.files) if (typeof f.z === "number" && f.z > maxZ) maxZ = f.z;
   board.nextZ = Math.max(board.nextZ, maxZ + 1);
 
   syncPanelSliders();
@@ -130,24 +81,15 @@ function applyBoardScene(data) {
   pgkitNotifyAll();
 }
 
-async function loadBoardFromText(text) {
+export async function loadBoardFromText(text) {
   let data;
-  try {
-    data = JSON.parse(text);
-  } catch (e) {
-    flashStatus("Load failed: not valid JSON", "bad");
-    return false;
-  }
-  try {
-    applyBoardScene(data);
-  } catch (e) {
-    flashStatus("Load failed: " + e.message, "bad");
-    return false;
-  }
+  try { data = JSON.parse(text); }
+  catch (e) { flashStatus("Load failed: not valid JSON", "bad"); return false; }
+  try { applyBoardScene(data); }
+  catch (e) { flashStatus("Load failed: " + e.message, "bad"); return false; }
 
   flashStatus("loaded layout; opening files in Krita…", "ok");
   await openAllMissing();
-
   flashStatus("loaded " + board.files.length + " file(s)", "ok");
   return true;
 }
@@ -156,21 +98,13 @@ let _boardFileInput = null;
 function _installBoardFileInput() {
   if (_boardFileInput) return _boardFileInput;
   const inp = document.createElement("input");
-  inp.type = "file";
-  inp.accept = "application/json,.json";
-  inp.style.display = "none";
+  inp.type = "file"; inp.accept = "application/json,.json"; inp.style.display = "none";
   inp.addEventListener("change", (e) => {
     const file = e.target.files && e.target.files[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = () => {
-      loadBoardFromText(String(reader.result || ""));
-      inp.value = "";
-    };
-    reader.onerror = () => {
-      flashStatus("Load failed: could not read file", "bad");
-      inp.value = "";
-    };
+    reader.onload = () => { loadBoardFromText(String(reader.result || "")); inp.value = ""; };
+    reader.onerror = () => { flashStatus("Load failed: could not read file", "bad"); inp.value = ""; };
     reader.readAsText(file);
   });
   document.body.appendChild(inp);
@@ -178,7 +112,5 @@ function _installBoardFileInput() {
   return inp;
 }
 
-function promptLoadBoard() {
-  _installBoardFileInput().click();
-}
+export function promptLoadBoard() { _installBoardFileInput().click(); }
 """

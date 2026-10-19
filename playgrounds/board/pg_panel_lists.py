@@ -1,18 +1,10 @@
-"""
-pg_panel_lists.py — the file list.
-
-`syncFileList` rebuilds the panel's list of file cards and ends with
-`pgkitNotifyEntities()`.  It runs after every change to
-`board.files`, every selection change, and every model-mutating
-action.
-"""
-
 PG_PANEL_LISTS_JS = r"""
-/* ==========================================================================
-   FILE LIST
-   ========================================================================== */
+import { board, _rgba, bringToTop, fileState } from "./pg_core.js";
+import { _syncCardFields } from "./pg_panel_fields.js";
+import { draw } from "./pg_dispatch.js";
+import { pgkitNotifyEntities } from "./pgkit/remote_client.js";
 
-function syncFileList() {
+export function syncFileList() {
   const list = document.getElementById("fileList");
   if (!list) return;
   list.innerHTML = "";
@@ -32,17 +24,16 @@ function syncFileList() {
     const isSel = (i === board.selectedIdx);
 
     const row = document.createElement("div");
-    row.className = "fileRow"
-      + (isSel ? " selected" : "")
-      + (state === "closed"  ? " closed"  : "")
-      + (state === "missing" ? " missing" : "");
+    row.className = "fileRow" + (isSel ? " selected" : "") +
+                    (state === "closed" ? " closed" : "") +
+                    (state === "missing" ? " missing" : "");
     row.dataset.idx = String(i);
 
     const sw = document.createElement("span");
     sw.className = "fileSwatch";
     const hue = f.color || board.palette[0];
     sw.style.background = _rgba(hue, isSel ? 0.95 : 0.55);
-    sw.style.border     = "1px solid " + _rgba(hue, isSel ? 1.0 : 0.85);
+    sw.style.border = "1px solid " + _rgba(hue, isSel ? 1.0 : 0.85);
     row.appendChild(sw);
 
     const lb = document.createElement("span");
@@ -53,10 +44,8 @@ function syncFileList() {
 
     const st = document.createElement("span");
     st.className = "fileState " + state;
-    if (state === "open")        st.textContent = "\u25CF";
-    else if (state === "closed") st.textContent = "\u25CB";
-    else                          st.textContent = "\u2717";
-    st.title = (state === "open")
+    st.textContent = state === "open" ? "\u25CF" : state === "closed" ? "\u25CB" : "\u2717";
+    st.title = state === "open"
       ? (f.modified ? "open in Krita (unsaved changes)" : "open in Krita")
       : (state === "closed" ? "not open in Krita" : "file missing on disk");
     row.appendChild(st);
@@ -68,8 +57,8 @@ function syncFileList() {
       openBtn.title = "Open this file in Krita";
       openBtn.addEventListener("click", async (e) => {
         e.stopPropagation();
-        const ok = await openFileInKrita(f);
-        if (ok) await refreshFromKrita();
+        const m = await import("./pg_krita.js");
+        if (await m.openFileInKrita(f)) await m.refreshFromKrita();
       });
       row.appendChild(openBtn);
     }
@@ -80,7 +69,11 @@ function syncFileList() {
     del.title = "Remove from the board (does not close it in Krita)";
     del.addEventListener("click", (e) => {
       e.stopPropagation();
-      removeFile(i);
+      board.files.splice(i, 1);
+      if (board.selectedIdx === i) board.selectedIdx = -1;
+      else if (board.selectedIdx > i) board.selectedIdx -= 1;
+      syncFileList();
+      draw();
     });
     row.appendChild(del);
 
@@ -89,7 +82,7 @@ function syncFileList() {
       bringToTop(i);
       syncFileList();
       draw();
-      pgkitNotifyAll();
+      import("./pgkit/remote_client.js").then(m => m.pgkitNotifyAll()).catch(() => {});
     });
 
     list.appendChild(row);

@@ -1,39 +1,13 @@
 """
-pgkit.js_check — syntax-check a JS bundle before serving it.
+pgkit.js_check — syntax-check a JS module before serving it.
 
-Every playground serves JS assembled from N Python-string segments.
-A syntax error anywhere in that assembly is catastrophic in a way a
-per-module error is not: the browser's parser rejects the *entire*
-script, "use strict" and every function declaration in it never
-execute, and the playground loads as a panel-shaped shell with no
-behavior.  Buttons don't fire.  The canvas never draws.  The console
-shows a single `Uncaught SyntaxError` whose position is a character
-offset into the concatenated bundle, not a line into any file the
-developer actually edited.
-
-The bug this module was written for was a Python implicit-string-
-concatenation that slipped into a JS payload:
-
-    "Opens the native file picker. "
-    "Use action.addFilesWithPaths…"
-
-Adjacent string literals are valid Python and a SyntaxError in JS.
-Because the offending segment lived inside a bundle of about a hundred
-thousand characters, the browser could say no more than "Unexpected
-string at 1:48219"; finding which of the six panel files actually
-contained the problem required bisecting the bundle.
-
-`check_js()` runs `node --check` on the assembled string.  `node
---check` parses without executing, exits non-zero on a syntax error,
-and prints `path:line` — the line number into the string the caller
-passed, which the caller maps back to a source file using an index it
-built during concatenation.  `JsSyntaxError` carries both the line
-number and the label so callers do not have to re-parse node's stderr.
+`check_js(source, label)` writes `source` to a temp file and runs
+`node --check` on it.  The temp file gets `.mjs` suffix so node
+parses `import`/`export` as ES module syntax; a `.js` suffix would
+require `--experimental-modules` on older nodes.
 
 Non-tool failures (node missing, subprocess error, timeout) do not
-raise.  The check is a diagnostic, not a build requirement — a
-developer without node installed can still run their playground, and
-a false positive from a broken tool is far worse than a missed check.
+raise — the check is a diagnostic, not a build requirement.
 """
 
 from __future__ import annotations
@@ -51,16 +25,6 @@ _LINENO_RE = re.compile(r'^(.+?):(\d+)(?::\d+)?$')
 
 
 class JsSyntaxError(Exception):
-    """A syntax error in a checked JS bundle.
-
-    Attributes:
-        label     the caller-supplied label (usually a source filename).
-        lineno    1-based line number into the string passed to check_js,
-                  or None if node's output could not be parsed.
-        message   the human-readable SyntaxError line from node.
-        raw       node's stderr verbatim.
-    """
-
     def __init__(self, label: str, lineno: Optional[int],
                  message: str, raw: str):
         self.label = label
@@ -72,12 +36,7 @@ class JsSyntaxError(Exception):
 
 
 def check_js(source: str, *, label: str = "bundle") -> None:
-    """Raise JsSyntaxError if `source` is not valid JavaScript.
-
-    No-op when node is unavailable; warns once per process so a
-    developer who has not installed node sees why the check is silent
-    but is not blocked by it.
-    """
+    """Raise JsSyntaxError if `source` is not valid JS module source."""
     node = shutil.which("node")
     if node is None:
         _warn_once(
@@ -86,10 +45,7 @@ def check_js(source: str, *, label: str = "bundle") -> None:
         )
         return
 
-    # A temp file, not stdin: `node --check` opens the path itself,
-    # and the error format for a piped source differs across node
-    # versions.
-    fd, path = tempfile.mkstemp(suffix=".js", prefix="pgkit_check_")
+    fd, path = tempfile.mkstemp(suffix=".mjs", prefix="pgkit_check_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(source)
@@ -124,15 +80,6 @@ def check_js(source: str, *, label: str = "bundle") -> None:
 
 
 def _parse_lineno(raw: str) -> Optional[int]:
-    """Extract `path:line` from node's stderr.
-
-    node's error header is `path:line` or `path:line:col` on its own
-    line, followed by a code excerpt and the `SyntaxError:` line.
-    Non-greedy `(.+?)` handles paths with colons because it backtracks
-    until `:\\d+` matches — for `/tmp/weird:file.js:3` it correctly
-    returns 3, not a `ValueError` from trying to parse `file.js` as
-    an integer.
-    """
     for line in raw.splitlines():
         m = _LINENO_RE.match(line.strip())
         if m:
@@ -144,7 +91,6 @@ def _parse_lineno(raw: str) -> Optional[int]:
 
 
 def _parse_message(raw: str) -> str:
-    """Return the `SyntaxError: …` line from node's stderr."""
     for line in raw.splitlines():
         s = line.strip()
         if s.startswith("SyntaxError:"):

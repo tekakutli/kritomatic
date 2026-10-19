@@ -1,41 +1,25 @@
 """
-tb_panel_lists.py — the item list, the cursor coordinate readout,
-and the canvas-JSON export.
+tb_panel_lists.py — item list, cursor readout, canvas JSON export.
 
-`syncItemList` rebuilds the panel's list of text-shape cards and ends
-with `pgkitNotifyEntities()`.
-
-`updateCursorReadout` / `clearCursorReadout` drive the panel's
-document + coordinate readout.  They run on every mousemove (the
-fast path calls them unconditionally when the mouse is over the
-canvas) and are therefore the DOM hot path.
-
-`exportCanvasJSON` dumps every object the canvas knows about — in
-document pixels, board units, and screen pixels.  Used by the
-"Export canvas JSON" button and the `action.exportCanvasJSON`
-remote action.
-
-DOM-WRITE GUARDS
-================
-`updateCursorReadout` used to reassign `.textContent` and `.style.color`
-on every mousemove.  Both trigger a style recalc in the browser even
-when the value is unchanged.  The new versions compare first:
-
-    textContent is compared to the previous string, byte-for-byte.
-    Colors are tracked in JS locals `_lastCursorDoc` / `_lastCursorPos`,
-    because `.style.color` reads back as `"rgb(...)"` rather than the
-    hex string that was written.
-
-The color states are small enums ("dim", "brt", "dim2", "accent")
-mapped to the same hex strings the pre-optimization code wrote.
+Exports: syncItemList, updateCursorReadout, clearCursorReadout,
+exportCanvasJSON.
 """
 
 TB_PANEL_LISTS_JS = r"""
+import {
+  board, b2s, view, _rgba, _documentSlots, _docLayout, _invalidateDocLayout,
+  documentAtBoardPoint, bringToTop, _contentBounds, _pathBasename,
+  DOCUMENT_GAP,
+} from "./tb_core.js";
+import { _syncEditor } from "./tb_panel_fields.js";
+import { pgkitNotifyEntities } from "./pgkit/remote_client.js";
+import { flashStatus } from "./pgkit/panel_core.js";
+
 /* ==========================================================================
    ITEM LIST
    ========================================================================== */
 
-function syncItemList() {
+export function syncItemList() {
   const list = document.getElementById("itemList");
   const countEl = document.getElementById("itemCount");
   if (!list) return;
@@ -82,12 +66,12 @@ function syncItemList() {
       bringToTop(i);
       syncItemList();
       _syncEditor();
-      draw();
+      import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
     });
 
     row.addEventListener("dblclick", (e) => {
       e.stopPropagation();
-      activateItemDocument(it);
+      import("./tb_krita.js").then(m => m.activateItemDocument(it)).catch(() => {});
       flashStatus("activating " + (it.documentName || "document"), "ok");
     });
 
@@ -111,7 +95,7 @@ const _CURSOR_COLORS = {
 let _lastCursorDoc = null;
 let _lastCursorPos = null;
 
-function updateCursorReadout(sx, sy) {
+export function updateCursorReadout(sx, sy) {
   const docEl = document.getElementById("cursorDoc");
   const posEl = document.getElementById("cursorPos");
   if (!docEl || !posEl) return;
@@ -155,7 +139,7 @@ function updateCursorReadout(sx, sy) {
   }
 }
 
-function clearCursorReadout() {
+export function clearCursorReadout() {
   const docEl = document.getElementById("cursorDoc");
   const posEl = document.getElementById("cursorPos");
   if (docEl) {
@@ -176,16 +160,9 @@ function clearCursorReadout() {
 
 /* ==========================================================================
    CANVAS JSON EXPORT
-   ==========================================================================
-   Dumps every object the canvas knows about, in every coordinate space
-   it is known in: document pixels, board units, and screen pixels.
-   For a shape whose placement looks wrong, comparing its doc coords
-   against its board coords and its slot's board coords is what tells
-   us which transform is responsible.
+   ========================================================================== */
 
-   Uses the cached `_docLayout()` rather than re-sorting. */
-
-function exportCanvasJSON() {
+export function exportCanvasJSON() {
   const data = {
     exportedAt: new Date().toISOString(),
     window: {
@@ -196,7 +173,7 @@ function exportCanvasJSON() {
     view: { zoom: view.zoom, panX: view.panX, panY: view.panY },
     board: {
       defaultWidth:  board.defaultWidth,
-      boardScale:    _boardScale,
+      boardScale:    board.scale,
       gridGap:       board.gridGap,
       scaleUserSet:  board._scaleUserSet,
       autoFitDone:   board._autoFitDone,
@@ -227,43 +204,30 @@ function exportCanvasJSON() {
   for (const it of board.items) {
     const [scrX, scrY] = b2s(it.bx, it.by);
     const sb = it.shapeBounds;
-    const ancBx = it.bx + (it.x - sb.x) * _boardScale;
-    const ancBy = it.by + (it.y - sb.y) * _boardScale;
+    const ancBx = it.bx + (it.x - sb.x) * board.scale;
+    const ancBy = it.by + (it.y - sb.y) * board.scale;
     const [ancX, ancY] = b2s(ancBx, ancBy);
     data.items.push({
-      id:           it.id,
-      documentPath: it.documentPath,
-      documentName: it.documentName,
-      layerName:    it.layerName,
-      textIndex:    it.textIndex,
-      text:         it.text,
-      fontFamily:   it.fontFamily,
-      fontSize:     it.fontSize,
-      color:        it.color,
-      alignment:    it.alignment,
-      rotationDeg:  it.rotationDeg,
+      id: it.id, documentPath: it.documentPath, documentName: it.documentName,
+      layerName: it.layerName, textIndex: it.textIndex, text: it.text,
+      fontFamily: it.fontFamily, fontSize: it.fontSize, color: it.color,
+      alignment: it.alignment, rotationDeg: it.rotationDeg,
       document: {
-        x:              it.x,
-        y:              it.y,
-        shapeBounds:    it.shapeBounds,
-        documentWidth:  it.documentWidth,
-        documentHeight: it.documentHeight,
-        wordBoxes:      (it.wordBoxes || []).length,
+        x: it.x, y: it.y, shapeBounds: it.shapeBounds,
+        documentWidth: it.documentWidth, documentHeight: it.documentHeight,
+        wordBoxes: (it.wordBoxes || []).length,
       },
       board: {
         x: it.bx, y: it.by, w: it.bw, h: it.bh,
         screenX: scrX, screenY: scrY,
-        screenW: it.bw * view.zoom,
-        screenH: it.bh * view.zoom,
-        anchorScreenX: ancX,
-        anchorScreenY: ancY,
+        screenW: it.bw * view.zoom, screenH: it.bh * view.zoom,
+        anchorScreenX: ancX, anchorScreenY: ancY,
       },
     });
   }
 
   const text = JSON.stringify(data, null, 2);
-  const url  = "data:application/json;charset=utf-8," +
-               encodeURIComponent(text);
+  const url  = "data:application/json;charset=utf-8," + encodeURIComponent(text);
   const a = document.createElement("a");
   a.href = url;
   a.download = "canvas_dump.json";

@@ -1,156 +1,145 @@
 """
-pg_core.py — canvas, layout, view, pair model, geometry.
+pg_core.py — model, geometry, and session state.
 
-Two coordinate systems:
+Everything mutable that other modules reassign lives on one of two
+objects:
 
-    world     the abstract 2D space the pairs live in
-    screen    pixels, y flipped, origin top-left
+    pairState   model cursor: selectedPair, selectedSegment,
+                nextPairId, nextSegId
+    state       UI session: drag state, mouse, segScroll,
+                drawSegmentMode, overlapHighlight, shiftDragSet
 
-A PAIR is:
+Both are `const` objects exported here.  ES module `let` imports are
+read-only, so a top-level `let` cannot be reassigned from another
+module; a property of a `const` object can.
 
-    { id, name, cx, cy, angle, metricA, metricB, offset, gap,
-      loopbackGap, scale, segments: [ { id, name, a, b, filled }, ... ] }
+`pairs` stays as an exported `const` array — push/splice mutate it
+in place and every importer sees the same reference.
 
-    cx, cy        anchor point of line A, in world coords
-    angle         direction of the lines, radians
-    metricA       world units per abstract unit along line A
-    metricB       world units per abstract unit along line B
-    offset        shift of line B along the direction of line A
-    gap           perpendicular distance between the lines
-    loopbackGap   extra abstract distance before the axis wraps
-    scale         whole-pair zoom factor about (cx, cy); 1 = identity
-    segments      abstract 1D intervals along the pair's axis
+CHANGE HOOK
+===========
+Lifecycle functions (addPair, deletePair, addSegmentToPair, etc.)
+call `notifyChanged()` after any model mutation.  `notifyChanged`
+runs whatever handler the boot module injected via
+`setAfterChange()`.  That handler is responsible for syncing the
+panel, drawing, and notifying the remote client.  This keeps
+pg_core free of imports from pg_panel_lists / pg_dispatch / pgkit,
+breaking the cycles those would otherwise create.
 
-The unit direction u = (cos angle, sin angle).  The perpendicular is
-v = (-sin angle, cos angle).
-
-    Line A passes through (cx, cy) + u · (t · metricA · scale)
-    Line B passes through (cx, cy) + u · (offset + t · metricB) · scale
-                            + v · gap · scale
-
-A segment [a, b] becomes the trapezoid with world corners
-
-    A(a)  A(b)  B(b)  B(a)
-
-which is what drawSegmentTrapezoid renders, clipped to the viewport.
-
-REMOTE NOTIFICATION
-===================
-The four lifecycle functions — addPair, clonePair, deletePair,
-movePair — change which pair `selectedPair` names, and therefore
-change every value that the `pair.*` API getters return.  Each of
-them ends with `pgkitNotifyAll()`.  The single-pair operations that
-do not touch the selection (addSegmentToPair, deleteSegment) do not
-need a notify, because no registered field depends on the segments
-array's contents.
-
-RENDER HELPERS
+DRAW REFERENCE
 ==============
-Three per-frame optimizations live near the end of this file.  None
-of them changes the projection or the overlap test; they only cut
-the amount of work the renderers do.
-
-    _overlapMemo / _cachedSegmentOverlaps
-        A per-frame memo.  `draw()` (in pg_dispatch.py) resets
-        `_overlapMemo` to a fresh Map at the top of every frame, and
-        the two view renderers consult `_cachedSegmentOverlaps`
-        instead of `_segmentOverlapsOtherPair` directly.  Because
-        both renderers ask about the same (pairIdx, segIdx) pairs,
-        the memo halves the total SAT cost per frame — every
-        distinct pair is tested once instead of twice — with zero
-        risk of staleness since the memo never outlives a frame.
-
-    _kRangeForSegmentInBand
-    _kRangeForSegmentInSegmentView
-        Compute a k-range for wrapped-copy iteration.  The default
-        `forEachSegmentCopy` iterates k ∈ [-20, 20]; for typical
-        metrics and zoom levels only 2–8 of those can be on-screen.
-        These helpers invert the abstract-to-screen mapping enough
-        to say "here is the closed interval of k whose wrapped copy
-        could intersect the visible region", with one period of
-        slack on each side to cover the A/B corner split and the
-        segment's own width.  The range is clamped to
-        SEGMENT_WRAP_K so the outer bound never grows.
+resize() and fitView() call a `_draw` injected at boot via
+`_setDraw(draw)`.  Same reason as above: a static import from
+pg_dispatch.js would create a cycle (pg_dispatch imports from
+pg_core).
 """
 
 CORE_JS = r"""
 /* ==========================================================================
-   CANVAS
+   CANVAS, LAYOUT, VIEW
    ========================================================================== */
 
-const canvas = document.getElementById("c");
-const ctx    = canvas.getContext("2d");
-let dpr = window.devicePixelRatio || 1;
+export const canvas = document.getElementById("c");
+export const ctx    = canvas.getContext("2d");
+export let   dpr    = window.devicePixelRatio || 1;
 
-/* ==========================================================================
-   LAYOUT
-   ========================================================================== */
-
-const layout = {
+export const layout = {
   topH:      0,
   dividerY:  0,
   reservedY: 0,
   reservedH: 0,
 };
 
-/* ==========================================================================
-   VIEW
-   ========================================================================== */
-
-const view = {
+export const view = {
   scale: 3,
   tx: 0, ty: 0,
   zoom: 1, panX: 0, panY: 0,
 };
 
-function w2s(x, y) { return [x * view.scale + view.tx,
-                             -y * view.scale + view.ty]; }
-function s2w(sx, sy) { return [(sx - view.tx) / view.scale,
-                               -(sy - view.ty) / view.scale]; }
+export function w2s(x, y) { return [x * view.scale + view.tx,
+                                    -y * view.scale + view.ty]; }
+export function s2w(sx, sy) { return [(sx - view.tx) / view.scale,
+                                      -(sy - view.ty) / view.scale]; }
 
 /* ==========================================================================
    SEGMENT AXIS — PERIOD AND WRAP HELPERS
    ========================================================================== */
 
-const SEG_X_MIN  = -6;
-const SEG_X_MAX  =  6;
-const SEG_X_SPAN = SEG_X_MAX - SEG_X_MIN;
+export const SEG_X_MIN  = -6;
+export const SEG_X_MAX  =  6;
+export const SEG_X_SPAN = SEG_X_MAX - SEG_X_MIN;
 
-const SEGMENT_WRAP_K = 20;
+export const SEGMENT_WRAP_K = 20;
 
-function _pairPeriod(p) {
+export function _pairPeriod(p) {
   if (!p) return SEG_X_SPAN;
   const g = (typeof p.loopbackGap === "number" && p.loopbackGap > 0)
     ? p.loopbackGap : 0;
   return SEG_X_SPAN + g;
 }
 
-function _pairScale(p) {
+export function _pairScale(p) {
   if (!p) return 1;
   const s = p.scale;
   return (typeof s === "number" && isFinite(s) && s > 0) ? s : 1;
 }
 
-function forEachSegmentCopy(period, aBase, bBase, fn) {
+export function forEachSegmentCopy(period, aBase, bBase, fn) {
   for (let k = -SEGMENT_WRAP_K; k <= SEGMENT_WRAP_K; k++) {
     fn(aBase + k * period, bBase + k * period, k);
   }
 }
 
-/* Same as forEachSegmentCopy but over a caller-provided k-range.
-   Used by the two view renderers after they've computed a range via
-   _kRangeForSegmentInBand / _kRangeForSegmentInSegmentView. */
-function forEachSegmentCopyInRange(period, aBase, bBase, kMin, kMax, fn) {
+export function forEachSegmentCopyInRange(period, aBase, bBase, kMin, kMax, fn) {
   for (let k = kMin; k <= kMax; k++) {
     fn(aBase + k * period, bBase + k * period, k);
   }
 }
 
 /* ==========================================================================
-   OVERLAP QUERY — CANVAS-SPACE POLYGON INTERSECTION
+   SESSION STATE
    ========================================================================== */
 
-const OVERLAP_HUE = { r: 255, g: 90, b: 105 };
+export const pairState = {
+  selectedPair:    -1,
+  selectedSegment: null,
+  nextPairId:      1,
+  nextSegId:       1,
+};
+
+export const state = {
+  dragPairAnchor:  null,
+  dragSegmentEdge: null,
+  dragSegmentBody: null,
+  mouse: { sx: 0, sy: 0, inside: false },
+  segScroll: 0,
+  drawSegmentMode: false,
+  overlapHighlight: false,
+  shiftDragSet: null,
+};
+
+export const OVERLAP_HUE = { r: 255, g: 90, b: 105 };
+
+/* ==========================================================================
+   CHANGE HOOK
+   ========================================================================== */
+
+let _afterChange = null;
+export function setAfterChange(fn) { _afterChange = fn; }
+
+export function notifyChanged() { if (_afterChange) _afterChange(); }
+
+/* ==========================================================================
+   DRAW REFERENCE (breaks cycle with pg_dispatch.js)
+   ========================================================================== */
+
+let _drawRef = null;
+export function _setDraw(fn) { _drawRef = fn; }
+function _draw() { if (_drawRef) _drawRef(); }
+
+/* ==========================================================================
+   OVERLAP QUERY — CANVAS-SPACE POLYGON INTERSECTION
+   ========================================================================== */
 
 function _segPolygonAtK(p, seg, k) {
   const period = _pairPeriod(p);
@@ -239,7 +228,7 @@ function _kRangeForTargetY(bb, dyPerK, targetMin, targetMax) {
   return [Math.min(t1, t2), Math.max(t1, t2)];
 }
 
-function _segmentTrapezoidsOverlap(p1, seg1, p2, seg2) {
+export function _segmentTrapezoidsOverlap(p1, seg1, p2, seg2) {
   const cw = window.innerWidth;
   const ch = layout.topH;
   const MARGIN = 4;
@@ -278,7 +267,7 @@ function _segmentTrapezoidsOverlap(p1, seg1, p2, seg2) {
   return false;
 }
 
-function _segmentOverlapsOtherPair(pairIdx, segIdx) {
+export function _segmentOverlapsOtherPair(pairIdx, segIdx) {
   if (pairIdx < 0 || pairIdx >= pairs.length) return false;
   const p = pairs[pairIdx];
   if (segIdx < 0 || segIdx >= p.segments.length) return false;
@@ -294,7 +283,7 @@ function _segmentOverlapsOtherPair(pairIdx, segIdx) {
   return false;
 }
 
-function _pairHasAnyOverlap(pairIdx) {
+export function _pairHasAnyOverlap(pairIdx) {
   if (pairIdx < 0 || pairIdx >= pairs.length) return false;
   const p = pairs[pairIdx];
   for (let j = 0; j < p.segments.length; j++) {
@@ -312,23 +301,21 @@ const OVERLAP_RESOLVE_COARSE_STEP = 0.1;
 const OVERLAP_RESOLVE_FINE_ITERS  = 14;
 const OVERLAP_RESOLVE_MAX_ITERS   = 50;
 
-function _segmentOverlapsPairBelow(pairIdx, segIdx) {
+export function _segmentOverlapsPairBelow(pairIdx, segIdx) {
   if (pairIdx < 0 || pairIdx + 1 >= pairs.length) return false;
   const pUpper = pairs[pairIdx];
   if (segIdx < 0 || segIdx >= pUpper.segments.length) return false;
   const segUpper = pUpper.segments[segIdx];
   const pLower = pairs[pairIdx + 1];
   for (let j = 0; j < pLower.segments.length; j++) {
-    if (_segmentTrapezoidsOverlap(pUpper, segUpper, pLower,
-                                  pLower.segments[j])) {
+    if (_segmentTrapezoidsOverlap(pUpper, segUpper, pLower, pLower.segments[j])) {
       return true;
     }
   }
   return false;
 }
 
-function _segmentsOverlapWithShift(pUpper, segUpper, pLower, segLower,
-                                   shift) {
+function _segmentsOverlapWithShift(pUpper, segUpper, pLower, segLower, shift) {
   const a0 = segLower.a, b0 = segLower.b;
   segLower.a = a0 + shift;
   segLower.b = b0 + shift;
@@ -342,8 +329,7 @@ function _segmentsOverlapWithShift(pUpper, segUpper, pLower, segLower,
   return overlap;
 }
 
-function _resolveOverlapDeltaDirection(pUpper, segUpper, pLower, segLower,
-                                       sign) {
+function _resolveOverlapDeltaDirection(pUpper, segUpper, pLower, segLower, sign) {
   let prevD = 0;
   for (let d = OVERLAP_RESOLVE_COARSE_STEP;
        d <= OVERLAP_RESOLVE_MAX_SHIFT + 1e-9;
@@ -366,10 +352,8 @@ function _resolveOverlapDeltaDirection(pUpper, segUpper, pLower, segLower,
 }
 
 function _resolveOverlapDelta(pUpper, segUpper, pLower, segLower) {
-  const dPos = _resolveOverlapDeltaDirection(pUpper, segUpper, pLower,
-                                             segLower, +1);
-  const dNeg = _resolveOverlapDeltaDirection(pUpper, segUpper, pLower,
-                                             segLower, -1);
+  const dPos = _resolveOverlapDeltaDirection(pUpper, segUpper, pLower, segLower, +1);
+  const dNeg = _resolveOverlapDeltaDirection(pUpper, segUpper, pLower, segLower, -1);
   if (dPos === null && dNeg === null) return null;
   if (dPos === null) return { direction: -1, delta: dNeg };
   if (dNeg === null) return { direction: +1, delta: dPos };
@@ -387,24 +371,18 @@ function _findOverlapWithPairBelow(pairIdx, segIdx) {
   let best = null;
   for (let j = 0; j < pLower.segments.length; j++) {
     const segLower = pLower.segments[j];
-    if (!_segmentTrapezoidsOverlap(pUpper, segUpper, pLower, segLower)) {
-      continue;
-    }
+    if (!_segmentTrapezoidsOverlap(pUpper, segUpper, pLower, segLower)) continue;
     const sol = _resolveOverlapDelta(pUpper, segUpper, pLower, segLower);
     if (!sol) continue;
     if (!best || sol.delta < best.delta) {
-      best = {
-        lowerPairIdx: pairIdx + 1,
-        lowerSegIdx:  j,
-        direction:    sol.direction,
-        delta:        sol.delta,
-      };
+      best = { lowerPairIdx: pairIdx + 1, lowerSegIdx: j,
+               direction: sol.direction, delta: sol.delta };
     }
   }
   return best;
 }
 
-function _makeRoomInferior(pairIdx, segIdx) {
+export function _makeRoomInferior(pairIdx, segIdx) {
   let resolved = 0;
   for (let iter = 0; iter < OVERLAP_RESOLVE_MAX_ITERS; iter++) {
     const found = _findOverlapWithPairBelow(pairIdx, segIdx);
@@ -420,12 +398,8 @@ function _makeRoomInferior(pairIdx, segIdx) {
 
     for (const s of pLower.segments) {
       const c = (s.a + s.b) / 2;
-      const follows = (dir > 0) ? (c >= pivotCenter)
-                                : (c <= pivotCenter);
-      if (follows) {
-        s.a += delta;
-        s.b += delta;
-      }
+      const follows = (dir > 0) ? (c >= pivotCenter) : (c <= pivotCenter);
+      if (follows) { s.a += delta; s.b += delta; }
     }
     resolved++;
   }
@@ -436,23 +410,15 @@ function _makeRoomInferior(pairIdx, segIdx) {
    PAIR MODEL
    ========================================================================== */
 
-const pairs = [];
-let nextPairId   = 1;
-let nextSegId    = 1;
-let selectedPair    = -1;
-let selectedSegment = null;   /* { pairIdx, segIdx } */
+export const pairs = [];
 
-function pairFrame(p) {
+export function pairFrame(p) {
   const ux = Math.cos(p.angle);
   const uy = Math.sin(p.angle);
-  return {
-    ux, uy,
-    vx: -uy,
-    vy:  ux,
-  };
+  return { ux, uy, vx: -uy, vy: ux };
 }
 
-function pointOnPairLine(p, which, abstractT) {
+export function pointOnPairLine(p, which, abstractT) {
   const f = pairFrame(p);
   const s = _pairScale(p);
   if (which === "A") {
@@ -465,7 +431,7 @@ function pointOnPairLine(p, which, abstractT) {
               +  p.gap * s * f.vy];
 }
 
-function segmentCornersWorldAt(p, a, b) {
+export function segmentCornersWorldAt(p, a, b) {
   return [
     pointOnPairLine(p, "A", a),
     pointOnPairLine(p, "A", b),
@@ -474,13 +440,13 @@ function segmentCornersWorldAt(p, a, b) {
   ];
 }
 
-function segmentCornersWorld(p, seg) {
+export function segmentCornersWorld(p, seg) {
   return segmentCornersWorldAt(p, seg.a, seg.b);
 }
 
 const LINE_REACH = 1e5;
 
-function lineEndpointsWorld(p, which) {
+export function lineEndpointsWorld(p, which) {
   const f = pairFrame(p);
   const [ax, ay] = pointOnPairLine(p, which, 0);
   return [
@@ -493,12 +459,11 @@ function lineEndpointsWorld(p, which) {
    RENDER HELPERS
    ========================================================================== */
 
-/* Per-frame overlap memo.  Reset by draw() at the top of every
-   frame; queried by both view renderers via _cachedSegmentOverlaps.
-   See the module docstring, RENDER HELPERS. */
 let _overlapMemo = null;
 
-function _cachedSegmentOverlaps(pairIdx, segIdx) {
+export function _resetOverlapMemo() { _overlapMemo = new Map(); }
+
+export function _cachedSegmentOverlaps(pairIdx, segIdx) {
   if (!_overlapMemo) _overlapMemo = new Map();
   const key = pairIdx + ":" + segIdx;
   if (_overlapMemo.has(key)) return _overlapMemo.get(key);
@@ -507,21 +472,12 @@ function _cachedSegmentOverlaps(pairIdx, segIdx) {
   return r;
 }
 
-/* Return the k-range whose wrapped copy could intersect the visible
-   region of the CANVAS band [0, cw] × [0, bandTop].
+export function _isShiftSetMember(pairIdx, segIdx) {
+  const s = state.shiftDragSet;
+  return !!(s && s.pairIdx === pairIdx && s.members.has(segIdx));
+}
 
-   The abstract-to-screen map for line A is linear in abstract t:
-       screenX(t) = x0 + t·slopeX
-       screenY(t) = y0 + t·slopeY
-   Solving each inequality for t gives the [tMin, tMax] interval of
-   abstract coordinates whose projection is on-screen.  A one-period
-   margin on each side covers the perpendicular offset of line B
-   (whose visible t-range differs from A's by less than a period at
-   typical metrics) and the segment's own width.
-
-   The range is clamped to [-SEGMENT_WRAP_K, +SEGMENT_WRAP_K] so the
-   outer bound can never grow beyond the original iteration limit. */
-function _kRangeForSegmentInBand(p, seg, cw, bandTop) {
+export function _kRangeForSegmentInBand(p, seg, cw, bandTop) {
   const f = pairFrame(p);
   const period = _pairPeriod(p);
   const m = p.metricA * _pairScale(p);
@@ -565,12 +521,7 @@ function _kRangeForSegmentInBand(p, seg, cw, bandTop) {
   };
 }
 
-/* Return the k-range whose wrapped copy could intersect the visible
-   region of one row in the SEGMENT VIEW.  The row's abstract range
-   is [-period/2, +period/2] by construction (each row scales to one
-   period of its own pair); one period of margin on each side covers
-   any segment that straddles a boundary. */
-function _kRangeForSegmentInSegmentView(p, seg) {
+export function _kRangeForSegmentInSegmentView(p, seg) {
   const period = _pairPeriod(p);
   const tMin = -period / 2 - period;
   const tMax =  period / 2 + period;
@@ -588,7 +539,7 @@ function _kRangeForSegmentInSegmentView(p, seg) {
    LIFECYCLE
    ========================================================================== */
 
-function pairHue(p) {
+export function pairHue(p) {
   const PALETTE = [
     { r: 255, g: 200, b:  90 },
     { r: 120, g: 220, b: 255 },
@@ -605,19 +556,19 @@ function pairHue(p) {
   return PALETTE[idx];
 }
 
-function _huergb(h, a) {
+export function _huergb(h, a) {
   return "rgba(" + h.r + ", " + h.g + ", " + h.b + ", " + a + ")";
 }
 
-function _huergbLight(h) {
+export function _huergbLight(h) {
   const r = Math.round(h.r * 0.7 + 255 * 0.3);
   const g = Math.round(h.g * 0.7 + 255 * 0.3);
   const b = Math.round(h.b * 0.7 + 255 * 0.3);
   return "rgb(" + r + ", " + g + ", " + b + ")";
 }
 
-function addPair() {
-  const id  = nextPairId++;
+export function addPair() {
+  const id  = pairState.nextPairId++;
   const idx = pairs.length;
   pairs.push({
     id, name: "P" + id,
@@ -631,17 +582,15 @@ function addPair() {
     scale: 1,
     segments: [],
   });
-  selectedPair    = pairs.length - 1;
-  selectedSegment = null;
-  syncPairList();
-  draw();
-  pgkitNotifyAll();
+  pairState.selectedPair = pairs.length - 1;
+  pairState.selectedSegment = null;
+  notifyChanged();
 }
 
-function clonePair(idx) {
+export function clonePair(idx) {
   if (idx < 0 || idx >= pairs.length) return;
   const src = pairs[idx];
-  const id  = nextPairId++;
+  const id  = pairState.nextPairId++;
   const copy = {
     id, name: "P" + id,
     cx: src.cx, cy: src.cy - 2.5,
@@ -650,40 +599,36 @@ function clonePair(idx) {
     metricB: src.metricB,
     offset: src.offset,
     gap: src.gap,
-    loopbackGap: (typeof src.loopbackGap === "number")
-                   ? src.loopbackGap : 0,
-    scale: (typeof src.scale === "number" && isFinite(src.scale)
-              && src.scale > 0)
+    loopbackGap: (typeof src.loopbackGap === "number") ? src.loopbackGap : 0,
+    scale: (typeof src.scale === "number" && isFinite(src.scale) && src.scale > 0)
              ? src.scale : 1,
     segments: [],
   };
   for (const s of src.segments) {
     copy.segments.push({
-      id: nextSegId++,
+      id: pairState.nextSegId++,
       name: s.name,
       a: s.a, b: s.b,
       filled: s.filled !== false,
     });
   }
   pairs.push(copy);
-  selectedPair    = pairs.length - 1;
-  selectedSegment = null;
-  syncPairList();
-  draw();
-  pgkitNotifyAll();
+  pairState.selectedPair = pairs.length - 1;
+  pairState.selectedSegment = null;
+  notifyChanged();
 }
 
-function deletePair(idx) {
+export function deletePair(idx) {
   if (idx < 0 || idx >= pairs.length) return;
   pairs.splice(idx, 1);
-  if (selectedPair >= pairs.length) selectedPair = pairs.length - 1;
-  selectedSegment = null;
-  syncPairList();
-  draw();
-  pgkitNotifyAll();
+  if (pairState.selectedPair >= pairs.length) {
+    pairState.selectedPair = pairs.length - 1;
+  }
+  pairState.selectedSegment = null;
+  notifyChanged();
 }
 
-function movePair(idx, delta) {
+export function movePair(idx, delta) {
   if (idx < 0 || idx >= pairs.length) return;
   const j = idx + delta;
   if (j < 0 || j >= pairs.length) return;
@@ -692,65 +637,52 @@ function movePair(idx, delta) {
   pairs[idx] = pairs[j];
   pairs[j] = tmp;
 
-  if (selectedPair === idx) selectedPair = j;
-  else if (selectedPair === j) selectedPair = idx;
+  if (pairState.selectedPair === idx) pairState.selectedPair = j;
+  else if (pairState.selectedPair === j) pairState.selectedPair = idx;
 
-  if (selectedSegment) {
-    if (selectedSegment.pairIdx === idx) selectedSegment.pairIdx = j;
-    else if (selectedSegment.pairIdx === j) selectedSegment.pairIdx = idx;
+  if (pairState.selectedSegment) {
+    if (pairState.selectedSegment.pairIdx === idx) pairState.selectedSegment.pairIdx = j;
+    else if (pairState.selectedSegment.pairIdx === j) pairState.selectedSegment.pairIdx = idx;
   }
 
-  if (typeof _clearShiftDragSet === "function") _clearShiftDragSet();
-
-  syncPairList();
-  draw();
-  pgkitNotifyAll();
+  state.shiftDragSet = null;
+  notifyChanged();
 }
 
-function addSegmentToPair(pairIdx, a, b) {
+export function addSegmentToPair(pairIdx, a, b) {
   if (pairIdx < 0 || pairIdx >= pairs.length) return;
   const p = pairs[pairIdx];
-  const id = nextSegId++;
-  p.segments.push({
-    id, name: "S" + id,
-    a, b,
-    filled: true,
-  });
-  selectedPair    = pairIdx;
-  selectedSegment = { pairIdx, segIdx: p.segments.length - 1 };
-  syncPairList();
-  draw();
+  const id = pairState.nextSegId++;
+  p.segments.push({ id, name: "S" + id, a, b, filled: true });
+  pairState.selectedPair = pairIdx;
+  pairState.selectedSegment = { pairIdx, segIdx: p.segments.length - 1 };
+  notifyChanged();
 }
 
-function deleteSegment(pairIdx, segIdx) {
+export function deleteSegment(pairIdx, segIdx) {
   if (pairIdx < 0 || pairIdx >= pairs.length) return;
   const p = pairs[pairIdx];
   if (segIdx < 0 || segIdx >= p.segments.length) return;
   p.segments.splice(segIdx, 1);
 
-  if (selectedSegment &&
-      selectedSegment.pairIdx === pairIdx) {
-    if (selectedSegment.segIdx === segIdx) {
-      selectedSegment = null;
-    } else if (selectedSegment.segIdx > segIdx) {
-      selectedSegment = {
-        pairIdx,
-        segIdx: selectedSegment.segIdx - 1,
-      };
+  const sel = pairState.selectedSegment;
+  if (sel && sel.pairIdx === pairIdx) {
+    if (sel.segIdx === segIdx) {
+      pairState.selectedSegment = null;
+    } else if (sel.segIdx > segIdx) {
+      pairState.selectedSegment = { pairIdx, segIdx: sel.segIdx - 1 };
     }
   }
 
-  if (typeof _clearShiftDragSet === "function") _clearShiftDragSet();
-
-  syncPairList();
-  draw();
+  state.shiftDragSet = null;
+  notifyChanged();
 }
 
 /* ==========================================================================
    RESIZE / FIT
    ========================================================================== */
 
-function resize() {
+export function resize() {
   dpr = window.devicePixelRatio || 1;
   const cw = window.innerWidth;
   const ch = window.innerHeight;
@@ -767,11 +699,11 @@ function resize() {
   layout.reservedH = ch - layout.reservedY;
 
   fitView();
-  draw();
+  _draw();
 }
 window.addEventListener("resize", resize);
 
-function fitView() {
+export function fitView() {
   view.scale = 30 * view.zoom;
   view.tx = window.innerWidth / 2 + view.panX;
   view.ty = layout.topH / 2 + view.panY;

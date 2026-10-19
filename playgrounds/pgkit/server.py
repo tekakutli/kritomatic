@@ -1,33 +1,26 @@
 """
-pgkit.server — HTTP file server plus the WebSocket endpoint.
+pgkit.server — HTTP file server, WebSocket endpoint, module serving.
 
-`serve(...)` serves the current working directory the way the
-existing playground servers do, and additionally accepts WebSocket
-upgrades on `/remote` when a `Hub` is provided.  Any HTTP `POST`
-routes the project cares about — the existing `/generate-kra` is
-the canonical example — are registered as a dict of
-`path -> handler(payload) -> response_dict` and dispatched through
-the same handler class.
+`serve(...)` serves the current working directory, accepts WebSocket
+upgrades on `/remote`, dispatches JSON POST routes and raw-body POST
+routes, and additionally serves `/modules/<name>` for every entry in
+`module_sources` (the project's `_MODULE_SOURCES` dict).
 
-RAW-BODY ROUTES
-===============
-The `raw_routes` dict handles POSTs that carry non-JSON bodies
-(file uploads, binary payloads, `application/octet-stream`).  Each
-entry is `path -> handler(headers: dict, body: bytes) ->
-response_dict`.  The handler is responsible for its own parsing;
-`serve()` reads the body off the socket and hands it over
-unmodified.  The response dict is JSON-serialised exactly as for a
-JSON route, so the caller sees the same shape either way.
+Module serving
+==============
+`GET /modules/pgkit/remote_client.js` looks up
+`module_sources["pgkit/remote_client.js"]` and serves the string with
+`Content-Type: application/javascript` and `Cache-Control: no-store`.
+The no-store matters during development: a stale cached module
+combined with a fresh boot module produces load-order mismatches
+that are hard to spot.
 
-Raw routes take precedence over JSON routes when both declare the
-same path.  Registering a path twice is a project-side bug, not a
-kit-side one — the last dict definition wins at Python level, and
-raw-before-JSON ordering just makes the intent explicit.
+A missing module is a 404 with a short text body naming the missing
+key and listing the keys that *are* present — the browser will show
+it in the network tab and the console, so a typo in an `import`
+path is visible without server access.
 
-Port selection is the same loop the pair and cone servers use: try
-`port`, `port + 1`, …, `port + 19`, take the first free one.
-Opening the browser is optional and off a short timer so the
-socket is listening by the time the tab loads.
+Port selection is the same loop the pair and cone servers use.
 """
 
 import json
@@ -43,16 +36,12 @@ from .remote_hub import Client, Hub, handle_message
 
 def serve(*, port=8766, open_browser=True,
           html_file="playground.html",
-          routes=None, raw_routes=None, hub=None):
-    """Start the HTTP + WebSocket server and block until Ctrl+C.
-
-    `routes` is `path -> handler(payload: dict) -> response_dict` for
-    JSON POSTs.  `raw_routes` is `path -> handler(headers: dict,
-    body: bytes) -> response_dict` for binary POSTs.  Both are
-    optional; a project supplies only what it needs.
-    """
-    routes     = routes or {}
-    raw_routes = raw_routes or {}
+          routes=None, raw_routes=None,
+          module_sources=None, hub=None):
+    """Start the HTTP + WebSocket server and block until Ctrl+C."""
+    routes         = routes or {}
+    raw_routes     = raw_routes or {}
+    module_sources = module_sources or {}
     if hub is None:
         hub = Hub()
 
@@ -67,6 +56,10 @@ def serve(*, port=8766, open_browser=True,
             if self.path == "/remote" and \
                self.headers.get("Upgrade", "").lower() == "websocket":
                 self._serve_websocket()
+                return
+            if self.path.startswith("/modules/"):
+                name = self.path[len("/modules/"):]
+                self._serve_module(name)
                 return
             super().do_GET()
 
@@ -99,10 +92,6 @@ def serve(*, port=8766, open_browser=True,
             self._send_json(200, result)
 
         def _handle_raw_post(self, handler):
-            """Read the body off the socket as raw bytes; hand it to
-            the caller with the request headers.  The body is not
-            decoded, parsed, or validated; that is the handler's
-            problem."""
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(length) if length else b""
@@ -127,6 +116,29 @@ def serve(*, port=8766, open_browser=True,
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _serve_module(self, name):
+            source = module_sources.get(name)
+            if source is None:
+                available = ", ".join(sorted(module_sources.keys())) or "(none)"
+                body = (
+                    f"Module not found: {name!r}\n"
+                    f"Available modules: {available}\n"
+                ).encode("utf-8")
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            body = source.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
 
@@ -180,6 +192,7 @@ def serve(*, port=8766, open_browser=True,
     url = "http://127.0.0.1:%d/%s" % (used_port, html_file)
     print("Serving %s" % os.getcwd())
     print("  -> open  %s" % url)
+    print("  -> modules at /modules/ (%d file(s))" % len(module_sources))
     print("  -> remote ws at ws://127.0.0.1:%d/remote" % used_port)
     print("  Press Ctrl+C to stop.")
 

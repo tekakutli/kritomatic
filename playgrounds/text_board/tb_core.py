@@ -1,48 +1,8 @@
 """
-tb_core.py — canvas, view, item model, formatting signature, wanted paths.
-
-Layout model
-------------
-Documents are laid out side by side in a horizontal row, ordered by a
-stable hash of the document path.  Each slot is as wide as its
-document, expressed in board units.  A shape sits at
-(slot.x + shape_bounds.x * scale, slot.y + shape_bounds.y * scale),
-where shape_bounds is the axis-aligned document-space rectangle the
-daemon reports for the shape.
-
-The card's rectangle is exactly the shape's text area — no padding,
-no rotation.  The text label is drawn as an indication on top and is
-allowed to overflow.
-
-DOCUMENT SLOT LAYOUT CACHE
-==========================
-`documentAtBoardPoint` runs on every mousemove (via
-`updateCursorReadout`), and `_drawDocumentBounds` runs on every
-frame.  Both need the sorted slot list plus each slot's board-space
-box.  Both would otherwise pay `Array.from(_documentSlots.values())`
-+ `.sort()` + `_slotRowWidth()` per call.
-
-`_docLayout()` caches the result.  The cache is invalidated by
-`_invalidateDocLayout()`, called from exactly two places:
-
-    _rebaseAllItems       runs after any scale change and after
-                          every mergeIncomingShapes, which is the
-                          only path that adds or updates slots.
-    _clearBoardAction     empties `_documentSlots` directly.
-
-Each slot object carries its own path, so `_docLayout()` produces
-the path per entry and `_sortedDocumentPaths()` is a simple `.map`.
-The pre-migration version did an O(N²) reverse lookup — one
-`_documentSlots` scan per layout entry — which would run on every
-`documents` entities flush and on every document-level row action.
-
-HOVER CURSOR — ANY-HIT SHORT-CIRCUIT
-====================================
-`itemHitTest` returns the *topmost* card, which requires sorting by
-`bz`.  The hover cursor only needs "is there a card under the
-pointer" — a boolean.  `_anyItemHitTest` does an unordered linear
-scan with early exit and no allocation.  The selection path still
-uses `itemHitTest`.
+tb_core.py — canvas, view, item model, formatting signature, wanted
+paths.  All exports are module-level declarations; `board.scale`
+replaces the old top-level `_boardScale` `let`, which cannot be
+reassigned from importers.
 """
 
 CORE_JS = r"""
@@ -50,32 +10,37 @@ CORE_JS = r"""
    CANVAS
    ========================================================================== */
 
-const canvas = document.getElementById("c");
-const ctx    = canvas.getContext("2d");
-let dpr = window.devicePixelRatio || 1;
+export const canvas = document.getElementById("c");
+export const ctx    = canvas.getContext("2d");
+export let dpr      = window.devicePixelRatio || 1;
 
 /* ==========================================================================
    VIEW
    ========================================================================== */
 
-const view = { zoom: 1, panX: 0, panY: 0 };
+export const view = { zoom: 1, panX: 0, panY: 0 };
 
-function b2s(bx, by) {
+export function b2s(bx, by) {
   return [bx * view.zoom + view.panX,
           by * view.zoom + view.panY];
 }
-function s2b(sx, sy) {
+export function s2b(sx, sy) {
   return [(sx - view.panX) / view.zoom,
           (sy - view.panY) / view.zoom];
 }
 
 /* ==========================================================================
    BOARD STATE
-   ========================================================================== */
+   ==========================================================================
+   board.scale replaces the old `_boardScale` top-level let.  Any
+   module can assign `board.scale = X` because board is a const
+   object, whereas a top-level `let _boardScale` cannot be assigned
+   from another module. */
 
-const board = {
+export const board = {
   items:        [],
   selectedIdx:  -1,
+  scale:        0.25,
   gridGap:      24,
   defaultWidth: 320,
   nextZ:        1,
@@ -95,19 +60,15 @@ const board = {
   ],
 };
 
-const MIN_SHAPE_PX_W = 12;   // document pixels
-const MIN_SHAPE_PX_H = 8;    // document pixels
+export const MIN_SHAPE_PX_W = 12;
+export const MIN_SHAPE_PX_H = 8;
 
 /* ==========================================================================
-   DOCUMENT SLOTS AND BOARD SCALE
+   DOCUMENT SLOTS
    ========================================================================== */
 
-let _boardScale = 0.25;
-
-const _documentSlots = new Map();
-
-const DOCUMENT_GAP = 60;   // board units between adjacent slots
-
+export const _documentSlots = new Map();
+export const DOCUMENT_GAP   = 60;
 let _docLayoutCache = null;
 
 function _slotHash(docPath) {
@@ -118,7 +79,7 @@ function _slotHash(docPath) {
   return h >>> 0;
 }
 
-function _computeBoardScale() {
+export function _computeBoardScale() {
   let widest = 0;
   for (const s of _documentSlots.values()) {
     if (s.docW > widest) widest = s.docW;
@@ -127,7 +88,7 @@ function _computeBoardScale() {
   return board.defaultWidth / widest;
 }
 
-function _documentOrigin(docPath, docW, docH) {
+export function _documentOrigin(docPath, docW, docH) {
   if (!_documentSlots.has(docPath)) {
     const myHash = _slotHash(docPath);
     const existing = Array.from(_documentSlots.values());
@@ -144,9 +105,6 @@ function _documentOrigin(docPath, docW, docH) {
       docW:  docW,
       docH:  docH,
       name:  _pathBasename(docPath),
-      /* Cache the path on the slot so `_docLayout` can produce it
-         without an O(N) reverse lookup per entry.  See the module
-         docstring, DOCUMENT SLOT LAYOUT CACHE. */
       path:  docPath,
     });
   } else {
@@ -161,18 +119,18 @@ function _slotRowWidth() {
   let total = 0;
   let count = 0;
   for (const s of _documentSlots.values()) {
-    total += s.docW * _boardScale;
+    total += s.docW * board.scale;
     count++;
   }
   if (count > 1) total += DOCUMENT_GAP * (count - 1);
   return total;
 }
 
-function _invalidateDocLayout() {
+export function _invalidateDocLayout() {
   _docLayoutCache = null;
 }
 
-function _docLayout() {
+export function _docLayout() {
   if (_docLayoutCache !== null) return _docLayoutCache;
 
   const sorted = Array.from(_documentSlots.values())
@@ -183,8 +141,8 @@ function _docLayout() {
 
   const layout = [];
   for (const s of sorted) {
-    const bw = s.docW * _boardScale;
-    const bh = s.docH * _boardScale;
+    const bw = s.docW * board.scale;
+    const bh = s.docH * board.scale;
     layout.push({
       slot: s,
       path: s.path,
@@ -206,14 +164,14 @@ function _docLayout() {
    DOCUMENT HIT-TEST AND COORDINATE MAPPING
    ========================================================================== */
 
-function documentAtBoardPoint(bx, by) {
+export function documentAtBoardPoint(bx, by) {
   for (const entry of _docLayout()) {
     if (bx >= entry.bx && bx <= entry.bx + entry.bw &&
         by >= entry.by && by <= entry.by + entry.bh) {
       return {
         slot: entry.slot,
-        docX: (bx - entry.bx) / _boardScale,
-        docY: (by - entry.by) / _boardScale,
+        docX: (bx - entry.bx) / board.scale,
+        docY: (by - entry.by) / board.scale,
         docW: entry.docW,
         docH: entry.docH,
       };
@@ -226,10 +184,11 @@ function documentAtBoardPoint(bx, by) {
    COLOR HELPERS
    ========================================================================== */
 
-function _rgba(h, a) {
+export function _rgba(h, a) {
   return "rgba(" + h.r + ", " + h.g + ", " + h.b + ", " + a + ")";
 }
-function _rgbaLight(h) {
+
+export function _rgbaLight(h) {
   const r = Math.round(h.r * 0.7 + 255 * 0.3);
   const g = Math.round(h.g * 0.7 + 255 * 0.3);
   const b = Math.round(h.b * 0.7 + 255 * 0.3);
@@ -240,7 +199,7 @@ function _rgbaLight(h) {
    FORMATTING SIGNATURE
    ========================================================================== */
 
-function computeFormatSig(item) {
+export function computeFormatSig(item) {
   const s = [
     (item.fontFamily || "").toLowerCase(),
     String(item.fontSize || 0),
@@ -266,17 +225,10 @@ function _colorFromSig(sig) {
    ITEM IDENTITY
    ========================================================================== */
 
-function itemId(rec) {
+export function itemId(rec) {
   return (rec.document_path || "") + "::" +
          (rec.layer_name    || "") + "::" +
          String(rec.text_index || 0);
-}
-
-function _findItemById(id) {
-  for (let i = 0; i < board.items.length; i++) {
-    if (board.items[i].id === id) return i;
-  }
-  return -1;
 }
 
 /* ==========================================================================
@@ -287,8 +239,8 @@ function _cardSizeFor(shapeBounds) {
   const wpx = Math.max(MIN_SHAPE_PX_W, shapeBounds.w || 1);
   const hpx = Math.max(MIN_SHAPE_PX_H, shapeBounds.h || 1);
   return {
-    bw: wpx * _boardScale,
-    bh: hpx * _boardScale,
+    bw: wpx * board.scale,
+    bh: hpx * board.scale,
   };
 }
 
@@ -324,10 +276,8 @@ function makeItemFromRecord(rec) {
     documentWidth:  docW,
     documentHeight: docH,
 
-    bx: 0,
-    by: 0,
-    bw: size.bw,
-    bh: size.bh,
+    bx: 0, by: 0,
+    bw: size.bw, bh: size.bh,
     bz: board.nextZ++,
 
     colorRGB:  _colorFromSig(sig),
@@ -339,7 +289,7 @@ function makeItemFromRecord(rec) {
    REBASE
    ========================================================================== */
 
-function _rebaseAllItems() {
+export function _rebaseAllItems() {
   _invalidateDocLayout();
 
   const sorted = Array.from(_documentSlots.values())
@@ -353,8 +303,8 @@ function _rebaseAllItems() {
   let x = rowLeft;
   for (const s of sorted) {
     slotX.set(s.index, x);
-    slotY.set(s.index, -(s.docH * _boardScale) / 2);
-    x += s.docW * _boardScale + DOCUMENT_GAP;
+    slotY.set(s.index, -(s.docH * board.scale) / 2);
+    x += s.docW * board.scale + DOCUMENT_GAP;
   }
 
   for (const it of board.items) {
@@ -362,8 +312,8 @@ function _rebaseAllItems() {
     if (!slot) continue;
     const sx = slotX.get(slot.index) || 0;
     const sy = slotY.get(slot.index) || 0;
-    it.bx = sx + it.shapeBounds.x * _boardScale;
-    it.by = sy + it.shapeBounds.y * _boardScale;
+    it.bx = sx + it.shapeBounds.x * board.scale;
+    it.by = sy + it.shapeBounds.y * board.scale;
     const size = _cardSizeFor(it.shapeBounds);
     it.bw = size.bw;
     it.bh = size.bh;
@@ -374,7 +324,9 @@ function _rebaseAllItems() {
    MERGE POLICY
    ========================================================================== */
 
-function mergeIncomingShapes(shapes) {
+import { pgkitNotifyAll } from "./pgkit/remote_client.js";
+
+export function mergeIncomingShapes(shapes) {
   const byId = new Map();
   for (const it of board.items) byId.set(it.id, it);
 
@@ -416,7 +368,7 @@ function mergeIncomingShapes(shapes) {
   board.nextZ = Math.max(board.nextZ, maxZ + 1);
 
   if (!board._scaleUserSet) {
-    _boardScale = _computeBoardScale();
+    board.scale = _computeBoardScale();
   }
 
   _rebaseAllItems();
@@ -429,7 +381,7 @@ function mergeIncomingShapes(shapes) {
    WANTED PATHS
    ========================================================================== */
 
-function _pathBasename(path) {
+export function _pathBasename(path) {
   if (!path) return "(untitled)";
   const norm = String(path).replace(/\\/g, "/");
   const base = norm.substring(norm.lastIndexOf("/") + 1);
@@ -437,7 +389,7 @@ function _pathBasename(path) {
   return dot > 0 ? base.substring(0, dot) : base;
 }
 
-function addWantedPath(path) {
+export function addWantedPath(path) {
   if (!path) return;
   const norm = String(path);
   for (const p of board.wantedPaths) {
@@ -460,7 +412,7 @@ function _markWantedPathsFromItems() {
   }
 }
 
-function closedWantedPaths() {
+export function closedWantedPaths() {
   return board.wantedPaths.filter(wp => !wp.opened);
 }
 
@@ -468,7 +420,7 @@ function closedWantedPaths() {
    LAYOUT
    ========================================================================== */
 
-function arrangeGrid(columns) {
+export function arrangeGrid(columns) {
   if (board.items.length === 0) return;
   const gap = board.gridGap;
   if (!columns) columns = Math.max(1, Math.ceil(Math.sqrt(board.items.length)));
@@ -489,7 +441,7 @@ function arrangeGrid(columns) {
   }
 }
 
-function groupByFormat() {
+export function groupByFormat() {
   board.items.sort((a, b) => {
     if (a.formatSig !== b.formatSig)
       return a.formatSig < b.formatSig ? -1 : 1;
@@ -531,7 +483,7 @@ function _contentBounds() {
   return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
 }
 
-function fitAll() {
+export function fitAll() {
   const cw = window.innerWidth;
   const ch = window.innerHeight;
   const bounds = _contentBounds();
@@ -540,7 +492,7 @@ function fitAll() {
     view.zoom = 1;
     view.panX = cw / 2;
     view.panY = ch / 2;
-    draw();
+    if (typeof draw === "function") draw();
     return;
   }
 
@@ -556,10 +508,22 @@ function fitAll() {
   view.panX = cw / 2 - cx * view.zoom;
   view.panY = ch / 2 - cy * view.zoom;
 
-  draw();
+  if (typeof draw === "function") draw();
 }
 
-function resize() {
+/* ==========================================================================
+   RESIZE
+   ==========================================================================
+   Uses the setRemoteDraw injection to reach draw(); a direct import
+   from tb_dispatch would create a cycle because tb_dispatch imports
+   resize. */
+
+import { setRemoteDraw as _setDrawRef } from "./pgkit/remote_client.js";
+
+let _drawRef = null;
+export function _setDraw(fn) { _drawRef = fn; }
+
+export function resize() {
   dpr = window.devicePixelRatio || 1;
   const cw = window.innerWidth;
   const ch = window.innerHeight;
@@ -569,7 +533,7 @@ function resize() {
   canvas.style.width  = cw + "px";
   canvas.style.height = ch + "px";
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  draw();
+  if (_drawRef) _drawRef();
 }
 window.addEventListener("resize", resize);
 
@@ -577,19 +541,19 @@ window.addEventListener("resize", resize);
    HIT TESTING
    ========================================================================== */
 
-function _pointInItem(it, bx, by) {
+export function _pointInItem(it, bx, by) {
   return bx >= it.bx && bx <= it.bx + it.bw &&
          by >= it.by && by <= it.by + it.bh;
 }
 
-function _zSortedIndices() {
+export function _zSortedIndices() {
   const idx = [];
   for (let i = 0; i < board.items.length; i++) idx.push(i);
   idx.sort((a, b) => (board.items[a].bz || 0) - (board.items[b].bz || 0));
   return idx;
 }
 
-function itemHitTest(sx, sy) {
+export function itemHitTest(sx, sy) {
   const order = _zSortedIndices();
   const [bx, by] = s2b(sx, sy);
   for (let k = order.length - 1; k >= 0; k--) {
@@ -599,7 +563,7 @@ function itemHitTest(sx, sy) {
   return -1;
 }
 
-function _anyItemHitTest(sx, sy) {
+export function _anyItemHitTest(sx, sy) {
   const bx = (sx - view.panX) / view.zoom;
   const by = (sy - view.panY) / view.zoom;
   for (let i = 0; i < board.items.length; i++) {
@@ -608,7 +572,7 @@ function _anyItemHitTest(sx, sy) {
   return false;
 }
 
-function bringToTop(idx) {
+export function bringToTop(idx) {
   if (idx < 0 || idx >= board.items.length) return;
   board.items[idx].bz = board.nextZ++;
 }
@@ -617,7 +581,7 @@ function bringToTop(idx) {
    SELECTED ITEM
    ========================================================================== */
 
-function selectedItem() {
+export function selectedItem() {
   if (board.selectedIdx < 0 ||
       board.selectedIdx >= board.items.length) return null;
   return board.items[board.selectedIdx];

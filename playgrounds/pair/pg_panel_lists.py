@@ -1,3 +1,40 @@
+"""
+pg_panel_lists.py — the two selection lists.
+
+ES module.  Exports:
+
+    syncSegmentList   rebuild the segment list for the selected pair
+    syncPairList      rebuild the pair list (calls syncSegmentList
+                      and _syncPairFieldInputs first, so the field
+                      values always match the newly-selected pair)
+
+Both rebuild from scratch on every call.  Each rebuild ends with
+`pgkitNotifyEntities()` — the two lists are the pair playground's
+two entity levels — but does NOT call `draw()`.  Canvas repaint is
+the caller's job: `notifyChanged()` (the injected afterChange hook)
+fires `syncPairList() → draw() → pgkitNotifyAll()` in one pass, so
+any model change that goes through `notifyChanged` gets the panel
+and canvas update together.  Places that need only the panel
+refreshed (a name edit that hasn't changed geometry, an incremental
+`syncSegmentList`) call `syncSegmentList` / `syncPairList` directly.
+
+DOM STATE
+=========
+`syncSegmentList` also reads `state.overlapHighlight`,
+`state.shiftDragSet`, and the per-segment overlap memo.  Every row
+therefore reflects three independent bits: the current selection,
+the overlap highlight (if enabled), and whether the row belongs to
+the shift-drag set.  Rows are rebuilt, so the color-band feedback
+is a pure function of the current state.
+
+`syncPairList` runs `_syncPairFieldInputs()` first so the seven
+pair-scoped inputs reflect whichever pair is selected.
+
+The overlap markers (`.overlapRow`, `.shiftMember`) and the
+make-room (`⇣`) button are the only pair-specific CSS classes on
+these rows; see `PAIR_CSS` in `pg_base.py`.
+"""
+
 PAIR_PANEL_LISTS_JS = r"""
 import {
   pairs, pairState, state, pairHue, _huergb, _huergbLight,

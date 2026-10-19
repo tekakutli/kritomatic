@@ -1,6 +1,71 @@
+"""
+pg_kra.py — client-side glue for the "Generate .kra" button.
+
+ES module.  Exports:
+
+    readKraOptionsFromDOM     read the KRA options block from the panel
+    applyKraOptionsToDOM      push options back into the panel
+    buildKraPayload           produce { texts, rects } from the scene
+    generateKraFromScene      prompt for a path, then call generateKraToPath
+    generateKraToPath         POST the payload to /generate-kra
+
+The POST body's `texts` and `rects` arrays are consumed by
+`pair_kra.generate()` server-side, which forwards them to the
+Kritomatic daemon.  Each text carries a full 6-element affine
+transform derived from the segment's local Jacobian; the KRA export
+uses those numbers verbatim.
+
+PARAMETRIC MAP AND JACOBIAN
+===========================
+For a segment on a pair, the four world corners are
+
+    A(a)  A(b)  B(b)  B(a)
+
+where A(t) and B(t) place a point at abstract coordinate `t` on
+line A or line B respectively.  A text's anchor is a point (s, t)
+inside that trapezoid.  The local Jacobian of the map
+(s, t) → world is:
+
+    ∂world/∂s = k · (m_A + t·(m_B − m_A)) · u
+    ∂world/∂t = (offset + u·(m_B − m_A)) · u + gap · v
+
+where k = b − a, m_A / m_B / offset / gap are the pair's metric and
+gap after `_pairScale` is applied, and u / v are the pair's world
+axes.  Multiplying by `view.scale` and flipping y gives screen-space
+vectors; normalizing by the larger of the two gives the affine's
+two columns.  Handedness is corrected by negating one column when
+the determinant is negative.
+
+HANDEDNESS AND READING DIRECTION
+================================
+The Jacobian's two column vectors (in screen space) have angles
+`angleS` and `angleT`.  The text's baseline runs along whichever
+is more horizontal — this is the "reading direction" of the
+trapezoid.  The vertical-ish vector becomes the affine's second
+column.  Reading along the more horizontal axis matters because
+the daemon's `add_vector_text` produces text whose baseline is the
+affine's x-axis; if that were the near-vertical axis, the text
+would stand on its side.
+
+SPLIT ENTRY POINT
+=================
+`generateKraFromScene()` prompts via `window.prompt` for the path,
+then delegates to `generateKraToPath(path)`.  A remote client that
+has already gathered the path on the other end of the WebSocket
+calls `action.generateKra` with `output_path` in its payload, and
+the action's `run` handler calls `generateKraToPath` directly — no
+`window.prompt` involved.
+
+NOTES ON IMPORTS
+================
+`pairState` is not imported: this module is purely a builder and
+does not touch the selection.  `pairs`, `view`, `layout` are the
+only state it reads.
+"""
+
 KRA_JS = r"""
 import {
-  pairs, view, layout, pairState,
+  pairs, view, layout,
   _pairScale, pairHue, w2s,
 } from "./pg_core.js";
 import { flashStatus } from "./pgkit/panel_core.js";

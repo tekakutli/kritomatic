@@ -1,3 +1,51 @@
+"""
+pg_export.py — JSON export of the current visual state.
+
+ES module.  Exports `buildVisualStateExport` and
+`exportVisualStateJSON`.  Pure read-only walk of the pair model —
+no DOM mutation, no server round-trip.  The only reason it is a
+module rather than a helper is that a remote client can invoke the
+`action.exportVisual` action, which calls the same function the
+button calls.
+
+WHAT'S IN THE DUMP
+==================
+Per pair:
+
+    cx, cy, angle             anchor and direction
+    metricA, metricB          per-line world units per abstract unit
+    offset, gap               geometric separation
+    loopbackGap               extra abstract distance before wrap
+    scale                     whole-pair zoom
+    u, v                      pair's world-frame unit axes
+    linesScreen               screen endpoints of A and B
+    segments[]                each with { id, name, a, b, filled,
+                              copies[] } where each copy carries
+                              the wrapped-copy index `k`, its
+                              abstract (a, b), and its world and
+                              screen corners
+
+Per copy, `cornersWorld` is the parallelogram (a, b, A, B) mapped
+to world coords.  When the pair's `metricA` and `metricB` differ,
+or when `offset` is nonzero, that parallelogram is a trapezoid; the
+world corners quantify the skew exactly.
+
+The `segSpan` field records SEG_X_SPAN (12) and `segRect` records
+the visible band in screen space.  Together they let a consumer
+reason about which wrapped copies are actually on-screen without
+re-deriving the pair's own period.
+
+DIAGNOSTIC USE
+==============
+If the world corners of a segment on a pair with equal metrics and
+zero offset form a rectangle (up to rotation), the geometry is
+consistent.  Any deviation from that rectangle tells you which
+parameter is wrong: a parallelogram skew means `metricA ≠ metricB`;
+a nonzero perpendicular offset between the two edges means
+`offset ≠ 0`; a non-rectangle at equal metrics and zero offset
+means `gap` or a numeric edge case.
+"""
+
 EXPORT_JS = r"""
 import {
   pairs, pairFrame, segmentCornersWorldAt, lineEndpointsWorld,

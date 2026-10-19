@@ -1,9 +1,74 @@
+"""
+pg_panel_bindings.py — buttons, remote actions, remote levels,
+pgkitHandleSelect, and pairBootSync.
+
+ES module.  Exports four names the boot module uses:
+
+    installPanelBindings   attach buttons / list / keyboard listeners
+    pgkitHandleSelect      translate the remote `select` command
+    pairBootSync           the initial sync sequence
+
+IMPORTS FROM pgkit/remote_client
+================================
+This module both *registers* (fields, actions, levels) and *notifies*.
+Every registration function must be imported explicitly:
+
+    pgkitRegisterField     used for ui.overlapHighlight,
+                           ui.drawSegmentMode, kra.textPosition,
+                           kra.drawRects
+    pgkitRegisterAction    used for every action.* registration
+    pgkitRegisterLevel     used for the `pairs` and `segments` levels
+    pgkitNotifyLocal       called by the button bindings when the
+                           panel's own widgets change
+
+Missing `pgkitRegisterField` from this list is what blanked the pair
+playground when the file was first refactored to ES modules: the
+module parsed fine (which is what `node --check` verified), but it
+threw `ReferenceError: pgkitRegisterField is not defined` at
+evaluation time, the browser refused to hand it to `_boot.js`, and
+the boot never ran.
+
+LEVELS
+======
+Two: `pairs` (root, one item per pair) and `segments` (nested under
+the selected pair).  `segments.parent()` reports the currently-
+selected pair, or null when nothing is selected.
+
+ACTIONS
+=======
+Every action follows the pgkit pattern — `scope`, optional `level`,
+optional `appliesTo` for row scope, optional `requires` for
+payloads, optional `variant` for the button's color.  Actions that
+mutate the model route through `notifyChanged()` (which triggers
+the boot-injected afterChange hook: sync, draw, pgkitNotifyAll) or
+through a dynamic `import("./pg_dispatch.js").then(m => m.draw())`
+when only the canvas needs repainting.
+
+There is NO `board` object in pair's model.  The only state is
+`pairState` (model cursor) and `state` (UI session).  The `board`
+references that used to be here were copy-pasted from the text
+board and referenced a symbol that never existed in this project.
+`_fitAction` and `_resetViewAction` now call `fitView()` (pair's
+equivalent of "fit" — it recomputes the world-to-screen transform
+from `view.zoom` and `view.panX/Y`), not a hypothetical `fitAll()`.
+
+WHY DYNAMIC IMPORTS
+===================
+`import("./pg_dispatch.js").then(m => m.draw())` appears in several
+handlers.  `pg_dispatch` imports `tb_core`-style state from
+`pg_core`, and both `pg_panel_scrubs` and `pg_panel_bindings` need
+to trigger a repaint.  A static import of `draw` in either file
+would create a load-order cycle (`pg_dispatch` → `pg_panel_lists`
+→ `pg_panel_fields` → `pg_core`), which the browser resolves but
+with Temporal Dead Zone surprises on first evaluation.  Deferring
+to a dynamic import keeps the graph clean.
+"""
+
 PAIR_PANEL_BINDINGS_JS = r"""
 import {
-  pairs, pairState, state, view, bringToTop, fitView,
+  pairs, pairState, state, view, fitView,
   addPair, clonePair, deletePair, movePair, notifyChanged,
   _segmentOverlapsPairBelow, _makeRoomInferior,
-  _pairPeriod,
 } from "./pg_core.js";
 import { syncPairList, syncSegmentList } from "./pg_panel_lists.js";
 import { _syncPairFieldInputs } from "./pg_panel_fields.js";
@@ -14,12 +79,15 @@ import { exportVisualStateJSON } from "./pg_export.js";
 import {
   generateKraFromScene, generateKraToPath,
 } from "./pg_kra.js";
-import { _installScrubInput } from "./pgkit/panel_core.js";
 import {
-  pgkitRegisterAction, pgkitRegisterLevel,
-  pgkitNotifyLocal, pgkitNotifyAll,
+  pgkitRegisterAction, pgkitRegisterLevel, pgkitRegisterField,
+  pgkitNotifyLocal,
 } from "./pgkit/remote_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
+
+/* ==========================================================================
+   ACTION HELPERS
+   ========================================================================== */
 
 function _addPairAction() { addPair(); }
 
@@ -64,6 +132,34 @@ function _clearSelectedPairSegmentsAction() {
   pairState.selectedSegment = null;
   state.shiftDragSet = null;
   notifyChanged();
+}
+
+/* ==========================================================================
+   VIEW RESET / FIT
+   ==========================================================================
+   Pair has no "fit to content" concept — the lines are infinite and
+   the segments wrap around the axis period, so there is nothing to
+   frame.  `fitView()` recomputes `view.scale/tx/ty` from the current
+   `view.zoom` and `view.panX/Y`.  Calling it after a reset (or on
+   its own for a "re-fit the current view" action) is the pair
+   equivalent of text_board's `fitAll()`.
+
+   Both actions used to reference `board._autoFitDone`, a symbol that
+   exists only in text_board's model; calling either would throw
+   `ReferenceError: board is not defined`.  Both are reachable over
+   the remote API, so the throw was a real bug, not dead code. */
+
+function _fitAction() {
+  fitView();
+  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+}
+
+function _resetViewAction() {
+  view.zoom = 1;
+  view.panX = 0;
+  view.panY = 0;
+  fitView();
+  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
 }
 
 /* ==========================================================================
@@ -308,6 +404,14 @@ pgkitRegisterAction("action.movePairUp", {
 pgkitRegisterAction("action.movePairDown", {
   label: "\u2193", scope: "selection", level: "pairs",
   run: _moveSelectedPairDownAction, meta: { variant: "plain" },
+});
+
+pgkitRegisterAction("action.fit", {
+  label: "Fit", scope: "global", run: _fitAction, meta: { variant: "plain" },
+});
+
+pgkitRegisterAction("action.resetView", {
+  label: "Reset view", scope: "global", run: _resetViewAction, meta: { variant: "plain" },
 });
 
 pgkitRegisterAction("action.toggleFill", {

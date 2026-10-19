@@ -1,23 +1,40 @@
 """
 tb_scene.py — save and load the board.
 
-Exports: buildBoardScene, saveBoardJSON, applyBoardScene,
-loadBoardFromText, promptLoadBoard.
+ES module.  Exports the scene read/write functions.  The scene format
+is deliberately settings-only: board defaults, view state, and each
+item's z-order.  Items themselves are always re-pulled from Krita;
+board rectangles are recomputed from document slots by
+`_rebaseAllItems`.  A saved board is therefore a stable set of
+settings, not a snapshot of a layout that will go stale.
+
+SCENE CONTENTS
+==============
+    sceneVersion  2
+    type          "text_board_scene"
+    board         defaultWidth, gridGap, showWordBoxes, boardScale
+    view          zoom, panX, panY
+    items         per-item { id, bx, by, bw, bh, bz } — position
+                  data is re-derived on load, but bz survives so a
+                  user's manual stacking is preserved across reloads
+
+REMOTE NOTIFICATION
+===================
+`applyBoardScene` replaces the board's settings and view state, so
+it ends with `pgkitNotifyAll()` — one patch reaches the wire with
+every value any registered field reads, on the next animation frame.
+`saveBoardJSON` is read-only from the model's perspective and does
+not notify.
 """
 
 SCENE_JS = r"""
 import {
   board, view, _rebaseAllItems, _computeBoardScale,
-  addFileByPath_unused,
 } from "./tb_core.js";
 import { syncItemList } from "./tb_panel_lists.js";
 import { _syncEditor, syncPanelSliders } from "./tb_panel_fields.js";
 import { pgkitNotifyAll } from "./pgkit/remote_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
-
-/* addFileByPath is used below; alias-imported by the boot via the
-   real export name from tb_core.js. */
-import { addFileByPath } from "./tb_core.js";
 
 const SCENE_VERSION = 2;
 const SCENE_TYPE    = "text_board_scene";

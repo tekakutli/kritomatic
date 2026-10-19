@@ -1,8 +1,28 @@
 """
-tb_panel_lists.py — item list, cursor readout, canvas JSON export.
+tb_panel_lists.py — the item list, the cursor readout, and the
+canvas-JSON export.
 
-Exports: syncItemList, updateCursorReadout, clearCursorReadout,
-exportCanvasJSON.
+ES module.  Exports the three DOM/refresh functions the boot module
+uses:
+
+    syncItemList         rebuild the panel's list of text shapes
+    updateCursorReadout  map the cursor to a document and coordinates
+    clearCursorReadout   blank the readout when the mouse leaves
+    exportCanvasJSON     download a JSON dump of every object
+
+`syncItemList` ends with `pgkitNotifyEntities()` — the item list is
+one of the two entity levels the remote panel consumes.
+
+DOM-WRITE GUARDS
+================
+`updateCursorReadout` runs on every mousemove.  It caches the last
+doc text, position text, and color-class name, and only reassigns
+when the value actually changed.  Without the guards, the browser
+performed a style recalc on every mouse pixel — measurable at high
+hover frequencies.  The color is tracked as a short string key
+("dim", "dim2", "brt", "accent") rather than read back from
+`style.color`, because the latter is normalized by the browser to
+"rgb(...)" form and never matches the hex string we wrote.
 """
 
 TB_PANEL_LISTS_JS = r"""

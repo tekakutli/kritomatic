@@ -1,13 +1,43 @@
 """
 tb_panel_fields.py — editor semantics and the per-item debounce buffer.
 
-Exports: installEditorBindings, _syncEditor, applyItemField,
-syncPanelSliders, updatePanelLabels.
+ES module.  Exports the editor sync, editor bindings installer, the
+unified per-field applier, and the card-width slider helpers.
+
+The editor is a set of plain DOM controls (textarea, text input,
+select).  Each one fires `change` on blur or Enter; the listener
+calls `applyItemField(item, key, value)`, which:
+
+    1. mutates `item[key]` immediately,
+    2. queues a per-item debounced patch to `/krita/patch_text`
+       (250ms per item, merged across every edit on that item),
+    3. fires `pgkitNotifyLocal("item.<key>")` so the remote panel
+       sees the change on the next animation frame.
+
+The `set` counterpart of each `item.*` field registration in
+`tb_panel_scrubs.py` calls the same `applyItemField`, so a
+remote-originated edit and a local one take the same code path.
+The kit's `_pgkitApplyingRemote` guard prevents the echo; the Krita
+round trip still happens because a remote edit is a real edit of
+the shape.
+
+DOM-WRITE GUARDS
+================
+`_syncEditor` is called from `draw()` on every frame.  It caches
+the six editor element references on first call (they never change)
+and equality-checks each write, so the DOM is only touched when a
+value actually moved.  Without these guards, every frame reassigned
+all six values, which played havoc with the caret and performed an
+unnecessary style recalc.
+
+The debounce buffer's key is `item.id`.  Two edits on the same item
+within 250ms collapse into one POST.  Edits on different items do
+not share a timer.
 """
 
 TB_PANEL_FIELDS_JS = r"""
-import { board, itemId } from "./tb_core.js";
-import { pgkitNotifyLocal, pgkitNotifyEntities } from "./pgkit/remote_client.js";
+import { board } from "./tb_core.js";
+import { pgkitNotifyLocal } from "./pgkit/remote_client.js";
 
 /* ==========================================================================
    SLIDER SYNC

@@ -1,5 +1,59 @@
 """
-text_board_html.py — assemble the text board's HTML page and module dict.
+text_board_html.py — assemble the text board's HTML page and module
+manifest.
+
+Entry point.  `render()` is the only public function; it asks
+pgkit's `page()` to build the shell, passing the project's
+`_MODULE_SOURCES` dict (one entry per JS file — kit's own modules
+plus every text_board module) and the name of the boot module.
+
+MODULE MANIFEST
+===============
+`_MODULE_SOURCES` maps URL paths *under* `/modules/` to JS source
+strings:
+
+    "pgkit/shell.js"               served at /modules/pgkit/shell.js
+    "tb_core.js"                   served at /modules/tb_core.js
+    "_boot.js"                     served at /modules/_boot.js
+
+`_boot.js` is one entry among the others; it does all the `import`
+wiring and calls the shell, panel, and boot-sync functions in the
+right order.  Its imports:
+
+    · "./tb_panel_scrubs.js"          (side effect: field registrations)
+    · installShellControls            from pgkit/shell
+    · setRemoteDraw/Select/Deselect   from pgkit/remote_client
+    · setPanelDraw                    from pgkit/panel_core
+    · installEditorBindings,
+      _syncEditor, syncPanelSliders   from tb_panel_fields
+    · installPanelBindings,
+      pgkitHandleSelect, pgkitBootSync from tb_panel_bindings
+    · draw                            from tb_dispatch
+    · board, resize, _setDraw         from tb_core
+    · syncItemList                    from tb_panel_lists
+
+Then it wires the injected callbacks (`_setDraw`, `setPanelDraw`,
+`setRemoteDraw`, `setRemoteSelect`, `setRemoteDeselect`) and calls
+the boot sequence (`installShellControls`, `installEditorBindings`,
+`installPanelBindings`, `pgkitBootSync`, `resize`).
+
+WHY A MANIFEST
+==============
+The browser loads each module over HTTP; `page()` needs the source
+strings to run `node --check` on each one before serving HTML, and
+`serve()` needs them to respond to `GET /modules/<name>`.  Putting
+both the file names and their contents in one dict means the two
+sides of the pipe can never disagree about which file exists.
+
+SYNTAX ERRORS
+=============
+`page()` runs `pgkit.js_check.check_js` on every module before
+assembling HTML.  A syntax error is reported with the source file
+and line and exits with status 1; no HTML file is written and no
+server starts.  The `JsSyntaxError` catch here mirrors that; without
+it, `page()` would raise uncaught from `render()` and the failure
+mode would be a Python traceback rather than a clear "JS syntax
+error in tb_core.py, line N".
 """
 
 import os

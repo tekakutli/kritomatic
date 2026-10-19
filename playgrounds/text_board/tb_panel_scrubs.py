@@ -1,9 +1,40 @@
 """
 tb_panel_scrubs.py — field registrations and DOM bindings.
 
-Pure side effect at module load: registers every field, installs the
-slider and word-box checkbox listeners.  No exports — the boot
-module imports it bare to trigger the registrations.
+ES module.  Pure side effect at module load: registers every field
+the remote API exposes and installs the slider + word-box checkbox
+listeners.  No named exports — the boot module imports this file for
+its side effects only.
+
+FIELDS REGISTERED HERE
+======================
+    board.cardWidth       number, driven by the slider
+    board.showWordBoxes   bool, driven by the checkbox
+    view.zoom             number, driven by the wheel
+    view.panX             number, driven by canvas pan
+    view.panY             number, driven by canvas pan
+    item.text             text, follows selection
+    item.fontFamily       text, follows selection
+    item.fontSize         number, follows selection
+    item.color            text, follows selection
+    item.alignment        enum (left|center|right), follows selection
+    item.rotationDeg      number, follows selection
+
+The item.* getters return the selected item's value, or the field's
+natural empty ("" / 0) when nothing is selected.  The item.* setters
+route through `applyItemField` in `tb_panel_fields.py` — same code
+path as a local editor change — so a remote edit triggers the same
+Krita round-trip that a local edit does.  The kit's
+`_pgkitApplyingRemote` guard prevents the echo.
+
+DYNAMIC IMPORTS
+===============
+`import("./tb_dispatch.js").then(m => m.draw())` appears in every
+`set` and slider handler.  `tb_dispatch` imports `tb_core` (for
+`board`, `view`, etc.); a static import of `draw` here would create
+a load-order surprise because `tb_panel_scrubs` is imported bare by
+the boot module, before `tb_core` has been evaluated.  Dynamic
+import is the simplest non-cyclic path.
 """
 
 TB_PANEL_SCRUBS_JS = r"""

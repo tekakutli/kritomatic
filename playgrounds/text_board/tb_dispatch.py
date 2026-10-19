@@ -1,7 +1,46 @@
 """
-tb_dispatch.py — draw() + event listeners.
+tb_dispatch.py — draw() and the canvas event listeners.
 
-Exports: draw.
+ES module.  Exports `draw`; the module keeps `updateStatus` local
+because it's only called from this file's own `draw` and wheel
+handler.
+
+Two drag modes, mutually exclusive:
+
+    dragCanvas   pan the view
+    dragItem     move a card
+
+Dragging a card moves it off its document position; a subsequent
+Refresh snaps it back, because `_rebaseAllItems` recomputes board
+positions from the document slot on every merge.  That is the
+intended behaviour: the document is the source of truth for layout,
+and manual drags are a scratchpad on top of it.
+
+MOUSEMOVE FAST PATH
+===================
+`draw()` runs only when the canvas is actually going to change.
+Pure hover — the mouse moving over the canvas with no button held —
+updates the cursor readout (pure DOM) and the CSS cursor style
+(a CSS property, not a canvas drawing), and nothing else.
+
+CURSOR STYLE — SET ONLY ON CHANGE
+=================================
+`canvas.style.cursor = X` triggers a style recalc even when X equals
+the current value, and the hover handler fires on every mousemove.
+`_setCursor()` tracks the last value in JS and only writes when it
+changes.  The hit test behind the decision is `_anyItemHitTest` —
+boolean, no allocation, no z-sort.
+
+DYNAMIC IMPORTS
+===============
+Several handlers reach for `refreshFromKrita`, `arrangeGrid`,
+`fitAll`, `openAllClosed`, and `activateItemDocument`.  A static
+import of any of those would introduce a cycle — `tb_krita` imports
+`draw` from this file, `tb_core` imports nothing, but `tb_dispatch`
+and `tb_krita` both chain through `tb_panel_fields` and
+`tb_panel_lists`, and a boot-time ordering mistake there causes a
+Temporal Dead Zone on `draw`.  The dynamic `import(...)` calls defer
+resolution until after the boot module has run.
 """
 
 DISPATCH_JS = r"""
@@ -202,6 +241,5 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-/* Side effect at load: default cursor. */
 canvas.style.cursor = "default";
 """

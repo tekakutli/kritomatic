@@ -1,11 +1,86 @@
 """
-tb_core.py — canvas, view, item model, formatting signature, wanted
-paths.  All exports are module-level declarations; `board.scale`
-replaces the old top-level `_boardScale` `let`, which cannot be
-reassigned from importers.
+tb_core.py — canvas, view, item model, formatting signature, wanted paths.
+
+ES module.  Owns all state that other modules read or write and
+exports it.  Nothing here imports tb_dispatch, tb_view, or the panel;
+those depend on this file, so the module graph stays acyclic.
+
+STATE THAT CROSSES MODULE BOUNDARIES
+====================================
+Module `let` bindings are read-only from the import side (the
+classic ES-module gotcha: `import { x } from "m"; x = 5` throws).
+Any value another module needs to reassign therefore lives on the
+`board` const object, whose properties are mutable:
+
+    board.scale        replaces the old top-level `_boardScale` let
+    board.items        replaced via `board.items = [...]` inside
+                       mergeIncomingShapes (a property write, not a
+                       binding write)
+    board.selectedIdx  reassigned from the panel, the dispatch
+                       handlers, and the remote select handler
+
+`_setDraw(fn)` injects the `draw` implementation.  `resize()` and
+`fitAll()` both call the injected `_drawRef`; without this
+indirection, either function here would need to import `draw` from
+`tb_dispatch.js`, which imports `tb_core.js` — a cycle.
+
+    IMPORTANT: tb_core.js does NOT import `draw` statically, so
+    a bare `if (typeof draw === "function") draw();` inside this
+    module is a silent no-op — `typeof` on an undeclared identifier
+    is `"undefined"` (it doesn't throw).  Any future edit that adds
+    a `draw()` call here must go through `_drawRef`.
+
+DOCUMENT SLOT LAYOUT
+====================
+`_docLayout()` is called from every frame (`_drawDocumentBounds`,
+`_drawItemCard`), from every cursor hover (`documentAtBoardPoint`,
+via `updateCursorReadout`), and from the panel's document-list
+refresh.  Its result is memoized; `_invalidateDocLayout()` is the
+only invalidation path and is called from `_rebaseAllItems` (after
+a refresh or scale change) and from `_clearBoardAction` (which
+empties `_documentSlots` directly).
+
+ITEM MODEL
+==========
+See `makeItemFromRecord` for the exact shape.  Briefly:
+
+    id              "<docPath>::<layerName>::<textIndex>"
+    document*       Krita-side identity and dimensions
+    layerName       Krita layer the text lives on
+    textIndex       which text shape on that layer
+    text, font*,    editable content and its presentation
+    color, alignment
+    rotationDeg
+    wordBoxes       per-word quad corners in document space
+    shapeBounds     axis-aligned bounds in document space
+    x, y            anchor in document space
+    bx, by, bw, bh  board-space rectangle (derived; recomputed by
+                    `_rebaseAllItems` on every scale change)
+    bz              z-order (higher is on top)
+    colorRGB        derived from `formatSig` via `_colorFromSig`
+    formatSig       a stable hash of (font, size, color, alignment)
+                    used to group cards by formatting
+
+FIT AND RESIZE
+==============
+`fitAll()` computes the view that frames every document slot and
+every item.  It used to call `draw()` directly; that name is not
+in scope in this module, so the call was a silent no-op, and the
+new view state sat un-painted until the next user interaction.  It
+now calls `_drawRef()`, which the boot module wires to `draw`
+before any of this runs.
+
+EXPORTS
+=======
+Canvas / DPR / ctx / view / board / palette / scale / document
+slots / document lookups / layout / content-bounds / hit testing /
+item selection / item construction / merge policy / wanted-paths /
+grid arrangement / fit-to-content / resize / `_setDraw`.
 """
 
 CORE_JS = r"""
+import { pgkitNotifyAll } from "./pgkit/remote_client.js";
+
 /* ==========================================================================
    CANVAS
    ========================================================================== */
@@ -32,8 +107,8 @@ export function s2b(sx, sy) {
 /* ==========================================================================
    BOARD STATE
    ==========================================================================
-   board.scale replaces the old `_boardScale` top-level let.  Any
-   module can assign `board.scale = X` because board is a const
+   board.scale replaces the old top-level `_boardScale` let.  Any
+   module can assign `board.scale = X` because `board` is a const
    object, whereas a top-level `let _boardScale` cannot be assigned
    from another module. */
 
@@ -324,8 +399,6 @@ export function _rebaseAllItems() {
    MERGE POLICY
    ========================================================================== */
 
-import { pgkitNotifyAll } from "./pgkit/remote_client.js";
-
 export function mergeIncomingShapes(shapes) {
   const byId = new Map();
   for (const it of board.items) byId.set(it.id, it);
@@ -456,9 +529,13 @@ export function groupByFormat() {
 
 /* ==========================================================================
    CONTENT BOUNDS
-   ========================================================================== */
+   ==========================================================================
+   Union of every document slot and every card rectangle, in board
+   coordinates.  Used by `fitAll` and by `exportCanvasJSON` (imported
+   by `tb_panel_lists.py`).  Returns null when the board has no
+   documents and no items. */
 
-function _contentBounds() {
+export function _contentBounds() {
   let minX =  Infinity, minY =  Infinity;
   let maxX = -Infinity, maxY = -Infinity;
   let any = false;
@@ -483,6 +560,20 @@ function _contentBounds() {
   return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
 }
 
+/* ==========================================================================
+   FIT TO CONTENT
+   ==========================================================================
+   `fitAll` is called from `refreshFromKrita` (after the first merge,
+   when `board._autoFitDone` is false) and from the Fit and Reset
+   view buttons.
+
+   Both branches MUST paint through `_drawRef`, not a bare `draw`:
+   `draw` is not a binding in this module, and `typeof draw` on an
+   undeclared identifier silently returns `"undefined"` rather than
+   throwing — so a `typeof draw === "function"` guard here is a
+   no-op, and the freshly-computed view state never reaches the
+   canvas until some unrelated event calls `draw` again. */
+
 export function fitAll() {
   const cw = window.innerWidth;
   const ch = window.innerHeight;
@@ -492,7 +583,7 @@ export function fitAll() {
     view.zoom = 1;
     view.panX = cw / 2;
     view.panY = ch / 2;
-    if (typeof draw === "function") draw();
+    if (_drawRef) _drawRef();
     return;
   }
 
@@ -508,17 +599,15 @@ export function fitAll() {
   view.panX = cw / 2 - cx * view.zoom;
   view.panY = ch / 2 - cy * view.zoom;
 
-  if (typeof draw === "function") draw();
+  if (_drawRef) _drawRef();
 }
 
 /* ==========================================================================
    RESIZE
    ==========================================================================
-   Uses the setRemoteDraw injection to reach draw(); a direct import
-   from tb_dispatch would create a cycle because tb_dispatch imports
-   resize. */
-
-import { setRemoteDraw as _setDrawRef } from "./pgkit/remote_client.js";
+   `_setDraw(fn)` is called by the boot module with `draw`.  A static
+   import from tb_dispatch.js would create a cycle because
+   tb_dispatch imports resize. */
 
 let _drawRef = null;
 export function _setDraw(fn) { _drawRef = fn; }

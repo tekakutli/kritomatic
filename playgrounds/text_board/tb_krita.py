@@ -1,17 +1,34 @@
 """
-tb_krita.py — fetch glue for /krita endpoints, as an ES module.
+tb_krita.py — fetch glue for the /krita endpoints.
 
-Exports: reportError, refreshFromKrita, applySelectedChanges,
-activateItemDocument, pickFilesViaServer, openOneFileInKrita,
-openAllClosed.
+ES module.  Exports the async fetch wrappers, error reporters, and
+open/refresh helpers.  All POSTs return JSON with a `success` flag;
+a non-success response has its `message` mirrored to `/log` on the
+local server, so failures also appear on the terminal.
+
+EXPORTS
+=======
+    reportError(tag, message)     POST /log, plus console.error
+    refreshFromKrita()            POST /krita/dump_text, merge the
+                                  result into the board, then
+                                  refresh the panel and canvas
+    activateItemDocument(it)      POST /krita/activate
+    pickFilesViaServer()          POST /krita/pick_files (native
+                                  dialog on the server machine)
+    openOneFileInKrita(path)      POST /krita/open, returns boolean
+    openAllClosed()               open every wanted path that is
+                                  not already open, then refresh
+
+The single-flight `_refreshInFlight` guard prevents two concurrent
+`dump_text` requests from clobbering each other's responses.
 """
 
 KRITA_JS = r"""
 import { board, fitAll, addWantedPath, closedWantedPaths,
-         mergeIncomingShapes, updateStatus as _unusedStatus }
+         mergeIncomingShapes }
   from "./tb_core.js";
 import { syncItemList }      from "./tb_panel_lists.js";
-import { _syncEditor, applyItemField } from "./tb_panel_fields.js";
+import { _syncEditor }       from "./tb_panel_fields.js";
 import { draw }              from "./tb_dispatch.js";
 import { flashStatus }       from "./pgkit/panel_core.js";
 
@@ -110,12 +127,8 @@ export async function refreshFromKrita() {
 }
 
 /* ==========================================================================
-   APPLY CHANGES
+   ACTIVATE
    ========================================================================== */
-
-export async function applySelectedChanges() {
-  // (kept for compatibility; not used by the boot)
-}
 
 export async function activateItemDocument(it) {
   if (!it || !it.documentPath) return;

@@ -1,16 +1,49 @@
 """
 tb_view.py — draw the board.
 
-Imports come from tb_core (`board`, `view`, `ctx`, `b2s`,
-`_docLayout`, `_zSortedIndices`, `_rgba`, `board.scale`,
-`DOCUMENT_GAP`, `ensureThumbLoaded`, `fileState`, `_cardLabelWidth`
-is defined locally).  Exports `drawBoardView`.
+ES module.  Exports `drawBoardView`, which paints the canvas from the
+current board state.  Everything it needs — `board`, `view`, `ctx`,
+`_docLayout`, `_zSortedIndices` — is imported from `tb_core.js`; the
+only state this file owns is a per-item label-width cache stored on
+each item as `_labelText` / `_labelWidth`, which is transient and
+never written to disk.
+
+LAYERS, BACK TO FRONT
+=====================
+    1.  Background fill
+    2.  One dashed rectangle per document (the document slot)
+    3.  One dot grid, batched into a single path
+    4.  Cards, in ascending z-order
+    5.  Empty-board caption, if `board.items` is empty
+
+PERFORMANCE NOTES
+=================
+    VIEWPORT CULLING
+        `_drawItemCard` early-returns if the card's screen rect is
+        fully outside the viewport (plus a margin for its label).
+
+    SHADOW-ONLY-WHEN-SELECTED
+        `shadowBlur` is applied only to the selected card; every
+        other card gets a cheap flat offset rect.
+
+    BATCHED GRID
+        The dot grid is one `ctx.beginPath()` / many `ctx.rect()` /
+        one `ctx.fill()`, not N `fillRect` calls.
+
+    LABEL-WIDTH CACHE
+        `ctx.measureText` is only called when the label text has
+        changed for that item.
+
+    HOISTED DOC-TO-SCREEN
+        Word-box quads are drawn with three precomputed arithmetic
+        expressions (`ox`, `oy`, `s`), not a per-corner closure or
+        `b2s()` call.  Saves four array allocations per word.
 """
 
 VIEW_JS = r"""
 import {
   b2s, view, ctx, board, _zSortedIndices, _rgba, _rgbaLight,
-  _docLayout, DOCUMENT_GAP, ensureThumbLoaded,
+  _docLayout,
 } from "./tb_core.js";
 
 /* ==========================================================================
@@ -94,49 +127,6 @@ function _roundRect(x, y, w, h, r) {
   ctx.arcTo(x,     y + h, x,     y,     r);
   ctx.arcTo(x,     y,     x + w, y,     r);
   ctx.closePath();
-}
-
-function _parseHexColor(c) {
-  if (!c || c[0] !== "#") return null;
-  const hex = c.slice(1);
-  if (hex.length === 3) {
-    return {
-      r: parseInt(hex[0] + hex[0], 16),
-      g: parseInt(hex[1] + hex[1], 16),
-      b: parseInt(hex[2] + hex[2], 16),
-    };
-  }
-  if (hex.length === 6) {
-    return {
-      r: parseInt(hex.slice(0, 2), 16),
-      g: parseInt(hex.slice(2, 4), 16),
-      b: parseInt(hex.slice(4, 6), 16),
-    };
-  }
-  return null;
-}
-
-function _sanitizeTextColor(c, fallback) {
-  if (!c || typeof c !== "string") return fallback;
-  if (c === "none" || c === "transparent") return fallback;
-  if (/^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/.test(c)) return c;
-  if (/^rgba?\(/.test(c)) return c;
-  return fallback;
-}
-
-function _lightenForDarkCard(c, fallback, minLum) {
-  const safe = _sanitizeTextColor(c, fallback);
-  const rgb = _parseHexColor(safe);
-  if (!rgb) return safe;
-  const lum = (0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b) / 255;
-  if (lum >= minLum) return safe;
-  const k = Math.min(255 / Math.max(rgb.r, 1),
-                     Math.min(255 / Math.max(rgb.g, 1),
-                              255 / Math.max(rgb.b, 1))) * 0.85 + 0.5;
-  const r = Math.min(255, Math.round(rgb.r * k + 40));
-  const g = Math.min(255, Math.round(rgb.g * k + 40));
-  const b = Math.min(255, Math.round(rgb.b * k + 40));
-  return "rgb(" + r + ", " + g + ", " + b + ")";
 }
 
 const _CARD_LABEL_FONT = "700 11px 'JetBrains Mono', 'Fira Code', monospace";

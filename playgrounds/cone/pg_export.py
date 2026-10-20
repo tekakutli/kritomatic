@@ -1,83 +1,49 @@
 """
 pg_export.py — JSON export of the current visual state.
 
-For each shape, dumps the raw stored fields, the single array both
-views read (cornersLocal, rotated and depth-scaled in (u, v)), and
-the derived screen positions and side lengths in BOTH views.
+ES module.  Pure read-only walk.  Writes `cone_visual_state.json`.
 
-Diagnostic use: if screenSideLengthsCone for a rotated shape is a
-permutation of the unrotated shape's screenSideLengthsCone, the two
-render as the same screen polygon turned by θ.
+Per patch and per shape, dumps raw stored fields, derived dimensions
+(flat-view and cone-view), world and screen positions, and — for
+hinged shapes — the plane-intersection hint.
 
-Schema v4
-=========
-Removed `perspStrength` (the panel no longer exposes that toggle;
-the constant was removed from pg_view_squares.py).  Added per-shape
-`dimsSource` describing whether the shape's height is anchored to
-the patch's uLen or vLen (currently vLen — see the note in
-pg_view_squares.py), and `extentVNorm`, the shape's half-extent
-along the patch's V axis in normalized coordinates.  Both fields
-exist for diagnosing the horizon-clamp behaviour; nothing else reads
-them.
+DIAGNOSTIC USE ONLY
+===================
+Nothing else reads this file.  `shapeDepthCone` is read live from
+`SHAPE_STATE.depthCone` on every export, so slider moves between
+exports are reflected accurately.
 
-Schema v5
-=========
-The single `shapeDepth` field is replaced by `shapeDepthCone` and
-`shapeDepthFlat`.  The two views now scale the shape's height
-independently: the cone view through `SHAPE_DEPTH_CONE` (driven by
-the panel's "Shape depth" slider) and the flat view through the
-fixed `SHAPE_DEPTH_FLAT`.  Per-shape, `dims` reports the FLAT-view
-dimensions (the ones the flat renderer reads) and `dimsCone` reports
-the CONE-view dimensions, so the export describes what each band
-actually draws.
+APEX — BOTH INTENT AND DISPLAY
+==============================
+`cone.ax` / `cone.ay` are the clamped display values the renderer
+and every projection in the file above use.  `cone.axRaw` /
+`cone.ayRaw` are the user's intent.  The two differ only when the
+intended apex lies outside the base radius (98% clamp); the diff is
+the visible signature of the clamp.  When diagnosing "why does this
+scene look shifted after a zoom change", compare the two — a raw
+value outside the displayed radius means the constraint, not a bug,
+is doing the shifting.
 
-Schema v6
-=========
-Each shape gained a `slopeRad` / `slopeDeg` pair: a pseudo-3D tilt
-about the shape's own reference U axis.  Superseded by schema v8.
-
-Schema v7
-=========
-Each shape now carries a `visualBottom` boolean: the per-square flag
-that switches the KRA export's text-anchor and corner-sense logic
-from "longest edge" (false / unset) to "visual bottom of the scene"
-(true).  Nothing on the render path reads it; it is included here so
-the visual-state dump matches the scene file and the KRA export's
-own inputs.  See pg_kra.py's `_shapeLabelScreenAngleDeg` and the
-VISUAL BOTTOM note in pg_panel.py.
-
-Schema v8
-=========
-The per-shape `slope` field is now a unitless hinge parameter in
-[0, 1] rather than a tilt angle in radians.  At 0 the shape lies
-flat on the patch; at 1 it has rotated a full 90 degrees about its
-near edge (the edge of the shape facing the viewer) and stands
-perpendicular to the patch plane.  The `slopeRad` / `slopeDeg`
-pair from v6 is gone — there is a single `slope` field.  The cone
-view reads it; the flat view still ignores it.  See the SLOPE
-section in pg_view_squares.py.
-
-Schema v9
-=========
-(interim, not shipped) added a per-patch `warp` field.
-
-Schema v10
-==========
-Each patch carries a `warp` parameter in [0, 1] that reparametrises
-its own tangential plane.  0 = the historic axial (rectangular)
-chart, aligned with the patch's U and V axes.  1 = a concentric
-chart centred on the apex, whose lines of constant u are arcs
-around the apex and whose lines of constant v are radial spokes.
-In between, the two charts blend linearly.  The plane itself is
-never moved or bent.  Only the CONE view reads it; the flat view
-is unchanged.  See _warpedFrameToWorld and the PLANE WARP section
-of pg_view_squares.py.
+Schema version moved from 10 to 11 for the two new fields.  A
+consumer that keyed on the version to parse older dumps is expected
+to treat 11 as a superset of 10 — the older fields are unchanged.
 """
 
 EXPORT_JS = r"""
-/* ==========================================================================
-   VISUAL STATE EXPORT
-   ========================================================================== */
+import {
+  quads, floatSquares, cone, view, layout, SHAPE_STATE,
+  quadCorners, surfacePoint, quadIdxById, coneR, w2s,
+} from "./pg_state.js";
+import {
+  patchFrame,
+  squareCornersLocal,
+  squareDims, squareDimsCone,
+  shapePerspCentre, shapeVMax, shapeVExtentNorm,
+  squareDisplayName, squareFlatCorners, frameToWorld,
+} from "./pg_view_squares_core.js";
+import { squareCornersScreen } from "./pg_view_squares_proj.js";
+import { flatToScreen } from "./pg_flat_math.js";
+import { flashStatus } from "./pgkit/panel_core.js";
 
 function _round3(v) { return Math.round(v * 1000) / 1000; }
 
@@ -101,14 +67,16 @@ function _worldSideLengths(pts) {
   return out;
 }
 
-function buildVisualStateExport() {
+export function buildVisualStateExport() {
   const out = {
-    schemaVersion: 10,
+    schemaVersion: 11,
     generatedAt:   new Date().toISOString(),
 
     cone: {
       ax:            _round3(cone.ax),
       ay:            _round3(cone.ay),
+      axRaw:         _round3(cone.axRaw),
+      ayRaw:         _round3(cone.ayRaw),
       depth:         _round3(cone.depth),
       halfAngleRad:  _round3(cone.halfAngle),
       halfAngleDeg:  _round3(cone.halfAngle * 180 / Math.PI),
@@ -117,8 +85,8 @@ function buildVisualStateExport() {
       R_world:       _round3(coneR()),
     },
 
-    shapeDepthCone: SHAPE_DEPTH_CONE,
-    shapeDepthFlat: SHAPE_DEPTH_FLAT,
+    shapeDepthCone: SHAPE_STATE.depthCone,
+    shapeDepthFlat: 1.00,
 
     view: {
       scale: _round3(view.scale),
@@ -220,10 +188,8 @@ function buildVisualStateExport() {
       return { w: _round3(d.w), h: _round3(d.h) };
     })();
 
-    entry.cornersLocal = local.map(p =>
-      [_round3(p[0]), _round3(p[1])]);
-    entry.cornersWorld = world.map(p =>
-      [_round3(p[0]), _round3(p[1])]);
+    entry.cornersLocal = local.map(p => [_round3(p[0]), _round3(p[1])]);
+    entry.cornersWorld = world.map(p => [_round3(p[0]), _round3(p[1])]);
     entry.worldSideLengths = _worldSideLengths(world);
 
     entry.perspCentre = _round3(shapePerspCentre(sq));
@@ -231,19 +197,15 @@ function buildVisualStateExport() {
 
     const screenCone = squareCornersScreen(sq);
     if (screenCone) {
-      entry.cornersScreenCone = screenCone.map(p =>
-        [_round3(p[0]), _round3(p[1])]);
+      entry.cornersScreenCone = screenCone.map(p => [_round3(p[0]), _round3(p[1])]);
       entry.screenSideLengthsCone = _screenSideLengths(screenCone);
     }
 
     const flatCorners = squareFlatCorners(sq);
     if (flatCorners) {
-      const screenFlat = flatCorners.map(([phi, s]) =>
-        flatToScreen(phi, s));
-      entry.cornersFlatParam = flatCorners.map(p =>
-        [_round3(p[0]), _round3(p[1])]);
-      entry.cornersScreenFlat = screenFlat.map(p =>
-        [_round3(p[0]), _round3(p[1])]);
+      const screenFlat = flatCorners.map(([phi, s]) => flatToScreen(phi, s));
+      entry.cornersFlatParam = flatCorners.map(p => [_round3(p[0]), _round3(p[1])]);
+      entry.cornersScreenFlat = screenFlat.map(p => [_round3(p[0]), _round3(p[1])]);
       entry.screenSideLengthsFlat = _screenSideLengths(screenFlat);
     }
 
@@ -253,7 +215,7 @@ function buildVisualStateExport() {
   return out;
 }
 
-function exportVisualStateJSON() {
+export function exportVisualStateJSON() {
   const data = buildVisualStateExport();
   const text = JSON.stringify(data, null, 2);
   const url  = "data:application/json;charset=utf-8,"
@@ -267,9 +229,7 @@ function exportVisualStateJSON() {
   a.click();
   document.body.removeChild(a);
 
-  if (typeof flashStatus === "function") {
-    flashStatus("Exported " + quads.length + " patch(es) and " +
-                floatSquares.length + " shape(s)", "ok");
-  }
+  flashStatus("Exported " + quads.length + " patch(es) and " +
+              floatSquares.length + " shape(s)", "ok");
 }
 """

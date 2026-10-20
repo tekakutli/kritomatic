@@ -2,148 +2,53 @@
 pg_view_flat.py — the parameter-space view of the cone's lateral
 surface.
 
-The cone's lateral surface is parameterised by (phi, s).  Drawing the
-parameter rectangle flat gives the "2D view".  A patch — being
-[phi0, phi1] × [s0, s1] in the model — shows up here as an actual
-rectangle, and back on the cone as a curved trapezoid narrowing
-toward the apex.
+ES module.  Renders the unfolded-cone sheet: static chrome (grid,
+frame, captions, cardinal markers) blitted from a cache, plus the
+dynamic content (patches, floating squares, labels).
 
-PHI IS A CIRCLE
-===============
-The phi axis has no boundary.  phi = 0 and phi = 2π are the same
-physical line on the cone; the sheet was cut there to lay it flat.
-A patch that drifts past the right edge of the sheet is the same
-patch as one that re-enters from the left, and the drawing code
-reflects that by drawing every integer-2π copy of a drifted patch
-whose range overlaps the visible rectangle.
+STAGE 1 OPTIMIZATION (preserved)
+================================
+The static chrome is drawn once per key change (resize, half-angle,
+depth) into an offscreen canvas and blitted per frame.
 
-CARDINAL DIRECTION MARKERS
-==========================
-The four letters E, N, W, S are pinned just above the base line, at
-the four φ values that correspond to the world +x, +y, −x, −y
-directions of the cone view.  The apex can be dragged anywhere
-within the cone's own reach limit, but it does not move the base
-ring, so the pins never move.
-
-STAGE 1 OPTIMIZATION — CHROME CACHE
-===================================
-The static chrome — grid, frame outline, captions, cardinal markers,
-s1 line, phi boundary dashed marks — is fully determined by
-(layout, flatRect, coneR).  It changes only on resize or on the
-half-angle/depth slider.  It used to re-render every frame: a
-half-dozen `strokeStyle`/`fillText`/`arc` per grid line, plus the
-four cardinal pins.
-
-The chrome is now drawn into an offscreen canvas.  Per-frame key
-comparison decides whether to blit or rebuild.  During any drag
-(apex, patch, square, scrub), the layout is stable, so the whole
-chrome is one `ctx.drawImage`.
-
-`flatRect()` is also memoized: it's called from `flatToScreen`,
-`screenToFlat`, `_flatInsideRect`, and every projection that needs
-a shape's standing scale — ~80–100 calls per frame.  Five `Math.min`
-/ `Math.max` per call, cached on (innerWidth, innerHeight, layout).
+IMPORT SOURCE NOTES
+===================
+`squareFlatCorners` is a geometry primitive from `pg_view_squares_core`,
+not from `pg_view_squares_flat` (the latter is the label / hit-test
+renderer).  `PATCH_SHAPE_EDIT_ENABLED` is a feature flag from
+`pg_state`, not from `pg_view_squares_core`.  Both were miscategorised
+in an earlier revision and blocked module load until fixed.
 """
 
 FLAT_VIEW_JS = r"""
-/* ==========================================================================
-   FLAT VIEW CONSTANTS
-   ========================================================================== */
-
-const FLAT_PHI_MIN  = 0;
-const FLAT_PHI_MAX  = 2 * Math.PI;
-const FLAT_PHI_SPAN = FLAT_PHI_MAX - FLAT_PHI_MIN;
-const FLAT_S_MIN    = 0;
-const FLAT_S_MAX    = 1;
-
-const QUAD_MIN_SIZE_PHI = 0.06;
-const QUAD_MIN_SIZE_S   = 0.04;
-
-const PATCH_SNAP_PHI = Math.PI / 12;
-const PATCH_SNAP_S   = 0.05;
-
-/* ==========================================================================
-   PHI-WRAP HELPERS
-   ========================================================================== */
-
-function _phiCopies(phi0, phi1) {
-  const kMin = Math.floor((FLAT_PHI_MIN - phi1) / FLAT_PHI_SPAN);
-  const kMax = Math.ceil ((FLAT_PHI_MAX - phi0) / FLAT_PHI_SPAN);
-  const out = [];
-  for (let k = kMin; k <= kMax; k++) out.push(k * FLAT_PHI_SPAN);
-  return out;
-}
-
-function _phiShiftForPatch(phiCursor, phi0, phi1) {
-  const phiMid = (phi0 + phi1) / 2;
-  return Math.round((phiMid - phiCursor) / FLAT_PHI_SPAN) * FLAT_PHI_SPAN;
-}
+import {
+  ctx, env, view, layout, cone, quads, floatSquares, coneState,
+  coneR, quadCorners, quadIdxById, PATCH_SHAPE_EDIT_ENABLED,
+} from "./pg_state.js";
+import {
+  flatRect, flatToScreen, _flatInsideRect,
+  _phiCopies, FLAT_PHI_MIN, FLAT_PHI_MAX, FLAT_S_MIN, FLAT_S_MAX,
+} from "./pg_flat_math.js";
+import {
+  patchHue, _huergb, _huergbLight, _withSquareMirror,
+  squareFlatCorners,
+  FLAT_HANDLE_R, FLAT_EDGE_R,
+} from "./pg_view_squares_core.js";
+import {
+  squareFlatRotateHandleScreen, drawShapeLabelsFlat,
+} from "./pg_view_squares_flat.js";
+import { squarePlaneIntersectionFlat } from "./pg_view_squares_proj.js";
 
 /* ==========================================================================
-   flatRect — WITH MEMO
+   CHROME CACHE
    ========================================================================== */
 
-let _flatRectCache = null;
-
-function flatRect() {
-  const W = window.innerWidth;
-  const H = layout.reservedH;
-  const y0Base = layout.reservedY;
-
-  if (_flatRectCache &&
-      _flatRectCache.W === W && _flatRectCache.H === H &&
-      _flatRectCache.y0Base === y0Base) {
-    return _flatRectCache.r;
-  }
-
-  const MARGIN_X = 44;
-  const TOP_PAD  = 26;
-  const BOT_PAD  = 26;
-  const maxW = W - 2 * MARGIN_X;
-  const maxH = H - TOP_PAD - BOT_PAD - 4;
-
-  const w = Math.min(maxW, maxH * 2.5);
-  const h = Math.min(maxH, w / 2.5);
-  const x0 = (W - w) / 2;
-  const y0 = y0Base + TOP_PAD + (maxH - h) / 2;
-
-  const r = { x0, y0, w, h };
-  _flatRectCache = { W, H, y0Base, r };
-  return r;
-}
-
-function flatToScreen(phi, s) {
-  const r = flatRect();
-  const u = (phi - FLAT_PHI_MIN) / (FLAT_PHI_MAX - FLAT_PHI_MIN);
-  const v = s;
-  return [r.x0 + u * r.w, r.y0 + (1 - v) * r.h];
-}
-
-function screenToFlat(sx, sy) {
-  const r = flatRect();
-  return {
-    phi: FLAT_PHI_MIN +
-         (sx - r.x0) / r.w * (FLAT_PHI_MAX - FLAT_PHI_MIN),
-    s:   1 - (sy - r.y0) / r.h,
-  };
-}
-
-function _flatInsideRect(sx, sy) {
-  const r = flatRect();
-  return sx >= r.x0 && sx <= r.x0 + r.w &&
-         sy >= r.y0 && sy <= r.y0 + r.h;
-}
-
-/* ==========================================================================
-   FLAT-VIEW CHROME CACHE
-   ========================================================================== */
-
-let _flatChromeCache = null;   // { key, canvas }
+let _flatChromeCache = null;
 
 function _flatChromeKey(cw, ch) {
   const r = flatRect();
   return [
-    cw, ch, dpr,
+    cw, ch, env.dpr,
     layout.reservedY, layout.reservedH,
     r.x0, r.y0, r.w, r.h,
     coneR(),
@@ -152,17 +57,16 @@ function _flatChromeKey(cw, ch) {
 
 function _buildFlatChrome(cw, ch) {
   const off = document.createElement("canvas");
-  off.width  = Math.round(cw * dpr);
-  off.height = Math.round(ch * dpr);
+  off.width  = Math.round(cw * env.dpr);
+  off.height = Math.round(ch * env.dpr);
   const octx = off.getContext("2d");
-  octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  octx.setTransform(env.dpr, 0, 0, env.dpr, 0, 0);
 
   octx.fillStyle = "#060a10";
   octx.fillRect(0, layout.reservedY, cw, layout.reservedH);
 
   const r = flatRect();
 
-  // Grid: horizontal ring hints.
   octx.save();
   const N_RINGS = 6;
   for (let k = 1; k < N_RINGS; k++) {
@@ -189,7 +93,6 @@ function _buildFlatChrome(cw, ch) {
   octx.lineWidth = 1;
   octx.strokeRect(r.x0 + 0.5, r.y0 + 0.5, r.w - 1, r.h - 1);
 
-  // s=1 line.
   {
     const [sx0, sy] = flatToScreen(FLAT_PHI_MIN, 1);
     const [sx1]     = flatToScreen(FLAT_PHI_MAX, 1);
@@ -198,7 +101,6 @@ function _buildFlatChrome(cw, ch) {
     octx.beginPath(); octx.moveTo(sx0, sy); octx.lineTo(sx1, sy); octx.stroke();
   }
 
-  // Dashed phi-boundary marks.
   {
     const [sxL, sy0] = flatToScreen(FLAT_PHI_MIN, FLAT_S_MAX);
     const [,   sy1]  = flatToScreen(FLAT_PHI_MIN, FLAT_S_MIN);
@@ -214,7 +116,6 @@ function _buildFlatChrome(cw, ch) {
   }
   octx.restore();
 
-  // Captions.
   octx.save();
   octx.font = "700 9px 'JetBrains Mono', 'Fira Code', monospace";
 
@@ -237,7 +138,6 @@ function _buildFlatChrome(cw, ch) {
   octx.fillText("s = 1  \u00B7  apex", r.x0, r.y0 + 4);
   octx.restore();
 
-  // Cardinal markers.
   const yBase = r.y0 + r.h;
   const R_PIN = 9;
   const yPin  = yBase - R_PIN - 3;
@@ -291,34 +191,33 @@ function _flatChrome(cw, ch) {
    FLAT VIEW — DRAW
    ========================================================================== */
 
-function drawFlatView() {
+export function drawFlatView() {
   const cw = window.innerWidth;
-
-  // Static chrome: blit.
   ctx.drawImage(_flatChrome(cw, window.innerHeight), 0, 0, cw, window.innerHeight);
 
   const r = flatRect();
 
-  // Dynamic content: patches and squares.
   ctx.save();
   ctx.beginPath();
   ctx.rect(r.x0, r.y0, r.w, r.h);
   ctx.clip();
 
   for (let i = 0; i < quads.length; i++) {
-    if (i === selectedQuad) continue;
+    if (i === coneState.selectedQuad) continue;
     drawFlatQuad(quads[i], false);
   }
-  if (selectedQuad >= 0 && selectedQuad < quads.length) {
-    drawFlatQuad(quads[selectedQuad], true);
+  if (coneState.selectedQuad >= 0 &&
+      coneState.selectedQuad < quads.length) {
+    drawFlatQuad(quads[coneState.selectedQuad], true);
   }
 
-  if (selectedQuad >= 0 && selectedQuad < quads.length) {
-    const activeQ = quads[selectedQuad];
+  if (coneState.selectedQuad >= 0 &&
+      coneState.selectedQuad < quads.length) {
+    const activeQ = quads[coneState.selectedQuad];
     for (let i = 0; i < floatSquares.length; i++) {
       const sq = floatSquares[i];
       if (sq.quadId !== activeQ.id) continue;
-      const isSel = (i === selectedSquare);
+      const isSel = (i === coneState.selectedSquare);
       _drawFlatSquareOne(sq, isSel, false);
       if (activeQ.mirror) {
         _withSquareMirror(sq, () => _drawFlatSquareOne(sq, false, true));
@@ -340,8 +239,10 @@ function drawFlatQuad(q, selected) {
 
 function drawFlatQuadShifted(q, selected, shift) {
   const hue = patchHue(q);
-  const pts = quadCorners(q).map(c =>
-    flatToScreen(c.phi + shift, c.s));
+  const pts = [
+    { phi: q.phi0, s: q.s1 }, { phi: q.phi1, s: q.s1 },
+    { phi: q.phi1, s: q.s0 }, { phi: q.phi0, s: q.s0 },
+  ].map(c => flatToScreen(c.phi + shift, c.s));
 
   ctx.save();
 
@@ -473,9 +374,6 @@ function _drawFlatSquareOne(sq, isSel, isMirror) {
    HIT TESTING
    ========================================================================== */
 
-const FLAT_HANDLE_R = 10;
-const FLAT_EDGE_R   = 6;
-
 function _flatPtSegDist(px, py, ax, ay, bx, by) {
   const dx = bx - ax, dy = by - ay;
   const l2 = dx * dx + dy * dy;
@@ -499,15 +397,16 @@ function _flatPtInQuad(px, py, c) {
   return inside;
 }
 
-function flatHitTest(sx, sy) {
+export function flatHitTest(sx, sy) {
   if (!_flatInsideRect(sx, sy)) return null;
 
   const order = [];
-  if (selectedQuad >= 0 && selectedQuad < quads.length) {
-    order.push(selectedQuad);
+  if (coneState.selectedQuad >= 0 &&
+      coneState.selectedQuad < quads.length) {
+    order.push(coneState.selectedQuad);
   }
   for (let i = 0; i < quads.length; i++) {
-    if (i !== selectedQuad) order.push(i);
+    if (i !== coneState.selectedQuad) order.push(i);
   }
 
   for (const qi of order) {
@@ -544,106 +443,5 @@ function flatHitTest(sx, sy) {
     }
   }
   return null;
-}
-
-/* ==========================================================================
-   SHAPE RE-CLAMP AFTER PATCH MUTATION
-   ========================================================================== */
-
-function _reclampShapesOnPatch(q) {
-  if (!q) return;
-  const qi = quadIdxById(q.id);
-  if (qi < 0) return;
-  for (let i = 0; i < floatSquares.length; i++) {
-    const sq = floatSquares[i];
-    if (sq.quadId === q.id) {
-      sq.v = clampCloneV(qi, sq.v);
-    }
-  }
-}
-
-/* ==========================================================================
-   PATCH DRAG AND MUTATORS
-   ========================================================================== */
-
-function applyPatchDragFromStart(q, dp, curPhi, curS, constrain) {
-  let rawPhi = curPhi - dp.startPhi;
-  while (rawPhi >  Math.PI) rawPhi -= 2 * Math.PI;
-  while (rawPhi < -Math.PI) rawPhi += 2 * Math.PI;
-  const rawS = curS - dp.startS;
-
-  let dPhi = rawPhi;
-  const dS = rawS;
-
-  if (constrain) {
-    dPhi = 0;
-  }
-
-  q.phi0 = dp.startPhi0 + dPhi;
-  q.phi1 = dp.startPhi1 + dPhi;
-
-  let ns0 = dp.startS0 + dS;
-  let ns1 = dp.startS1 + dS;
-  if (ns0 < FLAT_S_MIN) { ns1 += FLAT_S_MIN - ns0; ns0 = FLAT_S_MIN; }
-  if (ns1 > FLAT_S_MAX) { ns0 -= ns1 - FLAT_S_MAX; ns1 = FLAT_S_MAX; }
-  if (ns0 < FLAT_S_MIN) ns0 = FLAT_S_MIN;
-  q.s0 = ns0;
-  q.s1 = ns1;
-
-  _reclampShapesOnPatch(q);
-}
-
-function flatMoveCorner(q, cornerIdx, phi, s) {
-  if (cornerIdx === 0) {
-    q.phi0 = Math.max(FLAT_PHI_MIN,
-                      Math.min(phi, q.phi1 - QUAD_MIN_SIZE_PHI));
-    q.s1   = Math.min(FLAT_S_MAX,
-                      Math.max(s, q.s0 + QUAD_MIN_SIZE_S));
-  } else if (cornerIdx === 1) {
-    q.phi1 = Math.min(FLAT_PHI_MAX,
-                      Math.max(phi, q.phi0 + QUAD_MIN_SIZE_PHI));
-    q.s1   = Math.min(FLAT_S_MAX,
-                      Math.max(s, q.s0 + QUAD_MIN_SIZE_S));
-  } else if (cornerIdx === 2) {
-    q.phi1 = Math.min(FLAT_PHI_MAX,
-                      Math.max(phi, q.phi0 + QUAD_MIN_SIZE_PHI));
-    q.s0   = Math.max(FLAT_S_MIN,
-                      Math.min(s, q.s1 - QUAD_MIN_SIZE_S));
-  } else if (cornerIdx === 3) {
-    q.phi0 = Math.max(FLAT_PHI_MIN,
-                      Math.min(phi, q.phi1 - QUAD_MIN_SIZE_PHI));
-    q.s0   = Math.max(FLAT_S_MIN,
-                      Math.min(s, q.s1 - QUAD_MIN_SIZE_S));
-  }
-  _reclampShapesOnPatch(q);
-}
-
-function flatMoveEdge(q, edge, phi, s) {
-  if (edge === "top") {
-    q.s1 = Math.min(FLAT_S_MAX, Math.max(s, q.s0 + QUAD_MIN_SIZE_S));
-  } else if (edge === "bottom") {
-    q.s0 = Math.max(FLAT_S_MIN, Math.min(s, q.s1 - QUAD_MIN_SIZE_S));
-  } else if (edge === "left") {
-    q.phi0 = Math.max(FLAT_PHI_MIN,
-                      Math.min(phi, q.phi1 - QUAD_MIN_SIZE_PHI));
-  } else if (edge === "right") {
-    q.phi1 = Math.min(FLAT_PHI_MAX,
-                      Math.max(phi, q.phi0 + QUAD_MIN_SIZE_PHI));
-  }
-  _reclampShapesOnPatch(q);
-}
-
-function flatMoveBody(q, dPhi, dS) {
-  q.phi0 += dPhi;
-  q.phi1 += dPhi;
-
-  let ns0 = q.s0 + dS, ns1 = q.s1 + dS;
-  if (ns0 < FLAT_S_MIN) { ns1 += FLAT_S_MIN - ns0; ns0 = FLAT_S_MIN; }
-  if (ns1 > FLAT_S_MAX) { ns0 -= ns1 - FLAT_S_MAX; ns1 = FLAT_S_MAX; }
-  if (ns0 < FLAT_S_MIN) ns0 = FLAT_S_MIN;
-
-  q.s0 = ns0; q.s1 = ns1;
-
-  _reclampShapesOnPatch(q);
 }
 """

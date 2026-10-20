@@ -1,97 +1,114 @@
 """
 pg_view_squares_core.py — model, frame, geometry, lifecycle.
 
-The stable half of the square system: state, constants, the patch
-frame, shape dimensions and corners, the mirror wrapper, the
-horizon, and the shape lifecycle (add / clone / delete).  Nothing
-here depends on the projection or on the warp chart — this file is
-edited only when the SHAPE MODEL itself changes.
+ES module.  Shape model + geometry + hit-test helpers.  Everything
+here except a few cache singletons is stateless — the state lives
+in pg_state.
 
-STAGE 1 OPTIMIZATIONS
+IMPORTS FROM pg_state
 =====================
-    patchFrame MEMO
-        `patchFrame(qi)` is called 15–30 times per frame with a few
-        patches on screen (once per square's corners, once per
-        screen→frame inversion, once per horizon/standing-scale
-        query).  Each call recomputes four `surfacePoint` calls —
-        eight `Math.cos`/`Math.sin`/`Math.hypot` operations.  The
-        result is cached on `q.id` and invalidated when the quad's
-        (phi0, phi1, s0, s1) bounds change.  Four `===` per lookup
-        — the cache is essentially free — and it saves ~200–400
-        trig calls per frame during a drag.
+    quads, floatSquares, coneState, SHAPE_STATE
+    quadIdxById, horizonLocal, clampCloneV, _reclampShapesOnPatch
+    _TAU, cone
 
-    _huergb / _huergbLight STRING CACHE
-        Both are called ~200× per frame (one per border / fill /
-        stroke).  Each allocates a new string.  A `Map` keyed on
-        the exact argument tuple returns the cached string after
-        the first call per palette entry — calloc becomes a hash
-        lookup.
+IMPORTS FROM pg_flat_math
+=========================
+    flatRect, FLAT_S_MIN, FLAT_S_MAX
+
+CALLED BY
+=========
+    pg_view_squares_warp / proj / edit / flat
+    pg_view_cone / pg_view_flat
+    pg_view_squares_flat (squareFlatCorners used by pg_core fit)
+    pg_core._fitPatchAndShape_shapeFirst
+    pg_panel_fields (squareWorldWidth, squareFlatCenter)
+    pg_panel_scrubs (_patchPhiCenter, squareWorldWidth/Height,
+                     squareFlatCenter, SHAPE_SLOPE_MIN/MAX,
+                     SHAPE_STANDING_HEIGHT_MULT via SHAPE_STATE)
+    pg_kra (many)
+    pg_export (many)
+
+PATCH-FRAME CACHE — WHY IT KEYS ON CONE STATE
+=============================================
+`patchFrame` computes a patch's world-space basis (`Cx, Cy, Ux, Uy,
+Vx, Vy, uLen, vLen, det`) from the patch's (phi0, phi1, s0, s1) AND
+from four cone parameters: `cone.ax`, `cone.ay`, `cone.depth`,
+`cone.halfAngle`.  The frame is the reference the whole square
+pipeline reads — `squareCornersLocal`, `squareCornersScreen`,
+`squareFlatCorners`, `squareSetFlatCenter`, `_shapeStandingScale`,
+`frameToWorld` / `screenToFrame`.  Every one of those depends on the
+frame.
+
+The cache hit check must therefore compare against all six inputs.
+Historically it only compared `(phi0, phi1, s0, s1)` — the patch
+values, not the cone values.  That was wrong: dragging the apex,
+zooming (depth), or moving the half-angle slider all changed the
+cone without touching the patch's own parameters, so the cache
+returned a frame frozen at whatever cone state had been current on
+the last miss.  The squares inside the patch therefore did not
+re-project when the cone changed, even though the patches themselves
+(which bypass the frame and read `surfacePoint` directly) did.
+
+The visible symptom was that zooming the cone left the squares
+sitting at the depth-15 screen position while the cone shrank around
+them; and, before the apex dual-intent fix, that the squares
+appeared to "follow" the apex during a clamp — actually the anchor
+in `projectShapePoint` (`w2s(cone.ax, cone.ay)`) was moving while
+the frame's target stayed frozen, so the perspective interpolation
+squeezed the squares toward the anchor.
+
+Including the four cone values in the check makes the frame
+invalidated exactly when it should be — on apex drag, on depth
+change, on half-angle change — and left valid on square drag, patch
+drag, selection change, and every other mutation that does not alter
+the cone's geometry.
 """
 
 SQUARES_CORE_JS = r"""
-/* ==========================================================================
-   STATE
-   ========================================================================== */
-
-const floatSquares = [];
-let nextSquareId = 1;
-let selectedSquare = -1;
-
-/* ==========================================================================
-   SHAPE DIMENSIONS
-   ========================================================================== */
-
-const SHAPE_REL_SIZE = 2.0;
-
-const SHAPE_DEFAULT_SCALE = 1.0;
-const SHAPE_MIN_SCALE     = 0.03;
-const SHAPE_MAX_SCALE     = 10.00;
-
-const SHAPE_SLOPE_MIN = 0;
-const SHAPE_SLOPE_MAX = 1;
-
-let SHAPE_STANDING_HEIGHT_MULT = 2.00;
+import {
+  quads, floatSquares, coneState, SHAPE_STATE,
+  quadIdxById, horizonLocal, clampCloneV, _reclampShapesOnPatch,
+  _TAU, cone,
+} from "./pg_state.js";
+import { flatRect, FLAT_S_MIN, FLAT_S_MAX } from "./pg_flat_math.js";
 
 /* ==========================================================================
-   PATCH-RELATIVE ASPECT SCALING
+   SHAPE CONSTANTS
    ========================================================================== */
 
-const SHAPE_U_REF = 3.2;
-const SHAPE_V_REF = 4.0;
+export const SHAPE_REL_SIZE = 2.0;
+export const SHAPE_U_REF    = 3.2;
+export const SHAPE_V_REF    = 4.0;
 
-function _shapeAspectScales(f) {
-  if (!f || f.uLen <= 0 || f.vLen <= 0) {
-    return { Ku: 1, Kv: 1 };
-  }
-  return { Ku: f.uLen / SHAPE_U_REF, Kv: f.vLen / SHAPE_V_REF };
-}
+export const SHAPE_DEFAULT_SCALE = 1.0;
+export const SHAPE_MIN_SCALE     = 0.03;
+export const SHAPE_MAX_SCALE     = 10.00;
 
-/* ==========================================================================
-   SHAPE DEPTH — ONE PER VIEW
-   ========================================================================== */
+export const SHAPE_SLOPE_MIN = 0;
+export const SHAPE_SLOPE_MAX = 1;
 
 const SHAPE_DEPTH_CONE_UNIT = 1.00;
-let   SHAPE_DEPTH_CONE      = 1.00;
-const SHAPE_DEPTH_FLAT      = 1.00;
+export const SHAPE_DEPTH_FLAT = 1.00;
 
-function effectiveConeDepth() {
-  return SHAPE_DEPTH_CONE * SHAPE_DEPTH_CONE_UNIT;
+export function effectiveConeDepth() {
+  return SHAPE_STATE.depthCone * SHAPE_DEPTH_CONE_UNIT;
 }
 
-const WEDGE_BASE_REACH = 2.50;
+export const ROTATE_HANDLE_OFFSET = 0.25;
+export const ROTATE_HANDLE_R      = 10;
+export const ROTATE_JUMP_STEP     = Math.PI / 12;
+export const U_LIMIT = 3.0;
 
-const ROTATE_HANDLE_OFFSET = 0.25;
-const ROTATE_HANDLE_R      = 10;
-
-const ROTATE_JUMP_STEP = Math.PI / 12;
-
-const U_LIMIT = 3.0;
+export const FLAT_HANDLE_R = 10;
+export const FLAT_EDGE_R   = 6;
+export const QUAD_MIN_SIZE_PHI = 0.06;
+export const QUAD_MIN_SIZE_S   = 0.04;
 
 /* ==========================================================================
-   PATCH HUE PALETTE + STRING CACHES
+   PALETTE + STRING CACHES
    ========================================================================== */
 
-const PATCH_HUES = [
+export const PATCH_HUES = [
   { r: 255, g: 200, b:  90 },
   { r: 120, g: 220, b: 255 },
   { r: 255, g: 130, b: 210 },
@@ -102,7 +119,7 @@ const PATCH_HUES = [
   { r: 220, g: 230, b: 120 },
 ];
 
-function patchHue(q) {
+export function patchHue(q) {
   if (!q) return PATCH_HUES[0];
   const n = PATCH_HUES.length;
   const idx = ((q.id - 1) % n + n) % n;
@@ -110,7 +127,7 @@ function patchHue(q) {
 }
 
 const _rgbaCache = new Map();
-function _huergb(h, a) {
+export function _huergb(h, a) {
   const key = h.r + "," + h.g + "," + h.b + "," + a;
   let s = _rgbaCache.get(key);
   if (s !== undefined) return s;
@@ -120,7 +137,7 @@ function _huergb(h, a) {
 }
 
 const _rgbaLightCache = new Map();
-function _huergbLight(h) {
+export function _huergbLight(h) {
   const key = h.r + "," + h.g + "," + h.b;
   let s = _rgbaLightCache.get(key);
   if (s !== undefined) return s;
@@ -133,29 +150,59 @@ function _huergbLight(h) {
 }
 
 /* ==========================================================================
-   PATCH FRAME — with memo
+   ASPECT SCALING
+   ========================================================================== */
+
+export function _shapeAspectScales(f) {
+  if (!f || f.uLen <= 0 || f.vLen <= 0) return { Ku: 1, Kv: 1 };
+  return { Ku: f.uLen / SHAPE_U_REF, Kv: f.vLen / SHAPE_V_REF };
+}
+
+/* ==========================================================================
+   PATCH FRAME — memoized on patch bounds AND cone state
    ==========================================================================
-   The cache key is the quad's current (phi0, phi1, s0, s1).  Any
-   mutation that changes one of those (patch drag, panel scrub,
-   scene load, apex drag indirectly no — apex doesn't change the
-   bounds, only surfacePoint) invalidates that quad's entry on the
-   next lookup.  Different quads have different ids, so entries
-   don't collide. */
+   The cache hit check compares against every input the frame
+   computation reads. Historically it compared only the patch's own
+   (phi0, phi1, s0, s1); the four cone values below were missing, so
+   an apex drag or a wheel zoom left the frame frozen at the previous
+   cone geometry. Every downstream consumer of the frame — square
+   corners, square screen projection, flat-view corners, standing
+   height, screenToFrame / frameToWorld — inherited the freeze, which
+   is what made squares stay put when the cone zoomed and (before the
+   apex dual-intent fix) appear to "follow" the apex when it clamped.
+
+   The check is intentionally strict on all six values. If any one of
+   them changes the frame is recomputed; the recompute happens at most
+   once per patch per frame, and re-hits on the subsequent per-square
+   lookups. Cost per zoom frame during a scroll: one recompute per
+   patch, not per square. */
 
 const _patchFrameCache = new Map();
 
-function patchFrame(quadIdx) {
+export function patchFrame(quadIdx) {
   if (quadIdx < 0 || quadIdx >= quads.length) return null;
   const q = quads[quadIdx];
 
   const cached = _patchFrameCache.get(q.id);
   if (cached &&
-      cached.phi0 === q.phi0 && cached.phi1 === q.phi1 &&
-      cached.s0   === q.s0   && cached.s1   === q.s1) {
+      cached.phi0  === q.phi0  && cached.phi1  === q.phi1  &&
+      cached.s0    === q.s0    && cached.s1    === q.s1    &&
+      cached.ax    === cone.ax && cached.ay    === cone.ay &&
+      cached.depth === cone.depth &&
+      cached.halfAngle === cone.halfAngle) {
     return cached.frame;
   }
 
-  const c = quadCorners(q).map(v => surfacePoint(v.phi, v.s));
+  const corners = [
+    { phi: q.phi0, s: q.s1 }, { phi: q.phi1, s: q.s1 },
+    { phi: q.phi1, s: q.s0 }, { phi: q.phi0, s: q.s0 },
+  ];
+  const c = corners.map(v => {
+    const R = cone.depth * Math.tan(cone.halfAngle);
+    const r = (1 - v.s) * R;
+    return [v.s * cone.ax + r * Math.cos(v.phi),
+            v.s * cone.ay + r * Math.sin(v.phi)];
+  });
   const C0 = c[0], C1 = c[1], C2 = c[2], C3 = c[3];
 
   const Cx = (C0[0] + C1[0] + C2[0] + C3[0]) / 4;
@@ -163,13 +210,11 @@ function patchFrame(quadIdx) {
 
   let Ux = (C1[0] + C2[0]) / 2 - (C0[0] + C3[0]) / 2;
   let Uy = (C1[1] + C2[1]) / 2 - (C0[1] + C3[1]) / 2;
-
   let Vx = (C0[0] + C1[0]) / 2 - (C3[0] + C2[0]) / 2;
   let Vy = (C0[1] + C1[1]) / 2 - (C3[1] + C2[1]) / 2;
 
   const uLen = Math.hypot(Ux, Uy) || 1;
   const vLen = Math.hypot(Vx, Vy) || 1;
-
   Ux /= uLen; Uy /= uLen;
   Vx /= vLen; Vy /= vLen;
 
@@ -178,22 +223,25 @@ function patchFrame(quadIdx) {
 
   const frame = { Cx, Cy, Ux, Uy, Vx, Vy, det, uLen, vLen };
   _patchFrameCache.set(q.id, {
-    phi0: q.phi0, phi1: q.phi1, s0: q.s0, s1: q.s1, frame,
+    phi0: q.phi0, phi1: q.phi1, s0: q.s0, s1: q.s1,
+    ax: cone.ax, ay: cone.ay,
+    depth: cone.depth, halfAngle: cone.halfAngle,
+    frame,
   });
   return frame;
 }
 
-function frameToWorld(f, u, v) {
+export function frameToWorld(f, u, v) {
   return [f.Cx + u * f.Ux + v * f.Vx,
           f.Cy + u * f.Uy + v * f.Vy];
 }
 
-function frameToScreen(f, u, v) {
+export function frameToScreen(f, u, v) {
   const [wx, wy] = frameToWorld(f, u, v);
   return w2s(wx, wy);
 }
 
-function screenToFrame(f, sx, sy) {
+export function screenToFrame(f, sx, sy) {
   const [wx, wy] = s2w(sx, sy);
   const dx = wx - f.Cx;
   const dy = wy - f.Cy;
@@ -203,18 +251,14 @@ function screenToFrame(f, sx, sy) {
   };
 }
 
-function quadIdxById(id) {
-  for (let i = 0; i < quads.length; i++) {
-    if (quads[i].id === id) return i;
-  }
-  return -1;
-}
+// w2s / s2w come from pg_state
+import { w2s, s2w, view } from "./pg_state.js";
 
 /* ==========================================================================
-   MIRROR
+   MIRROR / PHI SHIFT
    ========================================================================== */
 
-function _withQuadPhiShifted(q, dPhi, fn) {
+export function _withQuadPhiShifted(q, dPhi, fn) {
   const phi0 = q.phi0, phi1 = q.phi1;
   q.phi0 = phi0 + dPhi;
   q.phi1 = phi1 + dPhi;
@@ -224,25 +268,23 @@ function _withQuadPhiShifted(q, dPhi, fn) {
   }
 }
 
-function _squareHasMirror(sq) {
+export function _squareHasMirror(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return false;
   const q = quads[qi];
   return !!(q && q.mirror);
 }
 
-function _withSquareMirror(sq, fn) {
+export function _withSquareMirror(sq, fn) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const q = quads[qi];
   if (!q || !q.mirror) return;
 
-  const angle = (typeof q.mirrorAngle === "number")
-                  ? q.mirrorAngle : Math.PI;
+  const angle = (typeof q.mirrorAngle === "number") ? q.mirrorAngle : Math.PI;
   const flip  = q.mirrorFlip !== false;
 
-  const phi0   = q.phi0;
-  const phi1   = q.phi1;
+  const phi0   = q.phi0, phi1 = q.phi1;
   const theta0 = sq.theta || 0;
   const slope0 = sq.slope || 0;
   const u0     = sq.u;
@@ -255,9 +297,7 @@ function _withSquareMirror(sq, fn) {
     sq.u     = -u0;
   }
 
-  try {
-    fn();
-  } finally {
+  try { fn(); } finally {
     q.phi0   = phi0;
     q.phi1   = phi1;
     sq.theta = theta0;
@@ -266,7 +306,7 @@ function _withSquareMirror(sq, fn) {
   }
 }
 
-function _patchNormalPhi(qi) {
+export function _patchNormalPhi(qi) {
   if (qi < 0 || qi >= quads.length) return 0;
   const q = quads[qi];
   const TAU = 2 * Math.PI;
@@ -276,18 +316,24 @@ function _patchNormalPhi(qi) {
 }
 
 /* ==========================================================================
-   PATCH CORNERS IN LOCAL FRAME — [TL, TR, BR, BL]
+   PATCH CORNERS IN LOCAL FRAME
    ========================================================================== */
 
-function patchCornersLocal(quadIdx) {
+export function patchCornersLocal(quadIdx) {
   if (quadIdx < 0 || quadIdx >= quads.length) return null;
   const f = patchFrame(quadIdx);
   if (!f) return null;
   const q = quads[quadIdx];
-  const world = quadCorners(q).map(c => surfacePoint(c.phi, c.s));
-  return world.map(([wx, wy]) => {
-    const dx = wx - f.Cx;
-    const dy = wy - f.Cy;
+  const corners = [
+    { phi: q.phi0, s: q.s1 }, { phi: q.phi1, s: q.s1 },
+    { phi: q.phi1, s: q.s0 }, { phi: q.phi0, s: q.s0 },
+  ];
+  return corners.map(c => {
+    const R = cone.depth * Math.tan(cone.halfAngle);
+    const r = (1 - c.s) * R;
+    const wx = c.s * cone.ax + r * Math.cos(c.phi);
+    const wy = c.s * cone.ay + r * Math.sin(c.phi);
+    const dx = wx - f.Cx, dy = wy - f.Cy;
     return [
       (dx * f.Vy - dy * f.Vx) / f.det,
       (f.Ux * dy - f.Uy * dx) / f.det,
@@ -296,32 +342,23 @@ function patchCornersLocal(quadIdx) {
 }
 
 /* ==========================================================================
-   HORIZON
+   HORIZON / PERSPECTIVE
    ========================================================================== */
 
-function horizonLocal(qi) {
-  if (qi < 0 || qi >= quads.length) return null;
-  const q = quads[qi];
-  const ds = q.s1 - q.s0;
-  if (Math.abs(ds) < 1e-9) return null;
-  const sAvg = (q.s0 + q.s1) / 2;
-  return { vHat: (1 - sAvg) / ds };
-}
-
-function perspAt(qi, vHat) {
+export function perspAt(qi, vHat) {
   const h = horizonLocal(qi);
   if (!h || h.vHat <= 1e-6) return 1;
   const p = (h.vHat - vHat) / h.vHat;
   return Math.max(0, p);
 }
 
-function shapePerspCentre(sq) {
+export function shapePerspCentre(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return 1;
   return perspAt(qi, sq.v);
 }
 
-function shapeVMax(sq) {
+export function shapeVMax(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return 1;
   const f = patchFrame(qi);
@@ -332,7 +369,7 @@ function shapeVMax(sq) {
 }
 
 /* ==========================================================================
-   STANDING-HEIGHT SCALE FOR THE HINGE
+   STANDING HEIGHT
    ========================================================================== */
 
 function _flatVExtentPxForShape(sq) {
@@ -341,29 +378,24 @@ function _flatVExtentPxForShape(sq) {
   const q = quads[qi];
   const f = patchFrame(qi);
   if (!f) return null;
-
   const dS = q.s1 - q.s0;
   if (Math.abs(dS) < 1e-9) return null;
 
   const vExtentLocal = SHAPE_REL_SIZE * (sq.scaleV || 1)
                        * (f.vLen / SHAPE_V_REF);
   const vExtentS = vExtentLocal * dS / f.vLen;
-
   const r = flatRect();
-  return vExtentS * r.h * SHAPE_STANDING_HEIGHT_MULT;
+  return vExtentS * r.h * SHAPE_STATE.standingMult;
 }
 
-function _shapeStandingScale(f, sq, qi, hingeV, depthScale) {
+export function _shapeStandingScale(f, sq, qi, hingeV, depthScale) {
   if (!f || !sq) return 1;
-
   const flatVExtentPx = _flatVExtentPxForShape(sq);
   if (!flatVExtentPx || !isFinite(flatVExtentPx) ||
       flatVExtentPx < 1e-6) return 1;
-
   const Kv = f.vLen / SHAPE_V_REF;
   const shapeWorldH = SHAPE_REL_SIZE * (sq.scaleV || 1) * depthScale * Kv;
   if (shapeWorldH < 1e-9) return 1;
-
   const scale = flatVExtentPx / (shapeWorldH * view.scale);
   return (isFinite(scale) && scale > 0) ? scale : 1;
 }
@@ -372,7 +404,7 @@ function _shapeStandingScale(f, sq, qi, hingeV, depthScale) {
    HORIZON CLIP
    ========================================================================== */
 
-function _clipPolygonToVMax(corners, vMaxLocal) {
+export function _clipPolygonToVMax(corners, vMaxLocal) {
   const out = [];
   const n = corners.length;
   for (let i = 0; i < n; i++) {
@@ -390,20 +422,7 @@ function _clipPolygonToVMax(corners, vMaxLocal) {
 }
 
 /* ==========================================================================
-   CLAMP — v only
-   ========================================================================== */
-
-function clampCloneV(qi, vHat) {
-  const h = horizonLocal(qi);
-  if (!h) return vHat;
-  const vMin = -WEDGE_BASE_REACH;
-  const vMax = h.vHat + WEDGE_BASE_REACH;
-  if (vMax <= vMin) return vMin;
-  return Math.max(vMin, Math.min(vMax, vHat));
-}
-
-/* ==========================================================================
-   SHAPE V-EXTENT
+   V-EXTENT / POSITION / LIFECYCLE HELPERS
    ========================================================================== */
 
 function _vExtentNormFromDims(f, dims, theta) {
@@ -414,7 +433,7 @@ function _vExtentNormFromDims(f, dims, theta) {
   return hwHat * sinT + hhHat * cosT;
 }
 
-function shapeVExtentNorm(sq) {
+export function shapeVExtentNorm(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return 0;
   const f = patchFrame(qi);
@@ -423,99 +442,19 @@ function shapeVExtentNorm(sq) {
   return _vExtentNormFromDims(f, dims, sq.theta || 0);
 }
 
-/* ==========================================================================
-   SHAPE POSITION
-   ========================================================================== */
-
-function setClonePosition(sq, uLocal, vLocal) {
+export function setClonePosition(sq, uLocal, vLocal) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const f = patchFrame(qi);
   if (!f) return;
-
   let uHat = uLocal / f.uLen;
   if (uHat >  U_LIMIT) uHat =  U_LIMIT;
   if (uHat < -U_LIMIT) uHat = -U_LIMIT;
-
   sq.u = uHat;
   sq.v = clampCloneV(qi, vLocal / f.vLen);
 }
 
-/* ==========================================================================
-   LIFECYCLE
-   ========================================================================== */
-
-function addSquareAt(quadIdx, uLocal, vLocal) {
-  if (quadIdx < 0 || quadIdx >= quads.length) return;
-  const q = quads[quadIdx];
-  const f = patchFrame(quadIdx);
-  if (!f) return;
-
-  const uHat = uLocal / f.uLen;
-  const vHat = clampCloneV(quadIdx, vLocal / f.vLen);
-
-  const id = nextSquareId++;
-  floatSquares.push({
-    id: id,
-    name: "S" + id,
-    quadId: q.id,
-    u: uHat, v: vHat,
-    scaleU: SHAPE_DEFAULT_SCALE,
-    scaleV: SHAPE_DEFAULT_SCALE,
-    theta: 0,
-    slope: 0,
-    visualBottom: false,
-  });
-  selectedSquare = floatSquares.length - 1;
-  syncQuadList();
-  draw();
-}
-
-function addSquareAtCenter(quadIdx) { addSquareAt(quadIdx, 0, 0); }
-
-function cloneSquare(idx) {
-  if (idx < 0 || idx >= floatSquares.length) return;
-  const src = floatSquares[idx];
-  if (!src) return;
-
-  const newId = nextSquareId++;
-  floatSquares.push({
-    id:     newId,
-    name:   "S" + newId,
-    quadId: src.quadId,
-    u:      src.u,
-    v:      src.v,
-    scaleU: src.scaleU,
-    scaleV: src.scaleV,
-    theta:  src.theta || 0,
-    slope:  src.slope || 0,
-    visualBottom: !!src.visualBottom,
-  });
-  selectedSquare = floatSquares.length - 1;
-  syncQuadList();
-  draw();
-}
-
-function deleteSquare(idx) {
-  if (idx < 0 || idx >= floatSquares.length) return;
-  floatSquares.splice(idx, 1);
-  if (selectedSquare === idx) selectedSquare = -1;
-  else if (selectedSquare > idx) selectedSquare -= 1;
-  syncQuadList();
-  draw();
-}
-
-function deleteSquaresForQuad(quadId) {
-  for (let i = floatSquares.length - 1; i >= 0; i--) {
-    if (floatSquares[i].quadId === quadId) {
-      floatSquares.splice(i, 1);
-      if (selectedSquare === i) selectedSquare = -1;
-      else if (selectedSquare > i) selectedSquare -= 1;
-    }
-  }
-}
-
-function clampShapeScales(sq) {
+export function clampShapeScales(sq) {
   sq.scaleU = Math.max(SHAPE_MIN_SCALE,
               Math.min(SHAPE_MAX_SCALE, sq.scaleU));
   sq.scaleV = Math.max(SHAPE_MIN_SCALE,
@@ -523,18 +462,13 @@ function clampShapeScales(sq) {
 }
 
 /* ==========================================================================
-   GEOMETRY
+   GEOMETRY — dims, corners, handles
    ========================================================================== */
 
-function squareDims(sq) {
-  return squareDimsWith(sq, SHAPE_DEPTH_FLAT);
-}
+export function squareDims(sq) { return squareDimsWith(sq, SHAPE_DEPTH_FLAT); }
+export function squareDimsCone(sq) { return squareDimsWith(sq, effectiveConeDepth()); }
 
-function squareDimsCone(sq) {
-  return squareDimsWith(sq, effectiveConeDepth());
-}
-
-function squareDimsWith(sq, depthScale) {
+export function squareDimsWith(sq, depthScale) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return { w: 0, h: 0 };
   const q = quads[qi];
@@ -548,15 +482,10 @@ function squareDimsWith(sq, depthScale) {
   };
 }
 
-function squareWorldWidth(sq) {
-  return SHAPE_REL_SIZE * sq.scaleU;
-}
+export function squareWorldWidth(sq)  { return SHAPE_REL_SIZE * sq.scaleU; }
+export function squareWorldHeight(sq) { return SHAPE_REL_SIZE * sq.scaleV; }
 
-function squareWorldHeight(sq) {
-  return SHAPE_REL_SIZE * sq.scaleV;
-}
-
-function squareCenterLocal(sq) {
+export function squareCenterLocal(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const f = patchFrame(qi);
@@ -564,33 +493,23 @@ function squareCenterLocal(sq) {
   return [sq.u * f.uLen, sq.v * f.vLen];
 }
 
-function squareCornersLocal(sq) {
-  return squareCornersLocalWith(sq, SHAPE_DEPTH_FLAT);
-}
+export function squareCornersLocal(sq)     { return squareCornersLocalWith(sq, SHAPE_DEPTH_FLAT); }
+export function squareCornersLocalCone(sq) { return squareCornersLocalWith(sq, effectiveConeDepth()); }
 
-function squareCornersLocalCone(sq) {
-  return squareCornersLocalWith(sq, effectiveConeDepth());
-}
-
-function squareCornersLocalWith(sq, depthScale) {
+export function squareCornersLocalWith(sq, depthScale) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const f = patchFrame(qi);
   if (!f) return null;
-
   const refHW = SHAPE_REL_SIZE / 2 * sq.scaleU;
   const refHH = SHAPE_REL_SIZE / 2 * sq.scaleV * depthScale;
-
   const cosT = Math.cos(sq.theta || 0);
   const sinT = Math.sin(sq.theta || 0);
-
-  const rawCorners = [
+  const raw = [
     [-refHW, +refHH], [+refHW, +refHH], [+refHW, -refHH], [-refHW, -refHH],
   ];
-
   const { Ku, Kv } = _shapeAspectScales(f);
-
-  return rawCorners.map(([du, dv]) => {
+  return raw.map(([du, dv]) => {
     const duR = du * cosT - dv * sinT;
     const dvR = du * sinT + dv * cosT;
     const uHat = sq.u + (duR * Ku) / f.uLen;
@@ -599,14 +518,13 @@ function squareCornersLocalWith(sq, depthScale) {
   });
 }
 
-function squareAnchorCornerLocal(sq, cornerIdx, depthScale) {
+export function squareAnchorCornerLocal(sq, cornerIdx, depthScale) {
   const corners = squareCornersLocalWith(sq, depthScale);
   if (!corners || corners.length < 4) return null;
-  const anchorIdx = (cornerIdx + 2) % 4;
-  return corners[anchorIdx];
+  return corners[(cornerIdx + 2) % 4];
 }
 
-function squareCornersLocalUnrotated(sq) {
+export function squareCornersLocalUnrotated(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const f = patchFrame(qi);
@@ -614,36 +532,27 @@ function squareCornersLocalUnrotated(sq) {
   const uC = sq.u * f.uLen;
   const vC = sq.v * f.vLen;
   const dims = squareDims(sq);
-  const hw = dims.w / 2;
-  const hh = dims.h / 2;
+  const hw = dims.w / 2, hh = dims.h / 2;
   return [
     [uC - hw, vC + hh], [uC + hw, vC + hh],
     [uC + hw, vC - hh], [uC - hw, vC - hh],
   ];
 }
 
-function squareRotateHandleLocal(sq) {
-  return squareRotateHandleLocalWith(sq, SHAPE_DEPTH_FLAT);
-}
+export function squareRotateHandleLocal(sq)     { return squareRotateHandleLocalWith(sq, SHAPE_DEPTH_FLAT); }
+export function squareRotateHandleLocalCone(sq) { return squareRotateHandleLocalWith(sq, effectiveConeDepth()); }
 
-function squareRotateHandleLocalCone(sq) {
-  return squareRotateHandleLocalWith(sq, effectiveConeDepth());
-}
-
-function squareRotateHandleLocalWith(sq, depthScale) {
+export function squareRotateHandleLocalWith(sq, depthScale) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const f = patchFrame(qi);
   if (!f) return null;
-
   const refHH = SHAPE_REL_SIZE / 2 * sq.scaleV * depthScale;
   const k = refHH + ROTATE_HANDLE_OFFSET;
   const cosT = Math.cos(sq.theta || 0);
   const sinT = Math.sin(sq.theta || 0);
-
   const duR = -k * sinT;
   const dvR =  k * cosT;
-
   const { Ku, Kv } = _shapeAspectScales(f);
   const uHat = sq.u + (duR * Ku) / f.uLen;
   const vHat = sq.v + (dvR * Kv) / f.vLen;
@@ -651,10 +560,141 @@ function squareRotateHandleLocalWith(sq, depthScale) {
 }
 
 /* ==========================================================================
+   FLAT CORNERS — from a (u, v) footprint
+   ========================================================================== */
+
+export function squareFlatCorners(sq) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const q = quads[qi];
+  const f = patchFrame(qi);
+  if (!f) return null;
+  const locals = squareCornersLocal(sq);
+  if (!locals) return null;
+  const phiC = (q.phi0 + q.phi1) / 2;
+  const sC   = (q.s0   + q.s1)   / 2;
+  const dPhi = q.phi1 - q.phi0;
+  const dS   = q.s1   - q.s0;
+  return locals.map(([u, v]) => [
+    phiC + (u / f.uLen) * dPhi,
+    sC   + (v / f.vLen) * dS,
+  ]);
+}
+
+export function squareFlatCenter(sq) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const q = quads[qi];
+  const f = patchFrame(qi);
+  if (!f) return null;
+  const phiC = (q.phi0 + q.phi1) / 2;
+  const sC   = (q.s0   + q.s1)   / 2;
+  const dPhi = q.phi1 - q.phi0;
+  const dS   = q.s1   - q.s0;
+  return {
+    phi: phiC + sq.u * dPhi,
+    s:   sC   + sq.v * dS,
+  };
+}
+
+export function setSquareFlatCenter(sq, targetPhi, targetS) {
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return;
+  const q = quads[qi];
+  const f = patchFrame(qi);
+  if (!f) return;
+  const phiC = (q.phi0 + q.phi1) / 2;
+  const sC   = (q.s0   + q.s1)   / 2;
+  const dPhi = q.phi1 - q.phi0;
+  const dS   = q.s1   - q.s0;
+  if (Math.abs(dPhi) < 1e-9 || Math.abs(dS) < 1e-9) return;
+
+  const curPhi = phiC + sq.u * dPhi;
+  let deltaPhi = targetPhi - curPhi;
+  while (deltaPhi >  Math.PI) deltaPhi -= 2 * Math.PI;
+  while (deltaPhi < -Math.PI) deltaPhi += 2 * Math.PI;
+  const newPhi = curPhi + deltaPhi;
+  const newU = (newPhi - phiC) / dPhi;
+  const newV = (targetS - sC) / dS;
+  setClonePosition(sq, newU * f.uLen, newV * f.vLen);
+}
+
+/* ==========================================================================
+   PATCH DRAG MUTATORS
+   ========================================================================== */
+
+export function applyPatchDragFromStart(q, dp, curPhi, curS, constrain) {
+  let rawPhi = curPhi - dp.startPhi;
+  while (rawPhi >  Math.PI) rawPhi -= 2 * Math.PI;
+  while (rawPhi < -Math.PI) rawPhi += 2 * Math.PI;
+  const rawS = curS - dp.startS;
+
+  let dPhi = rawPhi;
+  const dS = rawS;
+  if (constrain) dPhi = 0;
+
+  q.phi0 = dp.startPhi0 + dPhi;
+  q.phi1 = dp.startPhi1 + dPhi;
+
+  let ns0 = dp.startS0 + dS;
+  let ns1 = dp.startS1 + dS;
+  if (ns0 < FLAT_S_MIN) { ns1 += FLAT_S_MIN - ns0; ns0 = FLAT_S_MIN; }
+  if (ns1 > FLAT_S_MAX) { ns0 -= ns1 - FLAT_S_MAX; ns1 = FLAT_S_MAX; }
+  if (ns0 < FLAT_S_MIN) ns0 = FLAT_S_MIN;
+  q.s0 = ns0;
+  q.s1 = ns1;
+
+  _reclampShapesOnPatch(q);
+}
+
+export function flatMoveCorner(q, cornerIdx, phi, s) {
+  if (cornerIdx === 0) {
+    q.phi0 = Math.max(0, Math.min(phi, q.phi1 - QUAD_MIN_SIZE_PHI));
+    q.s1   = Math.min(1, Math.max(s, q.s0 + QUAD_MIN_SIZE_S));
+  } else if (cornerIdx === 1) {
+    q.phi1 = Math.min(2 * Math.PI, Math.max(phi, q.phi0 + QUAD_MIN_SIZE_PHI));
+    q.s1   = Math.min(1, Math.max(s, q.s0 + QUAD_MIN_SIZE_S));
+  } else if (cornerIdx === 2) {
+    q.phi1 = Math.min(2 * Math.PI, Math.max(phi, q.phi0 + QUAD_MIN_SIZE_PHI));
+    q.s0   = Math.max(0, Math.min(s, q.s1 - QUAD_MIN_SIZE_S));
+  } else if (cornerIdx === 3) {
+    q.phi0 = Math.max(0, Math.min(phi, q.phi1 - QUAD_MIN_SIZE_PHI));
+    q.s0   = Math.max(0, Math.min(s, q.s1 - QUAD_MIN_SIZE_S));
+  }
+  _reclampShapesOnPatch(q);
+}
+
+export function flatMoveEdge(q, edge, phi, s) {
+  if (edge === "top") {
+    q.s1 = Math.min(1, Math.max(s, q.s0 + QUAD_MIN_SIZE_S));
+  } else if (edge === "bottom") {
+    q.s0 = Math.max(0, Math.min(s, q.s1 - QUAD_MIN_SIZE_S));
+  } else if (edge === "left") {
+    q.phi0 = Math.max(0, Math.min(phi, q.phi1 - QUAD_MIN_SIZE_PHI));
+  } else if (edge === "right") {
+    q.phi1 = Math.min(2 * Math.PI, Math.max(phi, q.phi0 + QUAD_MIN_SIZE_PHI));
+  }
+  _reclampShapesOnPatch(q);
+}
+
+export function flatMoveBody(q, dPhi, dS) {
+  q.phi0 += dPhi;
+  q.phi1 += dPhi;
+
+  let ns0 = q.s0 + dS, ns1 = q.s1 + dS;
+  if (ns0 < 0) { ns1 += 0 - ns0; ns0 = 0; }
+  if (ns1 > 1) { ns0 -= ns1 - 1; ns1 = 1; }
+  if (ns0 < 0) ns0 = 0;
+  q.s0 = ns0; q.s1 = ns1;
+
+  _reclampShapesOnPatch(q);
+}
+
+/* ==========================================================================
    SHARED HIT-TEST HELPERS
    ========================================================================== */
 
-function _ptInQuadPx(px, py, poly) {
+export function _ptInQuadPx(px, py, poly) {
   let inside = false;
   const n = poly.length;
   for (let i = 0, j = n - 1; i < n; j = i++) {
@@ -668,7 +708,7 @@ function _ptInQuadPx(px, py, poly) {
   return inside;
 }
 
-function squareDisplayName(sq) {
+export function squareDisplayName(sq) {
   return (sq && sq.name) ? sq.name : ("S" + (sq ? sq.id : "?"));
 }
 """

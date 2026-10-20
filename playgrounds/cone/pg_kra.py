@@ -1,170 +1,67 @@
 """
-pg_kra.py — panel-side glue for the "Generate .kra" button.
+pg_kra.py — client-side glue for the "Generate .kra" button.
 
-Five export modes:
+ES module.  Builds the payload for one of five export modes and POSTs
+it to `/generate-kra`.  The server side (`cone_kra.py`) is unchanged —
+only the client glue moves into ES-module form.
 
-    text_warp_mode = "square"  (default)
-        One group + one mask per square.
+Export modes (chosen by the `kraTextWarp` select):
 
-    text_warp_mode = "patch"
-        One group + one mask per PATCH.  All texts on the patch
-        share the patch's mask.
+    square       one group + one mask per square (default)
+    patch        one group + one mask per patch
+    text         one group + one mask per text
+    text-shear   no masks, one vector layer per text (affine)
+    patch-shear  no masks, one group per patch (affine per text)
 
-    text_warp_mode = "text"
-        One group + one mask per TEXT.  Each text's mask is a copy
-        of the SQUARE'S own mask.
+SPLIT ENTRY POINT
+=================
+`generateKraFromScene()` prompts via `window.prompt` for the path,
+then delegates to `generateKraToPath(path)`.  A remote client that
+has already gathered the path on the other end of the WebSocket
+calls `action.generateKra` with `output_path` in its payload; the
+action's `run` handler calls `generateKraToPath` directly — no
+`window.prompt` involved.
 
-    text_warp_mode = "text-shear"
-        No masks.  One direct vector layer per text, carrying a full
-        affine transform computed to reproduce the mask-mode result.
-
-    text_warp_mode = "patch-shear"
-        No masks.  One group per patch (no mask on the group); each
-        text on the patch is a direct vector layer inside the group,
-        each with its own affine transform.
-
-POSITION-AWARE ALIGNMENT
-========================
-The text's visual anchor is computed in the flat square's frame by
-_flatAnchorFromVisual, which returns the CENTER of the text's visual
-box for the requested position.  The alignment sent to the daemon is
-chosen from that same requested position — a top-right anchor uses
-right alignment, a top-left anchor uses left, a top or center anchor
-uses center — so that editing a label later grows it away from the
-side it is attached to, rather than half in each direction from its
-center.  _anchorForPosition shifts the anchor along the reading
-direction by the amount appropriate to that alignment.
-
-TEXT BOTTOM — TWO MODES
-=======================
-The "reading direction" of a shape — which edge of the drawn
-polygon is read as the shape's BOTTOM — has two sources, selected
-per square by the `visualBottom` flag (a per-square boolean set
-from the panel's "Visual bot." checkbox; see pg_panel.py):
-
-    sq.visualBottom falsy (the default, and every pre-existing
-    scene)
-
-        The bottom is the shape's own LONGEST edge in screen space.
-        The reading angle is that edge's direction, normalized to
-        bx >= 0.  This is what produced the historical behaviour:
-        the label always ran along the long side of the shape, and
-        the "bottom-left / bottom-right" anchor positions sat at
-        the ends of the long edge.
-
-    sq.visualBottom truthy
-
-        The bottom is the visual bottom of the SCENE: the edge of
-        the drawn polygon whose midpoint sits lowest on screen
-        (largest screen y).  The reading angle runs along that
-        edge, from its left endpoint to its right endpoint, so bx
-        >= 0.  The label therefore reads left-to-right along the
-        edge the viewer sees at the bottom of the shape, and the
-        corner senses (which corner is "top-left", etc.) follow
-        that edge rather than the shape's own geometry.
-
-The choice matters most for tall, narrow shapes hinged so that the
-longest edge is not the bottom edge, and for shapes rotated past
-45°: with `visualBottom` off, the label stands on the long side; with
-it on, the label lies flat along the visually-lowest side.
-
-Everything downstream of the reading angle follows automatically:
-
-    _shapeLabelScreenAngleDeg  picks the edge (longest, or visual
-                               bottom) and returns its angle in
-                               degrees.
-    _shapeLabelFlatRotationDeg picks the axis-aligned flat rotation
-                               (0/90/180/270) whose projected
-                               appearance best matches that angle.
-    _flatAnchorFromVisual      classifies the four visual corners
-                               in the reading frame and places the
-                               anchor at the requested position.
-
-There is nothing else to switch: the mode is read once, in
-_shapeLabelScreenAngleDeg, from the square object itself.
-
-AFFINE DECOMPOSITION IN THE SHEAR MODES
-=======================================
-The local warp of a square at a given flat point is a 2x2 linear
-map J.  Composed with the text's own flat rotation R, the total
-warp is M = J · R.  Any invertible 2x2 M can be written uniquely as
-
-    M = R(θ) · Shx(k) · S(sx, sy)
-
-where R is rotation, Shx is horizontal shear, and S is diagonal
-scale.  The shear modes decompose M into these primitives, then
-normalize so that the larger of |sx|, |sy| is 1.  The text is then
-drawn at font_px = fontNat and warped by the normalized M.  The
-on-screen result fits in a fontNat × fontNat bounding box: the
-longer on-screen dimension reaches fontNat, the shorter is
-proportionally smaller.  This is what keeps text from overflowing
-its square when the local Jacobian is anisotropic — the compressed
-dimension grows only as much as the stretched dimension allows, and
-nothing is left to spill past the square's own edges.
-
-INLINE-WRAPPED TEXT
-===================
-Every text this module emits is now sized for Krita's SVG 2
-"inline wrapped" text mode.  cone_kra.py turns that sizing into an
-`inline_size` argument on the `add_vector_text` command, and the
-daemon builds the SVG accordingly.
-
-For the inline-size handles to land on the square's own edges, the
-payload must carry the square's true width alongside the anchor.
-Each of the three per-text payload builders in this file therefore
-now emits a `src_w` field:
-
-    _buildOnePatchKraPatch  ->  src_w = W_sq
-    _kraShearTextEntry      ->  src_w = W_sq
-    _shearTextForSquare     ->  src_w = W_sq
-
-`W_sq` is the square's own width in its local frame, computed in
-each builder from the projected corner edge lengths.  cone_kra.py
-folds the anchor's offset inside the square into this width, so
-the wrapping area ends exactly at the square's far edge regardless
-of where in the square the anchor sits.
-
-The per-square `square` mode already carries the square's natural
-width as `natural_w` on each shape entry, so it does not need a
-new field; cone_kra.py takes it from there.
+The remote path is why `generateKraToPath` must be its own export:
+`pg_panel_bindings._generateKraAction` calls it by name.  In an
+earlier revision the whole flow was one function and the binding
+failed at module-link time.  See `pg_panel_bindings.py`'s
+`action.generateKra` registration.
 
 MIRROR
 ======
-Every mode that has a per-square pass (square, text, text-shear)
-runs that pass through `_withSquareMirror` for a second invocation
-when the patch's `mirror` flag is on, exactly the way the on-screen
-renderer does.  The mirror call sees the square in its mirrored
-state (θ, slope, and u negated, patch φ shifted), so the exported
-mirror entry lands where the on-screen mirror lands.
-
-The two per-patch modes (patch, patch-shear) emit a full mirror
-group as well:
-
-    - patch-shear: extracts the per-square work into
-      `_shearTextForSquare`, then calls it once as-is and once with
-      the patch's φ shifted and the square's state flipped, pushing
-      the results into a `<patch>_mirror` group.
-
-    - patch: extracts the whole per-patch body into
-      `_buildOnePatchKraPatch`, and does the same double call,
-      naming the second patch `<patch>_mirror`.
+When a patch's `mirror` flag is on, every mode that emits the mirror
+calls `_withSquareMirror` (or the patch equivalent) so the mirror
+copy uses the same on-screen geometry the renderer draws.
 
 LAYER-NAME COLLISIONS
 =====================
 Every mirror entry appends a `_mirror` suffix to the LAYER name so
 Krita's name-based lookup cannot confuse the mirror with the
 original.  The text CONTENT stays the same — the square's plain
-label — because that is what the user set.  This is why every text
-item carries both a `name` (the layer identifier, possibly
-suffixed) and a `label` (the text to render).
-
-Do NOT use squareFlatCorners here — that returns the unfolded-cone
-footprint, which loses the perspective.
+label.
 """
 
 KRA_JS = r"""
+import {
+  quads, floatSquares, cone, view, layout,
+  quadIdxById, w2s, surfacePoint,
+} from "./pg_state.js";
+import {
+  patchFrame,
+  squareCornersLocalCone,
+  effectiveConeDepth, _shapeStandingScale,
+  shapePerspCentre, shapeVMax, _patchNormalPhi,
+  patchHue, _huergb, _huergbLight,
+  squareDisplayName, _withSquareMirror,
+} from "./pg_view_squares_core.js";
+import {
+  squareCornersScreen, projectShapePoint,
+} from "./pg_view_squares_proj.js";
+import { flashStatus } from "./pgkit/panel_core.js";
+
 /* ==========================================================================
-   .KRA EXPORT
+   HELPERS
    ========================================================================== */
 
 function _hueToHex(h) {
@@ -179,28 +76,6 @@ function _hueToHexLight(h) {
   return "#" + to2(mix(h.r)) + to2(mix(h.g)) + to2(mix(h.b));
 }
 
-function _polygonCentroid(pts) {
-  let cx = 0, cy = 0;
-  for (const [x, y] of pts) { cx += x; cy += y; }
-  return [cx / pts.length, cy / pts.length];
-}
-
-function _polygonArea(pts) {
-  let area = 0;
-  const n = pts.length;
-  for (let i = 0; i < n; i++) {
-    const a = pts[i];
-    const b = pts[(i + 1) % n];
-    area += a[0] * b[1] - b[0] * a[1];
-  }
-  return Math.abs(area) / 2;
-}
-
-/* Unclipped projection of the shape's corners, with the hinge
-   applied using the same standing scale as the on-screen renderer.
-   The hinge is the minimum local v of the four corners; the standing
-   scale is _shapeStandingScale, so the KRA export sees exactly the
-   hinged shape the renderer draws. */
 function _unclippedProjectedCorners(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
@@ -215,10 +90,6 @@ function _unclippedProjectedCorners(sq) {
   const phiC = _patchNormalPhi(qi);
   const slope = sq.slope || 0;
 
-  /* Hinge v: minimum local v of the four unclipped corners.
-     Matches the hinge used by squareCornersScreen and the other
-     projection callers, so the KRA export sees exactly the hinged
-     shape the on-screen renderer draws. */
   let hingeV = Infinity;
   for (const [u, v] of local) {
     if (v < hingeV) hingeV = v;
@@ -234,22 +105,7 @@ function _unclippedProjectedCorners(sq) {
 
 /* ==========================================================================
    READING DIRECTION — TWO SOURCES
-   ==========================================================================
-   The label's baseline runs along whichever edge of the drawn polygon
-   is read as the shape's "bottom".  Two candidate edges exist, and
-   the per-square `visualBottom` flag picks between them:
-
-     visualBottom falsy  — the shape's own LONGEST edge in screen
-                           space (_longestEdgeDir).  This is the
-                           historical behaviour and the default.
-
-     visualBottom truthy — the VISUAL BOTTOM of the scene: the edge
-                           whose midpoint sits lowest on screen
-                           (_bottomEdgeDir).
-
-   Both helpers return a unit vector pointing along the chosen edge
-   with bx >= 0, so the reading angle lies in [-90°, +90°].  See the
-   module docstring, TEXT BOTTOM — TWO MODES. */
+   ========================================================================== */
 
 function _longestEdgeDir(pts) {
   let bestLen = 0, bx = 0, by = 0;
@@ -270,13 +126,6 @@ function _longestEdgeDir(pts) {
   return [bx, by];
 }
 
-/* Direction of the shape's bottom edge as it appears on screen: the
-   edge whose midpoint has the largest y, i.e. sits lowest on screen
-   (screen y grows downward).  Returned as a unit vector from the
-   edge's left endpoint to its right endpoint, so bx >= 0.  Works on
-   any polygon — the shape is fed in its clipped form, so a shape
-   that overhangs the horizon is judged on its drawn bottom edge,
-   not on the invisible part beyond the clip. */
 function _bottomEdgeDir(screenPts) {
   if (!screenPts || screenPts.length < 3) return null;
   const n = screenPts.length;
@@ -304,52 +153,38 @@ function _bottomEdgeDir(screenPts) {
 
 function _shapeLabelScreenAngleDeg(sq, screenPts) {
   if (!screenPts || screenPts.length < 3) return 0;
-
-  /* Per-square mode selector.  Undefined / false keeps the
-     historical longest-edge behaviour; true switches to the visual
-     bottom of the scene.  See the module docstring, TEXT BOTTOM —
-     TWO MODES. */
   const useVisualBottom = !!(sq && sq.visualBottom);
   const baseDir = useVisualBottom
     ? _bottomEdgeDir(screenPts)
     : _longestEdgeDir(screenPts);
   if (!baseDir) return 0;
-
   let bx = baseDir[0];
   let by = baseDir[1];
   if (bx < 0) { bx = -bx; by = -by; }
-
   return Math.atan2(by, bx) * 180 / Math.PI;
 }
 
 function _shapeLabelFlatRotationDeg(sq, screenPts) {
   if (!screenPts || screenPts.length < 4) return 0;
-
   const ux = screenPts[1][0] - screenPts[0][0];
   const uy = screenPts[1][1] - screenPts[0][1];
-
   const vx = screenPts[3][0] - screenPts[0][0];
   const vy = screenPts[3][1] - screenPts[0][1];
-
   const angleU = Math.atan2(uy, ux) * 180 / Math.PI;
   const angleV = Math.atan2(vy, vx) * 180 / Math.PI;
-
   const target = _shapeLabelScreenAngleDeg(sq, screenPts);
-
   const candidates = [
     { r:   0, projected: angleU },
     { r:  90, projected: angleV },
     { r: 180, projected: angleU + 180 },
     { r: 270, projected: angleV + 180 },
   ];
-
   const angDiff = (a, b) => {
     let d = a - b;
     while (d >  180) d -= 360;
     while (d < -180) d += 360;
     return Math.abs(d);
   };
-
   let best = candidates[0];
   let bestD = angDiff(candidates[0].projected, target);
   for (let i = 1; i < candidates.length; i++) {
@@ -365,33 +200,22 @@ function _classifyCornersInReadingFrame(visualPts, readingAngleDeg) {
   const by = Math.sin(rad);
   const dx = -by;
   const dy = bx;
-
   const coords = [];
   for (let i = 0; i < 4; i++) {
     const px = visualPts[i][0];
     const py = visualPts[i][1];
-    coords.push({
-      X: px * bx + py * by,
-      Y: px * dx + py * dy,
-    });
+    coords.push({ X: px * bx + py * by, Y: px * dx + py * dy });
   }
-
   let tlI = 0, trI = 0, brI = 0, blI = 0;
   let bestTL = Infinity, bestTR = -Infinity;
   let bestBR = -Infinity, bestBL = Infinity;
   for (let i = 0; i < 4; i++) {
     const X = coords[i].X, Y = coords[i].Y;
-    const sTL = X + Y;
-    const sTR = X - Y;
-    const sBR = X + Y;
-    const sBL = X - Y;
-
-    if (sTL < bestTL) { bestTL = sTL; tlI = i; }
-    if (sTR > bestTR) { bestTR = sTR; trI = i; }
-    if (sBR > bestBR) { bestBR = sBR; brI = i; }
-    if (sBL < bestBL) { bestBL = sBL; blI = i; }
+    if (X + Y < bestTL) { bestTL = X + Y; tlI = i; }
+    if (X - Y > bestTR) { bestTR = X - Y; trI = i; }
+    if (X + Y > bestBR) { bestBR = X + Y; brI = i; }
+    if (X - Y < bestBL) { bestBL = X - Y; blI = i; }
   }
-
   return { tl: tlI, tr: trI, br: brI, bl: blI };
 }
 
@@ -402,9 +226,7 @@ function _flatAnchorFromVisual(visualPts, W, H, position,
       !visualPts || visualPts.length < 4) {
     return { x: W / 2, y: H / 2 };
   }
-
   const pad = padFrac * Math.min(W, H);
-
   const textPixelLen = textLen * fontSize * 0.55;
   const textPixelH = fontSize;
   let textHalfW, textHalfH;
@@ -415,9 +237,7 @@ function _flatAnchorFromVisual(visualPts, W, H, position,
     textHalfW = textPixelLen / 2;
     textHalfH = textPixelH / 2;
   }
-
   const roles = _classifyCornersInReadingFrame(visualPts, readingAngleDeg);
-
   const flatCorners = [[0, 0], [W, 0], [W, H], [0, H]];
 
   function anchorForCorner(idx) {
@@ -430,219 +250,65 @@ function _flatAnchorFromVisual(visualPts, W, H, position,
       y: fy + dirY * (pad + textHalfH),
     };
   }
-
   const aTL = anchorForCorner(roles.tl);
   const aTR = anchorForCorner(roles.tr);
   const aBR = anchorForCorner(roles.br);
   const aBL = anchorForCorner(roles.bl);
-
   if (position === "tl") return aTL;
   if (position === "tr") return aTR;
   if (position === "br") return aBR;
   if (position === "bl") return aBL;
-  if (position === "top") {
-    return { x: (aTL.x + aTR.x) / 2, y: (aTL.y + aTR.y) / 2 };
-  }
-  if (position === "bottom") {
-    return { x: (aBL.x + aBR.x) / 2, y: (aBL.y + aBR.y) / 2 };
-  }
-  if (position === "left") {
-    return { x: (aTL.x + aBL.x) / 2, y: (aTL.y + aBL.y) / 2 };
-  }
-  if (position === "right") {
-    return { x: (aTR.x + aBR.x) / 2, y: (aTR.y + aBR.y) / 2 };
-  }
+  if (position === "top")    return { x: (aTL.x + aTR.x) / 2, y: (aTL.y + aTR.y) / 2 };
+  if (position === "bottom") return { x: (aBL.x + aBR.x) / 2, y: (aBL.y + aBR.y) / 2 };
+  if (position === "left")   return { x: (aTL.x + aBL.x) / 2, y: (aTL.y + aBL.y) / 2 };
+  if (position === "right")  return { x: (aTR.x + aBR.x) / 2, y: (aTR.y + aBR.y) / 2 };
   return { x: W / 2, y: H / 2 };
 }
 
-/* ==========================================================================
-   POSITION-AWARE ALIGNMENT
-   ==========================================================================
-   _flatAnchorFromVisual returns the anchor of the text's visual CENTER
-   for the requested position.  The alignment the daemon writes then
-   determines where, along the reading direction, that anchor sits
-   relative to the text's visual box:
-
-       left    anchor at the box's -half-length end (start)
-       center  anchor at the box's middle
-       right   anchor at the box's +half-length end
-
-   So the visual box keeps the same center regardless of alignment,
-   and the anchor shifts along the reading direction by:
-
-       left    -halfLen * (cos R, sin R)
-       center   0
-       right   +halfLen * (cos R, sin R)
-
-   The alignment is chosen from the requested visual position: a text
-   anchored at a right-hand corner or edge uses right alignment; at a
-   left-hand corner or edge uses left; at the top, bottom, or center
-   uses center. */
-
 function _alignmentForPosition(position) {
-    if (position === "tr" || position === "br" || position === "right") {
-        return "right";
-    }
-    if (position === "top" || position === "bottom" || position === "center") {
-        return "center";
-    }
-    return "left";
+  if (position === "tr" || position === "br" || position === "right") return "right";
+  if (position === "top" || position === "bottom" || position === "center") return "center";
+  return "left";
 }
 
-function _anchorForPosition(anchorCenter, flatRotation, textLen, fontSize,
-                            position) {
-    const alignment = _alignmentForPosition(position);
-    const rad = flatRotation * Math.PI / 180;
-    const halfLen = (textLen * fontSize * 0.55) / 2;
-
-    let dx = 0, dy = 0;
-    if (alignment === "left") {
-        dx = -halfLen * Math.cos(rad);
-        dy = -halfLen * Math.sin(rad);
-    } else if (alignment === "right") {
-        dx = halfLen * Math.cos(rad);
-        dy = halfLen * Math.sin(rad);
-    }
-
-    return {
-        x: anchorCenter.x + dx,
-        y: anchorCenter.y + dy,
-        alignment: alignment,
-    };
+function _anchorForPosition(anchorCenter, flatRotation, textLen, fontSize, position) {
+  const alignment = _alignmentForPosition(position);
+  const rad = flatRotation * Math.PI / 180;
+  const halfLen = (textLen * fontSize * 0.55) / 2;
+  let dx = 0, dy = 0;
+  if (alignment === "left") {
+    dx = -halfLen * Math.cos(rad);
+    dy = -halfLen * Math.sin(rad);
+  } else if (alignment === "right") {
+    dx = halfLen * Math.cos(rad);
+    dy = halfLen * Math.sin(rad);
+  }
+  return {
+    x: anchorCenter.x + dx,
+    y: anchorCenter.y + dy,
+    alignment: alignment,
+  };
 }
 
 /* ==========================================================================
    AFFINE DECOMPOSITION
-   ==========================================================================
-   Any invertible 2x2 matrix M can be written uniquely as
-
-       M = R(theta) * Shx(k) * S(sx, sy)
-
-   where R is a rotation, Shx is a horizontal shear (x gains k*y per
-   unit y), and S is a diagonal scale.  Solving the components gives:
-
-       sx        = sqrt(M00^2 + M10^2)
-       sy        = det(M) / sx
-       theta_rad = atan2(M10, M00)
-       k         = (M01*M00 + M11*M10) / det(M)
-
-   where M is given in column-vector form:
-
-       M = [[M00, M01],
-            [M10, M11]]
-
-   Returns null for a degenerate matrix (|det| or |sx| too small). */
+   ========================================================================== */
 
 function _decomposeAffineLocal(M00, M01, M10, M11) {
   const det = M00 * M11 - M01 * M10;
   const sxRaw = Math.sqrt(M00 * M00 + M10 * M10);
   if (sxRaw < 1e-9 || Math.abs(det) < 1e-9) return null;
-
   const syRaw = det / sxRaw;
   const rotationRad = Math.atan2(M10, M00);
   const shear = (M01 * M00 + M11 * M10) / det;
-
   return {
     rotation_rad: rotationRad,
     rotation_deg: rotationRad * 180 / Math.PI,
-    shear: shear,
+    shear,
     scale_x: sxRaw,
     scale_y: syRaw,
-    det: det,
+    det,
   };
-}
-
-/* ==========================================================================
-   SQUARE MODE
-   ==========================================================================
-   Same structure as before, but each entry now also carries a
-   `label` — the plain text to write into the vector shape — so the
-   layer name (`name`) and the text content can differ.  The mirror
-   pass uses `name + "_mirror"` for the layer and the original
-   `label` for the text. */
-
-function _kraShapeEntry(sq, options, nameSuffix) {
-  const textPos   = options.text_position || "center";
-  const padFrac   = (typeof options.text_padding === "number")
-                      ? options.text_padding : 0.06;
-  const colorMode = options.text_color_mode || "color";
-
-  const qi = quadIdxById(sq.quadId);
-  if (qi < 0) return null;
-  const q = quads[qi];
-  if (!q) return null;
-
-  const corners = _unclippedProjectedCorners(sq);
-  if (!corners || corners.length < 4) return null;
-
-  const lens = (function () {
-    const n = corners.length;
-    const s = [];
-    for (let k = 0; k < n; k++) {
-      const a = corners[k];
-      const b = corners[(k + 1) % n];
-      s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
-    }
-    return s;
-  })();
-  const W = (lens[0] + lens[2]) / 2;
-  const H = (lens[1] + lens[3]) / 2;
-  if (W <= 0.5 || H <= 0.5) return null;
-
-  const hue = patchHue(q);
-  const hex = _hueToHex(hue);
-  const hexLight = _hueToHexLight(hue);
-
-  const textColor = (colorMode === "black") ? "#000000" : hexLight;
-
-  const screenCorners = squareCornersScreen(sq) || corners;
-  const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
-  const readingAngle  = _shapeLabelScreenAngleDeg(sq, screenCorners);
-
-  const label     = squareDisplayName(sq);
-  const layerName = label + (nameSuffix || "");
-  const fontNat   = Math.min(W, H) * 0.40;
-
-  const anchorCenter = _flatAnchorFromVisual(
-    screenCorners, W, H, textPos, padFrac, fontNat, label.length,
-    readingAngle, flatRotation
-  );
-  const anchor = _anchorForPosition(
-    anchorCenter, flatRotation, label.length, fontNat, textPos
-  );
-
-  return {
-    name:            layerName,
-    label:           label,
-    points:          corners.map(([x, y]) => [x, y]),
-    natural_w:       W,
-    natural_h:       H,
-    flat_rotation:   flatRotation,
-    text_anchor:     anchor,
-    fill:            hex,
-    fill_opacity:    0.40,
-    stroke:          hex,
-    stroke_width:    2.0,
-    stroke_opacity:  1.0,
-    text_color:      textColor,
-  };
-}
-
-function buildKraShapes(options) {
-  options = options || {};
-  const shapes = [];
-  for (let i = 0; i < floatSquares.length; i++) {
-    const sq = floatSquares[i];
-
-    const e1 = _kraShapeEntry(sq, options, "");
-    if (e1) shapes.push(e1);
-
-    _withSquareMirror(sq, () => {
-      const e2 = _kraShapeEntry(sq, options, "_mirror");
-      if (e2) shapes.push(e2);
-    });
-  }
-  return shapes;
 }
 
 /* ==========================================================================
@@ -738,51 +404,534 @@ function _invert2x2(J) {
   };
 }
 
-function _squareCornersInPatchUV(sq) {
-  const refHW = SHAPE_REL_SIZE / 2 * sq.scaleU;
-  const refHH = SHAPE_REL_SIZE / 2 * sq.scaleV;
-  const cosT  = Math.cos(sq.theta || 0);
-  const sinT  = Math.sin(sq.theta || 0);
-  const raw = [
-    [-refHW, +refHH],
-    [+refHW, +refHH],
-    [+refHW, -refHH],
-    [-refHW, -refHH],
-  ];
-  return raw.map(([du, dv]) => {
-    const duR = du * cosT - dv * sinT;
-    const dvR = du * sinT + dv * cosT;
-    return {
-      u: sq.u + duR / SHAPE_U_REF,
-      v: sq.v + dvR / SHAPE_V_REF,
-    };
-  });
-}
+/* ==========================================================================
+   SQUARE MODE
+   ========================================================================== */
 
-function _bilinearInterpQuad(corners, u, v) {
-  const TL = corners[0], TR = corners[1], BR = corners[2], BL = corners[3];
-  const w00 = (1 - u) * (1 - v);
-  const w10 = u * (1 - v);
-  const w11 = u * v;
-  const w01 = (1 - u) * v;
+function _kraShapeEntry(sq, options, nameSuffix) {
+  const textPos   = options.text_position || "center";
+  const padFrac   = (typeof options.text_padding === "number")
+                      ? options.text_padding : 0.06;
+  const colorMode = options.text_color_mode || "color";
+
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const q = quads[qi];
+  if (!q) return null;
+
+  const corners = _unclippedProjectedCorners(sq);
+  if (!corners || corners.length < 4) return null;
+
+  const lens = (function () {
+    const n = corners.length;
+    const s = [];
+    for (let k = 0; k < n; k++) {
+      const a = corners[k];
+      const b = corners[(k + 1) % n];
+      s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
+    }
+    return s;
+  })();
+  const W = (lens[0] + lens[2]) / 2;
+  const H = (lens[1] + lens[3]) / 2;
+  if (W <= 0.5 || H <= 0.5) return null;
+
+  const hue = patchHue(q);
+  const hex = _hueToHex(hue);
+  const hexLight = _hueToHexLight(hue);
+  const textColor = (colorMode === "black") ? "#000000" : hexLight;
+
+  const screenCorners = squareCornersScreen(sq) || corners;
+  const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
+  const readingAngle  = _shapeLabelScreenAngleDeg(sq, screenCorners);
+
+  const label     = squareDisplayName(sq);
+  const layerName = label + (nameSuffix || "");
+  const fontNat   = Math.min(W, H) * 0.40;
+
+  const anchorCenter = _flatAnchorFromVisual(
+    screenCorners, W, H, textPos, padFrac, fontNat, label.length,
+    readingAngle, flatRotation
+  );
+  const anchor = _anchorForPosition(
+    anchorCenter, flatRotation, label.length, fontNat, textPos
+  );
+
   return {
-    u: w00 * TL.u + w10 * TR.u + w11 * BR.u + w01 * BL.u,
-    v: w00 * TL.v + w10 * TR.v + w11 * BR.v + w01 * BL.v,
+    name:            layerName,
+    label:           label,
+    points:          corners.map(([x, y]) => [x, y]),
+    natural_w:       W,
+    natural_h:       H,
+    flat_rotation:   flatRotation,
+    text_anchor:     anchor,
+    fill:            hex,
+    fill_opacity:    0.40,
+    stroke:          hex,
+    stroke_width:    2.0,
+    stroke_opacity:  1.0,
+    text_color:      textColor,
   };
 }
 
+function buildKraShapes(options) {
+  options = options || {};
+  const shapes = [];
+  for (let i = 0; i < floatSquares.length; i++) {
+    const sq = floatSquares[i];
+    const e1 = _kraShapeEntry(sq, options, "");
+    if (e1) shapes.push(e1);
+    _withSquareMirror(sq, () => {
+      const e2 = _kraShapeEntry(sq, options, "_mirror");
+      if (e2) shapes.push(e2);
+    });
+  }
+  return shapes;
+}
+
 /* ==========================================================================
-   PATCH MODE — one group + one mask per patch
-   ==========================================================================
-   The per-patch body is extracted into _buildOnePatchKraPatch so it
-   can be called twice: once on the patch as stored, and once with
-   the patch's φ shifted and each square flipped to emit the mirror
-   group.  The mirror group's name carries a `_mirror` suffix so
-   Krita's name lookup cannot collide the two. */
+   TEXT MODE
+   ========================================================================== */
+
+function _kraTextEntry(sq, options, nameSuffix) {
+  const colorMode = options.text_color_mode || "color";
+  const textPos   = options.text_position || "center";
+  const padFrac   = (typeof options.text_padding === "number")
+                      ? options.text_padding : 0.06;
+  const drawRects = options.draw_rectangles !== false;
+
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const q = quads[qi];
+  if (!q) return null;
+
+  const unclipped = _unclippedProjectedCorners(sq);
+  if (!unclipped || unclipped.length < 4) return null;
+  const screenCorners = squareCornersScreen(sq) || unclipped;
+
+  const lens = (function () {
+    const n = unclipped.length;
+    const s = [];
+    for (let k = 0; k < n; k++) {
+      const a = unclipped[k];
+      const b = unclipped[(k + 1) % n];
+      s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
+    }
+    return s;
+  })();
+  const W_sq = (lens[0] + lens[2]) / 2;
+  const H_sq = (lens[1] + lens[3]) / 2;
+  if (W_sq <= 0.5 || H_sq <= 0.5) return null;
+
+  const hue = patchHue(q);
+  const hex = _hueToHex(hue);
+  const hexLight = _hueToHexLight(hue);
+  const textColor = (colorMode === "black") ? "#000000" : hexLight;
+
+  const label     = squareDisplayName(sq);
+  const layerName = label + (nameSuffix || "");
+
+  let rect = null;
+  if (drawRects) {
+    rect = {
+      name: layerName,
+      points: screenCorners.map(([x, y]) => [x, y]),
+      fill: hex, fill_opacity: 0.40,
+      stroke: hex, stroke_width: 2.0, stroke_opacity: 1.0,
+    };
+  }
+
+  const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
+  const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
+  const fontNat = Math.min(W_sq, H_sq) * 0.40;
+
+  const anchorCenter = _flatAnchorFromVisual(
+    screenCorners, W_sq, H_sq, textPos, padFrac,
+    fontNat, label.length, readingAngle, flatRotation
+  );
+  const anchor = _anchorForPosition(
+    anchorCenter, flatRotation, label.length, fontNat, textPos
+  );
+
+  const srcPts = [[0, 0], [W_sq, 0], [W_sq, H_sq], [0, H_sq]];
+  const dstPts = unclipped.map(([x, y]) => [x, y]);
+
+  const item = {
+    name: layerName,
+    label: label,
+    src_w: W_sq,
+    src_h: H_sq,
+    text_x: anchor.x,
+    text_y: anchor.y,
+    font_px: Math.max(6, fontNat),
+    rotation: flatRotation,
+    alignment: anchor.alignment,
+    color: textColor,
+    src_pts: srcPts,
+    dst_pts: dstPts,
+  };
+
+  return { item, rect };
+}
+
+function buildKraTexts(options) {
+  options = options || {};
+  const items = [];
+  const rects = [];
+  for (let i = 0; i < floatSquares.length; i++) {
+    const sq = floatSquares[i];
+    const e1 = _kraTextEntry(sq, options, "");
+    if (e1) { items.push(e1.item); if (e1.rect) rects.push(e1.rect); }
+    _withSquareMirror(sq, () => {
+      const e2 = _kraTextEntry(sq, options, "_mirror");
+      if (e2) { items.push(e2.item); if (e2.rect) rects.push(e2.rect); }
+    });
+  }
+  return { items, rects };
+}
+
+/* ==========================================================================
+   SHEAR MODES
+   ========================================================================== */
+
+function _kraShearTextEntry(sq, options, nameSuffix) {
+  const colorMode = options.text_color_mode || "color";
+  const textPos   = options.text_position || "center";
+  const padFrac   = (typeof options.text_padding === "number")
+                      ? options.text_padding : 0.06;
+  const drawRects = options.draw_rectangles !== false;
+
+  const qi = quadIdxById(sq.quadId);
+  if (qi < 0) return null;
+  const q = quads[qi];
+  if (!q) return null;
+
+  const unclipped = _unclippedProjectedCorners(sq);
+  if (!unclipped || unclipped.length < 4) return null;
+  const screenCorners = squareCornersScreen(sq) || unclipped;
+
+  const lens = (function () {
+    const n = unclipped.length;
+    const s = [];
+    for (let k = 0; k < n; k++) {
+      const a = unclipped[k];
+      const b = unclipped[(k + 1) % n];
+      s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
+    }
+    return s;
+  })();
+  const W_sq = (lens[0] + lens[2]) / 2;
+  const H_sq = (lens[1] + lens[3]) / 2;
+  if (W_sq <= 0.5 || H_sq <= 0.5) return null;
+
+  const hue = patchHue(q);
+  const hex = _hueToHex(hue);
+  const hexLight = _hueToHexLight(hue);
+  const textColor = (colorMode === "black") ? "#000000" : hexLight;
+
+  const label     = squareDisplayName(sq);
+  const layerName = label + (nameSuffix || "");
+
+  let rect = null;
+  if (drawRects) {
+    rect = {
+      name: layerName,
+      points: screenCorners.map(([x, y]) => [x, y]),
+      fill: hex, fill_opacity: 0.40,
+      stroke: hex, stroke_width: 2.0, stroke_opacity: 1.0,
+    };
+  }
+
+  const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
+  const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
+  const fontNat = Math.min(W_sq, H_sq) * 0.40;
+
+  const anchorCenter = _flatAnchorFromVisual(
+    screenCorners, W_sq, H_sq, textPos, padFrac,
+    fontNat, label.length, readingAngle, flatRotation
+  );
+  const anchor = _anchorForPosition(
+    anchorCenter, flatRotation, label.length, fontNat, textPos
+  );
+
+  const sqH = _computeHomography(
+    [{x: 0, y: 0}, {x: W_sq, y: 0},
+     {x: W_sq, y: H_sq}, {x: 0, y: H_sq}],
+    [{x: unclipped[0][0], y: unclipped[0][1]},
+     {x: unclipped[1][0], y: unclipped[1][1]},
+     {x: unclipped[2][0], y: unclipped[2][1]},
+     {x: unclipped[3][0], y: unclipped[3][1]}]
+  );
+
+  const anchorScreen = _applyHomography(sqH, anchor.x, anchor.y);
+  if (!anchorScreen) return null;
+
+  const J = _patchProjectiveJacobian(sqH, anchor.x, anchor.y);
+  if (!J) return null;
+
+  const cosR = Math.cos(flatRotation * Math.PI / 180);
+  const sinR = Math.sin(flatRotation * Math.PI / 180);
+
+  const M00 =  J.J11 * cosR + J.J12 * sinR;
+  const M01 = -J.J11 * sinR + J.J12 * cosR;
+  const M10 =  J.J21 * cosR + J.J22 * sinR;
+  const M11 = -J.J21 * sinR + J.J22 * cosR;
+
+  const decomp = _decomposeAffineLocal(M00, M01, M10, M11);
+  if (!decomp) return null;
+
+  const maxScale = Math.max(Math.abs(decomp.scale_x),
+                            Math.abs(decomp.scale_y));
+  if (maxScale < 1e-9) return null;
+  const invScale = 1 / maxScale;
+
+  const N00 = M00 * invScale;
+  const N01 = M01 * invScale;
+  const N10 = M10 * invScale;
+  const N11 = M11 * invScale;
+
+  const ax = anchorScreen.x;
+  const ay = anchorScreen.y;
+  const dx = ax - N00 * ax - N01 * ay;
+  const dy = ay - N10 * ax - N11 * ay;
+
+  const item = {
+    name: layerName,
+    label: label,
+    text: label,
+    x: ax, y: ay,
+    font_px: Math.max(6, fontNat),
+    alignment: anchor.alignment,
+    color: textColor,
+    transform: [N00, N10, N01, N11, dx, dy],
+    decomposition: {
+      rotation_deg: decomp.rotation_deg,
+      shear: decomp.shear,
+      scale_x: decomp.scale_x,
+      scale_y: decomp.scale_y,
+      max_scale: maxScale,
+    },
+    src_w: W_sq,
+  };
+
+  return { item, rect };
+}
+
+function buildKraShearTexts(options) {
+  options = options || {};
+  const items = [];
+  const rects = [];
+  for (let i = 0; i < floatSquares.length; i++) {
+    const sq = floatSquares[i];
+    const e1 = _kraShearTextEntry(sq, options, "");
+    if (e1) { items.push(e1.item); if (e1.rect) rects.push(e1.rect); }
+    _withSquareMirror(sq, () => {
+      const e2 = _kraShearTextEntry(sq, options, "_mirror");
+      if (e2) { items.push(e2.item); if (e2.rect) rects.push(e2.rect); }
+    });
+  }
+  return { items, rects };
+}
+
+function _shearTextForSquare(sq, options, hex, textColor, nameSuffix) {
+  const textPos   = options.text_position || "center";
+  const padFrac   = (typeof options.text_padding === "number")
+                      ? options.text_padding : 0.06;
+  const drawRects = options.draw_rectangles !== false;
+
+  const unclipped = _unclippedProjectedCorners(sq);
+  if (!unclipped || unclipped.length < 4) return null;
+  const screenCorners = squareCornersScreen(sq) || unclipped;
+
+  const lens = (function () {
+    const n = unclipped.length;
+    const s = [];
+    for (let k = 0; k < n; k++) {
+      const a = unclipped[k];
+      const b = unclipped[(k + 1) % n];
+      s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
+    }
+    return s;
+  })();
+  const W_sq = (lens[0] + lens[2]) / 2;
+  const H_sq = (lens[1] + lens[3]) / 2;
+  if (W_sq <= 0.5 || H_sq <= 0.5) return null;
+
+  const label     = squareDisplayName(sq);
+  const layerName = label + (nameSuffix || "");
+
+  let rect = null;
+  if (drawRects) {
+    rect = {
+      name: layerName,
+      points: screenCorners.map(([x, y]) => [x, y]),
+      fill: hex, fill_opacity: 0.40,
+      stroke: hex, stroke_width: 2.0, stroke_opacity: 1.0,
+    };
+  }
+
+  const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
+  const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
+  const fontNat = Math.min(W_sq, H_sq) * 0.40;
+
+  const anchorCenter = _flatAnchorFromVisual(
+    screenCorners, W_sq, H_sq, textPos, padFrac,
+    fontNat, label.length, readingAngle, flatRotation
+  );
+  const anchor = _anchorForPosition(
+    anchorCenter, flatRotation, label.length, fontNat, textPos
+  );
+
+  const sqH = _computeHomography(
+    [{x: 0, y: 0}, {x: W_sq, y: 0},
+     {x: W_sq, y: H_sq}, {x: 0, y: H_sq}],
+    [{x: unclipped[0][0], y: unclipped[0][1]},
+     {x: unclipped[1][0], y: unclipped[1][1]},
+     {x: unclipped[2][0], y: unclipped[2][1]},
+     {x: unclipped[3][0], y: unclipped[3][1]}]
+  );
+
+  const anchorScreen = _applyHomography(sqH, anchor.x, anchor.y);
+  if (!anchorScreen) return null;
+
+  const J = _patchProjectiveJacobian(sqH, anchor.x, anchor.y);
+  if (!J) return null;
+
+  const cosR = Math.cos(flatRotation * Math.PI / 180);
+  const sinR = Math.sin(flatRotation * Math.PI / 180);
+
+  const M00 =  J.J11 * cosR + J.J12 * sinR;
+  const M01 = -J.J11 * sinR + J.J12 * cosR;
+  const M10 =  J.J21 * cosR + J.J22 * sinR;
+  const M11 = -J.J21 * sinR + J.J22 * cosR;
+
+  const decomp = _decomposeAffineLocal(M00, M01, M10, M11);
+  if (!decomp) return null;
+
+  const maxScale = Math.max(Math.abs(decomp.scale_x),
+                            Math.abs(decomp.scale_y));
+  if (maxScale < 1e-9) return null;
+  const invScale = 1 / maxScale;
+
+  const N00 = M00 * invScale;
+  const N01 = M01 * invScale;
+  const N10 = M10 * invScale;
+  const N11 = M11 * invScale;
+
+  const ax = anchorScreen.x;
+  const ay = anchorScreen.y;
+  const dx = ax - N00 * ax - N01 * ay;
+  const dy = ay - N10 * ax - N11 * ay;
+
+  return {
+    text: {
+      name: layerName,
+      label: label,
+      text: label,
+      x: ax, y: ay,
+      font_px: Math.max(6, fontNat),
+      alignment: anchor.alignment,
+      color: textColor,
+      transform: [N00, N10, N01, N11, dx, dy],
+      decomposition: {
+        rotation_deg: decomp.rotation_deg,
+        shear: decomp.shear,
+        scale_x: decomp.scale_x,
+        scale_y: decomp.scale_y,
+        max_scale: maxScale,
+      },
+      src_w: W_sq,
+    },
+    rect,
+  };
+}
+
+function buildKraShearPatches(options) {
+  options = options || {};
+  const colorMode = options.text_color_mode || "color";
+  const patches = [];
+
+  for (let qi = 0; qi < quads.length; qi++) {
+    const q = quads[qi];
+    const sqsOnPatch = [];
+    for (let i = 0; i < floatSquares.length; i++) {
+      if (floatSquares[i].quadId === q.id) sqsOnPatch.push(floatSquares[i]);
+    }
+    if (sqsOnPatch.length === 0) continue;
+
+    const hue = patchHue(q);
+    const hex = _hueToHex(hue);
+    const hexLight = _hueToHexLight(hue);
+    const textColor = (colorMode === "black") ? "#000000" : hexLight;
+
+    {
+      const rects = [];
+      const texts = [];
+      for (const sq of sqsOnPatch) {
+        const r = _shearTextForSquare(sq, options, hex, textColor, "");
+        if (!r) continue;
+        if (r.rect) rects.push(r.rect);
+        texts.push(r.text);
+      }
+      if (texts.length > 0 || rects.length > 0) {
+        patches.push({ name: q.name, texts, rects });
+      }
+    }
+
+    if (q.mirror) {
+      const angle = (typeof q.mirrorAngle === "number") ? q.mirrorAngle : Math.PI;
+      const flip  = q.mirrorFlip !== false;
+
+      const phi0 = q.phi0, phi1 = q.phi1;
+      q.phi0 = phi0 + angle;
+      q.phi1 = phi1 + angle;
+
+      const rects = [];
+      const texts = [];
+      try {
+        for (const sq of sqsOnPatch) {
+          const theta0 = sq.theta || 0;
+          const slope0 = sq.slope || 0;
+          const u0     = sq.u;
+          if (flip) {
+            sq.theta = -theta0;
+            sq.slope = -slope0;
+            sq.u     = -u0;
+          }
+          try {
+            const r = _shearTextForSquare(sq, options, hex, textColor, "_mirror");
+            if (!r) continue;
+            if (r.rect) rects.push(r.rect);
+            texts.push(r.text);
+          } finally {
+            sq.theta = theta0;
+            sq.slope = slope0;
+            sq.u     = u0;
+          }
+        }
+      } finally {
+        q.phi0 = phi0;
+        q.phi1 = phi1;
+      }
+
+      if (texts.length > 0 || rects.length > 0) {
+        patches.push({ name: q.name + "_mirror", texts, rects });
+      }
+    }
+  }
+
+  return patches;
+}
+
+/* ==========================================================================
+   PATCH AND PATCH-SHEAR MODES
+   ========================================================================== */
 
 function _projectedPatchCorners(q) {
-  const corners = quadCorners(q);
-  return corners.map(c => {
+  return [
+    { phi: q.phi0, s: q.s1 }, { phi: q.phi1, s: q.s1 },
+    { phi: q.phi1, s: q.s0 }, { phi: q.phi0, s: q.s0 },
+  ].map(c => {
     const [wx, wy] = surfacePoint(c.phi, c.s);
     return w2s(wx, wy);
   });
@@ -903,20 +1052,13 @@ function _buildOnePatchKraPatch(q, options, nameSuffix, isMirror) {
          {x: unclipped[3][0], y: unclipped[3][1]}]
       );
 
-      const desiredScreen = _applyHomography(
-        sqH, anchorFlatSq.x, anchorFlatSq.y
-      );
-      if (!desiredScreen ||
-          !isFinite(desiredScreen.x) || !isFinite(desiredScreen.y)) continue;
+      const desiredScreen = _applyHomography(sqH, anchorFlatSq.x, anchorFlatSq.y);
+      if (!desiredScreen || !isFinite(desiredScreen.x) || !isFinite(desiredScreen.y)) continue;
 
-      const flatPatch = _applyHomography(
-        patchHinv, desiredScreen.x, desiredScreen.y
-      );
-      if (!flatPatch ||
-          !isFinite(flatPatch.x) || !isFinite(flatPatch.y)) continue;
+      const flatPatch = _applyHomography(patchHinv, desiredScreen.x, desiredScreen.y);
+      if (!flatPatch || !isFinite(flatPatch.x) || !isFinite(flatPatch.y)) continue;
 
-      const px = flatPatch.x;
-      const py = flatPatch.y;
+      const px = flatPatch.x, py = flatPatch.y;
 
       const J = _patchProjectiveJacobian(patchH, px, py);
       if (!J) continue;
@@ -947,10 +1089,6 @@ function _buildOnePatchKraPatch(q, options, nameSuffix, isMirror) {
         font_px,
         rotation: flatRotation,
         alignment: anchorFlatSq.alignment,
-        /* The square's own width in its local frame.  cone_kra.py
-           uses this to size Krita's inline-wrapped text area so the
-           inline-size handles land on the square's edges.  See the
-           module docstring, INLINE-WRAPPED TEXT. */
         src_w: W_sq,
       });
 
@@ -994,10 +1132,8 @@ function _buildOnePatchKraPatch(q, options, nameSuffix, isMirror) {
   bbMinX -= MARGIN; bbMinY -= MARGIN;
   bbMaxX += MARGIN; bbMaxY += MARGIN;
 
-  const offX = bbMinX;
-  const offY = bbMinY;
-  const Wshift = bbMaxX - bbMinX;
-  const Hshift = bbMaxY - bbMinY;
+  const offX = bbMinX, offY = bbMinY;
+  const Wshift = bbMaxX - bbMinX, Hshift = bbMaxY - bbMinY;
 
   const texts = [];
   for (const p of pending) {
@@ -1035,16 +1171,12 @@ function _buildOnePatchKraPatch(q, options, nameSuffix, isMirror) {
 function buildKraPatches(options) {
   options = options || {};
   const patches = [];
-
   for (let qi = 0; qi < quads.length; qi++) {
     const q = quads[qi];
-
     const p1 = _buildOnePatchKraPatch(q, options, "", false);
     if (p1) patches.push(p1);
-
     if (q.mirror) {
-      const angle = (typeof q.mirrorAngle === "number")
-                      ? q.mirrorAngle : Math.PI;
+      const angle = (typeof q.mirrorAngle === "number") ? q.mirrorAngle : Math.PI;
       const phi0 = q.phi0, phi1 = q.phi1;
       q.phi0 = phi0 + angle;
       q.phi1 = phi1 + angle;
@@ -1061,513 +1193,10 @@ function buildKraPatches(options) {
 }
 
 /* ==========================================================================
-   TEXT MODE — one group + one mask per text
-   ========================================================================== */
-
-function _kraTextEntry(sq, options, nameSuffix) {
-  const colorMode = options.text_color_mode || "color";
-  const textPos   = options.text_position || "center";
-  const padFrac   = (typeof options.text_padding === "number")
-                      ? options.text_padding : 0.06;
-  const drawRects = options.draw_rectangles !== false;
-
-  const qi = quadIdxById(sq.quadId);
-  if (qi < 0) return null;
-  const q = quads[qi];
-  if (!q) return null;
-
-  const unclipped = _unclippedProjectedCorners(sq);
-  if (!unclipped || unclipped.length < 4) return null;
-
-  const screenCorners = squareCornersScreen(sq) || unclipped;
-
-  const lens = (function () {
-    const n = unclipped.length;
-    const s = [];
-    for (let k = 0; k < n; k++) {
-      const a = unclipped[k];
-      const b = unclipped[(k + 1) % n];
-      s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
-    }
-    return s;
-  })();
-  const W_sq = (lens[0] + lens[2]) / 2;
-  const H_sq = (lens[1] + lens[3]) / 2;
-  if (W_sq <= 0.5 || H_sq <= 0.5) return null;
-
-  const hue = patchHue(q);
-  const hex = _hueToHex(hue);
-  const hexLight = _hueToHexLight(hue);
-  const textColor = (colorMode === "black") ? "#000000" : hexLight;
-
-  const label     = squareDisplayName(sq);
-  const layerName = label + (nameSuffix || "");
-
-  let rect = null;
-  if (drawRects) {
-    rect = {
-      name: layerName,
-      points: screenCorners.map(([x, y]) => [x, y]),
-      fill: hex, fill_opacity: 0.40,
-      stroke: hex, stroke_width: 2.0, stroke_opacity: 1.0,
-    };
-  }
-
-  const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
-  const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
-  const fontNat = Math.min(W_sq, H_sq) * 0.40;
-
-  const anchorCenter = _flatAnchorFromVisual(
-    screenCorners, W_sq, H_sq, textPos, padFrac,
-    fontNat, label.length, readingAngle, flatRotation
-  );
-  const anchor = _anchorForPosition(
-    anchorCenter, flatRotation, label.length, fontNat, textPos
-  );
-
-  const srcPts = [[0, 0], [W_sq, 0], [W_sq, H_sq], [0, H_sq]];
-  const dstPts = unclipped.map(([x, y]) => [x, y]);
-
-  const item = {
-    name: layerName,
-    label: label,
-    src_w: W_sq,
-    src_h: H_sq,
-    text_x: anchor.x,
-    text_y: anchor.y,
-    font_px: Math.max(6, fontNat),
-    rotation: flatRotation,
-    alignment: anchor.alignment,
-    color: textColor,
-    src_pts: srcPts,
-    dst_pts: dstPts,
-  };
-
-  return { item, rect };
-}
-
-function buildKraTexts(options) {
-  options = options || {};
-  const items = [];
-  const rects = [];
-
-  for (let i = 0; i < floatSquares.length; i++) {
-    const sq = floatSquares[i];
-
-    const e1 = _kraTextEntry(sq, options, "");
-    if (e1) { items.push(e1.item); if (e1.rect) rects.push(e1.rect); }
-
-    _withSquareMirror(sq, () => {
-      const e2 = _kraTextEntry(sq, options, "_mirror");
-      if (e2) { items.push(e2.item); if (e2.rect) rects.push(e2.rect); }
-    });
-  }
-  return { items: items, rects: rects };
-}
-
-/* ==========================================================================
-   TEXT-SHEAR MODE — no masks; one layer per text
-   ==========================================================================
-   No transform masks.  Each text lives on its own vector layer as a
-   plain shape.  The warp is encoded entirely in primitives the shape
-   itself carries:
-
-     - position: SVG x, y
-     - font size: SVG font-size, set to fontNat directly
-     - rotation, shear, scale_x, scale_y: one QTransform via
-       setTransformation
-
-   For each square the JS computes the local Jacobian J of the
-   square's homography at the text's anchor, composes it with the
-   text's own flat rotation R to get the total warp M = J · R,
-   decomposes M into R(θ) · Shx(k) · S(sx, sy), and normalizes the
-   scales so the larger of |sx|, |sy| is 1.  That way the text's
-   on-screen bounding box fits in a fontNat × fontNat square: the
-   longer dimension reaches fontNat, the shorter is proportionally
-   smaller, and nothing overflows.  Rotation and shear are invariant
-   under the normalization, so the shape of the text is preserved. */
-
-function _kraShearTextEntry(sq, options, nameSuffix) {
-  const colorMode = options.text_color_mode || "color";
-  const textPos   = options.text_position || "center";
-  const padFrac   = (typeof options.text_padding === "number")
-                      ? options.text_padding : 0.06;
-  const drawRects = options.draw_rectangles !== false;
-
-  const qi = quadIdxById(sq.quadId);
-  if (qi < 0) return null;
-  const q = quads[qi];
-  if (!q) return null;
-
-  const unclipped = _unclippedProjectedCorners(sq);
-  if (!unclipped || unclipped.length < 4) return null;
-  const screenCorners = squareCornersScreen(sq) || unclipped;
-
-  const lens = (function () {
-    const n = unclipped.length;
-    const s = [];
-    for (let k = 0; k < n; k++) {
-      const a = unclipped[k];
-      const b = unclipped[(k + 1) % n];
-      s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
-    }
-    return s;
-  })();
-  const W_sq = (lens[0] + lens[2]) / 2;
-  const H_sq = (lens[1] + lens[3]) / 2;
-  if (W_sq <= 0.5 || H_sq <= 0.5) return null;
-
-  const hue = patchHue(q);
-  const hex = _hueToHex(hue);
-  const hexLight = _hueToHexLight(hue);
-  const textColor = (colorMode === "black") ? "#000000" : hexLight;
-
-  const label     = squareDisplayName(sq);
-  const layerName = label + (nameSuffix || "");
-
-  let rect = null;
-  if (drawRects) {
-    rect = {
-      name: layerName,
-      points: screenCorners.map(([x, y]) => [x, y]),
-      fill: hex, fill_opacity: 0.40,
-      stroke: hex, stroke_width: 2.0, stroke_opacity: 1.0,
-    };
-  }
-
-  const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
-  const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
-  const fontNat = Math.min(W_sq, H_sq) * 0.40;
-
-  const anchorCenter = _flatAnchorFromVisual(
-    screenCorners, W_sq, H_sq, textPos, padFrac,
-    fontNat, label.length, readingAngle, flatRotation
-  );
-  const anchor = _anchorForPosition(
-    anchorCenter, flatRotation, label.length, fontNat, textPos
-  );
-
-  const sqH = _computeHomography(
-    [{x: 0, y: 0}, {x: W_sq, y: 0},
-     {x: W_sq, y: H_sq}, {x: 0, y: H_sq}],
-    [{x: unclipped[0][0], y: unclipped[0][1]},
-     {x: unclipped[1][0], y: unclipped[1][1]},
-     {x: unclipped[2][0], y: unclipped[2][1]},
-     {x: unclipped[3][0], y: unclipped[3][1]}]
-  );
-
-  const anchorScreen = _applyHomography(sqH, anchor.x, anchor.y);
-  if (!anchorScreen) return null;
-
-  const J = _patchProjectiveJacobian(sqH, anchor.x, anchor.y);
-  if (!J) return null;
-
-  const cosR = Math.cos(flatRotation * Math.PI / 180);
-  const sinR = Math.sin(flatRotation * Math.PI / 180);
-
-  const M00 =  J.J11 * cosR + J.J12 * sinR;
-  const M01 = -J.J11 * sinR + J.J12 * cosR;
-  const M10 =  J.J21 * cosR + J.J22 * sinR;
-  const M11 = -J.J21 * sinR + J.J22 * cosR;
-
-  const decomp = _decomposeAffineLocal(M00, M01, M10, M11);
-  if (!decomp) return null;
-
-  const maxScale = Math.max(Math.abs(decomp.scale_x),
-                            Math.abs(decomp.scale_y));
-  if (maxScale < 1e-9) return null;
-  const invScale = 1 / maxScale;
-
-  const N00 = M00 * invScale;
-  const N01 = M01 * invScale;
-  const N10 = M10 * invScale;
-  const N11 = M11 * invScale;
-
-  const ax = anchorScreen.x;
-  const ay = anchorScreen.y;
-  const dx = ax - N00 * ax - N01 * ay;
-  const dy = ay - N10 * ax - N11 * ay;
-
-  const item = {
-    name: layerName,
-    label: label,
-    text: label,
-    x: ax, y: ay,
-    font_px: Math.max(6, fontNat),
-    alignment: anchor.alignment,
-    color: textColor,
-    transform: [N00, N10, N01, N11, dx, dy],
-    decomposition: {
-      rotation_deg: decomp.rotation_deg,
-      shear: decomp.shear,
-      scale_x: decomp.scale_x,
-      scale_y: decomp.scale_y,
-      max_scale: maxScale,
-    },
-    /* The square's own width in its local frame.  cone_kra.py uses
-       this to size Krita's inline-wrapped text area so the
-       inline-size handles land on the square's edges.  See the
-       module docstring, INLINE-WRAPPED TEXT. */
-    src_w: W_sq,
-  };
-
-  return { item, rect };
-}
-
-function buildKraShearTexts(options) {
-  options = options || {};
-  const items = [];
-  const rects = [];
-
-  for (let i = 0; i < floatSquares.length; i++) {
-    const sq = floatSquares[i];
-
-    const e1 = _kraShearTextEntry(sq, options, "");
-    if (e1) { items.push(e1.item); if (e1.rect) rects.push(e1.rect); }
-
-    _withSquareMirror(sq, () => {
-      const e2 = _kraShearTextEntry(sq, options, "_mirror");
-      if (e2) { items.push(e2.item); if (e2.rect) rects.push(e2.rect); }
-    });
-  }
-
-  return { items: items, rects: rects };
-}
-
-/* ==========================================================================
-   PATCH-SHEAR MODE — no masks; one group per patch
-   ==========================================================================
-   Same primitives as text-shear, but the texts are grouped by patch
-   instead of being flat under the export group.  No mask is applied
-   at any level, so the transform each text carries is the entire
-   warp.  The scale normalization matches text-shear's, so the two
-   modes render each text at the same on-screen size.
-
-   The per-square work is extracted into _shearTextForSquare so it
-   can be called twice per square: once for the original group, and
-   once — inside a patch φ shift plus per-square flip — for the
-   mirror group.  The mirror group's name carries a `_mirror` suffix
-   and the mirror text's layer name carries the same suffix, so
-   Krita's name lookup cannot collide the two. */
-
-function _shearTextForSquare(sq, options, hex, textColor, nameSuffix) {
-  const textPos   = options.text_position || "center";
-  const padFrac   = (typeof options.text_padding === "number")
-                      ? options.text_padding : 0.06;
-  const drawRects = options.draw_rectangles !== false;
-
-  const unclipped = _unclippedProjectedCorners(sq);
-  if (!unclipped || unclipped.length < 4) return null;
-  const screenCorners = squareCornersScreen(sq) || unclipped;
-
-  const lens = (function () {
-    const n = unclipped.length;
-    const s = [];
-    for (let k = 0; k < n; k++) {
-      const a = unclipped[k];
-      const b = unclipped[(k + 1) % n];
-      s.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
-    }
-    return s;
-  })();
-  const W_sq = (lens[0] + lens[2]) / 2;
-  const H_sq = (lens[1] + lens[3]) / 2;
-  if (W_sq <= 0.5 || H_sq <= 0.5) return null;
-
-  const label     = squareDisplayName(sq);
-  const layerName = label + (nameSuffix || "");
-
-  let rect = null;
-  if (drawRects) {
-    rect = {
-      name: layerName,
-      points: screenCorners.map(([x, y]) => [x, y]),
-      fill: hex, fill_opacity: 0.40,
-      stroke: hex, stroke_width: 2.0, stroke_opacity: 1.0,
-    };
-  }
-
-  const flatRotation = _shapeLabelFlatRotationDeg(sq, screenCorners);
-  const readingAngle = _shapeLabelScreenAngleDeg(sq, screenCorners);
-  const fontNat = Math.min(W_sq, H_sq) * 0.40;
-
-  const anchorCenter = _flatAnchorFromVisual(
-    screenCorners, W_sq, H_sq, textPos, padFrac,
-    fontNat, label.length, readingAngle, flatRotation
-  );
-  const anchor = _anchorForPosition(
-    anchorCenter, flatRotation, label.length, fontNat, textPos
-  );
-
-  const sqH = _computeHomography(
-    [{x: 0, y: 0}, {x: W_sq, y: 0},
-     {x: W_sq, y: H_sq}, {x: 0, y: H_sq}],
-    [{x: unclipped[0][0], y: unclipped[0][1]},
-     {x: unclipped[1][0], y: unclipped[1][1]},
-     {x: unclipped[2][0], y: unclipped[2][1]},
-     {x: unclipped[3][0], y: unclipped[3][1]}]
-  );
-
-  const anchorScreen = _applyHomography(sqH, anchor.x, anchor.y);
-  if (!anchorScreen) return null;
-
-  const J = _patchProjectiveJacobian(sqH, anchor.x, anchor.y);
-  if (!J) return null;
-
-  const cosR = Math.cos(flatRotation * Math.PI / 180);
-  const sinR = Math.sin(flatRotation * Math.PI / 180);
-
-  const M00 =  J.J11 * cosR + J.J12 * sinR;
-  const M01 = -J.J11 * sinR + J.J12 * cosR;
-  const M10 =  J.J21 * cosR + J.J22 * sinR;
-  const M11 = -J.J21 * sinR + J.J22 * cosR;
-
-  const decomp = _decomposeAffineLocal(M00, M01, M10, M11);
-  if (!decomp) return null;
-
-  const maxScale = Math.max(Math.abs(decomp.scale_x),
-                            Math.abs(decomp.scale_y));
-  if (maxScale < 1e-9) return null;
-  const invScale = 1 / maxScale;
-
-  const N00 = M00 * invScale;
-  const N01 = M01 * invScale;
-  const N10 = M10 * invScale;
-  const N11 = M11 * invScale;
-
-  const ax = anchorScreen.x;
-  const ay = anchorScreen.y;
-  const dx = ax - N00 * ax - N01 * ay;
-  const dy = ay - N10 * ax - N11 * ay;
-
-  return {
-    text: {
-      name: layerName,
-      label: label,
-      text: label,
-      x: ax, y: ay,
-      font_px: Math.max(6, fontNat),
-      alignment: anchor.alignment,
-      color: textColor,
-      transform: [N00, N10, N01, N11, dx, dy],
-      decomposition: {
-        rotation_deg: decomp.rotation_deg,
-        shear: decomp.shear,
-        scale_x: decomp.scale_x,
-        scale_y: decomp.scale_y,
-        max_scale: maxScale,
-      },
-      /* The square's own width in its local frame.  cone_kra.py
-         uses this to size Krita's inline-wrapped text area so the
-         inline-size handles land on the square's edges.  See the
-         module docstring, INLINE-WRAPPED TEXT. */
-      src_w: W_sq,
-    },
-    rect: rect,
-  };
-}
-
-function buildKraShearPatches(options) {
-  options = options || {};
-  const colorMode = options.text_color_mode || "color";
-  const patches = [];
-
-  for (let qi = 0; qi < quads.length; qi++) {
-    const q = quads[qi];
-
-    const sqsOnPatch = [];
-    for (let i = 0; i < floatSquares.length; i++) {
-      if (floatSquares[i].quadId === q.id) sqsOnPatch.push(floatSquares[i]);
-    }
-    if (sqsOnPatch.length === 0) continue;
-
-    const hue = patchHue(q);
-    const hex = _hueToHex(hue);
-    const hexLight = _hueToHexLight(hue);
-    const textColor = (colorMode === "black") ? "#000000" : hexLight;
-
-    /* ---- original group ---------------------------------------- */
-    {
-      const rects = [];
-      const texts = [];
-      for (const sq of sqsOnPatch) {
-        const r = _shearTextForSquare(sq, options, hex, textColor, "");
-        if (!r) continue;
-        if (r.rect) rects.push(r.rect);
-        texts.push(r.text);
-      }
-      if (texts.length > 0 || rects.length > 0) {
-        patches.push({ name: q.name, texts, rects });
-      }
-    }
-
-    /* ---- mirror group ------------------------------------------ */
-    if (q.mirror) {
-      const angle = (typeof q.mirrorAngle === "number")
-                      ? q.mirrorAngle : Math.PI;
-      const flip  = q.mirrorFlip !== false;
-
-      const phi0 = q.phi0, phi1 = q.phi1;
-      q.phi0 = phi0 + angle;
-      q.phi1 = phi1 + angle;
-
-      const rects = [];
-      const texts = [];
-      try {
-        for (const sq of sqsOnPatch) {
-          const theta0 = sq.theta || 0;
-          const slope0 = sq.slope || 0;
-          const u0     = sq.u;
-          if (flip) {
-            sq.theta = -theta0;
-            sq.slope = -slope0;
-            sq.u     = -u0;
-          }
-          try {
-            const r = _shearTextForSquare(sq, options, hex, textColor,
-                                          "_mirror");
-            if (!r) continue;
-            if (r.rect) rects.push(r.rect);
-            texts.push(r.text);
-          } finally {
-            sq.theta = theta0;
-            sq.slope = slope0;
-            sq.u     = u0;
-          }
-        }
-      } finally {
-        q.phi0 = phi0;
-        q.phi1 = phi1;
-      }
-
-      if (texts.length > 0 || rects.length > 0) {
-        patches.push({ name: q.name + "_mirror", texts, rects });
-      }
-    }
-  }
-
-  return patches;
-}
-
-/* ==========================================================================
-   POINT OF VIEW
-   ========================================================================== */
-
-function _coneBandDimensions() {
-  const w = Math.max(1, Math.round(window.innerWidth));
-  const h = Math.max(1, Math.round(LAYOUT_coneH()));
-  return { width: w, height: h };
-}
-
-function LAYOUT_coneH() {
-  return layout.coneH;
-}
-
-/* ==========================================================================
    META-OPTIONS
    ========================================================================== */
 
-function readKraOptionsFromDOM() {
+export function readKraOptionsFromDOM() {
   const posEl  = document.getElementById("kraTextPos");
   const padEl  = document.getElementById("kraTextPad");
   const rectEl = document.getElementById("kraDrawRects");
@@ -1575,10 +1204,8 @@ function readKraOptionsFromDOM() {
   const wrpEl  = document.getElementById("kraTextWarp");
 
   const text_position = posEl ? posEl.value : "center";
-
   let text_padding = padEl ? parseFloat(padEl.value) : 0.06;
   if (!isFinite(text_padding) || text_padding < 0) text_padding = 0.06;
-
   const draw_rectangles = rectEl ? !!rectEl.checked : true;
 
   let text_color_mode = colEl ? colEl.value : "color";
@@ -1596,45 +1223,56 @@ function readKraOptionsFromDOM() {
   }
 
   return {
-    text_position:   text_position,
-    text_padding:    text_padding,
-    draw_rectangles: draw_rectangles,
-    text_color_mode: text_color_mode,
-    text_warp_mode:  text_warp_mode,
+    text_position,
+    text_padding,
+    draw_rectangles,
+    text_color_mode,
+    text_warp_mode,
   };
 }
 
-function applyKraOptionsToDOM(opts) {
+export function applyKraOptionsToDOM(opts) {
   if (!opts || typeof opts !== "object") return;
-
   const posEl  = document.getElementById("kraTextPos");
   const padEl  = document.getElementById("kraTextPad");
   const rectEl = document.getElementById("kraDrawRects");
   const colEl  = document.getElementById("kraTextColor");
   const wrpEl  = document.getElementById("kraTextWarp");
 
-  if (posEl && typeof opts.text_position === "string") {
+  if (posEl && typeof opts.text_position === "string")
     posEl.value = opts.text_position;
-  }
-  if (padEl && typeof opts.text_padding === "number") {
+  if (padEl && typeof opts.text_padding === "number")
     padEl.value = String(opts.text_padding);
-  }
-  if (rectEl && typeof opts.draw_rectangles === "boolean") {
+  if (rectEl && typeof opts.draw_rectangles === "boolean")
     rectEl.checked = opts.draw_rectangles;
-  }
-  if (colEl && typeof opts.text_color_mode === "string") {
+  if (colEl && typeof opts.text_color_mode === "string")
     colEl.value = opts.text_color_mode;
-  }
-  if (wrpEl && typeof opts.text_warp_mode === "string") {
+  if (wrpEl && typeof opts.text_warp_mode === "string")
     wrpEl.value = opts.text_warp_mode;
-  }
 }
 
-async function generateKraFromScene() {
+/* ==========================================================================
+   TOP-LEVEL ENTRY
+   ========================================================================== */
+
+function _coneBandDimensions() {
+  const w = Math.max(1, Math.round(window.innerWidth));
+  const h = Math.max(1, Math.round(layout.coneH));
+  return { width: w, height: h };
+}
+
+export async function generateKraFromScene() {
+  const defaultPath = "/tmp/cone_scene.kra";
+  const outputPath = window.prompt("Output .kra path:", defaultPath);
+  if (!outputPath) return;
+  await generateKraToPath(outputPath);
+}
+
+export async function generateKraToPath(outputPath) {
+  if (!outputPath || typeof outputPath !== "string") return;
+
   if (floatSquares.length === 0) {
-    if (typeof flashStatus === "function") {
-      flashStatus("No shapes to export", "warn");
-    }
+    flashStatus("No shapes to export", "warn");
     return;
   }
 
@@ -1643,64 +1281,34 @@ async function generateKraFromScene() {
 
   const body = {
     doc_name:    "Cone Scene",
-    output_path: null,
+    output_path: outputPath,
     options:     options,
     cone_band:   coneBand,
   };
 
   if (options.text_warp_mode === "patch-shear") {
     const patches = buildKraShearPatches(options);
-    if (patches.length === 0) {
-      if (typeof flashStatus === "function") {
-        flashStatus("No exportable patches", "warn");
-      }
-      return;
-    }
+    if (patches.length === 0) { flashStatus("No exportable patches", "warn"); return; }
     body.patches = patches;
   } else if (options.text_warp_mode === "text-shear") {
     const result = buildKraShearTexts(options);
-    if (result.items.length === 0) {
-      if (typeof flashStatus === "function") {
-        flashStatus("No exportable texts", "warn");
-      }
-      return;
-    }
+    if (result.items.length === 0) { flashStatus("No exportable texts", "warn"); return; }
     body.texts = result.items;
     body.rects = result.rects;
   } else if (options.text_warp_mode === "text") {
     const result = buildKraTexts(options);
-    if (result.items.length === 0) {
-      if (typeof flashStatus === "function") {
-        flashStatus("No exportable texts", "warn");
-      }
-      return;
-    }
+    if (result.items.length === 0) { flashStatus("No exportable texts", "warn"); return; }
     body.texts = result.items;
     body.rects = result.rects;
   } else if (options.text_warp_mode === "patch") {
     const patches = buildKraPatches(options);
-    if (patches.length === 0) {
-      if (typeof flashStatus === "function") {
-        flashStatus("No exportable patches", "warn");
-      }
-      return;
-    }
+    if (patches.length === 0) { flashStatus("No exportable patches", "warn"); return; }
     body.patches = patches;
   } else {
     const shapes = buildKraShapes(options);
-    if (shapes.length === 0) {
-      if (typeof flashStatus === "function") {
-        flashStatus("No exportable shapes", "warn");
-      }
-      return;
-    }
+    if (shapes.length === 0) { flashStatus("No exportable shapes", "warn"); return; }
     body.shapes = shapes;
   }
-
-  const defaultPath = "/tmp/cone_scene.kra";
-  const outputPath = window.prompt("Output .kra path:", defaultPath);
-  if (!outputPath) return;
-  body.output_path = outputPath;
 
   const count = (body.texts   ? body.texts.length
                : body.patches ? body.patches.length
@@ -1709,9 +1317,7 @@ async function generateKraFromScene() {
                : body.patches ? "patch(es)"
                               : "shape(s)");
 
-  if (typeof flashStatus === "function") {
-    flashStatus("Generating .kra (" + count + " " + kind + ")...", "");
-  }
+  flashStatus("Generating .kra (" + count + " " + kind + ")...", "");
 
   try {
     const response = await fetch("/generate-kra", {
@@ -1721,19 +1327,12 @@ async function generateKraFromScene() {
     });
     const result = await response.json();
     if (result && result.success) {
-      if (typeof flashStatus === "function") {
-        flashStatus(result.message || "Done", "ok");
-      }
+      flashStatus(result.message || "Done", "ok");
     } else {
-      const msg = (result && result.message) ? result.message : "unknown error";
-      if (typeof flashStatus === "function") {
-        flashStatus("Failed: " + msg, "bad");
-      }
+      flashStatus("Failed: " + ((result && result.message) ? result.message : "unknown error"), "bad");
     }
   } catch (e) {
-    if (typeof flashStatus === "function") {
-      flashStatus("Request failed: " + e.message, "bad");
-    }
+    flashStatus("Request failed: " + e.message, "bad");
   }
 }
 """

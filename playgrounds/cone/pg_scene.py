@@ -1,85 +1,74 @@
 """
 pg_scene.py — save and load the whole scene to JSON.
 
-The scene is the complete editable state of the workspace:
+ES module.  `applySceneJSON` replaces the contents of `quads` and
+`floatSquares` (in place — the arrays are const and other modules
+hold references) and calls `notifyChanged()`, so the boot's
+afterChange hook repaints the panel and canvas in one pass.
 
-    cone state      ax, ay, depth, halfAngle, ringCount, meridianCount
-    shapeDepthCone  the cone view's SHAPE_DEPTH_CONE multiplier
-    shapeStandingMult
-                    the global hinge standing-height multiplier
-    patches         id, name, phi0, phi1, s0, s1, mirror,
-                    mirrorAngle, mirrorFlip, warp
-    squares         id, name, quadId, u, v, scaleU, scaleV, theta,
-                    slope, visualBottom
-    id counters     nextQuadId, nextSquareId
-    kraOptions      the KRA-export meta-options block
+`_clearTransientState` clears the drag slots in `state` (from
+`pg_state`) and resets the selection.
 
-File shape:
+Dead `drawing` / `drawingPreview` locals removed (stage 1 cleanup).
 
-    {
-      "sceneVersion": 1,
-      "type":         "cone_scene",
-      "generatedAt":  "2026-...",
-      "cone":         { ... },
-      "shapeDepthCone": 0.5,
-      "shapeStandingMult": 2.0,
-      "nextQuadId":   3,
-      "nextSquareId": 5,
-      "patches":      [ ... ],
-      "squares":      [ ... ],
-      "kraOptions":   { ... }
-    }
+APEX IS SAVED / LOADED AS INTENT
+================================
+The cone's `ax` / `ay` in the scene file are the user's intended
+apex (`cone.axRaw` / `cone.ayRaw`), not the clamped display.
+Saving the display would bake the constraint of the depth the scene
+was saved at into the file, so a scene written at a shallow depth
+and reloaded at a deep one would silently keep the shrunken apex.
+Saving intent means the scene behaves the same way at any depth;
+`clampApex` is called after loading to derive the initial display.
 
-The "type" field is a plain string tag so a scene file can be
-distinguished from the visual-state export (which uses schemaVersion
-and has a completely different shape).
-
-Applying a scene
-================
-The scene replaces the contents of `quads` and `floatSquares` without
-rebinding them — the arrays are cleared by truncation and refilled by
-push — because they are `const` and other modules hold references to
-the same objects.
-
-STAGE 1 CLEANUP
-===============
-`_clearTransientState` used to clear two locals, `drawing` and
-`drawingPreview`, that no longer exist anywhere in the codebase
-(they were from an earlier "draw a patch freeform" experiment).
-The `typeof ... !== "undefined"` guards made the lines legal but
-dead.  Removed.
+Field name in the JSON is unchanged (`cone.ax` / `cone.ay`) for
+backwards compatibility with existing scene files; only the
+semantics of what is stored changed. Old scenes still load — their
+previously-clamped values simply become the intent, which is
+correct for the depth they were saved at and now behaves sensibly
+at any other depth.
 """
 
-
 SCENE_JS = r"""
-/* ==========================================================================
-   SCENE SAVE / LOAD
-   ========================================================================== */
+import {
+  quads, floatSquares, coneState, SHAPE_STATE, state,
+  view, cone, quadIdxById, clampApex, clampCloneV, syncPanelSliders,
+  notifyChanged,
+} from "./pg_state.js";
+import { SHAPE_DEFAULT_SCALE } from "./pg_view_squares_core.js";
+import { readKraOptionsFromDOM, applyKraOptionsToDOM } from "./pg_kra.js";
+import { flashStatus } from "./pgkit/panel_core.js";
 
 const SCENE_VERSION = 1;
 const SCENE_TYPE    = "cone_scene";
 const SCENE_FILE    = "cone_scene.json";
 
-function buildSceneJSON() {
+export function buildSceneJSON() {
   return {
     sceneVersion: SCENE_VERSION,
     type:         SCENE_TYPE,
     generatedAt:  new Date().toISOString(),
 
     cone: {
-      ax:            cone.ax,
-      ay:            cone.ay,
+      // Save the INTENT (axRaw/ayRaw), not the clamped display. The
+      // displayed apex depends on depth and may already be clamped;
+      // saving it would bake the constraint into the scene file, so
+      // reloading at a different depth would lose the user's original
+      // offset. Saving raw means the same scene file behaves the same
+      // way at any depth it is loaded at.
+      ax:            cone.axRaw,
+      ay:            cone.ayRaw,
       depth:         cone.depth,
       halfAngle:     cone.halfAngle,
       ringCount:     cone.ringCount,
       meridianCount: cone.meridianCount,
     },
 
-    shapeDepthCone: SHAPE_DEPTH_CONE,
-    shapeStandingMult: SHAPE_STANDING_HEIGHT_MULT,
+    shapeDepthCone:    SHAPE_STATE.depthCone,
+    shapeStandingMult: SHAPE_STATE.standingMult,
 
-    nextQuadId:   nextQuadId,
-    nextSquareId: nextSquareId,
+    nextQuadId:   coneState.nextQuadId,
+    nextSquareId: coneState.nextSquareId,
 
     patches: quads.map(q => ({
       id:   q.id,
@@ -109,12 +98,11 @@ function buildSceneJSON() {
     })),
 
     kraOptions: (typeof readKraOptionsFromDOM === "function")
-                  ? readKraOptionsFromDOM()
-                  : undefined,
+                  ? readKraOptionsFromDOM() : undefined,
   };
 }
 
-function saveSceneJSON() {
+export function saveSceneJSON() {
   const text = JSON.stringify(buildSceneJSON(), null, 2);
   const url  = "data:application/json;charset=utf-8,"
              + encodeURIComponent(text);
@@ -125,10 +113,8 @@ function saveSceneJSON() {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  if (typeof flashStatus === "function") {
-    flashStatus("Saved " + quads.length + " patch(es) and "
-                + floatSquares.length + " shape(s)", "ok");
-  }
+  flashStatus("Saved " + quads.length + " patch(es) and "
+              + floatSquares.length + " shape(s)", "ok");
 }
 
 function _clearTransientState() {
@@ -145,11 +131,11 @@ function _clearTransientState() {
     state.mouse.inside = false;
   }
 
-  selectedQuad   = -1;
-  selectedSquare = -1;
+  coneState.selectedQuad   = -1;
+  coneState.selectedSquare = -1;
 }
 
-function applySceneJSON(data) {
+export function applySceneJSON(data) {
   if (!data || typeof data !== "object") {
     throw new Error("scene: not an object");
   }
@@ -165,22 +151,26 @@ function applySceneJSON(data) {
 
   if (data.cone && typeof data.cone === "object") {
     const c = data.cone;
-    if (typeof c.ax            === "number") cone.ax            = c.ax;
-    if (typeof c.ay            === "number") cone.ay            = c.ay;
+    // Depth and half-angle first: the clamped display depends on them,
+    // so clampApex must run *after* they are set.
     if (typeof c.depth         === "number") cone.depth         = c.depth;
     if (typeof c.halfAngle     === "number") cone.halfAngle     = c.halfAngle;
     if (typeof c.ringCount     === "number") cone.ringCount     = c.ringCount;
     if (typeof c.meridianCount === "number") cone.meridianCount = c.meridianCount;
+    // Save files carry the intent in ax/ay (see buildSceneJSON).
+    if (typeof c.ax === "number") cone.axRaw = c.ax;
+    if (typeof c.ay === "number") cone.ayRaw = c.ay;
+    clampApex();
   }
 
   if (typeof data.shapeDepthCone === "number") {
-    SHAPE_DEPTH_CONE = data.shapeDepthCone;
+    SHAPE_STATE.depthCone = data.shapeDepthCone;
   } else if (typeof data.shapeDepth === "number") {
-    SHAPE_DEPTH_CONE = data.shapeDepth;
+    SHAPE_STATE.depthCone = data.shapeDepth;
   }
 
   if (typeof data.shapeStandingMult === "number") {
-    SHAPE_STANDING_HEIGHT_MULT =
+    SHAPE_STATE.standingMult =
       Math.max(0.05, Math.min(10, data.shapeStandingMult));
   }
 
@@ -246,12 +236,10 @@ function applySceneJSON(data) {
   let maxSquareId = 0;
   for (const q of quads)        maxQuadId   = Math.max(maxQuadId,   q.id);
   for (const s of floatSquares) maxSquareId = Math.max(maxSquareId, s.id);
-  nextQuadId   = Math.max(maxQuadId   + 1,
-                          (typeof data.nextQuadId   === "number")
-                            ? data.nextQuadId   : 1);
-  nextSquareId = Math.max(maxSquareId + 1,
-                          (typeof data.nextSquareId === "number")
-                            ? data.nextSquareId : 1);
+  coneState.nextQuadId   = Math.max(maxQuadId   + 1,
+    (typeof data.nextQuadId   === "number") ? data.nextQuadId   : 1);
+  coneState.nextSquareId = Math.max(maxSquareId + 1,
+    (typeof data.nextSquareId === "number") ? data.nextSquareId : 1);
 
   _clearTransientState();
 
@@ -262,32 +250,25 @@ function applySceneJSON(data) {
   }
 
   syncPanelSliders();
-  syncQuadList();
-  draw();
+  notifyChanged();
 }
 
-function loadSceneFromText(text) {
+export function loadSceneFromText(text) {
   let data;
   try {
     data = JSON.parse(text);
   } catch (e) {
-    if (typeof flashStatus === "function") {
-      flashStatus("Load failed: not valid JSON", "bad");
-    }
+    flashStatus("Load failed: not valid JSON", "bad");
     return false;
   }
   try {
     applySceneJSON(data);
   } catch (e) {
-    if (typeof flashStatus === "function") {
-      flashStatus("Load failed: " + e.message, "bad");
-    }
+    flashStatus("Load failed: " + e.message, "bad");
     return false;
   }
-  if (typeof flashStatus === "function") {
-    flashStatus("Loaded " + quads.length + " patch(es) and "
-                + floatSquares.length + " shape(s)", "ok");
-  }
+  flashStatus("Loaded " + quads.length + " patch(es) and "
+              + floatSquares.length + " shape(s)", "ok");
   return true;
 }
 
@@ -308,9 +289,7 @@ function _installSceneFileInput() {
       inp.value = "";
     };
     reader.onerror = () => {
-      if (typeof flashStatus === "function") {
-        flashStatus("Load failed: could not read file", "bad");
-      }
+      flashStatus("Load failed: could not read file", "bad");
       inp.value = "";
     };
     reader.readAsText(file);
@@ -320,7 +299,7 @@ function _installSceneFileInput() {
   return inp;
 }
 
-function promptLoadScene() {
+export function promptLoadScene() {
   _installSceneFileInput().click();
 }
 """

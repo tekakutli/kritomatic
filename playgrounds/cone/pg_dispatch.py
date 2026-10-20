@@ -1,61 +1,78 @@
 """
 pg_dispatch.py — draw() and the canvas event listeners.
 
-Four drag modes, mutually exclusive:
+ES module.  Exports `draw` and `updateStatus`.  Owns the drag `state`
+(from `pg_state`) and every mouse/wheel/key handler.
 
-    dragApex        apex tilt / depth pull from the cone band
-    dragQuadVertex  a patch's corner, either band (gated)
-    dragSquare      a floating square from the cone band
-    flatDrag        a patch's corner/edge/body from the flat band
-                    (gated)
-    flatSquareDrag  a floating square from the flat band
-    dragPatchBody   a patch moved by dragging its body
+STAGE 1 OPTIMIZATIONS (preserved)
+================================
+    MOUSEMOVE FAST PATH       pure hover updates status only, no draw
+    CURSOR SET ONLY ON CHANGE `_setCursor` compares first
+    REDUNDANT FILL REMOVED    outer full-canvas clear gone
 
-STAGE 1 OPTIMIZATIONS
-=====================
-    MOUSEMOVE FAST PATH
-        The mousemove handler used to call `draw()` at the end
-        unconditionally — pure hover re-rendered the entire cone
-        view (gradients, meridians, rings) and the entire flat
-        view (grid, cardinal markers) and every square and label,
-        sixty times per second.  Most of that work was identical
-        frame to frame.
+STAGE 3 CHANGES (preserved)
+===========================
+    wheel      → pgkitNotifyLocal for cone.depth / cone.apexX / cone.apexY
+    mouseup    → notifyChanged() after any drag released
 
-        The handler now distinguishes three cases:
-            dragTool active  → draw (rubber-band preview)
-            any drag active  → draw (positions changing)
-            pure hover       → updateStatus only, no draw
+SHIFT+CLICK COORDINATE FIX
+==========================
+`addSquareAt` from pg_state takes NORMALIZED (uHat, vHat) where 0 is
+the patch centre and the patch spans roughly [-1, 1].  This file
+converts from local units via `f.uLen` / `f.vLen` before calling it.
+Before the fix, raw local coords were passed and the shim divided by
+`dPhi * 4` / `dS * 4`, which produced a wrong u/v and placed new
+squares off-centre — visually, shift+clicking a patch dropped a
+square at the wrong position (sometimes outside the patch).
 
-        Hover now costs ~one DOM write per mousemove.  Frame cost
-        during a drag is unchanged, but the inter-frame cost drops
-        to zero.
-
-    CURSOR — SET ONLY ON CHANGE
-        `canvas.style.cursor = X` triggers a style recalc even
-        when X equals the current value.  `_setCursor` tracks the
-        last value in JS and only writes when it changes.  Used
-        everywhere a drag state sets the cursor.
-
-    REMOVED REDUNDANT FULL-CANVAS FILL
-        `draw()` used to clear the whole canvas before drawing
-        the cone band (which fills its own band) and the flat band
-        (which fills its own band).  The outer clear was only
-        visible in the 2px divider strip that the divider lines
-        then paint over.  Removed — one fewer full-canvas fill
-        per frame.
+APEX DRAG / WHEEL NOW WRITE / RE-DERIVE VIA RAW
+===============================================
+The apex drag in mousemove writes `cone.axRaw` / `cone.ayRaw` — the
+intent — and calls `clampApex()` so the display reflects the current
+depth.  The wheel handler changes `cone.depth`, then calls
+`clampApex()`, which re-derives display from the *unchanged* intent
+against the new depth.  This is what makes zoom-out-then-in
+reversible for the shapes' perspective: the clamp is no longer
+destructive, so a smaller base at lower depth cannot irreversibly
+shrink the apex.  See pg_state.py's DUAL APEX section.
 """
 
 DISPATCH_JS = r"""
-/* ==========================================================================
-   DRAG DELTA CAPS
-   ========================================================================== */
+import {
+  canvas, ctx, env, view, layout, cone, quads, floatSquares,
+  coneState, state, drawTool, PATCH_SHAPE_EDIT_ENABLED,
+  w2s, s2w, surfacePoint, clampApex,
+  projectToConeSurface, syncPanelSliders,
+  addSquareAt, quadIdxById, quadCorners,
+  notifyChanged,
+} from "./pg_state.js";
+import {
+  patchFrame, screenToFrame,
+  shapeVMax, shapePerspCentre,
+  squareAnchorCornerLocal, squareCenterLocal, setClonePosition,
+  squareDims, SHAPE_DEPTH_FLAT, effectiveConeDepth,
+  applyPatchDragFromStart, flatMoveCorner, flatMoveEdge,
+} from "./pg_view_squares_core.js";
+import {
+  squareHitTest, squareMirrorHitTest, findPatchAtScreen,
+  cursorToLocalShapeRelativeExactWith,
+  resizeSquareFromCorner, rotateSquareToCursor,
+} from "./pg_view_squares_edit.js";
+import {
+  flatCursorToShapeLocal, flatResizeSquareFromCornerIdx,
+  flatRotateSquareToCursor, squareFlatHitTest, squareFlatMirrorHitTest,
+} from "./pg_view_squares_flat.js";
+import { squareCornersScreen } from "./pg_view_squares_proj.js";
+import { drawConeView } from "./pg_view_cone.js";
+import { drawFlatView, flatHitTest } from "./pg_view_flat.js";
+import { screenToFlat } from "./pg_flat_math.js";
+import { syncQuadList } from "./pg_panel_lists.js";
+import { _syncPatchCoordInputs } from "./pg_panel_fields.js";
+import { addDrawPoint } from "./pg_core.js";
+import { pgkitNotifyLocal } from "./pgkit/remote_client.js";
 
 const BODY_DRAG_MAX_DU = 4.0;
 const BODY_DRAG_MAX_DV = 4.0;
-
-/* ==========================================================================
-   CURSOR STATE
-   ========================================================================== */
 
 let _lastCursor = "crosshair";
 function _setCursor(c) {
@@ -68,11 +85,11 @@ function _setCursor(c) {
    DRAW
    ========================================================================== */
 
-function draw() {
+export function draw() {
   const cw = window.innerWidth;
   const ch = window.innerHeight;
 
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.setTransform(env.dpr, 0, 0, env.dpr, 0, 0);
 
   ctx.save();
   ctx.beginPath(); ctx.rect(0, 0, cw, layout.coneH); ctx.clip();
@@ -131,7 +148,7 @@ function draw() {
    STATUS
    ========================================================================== */
 
-function updateStatus() {
+export function updateStatus() {
   const el = document.getElementById("status");
   if (!el) return;
 
@@ -209,11 +226,12 @@ function findQuadVertexAt(sx, sy) {
   let best = null, bestD = R_HIT;
 
   const order = [];
-  if (selectedQuad >= 0 && selectedQuad < quads.length) {
-    order.push(selectedQuad);
+  if (coneState.selectedQuad >= 0 &&
+      coneState.selectedQuad < quads.length) {
+    order.push(coneState.selectedQuad);
   }
   for (let i = 0; i < quads.length; i++) {
-    if (i !== selectedQuad) order.push(i);
+    if (i !== coneState.selectedQuad) order.push(i);
   }
 
   for (const qi of order) {
@@ -242,11 +260,11 @@ function _beginConePatchDragFromSquareIdx(squareIdx, sx, sy) {
   if (qi < 0) return false;
 
   const q = quads[qi];
-  if (qi !== selectedQuad) {
-    selectedQuad = qi;
+  if (qi !== coneState.selectedQuad) {
+    coneState.selectedQuad = qi;
     syncQuadList();
   }
-  selectedSquare = -1;
+  coneState.selectedSquare = -1;
 
   const [wx, wy] = s2w(sx, sy);
   const p0 = projectToConeSurface(wx, wy, (q.s0 + q.s1) / 2);
@@ -270,11 +288,11 @@ function _beginFlatPatchDragFromSquareIdx(squareIdx, sx, sy) {
   if (qi < 0) return false;
 
   const q = quads[qi];
-  if (qi !== selectedQuad) {
-    selectedQuad = qi;
+  if (qi !== coneState.selectedQuad) {
+    coneState.selectedQuad = qi;
     syncQuadList();
   }
-  selectedSquare = -1;
+  coneState.selectedSquare = -1;
 
   const p = screenToFlat(sx, sy);
   state.flatDrag = {
@@ -310,18 +328,14 @@ canvas.addEventListener("mousedown", (e) => {
 
   const passThrough = e.altKey;
 
-  /* ---- cone band ------------------------------------------------ */
   if (sy < layout.dividerY) {
 
     const sqHit = squareHitTest(sx, sy);
 
     if (passThrough) {
       let hit = sqHit;
-      if (!hit) {
-        hit = squareMirrorHitTest(sx, sy);
-      }
-      if (hit && _beginConePatchDragFromSquareIdx(hit.squareIdx,
-                                                  sx, sy)) {
+      if (!hit) hit = squareMirrorHitTest(sx, sy);
+      if (hit && _beginConePatchDragFromSquareIdx(hit.squareIdx, sx, sy)) {
         return;
       }
     }
@@ -332,9 +346,10 @@ canvas.addEventListener("mousedown", (e) => {
         const f = patchFrame(patchIdx);
         if (f) {
           const lc = screenToFrame(f, sx, sy);
-          addSquareAt(patchIdx, lc.u, lc.v);
-          if (patchIdx !== selectedQuad) {
-            selectedQuad = patchIdx;
+          // Local units → normalized units (patch spans roughly [-1, 1]).
+          addSquareAt(patchIdx, lc.u / f.uLen, lc.v / f.vLen);
+          if (patchIdx !== coneState.selectedQuad) {
+            coneState.selectedQuad = patchIdx;
             syncQuadList();
           }
           draw();
@@ -346,11 +361,11 @@ canvas.addEventListener("mousedown", (e) => {
     if (!passThrough && sqHit) {
       const sq = floatSquares[sqHit.squareIdx];
       const qi = quadIdxById(sq.quadId);
-      if (qi >= 0 && qi !== selectedQuad) {
-        selectedQuad = qi;
+      if (qi >= 0 && qi !== coneState.selectedQuad) {
+        coneState.selectedQuad = qi;
         syncQuadList();
       }
-      selectedSquare = sqHit.squareIdx;
+      coneState.selectedSquare = sqHit.squareIdx;
 
       if (sqHit.kind === "rotate") {
         state.dragSquare = {
@@ -398,11 +413,11 @@ canvas.addEventListener("mousedown", (e) => {
     if (!passThrough && PATCH_SHAPE_EDIT_ENABLED) {
       const vHit = findQuadVertexAt(sx, sy);
       if (vHit) {
-        if (vHit.quadIdx !== selectedQuad) {
-          selectedQuad = vHit.quadIdx;
+        if (vHit.quadIdx !== coneState.selectedQuad) {
+          coneState.selectedQuad = vHit.quadIdx;
           syncQuadList();
         }
-        selectedSquare = -1;
+        coneState.selectedSquare = -1;
         state.dragQuadVertex = vHit;
         _setCursor("grabbing");
         draw();
@@ -413,11 +428,11 @@ canvas.addEventListener("mousedown", (e) => {
     const patchHit = findPatchAtScreen(sx, sy);
     if (patchHit >= 0) {
       const q = quads[patchHit];
-      if (patchHit !== selectedQuad) {
-        selectedQuad = patchHit;
+      if (patchHit !== coneState.selectedQuad) {
+        coneState.selectedQuad = patchHit;
         syncQuadList();
       }
-      selectedSquare = -1;
+      coneState.selectedSquare = -1;
 
       const [wx, wy] = s2w(sx, sy);
       const p0 = projectToConeSurface(wx, wy, (q.s0 + q.s1) / 2);
@@ -435,7 +450,7 @@ canvas.addEventListener("mousedown", (e) => {
       return;
     }
 
-    selectedSquare = -1;
+    coneState.selectedSquare = -1;
     state.dragApex = {
       startSx: sx, startSy: sy,
       startAx: cone.ax, startAy: cone.ay,
@@ -444,15 +459,12 @@ canvas.addEventListener("mousedown", (e) => {
     return;
   }
 
-  /* ---- flat band ------------------------------------------------ */
-
   const sqFlatHit = squareFlatHitTest(sx, sy);
 
   if (passThrough) {
     let hit = sqFlatHit;
     if (!hit) hit = squareFlatMirrorHitTest(sx, sy);
-    if (hit && _beginFlatPatchDragFromSquareIdx(hit.squareIdx,
-                                                sx, sy)) {
+    if (hit && _beginFlatPatchDragFromSquareIdx(hit.squareIdx, sx, sy)) {
       return;
     }
   }
@@ -460,11 +472,11 @@ canvas.addEventListener("mousedown", (e) => {
   if (!passThrough && sqFlatHit) {
     const sq = floatSquares[sqFlatHit.squareIdx];
     const qi = quadIdxById(sq.quadId);
-    if (qi >= 0 && qi !== selectedQuad) {
-      selectedQuad = qi;
+    if (qi >= 0 && qi !== coneState.selectedQuad) {
+      coneState.selectedQuad = qi;
       syncQuadList();
     }
-    selectedSquare = sqFlatHit.squareIdx;
+    coneState.selectedSquare = sqFlatHit.squareIdx;
 
     if (sqFlatHit.kind === "rotate") {
       state.flatSquareDrag = {
@@ -502,17 +514,17 @@ canvas.addEventListener("mousedown", (e) => {
 
   const hHit = flatHitTest(sx, sy);
   if (!hHit) {
-    selectedQuad = -1;
-    selectedSquare = -1;
+    coneState.selectedQuad = -1;
+    coneState.selectedSquare = -1;
     syncQuadList();
     draw();
     return;
   }
-  if (hHit.quadIdx !== selectedQuad) {
-    selectedQuad = hHit.quadIdx;
+  if (hHit.quadIdx !== coneState.selectedQuad) {
+    coneState.selectedQuad = hHit.quadIdx;
     syncQuadList();
   }
-  selectedSquare = -1;
+  coneState.selectedSquare = -1;
 
   const p = screenToFlat(sx, sy);
   const q = quads[hHit.quadIdx];
@@ -530,17 +542,9 @@ canvas.addEventListener("mousedown", (e) => {
 
   if (!passThrough && PATCH_SHAPE_EDIT_ENABLED) {
     if (hHit.kind === "corner") {
-      flatDrag = {
-        mode: "corner",
-        quadIdx: hHit.quadIdx,
-        cornerIdx: hHit.cornerIdx,
-      };
+      flatDrag = { mode: "corner", quadIdx: hHit.quadIdx, cornerIdx: hHit.cornerIdx };
     } else if (hHit.kind === "edge") {
-      flatDrag = {
-        mode: "edge",
-        quadIdx: hHit.quadIdx,
-        edge: hHit.edge,
-      };
+      flatDrag = { mode: "edge", quadIdx: hHit.quadIdx, edge: hHit.edge };
     }
   }
 
@@ -555,10 +559,8 @@ window.addEventListener("mousemove", (e) => {
   const sy = e.clientY - rect.top;
   state.mouse.sx = sx; state.mouse.sy = sy;
   state.mouse.inside = (sx >= 0 && sy >= 0 &&
-                        sx < window.innerWidth &&
-                        sy < window.innerHeight);
+                        sx < window.innerWidth && sy < window.innerHeight);
 
-  /* Draw tool active: live preview. */
   if (drawTool.active) {
     drawTool.hover = [sx, sy];
     draw();
@@ -591,16 +593,13 @@ window.addEventListener("mousemove", (e) => {
                        sx, sy);
           let dU = lc.u - ds.startCursorU;
           let dV = lc.v - ds.startCursorV;
-
           if (e.shiftKey) dU = 0;
-
           const maxDU = BODY_DRAG_MAX_DU * f.uLen;
           const maxDV = BODY_DRAG_MAX_DV * f.vLen;
           if (dU >  maxDU) dU =  maxDU;
           if (dU < -maxDU) dU = -maxDU;
           if (dV >  maxDV) dV =  maxDV;
           if (dV < -maxDV) dV = -maxDV;
-
           const newU = ds.startCenterU + dU;
           const newV = ds.startCenterV + dV;
           setClonePosition(sq, newU, newV);
@@ -622,8 +621,13 @@ window.addEventListener("mousemove", (e) => {
     dragging = true;
     const dSx = sx - state.dragApex.startSx;
     const dSy = sy - state.dragApex.startSy;
-    cone.ax = state.dragApex.startAx + dSx / view.scale;
-    cone.ay = state.dragApex.startAy - dSy / view.scale;
+    // Write the INTENT, not the displayed value. clampApex derives the
+    // displayed apex from the intent against the current depth; the
+    // drag sees the result immediately through cone.ax/ay on the next
+    // draw. This matches the pre-fix feel during drag while keeping
+    // the original intent intact for a later zoom-in to restore.
+    cone.axRaw = state.dragApex.startAx + dSx / view.scale;
+    cone.ayRaw = state.dragApex.startAy - dSy / view.scale;
     clampApex();
   } else if (state.dragPatchBody) {
     dragging = true;
@@ -651,16 +655,13 @@ window.addEventListener("mousemove", (e) => {
           if (f) {
             let dU = lc.u - fsd.startCursorU;
             let dV = lc.v - fsd.startCursorV;
-
             if (e.shiftKey) dU = 0;
-
             const maxDU = BODY_DRAG_MAX_DU * f.uLen;
             const maxDV = BODY_DRAG_MAX_DV * f.vLen;
             if (dU >  maxDU) dU =  maxDU;
             if (dU < -maxDU) dU = -maxDU;
             if (dV >  maxDV) dV =  maxDV;
             if (dV < -maxDV) dV = -maxDV;
-
             const uWorld = fsd.startCenterU * f.uLen + dU;
             const vWorld = fsd.startCenterV * f.vLen + dV;
             setClonePosition(sq, uWorld, vWorld);
@@ -695,16 +696,15 @@ window.addEventListener("mousemove", (e) => {
     draw();
     return;
   }
-
-  // Pure hover: only the status readout needs refreshing.
   updateStatus();
 });
 
 window.addEventListener("mouseup", () => {
   if (drawTool.active) return;
-  if (state.dragQuadVertex || state.dragApex ||
-      state.flatDrag || state.dragSquare || state.flatSquareDrag ||
-      state.dragPatchBody) {
+  const hadDrag = !!(state.dragQuadVertex || state.dragApex ||
+                     state.flatDrag || state.dragSquare ||
+                     state.flatSquareDrag || state.dragPatchBody);
+  if (hadDrag) {
     state.dragQuadVertex = null;
     state.dragApex       = null;
     state.flatDrag       = null;
@@ -712,6 +712,7 @@ window.addEventListener("mouseup", () => {
     state.flatSquareDrag = null;
     state.dragPatchBody  = null;
     _setCursor("crosshair");
+    notifyChanged();
   }
 });
 
@@ -723,8 +724,16 @@ canvas.addEventListener("wheel", (e) => {
   e.preventDefault();
   const factor = e.deltaY < 0 ? 1.08 : 1 / 1.08;
   cone.depth = Math.max(3, Math.min(40, cone.depth * factor));
+  // Re-derive the DISPLAYED apex from the INTENT (cone.axRaw/ayRaw)
+  // against the new depth. This is what makes the clamp reversible:
+  // a zoom-out shrinks the base radius and may push the displayed
+  // apex inward, but the intent is untouched, so a zoom-in restores
+  // the displayed apex — and with it, the shapes' projection from it.
   clampApex();
   syncPanelSliders();
+  pgkitNotifyLocal("cone.depth");
+  pgkitNotifyLocal("cone.apexX");
+  pgkitNotifyLocal("cone.apexY");
   draw();
 }, { passive: false });
 

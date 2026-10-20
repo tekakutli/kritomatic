@@ -1,18 +1,47 @@
 """
 pg_view_squares_edit.py — drag solvers and edit operations.
 
-The cone-band hit test, the four cursor→local inverse solvers, the
-corner-resize / rotate entry points, and the two quick-rotate
-operations.  All the solvers invert the UN-WARPED projection; a
-drag on a strongly warped square tracks the cursor approximately,
-with a discrepancy that vanishes at warp = 0.
+ES module.  The cone-band hit test, the four cursor→local inverse
+solvers, the corner-resize / rotate entry points, and the two
+quick-rotate operations.
 
-This file is edited when the drag mechanics or the inverse solvers
-change.  See the ANCHORED RESIZE and INVERSION sections of
-pg_view_squares.py.
+All the solvers invert the UN-WARPED projection; a drag on a
+strongly warped square tracks the cursor approximately, with a
+discrepancy that vanishes at warp = 0.
+
+IMPORT HYGIENE
+==============
+All imports are at the top of the module.  Earlier revisions had
+`import { quads, cone } from "./pg_state.js";` and `import { callDraw
+} ...` mid-body — harmless (imports hoist) but confusing to read.
+Consolidated here.
 """
 
 SQUARES_EDIT_JS = r"""
+import {
+  floatSquares, coneState, quads, cone,
+  quadIdxById, horizonLocal, clampCloneV, surfacePoint,
+  view, w2s, callDraw,
+} from "./pg_state.js";
+import {
+  patchFrame,
+  screenToFrame,
+  shapeVMax,
+  shapePerspCentre,
+  _shapeAspectScales,
+  clampShapeScales,
+  _ptInQuadPx,
+  _withSquareMirror,
+  effectiveConeDepth,
+  ROTATE_HANDLE_R,
+  ROTATE_JUMP_STEP,
+} from "./pg_view_squares_core.js";
+import {
+  squareCornersScreen,
+  squareRotateHandleScreen,
+} from "./pg_view_squares_proj.js";
+import { flashStatus } from "./pgkit/panel_core.js";
+
 /* ==========================================================================
    HIT TESTING — cone band
    ========================================================================== */
@@ -22,11 +51,12 @@ const SQUARE_BODY_MIN_R = 8;
 
 function _squareHitOrder() {
   const order = [];
-  if (selectedSquare >= 0 && selectedSquare < floatSquares.length) {
-    order.push(selectedSquare);
+  if (coneState.selectedSquare >= 0 &&
+      coneState.selectedSquare < floatSquares.length) {
+    order.push(coneState.selectedSquare);
   }
   for (let i = 0; i < floatSquares.length; i++) {
-    if (i !== selectedSquare) order.push(i);
+    if (i !== coneState.selectedSquare) order.push(i);
   }
   return order;
 }
@@ -60,7 +90,7 @@ function _squareHitTestOne(si, sx, sy) {
   return null;
 }
 
-function squareHitTest(sx, sy) {
+export function squareHitTest(sx, sy) {
   for (const si of _squareHitOrder()) {
     const hit = _squareHitTestOne(si, sx, sy);
     if (hit) return hit;
@@ -68,7 +98,7 @@ function squareHitTest(sx, sy) {
   return null;
 }
 
-function squareMirrorHitTest(sx, sy) {
+export function squareMirrorHitTest(sx, sy) {
   for (const si of _squareHitOrder()) {
     const sq = floatSquares[si];
     if (!sq) continue;
@@ -81,10 +111,13 @@ function squareMirrorHitTest(sx, sy) {
   return null;
 }
 
-function findPatchAtScreen(sx, sy) {
+export function findPatchAtScreen(sx, sy) {
   for (let qi = quads.length - 1; qi >= 0; qi--) {
     const q = quads[qi];
-    const corners = quadCorners(q).map(c => {
+    const corners = [
+      { phi: q.phi0, s: q.s1 }, { phi: q.phi1, s: q.s1 },
+      { phi: q.phi1, s: q.s0 }, { phi: q.phi0, s: q.s0 },
+    ].map(c => {
       const [wx, wy] = surfacePoint(c.phi, c.s);
       return w2s(wx, wy);
     });
@@ -95,13 +128,10 @@ function findPatchAtScreen(sx, sy) {
 
 /* ==========================================================================
    INVERSE #1 — shape-relative taper, EXACT (quadratic)
-   ==========================================================================
-   Assumes the shape is FLAT on the patch plane and the patch is
-   UN-WARPED.  A drag on a hinged or warped shape lands the corner
-   at the un-hinged, un-warped (u, v) of the cursor. */
+   ========================================================================== */
 
-function cursorToLocalShapeRelativeExactWith(f, qi, vC, pC, vMax,
-                                             sx, sy) {
+export function cursorToLocalShapeRelativeExactWith(f, qi, vC, pC, vMax,
+                                                    sx, sy) {
   if (vMax < 1e-6) return screenToFrame(f, sx, sy);
 
   const A0 = pC + vC / vMax;
@@ -182,7 +212,7 @@ function cursorToLocalShapeRelativeExactWith(f, qi, vC, pC, vMax,
   return { u, v };
 }
 
-function cursorToLocalShapeRelativeExact(f, qi, sq, sx, sy) {
+export function cursorToLocalShapeRelativeExact(f, qi, sq, sx, sy) {
   const h = horizonLocal(qi);
   if (!h) return screenToFrame(f, sx, sy);
   const vMax = shapeVMax(sq);
@@ -192,10 +222,10 @@ function cursorToLocalShapeRelativeExact(f, qi, sq, sx, sy) {
 }
 
 /* ==========================================================================
-   INVERSE #2 — full per-vertex quadratic (preserved)
+   INVERSE #2 / #3 — preserved (full per-vertex, iterative)
    ========================================================================== */
 
-function cursorToLocalFullPersp(f, qi, sx, sy) {
+export function cursorToLocalFullPersp(f, qi, sx, sy) {
   const h = horizonLocal(qi);
   if (!h) return screenToFrame(f, sx, sy);
   const vMax = h.vHat * f.vLen;
@@ -255,11 +285,7 @@ function cursorToLocalFullPersp(f, qi, sx, sy) {
   return { u, v };
 }
 
-/* ==========================================================================
-   INVERSE #3 — shape-relative, iterative (preserved)
-   ========================================================================== */
-
-function cursorToLocalWithPersp(f, qi, sq, sx, sy) {
+export function cursorToLocalWithPersp(f, qi, sq, sx, sy) {
   const pC = shapePerspCentre(sq);
   const vMax = shapeVMax(sq);
   const vC = sq.v * f.vLen;
@@ -289,8 +315,8 @@ function cursorToLocalWithPersp(f, qi, sq, sx, sy) {
    SHARED EDIT OPERATIONS
    ========================================================================== */
 
-function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale,
-                                 anchorU, anchorV) {
+export function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale,
+                                        anchorU, anchorV) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const q = quads[qi];
@@ -309,15 +335,12 @@ function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale,
   const sinT = Math.sin(sq.theta || 0);
 
   const signs = [[-1, +1], [+1, +1], [+1, -1], [-1, -1]][cornerIdx];
-  const sx = signs[0], sy = signs[1];
+  const sxSign = signs[0], sySign = signs[1];
 
-  const refHWmin = SHAPE_MIN_SCALE * SHAPE_REL_SIZE / 2;
-  const refHHmin = SHAPE_MIN_SCALE * SHAPE_REL_SIZE / 2 * depthScale;
+  const refHWmin = 0.03 * 2.0 / 2;
+  const refHHmin = 0.03 * 2.0 / 2 * depthScale;
 
   if (anchorU !== undefined && anchorV !== undefined) {
-    const midU = (anchorU + cu) / 2;
-    const midV = (anchorV + cv) / 2;
-
     const pu = (cu - anchorU) / (2 * Ku);
     const pv = (cv - anchorV) / (2 * Kv);
 
@@ -327,12 +350,12 @@ function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale,
     refHW = Math.max(Math.abs(refHW), refHWmin);
     refHH = Math.max(Math.abs(refHH), refHHmin);
 
-    sq.scaleU = refHW / (SHAPE_REL_SIZE / 2);
-    sq.scaleV = refHH / (SHAPE_REL_SIZE / 2 * depthScale);
+    sq.scaleU = refHW / (2.0 / 2);
+    sq.scaleV = refHH / (2.0 / 2 * depthScale);
     clampShapeScales(sq);
 
-    const duR = sx * refHW * cosT - sy * refHH * sinT;
-    const dvR = sx * refHW * sinT + sy * refHH * cosT;
+    const duR = sxSign * refHW * cosT - sySign * refHH * sinT;
+    const dvR = sxSign * refHW * sinT + sySign * refHH * cosT;
     const uHat = (anchorU + duR * Ku) / f.uLen;
     const vHat = (anchorV + dvR * Kv) / f.vLen;
     sq.u = uHat;
@@ -343,15 +366,15 @@ function setShapeFromCornerLocal(sq, cornerIdx, cu, cv, depthScale,
   const ux = ox * cosT + oy * sinT;
   const uy = oy * cosT - ox * sinT;
 
-  const refHW = Math.max(sx * ux, refHWmin);
-  const refHH = Math.max(sy * uy, refHHmin);
+  const refHW = Math.max(sxSign * ux, refHWmin);
+  const refHH = Math.max(sySign * uy, refHHmin);
 
-  sq.scaleU = refHW / (SHAPE_REL_SIZE / 2);
-  sq.scaleV = refHH / (SHAPE_REL_SIZE / 2 * depthScale);
+  sq.scaleU = refHW / (2.0 / 2);
+  sq.scaleV = refHH / (2.0 / 2 * depthScale);
   clampShapeScales(sq);
 }
 
-function setShapeRotationFromCursorLocal(sq, cu, cv, snap, startTheta) {
+export function setShapeRotationFromCursorLocal(sq, cu, cv, snap, startTheta) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const f = patchFrame(qi);
@@ -378,24 +401,22 @@ function setShapeRotationFromCursorLocal(sq, cu, cv, snap, startTheta) {
 }
 
 /* ==========================================================================
-   QUICK-ROTATE OPERATIONS
+   QUICK-ROTATE
    ========================================================================== */
 
-function alignShapeToAxis(sq) {
+export function alignShapeToAxis(sq) {
   const step = Math.PI / 4;
-  const theta = sq.theta || 0;
-  sq.theta = Math.round(theta / step) * step;
+  sq.theta = Math.round((sq.theta || 0) / step) * step;
 }
 
-function alignSelectedShapeToAxis() {
-  if (selectedSquare < 0 || selectedSquare >= floatSquares.length) {
-    if (typeof flashStatus === "function") {
-      flashStatus("No shape selected", "warn");
-    }
+export function alignSelectedShapeToAxis() {
+  if (coneState.selectedSquare < 0 ||
+      coneState.selectedSquare >= floatSquares.length) {
+    flashStatus("No shape selected", "warn");
     return false;
   }
-  alignShapeToAxis(floatSquares[selectedSquare]);
-  draw();
+  alignShapeToAxis(floatSquares[coneState.selectedSquare]);
+  callDraw();
   return true;
 }
 
@@ -403,8 +424,8 @@ function alignSelectedShapeToAxis() {
    CONE-BAND EDIT WRAPPERS
    ========================================================================== */
 
-function resizeSquareFromCorner(sq, cornerIdx, cursorWX, cursorWY,
-                                 anchorU, anchorV) {
+export function resizeSquareFromCorner(sq, cornerIdx, cursorWX, cursorWY,
+                                       anchorU, anchorV) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const f = patchFrame(qi);
@@ -420,7 +441,7 @@ function resizeSquareFromCorner(sq, cornerIdx, cursorWX, cursorWY,
   }
 }
 
-function rotateSquareToCursor(sq, cursorWX, cursorWY, snap, startTheta) {
+export function rotateSquareToCursor(sq, cursorWX, cursorWY, snap, startTheta) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return;
   const f = patchFrame(qi);

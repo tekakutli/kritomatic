@@ -1,28 +1,33 @@
 """
 pg_panel_lists.py — the two selection lists.
 
-The Patches section of the panel carries a scrollable list of every
-patch, and the Squares section carries a list of the squares on the
-currently-selected patch.  Each row shows a hue swatch, an editable
-name field, and a delete button; clicking the row selects.
+ES module.  `syncQuadList` rebuilds the patch list, calls
+`syncSquareList` for the squares of the selected patch, and ends
+with `pgkitNotifyEntities()`.
 
-Both lists are rebuilt from scratch on every sync — the DOM is
-small, and rebuilding is simpler than reconciling.  Each row's
-label input suppresses the click that would bubble up and re-select
-the patch while the user is typing.
-
-The list sync functions are called from draw() (via updateStatus's
-neighbours) and from every place the selection or the model changes.
-They in turn call _syncPatchCoordInputs, so the field values follow
-the selection the same frame the list changes.
+Writes go through `notifyChanged()` (from state) which triggers the
+boot's afterChange hook (sync + draw + pgkitNotifyAll).  Editing the
+list rows themselves only mutates the model — the next sync reflects
+it.
 """
 
 PANEL_LISTS_JS = r"""
+import {
+  quads, floatSquares, coneState,
+  addQuad, cloneQuad, deleteQuad, cloneSquare, deleteSquare,
+  notifyChanged,
+} from "./pg_state.js";
+import {
+  patchHue, _huergb, squareDisplayName,
+} from "./pg_view_squares_core.js";
+import { _syncPatchCoordInputs } from "./pg_panel_fields.js";
+import { pgkitNotifyEntities } from "./pgkit/remote_client.js";
+
 /* ==========================================================================
    PATCH LIST
    ========================================================================== */
 
-function syncQuadList() {
+export function syncQuadList() {
   syncSquareList();
   _syncPatchCoordInputs();
 
@@ -34,12 +39,13 @@ function syncQuadList() {
     e.className = "empty";
     e.textContent = "no patches yet";
     list.appendChild(e);
+    pgkitNotifyEntities();
     return;
   }
   for (let i = 0; i < quads.length; i++) {
     const q   = quads[i];
     const hue = patchHue(q);
-    const isSel = (i === selectedQuad);
+    const isSel = (i === coneState.selectedQuad);
     const row = document.createElement("div");
     row.className = "quadRow" + (isSel ? " selected" : "");
     row.dataset.idx = String(i);
@@ -60,7 +66,6 @@ function syncQuadList() {
     lb.addEventListener("click",     (ev) => ev.stopPropagation());
     lb.addEventListener("input", () => {
       q.name = lb.value;
-      draw();
     });
     lb.addEventListener("keydown", (ev) => {
       if (ev.key === "Enter") { ev.preventDefault(); lb.blur(); }
@@ -68,7 +73,6 @@ function syncQuadList() {
         q.name = startName;
         lb.value = startName;
         lb.blur();
-        draw();
       }
     });
     row.appendChild(lb);
@@ -84,37 +88,33 @@ function syncQuadList() {
     row.appendChild(del);
 
     row.addEventListener("click", () => {
-      selectedQuad = i;
-      syncQuadList();
-      draw();
+      coneState.selectedQuad = i;
+      notifyChanged();
     });
 
     list.appendChild(row);
   }
+
+  pgkitNotifyEntities();
 }
 
 /* ==========================================================================
    SQUARE LIST
-   ==========================================================================
-   Shows only the squares on the currently-selected patch.  "+ Clone"
-   in the Squares row duplicates the selected square at the EXACT
-   same location as its source: same patch (quadId), same normalized
-   (u, v), same scaleU / scaleV, same theta, same slope, same
-   visualBottom.  The clone overlaps its source pixel-for-pixel
-   until it is dragged away. */
+   ========================================================================== */
 
-function syncSquareList() {
+export function syncSquareList() {
   const list = document.getElementById("squareList");
   if (!list) return;
   list.innerHTML = "";
-  if (selectedQuad < 0 || selectedQuad >= quads.length) {
+  if (coneState.selectedQuad < 0 ||
+      coneState.selectedQuad >= quads.length) {
     const e = document.createElement("div");
     e.className = "empty";
     e.textContent = "select a patch";
     list.appendChild(e);
     return;
   }
-  const activeQ = quads[selectedQuad];
+  const activeQ = quads[coneState.selectedQuad];
   const activeHue = patchHue(activeQ);
   const rows = [];
   for (let i = 0; i < floatSquares.length; i++) {
@@ -130,7 +130,7 @@ function syncSquareList() {
     return;
   }
   for (const { sq, idx } of rows) {
-    const isSel = (idx === selectedSquare);
+    const isSel = (idx === coneState.selectedSquare);
     const row = document.createElement("div");
     row.className = "quadRow squareRow" + (isSel ? " selected" : "");
     row.dataset.idx = String(idx);
@@ -151,7 +151,6 @@ function syncSquareList() {
     lb.addEventListener("click",     (ev) => ev.stopPropagation());
     lb.addEventListener("input", () => {
       sq.name = lb.value;
-      draw();
     });
     lb.addEventListener("keydown", (ev) => {
       if (ev.key === "Enter") { ev.preventDefault(); lb.blur(); }
@@ -159,7 +158,6 @@ function syncSquareList() {
         sq.name = startName;
         lb.value = startName;
         lb.blur();
-        draw();
       }
     });
     row.appendChild(lb);
@@ -175,9 +173,8 @@ function syncSquareList() {
     row.appendChild(del);
 
     row.addEventListener("click", () => {
-      selectedSquare = idx;
-      syncQuadList();
-      draw();
+      coneState.selectedSquare = idx;
+      notifyChanged();
     });
 
     list.appendChild(row);

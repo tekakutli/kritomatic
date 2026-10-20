@@ -1,94 +1,62 @@
 """
 pg_view_squares_flat.py — flat-view projection, editing, labels.
 
-The flat (unfolded-cone) view deliberately ignores slope AND warp:
-its footprint is the un-warped, un-hinged (phi, s) linear image of
-the shape's (u, v) corners, so editing in that band stays exact and
-the flat sheet is a pure design-intent view.
+ES module.  The flat (unfolded-cone) view deliberately ignores slope
+AND warp: its footprint is the un-warped, un-hinged (phi, s) linear
+image of the shape's (u, v) corners, so editing in that band stays
+exact.
 
-STAGE 1 OPTIMIZATION
-====================
-`_drawShapeLabel` now:
-    · caches each label's measured width on the object it's
-      drawing (`q` for patches, `sq` for squares).  The width
-      changes only when the label text changes, so a stable board
-      runs `ctx.measureText` zero times per frame.
-    · culls labels whose anchor is far outside the viewport.  The
-      cone band has no clip; a label anchored 1000px off-screen was
-      previously laid out in full.  Conservative margin (200px on
-      x, 20px on y) — only skips labels that are truly invisible.
+`squareFlatCorners`, `squareFlatCenter`, `setSquareFlatCenter` live
+in `pg_view_squares_core`; this file only owns the *drawing* and
+*hit-testing* passes plus the label renderer.
 """
 
 SQUARES_FLAT_JS = r"""
+import {
+  quads, floatSquares, coneState,
+  quadIdxById,
+} from "./pg_state.js";
+import {
+  flatToScreen,
+  screenToFlat,
+  _phiCopies,
+  _phiShiftForPatch,
+  _flatInsideRect,
+} from "./pg_flat_math.js";
+import {
+  patchFrame,
+  squareCornersLocal,
+  squareFlatCorners,
+  squareFlatCenter,
+  setClonePosition,
+  squareRotateHandleLocal,
+  _ptInQuadPx,
+  _withSquareMirror,
+  squareDisplayName,
+  patchHue,
+  _huergb,
+  _huergbLight,
+  ROTATE_HANDLE_R,
+  FLAT_HANDLE_R,
+  SHAPE_DEPTH_FLAT,
+} from "./pg_view_squares_core.js";
+import {
+  setShapeFromCornerLocal,
+  setShapeRotationFromCursorLocal,
+} from "./pg_view_squares_edit.js";
+import { squarePlaneIntersectionFlat } from "./pg_view_squares_proj.js";
+
 /* ==========================================================================
-   FLAT-VIEW PROJECTION
+   FLAT-VIEW SCREEN HELPERS
    ========================================================================== */
 
-function squareFlatCorners(sq) {
-  const qi = quadIdxById(sq.quadId);
-  if (qi < 0) return null;
-  const q = quads[qi];
-  const f = patchFrame(qi);
-  if (!f) return null;
-  const locals = squareCornersLocal(sq);
-  if (!locals) return null;
-  const phiC = (q.phi0 + q.phi1) / 2;
-  const sC   = (q.s0   + q.s1)   / 2;
-  const dPhi = q.phi1 - q.phi0;
-  const dS   = q.s1   - q.s0;
-  return locals.map(([u, v]) => [
-    phiC + (u / f.uLen) * dPhi,
-    sC   + (v / f.vLen) * dS,
-  ]);
-}
-
-function squareFlatCenter(sq) {
-  const qi = quadIdxById(sq.quadId);
-  if (qi < 0) return null;
-  const q = quads[qi];
-  const f = patchFrame(qi);
-  if (!f) return null;
-  const phiC = (q.phi0 + q.phi1) / 2;
-  const sC   = (q.s0   + q.s1)   / 2;
-  const dPhi = q.phi1 - q.phi0;
-  const dS   = q.s1   - q.s0;
-  return {
-    phi: phiC + sq.u * dPhi,
-    s:   sC   + sq.v * dS,
-  };
-}
-
-function setSquareFlatCenter(sq, targetPhi, targetS) {
-  const qi = quadIdxById(sq.quadId);
-  if (qi < 0) return;
-  const q = quads[qi];
-  const f = patchFrame(qi);
-  if (!f) return;
-  const phiC = (q.phi0 + q.phi1) / 2;
-  const sC   = (q.s0   + q.s1)   / 2;
-  const dPhi = q.phi1 - q.phi0;
-  const dS   = q.s1   - q.s0;
-  if (Math.abs(dPhi) < 1e-9 || Math.abs(dS) < 1e-9) return;
-
-  const curPhi = phiC + sq.u * dPhi;
-  let deltaPhi = targetPhi - curPhi;
-  while (deltaPhi >  Math.PI) deltaPhi -= 2 * Math.PI;
-  while (deltaPhi < -Math.PI) deltaPhi += 2 * Math.PI;
-  const newPhi = curPhi + deltaPhi;
-
-  const newU = (newPhi - phiC) / dPhi;
-  const newV = (targetS - sC) / dS;
-
-  setClonePosition(sq, newU * f.uLen, newV * f.vLen);
-}
-
-function squareFlatCornersScreen(sq, shift) {
+export function squareFlatCornersScreen(sq, shift) {
   const corners = squareFlatCorners(sq);
   if (!corners) return null;
   return corners.map(([phi, s]) => flatToScreen(phi + shift, s));
 }
 
-function squareFlatRotateHandleScreen(sq, shift) {
+export function squareFlatRotateHandleScreen(sq, shift) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const q = quads[qi];
@@ -115,7 +83,7 @@ function squareFlatRotateHandleScreen(sq, shift) {
    FLAT-VIEW EDIT WRAPPERS
    ========================================================================== */
 
-function flatCursorToShapeLocal(sq, sx, sy) {
+export function flatCursorToShapeLocal(sq, sx, sy) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const q = quads[qi];
@@ -133,8 +101,8 @@ function flatCursorToShapeLocal(sq, sx, sy) {
   return { u: uHat * f.uLen, v: vHat * f.vLen };
 }
 
-function flatResizeSquareFromCornerIdx(sq, sx, sy, cornerIdx,
-                                        anchorU, anchorV) {
+export function flatResizeSquareFromCornerIdx(sq, sx, sy, cornerIdx,
+                                               anchorU, anchorV) {
   const lc = flatCursorToShapeLocal(sq, sx, sy);
   if (!lc) return;
   if (anchorU !== undefined && anchorV !== undefined) {
@@ -145,13 +113,13 @@ function flatResizeSquareFromCornerIdx(sq, sx, sy, cornerIdx,
   }
 }
 
-function flatRotateSquareToCursor(sq, sx, sy, snap, startTheta) {
+export function flatRotateSquareToCursor(sq, sx, sy, snap, startTheta) {
   const lc = flatCursorToShapeLocal(sq, sx, sy);
   if (!lc) return;
   setShapeRotationFromCursorLocal(sq, lc.u, lc.v, snap, startTheta);
 }
 
-function flatMoveSquareBody(sq, sx, sy) {
+export function flatMoveSquareBody(sq, sx, sy) {
   const lc = flatCursorToShapeLocal(sq, sx, sy);
   if (!lc) return;
   const qi = quadIdxById(sq.quadId);
@@ -197,9 +165,10 @@ function _squareFlatHitTestOne(si, sx, sy) {
   return null;
 }
 
-function squareFlatHitTest(sx, sy) {
-  if (selectedQuad < 0 || selectedQuad >= quads.length) return null;
-  const activeQ = quads[selectedQuad];
+export function squareFlatHitTest(sx, sy) {
+  if (coneState.selectedQuad < 0 ||
+      coneState.selectedQuad >= quads.length) return null;
+  const activeQ = quads[coneState.selectedQuad];
   for (let i = floatSquares.length - 1; i >= 0; i--) {
     if (floatSquares[i].quadId !== activeQ.id) continue;
     const hit = _squareFlatHitTestOne(i, sx, sy);
@@ -208,9 +177,10 @@ function squareFlatHitTest(sx, sy) {
   return null;
 }
 
-function squareFlatMirrorHitTest(sx, sy) {
-  if (selectedQuad < 0 || selectedQuad >= quads.length) return null;
-  const activeQ = quads[selectedQuad];
+export function squareFlatMirrorHitTest(sx, sy) {
+  if (coneState.selectedQuad < 0 ||
+      coneState.selectedQuad >= quads.length) return null;
+  const activeQ = quads[coneState.selectedQuad];
   for (let i = floatSquares.length - 1; i >= 0; i--) {
     const sq = floatSquares[i];
     if (sq.quadId !== activeQ.id) continue;
@@ -224,15 +194,14 @@ function squareFlatMirrorHitTest(sx, sy) {
 }
 
 /* ==========================================================================
-   LABEL RENDERING — WITH WIDTH CACHE AND VIEWPORT CULL
+   LABEL RENDERING — with width cache and viewport cull
    ========================================================================== */
+
+import { ctx } from "./pg_state.js";
 
 function _drawShapeLabel(sx, sy, text, color, cacheObj) {
   if (!text) return;
 
-  // Viewport cull: skip labels whose center is far outside the
-  // canvas.  Cone band has no clip; without this a label 1000px
-  // off-screen was laid out in full.
   const cw = window.innerWidth;
   const ch = window.innerHeight;
   if (sx < -200 || sx > cw + 200 || sy < -20 || sy > ch + 20) return;
@@ -272,14 +241,23 @@ function _drawShapeLabel(sx, sy, text, color, cacheObj) {
 }
 
 function _patchCentreScreenCone(q) {
-  const pts = quadCorners(q).map(c => {
-    const [wx, wy] = surfacePoint(c.phi, c.s);
+  const pts = [
+    { phi: q.phi0, s: q.s1 }, { phi: q.phi1, s: q.s1 },
+    { phi: q.phi1, s: q.s0 }, { phi: q.phi0, s: q.s0 },
+  ].map(c => {
+    const R = cone.depth * Math.tan(cone.halfAngle);
+    const r = (1 - c.s) * R;
+    const wx = c.s * cone.ax + r * Math.cos(c.phi);
+    const wy = c.s * cone.ay + r * Math.sin(c.phi);
     return w2s(wx, wy);
   });
   let cx = 0, cy = 0;
   for (const [x, y] of pts) { cx += x; cy += y; }
   return [cx / 4, cy / 4];
 }
+
+import { cone, w2s, view, surfacePoint } from "./pg_state.js";
+import { squareCornersScreen } from "./pg_view_squares_proj.js";
 
 function _shapeCentreScreenCone(sq) {
   const pts = squareCornersScreen(sq);
@@ -290,8 +268,10 @@ function _shapeCentreScreenCone(sq) {
 }
 
 function _patchCentreScreenFlat(q, shift) {
-  const pts = quadCorners(q).map(c =>
-    flatToScreen(c.phi + shift, c.s));
+  const pts = [
+    { phi: q.phi0, s: q.s1 }, { phi: q.phi1, s: q.s1 },
+    { phi: q.phi1, s: q.s0 }, { phi: q.phi0, s: q.s0 },
+  ].map(c => flatToScreen(c.phi + shift, c.s));
   let cx = 0, cy = 0;
   for (const [x, y] of pts) { cx += x; cy += y; }
   return [cx / 4, cy / 4];
@@ -306,7 +286,7 @@ function _shapeCentreScreenFlat(sq, shift) {
   return [cx / 4, cy / 4];
 }
 
-function drawShapeLabelsCone() {
+export function drawShapeLabelsCone() {
   for (let qi = 0; qi < quads.length; qi++) {
     const q = quads[qi];
     const hue = patchHue(q);
@@ -326,7 +306,7 @@ function drawShapeLabelsCone() {
   }
 }
 
-function drawShapeLabelsFlat() {
+export function drawShapeLabelsFlat() {
   for (let qi = 0; qi < quads.length; qi++) {
     const q = quads[qi];
     const hue = patchHue(q);
@@ -340,8 +320,9 @@ function drawShapeLabelsFlat() {
     }
   }
 
-  if (selectedQuad < 0 || selectedQuad >= quads.length) return;
-  const activeQ = quads[selectedQuad];
+  if (coneState.selectedQuad < 0 ||
+      coneState.selectedQuad >= quads.length) return;
+  const activeQ = quads[coneState.selectedQuad];
   const activeHue = patchHue(activeQ);
 
   for (let i = 0; i < floatSquares.length; i++) {

@@ -1,91 +1,23 @@
 """
 pg_panel_fields.py — setters and per-field sync functions.
 
-Everything that knows what a specific patch- or square-field MEANS
-lives here: the patch φ/s centre setters, the square W/H setters,
-the two field-sync functions that push the model's current state
-into the DOM each frame, and the mirror / warp / slope / visual-
-bottom fields' semantics.
-
-STAGE 1 OPTIMIZATION
-====================
-Both sync functions (`_syncPatchCoordInputs`, `_syncSquareSizeInputs`)
-used to call `document.getElementById` five to ten times each,
-every frame — including during every drag.  During an active drag,
-that's ~20 `getElementById` scans per frame against a 30-element
-panel.
-
-Both functions now:
-    · cache their element references on first call (they never
-      change — the panel DOM is built once at page load);
-    · equality-check each write, so the DOM is only mutated when
-      the value actually differs.  During a drag, most fields
-      don't change; the ones that do get one write apiece.
-
-The visual result is identical; DOM cost per frame drops from
-~20 lookups + ~10 writes to 0 lookups + ~1–2 writes.
+ES module.  `_syncPatchCoordInputs` and `_syncSquareSizeInputs`.
+Both use element caches and write-guards (stage 1), so a stable
+panel costs zero DOM writes per frame and zero `getElementById`
+lookups.
 """
 
 PANEL_FIELDS_JS = r"""
-/* ==========================================================================
-   PATCH-POSITION SETTERS
-   ========================================================================== */
-
-function _patchPhiCenter(q) {
-  let c = (q.phi0 + q.phi1) / 2;
-  c = ((c % _TAU) + _TAU) % _TAU;
-  return c;
-}
-
-function _patchSCenter(q) {
-  return (q.s0 + q.s1) / 2;
-}
-
-function _setPatchPhiCenter(q, target) {
-  const cur = _patchPhiCenter(q);
-  let delta = target - cur;
-  while (delta >  Math.PI) delta -= _TAU;
-  while (delta < -Math.PI) delta += _TAU;
-  q.phi0 += delta;
-  q.phi1 += delta;
-  _reclampShapesOnPatch(q);
-}
-
-function _setPatchSCenter(q, target) {
-  const cur = _patchSCenter(q);
-  const halfSpan = (q.s1 - q.s0) / 2;
-  const lo = FLAT_S_MIN + halfSpan;
-  const hi = FLAT_S_MAX - halfSpan;
-  let t;
-  if (hi < lo) {
-    t = (FLAT_S_MIN + FLAT_S_MAX) / 2;
-  } else {
-    t = Math.max(lo, Math.min(hi, target));
-  }
-  const delta = t - cur;
-  q.s0 += delta;
-  q.s1 += delta;
-  _reclampShapesOnPatch(q);
-}
+import {
+  quads, floatSquares, coneState, SHAPE_STATE,
+  _phiToDisplay, _patchPhiCenter, _patchSCenter,
+} from "./pg_state.js";
+import {
+  squareWorldWidth, squareWorldHeight, squareFlatCenter,
+} from "./pg_view_squares_core.js";
 
 /* ==========================================================================
-   SQUARE-SIZE SETTERS
-   ========================================================================== */
-
-function _setSquareWidth(sq, target) {
-  const sU = target / SHAPE_REL_SIZE;
-  sq.scaleU = Math.max(SHAPE_MIN_SCALE,
-              Math.min(SHAPE_MAX_SCALE, sU));
-}
-
-function _setSquareHeight(sq, target) {
-  const sV = target / SHAPE_REL_SIZE;
-  sq.scaleV = Math.max(SHAPE_MIN_SCALE,
-              Math.min(SHAPE_MAX_SCALE, sV));
-}
-
-/* ==========================================================================
-   PATCH-POSITION FIELDS — ELEMENT CACHE + WRITE GUARDS
+   PATCH FIELDS — element cache + write guards
    ========================================================================== */
 
 let _patchEls = null;
@@ -103,12 +35,12 @@ function _getPatchEls() {
   return _patchEls;
 }
 
-function _syncPatchCoordInputs() {
+export function _syncPatchCoordInputs() {
   const els = _getPatchEls();
-  const q = (selectedQuad >= 0 && selectedQuad < quads.length)
-    ? quads[selectedQuad] : null;
+  const q = (coneState.selectedQuad >= 0 &&
+             coneState.selectedQuad < quads.length)
+    ? quads[coneState.selectedQuad] : null;
 
-  // Patch φ and s.
   if (els.phi && els.s) {
     if (!q) {
       if (!els.phi.disabled) els.phi.disabled = true;
@@ -122,7 +54,6 @@ function _syncPatchCoordInputs() {
     } else {
       if (els.phi.disabled) els.phi.disabled = false;
       if (els.s.disabled)   els.s.disabled   = false;
-
       if (document.activeElement !== els.phi) {
         const t = _phiToDisplay(_patchPhiCenter(q)).toFixed(3);
         if (els.phi.value !== t) els.phi.value = t;
@@ -134,7 +65,6 @@ function _syncPatchCoordInputs() {
     }
   }
 
-  // Mirror checkbox.
   if (els.mirror) {
     if (!q) {
       if (!els.mirror.disabled) els.mirror.disabled = true;
@@ -148,7 +78,6 @@ function _syncPatchCoordInputs() {
     }
   }
 
-  // Mirror angle (degrees in the field, radians in the model).
   if (els.mirrorAng) {
     if (!q) {
       if (!els.mirrorAng.disabled) els.mirrorAng.disabled = true;
@@ -166,7 +95,6 @@ function _syncPatchCoordInputs() {
     }
   }
 
-  // Mirror flip checkbox.
   if (els.mirrorFlip) {
     if (!q) {
       if (!els.mirrorFlip.disabled) els.mirrorFlip.disabled = true;
@@ -180,7 +108,6 @@ function _syncPatchCoordInputs() {
     }
   }
 
-  // Plane warp.
   if (els.warp) {
     if (!q) {
       if (!els.warp.disabled) els.warp.disabled = true;
@@ -202,7 +129,7 @@ function _syncPatchCoordInputs() {
 }
 
 /* ==========================================================================
-   SQUARE-SIZE AND -POSITION FIELDS — ELEMENT CACHE + WRITE GUARDS
+   SQUARE FIELDS — element cache + write guards
    ========================================================================== */
 
 let _squareEls = null;
@@ -221,12 +148,13 @@ function _getSquareEls() {
   return _squareEls;
 }
 
-function _syncSquareSizeInputs() {
+export function _syncSquareSizeInputs() {
   const els = _getSquareEls();
   if (!els.w || !els.h || !els.slope) return;
 
-  const sq = (selectedSquare >= 0 && selectedSquare < floatSquares.length)
-    ? floatSquares[selectedSquare] : null;
+  const sq = (coneState.selectedSquare >= 0 &&
+              coneState.selectedSquare < floatSquares.length)
+    ? floatSquares[coneState.selectedSquare] : null;
 
   if (!sq) {
     if (!els.w.disabled)     els.w.disabled     = true;
@@ -299,9 +227,8 @@ function _syncSquareSizeInputs() {
     }
   }
 
-  // The global multiplier follows no selection; always shown.
   if (els.mult && document.activeElement !== els.mult) {
-    const t = SHAPE_STANDING_HEIGHT_MULT.toFixed(2);
+    const t = SHAPE_STATE.standingMult.toFixed(2);
     if (els.mult.value !== t) els.mult.value = t;
   }
 }

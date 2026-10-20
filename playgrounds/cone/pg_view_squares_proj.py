@@ -1,60 +1,52 @@
 """
 pg_view_squares_proj.py — cone-view projection and rendering.
 
-Turns a shape's local (u, v) into a screen position, applying the
-hinge (slope), the warp chart, and the perspective taper — in that
-order.  Also draws the patches' horizon and base-reach guides, and
-the shapes themselves on the cone band.
+ES module.  Turns a shape's local (u, v) into a screen position,
+applying the hinge (slope), the warp chart, and the perspective
+taper — in that order.  Also draws the patches' horizon and
+base-reach guides, and the shapes themselves on the cone band.
 
 The perspective taper is applied at every warp value.  The warp
 chart stays on the patch's own plane, so the plane's 3D look — the
-shrink toward the apex that sends anything at the horizon to a point
-— is unchanged by warp.
+shrink toward the apex — is unchanged by warp.
 
-STAGE 1 OPTIMIZATION
-====================
-`squareRotateHandleScreen` used to call `squareCornersScreen(sq)` as
-a defensive guard: "don't draw the handle if the shape's corners
-are all clipped".  But `squareCornersScreen` projects all four
-corners (each a `projectShapePoint` call — `w2s` + taper + hinge),
-and the result was discarded.  The caller (`drawFloatSquare`) calls
-`squareCornersScreen` itself immediately before, and the hit-test
-caller (`_squareHitTestOne`) does too.  Net effect: on every
-mousedown hit test and every selected-square render, projection ran
-2–3× per square.
-
-The guard has been rewritten to compute the clip directly from the
-local corners — a `_clipPolygonToVMax` call on the four (u, v)
-pairs — which skips the whole projection pipeline.  Projection now
-runs exactly once per square per frame.
+STAGE 1 OPTIMIZATION (preserved)
+================================
+`squareRotateHandleScreen` computes the local clip directly from
+the (u, v) corners instead of calling `squareCornersScreen` as a
+guard.  Projection runs exactly once per square per frame.
 """
 
 SQUARES_PROJ_JS = r"""
+import {
+  cone, quads, floatSquares, coneState,
+  quadIdxById, horizonLocal, view, w2s, s2w, ctx,
+} from "./pg_state.js";
+import {
+  patchFrame,
+  squareCornersLocalCone,
+  squareRotateHandleLocalCone,
+  _clipPolygonToVMax,
+  shapePerspCentre,
+  shapeVMax,
+  _patchNormalPhi,
+  _shapeStandingScale,
+  effectiveConeDepth,
+  patchHue,
+  _huergb,
+  _huergbLight,
+  _withSquareMirror,
+  SHAPE_DEPTH_FLAT,
+  frameToWorld,
+} from "./pg_view_squares_core.js";
+import { _warpedFrameToWorld } from "./pg_view_squares_warp.js";
+
 /* ==========================================================================
    PROJECTION — hinge, warp, taper
-   ==========================================================================
-   Order of operations for a single point at local (u, v):
+   ========================================================================== */
 
-     1.  Hinge.  If the shape has slope > 0, rotate the point about
-         the hinge line v = hingeV (the minimum local v of the
-         shape's corners) and produce an out-of-plane offset hOut
-         that becomes a screen-space displacement along the patch's
-         inward radial direction.
-
-     2.  Warp.  _warpedFrameToWorld maps the in-plane coordinate
-         (u, vInPlane) to a world position.  See
-         pg_view_squares_warp.py.
-
-     3.  Perspective taper.  p = pC − (vInPlane − vC) / vMax, applied
-         the same at every warp value.
-
-     4.  Hinge offset.  Add hOut along the inward radial direction.
-
-   See the SLOPE, STANDING HEIGHT, PLANE WARP, and PERSPECTIVE
-   sections in pg_view_squares.py for the math. */
-
-function projectShapePoint(f, qi, uLocal, vLocal, vC, pC, vMax,
-                           phiC, slopeParam, hingeV, standingScale) {
+export function projectShapePoint(f, qi, uLocal, vLocal, vC, pC, vMax,
+                                  phiC, slopeParam, hingeV, standingScale) {
   const s = Math.max(0, Math.min(1, slopeParam || 0));
 
   let vInPlane = vLocal;
@@ -92,7 +84,7 @@ function projectShapePoint(f, qi, uLocal, vLocal, vC, pC, vMax,
   return [px, py];
 }
 
-function squareCornersScreen(sq) {
+export function squareCornersScreen(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const f = patchFrame(qi);
@@ -125,7 +117,7 @@ function squareCornersScreen(sq) {
                       standingScale));
 }
 
-function squareRotateHandleScreen(sq) {
+export function squareRotateHandleScreen(sq) {
   const qi = quadIdxById(sq.quadId);
   if (qi < 0) return null;
   const f = patchFrame(qi);
@@ -135,8 +127,6 @@ function squareRotateHandleScreen(sq) {
   if (!h) return null;
   const vMaxLocal = h.vHat * f.vLen;
 
-  // Cheap clip check: don't project four corners just to decide
-  // whether to project the handle.  Local clip is enough.
   const local = squareCornersLocalCone(sq);
   if (!local) return null;
   const clipped = _clipPolygonToVMax(local, vMaxLocal);
@@ -186,7 +176,7 @@ function squarePlaneIntersectionLocal(sq) {
   return [sorted[0], sorted[1]];
 }
 
-function squarePlaneIntersectionScreen(sq) {
+export function squarePlaneIntersectionScreen(sq) {
   const local = squarePlaneIntersectionLocal(sq);
   if (!local) return null;
 
@@ -219,7 +209,7 @@ function squarePlaneIntersectionScreen(sq) {
                       standingScale));
 }
 
-function squarePlaneIntersectionFlat(sq) {
+export function squarePlaneIntersectionFlat(sq) {
   const local = squarePlaneIntersectionLocal(sq);
   if (!local) return null;
 
@@ -273,7 +263,7 @@ function drawHorizon(qi) {
 function drawBaseReach(qi) {
   const f = patchFrame(qi);
   if (!f) return;
-  const vLocal = -WEDGE_BASE_REACH * f.vLen;
+  const vLocal = -2.50 * f.vLen;
   const [px, py] = frameToWorld(f, 0, vLocal);
   const p1 = w2s(px - HORIZON_REACH * f.Ux, py - HORIZON_REACH * f.Uy);
   const p2 = w2s(px + HORIZON_REACH * f.Ux, py + HORIZON_REACH * f.Uy);
@@ -289,15 +279,16 @@ function drawBaseReach(qi) {
   ctx.restore();
 }
 
-function drawFloatSquares() {
+export function drawFloatSquares() {
   for (let i = 0; i < floatSquares.length; i++) {
-    if (i === selectedSquare) continue;
+    if (i === coneState.selectedSquare) continue;
     const sq = floatSquares[i];
     drawFloatSquare(sq, false, false);
     _withSquareMirror(sq, () => drawFloatSquare(sq, false, true));
   }
-  if (selectedSquare >= 0 && selectedSquare < floatSquares.length) {
-    const sq = floatSquares[selectedSquare];
+  if (coneState.selectedSquare >= 0 &&
+      coneState.selectedSquare < floatSquares.length) {
+    const sq = floatSquares[coneState.selectedSquare];
     drawFloatSquare(sq, true, false);
     _withSquareMirror(sq, () => drawFloatSquare(sq, false, true));
   }

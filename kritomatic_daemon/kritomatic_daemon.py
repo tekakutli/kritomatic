@@ -1,4 +1,5 @@
 from krita import *
+from PyQt6.QtCore import QObject
 from .server.socket_server import WebSocketServer
 from .server.event_server import EventServer
 from .handlers.base import CommandHandler
@@ -9,35 +10,71 @@ import time
 import traceback
 
 
-class _HandlerBox:
+class _HandlerBox(QObject):
     """
-    Indirection between the server's command_received signal and the
-    current command handler. The signal is connected to box.dispatch
-    once, at startup. Reloading swaps box.handler in place; the
-    connection never needs to change.
+    Container for the current command handler, pinned to the GUI thread.
 
-    dispatch() runs the handler on a freshly-spawned Python thread
-    rather than on whichever thread Qt invoked it from.
+    Because this is a QObject created during plugin load (on the main
+    thread), Qt resolves the connection from the server's
+    `command_received` signal as a QueuedConnection when the signal is
+    emitted from a client-receiver thread. `dispatch` therefore runs on
+    the main thread.
 
-    Deliberately NOT a QObject. If it were, Qt's thread-affinity rules
-    would apply to the connection and the receiver would be tied to a
-    specific thread; keeping it a plain Python object means the
-    connection's thread choice cannot leak into the daemon's runtime
-    behavior, because dispatch overrides it either way.
+    From the main thread, `dispatch` decides which thread the handler
+    itself runs on:
+
+      * Non-comfy batches (and every single non-comfy command) call
+        `handle_command` synchronously, so all of their Krita API calls
+        happen on the main thread. This is required for Krita's vector
+        shapes: an inline-wrapped text shape owns a QTextDocument
+        internally, and creating, modifying, or serialising one from a
+        non-GUI thread races Krita's own repaint pass and segfaults the
+        process (a QTextDocument thread-affinity violation, observed as
+        "Parent is QTextDocument(...), parent's thread is ...,
+        current thread is ..." followed by SIGSEGV in `doc.saveAs` or
+        during the next composite).
+
+      * Comfy batches spawn a worker thread as before. They spend
+        almost all their time in network I/O and would freeze the GUI
+        otherwise; the Krita calls they do make (paint layers,
+        setPixelData, refreshProjection) do not touch text shapes, so
+        they remain safe from a worker thread.
+
+    Reloading still swaps `box.handler` in place, so the signal
+    connection is never touched.
     """
+
     def __init__(self, handler):
+        super().__init__()
         self.handler = handler
 
     def dispatch(self, command, client_socket):
         h = self.handler
         if h is None:
             return
-        threading.Thread(
-            target=h.handle_command,
-            args=(command, client_socket),
-            name="kritomatic-handler",
-            daemon=True,
-        ).start()
+        if self._needs_worker_thread(command):
+            threading.Thread(
+                target=h.handle_command,
+                args=(command, client_socket),
+                name="kritomatic-handler",
+                daemon=True,
+            ).start()
+        else:
+            h.handle_command(command, client_socket)
+
+    @staticmethod
+    def _needs_worker_thread(command):
+        """True iff the batch contains a `comfy_*` command."""
+        if not isinstance(command, dict):
+            return False
+        cmds = command.get("commands")
+        if isinstance(cmds, list):
+            return any(
+                isinstance(c, dict)
+                and str(c.get("type", "")).startswith("comfy_")
+                for c in cmds
+            )
+        return str(command.get("type", "")).startswith("comfy_")
 
 
 class KritomaticDaemon(Extension):

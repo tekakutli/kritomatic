@@ -1,66 +1,36 @@
 """
 pg_view_cone.py — the interior of the cone.
 
-Layers, back to front:
+ES module.  Layers, back to front: cached depth gradient + meridians
++ rings (from `_coneBg`), patches, shapes, apex marker, corner
+caption, shape labels.
 
-    1.  radial depth gradient centred on the apex
-    2.  meridians from apex to base ring, low-alpha cyan
-    3.  rings on the axis, radius (1 − s) · R_world, opacity ∝ (1 − s)²
-    4.  dashed magenta axis line when the apex is off-centre
-    5.  base direction tick on the outer ring
-    6.  small ink dot at the base centre
-    7.  patch quads — dashed outlines, faint fills
-    8.  floating shapes — solid outlines, corner/rotate handles
-    9.  apex marker
-   10.  corner caption
-   11.  patch and shape name labels — drawn last
-
-STAGE 1 OPTIMIZATION — BACKGROUND CACHE
-=======================================
-Layers 1–6 (gradient, meridians, rings, axis, tick, base dot) are
-fully determined by the apex position, cone geometry sliders, and
-the canvas transform.  They change only on apex drag, slider move,
-or resize — never on square drag, panel edits, or hover.  They used
-to re-render every frame: ~24 `createLinearGradient` calls and 15
-`arc` strokes.
-
-Layers 1–6 are now drawn into an offscreen canvas.  A per-frame key
-comparison decides whether to blit the cache (GPU-fast) or rebuild
-it.  In the common case — dragging a square, editing a field,
-hovering — the key is stable and the whole layer stack renders as
-one `ctx.drawImage`.
-
-Cache key: (cw, ch, dpr, cone.ax, cone.ay, cone.depth,
-            cone.halfAngle, cone.ringCount, cone.meridianCount,
-            view.scale, view.tx, view.ty, layout.coneH)
-
-Memory: at DPR 2 on a 2000×1200 CSS canvas, ~38 MB.  Freed when the
-key changes (old canvas becomes garbage) and on window resize.
-
-PATCH VERSUS SHAPE
-==================
-Both a patch and a shape are quadrilaterals in the patch's own (u, v)
-frame, both are tinted by the patch's hue, and both carry a name
-label.  What distinguishes them is the STROKE:
-
-    patch   dashed outline, very faint fill
-    shape   solid outline, thicker when selected, corner handles and
-            a rotate handle when selected
-
-The dashed stroke is the drafting idiom for "this is the surface, not
-an object on it".
+STAGE 1 OPTIMIZATION (preserved)
+================================
+Layers 1–6 are drawn into an offscreen canvas once per key change
+(apex move, slider, resize) and blitted per frame.
 """
 
 CONE_VIEW_JS = r"""
+import {
+  ctx, canvas, env, view, layout, cone, quads, floatSquares,
+  coneState, w2s, surfacePoint, PATCH_SHAPE_EDIT_ENABLED,
+} from "./pg_state.js";
+import {
+  patchHue, _huergb, _huergbLight,
+} from "./pg_view_squares_core.js";
+import { drawFloatSquares } from "./pg_view_squares_proj.js";
+import { drawShapeLabelsCone } from "./pg_view_squares_flat.js";
+
 /* ==========================================================================
    BACKGROUND CACHE
    ========================================================================== */
 
-let _coneBgCache = null;   // { key: string, canvas: HTMLCanvasElement }
+let _coneBgCache = null;
 
 function _coneBgKey(cw, ch) {
   return [
-    cw, ch, dpr,
+    cw, ch, env.dpr,
     cone.ax, cone.ay,
     cone.depth, cone.halfAngle,
     cone.ringCount, cone.meridianCount,
@@ -71,20 +41,17 @@ function _coneBgKey(cw, ch) {
 
 function _buildConeBg(cw, ch) {
   const off = document.createElement("canvas");
-  off.width  = Math.round(cw * dpr);
-  off.height = Math.round(ch * dpr);
+  off.width  = Math.round(cw * env.dpr);
+  off.height = Math.round(ch * env.dpr);
 
-  // Save/restore the real ctx's transform so we don't disturb the
-  // outer frame.  Everything below draws into a local alias.
   const octx = off.getContext("2d");
-  octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  octx.setTransform(env.dpr, 0, 0, env.dpr, 0, 0);
 
   const R_world = cone.depth * Math.tan(cone.halfAngle);
   const [Bx, By] = w2s(0, 0);
   const [Ax, Ay] = w2s(cone.ax, cone.ay);
   const Rs = R_world * view.scale;
 
-  // 1. Depth gradient.
   const apexDist  = Math.hypot(Ax - Bx, Ay - By);
   const gradientR = Math.max(apexDist + Rs, 40);
   const bg = octx.createRadialGradient(Ax, Ay, 0, Ax, Ay, gradientR);
@@ -95,7 +62,6 @@ function _buildConeBg(cw, ch) {
   octx.fillStyle = bg;
   octx.fillRect(0, 0, cw, ch);
 
-  // 2. Meridians.
   const M = cone.meridianCount;
   octx.lineCap = "round";
   for (let i = 0; i < M; i++) {
@@ -111,7 +77,6 @@ function _buildConeBg(cw, ch) {
     octx.strokeStyle = lg; octx.lineWidth = 0.9; octx.stroke();
   }
 
-  // 3. Rings.
   const N = cone.ringCount;
   for (let k = 0; k <= N; k++) {
     const s = k / N;
@@ -126,7 +91,6 @@ function _buildConeBg(cw, ch) {
     octx.stroke();
   }
 
-  // 4. Dashed axis line when the apex is off-centre.
   if (apexDist > 6) {
     octx.save();
     octx.setLineDash([5, 4]);
@@ -136,7 +100,6 @@ function _buildConeBg(cw, ch) {
     octx.restore();
   }
 
-  // 5. Base direction tick.
   if (Rs > 20) {
     octx.beginPath();
     octx.arc(Bx, By, Rs, -Math.PI / 2 - 0.15, -Math.PI / 2 + 0.15);
@@ -144,7 +107,6 @@ function _buildConeBg(cw, ch) {
     octx.lineWidth = 2.4; octx.stroke();
   }
 
-  // 6. Base centre dot.
   octx.beginPath(); octx.arc(Bx, By, 2.2, 0, Math.PI * 2);
   octx.fillStyle = "rgba(220, 230, 242, 0.55)"; octx.fill();
 
@@ -163,26 +125,23 @@ function _coneBg(cw, ch) {
    CONE VIEW
    ========================================================================== */
 
-function drawConeView() {
+export function drawConeView() {
   const cw = window.innerWidth;
   const ch = layout.coneH;
 
-  // Layers 1–6: cached background.
   ctx.drawImage(_coneBg(cw, ch), 0, 0, cw, ch);
 
-  // Layer 7: patches.  Unselected first, selected on top.
   for (let i = 0; i < quads.length; i++) {
-    if (i === selectedQuad) continue;
+    if (i === coneState.selectedQuad) continue;
     drawQuadPatch(quads[i], false);
   }
-  if (selectedQuad >= 0 && selectedQuad < quads.length) {
-    drawQuadPatch(quads[selectedQuad], true);
+  if (coneState.selectedQuad >= 0 &&
+      coneState.selectedQuad < quads.length) {
+    drawQuadPatch(quads[coneState.selectedQuad], true);
   }
 
-  // Layer 8: floating shapes.
   drawFloatSquares();
 
-  // Layer 9: apex marker.
   const [Ax, Ay] = w2s(cone.ax, cone.ay);
   const haloR = 22;
   const halo = ctx.createRadialGradient(Ax, Ay, 0, Ax, Ay, haloR);
@@ -195,7 +154,6 @@ function drawConeView() {
   ctx.fillStyle = "#ffe600"; ctx.fill();
   ctx.strokeStyle = "#0a0e14"; ctx.lineWidth = 2; ctx.stroke();
 
-  // Layer 10: corner caption.
   ctx.save();
   ctx.font = "700 10px 'JetBrains Mono', 'Fira Code', monospace";
   ctx.fillStyle = "#5a6774";
@@ -213,13 +171,15 @@ function drawConeView() {
     14, 14);
   ctx.restore();
 
-  // Layer 11: labels.
   drawShapeLabelsCone();
 }
 
 function drawQuadPatch(q, selected) {
   const hue = patchHue(q);
-  const pts = quadCorners(q).map(c => {
+  const pts = [
+    { phi: q.phi0, s: q.s1 }, { phi: q.phi1, s: q.s1 },
+    { phi: q.phi1, s: q.s0 }, { phi: q.phi0, s: q.s0 },
+  ].map(c => {
     const [wx, wy] = surfacePoint(c.phi, c.s);
     return w2s(wx, wy);
   });

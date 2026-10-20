@@ -1,3 +1,34 @@
+"""
+pg_view_board.py — draw the board.
+
+ES module.  Exports `drawBoardView`, which is called once per
+frame from `pg_dispatch.draw()`.  Reads `board.files`, `view`,
+and the canvas; writes only to the canvas.
+
+DRAW ORDER
+==========
+Cards are drawn in `_zSortedIndices()` order, ascending, so a
+selected card sits above whatever it was overlapping.
+
+PERFORMANCE
+===========
+    VIEWPORT CULLING
+        A card whose rotated AABB (plus its label margin) does not
+        intersect the visible viewport is not drawn.
+
+    SHADOW-ONLY-WHEN-SELECTED
+        `shadowBlur` is applied only to the selected card; every
+        other card gets a cheap flat offset rect.
+
+    BATCHED GRID
+        The background dot grid is a single path filled once.
+
+    LABEL-WIDTH CACHE
+        `measureText` runs only when the label text changed.  The
+        cache lives on the file object as `_labelText` /
+        `_labelWidth` — transient, never serialised.
+"""
+
 VIEW_BOARD_JS = r"""
 import {
   b2s, view, ctx, board, _zSortedIndices, _rgba, _rgbaLight,

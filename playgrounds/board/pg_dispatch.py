@@ -1,6 +1,44 @@
+"""
+pg_dispatch.py — draw() and the canvas event listeners.
+
+ES module.  Exports two functions:
+
+    draw          repaint the canvas and sync the panel's per-card
+                  fields (`_syncCardFields`)
+    updateStatus  refresh the status line at the bottom of the panel
+
+Four drag modes, mutually exclusive:
+
+    dragCanvas   pan the view (drag on empty space)
+    dragFile     move the card (drag on the card's body)
+    dragFile     resize the card (drag on a corner; mode="resize")
+    dragFile     rotate the card (drag on the rotate handle;
+                 mode="rotate")
+
+MOUSEMOVE FAST PATH
+===================
+`draw()` runs only when the canvas is actually going to change:
+during a card drag, during a canvas pan, on wheel zoom, on mouseup
+after a drag, and on every model mutation (through the panel).
+
+Pure hover — the mouse moving over the canvas with no button held —
+only updates the CSS cursor style.  `_hoverCursorAt` (in pg_core)
+is a single linear pass; `_setCursor` writes `style.cursor` only
+when the value actually differs.
+
+FIX HISTORY
+===========
+The import list in this file used to name `itemHitTest`, which
+pg_core.js does not export — pg_core exports `fileHitTest`.  ES
+modules reject a `import { x } from "y"` when `x` isn't in `y`'s
+exports, so the browser refused to hand this module to `_boot.js`,
+blanking the canvas.  The name was unused (`fileHitTest` is what
+every handler actually calls); it has been removed.
+"""
+
 DISPATCH_JS = r"""
 import {
-  canvas, ctx, dpr, view, board, s2b, itemHitTest, bringToTop,
+  canvas, ctx, dpr, view, board, s2b, bringToTop,
   rotateHandleHitTest, fileCornerHitTest, fileHitTest,
   CORNER_SIGNS, _rotateOffset, _resizeCursorFor, _hoverCursorAt,
   resizeCardFromCorner, removeFile, arrangeGrid, fitAll,
@@ -53,7 +91,7 @@ export function updateStatus() {
   const parts = [opens + " open", closed + " closed"];
   if (miss) parts.push(miss + " missing");
   parts.push("zoom " + (view.zoom * 100).toFixed(0) + "%");
-  const text = parts.join("  ·  ");
+  const text = parts.join("  \u00b7  ");
   if (el.textContent !== text) el.textContent = text;
   if (el.className !== "") el.className = "";
 }

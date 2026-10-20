@@ -1,3 +1,22 @@
+"""
+pg_panel_fields.py — per-card field semantics.
+
+ES module.  Exports:
+
+    selectedFile       return the currently-selected card, or null
+    _syncCardFields    push the selected card's scale and rotation
+                       into the two scrub inputs (equality-guarded)
+
+Two per-card scrub fields follow the selection: **Scale** and
+**Rotation**.  Both are disabled with no card selected, and reflect
+the selected card's own values otherwise.
+
+`_syncCardFields` is called once per `draw()` frame.  Each write is
+equality-guarded so the caret doesn't jump when the user is typing
+into a field mid-drag.  This is the same pattern the pair and
+text_board playgrounds use for their selection-following fields.
+"""
+
 PG_PANEL_FIELDS_JS = r"""
 import { board } from "./pg_core.js";
 

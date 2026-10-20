@@ -1,8 +1,25 @@
+"""
+pg_panel_lists.py — the file list.
+
+ES module.  Exports `syncFileList`, which rebuilds the panel's list
+of file cards and ends with `pgkitNotifyEntities()`.
+
+It runs after every change to `board.files`, every selection
+change, and every model-mutating action.  The DOM is rebuilt from
+scratch — the list is small and rebuilding is simpler than
+reconciling.
+
+DEAD IMPORT REMOVED
+===================
+The file used to import `_syncCardFields` from `./pg_panel_fields.js`
+but never called it (it is called from `pg_dispatch.draw()` instead).
+Removed as part of the ES-module audit.
+"""
+
 PG_PANEL_LISTS_JS = r"""
 import { board, _rgba, bringToTop, fileState } from "./pg_core.js";
-import { _syncCardFields } from "./pg_panel_fields.js";
 import { draw } from "./pg_dispatch.js";
-import { pgkitNotifyEntities } from "./pgkit/remote_client.js";
+import { pgkitNotifyEntities, pgkitNotifyAll } from "./pgkit/remote_client.js";
 
 export function syncFileList() {
   const list = document.getElementById("fileList");
@@ -82,7 +99,7 @@ export function syncFileList() {
       bringToTop(i);
       syncFileList();
       draw();
-      import("./pgkit/remote_client.js").then(m => m.pgkitNotifyAll()).catch(() => {});
+      pgkitNotifyAll();
     });
 
     list.appendChild(row);

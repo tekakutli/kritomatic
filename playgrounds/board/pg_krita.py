@@ -1,3 +1,46 @@
+"""
+pg_krita.py — fetch glue for the /krita endpoints.
+
+ES module.  Exports:
+
+    reportError                POST /log, plus console.error
+    refreshFromKrita           POST /krita/refresh, merge, redraw
+    retrieveOpenFromKrita      add every open Krita doc to the board
+    mergeIncoming              merge a refresh response into board.files
+    openFileInKrita            POST /krita/open
+    openAllMissing             open every closed file, sequentially
+    activateFile               POST /krita/activate (or open first)
+    pickFilesViaServer         POST /krita/pick_files (native dialog)
+    importDroppedFile          stream a File from a drop event via
+                               POST /krita/drop_file, or add directly
+                               when the browser exposes file.path
+    projectSelectedOntoOverlaps  POST /krita/paste_transforms
+
+MERGE POLICY
+============
+On refresh, a card that has never been dragged-by-corner keeps its
+height locked to `width × aspect`, so a freshly added card mirrors
+its document's own proportions.  Once a corner drag has set
+`userSized = true`, the user's height wins and refresh stops
+touching it.  `mergeIncoming` ends with `pgkitNotifyAll()`, so a
+remote client sees the change on the next animation frame.
+
+DROP OVERLAY
+============
+The drop overlay (`#dropOverlay`) is created by `installDropOverlay`
+at module load.  It must be a sibling of `<canvas>`, not a child of
+`#ui` — a child would inherit the panel's `display: none` when a
+remote client connects, hiding the drop target exactly when
+someone on the playground machine wants to drop a file.
+
+DROP PAYLOAD — RAW BYTES
+========================
+`/krita/drop_file` receives the file's raw bytes; the filename
+travels in the `X-Filename` header, URL-encoded.  pgkit's
+`server.serve()` gained `raw_routes` support precisely so board
+could keep this wire format.
+"""
+
 KRITA_JS = r"""
 import {
   board, view, addFileByPath, fitAll, computeProjectionRegions,

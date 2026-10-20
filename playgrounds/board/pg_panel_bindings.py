@@ -1,3 +1,56 @@
+"""
+pg_panel_bindings.py — buttons, remote actions, remote levels,
+pgkitHandleSelect, and boardBootSync.
+
+ES module.  Exports:
+
+    installPanelBindings   attach every button listener
+    pgkitHandleSelect      translate the remote `select` command
+    boardBootSync          initial panel sync + async refresh
+
+LEVELS
+======
+One: `files` — one item per card on the board.  No nested levels;
+`parent()` always returns null.  `selected()` reflects
+`board.selectedIdx`.
+
+ACTIONS
+=======
+Every action follows the pgkit pattern — `scope`, optional `level`,
+optional `appliesTo` for row scope, optional `requires` for
+payloads, optional `variant` for the button's color.
+
+Board's action set:
+
+    refreshFromKrita    scope: global
+    addFiles            scope: global     (opens native dialog)
+    retrieveOpen        scope: global
+    openAll             scope: global
+    arrangeGrid         scope: global
+    fit                 scope: global
+    resetView           scope: global
+    clearBoard          scope: global     (variant: danger)
+    saveBoard           scope: global
+    loadBoard           scope: global     (requires: board_json file)
+    projectOverlaps     scope: selection  (level: files)
+    openItem            scope: row        (level: files,
+                                          appliesTo: !open && !missing)
+    deleteItem          scope: row        (level: files)
+
+Board does not use the pair playground's `setAfterChange` hook.
+Each action calls `syncFileList()`, `draw()`, `pgkitNotifyAll()`
+in its own body, matching text_board's convention.  Cleaner for
+board's eight actions, none of which share a common mutation
+pattern.
+
+WHY DYNAMIC IMPORTS ARE NOT NEEDED HERE
+=======================================
+Every handler calls `syncFileList`, `draw`, `pgkitNotifyAll`
+statically — no `import()` inside a handler.  There is no cycle
+from `pg_panel_bindings` back to `pg_dispatch`, so static imports
+of `draw` and `updateStatus` from `pg_dispatch` are safe.
+"""
+
 PG_PANEL_BINDINGS_JS = r"""
 import {
   board, view, arrangeGrid, fitAll, bringToTop, fileState, removeFile,

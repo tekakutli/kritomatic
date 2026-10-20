@@ -1,9 +1,42 @@
+"""
+pg_scene.py — save and load the board.
+
+ES module.  Exports:
+
+    buildBoardScene       return the scene as a plain object
+    saveBoardJSON         download the scene as `board_scene.json`
+    applyBoardScene       apply a parsed scene in place
+    loadBoardFromText     parse and apply JSON text
+    promptLoadBoard       open the file picker
+
+SCENE FORMAT (v4)
+=================
+The scene is a list of file paths, the layout the user has arranged
+on the canvas, and each card's z and rotation.  Thumbnails are not
+saved — they are pulled fresh from Krita on refresh.
+
+On load, three things happen in order:
+
+    1.  Paths, layout, z, and rotation are applied.
+    2.  Every file whose path is not currently open in Krita is
+        opened in Krita, sequentially, via `openAllMissing()`
+        from `pg_krita.js`.
+    3.  A single refresh picks up thumbnails and state for
+        everything that just opened.
+
+REMOTE NOTIFICATION
+===================
+`applyBoardScene` replaces the whole model.  It ends with
+`pgkitNotifyAll()`, so remote clients receive a single patch with
+the new state on the next animation frame.
+"""
+
 SCENE_JS = r"""
 import { board, view, addFileByPath } from "./pg_core.js";
 import { syncFileList } from "./pg_panel_lists.js";
 import { syncPanelSliders } from "./pg_panel_scrubs.js";
 import { draw } from "./pg_dispatch.js";
-import { openAllMissing, refreshFromKrita } from "./pg_krita.js";
+import { openAllMissing } from "./pg_krita.js";
 import { pgkitNotifyAll } from "./pgkit/remote_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
 

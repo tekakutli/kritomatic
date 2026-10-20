@@ -1,9 +1,58 @@
+"""
+pg_panel_scrubs.py — field registrations and DOM bindings.
+
+ES module.  Pure side effect at module load: registers the fields
+the remote API exposes and installs the two range sliders
+(`cardWSlider`, plus the two per-card scrub inputs
+`cardScaleVal` and `cardRotVal`).  No named exports — the boot
+module imports this file for its side effects only.
+
+FIELDS REGISTERED HERE
+======================
+    board.cardWidth       number, driven by the cardWSlider
+    view.zoom             number, driven by the wheel
+    view.panX             number, driven by canvas pan
+    view.panY             number, driven by canvas pan
+    card.scale            number, follows the selection
+    card.rotation         number, follows the selection
+
+The `card.*` getters return the selected file's value, or the
+field's natural empty (1.0 scale, 0° rotation) when nothing is
+selected.  Both go through `_sel()` (imported from
+`pg_panel_fields.js` as `selectedFile`).
+
+FIX HISTORY
+===========
+This file used to import three names from `./pg_core.js`:
+
+    import { board, view, selectedFile, _installScrubInput_unused }
+      from "./pg_core.js";
+
+Neither `selectedFile` nor `_installScrubInput_unused` is exported
+by pg_core.js (`selectedFile` lives in pg_panel_fields.js).  The
+browser refuses to hand the module to the boot when any named
+import is missing — the whole module graph fails, exactly the bug
+class that was blanking the canvas before the fix.  Both names
+have been removed; the correct source for `selectedFile` is the
+existing `import { selectedFile as _sel } from "./pg_panel_fields.js"`
+on the next line, and `_syncCardFields` was pulled in but never
+used.
+
+DYNAMIC IMPORTS
+===============
+None — `draw` is imported statically from `./pg_dispatch.js`.
+The cycle pg_dispatch → pg_krita → pg_dispatch is safe because
+all sides are `export function`, which is hoisted; the import
+resolves to a valid binding even when the modules load in a
+cycle.  Every setter here calls `draw()` explicitly, matching
+board's "no afterChange hook" convention.
+"""
+
 PG_PANEL_SCRUBS_JS = r"""
-import { board, view, selectedFile, _installScrubInput_unused } from "./pg_core.js";
-import { _installScrubInput } from "./pgkit/panel_core.js";
+import { board, view } from "./pg_core.js";
 import { selectedFile as _sel } from "./pg_panel_fields.js";
-import { _syncCardFields } from "./pg_panel_fields.js";
 import { draw } from "./pg_dispatch.js";
+import { _installScrubInput } from "./pgkit/panel_core.js";
 import {
   pgkitRegisterField, pgkitNotifyLocal,
 } from "./pgkit/remote_client.js";

@@ -190,11 +190,11 @@ playgrounds/board/board_drops/
 *project_dump*
 
 # Specific
-other_scripts/room/room_boxes.json
-other_scripts/room/room_dimensions.json
-other_scripts/room/room_layout.json
-other_scripts/room/room_walls.json
-other_scripts/room/floor_plan_layout.json
+*/room/room_boxes.json
+*/room/room_dimensions.json
+*/room/room_layout.json
+*/room/room_walls.json
+*/room/floor_plan_layout.json
 
 data/comfy_panel/*
 data/convert/*

@@ -14,6 +14,12 @@ the invalid chip, the ghost's collision pill — lives in TRANSLATIONS.
 Nothing in any other module should contain a hardcoded English (or
 Spanish, or anything else) literal that a user reads.
 
+This is a straight ES-module conversion of the concatenation-model
+`I18N_JS` block.  The only change is that `LANG`, `TRANSLATIONS`, and
+`T` are now `export`-able.  Everything else is byte-for-byte the same
+so the two versions can be diffed against each other and against the
+cable playground's `pg_i18n.py`, which uses the same conventions.
+
 Adding a language
 -----------------
     1.  Copy the `en` table to a new key, say `fr`.
@@ -44,14 +50,11 @@ is one long HTML string because the popover is prose-heavy and
 interleaving twenty keys with twenty `+` operators would be worse
 than one well-formed block.  Translators translate it as one piece.
 
-Concatenation order
--------------------
-This module's I18N_JS is prepended to LIVE_JS in boxes_live.py, so it
-is the first thing the playground's <script> tag defines after the
-GEOMETRY const.  Every other module can therefore call T(key) at
-parse time (inside a const initialiser) as well as at call time.
+The exports are consumed by every other module through
+`import { T } from "./bx_i18n.js"`.  `LANG` and `TRANSLATIONS` are
+exported too in case a future `installPanelBindings` wants to
+inspect them; nothing in the current tree does.
 """
-
 
 I18N_JS = r"""
 /* ==========================================================================
@@ -63,12 +66,11 @@ I18N_JS = r"""
    table keeps rendering.
 
    Every key whose value varies with a number or a state is a FUNCTION
-   of that argument.  Every key with no arguments is a plain string.
-   See the module docstring for why. */
+   of that argument.  Every key with no arguments is a plain string. */
 
-const LANG = "es";
+export const LANG = "en";
 
-const TRANSLATIONS = {
+export const TRANSLATIONS = {
   en: {
     /* ---- app shell ---------------------------------------------- */
     pageTitle:     "Box placement playground",
@@ -391,7 +393,7 @@ const TRANSLATIONS = {
    has not defined yet.  Keeps partial translations working. */
 const _T_ACTIVE = TRANSLATIONS[LANG] || TRANSLATIONS.en;
 
-function T(key) {
+export function T(key) {
   const v = _T_ACTIVE[key];
   return (v !== undefined) ? v : TRANSLATIONS.en[key];
 }

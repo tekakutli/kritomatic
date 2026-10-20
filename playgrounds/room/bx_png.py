@@ -34,60 +34,39 @@ a *label*.  Every label is in one list.  Every label has:
 
     rect         the AABB its text occupies, mutable by relaxation
     anchor       a list of points it points at
-    movable      false for labels that stay put (inside names,
-                 inside dimension numbers, and the box bodies
-                 themselves, which are collision obstacles with
-                 draw:false)
-    text, fontSize, rotationDeg, plateW, plateH
+    movable      false for labels that stay put
 
-The anchor is a polyline.  For a box name, it is the box polygon;
-for a dimension number, it is the dimension line.  The nearest point
-on the polyline is the label's target.
-
-Every label draws a dashed leader from its rect's edge to the
-nearest point on its anchor, with a solid arrowhead at the anchor
-end — UNLESS the label's centre is essentially on the anchor, in
-which case the leader would be zero-length and is skipped.
-
-Name orientation
-----------------
-Every box name — inside or outside — reads along the box's longest
-VISUAL side.  "Longest" is measured in screen pixels by comparing
-the two edges the box's screen-projected corners define, so a zoom
-and a fit view agree about which edge is the long one.  The
-resulting angle is normalised to keep the text upright: an angle
-past vertical is flipped by 180°.
-
-Dimension numbers are NOT subject to this rule.  A W-dimension
-number reads along the W-dimension line because it names that line;
-an H-dimension number reads along the H line.  Aligning a number
-with its own line is what makes the number legible as "the length of
-that edge".
+Every label draws a dashed leader from its rect's edge to the nearest
+point on its anchor.
 
 Relaxation
 ----------
 All labels, plus the box bodies as invisible fixed obstacles, are
 pushed apart pairwise: overlapping pairs are separated along their
 axis of smaller overlap.  Movable labels move; fixed ones do not.
-The whole pass iterates to a fixed point.
 
-Translation
------------
-The two flash-status messages this module emits on completion — one
-on failure, one on success with the pixel size — come from T() in
-bx_i18n.py.  Everything else this module draws is either geometry
-or a symbolic ID (V<n>, W<n>, H<n>) that stays the same in every
-language.
+Name orientation
+----------------
+Every box name reads along the box's longest VISUAL side.  "Longest"
+is measured in screen pixels by comparing the two edges the box's
+screen-projected corners define.
 """
 
+PNG_JS = """
 
-PNG_JS = r"""
+import {
+  board, view, state,
+  b2s, boxCorners, boxIsInvalid, pointInPolygon, polygonsOverlap,
+} from "./bx_core.js";
+import { GEOMETRY } from "./bx_geometry.js";
+import { T } from "./bx_i18n.js";
+import { flashStatus } from "./pgkit/panel_core.js";
+
 /* ==========================================================================
    PRINT PATTERNS
    ==========================================================================
-   Four cached pattern canvases with transparent backgrounds.  See the
-   module docstring for why each class gets a different KIND of mark
-   and why the pitches are looser than pg_export.py's band pitches. */
+   Four cached pattern canvases.  Each class gets a different KIND of
+   mark; pitches are looser than the on-screen hatches. */
 
 const _PNG_PATTERNS = Object.create(null);
 
@@ -136,13 +115,10 @@ function _pngPattern(kind) {
   return _PNG_PATTERNS[kind];
 }
 
-
 /* ==========================================================================
    LABEL HELPERS
    ========================================================================== */
 
-/* AABB of a w × h rectangle centred at (cx, cy) and rotated by theta
-   radians.  Used for the collision footprint of a rotated text. */
 function labelAABB(cx, cy, w, h, theta) {
   const c = Math.cos(theta), s = Math.sin(theta);
   const hw = w / 2, hh = h / 2;
@@ -157,20 +133,6 @@ function labelAABB(cx, cy, w, h, theta) {
   return { x0, y0, x1, y1 };
 }
 
-/* Text angle for a box name, in degrees.
-
-   The name's text reads along the box's longest VISUAL side — the
-   longer of the two edges its screen-projected corners define.  A
-   2000 × 1000 box and a 1000 × 2000 box therefore show their names
-   running along different axes, whichever reads longer on screen.
-
-   The angle is normalised to keep the text upright: an angle past
-   vertical (|θ| > 90°) is flipped by 180°, so the text never appears
-   upside-down.  A square box falls through to the W direction,
-   since the two edges tie and the `>=` picks the first.
-
-   The corners are passed in screen space, not model space, so the
-   "longest" comparison is on what the reader sees. */
 function nameTextAngleDeg(boxScreenCorners) {
   const c0 = boxScreenCorners[0];
   const c1 = boxScreenCorners[1];
@@ -190,10 +152,6 @@ function nameTextAngleDeg(boxScreenCorners) {
   return ang * 180 / Math.PI;
 }
 
-/* Push overlapping labels apart.  Every label's rect is mutated in
-   place.  A label with movable === false does not move; the other
-   label of the pair takes the full displacement.  Labels that are
-   both fixed are left as they are. */
 function relaxLabels(labels, pad) {
   const MAX_PASSES = 40;
   for (let pass = 0; pass < MAX_PASSES; pass++) {
@@ -238,14 +196,9 @@ function relaxLabels(labels, pad) {
   }
 }
 
-/* Nearest point on a target polyline to (cx, cy).  One point is a
-   point; two points are a segment; longer targets are closed
-   polylines (last point connects to first). */
 function nearestPointOnTarget(cx, cy, target) {
   if (!target || target.length === 0) return null;
-  if (target.length === 1) {
-    return { x: target[0][0], y: target[0][1] };
-  }
+  if (target.length === 1) return { x: target[0][0], y: target[0][1] };
   let bestX = 0, bestY = 0, bestD = Infinity;
   const n = target.length;
   for (let i = 0; i < n; i++) {
@@ -268,10 +221,6 @@ function nearestPointOnTarget(cx, cy, target) {
   return { x: bestX, y: bestY };
 }
 
-/* Dashed leader from a label's rect edge to a target point, with a
-   solid arrowhead at the target.  The arrowhead's length is capped
-   at half the leader's length so a very short leader still reads as
-   an arrow and not as a solid triangle. */
 function drawLabelLeader(g, rect, target, fontSize, pngRes) {
   const cx = (rect.x0 + rect.x1) / 2;
   const cy = (rect.y0 + rect.y1) / 2;
@@ -280,7 +229,6 @@ function drawLabelLeader(g, rect, target, fontSize, pngRes) {
   if (L < 3) return;
 
   const ux = dx / L, uy = dy / L;
-
   const hw = (rect.x1 - rect.x0) / 2;
   const hh = (rect.y1 - rect.y0) / 2;
   let tRect = Infinity;
@@ -316,8 +264,6 @@ function drawLabelLeader(g, rect, target, fontSize, pngRes) {
   g.restore();
 }
 
-/* Draw the line + arrowheads of a dimension line.  No text: the
-   number is a label now, drawn by the label pass. */
 function drawDimLineBody(g, A, B, ahSize, lw) {
   const dx = B[0] - A[0], dy = B[1] - A[1];
   const len = Math.hypot(dx, dy);
@@ -351,12 +297,11 @@ function drawDimLineBody(g, A, B, ahSize, lw) {
   g.fill();
 }
 
-
 /* ==========================================================================
    MAIN RENDERER
    ========================================================================== */
 
-function renderFloorPlanPNG() {
+export function renderFloorPlanPNG() {
   const PNG_RES   = 4;
   const PX_PER_MM = 0.05 * PNG_RES;
   const MARGIN_PX = 10   * PNG_RES;
@@ -438,11 +383,27 @@ function renderFloorPlanPNG() {
   }
 
   /* ---------- 3. BOXES — three classes, three visual rules --------- */
-  const validFlags = placedBoxes.map(bx => !boxIsInvalid(bx));
-  const overlapFlags = computeOverlapFlags(validFlags);
+  const validFlags = board.items.map(bx => !boxIsInvalid(bx));
+  const overlapFlags = (() => {
+    const n = board.items.length;
+    const flags = new Array(n).fill(false);
+    const corners = board.items.map(b =>
+      boxCorners(b.x, b.y, b.w, b.h, b.rot));
+    for (let i = 0; i < n; i++) {
+      if (!validFlags[i]) continue;
+      for (let j = i + 1; j < n; j++) {
+        if (!validFlags[j]) continue;
+        if (polygonsOverlap(corners[i], corners[j])) {
+          flags[i] = true;
+          flags[j] = true;
+        }
+      }
+    }
+    return flags;
+  })();
 
-  for (let i = 0; i < placedBoxes.length; i++) {
-    const bx = placedBoxes[i];
+  for (let i = 0; i < board.items.length; i++) {
+    const bx = board.items[i];
     const valid = validFlags[i];
     const ov    = overlapFlags[i];
 
@@ -468,10 +429,9 @@ function renderFloorPlanPNG() {
   }
 
   /* ---------- 4. LABELS --------------------------------------------
-     One collection, one relaxation, one draw pass.  See the module
-     docstring for the model. */
+     One collection, one relaxation, one draw pass. */
 
-  const boxPolysProj = placedBoxes.map(bx =>
+  const boxPolysProj = board.items.map(bx =>
     boxCorners(bx.x, bx.y, bx.w, bx.h, bx.rot).map(([x, y]) => P(x, y)));
 
   const boxRects = boxPolysProj.map(sc => ({
@@ -488,9 +448,7 @@ function renderFloorPlanPNG() {
 
   const allLabels = [];
 
-  /* Box bodies enter the collision system as invisible fixed
-     obstacles.  This keeps outside names and dimension numbers from
-     drifting onto a neighbouring box during relaxation. */
+  /* Box bodies as invisible fixed obstacles. */
   for (let i = 0; i < boxRects.length; i++) {
     allLabels.push({
       kind: "box-body",
@@ -501,17 +459,12 @@ function renderFloorPlanPNG() {
     });
   }
 
-  /* ---- 4a. pass 1: inside/outside decision ----
-     The fit test now measures the name against the box's LONG and
-     SHORT extents, not its W and H.  A name that reads along the
-     box's long edge has to fit that edge; its text-height has to fit
-     the short edge.  The dimension-number fit tests stay unchanged:
-     each number is tied to its own edge and reads along it. */
-  const insideFlags = new Array(placedBoxes.length).fill(false);
-  const insideFS    = new Array(placedBoxes.length).fill(0);
+  /* ---- 4a. inside/outside decision ---- */
+  const insideFlags = new Array(board.items.length).fill(false);
+  const insideFS    = new Array(board.items.length).fill(0);
 
-  for (let i = 0; i < placedBoxes.length; i++) {
-    const bx = placedBoxes[i];
+  for (let i = 0; i < board.items.length; i++) {
+    const bx = board.items[i];
     const hasName = !!(bx.name && bx.name.length);
     const nameStr = bx.name || "";
     const wStr = String(Math.round(bx.w));
@@ -527,9 +480,9 @@ function renderFloorPlanPNG() {
     if (fs < MIN_FONT) continue;
     for (let tries = 0; tries < 15; tries++) {
       const dimFS = fs * 0.82;
-      g.font = `600 ${fs}px ${FONT_MONO}`;
+      g.font = `600 ${fs}px 'JetBrains Mono', monospace`;
       const nameW = hasName ? g.measureText(nameStr).width : 0;
-      g.font = `500 ${dimFS}px ${FONT_MONO}`;
+      g.font = `500 ${dimFS}px 'JetBrains Mono', monospace`;
       const wW = g.measureText(wStr).width;
       const hW = g.measureText(hStr).width;
       const margin = 2.2 * dimFS;
@@ -544,13 +497,10 @@ function renderFloorPlanPNG() {
     }
   }
 
-  /* ---- 4b. collect inside labels (fixed obstacles) ----
-     Inside names read along the box's longest visual side.  Inside
-     dimension numbers stay aligned with their own edges. */
-
-  for (let i = 0; i < placedBoxes.length; i++) {
+  /* ---- 4b. collect inside labels ---- */
+  for (let i = 0; i < board.items.length; i++) {
     if (!insideFlags[i]) continue;
-    const bx = placedBoxes[i];
+    const bx = board.items[i];
     const nameStr = bx.name || "";
     const wStr = String(Math.round(bx.w));
     const hStr = String(Math.round(bx.h));
@@ -558,13 +508,12 @@ function renderFloorPlanPNG() {
     const fs = insideFS[i];
     const dimFS = fs * 0.82;
 
-    /* Inside name. */
     if (nameStr) {
       const [cxs, cys] = P(bx.x, bx.y);
       const nameDeg = nameTextAngleDeg(sc);
       const nameRad = nameDeg * Math.PI / 180;
 
-      g.font = `600 ${fs.toFixed(1)}px ${FONT_MONO}`;
+      g.font = `600 ${fs.toFixed(1)}px 'JetBrains Mono', monospace`;
       const nameW = g.measureText(nameStr).width;
       const plateW = nameW + fs * 0.3;
       const plateH = fs * 1.24;
@@ -581,8 +530,7 @@ function renderFloorPlanPNG() {
       });
     }
 
-    /* Inside W dimension number — near the bottom edge midpoint,
-       reading along the bottom edge. */
+    /* Inside W dimension number */
     {
       const mx = (sc[0][0] + sc[1][0]) / 2;
       const my = (sc[0][1] + sc[1][1]) / 2;
@@ -597,7 +545,7 @@ function renderFloorPlanPNG() {
       if (ang >  Math.PI / 2) ang -= Math.PI;
       if (ang < -Math.PI / 2) ang += Math.PI;
 
-      g.font = `500 ${dimFS.toFixed(1)}px ${FONT_MONO}`;
+      g.font = `500 ${dimFS.toFixed(1)}px 'JetBrains Mono', monospace`;
       const tw = g.measureText(wStr).width;
       const plateW = tw + dimFS * 0.3;
       const plateH = dimFS * 1.24;
@@ -614,8 +562,7 @@ function renderFloorPlanPNG() {
       });
     }
 
-    /* Inside H dimension number — near the right edge midpoint,
-       reading along the right edge. */
+    /* Inside H dimension number */
     {
       const mx = (sc[1][0] + sc[2][0]) / 2;
       const my = (sc[1][1] + sc[2][1]) / 2;
@@ -630,7 +577,7 @@ function renderFloorPlanPNG() {
       if (ang >  Math.PI / 2) ang -= Math.PI;
       if (ang < -Math.PI / 2) ang += Math.PI;
 
-      g.font = `500 ${dimFS.toFixed(1)}px ${FONT_MONO}`;
+      g.font = `500 ${dimFS.toFixed(1)}px 'JetBrains Mono', monospace`;
       const tw = g.measureText(hStr).width;
       const plateW = tw + dimFS * 0.3;
       const plateH = dimFS * 1.24;
@@ -648,17 +595,7 @@ function renderFloorPlanPNG() {
     }
   }
 
-  /* ---- 4c. collect outside labels (movable) ----
-     For each outside box:
-       1. draw the two dimension line bodies;
-       2. collect the two dimension number labels at their midpoints;
-       3. place the name via the candidate scan, then collect it.
-
-     The name reads along the box's longest visual side, so the
-     candidate ring uses the AABB of the rotated name — a box with a
-     vertical long edge reserves a taller slot for its name than a
-     box with a horizontal one. */
-
+  /* ---- 4c. collect outside labels (movable) ---- */
   const rectsOverlap = (a, b) =>
     !(a.x1 < b.x0 || a.x0 > b.x1 || a.y1 < b.y0 || a.y0 > b.y1);
 
@@ -673,7 +610,7 @@ function renderFloorPlanPNG() {
     }
     const p = rectToPoly(r);
     for (const face of wallFacesProj) {
-      if (polygonOverlapsFace(p, face)) n += 1;
+      if (polygonsOverlap(p, face.outer)) n += 1;
     }
     return n;
   }
@@ -684,9 +621,9 @@ function renderFloorPlanPNG() {
     return true;
   };
 
-  for (let i = 0; i < placedBoxes.length; i++) {
+  for (let i = 0; i < board.items.length; i++) {
     if (insideFlags[i]) continue;
-    const bx = placedBoxes[i];
+    const bx = board.items[i];
     const hasName = !!(bx.name && bx.name.length);
     const nameStr = bx.name || "";
     const wStr = String(Math.round(bx.w));
@@ -734,10 +671,9 @@ function renderFloorPlanPNG() {
     drawDimLineBody(g, wA, wB, numFS * 0.7, dimLW);
     drawDimLineBody(g, hA, hB, numFS * 0.7, dimLW);
 
-    /* W and H dimension numbers as labels.  Anchored to their own
-       dimension lines, reading along them. */
+    /* W and H dimension numbers. */
     {
-      g.font = `500 ${numFS.toFixed(1)}px ${FONT_MONO}`;
+      g.font = `500 ${numFS.toFixed(1)}px 'JetBrains Mono', monospace`;
       const wTw = g.measureText(wStr).width;
       const hTw = g.measureText(hStr).width;
 
@@ -779,11 +715,6 @@ function renderFloorPlanPNG() {
       });
     }
 
-    /* Outside name.  The name reads along the box's longest visual
-       side, so the candidate ring uses the AABB of the rotated
-       name.  A box whose long edge is vertical therefore reserves a
-       slot taller than the text is wide, which is what keeps the
-       ring honest for tall narrow boxes. */
     if (!hasName) continue;
 
     const nameDeg = nameTextAngleDeg(sc);
@@ -791,7 +722,7 @@ function renderFloorPlanPNG() {
     const absC = Math.abs(Math.cos(nameRad));
     const absS = Math.abs(Math.sin(nameRad));
 
-    g.font = `600 ${outFS.toFixed(1)}px ${FONT_MONO}`;
+    g.font = `600 ${outFS.toFixed(1)}px 'JetBrains Mono', monospace`;
     const textW = g.measureText(nameStr).width;
     const textH = outFS * 1.15;
     const plateW = textW + outFS * 0.3;
@@ -890,7 +821,7 @@ function renderFloorPlanPNG() {
     g.fillStyle = "#000000";
     g.font = `${L.kind === "inside-name" || L.kind === "outside-name"
                  ? "600" : "500"
-              } ${L.fontSize.toFixed(1)}px ${FONT_MONO}`;
+              } ${L.fontSize.toFixed(1)}px 'JetBrains Mono', monospace`;
     g.textAlign = "center";
     g.textBaseline = "middle";
     g.fillText(L.text, 0, 0);

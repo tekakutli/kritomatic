@@ -1,383 +1,673 @@
 """
-pg_base.py — palette, constants, textures, primitives, and the shared
-extended view state.
+pg_base.py — boxes' project CSS and panel body markup.
 
-The lowest layer of cable_live's twelve-module split: everything that
-other modules read but do not own.  Nothing here depends on any other
-live module; everything else depends on this one.
+The shared shell — the <html>/<head> structure, the panel wrapper,
+status line, the restore button, the "controlled remotely" banner,
+and the <canvas> — is provided by `pgkit.html_shell.page()`.  This
+file supplies the two pieces that are specific to the boxes
+playground:
 
-Contents
---------
-    • PALETTE               — the dark-theme colour system
-    • SHEET CONSTANTS       — dimension-tick, balloon, zoom, split
-                              constants shared by every renderer
-    • CABLE_STROKE          — cable width recipes (halo / ink pairs)
-    • EXTENDED VIEW STATE   — the fields this half of the split adds to
-                              pg_core's viewFloor / viewWall / state /
-                              mouse, plus session-scoped NOTES and the
-                              panel-fade flags
-    • SCREEN TEXTURES       — the three hatch patterns the sheet uses
-    • SHARED DRAWING HELPERS — the atoms: rounded rect, value pill,
-                              coloured variant, snap crosshair
-    • GRID LABEL / PILL     — the ruled pill that terminates a grid
-                              line in either view
+    PG_CSS          extras beyond pgkit's SHELL_CSS: the conditional
+                    GUIDES strip (visible only while draw-box mode is
+                    armed), the conditional BOX inspector (visible
+                    only while a box is selected), the instructions
+                    popover, and the title block.
 
-The extended view state lives here because it is the one place every
-module reads from and no module exclusively owns.  It extends the state
-pg_core.py declares; the rules that constrain it (zoom clamp, pan
-arithmetic) live in pg_navigation.py, and the palette that colours it
-lives above.
+    PG_PANEL_BODY   the panel's markup — the GUIDES strip, the draw
+                    tool toggle, the Edit and Output sections, the
+                    BOX inspector, the title block, the status line.
 
-viewWall carries two independent scale factors:
+In the previous concatenation model, the CSS and the panel markup
+started from small placeholders and were dynamically reshaped at
+runtime by `installVerticalMenu` and `installDarkScreenStyles` in
+`boxes_panel.py`.  In the ES-module model, the CSS and markup below
+are already the final shape; both functions become no-ops on the
+first call.  This is the same convention `board/pg_base.py` and
+`cone/pg_base.py` use: the panel CSS and the panel body are the
+authoritative end-state, not a base that gets patched.
 
-    zoom     uniform — applied to both axes.  Adjusted by the plain
-             wheel over the wall band, and by Shift+wheel over the
-             floor band (which is isotropic and has no X-only mode).
-    zoomX    horizontal-only — applied to viewWall.scaleX alone.
-             Adjusted by Shift+wheel over the wall band.  Dilation
-             leaves every vertical dimension untouched, which is what
-             you want when a narrow wall's cable geometry is packed
-             too tightly to read but the height scale is fine.
+The @font-face block and every `font-family` reference come from
+`playground_fonts.py` via the same placeholder-substitution the
+current `boxes_html.py` already performs in `inject_head`.  The
+substitution happens here so the page() call and the CSS agree
+exactly.
 
-zoomX = 1 is a no-op; the two compose, so a uniform zoom of 1.5 with
-an X-stretch of 2.0 gives scaleX a factor of 3.0 and scaleY a factor
-of 1.5.  The wall-band reset (Home, or the panel's zoom-reset button)
-zeroes both.
+Conditional visibility
+----------------------
+Two elements begin hidden and are shown by a sync function called
+from `draw()`:
+
+    #boxSection    starts display:none in the CSS; `_boxSyncInspector`
+                   sets display:block when a box is selected
+
+    .guidesItem    every element that belongs to the GUIDES strip
+                   carries this class; the CSS rule
+                   #ui:not(.draw-mode) .guidesItem { display:none }
+                   hides them while draw-box mode is off, and
+                   `updateDrawBoxButton` (in bx_dispatch.py) toggles
+                   the `draw-mode` class on `#ui`.
+
+The inputs' VALUES are untouched by these toggles: display:none does
+not clear an <input>'s value, so the defaults the user last set
+survive every mode flip with no save/restore code.
+
+Field chrome
+------------
+The text and number inputs share the visual chrome of the board
+playground's scrub-input fields (pgkit/styles.py:SHELL_CSS,
+`input.scrubInput`): transparent background, a single bottom rule,
+cyan tabular numerals, an underline that brightens on hover and
+goes full cyan on focus, and a dimmer disabled state.  Matching
+that chrome makes the two surfaces — boxes and board — read as the
+same family.
+
+The boxes inputs are typed rather than scrubbed, so the base rule
+keeps the browser's text cursor rather than advertising scrubbing
+with `cursor: ew-resize`; the underline alone carries the visual
+cue.  Native `type="number"` spinners are hidden for the same
+reason the board avoids them: the chrome is "text-like field with
+an underline", not "browser number spinner with an underline".
+
+Instructions popover
+--------------------
+The instructions popover (id `helpPopover`) is injected into
+document.body by `installInstructionsPopover` in
+`bx_panel_bindings.py`.  Its styling lives in PG_CSS here so
+the CSS is loaded once, at page assembly, rather than injected at
+runtime.  This matches the pattern in the cable playground, where
+the same popover is styled in `pg_panel.py` via the panel style
+sheet.
 """
 
+from playground_fonts import (
+    FONT_FAMILY_MONO,
+    FONT_FAMILY_SANS,
+    FONT_FACE_CSS,
+)
 
-BASE_JS = r"""
-/* ==========================================================================
-   PALETTE
-   ==========================================================================
-   Light ink on a deep, cool paper.  The polarity of the light theme
-   is inverted without touching the sheet idiom: what used to be black
-   ink is now cool grey, what used to be white paper is now near-black,
-   and the three semantic accents are pushed into an electric register
-   so they carry the visual weight that, on white paper, the ink alone
-   used to carry.
 
-     • ink        — structural stroke for every cable, wall, dimension,
-                    grid, ruler, anchor, and sheet frame
-     • paper      — the canvas, and the knockout halo under every
-                    stroke, and the fill of a wall chunk in the strip
-     • paperTint  — the wall band.  In the light theme this sat one
-                    step BELOW paper (#f4f4f4 under #ffffff) so a wall
-                    chunk read as raised.  Here it sits one step DEEPER
-                    than paper (#060a10 under #0a0e14) for the same
-                    reason, in the same direction.
-     • step       — magenta.  Step risers (z_hi dashes, dimension chain
-                    accents, step-bridge bars)
-     • transit    — cyan.  Anything crossing between the two views:
-                    hop arcs, cross-view boundary dots, escape arrows,
-                    the SAVE outline, the armed ruler button, the
-                    ruler's numeric input, the measure inspector, and
-                    a selected ruler measurement's value pill
-     • highlight  — yellow.  Cursor, snap crosshair, merge-target ring,
-                    live drawing preview, the live draw-button outline,
-                    and a hovered / pending ruler measurement
+def _subst(template):
+    return (template
+            .replace("@FONT_MONO@", FONT_FAMILY_MONO)
+            .replace("@FONT_SANS@", FONT_FAMILY_SANS))
 
-   Every rgba variant keeps the same semantic slot as its solid; alpha
-   values are chosen for a dark field where a 60 % ink reads like a
-   40 % ink did on white. */
-const PALETTE = {
-  /* ---- structural ink ---- */
-  ink:          "#dce6f2",
-  inkSoft:      "rgba(220, 230, 242, 0.55)",
-  inkFaint:     "rgba(220, 230, 242, 0.18)",
-  inkGuide:     "rgba(220, 230, 242, 0.28)",
 
-  /* ---- paper ---- */
-  paper:        "#0a0e14",
-  paperTint:    "#060a10",
+# ----------------------------------------------------------------------------
+#  PG_CSS — the panel's post-install stylesheet
+# ----------------------------------------------------------------------------
 
-  /* ---- electric accents ---- */
-  step:         "#ff2bd6",
-  stepSoft:     "rgba(255, 43, 214, 0.75)",
-  stepFaint:    "rgba(255, 43, 214, 0.40)",
+_PG_CSS_RAW = r"""
+  /* ==========================================================================
+     DARK SCREEN STYLE — "printed form" idiom
+     ==========================================================================
+     Everything below is the stable stylesheet the panel has at rest
+     after the old installDarkScreenStyles pass ran.  Section labels
+     are real static markup (in PG_PANEL_BODY), not injected, so the
+     whole panel reads the same way whether it was opened by a
+     first-load of a fresh tab or reloaded with a saved board. */
 
-  transit:      "#00e5ff",
-  transitSoft:  "rgba(0, 229, 255, 0.80)",
-  transitFaint: "rgba(0, 229, 255, 0.42)",
-
-  highlight:    "#ffe600",
-  highlightBg:  "rgba(255, 230, 0, 0.16)",
-  highlightSft: "rgba(255, 230, 0, 0.60)",
-};
-
-/* ==========================================================================
-   SHEET CONSTANTS
-   ========================================================================== */
-
-const SHEET_MARGIN       = 6;
-const RIBBON_BAND_H      = 22;
-const BALLOON_R          = 9;
-const BALLOON_MIN_SEP    = 16;
-const BALLOON_LEADER     = 22;
-const DIM_ROW_H          = 16;
-const DIM_TICK_LEN       = 4;
-const DIM_EXT_OVER       = 2;
-const FLOOR_PAD          = 28;
-const WALL_SIDE_CHAN     = 24;
-const MARGIN_TICK_LEN    = 5;
-const REG_CROSS_R        = 9;
-const SPLIT_MIN_FRAC     = 0.35;
-const SPLIT_MAX_FRAC     = 0.65;
-
-const MIN_ZOOM           = 0.25;
-const MAX_ZOOM           = 8.0;
-const ZOOM_STEP          = 1.12;
-
-/* Cable stroke recipes.  The unselected recipe is a two-pass halo+ink;
-   the selected recipe is a four-pass doubled stroke: outer halo, thick
-   ink ring, inner paper gap, thin ink core.  Draw order matters — each
-   later stroke is NARROWER than the previous, so it overlays the centre
-   of its predecessor rather than being covered by it.
-
-   These widths set the cable's visual weight everywhere it renders —
-   in the floor view, the wall view, and the hover highlight.  Halo to
-   ink is held at roughly 2.2:1, the same proportion pg_export.py uses,
-   so a screen cable and a printed cable of the same logical weight
-   read as the same hand.  To make cables lighter or heavier, scale
-   every number in one recipe by the same factor; changing ink alone
-   would break the halo ratio and change how cables read over grid
-   lines and dimension rules. */
-const CABLE_STROKE = {
-  plain:    { halo: 2.6, ink: 1.2 },
-  sibling:  { halo: 3.0, ink: 1.5 },
-  selected: { outerHalo: 5.4, outerInk: 4.0,
-              innerPaper: 2.8, innerInk: 1.3 },
-};
-
-/* ==========================================================================
-   EXTENDED VIEW STATE
-   ==========================================================================
-   The fields this half of the split adds to pg_core's viewFloor /
-   viewWall / state / mouse.  Extending rather than redeclaring keeps
-   pg_core untouched — the const bindings stay the ones pg_core made,
-   and every later module just reaches into the same objects.
-
-   viewWall.zoomX is the horizontal-only stretch factor: it feeds
-   viewWall.scaleX and nothing else, so the unfolded strip can be
-   dilated sideways without touching any vertical dimension.  It is
-   applied alongside viewWall.zoom inside fitViews, so the two
-   compose multiplicatively and both feed the router base Xs that the
-   arrow field and the ruler read.
-
-   Session-scoped NOTES and the panel-fade flags are declared here too:
-   they belong to no single view, and every renderer that reads them
-   already reads from this module's palette. */
-
-viewFloor.zoom = 1;   viewFloor.panX = 0;   viewFloor.panY = 0;
-viewWall.zoom  = 1;   viewWall.zoomX = 1;   viewWall.panX  = 0;
-viewWall.panY  = 0;
-
-state.pan = null;
-let spaceHeld = false;
-
-/* Modifier tracking.  pg_core defines `mouse` with `alt` only; we
-   add `shift` here so the ruler can read the Shift-held state from
-   draw() and drawRulers(), which have no event to consult. */
-mouse.shift = false;
-
-/* Session-scoped redline notes. */
-const NOTES = [];
-
-/* Panel-fade state. */
-let panelHovered = false;
-let panelLastActivity = 0;
-
-/* ==========================================================================
-   SCREEN TEXTURES
-   ==========================================================================
-   Pattern weights are retuned for a dark field.  On white paper a
-   0.55 px stroke at 100 % ink read as a crisp mark; on a dark field
-   the same mark blooms, so the hatch weights are lifted slightly
-   and the alphas dropped so the three fields keep their
-   light / mid / faint hierarchy.
-
-     crossHatch    — the hover highlight on every wall.  Two
-                     diagonals at 0.6 px / 0.72 alpha.  Reads as
-                     the drafting symbol for "attention here", and
-                     stays distinct from the two single-direction
-                     diagonals already in play.  Its alpha and
-                     weight are the two knobs that control how loud
-                     the highlight is: below roughly 0.35 / 0.45 the
-                     mark fades into the wall's paper fill on a
-                     dark field and the hover stops registering; at
-                     full ink it reads as a solid block rather than
-                     a hatch.  0.72 / 0.6 is deliberately in
-                     between — bright enough to be unmistakable
-                     against the surrounding strip, still sparse
-                     enough that the wall's own dimension rules and
-                     z_hi dashes show through it.
-     voidHatch     — the wall band behind the chunks.  Matches the
-                     crossHatch brightness so the "no wall here"
-                     symbology reads as strongly as the wall-under-
-                     cursor highlight, instead of fading into the
-                     strip.
-     planInterior  — the floor plan interior fill.  The lightest of
-                     the three: a texture, not a highlight. */
-
-const _SCREEN_PATTERNS = Object.create(null);
-
-function _screenPattern(kind) {
-  if (_SCREEN_PATTERNS[kind]) return _SCREEN_PATTERNS[kind];
-  const make = (size, color, weight, draw) => {
-    const pc = document.createElement("canvas");
-    pc.width = pc.height = size;
-    const p = pc.getContext("2d");
-    p.fillStyle   = PALETTE.paper;
-    p.fillRect(0, 0, size, size);
-    p.strokeStyle = color;
-    p.lineWidth   = weight;
-    p.lineCap     = "round";
-    draw(p, size);
-    return pc;
-  };
-  const defs = {
-    crossHatch: [11, "rgba(220, 230, 242, 0.72)", 0.6, (p, s) => {
-      p.beginPath();
-      p.moveTo(-1, s + 1); p.lineTo(s + 1, -1);
-      p.moveTo(-1, -1);    p.lineTo(s + 1, s + 1);
-      p.stroke();
-    }],
-    voidHatch: [12, "rgba(220, 230, 242, 0.72)", 0.6, (p, s) => {
-      p.beginPath();
-      p.moveTo(s + 1, -1); p.lineTo(-1, s + 1);
-      p.stroke();
-    }],
-    planInterior: [22, "rgba(220, 230, 242, 0.11)", 0.35, (p, s) => {
-      p.beginPath();
-      p.moveTo(-1, s + 1); p.lineTo(s + 1, -1);
-      p.stroke();
-    }],
-  };
-  const [size, color, weight, draw] = defs[kind];
-  _SCREEN_PATTERNS[kind] = make(size, color, weight, draw);
-  return _SCREEN_PATTERNS[kind];
-}
-
-function _screenPat(kind) {
-  return ctx.createPattern(_screenPattern(kind), "repeat");
-}
-
-/* ==========================================================================
-   SHARED DRAWING HELPERS
-   ========================================================================== */
-
-function _roundRect(x, y, w, h, r) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.lineTo(x + w - r, y);
-  ctx.arc(x + w - r, y + r, r, -Math.PI / 2, 0);
-  ctx.lineTo(x + w, y + h - r);
-  ctx.arc(x + w - r, y + h - r, r, 0, Math.PI / 2);
-  ctx.lineTo(x + r, y + h);
-  ctx.arc(x + r, y + h - r, r, Math.PI / 2, Math.PI);
-  ctx.lineTo(x, y + r);
-  ctx.arc(x + r, y + r, r, Math.PI, Math.PI * 3 / 2);
-  ctx.closePath();
-}
-
-function _drawValuePill(cx, cy, text) {
-  ctx.save();
-  ctx.font = "600 10px " + FONT_MONO;
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  const w = ctx.measureText(text).width + 10;
-  const h = 13;
-  ctx.fillStyle = PALETTE.paper;
-  ctx.fillRect(cx - w / 2, cy - h / 2, w, h);
-  ctx.strokeStyle = PALETTE.ink;
-  ctx.lineWidth = 0.8;
-  ctx.strokeRect(cx - w / 2 + 0.4, cy - h / 2 + 0.4, w - 0.8, h - 0.8);
-  ctx.fillStyle = PALETTE.ink;
-  ctx.fillText(text, cx, cy + 0.5);
-  ctx.restore();
-}
-
-/* Value pill with an arbitrary ink colour.  The palette-driven
-   _drawValuePill only inks in PALETTE.ink; the highlighted, selected,
-   and pending states of a ruler want their own accent. */
-function _drawValuePillColored(cx, cy, text, color) {
-  ctx.save();
-  ctx.font = "600 10px " + FONT_MONO;
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  const w = ctx.measureText(text).width + 10;
-  const h = 13;
-  ctx.fillStyle = PALETTE.paper;
-  ctx.fillRect(cx - w / 2, cy - h / 2, w, h);
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 0.8;
-  ctx.strokeRect(cx - w / 2 + 0.4, cy - h / 2 + 0.4, w - 0.8, h - 0.8);
-  ctx.fillStyle = color;
-  ctx.fillText(text, cx, cy + 0.5);
-  ctx.restore();
-}
-
-/* ==========================================================================
-   SNAP CROSSHAIR
-   ==========================================================================
-   The small four-armed cross the drawing preview and the ruler's free-
-   snap indicator both use.  It is the drafting idiom's mark for "the
-   cursor is here and snapping is not active". */
-
-function drawSnapCrosshair(sx, sy) {
-  ctx.save();
-  ctx.strokeStyle = PALETTE.ink;
-  ctx.lineWidth = 0.9;
-  const r = 12, g = 3;
-  ctx.beginPath();
-  ctx.moveTo(sx - r, sy); ctx.lineTo(sx - g, sy);
-  ctx.moveTo(sx + g, sy); ctx.lineTo(sx + r, sy);
-  ctx.moveTo(sx, sy - r); ctx.lineTo(sx, sy - g);
-  ctx.moveTo(sx, sy + g); ctx.lineTo(sx, sy + r);
-  ctx.stroke();
-  ctx.restore();
-}
-
-/* ==========================================================================
-   GRID LABEL / PILL
-   ==========================================================================
-   The ruled pill that terminates a grid line.  In the floor view a
-   N–S line gets a number, an E–W line a letter; in the wall view a
-   vertical line gets "u<n>" and a horizontal line "v<n>".  The same
-   pill is used in both views, so it lives in the shared layer. */
-
-function _gridLabel(g, allGrids) {
-  if (g.type === "ns") {
-    const sibs = allGrids.filter(x => x.type === "ns")
-                        .sort((a, b) => a.pos - b.pos);
-    const i = sibs.indexOf(g);
-    return String(i + 1);
+  html, body {
+    background: #0a0e14 !important;
+    color: #dce6f2 !important;
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    font-family: @FONT_MONO@;
   }
-  if (g.type === "ew") {
-    const sibs = allGrids.filter(x => x.type === "ew")
-                        .sort((a, b) => a.pos - b.pos);
-    const i = sibs.indexOf(g);
-    return String.fromCharCode(65 + (i % 26));
-  }
-  return "";
-}
+  canvas { background: #0a0e14 !important; display: block; }
 
-function _drawGridPill(sx, sy, label, active) {
-  ctx.save();
-  ctx.font = "700 10px " + FONT_MONO;
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  const textW = ctx.measureText(label).width;
-  const pw = textW + 10;
-  const ph = 14;
-  _roundRect(sx - pw / 2, sy - ph / 2, pw, ph, 3);
-  ctx.fillStyle = PALETTE.paper;
-  ctx.fill();
-  ctx.strokeStyle = active ? PALETTE.ink : PALETTE.inkSoft;
-  ctx.lineWidth = 1.2;
-  ctx.stroke();
-  ctx.fillStyle = active ? PALETTE.ink : PALETTE.inkSoft;
-  ctx.fillText(label, sx, sy + 0.5);
-  ctx.restore();
-}
+  #ui {
+    background: #0b1018;
+    border: 1px solid #1e2836;
+    border-radius: 3px;
+    box-shadow: 0 6px 28px rgba(0, 0, 0, 0.65);
+    font-family: @FONT_MONO@;
+    font-size: 10.5px;
+    line-height: 1.35;
+    color: #a8b5c4;
+    user-select: none;
+    width: 200px;
+    padding: 10px 12px 12px;
+    box-sizing: border-box;
+    position: absolute;
+    top: 12px; left: 12px; z-index: 10;
+    max-height: calc(100vh - 24px);
+    display: flex;
+    flex-direction: column;
+  }
+  #ui.collapsed { display: none; }
+  #ui .panel-body {
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-height: 0;
+    flex: 1 1 auto;
+  }
+  #ui .panel-body::-webkit-scrollbar { width: 6px; }
+  #ui .panel-body::-webkit-scrollbar-thumb {
+    background: #1e2836; border-radius: 3px;
+  }
+
+  /* ---- header ---- */
+  #ui h3 {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin: 0 0 10px;
+    padding: 0 0 8px;
+    border-bottom: 1px solid #1e2836;
+    font-family: @FONT_MONO@;
+    font-size: 11px; font-weight: 700;
+    letter-spacing: 0.16em; text-transform: uppercase;
+    color: #dce6f2;
+    flex: 0 0 auto;
+  }
+  #ui #helpBtn,
+  #ui #collapseBtn {
+    width: auto !important;
+    min-width: 22px !important;
+    height: 20px !important;
+    padding: 0 6px !important;
+    flex: 0 0 auto !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    font-family: @FONT_MONO@ !important;
+    font-size: 11px !important;
+    font-weight: 700 !important;
+    line-height: 1 !important;
+    text-align: center !important;
+    background: transparent !important;
+    border: 1px solid #223040 !important;
+    border-radius: 2px !important;
+    color: #a8b5c4 !important;
+    box-sizing: border-box !important;
+    cursor: pointer !important;
+    transition: none !important;
+  }
+  #ui #helpBtn { margin-left: auto !important; }
+  #ui #collapseBtn { margin-left: 4px !important; }
+  #ui #helpBtn:hover,
+  #ui #collapseBtn:hover {
+    border-color: #34445a !important;
+    color: #dce6f2 !important;
+    background: rgba(220, 230, 242, 0.03) !important;
+  }
+
+  /* ---- section labels: "GUIDES ────────────────" ---- */
+  #ui .sectionLabel {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 12px 0 6px;
+    font-family: @FONT_MONO@;
+    font-size: 8.5px;
+    font-weight: 700;
+    letter-spacing: 0.22em;
+    color: #5a6774;
+    text-transform: uppercase;
+    user-select: none;
+    pointer-events: none;
+  }
+  #ui .sectionLabel::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: #1e2836;
+  }
+
+  /* ---- buttons ---- */
+  #ui button {
+    width: 100%;
+    background: transparent;
+    border: 1px solid #223040;
+    color: #b8c4d2;
+    font-family: @FONT_MONO@;
+    font-size: 10.5px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    line-height: 1.35;
+    text-align: left;
+    padding: 5px 9px;
+    border-radius: 2px;
+    box-sizing: border-box;
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: break-word;
+    cursor: pointer;
+  }
+  #ui button:hover {
+    background: rgba(220, 230, 242, 0.035);
+    border-color: #34445a;
+    color: #dce6f2;
+  }
+  #ui button:active { background: rgba(220, 230, 242, 0.07); }
+
+  #ui #drawBoxBtn {
+    text-align: center;
+    padding: 7px 6px;
+    border-color: #34445a;
+    color: #dce6f2;
+    font-weight: 700;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    font-size: 10px;
+  }
+  #ui #drawBoxBtn:hover {
+    border-color: #4a5a70;
+    background: rgba(220, 230, 242, 0.04);
+  }
+  #ui #drawBoxBtn.active {
+    border-color: #ffe600;
+    color: #ffe600;
+    background: rgba(255, 230, 0, 0.04);
+  }
+  #ui #drawBoxBtn.active:hover {
+    background: rgba(255, 230, 0, 0.08);
+  }
+
+  #ui button.primary {
+    background: transparent;
+    border-color: #00e5ff;
+    color: #00e5ff;
+    font-weight: 700;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    text-align: center;
+  }
+  #ui button.primary:hover {
+    background: rgba(0, 229, 255, 0.05);
+    border-color: #4af0ff;
+    color: #4af0ff;
+  }
+
+  #ui button.danger {
+    background: transparent !important;
+    border-color: #4a2830;
+    color: #d48590;
+  }
+  #ui button.danger:hover {
+    background: rgba(212, 133, 144, 0.10) !important;
+    border-color: #7a3e4a;
+    color: #e8a0a8;
+  }
+
+  #ui #boxDeleteBtn {
+    width: 100%; padding: 5px 8px; text-align: center;
+    font-family: @FONT_MONO@;
+    font-size: 10px; font-weight: 700;
+    letter-spacing: 0.10em; text-transform: uppercase;
+    background: transparent;
+    border: 1px solid #4a2830; border-radius: 2px;
+    color: #d48590; cursor: pointer;
+  }
+  #ui #boxDeleteBtn:hover {
+    background: rgba(212, 133, 144, 0.10);
+    border-color: #7a3e4a; color: #e8a0a8;
+  }
+
+  #ui hr { display: none !important; }
+
+  /* ---- rows ---- */
+  #ui .row {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin: 0;
+    padding: 0;
+    align-items: stretch;
+  }
+  #ui .row.grid2x2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+    flex-direction: initial;
+  }
+  #ui .row.grid3 {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 4px;
+    flex-direction: initial;
+  }
+  #ui .row.grid2x2 button,
+  #ui .row.grid3 button {
+    text-align: center; padding: 6px 4px; font-size: 10px;
+    letter-spacing: 0.04em;
+  }
+
+  /* ---- text / number fields ----
+     The visual chrome matches the board playground's scrub-input
+     fields (pgkit/styles.py:SHELL_CSS `input.scrubInput`): a
+     transparent background, a single bottom rule, cyan tabular
+     numerals, and an underline that brightens on hover and goes
+     full cyan on focus.  Numeric fields right-align so their
+     digits line up; the name field left-aligns.  Native number
+     spinners are hidden so the fields read as text, matching the
+     board's type=text scrub inputs.  The inputs are typed, not
+     scrubbed, so the base cursor is the browser's text cursor
+     rather than the scrub-input's `ew-resize` hint — the
+     underline alone is the visual cue. */
+  #ui input[type=number],
+  #ui input[type=text] {
+    background: transparent;
+    border: 0;
+    border-bottom: 1px solid #223040;
+    color: #00e5ff;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    padding: 2px 4px;
+    margin: 0;
+    outline: none;
+    box-sizing: border-box;
+    text-align: right;
+    transition: border-color 0.1s ease;
+  }
+  #ui input[type=text] { text-align: left; }
+  #ui input[type=number]:hover,
+  #ui input[type=text]:hover {
+    border-bottom-color: #34445a;
+  }
+  #ui input[type=number]:focus,
+  #ui input[type=text]:focus {
+    border-bottom-color: #00e5ff;
+  }
+  #ui input[type=number]:disabled,
+  #ui input[type=text]:disabled {
+    color: #3d4756;
+    border-bottom-color: #1e2836;
+    cursor: not-allowed;
+  }
+  #ui input[type=number]::-webkit-outer-spin-button,
+  #ui input[type=number]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  #ui input[type=number] {
+    -moz-appearance: textfield;
+    appearance: textfield;
+  }
+
+  /* ---- GUIDES strip ---- */
+  #ui .row.fieldColumn {
+    display: flex; flex-direction: column; gap: 4px;
+    align-items: stretch;
+  }
+  #ui .row.fieldColumn label {
+    display: flex; flex-direction: row; gap: 8px;
+    align-items: center;
+  }
+  #ui .row.fieldColumn label > span.lbl {
+    flex: 0 0 34px;
+    font-family: @FONT_MONO@;
+    font-size: 8.5px; font-weight: 700; letter-spacing: 0.18em;
+    text-transform: uppercase; color: #5a6774;
+  }
+  #ui .row.fieldColumn label > input {
+    flex: 1 1 auto; min-width: 0;
+  }
+
+  /* ---- fieldRow (name field) ----
+     The name field uses a single-column label stack so the input
+     stretches the full panel width, matching the numeric fields'
+     visual weight. */
+  #ui .row.fieldRow label {
+    display: flex; flex-direction: column; gap: 2px;
+    flex: 1; min-width: 0;
+  }
+  #ui .row.fieldRow label > span.lbl {
+    font-family: @FONT_MONO@;
+    font-size: 8.5px; font-weight: 700; letter-spacing: 0.18em;
+    text-transform: uppercase; color: #5a6774;
+  }
+  #ui .row.fieldRow input {
+    width: 100%; box-sizing: border-box;
+  }
+
+  /* The GUIDES strip is the "what will a click place" configurator
+     and only matters when draw-box mode is armed.  Every element
+     inside carries .guidesItem and the following rule hides them
+     unless the root has .draw-mode.  The inputs' VALUES are not
+     touched; display:none leaves an <input>'s value alone. */
+  #ui:not(.draw-mode) .guidesItem { display: none; }
+
+  /* ---- BOX inspector (conditional) ---- */
+  #ui .boxSection { display: none; }
+  #ui .boxInspector {
+    display: flex; flex-direction: column; gap: 6px;
+    margin: 2px 0 0; padding: 8px;
+    border: 1px solid #1e2836;
+    border-left: 2px solid #00e5ff;
+    border-radius: 2px;
+    background: rgba(0, 229, 255, 0.02);
+  }
+  #ui .boxIndex {
+    font-family: @FONT_MONO@;
+    font-size: 8.5px; font-weight: 700;
+    letter-spacing: 0.16em; text-transform: uppercase;
+    color: #00e5ff;
+    line-height: 1.5; overflow-wrap: anywhere;
+  }
+  #ui .boxSelInfo {
+    font-family: @FONT_MONO@;
+    font-size: 10px; font-weight: 600;
+    letter-spacing: 0.04em; color: #a8b5c4;
+    overflow-wrap: anywhere;
+  }
+
+  /* ---- title block ---- */
+  #ui .titleBlock {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 12px 0 0;
+    padding: 10px 0 0;
+    border-top: 1px solid #1e2836;
+  }
+  #ui .titleRow { display: flex; flex-direction: column; gap: 1px; }
+  #ui .titleLabel {
+    font-family: @FONT_MONO@;
+    font-size: 8.5px; letter-spacing: 0.20em; font-weight: 700;
+    line-height: 1.3; text-transform: uppercase;
+    color: #5a6774;
+  }
+  #ui .titleValue {
+    font-family: @FONT_MONO@;
+    font-size: 10.5px; line-height: 1.4; overflow-wrap: anywhere;
+    color: #dce6f2;
+  }
+
+  /* ---- status ---- */
+  #ui #status {
+    font-family: @FONT_MONO@;
+    font-size: 10px;
+    line-height: 1.45;
+    height: 48px;
+    min-height: 48px;
+    max-height: 48px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    overflow-wrap: anywhere;
+    box-sizing: border-box;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid #1e2836;
+    color: #7b8794;
+  }
+  #ui #status.ok   { color: #00e5ff; }
+  #ui #status.bad  { color: #d48590; }
+  #ui #status.warn { color: #ffe600; }
+
+  /* ---- collapse / restore / banner ---- */
+  #restoreBtn {
+    padding: 6px 12px; background: #0b1018;
+    border: 1px solid #1e2836; border-radius: 3px;
+    box-shadow: 0 6px 28px rgba(0, 0, 0, 0.65);
+    color: #a8b5c4;
+    font-family: @FONT_MONO@;
+    font-size: 10px; font-weight: 700;
+    letter-spacing: 0.10em; text-transform: uppercase;
+    cursor: pointer;
+    position: absolute; top: 12px; left: 12px; z-index: 10;
+    display: none;
+  }
+  #restoreBtn:hover {
+    background: #141a24; border-color: #34445a; color: #dce6f2;
+  }
+  #restoreBtn.visible { display: block; }
+
+  /* ---- instructions popover ---- */
+  #helpPopover {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 100;
+    background: #0e1420;
+    padding: 20px 24px;
+    border: 1px solid #223040;
+    border-radius: 3px;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.70);
+    font-family: @FONT_MONO@;
+    font-size: 11px;
+    line-height: 1.6;
+    color: #a8b5c4;
+    width: calc(100vw - 48px);
+    max-width: 680px;
+    max-height: 80vh;
+    overflow-y: auto;
+    display: none;
+    box-sizing: border-box;
+  }
+  #helpPopover.show { display: block; }
+  #helpPopover > h3 {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 0 0 16px;
+    padding: 0 0 10px;
+    border-bottom: 1px solid #1e2836;
+    font-family: @FONT_MONO@;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: #dce6f2;
+  }
+  #helpPopover .closeBtn {
+    margin-left: auto;
+    padding: 4px 12px;
+    background: transparent;
+    border: 1px solid #223040;
+    border-radius: 2px;
+    color: #a8b5c4;
+    font-family: inherit;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    cursor: pointer;
+  }
+  #helpPopover .closeBtn:hover {
+    border-color: #34445a;
+    color: #dce6f2;
+    background: rgba(220, 230, 242, 0.03);
+  }
+  #helpPopover .body {
+    font-family: @FONT_SANS@;
+    font-size: 12.5px;
+    line-height: 1.65;
+    color: #a8b5c4;
+  }
+  #helpPopover .body b { color: #dce6f2; font-weight: 700; }
+"""
+
+PG_CSS = FONT_FACE_CSS + _subst(_PG_CSS_RAW)
+
+
+# ----------------------------------------------------------------------------
+#  PG_PANEL_BODY — the final panel markup
+# ----------------------------------------------------------------------------
+
+PG_PANEL_BODY = r"""
+    <div class="sectionLabel">Guides</div>
+    <div class="row fieldColumn guidesItem">
+      <label><span class="lbl">W</span>
+        <input type="number" id="boxW" value="2000" step="100"></label>
+      <label><span class="lbl">H</span>
+        <input type="number" id="boxH" value="1500" step="100"></label>
+      <label><span class="lbl">Rot</span>
+        <input type="number" id="boxRot" value="0" step="15"></label>
+    </div>
+    <div class="row grid2x2 guidesItem">
+      <button id="rotL90" title="Rotate the selected (or hovered) box by -90°">- 90°</button>
+      <button id="rotR90" title="Rotate the selected (or hovered) box by +90°">+ 90°</button>
+      <button id="rotL15" title="Rotate by -15°">- 15°</button>
+      <button id="rotR15" title="Rotate by +15°">+ 15°</button>
+    </div>
+
+    <div class="sectionLabel">Draw</div>
+    <div class="row">
+      <button id="drawBoxBtn" title="Arm the drawing tool — click to place a preset box, drag to draw an axis-aligned box (Esc to disarm)">Draw box</button>
+    </div>
+
+    <div id="boxSection" class="boxSection">
+      <div class="sectionLabel">Box</div>
+      <div class="boxInspector">
+        <div id="boxIndex" class="boxIndex">—</div>
+        <div class="row fieldRow">
+          <label style="flex:1;">
+            <span class="lbl">Name</span>
+            <input type="text" id="boxName" autocomplete="off" spellcheck="false">
+          </label>
+        </div>
+        <div class="row fieldColumn">
+          <label><span class="lbl">W</span>
+            <input type="number" id="selW" step="10" min="10"></label>
+          <label><span class="lbl">H</span>
+            <input type="number" id="selH" step="10" min="10"></label>
+          <label><span class="lbl">Rot</span>
+            <input type="number" id="selRot" step="15"></label>
+        </div>
+        <div id="selInfo" class="boxSelInfo">no box selected</div>
+        <button id="boxDeleteBtn">Delete box</button>
+      </div>
+    </div>
+
+    <div class="sectionLabel">Edit</div>
+    <div class="row grid3">
+      <button id="saveBtn" class="primary" title="Write room_boxes.json (Ctrl/Cmd+S)">Save</button>
+      <button id="undoBtn" title="Remove the last placed box">Undo</button>
+      <button id="clearBtn" title="Delete every box">Clear all</button>
+    </div>
+
+    <div class="sectionLabel">Output</div>
+    <div class="row grid2x2">
+      <button id="pngBtn" title="Save a black-and-white room_boxes.png">Print PNG</button>
+      <button id="listBtn" title="Print the box table to the terminal">List boxes</button>
+    </div>
+
+    <div class="titleBlock">
+      <div class="titleRow">
+        <div class="titleLabel">Project</div>
+        <div class="titleValue" id="tb_project">room_walls.json</div>
+      </div>
+      <div class="titleRow">
+        <div class="titleLabel">Sheet</div>
+        <div class="titleValue" id="tb_sheet">—</div>
+      </div>
+      <div class="titleRow">
+        <div class="titleLabel">Boxes</div>
+        <div class="titleValue" id="tb_boxes">—</div>
+      </div>
+      <div class="titleRow">
+        <div class="titleLabel">Scale</div>
+        <div class="titleValue" id="tb_scale">—</div>
+      </div>
+      <div class="titleRow">
+        <div class="titleLabel">Selection</div>
+        <div class="titleValue" id="tb_selection">—</div>
+      </div>
+    </div>
+
+    <div class="sectionLabel">Status</div>
+    <div id="status"></div>
 """

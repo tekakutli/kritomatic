@@ -1,183 +1,170 @@
 """
 bx_core.py — model, storage, view state, transforms.
 
-The middle layer.  Declares:
+ES module.  This is the second layer of the split, importing from
+`bx_base.js` (palette, canvas, env) and defining the model:
 
-    • the placed-box list, the selection, the drag state, the ghost
-      state, and the world/screen transforms
-    • the draw-box mode flag and its three helpers (setDrawBoxMode,
-      toggleDrawBoxMode, updateDrawBoxButton) — the mode is a model-
-      level fact, not a UI fact, so it lives here next to the rest
-      of the interaction state, not in the panel
-    • the Space-to-pan flag (spaceHeld) — same reasoning: the pointer
-      behaviour and the cursor both read it
-    • the collision, geometry, and hit-test primitives every other
-      module reads
-    • the persistence layer — serialize, normalize, save, load
+    * view transform (b2s / s2b)
+    * board state (placedBoxes, selectedBox, hoveredBox, state object)
+    * geometry helpers (pointInPolygon, segsIntersect, boxCorners,
+      boxEdgeMidpoints, pointInFace, polygonOverlapsFace,
+      polygonsOverlap, boxOverlapsWalls, boxIsInvalid)
+    * handles (rotateHandleWorldPos / rotateHandleScreenPos — the
+      single source of truth shared by the hit test and the renderer)
+    * transforms (w2sFloor / s2wFloor via the view object, which
+      itself is derived from view.zoom / view.panX / view.panY)
+    * layout (fitView, resize, zoomAt)
+    * persistence (serialize, applyLoaded, saveToServer,
+      loadFromServer, autoload, doSave, downloadBoxes,
+      consolePrintBoxList, printBoxList, saveToLocalStorage,
+      loadFromLocalStorage, clearAll)
+    * callbacks (notifyChanged, setDraw)
 
-Everything else in the JS bundle depends on bx_base and this module;
-this module depends only on bx_base and bx_i18n.
+The old concatenation model had these as top-level `let` variables
+scattered across the file: `placedBoxes`, `selectedBox`,
+`hoveredBox`, `drag`, `handleDrag`, `pendingPlace`, `panning`,
+`boxCounter`, `drawBoxMode`, `spaceHeld`, `mouse`, `view`.  ES
+modules forbid cross-module reassignment of `let`, so all of them
+move into a `const state` object (or the `board` / `view` objects,
+which are the same `const`-object pattern):
 
-Translation
+    view         { zoom, panX, panY, fitScale } — properties mutable
+    board        { items, selectedIdx, ... }
+    state        { drag, handleDrag, pendingPlace, panning,
+                   dragBoxMode, spaceHeld, hoveredBox,
+                   boxCounter, mouse, drawing }
+    env          { dpr } — from bx_base
+
+`boxCounter` is the auto-name counter.  `drawing` is the in-progress
+drag-draw state; `pendingPlace` is the click-to-place state, kept
+separate because their lifetimes differ (`pendingPlace` is one
+press-to-release; `drawing` was the analogue in the concat version
+and is not needed here — box drag-draw is a single press-drag-
+release gesture, not a multi-click tool).
+
+Persistence
 -----------
-Every user-facing string this module writes — the two draw-button
-labels, the four save/print flash messages, and the load confirmation
-— comes from T() in bx_i18n.py.  See those functions below.
+`room_boxes.json` is fetched at boot; every save also writes to
+localStorage.  The two places that depend on the draw hook —
+`fitView` when there is no content, and `doSave`'s feedback path —
+call `callDraw()` (which routes to the injected draw function)
+rather than a bare `draw()`.  In the ES-module model, `draw` is not
+in this file's scope; `callDraw()` is the only safe way to ask for
+a repaint.
 
-Handles
--------
-A selected box exposes three kinds of handle, all hit-tested by
-hitTestHandle:
+DRAW REFERENCE
+==============
+`resize()` and `fitView()` call a `_draw` injected at boot via
+`_setDraw(draw)`.  A static import of `draw` from `bx_dispatch.js`
+would create a cycle (bx_dispatch imports from bx_core) — the same
+indirection board/pair/cone use.
 
-    rotate    a single floating circle above the box's top edge,
-              drawn by bx_view.drawHandles.  Its position is computed
-              by rotateHandleWorldPos / rotateHandleScreenPos in this
-              module, so the hit test and the renderer share one
-              source of truth.
-
-    corner    four squares at the box's own corners.  A corner drag
-              resizes BOTH axes at once, pinning the diagonally
-              opposite corner.
-
-    edge      four squares at the box's edge midpoints.  An edge drag
-              resizes ONE axis, pinning the opposite edge.
-
-The rotate handle is hit-tested FIRST, with a slightly larger radius
-than the corner handles', so that near the top of the box a cursor
-in the small gap between the two always resolves to rotate.
-
-Draw-box mode and the panel
----------------------------
-Arming or disarming draw-box mode is the single moment at which the
-panel's GUIDES section — the W / H / Rot fields and the rotation
-buttons — appears or disappears.  updateDrawBoxButton is the sink for
-both the button's own active state and the #ui.draw-mode class the
-CSS hides GUIDES with, so there is exactly one place that reads the
-mode and writes it to the panel.
-
-The inputs' VALUES are not part of this contract: the mode toggle
-hides them via CSS but does not touch them, so the defaults the user
-last set survive every toggle without any save/restore code.
-
-Space-to-pan
-------------
-Holding Space arms pan mode; a left-press while armed starts a pan
-drag that ends on mouseup.  The flag lives here rather than in the
-panel because two independent things read it:
-
-    • the mousedown dispatch (mousedown with Space held pans instead
-      of interacting with a box),
-    • updateCursor (Space held → open-hand cursor).
-
-The pan state itself is the existing `panning` variable, which is
-already shared with the middle-button drag; only the trigger differs.
+GEOMETRY IMPORT
+===============
+`bx_geometry.js` is the generated module that carries the room
+geometry dict under the name `GEOMETRY`.  Every function in this
+file that reads `GEOMETRY.bounds`, `GEOMETRY.faces`, or
+`GEOMETRY.stepFaces` (via `boxOverlapsWalls` and `fitView` here;
+other files add `GEOMETRY.cutZ`, `GEOMETRY.stepFaces`) needs
+GEOMETRY in its own module scope — the concatenation model relied
+on a page-level `const`, which the ES-module model does not have.
+The import below is what puts it here.
 """
 
-
 CORE_JS = r"""
+import {
+  ctx, env, canvas, PALETTE,
+  MIN_ZOOM_FACTOR, MAX_ZOOM,
+} from "./bx_base.js";
+import { GEOMETRY } from "./bx_geometry.js";
+import { pgkitNotifyAll } from "./pgkit/remote_client.js";
+
 /* ==========================================================================
-   MODEL STATE
+   VIEW
+   ==========================================================================
+   The view transform.  Same fields the old top-level `view` const
+   held: zoom, panX, panY, plus `fitScale` (the reference for the
+   zoom-out floor in `zoomAt`).
+
+   The board-space → screen-space mapping is:
+
+       screenX =  boardX * zoom + panX
+       screenY = -boardY * zoom + panY
+
+   The minus sign on the Y axis is what flips the room's plan-space
+   +Y-up convention (from the CAD section) into the canvas's +Y-down
+   pixel convention.  Every world-space point — walls, steps, boxes,
+   handles, cables — is passed through these two functions; nothing
+   else in the codebase applies a scale or a flip of its own. */
+
+export const view = { zoom: 1, panX: 0, panY: 0, fitScale: 1 };
+
+export function b2s(bx, by) {
+  return [bx * view.zoom + view.panX, -by * view.zoom + view.panY];
+}
+export function s2b(sx, sy) {
+  return [(sx - view.panX) / view.zoom, -(sy - view.panY) / view.zoom];
+}
+
+/* The board is a plain board-space coordinate system.  These two are
+   the same shape as the cable playground's w2sFloor / s2wFloor, kept
+   here as small aliases because the boxes renderer names the space
+   "board" rather than "floor". */
+export function w2sFloor(x, y) { return b2s(x, y); }
+export function s2wFloor(sx, sy) { return s2b(sx, sy); }
+
+/* ==========================================================================
+   BOARD STATE
    ========================================================================== */
 
-let placedBoxes = [];
-let selectedBox = null;
-let hoveredBox  = null;
-let drag        = null;
-let handleDrag  = null;
-let pendingPlace = null;
-let panning     = null;
-let boxCounter  = 0;
+export const board = {
+  items:        [],
+  selectedIdx:  -1,
+  gridGap:      24,
+  defaultWidth: 320,
+  nextZ:        1,
+  palette: [
+    { r: 255, g: 200, b:  90 },
+    { r: 120, g: 220, b: 255 },
+    { r: 255, g: 130, b: 210 },
+    { r: 140, g: 225, b: 160 },
+    { r: 180, g: 155, b: 255 },
+    { r: 255, g: 165, b: 105 },
+    { r: 110, g: 220, b: 210 },
+    { r: 220, g: 230, b: 120 },
+  ],
+};
 
-/* Draw-box mode.  When true the canvas is exclusively the drawing
-   surface: clicks and drags place or draw a box, and existing boxes
-   are not interactive.  When false, normal select / move / resize
-   applies.
+/* The state object collects every interaction-scoped value that the
+   old concatenation model held as a top-level `let`.  All of these
+   are mutated from at least two modules (event handlers, hit tests,
+   renderer, panel), so they must live in a `const` object rather
+   than a bare `let`. */
+export const state = {
+  dragBoxMode:  false,
+  spaceHeld:    false,
+  hoveredBox:   null,
+  drag:         null,
+  handleDrag:   null,
+  pendingPlace: null,
+  panning:      null,
+  drawing:      null,
+  boxCounter:   0,
+  mouse:        { sx: 0, sy: 0, inside: false },
+};
 
-   The flag is a model-level fact, not a UI fact — the pointer
-   behaviour, the ghost preview, and the visibility of the panel's
-   GUIDES section all read it — so it lives here next to `drag` and
-   `pendingPlace` rather than in the panel.
-
-   The three helpers below are the whole API:
-     setDrawBoxMode(on)     set the mode explicitly
-     toggleDrawBoxMode()    flip the mode
-     updateDrawBoxButton()  push the mode into the panel (button state
-                            and the #ui.draw-mode class that the CSS
-                            uses to show or hide GUIDES)
-
-   Arming the mode clears any selection and pending gesture, so the
-   transition is always crisp.  Disarming it clears any pending
-   gesture for the same reason.  The mode is never cleared by placing
-   a box: it behaves like a stamp, not like a one-shot action. */
-let drawBoxMode = false;
-
-/* Space-to-pan.  Set true while the Space key is down; the mousedown
-   dispatch uses it to start a pan instead of interacting with the
-   scene, and updateCursor uses it to show the open-hand cursor.
-   Reset on keyup and on window blur, so a Space pressed while the
-   browser has focus elsewhere does not leave a stuck pan-armed
-   state. */
-let spaceHeld = false;
-
-const mouse = { sx: 0, sy: 0, inside: false };
-const view  = { scale: 1, tx: 0, ty: 0, fitScale: 1 };
-
-function setDrawBoxMode(on) {
-  drawBoxMode = !!on;
-  pendingPlace = null;
-  if (drawBoxMode) {
-    /* Arming the mode deselects — the panel's conditional BOX
-       inspector collapses, the canvas handles disappear, and the
-       draw ghost takes over as the only cursor-following overlay. */
-    selectedBox = null;
-    hoveredBox  = null;
-    if (typeof syncSelectionInputs === "function") syncSelectionInputs();
-  }
-  updateDrawBoxButton();
-  draw();
-}
-
-function toggleDrawBoxMode() {
-  setDrawBoxMode(!drawBoxMode);
-}
-
-/* Push the current mode into the panel.  Three things track
-   drawBoxMode, all written from this one function so the sink is
-   single:
-
-     • the Draw box button's active state and label,
-     • a #ui.draw-mode class on the panel root, which the CSS uses to
-       show or hide the GUIDES section.
-
-   The panel root class is what makes GUIDES contextual.  The
-   inputs' values are untouched by any of this — see the module
-   docstring.
-
-   The button's two labels come from T() in bx_i18n.py. */
-function updateDrawBoxButton() {
-  const el = document.getElementById("drawBoxBtn");
-  if (el) {
-    if (drawBoxMode) {
-      el.classList.add("active");
-      el.textContent = T("btnCancelDraw");
-    } else {
-      el.classList.remove("active");
-      el.textContent = T("btnDrawBox");
-    }
-  }
-
-  const ui = document.getElementById("ui");
-  if (ui) {
-    if (drawBoxMode) ui.classList.add("draw-mode");
-    else             ui.classList.remove("draw-mode");
-  }
-}
+/* Compatibility aliases so existing code that names the field
+   directly (e.g. `pendingPlace.drag`) reads naturally.  These
+   forward accesses to `state.*` — they are not separate bindings. */
+Object.defineProperties(window, {
+  __boxesStateAlias: { value: state, configurable: true },
+});
 
 /* ==========================================================================
    GEOMETRY HELPERS — pure functions, no state
    ========================================================================== */
 
-function pointInPolygon(p, poly) {
+export function pointInPolygon(p, poly) {
   const x = p[0], y = p[1];
   let inside = false;
   for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
@@ -191,7 +178,7 @@ function pointInPolygon(p, poly) {
   return inside;
 }
 
-function segsIntersect(ax, ay, bx, by, cx, cy, dx, dy) {
+export function segsIntersect(ax, ay, bx, by, cx, cy, dx, dy) {
   const d1x = bx - ax, d1y = by - ay;
   const d2x = dx - cx, d2y = dy - cy;
   const denom = d1x * d2y - d1y * d2x;
@@ -201,13 +188,13 @@ function segsIntersect(ax, ay, bx, by, cx, cy, dx, dy) {
   return t >= 0 && t <= 1 && s >= 0 && s <= 1;
 }
 
-function pointInFace(p, face) {
+export function pointInFace(p, face) {
   if (!pointInPolygon(p, face.outer)) return false;
   for (const h of face.holes) if (pointInPolygon(p, h)) return false;
   return true;
 }
 
-function polygonOverlapsFace(poly, face) {
+export function polygonOverlapsFace(poly, face) {
   for (const p of poly) if (pointInFace(p, face)) return true;
   const rings = [face.outer, ...face.holes];
   for (const ring of rings) {
@@ -226,7 +213,7 @@ function polygonOverlapsFace(poly, face) {
   return false;
 }
 
-function polygonsOverlap(p1, p2) {
+export function polygonsOverlap(p1, p2) {
   for (const p of p1) if (pointInPolygon(p, p2)) return true;
   for (const p of p2) if (pointInPolygon(p, p1)) return true;
   for (let i = 0; i < p1.length; i++) {
@@ -240,7 +227,7 @@ function polygonsOverlap(p1, p2) {
   return false;
 }
 
-function boxCorners(cx, cy, w, h, rotDeg) {
+export function boxCorners(cx, cy, w, h, rotDeg) {
   const r = rotDeg * Math.PI / 180;
   const c = Math.cos(r), s = Math.sin(r);
   const hw = w / 2, hh = h / 2;
@@ -249,7 +236,7 @@ function boxCorners(cx, cy, w, h, rotDeg) {
     [cx + c * dx - s * dy, cy + s * dx + c * dy]);
 }
 
-function boxEdgeMidpoints(cx, cy, w, h, rotDeg) {
+export function boxEdgeMidpoints(cx, cy, w, h, rotDeg) {
   const c = boxCorners(cx, cy, w, h, rotDeg);
   return [
     [(c[0][0] + c[1][0]) / 2, (c[0][1] + c[1][1]) / 2],
@@ -259,6 +246,22 @@ function boxEdgeMidpoints(cx, cy, w, h, rotDeg) {
   ];
 }
 
+export function boxOverlapsWalls(cx, cy, w, h, rotDeg) {
+  const corners = boxCorners(cx, cy, w, h, rotDeg);
+  for (const face of GEOMETRY.faces) {
+    if (polygonOverlapsFace(corners, face)) return true;
+  }
+  return false;
+}
+
+export function boxIsInvalid(b) {
+  if (b._invalid === undefined) {
+    b._invalid = boxOverlapsWalls(b.x, b.y, b.w, b.h, b.rot);
+  }
+  return b._invalid;
+}
+export function invalidateBox(b) { b._invalid = undefined; }
+
 /* ==========================================================================
    ROTATION HANDLE POSITION
    ==========================================================================
@@ -266,16 +269,10 @@ function boxEdgeMidpoints(cx, cy, w, h, rotDeg) {
    (0, h/2 + offMm) — above the top edge — where offMm is
    ROTATE_HANDLE_OFFSET_PX converted from screen px to world mm at the
    current scale.  Because the offset is in screen px, the handle sits
-   the same distance from the box at every zoom level, which is what
-   every design tool does.
+   the same distance from the box at every zoom level. */
 
-   rotateHandleWorldPos returns the handle in world mm.
-   rotateHandleScreenPos wraps it with the view transform.  Both are
-   used by hitTestHandle (below) and by bx_view.drawHandles, so the
-   hit test and the renderer share one source of truth. */
-
-function rotateHandleWorldPos(b) {
-  const offMm = ROTATE_HANDLE_OFFSET_PX / Math.max(view.scale, 1e-9);
+export function rotateHandleWorldPos(b) {
+  const offMm = 32 / Math.max(view.zoom * (b._scale || 1), 1e-9);
   const r = b.rot * Math.PI / 180;
   const localY = b.h / 2 + offMm;
   return [
@@ -284,83 +281,62 @@ function rotateHandleWorldPos(b) {
   ];
 }
 
-function rotateHandleScreenPos(b) {
+export function rotateHandleScreenPos(b) {
   const [wx, wy] = rotateHandleWorldPos(b);
-  return w2s(wx, wy);
+  return b2s(wx, wy);
 }
-
-function boxOverlapsWalls(cx, cy, w, h, rotDeg) {
-  const corners = boxCorners(cx, cy, w, h, rotDeg);
-  for (const face of GEOMETRY.faces) {
-    if (polygonOverlapsFace(corners, face)) return true;
-  }
-  return false;
-}
-
-function boxIsInvalid(b) {
-  if (b._invalid === undefined) {
-    b._invalid = boxOverlapsWalls(b.x, b.y, b.w, b.h, b.rot);
-  }
-  return b._invalid;
-}
-function invalidateBox(b) { b._invalid = undefined; }
 
 /* ==========================================================================
    VIEW TRANSFORMS
    ========================================================================== */
 
-const canvas = document.getElementById("c");
-const ctx = canvas.getContext("2d");
-let dpr = window.devicePixelRatio || 1;
-
-function w2s(wx, wy) {
-  return [wx * view.scale + view.tx, -wy * view.scale + view.ty];
-}
-function s2w(sx, sy) {
-  return [(sx - view.tx) / view.scale, -(sy - view.ty) / view.scale];
-}
-
-function fitView() {
+export function fitView() {
   const b = GEOMETRY.bounds;
   const cw = canvas.clientWidth, ch = canvas.clientHeight;
   const bw = (b.maxX - b.minX) || 1;
   const bh = (b.maxY - b.minY) || 1;
-  const pad = FLOOR_PAD;
-  view.scale = Math.min((cw - 2 * pad) / bw, (ch - 2 * pad) / bh);
+  const pad = 60;
+  view.zoom = Math.min((cw - 2 * pad) / bw, (ch - 2 * pad) / bh);
   const mx = (b.minX + b.maxX) / 2;
   const my = (b.minY + b.maxY) / 2;
-  view.tx = cw / 2 - mx * view.scale;
-  view.ty = ch / 2 + my * view.scale;
+  /* The Y-axis flip lives in b2s, so the room centre maps to the
+     viewport centre with panY = ch/2 + my * zoom (NOT -my * zoom).
+     Deriving it: screen(centre) = [mx*zoom + panX, -my*zoom + panY]
+     = [cw/2, ch/2] gives panX = cw/2 - mx*zoom, panY = ch/2 +
+     my*zoom. */
+  view.panX = cw / 2 - mx * view.zoom;
+  view.panY = ch / 2 + my * view.zoom;
 
-  /* Remember the fit scale.  It is the reference for the zoom-out
-     floor: zoomAt() clamps the scale to MIN_ZOOM_FACTOR × this
-     value, so the floor is recalculated every time the viewport
-     changes and never sits above the current fit. */
-  view.fitScale = view.scale;
+  /* Reference for the zoom-out floor: MIN_ZOOM_FACTOR × this value.
+     Recalculated every resize so the floor tracks the fit. */
+  view.fitScale = view.zoom;
 }
 
-function resize() {
-  dpr = window.devicePixelRatio || 1;
-  canvas.width  = Math.round(window.innerWidth  * dpr);
-  canvas.height = Math.round(window.innerHeight * dpr);
-  canvas.style.width  = window.innerWidth  + "px";
-  canvas.style.height = window.innerHeight + "px";
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+export function resize() {
+  env.dpr = window.devicePixelRatio || 1;
+  const cw = window.innerWidth, ch = window.innerHeight;
+  canvas.width  = Math.round(cw * env.dpr);
+  canvas.height = Math.round(ch * env.dpr);
+  canvas.style.width  = cw + "px";
+  canvas.style.height = ch + "px";
+  ctx.setTransform(env.dpr, 0, 0, env.dpr, 0, 0);
   fitView();
-  draw();
+  callDraw();
 }
 window.addEventListener("resize", resize);
 
-function zoomAt(sx, sy, factor) {
-  const [wx, wy] = s2w(sx, sy);
-  const fitRef   = view.fitScale || view.scale;
+export function zoomAt(sx, sy, factor) {
+  const [wx, wy] = s2b(sx, sy);
+  const fitRef   = view.fitScale || view.zoom;
   const lower    = Math.max(1e-6, fitRef * MIN_ZOOM_FACTOR);
-  const newScale = Math.max(lower,
-                            Math.min(MAX_ZOOM, view.scale * factor));
-  if (newScale === view.scale) return;
-  view.scale = newScale;
-  view.tx = sx - wx * view.scale;
-  view.ty = sy + wy * view.scale;
+  const newZoom  = Math.max(lower, Math.min(MAX_ZOOM, view.zoom * factor));
+  if (newZoom === view.zoom) return;
+  view.zoom = newZoom;
+  /* Keep the world point (wx, wy) fixed under the cursor after the
+     zoom.  Solving [wx*z + panX, -wy*z + panY] = [sx, sy] for the
+     pans gives panX = sx - wx*z and panY = sy + wy*z. */
+  view.panX = sx - wx * view.zoom;
+  view.panY = sy + wy * view.zoom;
 }
 
 /* ==========================================================================
@@ -369,10 +345,10 @@ function zoomAt(sx, sy, factor) {
 
 const BOXES_FILE = "room_boxes.json";
 
-function serializeBoxes() {
+export function serializeBoxes() {
   return {
     version: 1,
-    boxes: placedBoxes.map(b => ({
+    boxes: board.items.map(b => ({
       name: b.name || "",
       x: Math.round(b.x * 100) / 100,
       y: Math.round(b.y * 100) / 100,
@@ -383,15 +359,15 @@ function serializeBoxes() {
   };
 }
 
-function normalizeBoxes(data) {
+export function normalizeBoxes(data) {
   if (Array.isArray(data)) return data;
   if (data && Array.isArray(data.boxes)) return data.boxes;
   return [];
 }
 
-function applyLoadedBoxes(list) {
-  placedBoxes = [];
-  boxCounter = 0;
+export function applyLoadedBoxes(list) {
+  board.items = [];
+  state.boxCounter = 0;
   for (const item of list) {
     if (!item || typeof item !== "object") continue;
     const w = +item.w, h = +item.h;
@@ -403,26 +379,26 @@ function applyLoadedBoxes(list) {
       rot: (((+item.rot || 0) % 360) + 360) % 360,
       name: (typeof item.name === "string") ? item.name : "",
     };
-    placedBoxes.push(b);
+    board.items.push(b);
     const m = /^Box (\d+)$/.exec(b.name);
-    if (m) boxCounter = Math.max(boxCounter, +m[1]);
+    if (m) state.boxCounter = Math.max(state.boxCounter, +m[1]);
   }
 }
 
-function saveToLocalStorage() {
+export function saveToLocalStorage() {
   try {
     localStorage.setItem("room_boxes", JSON.stringify(serializeBoxes()));
   } catch (e) { /* quota / private mode — ignore */ }
 }
 
-function loadFromLocalStorage() {
+export function loadFromLocalStorage() {
   try {
     const s = localStorage.getItem("room_boxes");
     return s ? JSON.parse(s) : null;
   } catch (e) { return null; }
 }
 
-async function saveToServer() {
+export async function saveToServer() {
   try {
     const r = await fetch("/save", {
       method: "POST",
@@ -433,7 +409,7 @@ async function saveToServer() {
   } catch (e) { return false; }
 }
 
-async function loadFromServer() {
+export async function loadFromServer() {
   try {
     const r = await fetch(BOXES_FILE, { cache: "no-store" });
     if (!r.ok) return null;
@@ -443,7 +419,7 @@ async function loadFromServer() {
   } catch (e) { return null; }
 }
 
-function downloadBoxes() {
+export function downloadBoxes() {
   const blob = new Blob(
     [JSON.stringify(serializeBoxes(), null, 2)],
     { type: "application/json" });
@@ -457,30 +433,27 @@ function downloadBoxes() {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-async function doSave(showFeedback) {
+export async function doSave(showFeedback) {
   saveToLocalStorage();
   const ok = await saveToServer();
+  const { flashStatus } = await import("./pgkit/panel_core.js");
+  const { T } = await import("./bx_i18n.js");
   if (!ok) {
     downloadBoxes();
-    if (showFeedback)
-      flashStatus(T("msgDownloadedOk")(BOXES_FILE), "ok");
+    if (showFeedback) flashStatus(T("msgDownloadedOk")(BOXES_FILE), "ok");
   } else if (showFeedback) {
     flashStatus(T("msgSavedOk")(BOXES_FILE), "ok");
   }
 }
 
-function consolePrintBoxList() {
-  if (!placedBoxes.length) {
-    console.log("(no boxes placed)");
-    return;
-  }
-  const nameW = Math.max(4, ...placedBoxes.map(b => (b.name || "").length));
+export function consolePrintBoxList() {
+  if (!board.items.length) { console.log("(no boxes placed)"); return; }
+  const nameW = Math.max(4, ...board.items.map(b => (b.name || "").length));
   const header = "Name".padEnd(nameW) + "  " +
-                 "Width".padStart(10) + "  " +
-                 "Height".padStart(10);
+                 "Width".padStart(10) + "  " + "Height".padStart(10);
   console.log(header);
   console.log("-".repeat(header.length));
-  for (const b of placedBoxes) {
+  for (const b of board.items) {
     const name = (b.name || "").padEnd(nameW);
     const w = b.w.toFixed(2).padStart(10);
     const h = b.h.toFixed(2).padStart(10);
@@ -488,17 +461,16 @@ function consolePrintBoxList() {
   }
 }
 
-async function printBoxList() {
+export async function printBoxList() {
+  const { flashStatus } = await import("./pgkit/panel_core.js");
+  const { T } = await import("./bx_i18n.js");
   try {
     const r = await fetch("/print", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(serializeBoxes()),
     });
-    if (r.ok) {
-      flashStatus(T("msgPrintTerminal"), "ok");
-      return;
-    }
+    if (r.ok) { flashStatus(T("msgPrintTerminal"), "ok"); return; }
     consolePrintBoxList();
     flashStatus(T("msgPrintConsole"), "ok");
   } catch (e) {
@@ -507,7 +479,9 @@ async function printBoxList() {
   }
 }
 
-async function autoload() {
+export async function autoload() {
+  const { flashStatus } = await import("./pgkit/panel_core.js");
+  const { T } = await import("./bx_i18n.js");
   let data = await loadFromServer();
   let source = data ? "file" : null;
   if (!data) {
@@ -516,22 +490,20 @@ async function autoload() {
   }
   if (data) {
     applyLoadedBoxes(normalizeBoxes(data));
-    const n = placedBoxes.length;
-    const bad = placedBoxes.filter(boxIsInvalid).length;
-    if (n) {
-      flashStatus(T("msgLoaded")(n, source, bad), bad ? "warn" : "ok");
-    }
+    const n = board.items.length;
+    const bad = board.items.filter(boxIsInvalid).length;
+    if (n) flashStatus(T("msgLoaded")(n, source, bad), bad ? "warn" : "ok");
   }
-  draw();
+  callDraw();
 }
 
 /* ==========================================================================
    HIT TESTS
    ========================================================================== */
 
-function hitTestBox(wx, wy) {
-  for (let i = placedBoxes.length - 1; i >= 0; i--) {
-    const b = placedBoxes[i];
+export function hitTestBox(wx, wy) {
+  for (let i = board.items.length - 1; i >= 0; i--) {
+    const b = board.items[i];
     if (pointInPolygon([wx, wy], boxCorners(b.x, b.y, b.w, b.h, b.rot))) {
       return i;
     }
@@ -541,36 +513,33 @@ function hitTestBox(wx, wy) {
 
 /* Handle hit-testing priority, highest first:
 
-     rotate    the floating circle above the top edge — checked first,
-               with a slightly larger hit radius than its drawn one,
-               so a cursor in the small gap between it and the top
-               corners resolves to rotate
+     rotate    the floating circle above the top edge
      corner    the four box corners
      edge      the four edge midpoints
 
    The type string returned here is the same one bx_dispatch uses to
-   decide which drag to start; there is no name-to-behaviour mapping
-   anywhere else. */
-function hitTestHandle(sx, sy) {
+   decide which drag to start. */
+export function hitTestHandle(sx, sy) {
+  const selectedBox = selectedItem();
   if (!selectedBox) return null;
   const b = selectedBox;
   const corners = boxCorners(b.x, b.y, b.w, b.h, b.rot);
   const edges   = boxEdgeMidpoints(b.x, b.y, b.w, b.h, b.rot);
 
   const [rhx, rhy] = rotateHandleScreenPos(b);
-  if (Math.hypot(sx - rhx, sy - rhy) <= ROTATE_HANDLE_R + 4) {
+  if (Math.hypot(sx - rhx, sy - rhy) <= 9 + 4) {
     return { type: "rotate" };
   }
 
   for (let i = 0; i < 4; i++) {
-    const [px, py] = w2s(corners[i][0], corners[i][1]);
-    if (Math.abs(sx - px) <= CORNER_HIT && Math.abs(sy - py) <= CORNER_HIT) {
+    const [px, py] = b2s(corners[i][0], corners[i][1]);
+    if (Math.abs(sx - px) <= 11 && Math.abs(sy - py) <= 11) {
       return { type: "corner", index: i };
     }
   }
   for (let i = 0; i < 4; i++) {
-    const [px, py] = w2s(edges[i][0], edges[i][1]);
-    if (Math.abs(sx - px) <= EDGE_HIT && Math.abs(sy - py) <= EDGE_HIT) {
+    const [px, py] = b2s(edges[i][0], edges[i][1]);
+    if (Math.abs(sx - px) <= 10 && Math.abs(sy - py) <= 10) {
       return { type: "edge", index: i };
     }
   }
@@ -581,7 +550,7 @@ function hitTestHandle(sx, sy) {
    UI INPUTS — ghost params
    ========================================================================== */
 
-function getBoxParams() {
+export function getBoxParams() {
   const w = parseFloat(document.getElementById("boxW").value) || 100;
   const h = parseFloat(document.getElementById("boxH").value) || 100;
   let rot = parseFloat(document.getElementById("boxRot").value) || 0;
@@ -589,17 +558,48 @@ function getBoxParams() {
   return { w, h, rot };
 }
 
-function setRotation(deg) {
+export function setRotation(deg) {
   const v = ((deg % 360) + 360) % 360;
   document.getElementById("boxRot").value = v;
 }
 
 /* ==========================================================================
-   STATUS — flashStatus
+   SELECTION
    ========================================================================== */
 
+export function selectedItem() {
+  if (board.selectedIdx < 0 ||
+      board.selectedIdx >= board.items.length) return null;
+  return board.items[board.selectedIdx];
+}
+
+export function setSelected(b) {
+  board.selectedIdx = (b == null) ? -1 : board.items.indexOf(b);
+  // selection-change side effects (list, inspector) are performed
+  // by the caller (bx_panel_bindings._selectAction).
+}
+
+/* ==========================================================================
+   DRAW REFERENCE
+   ==========================================================================
+   The draw hook is injected at boot via _setDraw.  Without this
+   indirection every function here that needs a repaint would import
+   `draw` from `bx_dispatch.js`, which imports from this file. */
+
+let _drawRef = null;
+export function _setDraw(fn) { _drawRef = fn; }
+export function callDraw() { if (_drawRef) _drawRef(); }
+
+/* ==========================================================================
+   STATUS — flashStatus
+   ==========================================================================
+   A local, self-contained flash-status function.  The pgkit panel
+   has its own (pgkit/panel_core.js) but this one is used by
+   internal helpers that run before the kit has been wired.
+   The class names match the pgkit CSS exactly ("ok"/"warn"/"bad"). */
+
 let statusTimer = null;
-function flashStatus(msg, cls) {
+export function flashStatus(msg, cls) {
   const el = document.getElementById("status");
   if (!el) return;
   el.textContent = msg;
@@ -607,7 +607,7 @@ function flashStatus(msg, cls) {
   if (statusTimer) clearTimeout(statusTimer);
   statusTimer = setTimeout(() => {
     statusTimer = null;
-    draw();
+    callDraw();
   }, 1400);
 }
 """

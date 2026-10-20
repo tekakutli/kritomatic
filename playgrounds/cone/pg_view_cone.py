@@ -9,12 +9,33 @@ Layers, back to front:
     4.  dashed magenta axis line when the apex is off-centre
     5.  base direction tick on the outer ring
     6.  small ink dot at the base centre
-    7.  patch quads — dashed outlines, faint fills, the planes the
-        shapes live on
-    8.  floating shapes — solid outlines, low-alpha fills
+    7.  patch quads — dashed outlines, faint fills
+    8.  floating shapes — solid outlines, corner/rotate handles
     9.  apex marker
    10.  corner caption
-   11.  patch and shape name labels — drawn last, on top of everything
+   11.  patch and shape name labels — drawn last
+
+STAGE 1 OPTIMIZATION — BACKGROUND CACHE
+=======================================
+Layers 1–6 (gradient, meridians, rings, axis, tick, base dot) are
+fully determined by the apex position, cone geometry sliders, and
+the canvas transform.  They change only on apex drag, slider move,
+or resize — never on square drag, panel edits, or hover.  They used
+to re-render every frame: ~24 `createLinearGradient` calls and 15
+`arc` strokes.
+
+Layers 1–6 are now drawn into an offscreen canvas.  A per-frame key
+comparison decides whether to blit the cache (GPU-fast) or rebuild
+it.  In the common case — dragging a square, editing a field,
+hovering — the key is stable and the whole layer stack renders as
+one `ctx.drawImage`.
+
+Cache key: (cw, ch, dpr, cone.ax, cone.ay, cone.depth,
+            cone.halfAngle, cone.ringCount, cone.meridianCount,
+            view.scale, view.tx, view.ty, layout.coneH)
+
+Memory: at DPR 2 on a 2000×1200 CSS canvas, ~38 MB.  Freed when the
+key changes (old canvas becomes garbage) and on window resize.
 
 PATCH VERSUS SHAPE
 ==================
@@ -24,51 +45,73 @@ label.  What distinguishes them is the STROKE:
 
     patch   dashed outline, very faint fill
     shape   solid outline, thicker when selected, corner handles and
-            a rotate handle when selected, filled at low alpha
+            a rotate handle when selected
 
 The dashed stroke is the drafting idiom for "this is the surface, not
-an object on it".  It reads as a reference line, a construction
-guide, or a ruling — which is exactly what a patch is now.
+an object on it".
 """
 
 CONE_VIEW_JS = r"""
-function drawConeView() {
-  const cw = window.innerWidth;
-  const ch = layout.coneH;
+/* ==========================================================================
+   BACKGROUND CACHE
+   ========================================================================== */
+
+let _coneBgCache = null;   // { key: string, canvas: HTMLCanvasElement }
+
+function _coneBgKey(cw, ch) {
+  return [
+    cw, ch, dpr,
+    cone.ax, cone.ay,
+    cone.depth, cone.halfAngle,
+    cone.ringCount, cone.meridianCount,
+    view.scale, view.tx, view.ty,
+    layout.coneH,
+  ].join("|");
+}
+
+function _buildConeBg(cw, ch) {
+  const off = document.createElement("canvas");
+  off.width  = Math.round(cw * dpr);
+  off.height = Math.round(ch * dpr);
+
+  // Save/restore the real ctx's transform so we don't disturb the
+  // outer frame.  Everything below draws into a local alias.
+  const octx = off.getContext("2d");
+  octx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
   const R_world = cone.depth * Math.tan(cone.halfAngle);
   const [Bx, By] = w2s(0, 0);
   const [Ax, Ay] = w2s(cone.ax, cone.ay);
   const Rs = R_world * view.scale;
 
-  /* depth gradient */
+  // 1. Depth gradient.
   const apexDist  = Math.hypot(Ax - Bx, Ay - By);
   const gradientR = Math.max(apexDist + Rs, 40);
-  const bg = ctx.createRadialGradient(Ax, Ay, 0, Ax, Ay, gradientR);
+  const bg = octx.createRadialGradient(Ax, Ay, 0, Ax, Ay, gradientR);
   bg.addColorStop(0.00, "#05080c");
   bg.addColorStop(0.32, "#070c12");
   bg.addColorStop(0.68, "#0a1018");
   bg.addColorStop(1.00, "#0e1622");
-  ctx.fillStyle = bg;
-  ctx.fillRect(0, 0, cw, ch);
+  octx.fillStyle = bg;
+  octx.fillRect(0, 0, cw, ch);
 
-  /* meridians */
+  // 2. Meridians.
   const M = cone.meridianCount;
-  ctx.lineCap = "round";
+  octx.lineCap = "round";
   for (let i = 0; i < M; i++) {
     const phi = i * 2 * Math.PI / M;
     const [ex, ey] = w2s(R_world * Math.cos(phi),
                          R_world * Math.sin(phi));
-    const lg = ctx.createLinearGradient(Ax, Ay, ex, ey);
+    const lg = octx.createLinearGradient(Ax, Ay, ex, ey);
     lg.addColorStop(0.00, "rgba(0, 229, 255, 0.00)");
     lg.addColorStop(0.10, "rgba(0, 229, 255, 0.09)");
     lg.addColorStop(0.60, "rgba(0, 229, 255, 0.20)");
     lg.addColorStop(1.00, "rgba(0, 229, 255, 0.40)");
-    ctx.beginPath(); ctx.moveTo(Ax, Ay); ctx.lineTo(ex, ey);
-    ctx.strokeStyle = lg; ctx.lineWidth = 0.9; ctx.stroke();
+    octx.beginPath(); octx.moveTo(Ax, Ay); octx.lineTo(ex, ey);
+    octx.strokeStyle = lg; octx.lineWidth = 0.9; octx.stroke();
   }
 
-  /* rings */
+  // 3. Rings.
   const N = cone.ringCount;
   for (let k = 0; k <= N; k++) {
     const s = k / N;
@@ -77,35 +120,57 @@ function drawConeView() {
     if (rs < 0.5) continue;
     const u = 1 - s;
     const alpha = 0.10 + 0.55 * u * u;
-    ctx.beginPath(); ctx.arc(cx, cy, rs, 0, Math.PI * 2);
-    ctx.strokeStyle = "rgba(0, 229, 255, " + alpha.toFixed(3) + ")";
-    ctx.lineWidth = (k === 0) ? 2.0 : 0.9;
-    ctx.stroke();
+    octx.beginPath(); octx.arc(cx, cy, rs, 0, Math.PI * 2);
+    octx.strokeStyle = "rgba(0, 229, 255, " + alpha.toFixed(3) + ")";
+    octx.lineWidth = (k === 0) ? 2.0 : 0.9;
+    octx.stroke();
   }
 
-  /* axis */
+  // 4. Dashed axis line when the apex is off-centre.
   if (apexDist > 6) {
-    ctx.save();
-    ctx.setLineDash([5, 4]);
-    ctx.strokeStyle = "rgba(255, 43, 214, 0.45)";
-    ctx.lineWidth = 1.0;
-    ctx.beginPath(); ctx.moveTo(Bx, By); ctx.lineTo(Ax, Ay); ctx.stroke();
-    ctx.restore();
+    octx.save();
+    octx.setLineDash([5, 4]);
+    octx.strokeStyle = "rgba(255, 43, 214, 0.45)";
+    octx.lineWidth = 1.0;
+    octx.beginPath(); octx.moveTo(Bx, By); octx.lineTo(Ax, Ay); octx.stroke();
+    octx.restore();
   }
 
-  /* base direction tick */
+  // 5. Base direction tick.
   if (Rs > 20) {
-    ctx.beginPath();
-    ctx.arc(Bx, By, Rs, -Math.PI / 2 - 0.15, -Math.PI / 2 + 0.15);
-    ctx.strokeStyle = "rgba(255, 43, 214, 0.9)";
-    ctx.lineWidth = 2.4; ctx.stroke();
+    octx.beginPath();
+    octx.arc(Bx, By, Rs, -Math.PI / 2 - 0.15, -Math.PI / 2 + 0.15);
+    octx.strokeStyle = "rgba(255, 43, 214, 0.9)";
+    octx.lineWidth = 2.4; octx.stroke();
   }
 
-  /* base centre dot */
-  ctx.beginPath(); ctx.arc(Bx, By, 2.2, 0, Math.PI * 2);
-  ctx.fillStyle = "rgba(220, 230, 242, 0.55)"; ctx.fill();
+  // 6. Base centre dot.
+  octx.beginPath(); octx.arc(Bx, By, 2.2, 0, Math.PI * 2);
+  octx.fillStyle = "rgba(220, 230, 242, 0.55)"; octx.fill();
 
-  /* patches — unselected first, selected on top */
+  return off;
+}
+
+function _coneBg(cw, ch) {
+  const key = _coneBgKey(cw, ch);
+  if (_coneBgCache && _coneBgCache.key === key) return _coneBgCache.canvas;
+  const canvas = _buildConeBg(cw, ch);
+  _coneBgCache = { key, canvas };
+  return canvas;
+}
+
+/* ==========================================================================
+   CONE VIEW
+   ========================================================================== */
+
+function drawConeView() {
+  const cw = window.innerWidth;
+  const ch = layout.coneH;
+
+  // Layers 1–6: cached background.
+  ctx.drawImage(_coneBg(cw, ch), 0, 0, cw, ch);
+
+  // Layer 7: patches.  Unselected first, selected on top.
   for (let i = 0; i < quads.length; i++) {
     if (i === selectedQuad) continue;
     drawQuadPatch(quads[i], false);
@@ -114,10 +179,11 @@ function drawConeView() {
     drawQuadPatch(quads[selectedQuad], true);
   }
 
-  /* floating shapes on the patches' planes */
+  // Layer 8: floating shapes.
   drawFloatSquares();
 
-  /* apex marker */
+  // Layer 9: apex marker.
+  const [Ax, Ay] = w2s(cone.ax, cone.ay);
   const haloR = 22;
   const halo = ctx.createRadialGradient(Ax, Ay, 0, Ax, Ay, haloR);
   halo.addColorStop(0.0, "rgba(255, 230, 0, 0.34)");
@@ -129,7 +195,7 @@ function drawConeView() {
   ctx.fillStyle = "#ffe600"; ctx.fill();
   ctx.strokeStyle = "#0a0e14"; ctx.lineWidth = 2; ctx.stroke();
 
-  /* corner caption */
+  // Layer 10: corner caption.
   ctx.save();
   ctx.font = "700 10px 'JetBrains Mono', 'Fira Code', monospace";
   ctx.fillStyle = "#5a6774";
@@ -147,18 +213,10 @@ function drawConeView() {
     14, 14);
   ctx.restore();
 
-  /* Labels last, so they sit above the patches and shapes. */
+  // Layer 11: labels.
   drawShapeLabelsCone();
 }
 
-/* The patch is the plane a shape sits on.  It gets a DASHED outline,
-   a very faint fill, and no corner or rotate handles.  Everything
-   the eye reads as "an object on the sheet" — solid stroke, handles,
-   a filled body — belongs to the shapes, not to the patches.
-
-   When shape-editing is enabled the patch corners carry small dots,
-   drawn in the patch hue; those dots are the only handle-like
-   feature a patch has, and they are dormant while the flag is off. */
 function drawQuadPatch(q, selected) {
   const hue = patchHue(q);
   const pts = quadCorners(q).map(c => {

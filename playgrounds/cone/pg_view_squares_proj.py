@@ -9,14 +9,24 @@ the shapes themselves on the cone band.
 The perspective taper is applied at every warp value.  The warp
 chart stays on the patch's own plane, so the plane's 3D look — the
 shrink toward the apex that sends anything at the horizon to a point
-— is unchanged by warp.  (Earlier revisions blended the taper toward
-1 as warp rose because the old chart left the plane and lay on the
-cone's curved surface, whose own geometry encoded the perspective.
-That is no longer the case.)
+— is unchanged by warp.
 
-This file is edited when the cone-view projection or the drawing
-style changes.  The warp chart itself lives in
-pg_view_squares_warp.py.
+STAGE 1 OPTIMIZATION
+====================
+`squareRotateHandleScreen` used to call `squareCornersScreen(sq)` as
+a defensive guard: "don't draw the handle if the shape's corners
+are all clipped".  But `squareCornersScreen` projects all four
+corners (each a `projectShapePoint` call — `w2s` + taper + hinge),
+and the result was discarded.  The caller (`drawFloatSquare`) calls
+`squareCornersScreen` itself immediately before, and the hit-test
+caller (`_squareHitTestOne`) does too.  Net effect: on every
+mousedown hit test and every selected-square render, projection ran
+2–3× per square.
+
+The guard has been rewritten to compute the clip directly from the
+local corners — a `_clipPolygonToVMax` call on the four (u, v)
+pairs — which skips the whole projection pipeline.  Projection now
+runs exactly once per square per frame.
 """
 
 SQUARES_PROJ_JS = r"""
@@ -36,11 +46,7 @@ SQUARES_PROJ_JS = r"""
          pg_view_squares_warp.py.
 
      3.  Perspective taper.  p = pC − (vInPlane − vC) / vMax, applied
-         the same at every warp value.  The warp chart stays on the
-         patch's own plane, so the taper — the plane's own "3D"
-         shrink toward the apex — is never doubled and never
-         removed.  Points at the horizon (vInPlane = vMax) collapse
-         to the apex on screen, exactly as they do at warp = 0.
+         the same at every warp value.
 
      4.  Hinge offset.  Add hOut along the inward radial direction.
 
@@ -73,9 +79,6 @@ function projectShapePoint(f, qi, uLocal, vLocal, vC, pC, vMax,
   const [sx, sy] = w2s(wx, wy);
   const [ax, ay] = w2s(cone.ax, cone.ay);
 
-  /* Perspective taper.  Applied uniformly across warp values; the
-     warp chart does not leave the plane, so the taper is not
-     doubled and not removed. */
   const p = pC - (vInPlane - vC) / vMax;
 
   let px = ax + p * (sx - ax);
@@ -128,15 +131,20 @@ function squareRotateHandleScreen(sq) {
   const f = patchFrame(qi);
   if (!f) return null;
 
-  if (!squareCornersScreen(sq)) return null;
+  const h = horizonLocal(qi);
+  if (!h) return null;
+  const vMaxLocal = h.vHat * f.vLen;
+
+  // Cheap clip check: don't project four corners just to decide
+  // whether to project the handle.  Local clip is enough.
+  const local = squareCornersLocalCone(sq);
+  if (!local) return null;
+  const clipped = _clipPolygonToVMax(local, vMaxLocal);
+  if (clipped.length < 3) return null;
 
   const hl = squareRotateHandleLocalCone(sq);
   if (!hl) return null;
 
-  const h = horizonLocal(qi);
-  if (!h) return null;
-
-  const vMaxLocal = h.vHat * f.vLen;
   const HANDLE_GAP = 0.02 * f.vLen;
   const hv = Math.min(hl[1], vMaxLocal - HANDLE_GAP);
 
@@ -147,11 +155,8 @@ function squareRotateHandleScreen(sq) {
   const slope = sq.slope || 0;
 
   let hingeV = Infinity;
-  const local = squareCornersLocalCone(sq);
-  if (local) {
-    for (const [u, v] of local) {
-      if (v < hingeV) hingeV = v;
-    }
+  for (const [u, v] of local) {
+    if (v < hingeV) hingeV = v;
   }
 
   const standingScale = _shapeStandingScale(

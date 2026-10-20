@@ -5,6 +5,18 @@ The flat (unfolded-cone) view deliberately ignores slope AND warp:
 its footprint is the un-warped, un-hinged (phi, s) linear image of
 the shape's (u, v) corners, so editing in that band stays exact and
 the flat sheet is a pure design-intent view.
+
+STAGE 1 OPTIMIZATION
+====================
+`_drawShapeLabel` now:
+    · caches each label's measured width on the object it's
+      drawing (`q` for patches, `sq` for squares).  The width
+      changes only when the label text changes, so a stable board
+      runs `ctx.measureText` zero times per frame.
+    · culls labels whose anchor is far outside the viewport.  The
+      cone band has no clip; a label anchored 1000px off-screen was
+      previously laid out in full.  Conservative margin (200px on
+      x, 20px on y) — only skips labels that are truly invisible.
 """
 
 SQUARES_FLAT_JS = r"""
@@ -212,17 +224,37 @@ function squareFlatMirrorHitTest(sx, sy) {
 }
 
 /* ==========================================================================
-   LABEL RENDERING
+   LABEL RENDERING — WITH WIDTH CACHE AND VIEWPORT CULL
    ========================================================================== */
 
-function _drawShapeLabel(sx, sy, text, color) {
+function _drawShapeLabel(sx, sy, text, color, cacheObj) {
   if (!text) return;
+
+  // Viewport cull: skip labels whose center is far outside the
+  // canvas.  Cone band has no clip; without this a label 1000px
+  // off-screen was laid out in full.
+  const cw = window.innerWidth;
+  const ch = window.innerHeight;
+  if (sx < -200 || sx > cw + 200 || sy < -20 || sy > ch + 20) return;
+
   ctx.save();
   ctx.font = "700 10px 'JetBrains Mono', 'Fira Code', monospace";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
 
-  const w = ctx.measureText(text).width;
+  let w;
+  if (cacheObj &&
+      cacheObj._labelText === text &&
+      typeof cacheObj._labelWidth === "number") {
+    w = cacheObj._labelWidth;
+  } else {
+    w = ctx.measureText(text).width;
+    if (cacheObj) {
+      cacheObj._labelText  = text;
+      cacheObj._labelWidth = w;
+    }
+  }
+
   const padX = 6;
   const h = 14;
 
@@ -279,7 +311,7 @@ function drawShapeLabelsCone() {
     const q = quads[qi];
     const hue = patchHue(q);
     const [cx, cy] = _patchCentreScreenCone(q);
-    _drawShapeLabel(cx, cy, q.name, _huergb(hue, 0.92));
+    _drawShapeLabel(cx, cy, q.name, _huergb(hue, 0.92), q);
   }
 
   for (let i = 0; i < floatSquares.length; i++) {
@@ -290,7 +322,7 @@ function drawShapeLabelsCone() {
     const c = _shapeCentreScreenCone(sq);
     if (!c) continue;
     _drawShapeLabel(c[0], c[1], squareDisplayName(sq),
-                    _huergb(hue, 0.95));
+                    _huergb(hue, 0.95), sq);
   }
 }
 
@@ -302,7 +334,7 @@ function drawShapeLabelsFlat() {
     for (const shift of shifts) {
       const [cx, cy] = _patchCentreScreenFlat(q, shift);
       if (_flatInsideRect(cx, cy)) {
-        _drawShapeLabel(cx, cy, q.name, _huergb(hue, 0.92));
+        _drawShapeLabel(cx, cy, q.name, _huergb(hue, 0.92), q);
         break;
       }
     }
@@ -326,7 +358,7 @@ function drawShapeLabelsFlat() {
       if (!c) continue;
       if (_flatInsideRect(c[0], c[1])) {
         _drawShapeLabel(c[0], c[1], squareDisplayName(sq),
-                        _huergb(activeHue, 0.95));
+                        _huergb(activeHue, 0.95), sq);
         break;
       }
     }

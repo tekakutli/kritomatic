@@ -14,28 +14,8 @@ The scene is the complete editable state of the workspace:
     id counters     nextQuadId, nextSquareId
     kraOptions      the KRA-export meta-options block
 
-The save and the load both speak the same JSON shape.  Saving writes
-a data URL and triggers a download; loading opens a file picker, reads
-the file, and applies it in place.
+File shape:
 
-KRA options
-===========
-The KRA-export meta-options (text position, text padding, draw
-rectangles, text color) are saved alongside the geometry, so a scene
-reloaded later produces the same .kra without the user re-setting
-every dropdown.
-
-The functions readKraOptionsFromDOM and applyKraOptionsToDOM live in
-pg_kra.py and are the single point of truth for what the options
-are.  This module simply calls them: adding a new option in pg_kra
-automatically makes it part of the scene, with no change here.
-
-The `kraOptions` field is optional on load: a scene file from before
-the field existed simply does not restore the panel's option
-controls, leaving them at whatever the current session already had.
-
-File shape
-==========
     {
       "sceneVersion": 1,
       "type":         "cone_scene",
@@ -52,73 +32,22 @@ File shape
 
 The "type" field is a plain string tag so a scene file can be
 distinguished from the visual-state export (which uses schemaVersion
-and has a completely different shape).  On load, an unknown type is
-rejected with a clear message rather than silently misapplied.
+and has a completely different shape).
 
 Applying a scene
 ================
 The scene replaces the contents of `quads` and `floatSquares` without
 rebinding them — the arrays are cleared by truncation and refilled by
 push — because they are `const` and other modules hold references to
-the same objects.  Cone fields are assigned one by one for the same
-reason.  Every drag slot on `state` is cleared so a load mid-drag
-cannot leave a stale index pointing into a cleared array.
+the same objects.
 
-After applying, `syncPanelSliders`, `syncQuadList`, and `draw` are
-called to bring every view and the panel into agreement with the new
-state.
-
-SHAPE DEPTH
-===========
-Only the cone view's depth multiplier is persisted.  `SHAPE_DEPTH_FLAT`
-is a fixed const in pg_view_squares.py and is not written; a scene
-loaded on a build with a different flat-view constant will not shift
-the flat view's footprint.
-
-SLOPE
-=====
-The per-square `slope` field is persisted alongside `theta`.  It is
-a unitless hinge parameter in [0, 1] (see the SLOPE section in
-pg_view_squares.py).  Files written before slope existed simply
-omit it; the loader defaults a missing value to 0 (shape flat on
-its patch), so old scenes load unchanged.  A value from a scene
-written under the old radians-based model — outside [0, 1] — is
-reset to 0 on load.
-
-The global `shapeStandingMult` (see STANDING HEIGHT MULTIPLIER in
-pg_view_squares.py) is also persisted here: it is a single scalar
-that controls how tall a hinged shape stands, as a multiple of its
-flat-view height.  On load it is clamped to [0.05, 10].  A scene
-written before this field existed simply leaves the current
-session's value alone, so the default 2.00 (or whatever the user
-set) is preserved.
-
-MIRROR
-======
-The per-patch `mirror`, `mirrorAngle`, and `mirrorFlip` fields are
-persisted alongside the patch's φ and s bounds.  Files written
-before any of these existed simply omit them; the loader defaults
-`mirror` to false, `mirrorAngle` to π, and `mirrorFlip` to true, so
-old scenes load unchanged.
-
-PLANE WARP
-==========
-The per-patch `warp` field is persisted alongside the patch's φ and
-s bounds.  It reparametrises the patch's own tangential plane — 0 is
-the historic axial (rectangular) chart, 1 is a concentric chart
-centred on the apex.  See the PLANE WARP section in
-pg_view_squares.py.  Files written before this field existed simply
-omit it; the loader defaults a missing value to 0, so old scenes
-load unchanged.  The value is clamped to [0, 1] on load.
-
-VISUAL BOTTOM
-=============
-The per-square `visualBottom` boolean is persisted alongside the
-square's geometry.  Files written before this field existed simply
-omit it; the loader defaults a missing value to false, so old
-scenes load with the historical longest-edge reading of the
-shape's "bottom".  See the VISUAL BOTTOM section in pg_panel.py
-for the semantics.
+STAGE 1 CLEANUP
+===============
+`_clearTransientState` used to clear two locals, `drawing` and
+`drawingPreview`, that no longer exist anywhere in the codebase
+(they were from an earlier "draw a patch freeform" experiment).
+The `typeof ... !== "undefined"` guards made the lines legal but
+dead.  Removed.
 """
 
 
@@ -179,10 +108,6 @@ function buildSceneJSON() {
       visualBottom: !!sq.visualBottom,
     })),
 
-    /* KRA-export meta-options.  The mapping between DOM controls
-       and this object is defined entirely inside pg_kra.py, via
-       readKraOptionsFromDOM / applyKraOptionsToDOM.  Adding a new
-       option there makes it automatically part of the scene. */
     kraOptions: (typeof readKraOptionsFromDOM === "function")
                   ? readKraOptionsFromDOM()
                   : undefined,
@@ -206,9 +131,6 @@ function saveSceneJSON() {
   }
 }
 
-/* Clear every drag slot on `state` so a load cannot leave a stale
-   index pointing into a cleared array.  Also clears the selection
-   and any in-progress drawing. */
 function _clearTransientState() {
   state.dragApex       = null;
   state.dragQuadVertex = null;
@@ -222,9 +144,6 @@ function _clearTransientState() {
     state.mouse.sy     = 0;
     state.mouse.inside = false;
   }
-
-  if (typeof drawing        !== "undefined") drawing        = null;
-  if (typeof drawingPreview !== "undefined") drawingPreview = null;
 
   selectedQuad   = -1;
   selectedSquare = -1;
@@ -244,7 +163,6 @@ function applySceneJSON(data) {
                     + " (expected " + SCENE_VERSION + ")");
   }
 
-  /* ---- cone ---------------------------------------------------- */
   if (data.cone && typeof data.cone === "object") {
     const c = data.cone;
     if (typeof c.ax            === "number") cone.ax            = c.ax;
@@ -258,35 +176,21 @@ function applySceneJSON(data) {
   if (typeof data.shapeDepthCone === "number") {
     SHAPE_DEPTH_CONE = data.shapeDepthCone;
   } else if (typeof data.shapeDepth === "number") {
-    /* Legacy scenes stored a single factor; treat it as the cone
-       view's, since that is the one the panel now drives. */
     SHAPE_DEPTH_CONE = data.shapeDepth;
   }
-  /* SHAPE_DEPTH_FLAT is a fixed const and is not restored. */
 
-  /* Standing-height multiplier.  Optional: a scene written before
-     this field existed leaves the current session's value alone,
-     so the default 2.00 (or whatever the user set) is preserved. */
   if (typeof data.shapeStandingMult === "number") {
     SHAPE_STANDING_HEIGHT_MULT =
       Math.max(0.05, Math.min(10, data.shapeStandingMult));
   }
 
-  /* ---- KRA meta-options --------------------------------------- */
-  /* The DOM ⇄ object mapping lives in pg_kra.py.  Older scenes
-     without this field simply leave the panel's option controls
-     at whatever the current session already has. */
   if (data.kraOptions && typeof applyKraOptionsToDOM === "function") {
     applyKraOptionsToDOM(data.kraOptions);
   }
 
-  /* ---- patches ------------------------------------------------- */
   const patches = Array.isArray(data.patches) ? data.patches : [];
   const squares = Array.isArray(data.squares) ? data.squares : [];
 
-  /* quads and floatSquares are `const` bindings; the arrays cannot
-     be reassigned, but their contents can be cleared and refilled
-     in place.  Every module holds the same reference throughout. */
   quads.length = 0;
   for (const p of patches) {
     if (typeof p.id !== "number") continue;
@@ -312,18 +216,12 @@ function applySceneJSON(data) {
     if (typeof s.id     !== "number") continue;
     if (typeof s.quadId !== "number") continue;
 
-    /* Skip a square whose patch is not in the file — it would be
-       an orphan with no plane to live on. */
     let quadExists = false;
     for (const q of quads) {
       if (q.id === s.quadId) { quadExists = true; break; }
     }
     if (!quadExists) continue;
 
-    /* Legacy scenes stored slope in radians over ±85°.  Anything
-       outside the new [0, 1] range is discarded; a small positive
-       value is left as-is, since it maps reasonably to the new
-       hinge parameter. */
     let slopeVal = (typeof s.slope === "number") ? s.slope : 0;
     if (slopeVal < 0 || slopeVal > 1) slopeVal = 0;
 
@@ -344,7 +242,6 @@ function applySceneJSON(data) {
     });
   }
 
-  /* ---- id counters -------------------------------------------- */
   let maxQuadId   = 0;
   let maxSquareId = 0;
   for (const q of quads)        maxQuadId   = Math.max(maxQuadId,   q.id);
@@ -356,18 +253,14 @@ function applySceneJSON(data) {
                           (typeof data.nextSquareId === "number")
                             ? data.nextSquareId : 1);
 
-  /* ---- clean up ----------------------------------------------- */
   _clearTransientState();
 
-  /* Re-clamp each shape against the new cone: a sq.v that was legal
-     on the old cone may need pulling back on the new one. */
   for (let i = 0; i < floatSquares.length; i++) {
     const sq = floatSquares[i];
     const qi = quadIdxById(sq.quadId);
     if (qi >= 0) sq.v = clampCloneV(qi, sq.v);
   }
 
-  /* ---- refresh views and panel -------------------------------- */
   syncPanelSliders();
   syncQuadList();
   draw();
@@ -398,10 +291,6 @@ function loadSceneFromText(text) {
   return true;
 }
 
-/* A hidden <input type=file> is created on first use and reused
-   thereafter, so clicking Load does not create a new element per
-   click.  Its value is cleared after each read so the same file can
-   be loaded twice in a row. */
 let _sceneFileInput = null;
 
 function _installSceneFileInput() {

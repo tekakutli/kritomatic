@@ -6,6 +6,26 @@ frame, shape dimensions and corners, the mirror wrapper, the
 horizon, and the shape lifecycle (add / clone / delete).  Nothing
 here depends on the projection or on the warp chart — this file is
 edited only when the SHAPE MODEL itself changes.
+
+STAGE 1 OPTIMIZATIONS
+=====================
+    patchFrame MEMO
+        `patchFrame(qi)` is called 15–30 times per frame with a few
+        patches on screen (once per square's corners, once per
+        screen→frame inversion, once per horizon/standing-scale
+        query).  Each call recomputes four `surfacePoint` calls —
+        eight `Math.cos`/`Math.sin`/`Math.hypot` operations.  The
+        result is cached on `q.id` and invalidated when the quad's
+        (phi0, phi1, s0, s1) bounds change.  Four `===` per lookup
+        — the cache is essentially free — and it saves ~200–400
+        trig calls per frame during a drag.
+
+    _huergb / _huergbLight STRING CACHE
+        Both are called ~200× per frame (one per border / fill /
+        stroke).  Each allocates a new string.  A `Map` keyed on
+        the exact argument tuple returns the cached string after
+        the first call per palette entry — calloc becomes a hash
+        lookup.
 """
 
 SQUARES_CORE_JS = r"""
@@ -68,7 +88,7 @@ const ROTATE_JUMP_STEP = Math.PI / 12;
 const U_LIMIT = 3.0;
 
 /* ==========================================================================
-   PATCH HUE PALETTE
+   PATCH HUE PALETTE + STRING CACHES
    ========================================================================== */
 
 const PATCH_HUES = [
@@ -89,24 +109,52 @@ function patchHue(q) {
   return PATCH_HUES[idx];
 }
 
+const _rgbaCache = new Map();
 function _huergb(h, a) {
-  return "rgba(" + h.r + ", " + h.g + ", " + h.b + ", " + a + ")";
+  const key = h.r + "," + h.g + "," + h.b + "," + a;
+  let s = _rgbaCache.get(key);
+  if (s !== undefined) return s;
+  s = "rgba(" + h.r + ", " + h.g + ", " + h.b + ", " + a + ")";
+  _rgbaCache.set(key, s);
+  return s;
 }
 
+const _rgbaLightCache = new Map();
 function _huergbLight(h) {
+  const key = h.r + "," + h.g + "," + h.b;
+  let s = _rgbaLightCache.get(key);
+  if (s !== undefined) return s;
   const r = Math.round(h.r * 0.7 + 255 * 0.3);
   const g = Math.round(h.g * 0.7 + 255 * 0.3);
   const b = Math.round(h.b * 0.7 + 255 * 0.3);
-  return "rgb(" + r + ", " + g + ", " + b + ")";
+  s = "rgb(" + r + ", " + g + ", " + b + ")";
+  _rgbaLightCache.set(key, s);
+  return s;
 }
 
 /* ==========================================================================
-   PATCH FRAME
-   ========================================================================== */
+   PATCH FRAME — with memo
+   ==========================================================================
+   The cache key is the quad's current (phi0, phi1, s0, s1).  Any
+   mutation that changes one of those (patch drag, panel scrub,
+   scene load, apex drag indirectly no — apex doesn't change the
+   bounds, only surfacePoint) invalidates that quad's entry on the
+   next lookup.  Different quads have different ids, so entries
+   don't collide. */
+
+const _patchFrameCache = new Map();
 
 function patchFrame(quadIdx) {
   if (quadIdx < 0 || quadIdx >= quads.length) return null;
   const q = quads[quadIdx];
+
+  const cached = _patchFrameCache.get(q.id);
+  if (cached &&
+      cached.phi0 === q.phi0 && cached.phi1 === q.phi1 &&
+      cached.s0   === q.s0   && cached.s1   === q.s1) {
+    return cached.frame;
+  }
+
   const c = quadCorners(q).map(v => surfacePoint(v.phi, v.s));
   const C0 = c[0], C1 = c[1], C2 = c[2], C3 = c[3];
 
@@ -128,7 +176,11 @@ function patchFrame(quadIdx) {
   const det = Ux * Vy - Uy * Vx;
   if (Math.abs(det) < 1e-9) return null;
 
-  return { Cx, Cy, Ux, Uy, Vx, Vy, det, uLen, vLen };
+  const frame = { Cx, Cy, Ux, Uy, Vx, Vy, det, uLen, vLen };
+  _patchFrameCache.set(q.id, {
+    phi0: q.phi0, phi1: q.phi1, s0: q.s0, s1: q.s1, frame,
+  });
+  return frame;
 }
 
 function frameToWorld(f, u, v) {

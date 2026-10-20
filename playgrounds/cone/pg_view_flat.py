@@ -17,132 +17,37 @@ patch as one that re-enters from the left, and the drawing code
 reflects that by drawing every integer-2π copy of a drifted patch
 whose range overlaps the visible rectangle.
 
-Everything drawn inside the sheet — patches, their corner markers,
-the floating shapes, their handles — is clipped to the parameter
-rectangle.
-
 CARDINAL DIRECTION MARKERS
 ==========================
-The four letters E, N, W, S are pinned just above the base line
-(s = 0), at the four φ values that correspond to the world +x, +y,
-−x, −y directions of the cone view:
+The four letters E, N, W, S are pinned just above the base line, at
+the four φ values that correspond to the world +x, +y, −x, −y
+directions of the cone view.  The apex can be dragged anywhere
+within the cone's own reach limit, but it does not move the base
+ring, so the pins never move.
 
-    E   φ = 0          world +x     (screen right in the cone view)
-    N   φ = π/2        world +y     (screen up    in the cone view)
-    W   φ = π          world −x     (screen left  in the cone view)
-    S   φ = 3π/2       world −y     (screen down  in the cone view)
+STAGE 1 OPTIMIZATION — CHROME CACHE
+===================================
+The static chrome — grid, frame outline, captions, cardinal markers,
+s1 line, phi boundary dashed marks — is fully determined by
+(layout, flatRect, coneR).  It changes only on resize or on the
+half-angle/depth slider.  It used to re-render every frame: a
+half-dozen `strokeStyle`/`fillText`/`arc` per grid line, plus the
+four cardinal pins.
 
-Their positions are fixed: the base ring is centred at the origin
-with radius coneR(), and the four cardinal points sit at (R, 0),
-(0, R), (−R, 0), (0, −R) respectively, independent of where the
-apex is dragged.  The apex moves the meridians (which all converge
-on the apex) but it does not move the base ring, so the markers stay
-put as the cone is tilted.
+The chrome is now drawn into an offscreen canvas.  Per-frame key
+comparison decides whether to blit or rebuild.  During any drag
+(apex, patch, square, scrub), the layout is stable, so the whole
+chrome is one `ctx.drawImage`.
 
-The markers exist to answer a specific question: "I am looking at
-the flat parameter sheet, but I know the shape I care about is
-oriented a particular way in the cone view — which way is that on
-the sheet?"  The meridian line at each of the four labelled φ
-values runs straight up from the labelled base point to the apex,
-and it is the line along which the corresponding visual direction
-lives.  Any intermediate direction (NE, SSW, and so on) is read off
-the same φ axis: the meridian at a given φ has world angle φ on
-the base ring, which is its visual direction in the cone view.
-
-SHAPES IN THE FLAT VIEW
-=======================
-A shape lives on the patch's plane, not on the cone surface, so it
-has no intrinsic (phi, s) footprint.  When a patch is active, every
-shape of that patch is projected into the flat view by the linear
-correspondence (u, v) → (phi, s) that keeps the patch's own corners
-at the patch's own phi/s bounds:
-
-    phi = phiC + (u / uLen) · (phi1 − phi0)
-    s   = sC   + (v / vLen) · (s1   − s0)
-
-PATCH VERSUS SHAPE
-==================
-Both are quadrilaterals, both are tinted by the patch's hue, both
-carry a name label.  The distinguishing feature is the STROKE:
-
-    patch   dashed outline
-    shape   solid outline (thicker when selected), corner handles,
-            rotate handle
-
-The dashed stroke reads as "this is the surface the shapes live on",
-which is what the patch is now.  It matches the patch's rendering in
-the cone view.
-
-WRAPPED COPIES AND HANDLES
-==========================
-A shape whose patch has drifted past the seam draws multiple
-integer-2π copies.  The polygon is drawn once per copy; the rotate
-handle is drawn once per copy as well, using the same shift that the
-polygon copy used.
-
-PATCH DRAG — START-ANCHORED, WITH SHIFT-TO-APEX
-================================================
-A patch drag records the cursor's start position (phi, s), the
-patch's own start bounds (phi0, phi1, s0, s1), and applies the
-delta from drag start on every frame.  The drag handler therefore
-never reads the patch's current position as a source of truth for
-where it should be — the position is always recomputed from the
-start, so a wrap cannot accumulate error.
-
-With Shift held, the drag is constrained to the direction from the
-patch's centre toward the apex.  On the cone's lateral surface that
-is the meridian, so the constraint drops the φ component of the
-delta and lets s move freely in both directions.
-
-phi is unwrapped into (−π, π] on each frame so a drag across the
-atan2 seam does not add or drop a full turn.  s is bounded to
-[FLAT_S_MIN, FLAT_S_MAX] with the same push-on-contact behaviour
-flatMoveBody uses: when the patch's edge hits a wall, the whole
-interval slides and the far edge advances.
-
-PATCH MOVES AND THE HORIZON
-===========================
-Moving a patch along s is not a rigid motion of everything on it.
-The patch's own s0 and s1 shift, which moves the horizon in
-normalized v̂ terms; a shape whose sq.v was inside the old band may
-sit past the new one.  In the cone view this is handled by the
-horizon clip; in the flat view the shape's sq.v is simply clamped to
-the raw band so it does not fall off the sheet.
-
-PLANE INTERSECTION
-==================
-A tilted shape's plane cuts its patch plane along a line; the
-helpers in pg_view_squares.py (squarePlaneIntersectionFlat) return
-the chord in (phi, s), and the drawing loop here renders it per
-wrapped copy with the same faint dashed style the cone band uses.
-
-LABELS
-======
-Patch and shape name labels are drawn at the end of drawFlatView,
-inside the clip block, so a wrapped copy that has drifted past the
-sheet boundary is trimmed along with everything else.
-
-MIRROR
-======
-A patch whose `mirror` flag is true draws its shapes a second time
-on the patch's mirror — the same patch shifted by π in φ.  The
-mirror copies are drawn dimmed, without handles, and are not hit-
-testable.  See pg_view_squares.py for the mirror helpers.
-
-Interaction on this band:
-
-    shape corner / rotate / body drag   edit that shape
-    patch body drag                     translate the patch
-                                        (wraps freely across phi;
-                                        Shift held snaps to the
-                                        centre→apex axis)
-    empty space click                   deselect
+`flatRect()` is also memoized: it's called from `flatToScreen`,
+`screenToFlat`, `_flatInsideRect`, and every projection that needs
+a shape's standing scale — ~80–100 calls per frame.  Five `Math.min`
+/ `Math.max` per call, cached on (innerWidth, innerHeight, layout).
 """
-
 
 FLAT_VIEW_JS = r"""
 /* ==========================================================================
-   FLAT VIEW
+   FLAT VIEW CONSTANTS
    ========================================================================== */
 
 const FLAT_PHI_MIN  = 0;
@@ -153,17 +58,6 @@ const FLAT_S_MAX    = 1;
 
 const QUAD_MIN_SIZE_PHI = 0.06;
 const QUAD_MIN_SIZE_S   = 0.04;
-
-/* ==========================================================================
-   PATCH DRAG SNAP STEPS
-   ==========================================================================
-   PATCH_SNAP_PHI — one fifteenth of a full turn, matching the default
-   meridian spacing of 24 (2π / 24 = 15°).  A patch snapped with
-   Shift advances in meridian-sized increments along phi.
-
-   PATCH_SNAP_S   — one twentieth of the parameter rectangle's height.
-   For a patch whose own s-extent is 0.5, this is one tenth of its
-   own height; the eye reads the jump as "a small but visible step". */
 
 const PATCH_SNAP_PHI = Math.PI / 12;
 const PATCH_SNAP_S   = 0.05;
@@ -185,9 +79,23 @@ function _phiShiftForPatch(phiCursor, phi0, phi1) {
   return Math.round((phiMid - phiCursor) / FLAT_PHI_SPAN) * FLAT_PHI_SPAN;
 }
 
+/* ==========================================================================
+   flatRect — WITH MEMO
+   ========================================================================== */
+
+let _flatRectCache = null;
+
 function flatRect() {
   const W = window.innerWidth;
   const H = layout.reservedH;
+  const y0Base = layout.reservedY;
+
+  if (_flatRectCache &&
+      _flatRectCache.W === W && _flatRectCache.H === H &&
+      _flatRectCache.y0Base === y0Base) {
+    return _flatRectCache.r;
+  }
+
   const MARGIN_X = 44;
   const TOP_PAD  = 26;
   const BOT_PAD  = 26;
@@ -197,8 +105,11 @@ function flatRect() {
   const w = Math.min(maxW, maxH * 2.5);
   const h = Math.min(maxH, w / 2.5);
   const x0 = (W - w) / 2;
-  const y0 = layout.reservedY + TOP_PAD + (maxH - h) / 2;
-  return { x0, y0, w, h };
+  const y0 = y0Base + TOP_PAD + (maxH - h) / 2;
+
+  const r = { x0, y0, w, h };
+  _flatRectCache = { W, H, y0Base, r };
+  return r;
 }
 
 function flatToScreen(phi, s) {
@@ -223,24 +134,44 @@ function _flatInsideRect(sx, sy) {
          sy >= r.y0 && sy <= r.y0 + r.h;
 }
 
-function drawFlatView() {
-  const cw = window.innerWidth;
-  ctx.fillStyle = "#060a10";
-  ctx.fillRect(0, layout.reservedY, cw, layout.reservedH);
+/* ==========================================================================
+   FLAT-VIEW CHROME CACHE
+   ========================================================================== */
+
+let _flatChromeCache = null;   // { key, canvas }
+
+function _flatChromeKey(cw, ch) {
+  const r = flatRect();
+  return [
+    cw, ch, dpr,
+    layout.reservedY, layout.reservedH,
+    r.x0, r.y0, r.w, r.h,
+    coneR(),
+  ].join("|");
+}
+
+function _buildFlatChrome(cw, ch) {
+  const off = document.createElement("canvas");
+  off.width  = Math.round(cw * dpr);
+  off.height = Math.round(ch * dpr);
+  const octx = off.getContext("2d");
+  octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  octx.fillStyle = "#060a10";
+  octx.fillRect(0, layout.reservedY, cw, layout.reservedH);
 
   const r = flatRect();
 
-  /* ---- static chrome: grid, frame, captions --------------------- */
-  ctx.save();
-
+  // Grid: horizontal ring hints.
+  octx.save();
   const N_RINGS = 6;
   for (let k = 1; k < N_RINGS; k++) {
     const s = k / N_RINGS;
     const [sx0, sy] = flatToScreen(FLAT_PHI_MIN, s);
     const [sx1]     = flatToScreen(FLAT_PHI_MAX, s);
-    ctx.strokeStyle = "rgba(0, 229, 255, " + (0.03 + s * 0.09) + ")";
-    ctx.lineWidth = 0.7;
-    ctx.beginPath(); ctx.moveTo(sx0, sy); ctx.lineTo(sx1, sy); ctx.stroke();
+    octx.strokeStyle = "rgba(0, 229, 255, " + (0.03 + s * 0.09) + ")";
+    octx.lineWidth = 0.7;
+    octx.beginPath(); octx.moveTo(sx0, sy); octx.lineTo(sx1, sy); octx.stroke();
   }
 
   const N_MERID = 12;
@@ -249,63 +180,126 @@ function drawFlatView() {
                 (FLAT_PHI_MAX - FLAT_PHI_MIN) * k / N_MERID;
     const [sx, sy0] = flatToScreen(phi, FLAT_S_MAX);
     const [,   sy1] = flatToScreen(phi, FLAT_S_MIN);
-    ctx.strokeStyle = "rgba(0, 229, 255, 0.05)";
-    ctx.lineWidth = 0.7;
-    ctx.beginPath(); ctx.moveTo(sx, sy0); ctx.lineTo(sx, sy1); ctx.stroke();
+    octx.strokeStyle = "rgba(0, 229, 255, 0.05)";
+    octx.lineWidth = 0.7;
+    octx.beginPath(); octx.moveTo(sx, sy0); octx.lineTo(sx, sy1); octx.stroke();
   }
 
-  ctx.strokeStyle = "#1e2836";
-  ctx.lineWidth = 1;
-  ctx.strokeRect(r.x0 + 0.5, r.y0 + 0.5, r.w - 1, r.h - 1);
+  octx.strokeStyle = "#1e2836";
+  octx.lineWidth = 1;
+  octx.strokeRect(r.x0 + 0.5, r.y0 + 0.5, r.w - 1, r.h - 1);
 
+  // s=1 line.
   {
     const [sx0, sy] = flatToScreen(FLAT_PHI_MIN, 1);
     const [sx1]     = flatToScreen(FLAT_PHI_MAX, 1);
-    ctx.strokeStyle = "rgba(255, 43, 214, 0.55)";
-    ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(sx0, sy); ctx.lineTo(sx1, sy); ctx.stroke();
+    octx.strokeStyle = "rgba(255, 43, 214, 0.55)";
+    octx.lineWidth = 2;
+    octx.beginPath(); octx.moveTo(sx0, sy); octx.lineTo(sx1, sy); octx.stroke();
   }
 
+  // Dashed phi-boundary marks.
   {
     const [sxL, sy0] = flatToScreen(FLAT_PHI_MIN, FLAT_S_MAX);
     const [,   sy1]  = flatToScreen(FLAT_PHI_MIN, FLAT_S_MIN);
     const [sxR]      = flatToScreen(FLAT_PHI_MAX, 0);
-    ctx.setLineDash([4, 4]);
-    ctx.strokeStyle = "rgba(255, 43, 214, 0.30)";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(sxL, sy0); ctx.lineTo(sxL, sy1);
-    ctx.moveTo(sxR, sy0); ctx.lineTo(sxR, sy1);
-    ctx.stroke();
-    ctx.setLineDash([]);
+    octx.setLineDash([4, 4]);
+    octx.strokeStyle = "rgba(255, 43, 214, 0.30)";
+    octx.lineWidth = 1;
+    octx.beginPath();
+    octx.moveTo(sxL, sy0); octx.lineTo(sxL, sy1);
+    octx.moveTo(sxR, sy0); octx.lineTo(sxR, sy1);
+    octx.stroke();
+    octx.setLineDash([]);
   }
-  ctx.restore();
+  octx.restore();
 
-  /* captions */
-  ctx.save();
-  ctx.font = "700 9px 'JetBrains Mono', 'Fira Code', monospace";
+  // Captions.
+  octx.save();
+  octx.font = "700 9px 'JetBrains Mono', 'Fira Code', monospace";
 
-  ctx.fillStyle = "#3d4756";
-  ctx.textAlign = "left"; ctx.textBaseline = "top";
-  ctx.fillText("UNFOLDED CONE  \u00B7  PARAMETER SPACE",
+  octx.fillStyle = "#3d4756";
+  octx.textAlign = "left"; octx.textBaseline = "top";
+  octx.fillText("UNFOLDED CONE  \u00B7  PARAMETER SPACE",
                r.x0, r.y0 - 16);
 
-  ctx.textAlign = "right"; ctx.fillStyle = "#5a6774";
-  ctx.fillText("\u03C6 = 0", r.x0 - 6, r.y0);
-  ctx.textAlign = "left";
-  ctx.fillText("\u03C6 = 2\u03C0", r.x0 + r.w + 6, r.y0);
+  octx.textAlign = "right"; octx.fillStyle = "#5a6774";
+  octx.fillText("\u03C6 = 0", r.x0 - 6, r.y0);
+  octx.textAlign = "left";
+  octx.fillText("\u03C6 = 2\u03C0", r.x0 + r.w + 6, r.y0);
 
-  ctx.textAlign = "left"; ctx.textBaseline = "bottom";
-  ctx.fillStyle = "#3d4756";
-  ctx.fillText("s = 0  \u00B7  base", r.x0, r.y0 + r.h + 14);
+  octx.textAlign = "left"; octx.textBaseline = "bottom";
+  octx.fillStyle = "#3d4756";
+  octx.fillText("s = 0  \u00B7  base", r.x0, r.y0 + r.h + 14);
 
-  ctx.textBaseline = "top";
-  ctx.fillStyle = "rgba(255, 43, 214, 0.75)";
-  ctx.fillText("s = 1  \u00B7  apex", r.x0, r.y0 + 4);
-  ctx.restore();
+  octx.textBaseline = "top";
+  octx.fillStyle = "rgba(255, 43, 214, 0.75)";
+  octx.fillText("s = 1  \u00B7  apex", r.x0, r.y0 + 4);
+  octx.restore();
 
-  /* ---- patches and shapes, together, clipped to the sheet ------- */
+  // Cardinal markers.
+  const yBase = r.y0 + r.h;
+  const R_PIN = 9;
+  const yPin  = yBase - R_PIN - 3;
+  const cards = [
+    { key: "E", phi: 0               },
+    { key: "N", phi: Math.PI / 2     },
+    { key: "W", phi: Math.PI         },
+    { key: "S", phi: 3 * Math.PI / 2 },
+  ];
+  octx.save();
+  octx.font = "700 11px 'JetBrains Mono', 'Fira Code', monospace";
+  octx.textAlign = "center";
+  octx.textBaseline = "middle";
+  for (const c of cards) {
+    const [sx] = flatToScreen(c.phi, 0);
 
+    octx.beginPath();
+    octx.moveTo(sx, yBase);
+    octx.lineTo(sx, yBase - 4);
+    octx.strokeStyle = "rgba(255, 200, 90, 0.35)";
+    octx.lineWidth = 1.0;
+    octx.stroke();
+
+    octx.beginPath();
+    octx.arc(sx, yPin, R_PIN, 0, Math.PI * 2);
+    octx.fillStyle = "rgba(11, 16, 24, 0.88)";
+    octx.fill();
+    octx.strokeStyle = "rgba(255, 200, 90, 0.85)";
+    octx.lineWidth = 1.3;
+    octx.stroke();
+
+    octx.fillStyle = "rgba(255, 200, 90, 0.95)";
+    octx.fillText(c.key, sx, yPin + 0.5);
+  }
+  octx.restore();
+
+  return off;
+}
+
+function _flatChrome(cw, ch) {
+  const key = _flatChromeKey(cw, ch);
+  if (_flatChromeCache && _flatChromeCache.key === key) {
+    return _flatChromeCache.canvas;
+  }
+  const canvas = _buildFlatChrome(cw, ch);
+  _flatChromeCache = { key, canvas };
+  return canvas;
+}
+
+/* ==========================================================================
+   FLAT VIEW — DRAW
+   ========================================================================== */
+
+function drawFlatView() {
+  const cw = window.innerWidth;
+
+  // Static chrome: blit.
+  ctx.drawImage(_flatChrome(cw, window.innerHeight), 0, 0, cw, window.innerHeight);
+
+  const r = flatRect();
+
+  // Dynamic content: patches and squares.
   ctx.save();
   ctx.beginPath();
   ctx.rect(r.x0, r.y0, r.w, r.h);
@@ -321,91 +315,18 @@ function drawFlatView() {
 
   if (selectedQuad >= 0 && selectedQuad < quads.length) {
     const activeQ = quads[selectedQuad];
-
     for (let i = 0; i < floatSquares.length; i++) {
       const sq = floatSquares[i];
       if (sq.quadId !== activeQ.id) continue;
       const isSel = (i === selectedSquare);
-
       _drawFlatSquareOne(sq, isSel, false);
-
       if (activeQ.mirror) {
         _withSquareMirror(sq, () => _drawFlatSquareOne(sq, false, true));
       }
     }
   }
 
-  /* Labels, drawn inside the clip so a wrapped copy that has drifted
-     past the sheet boundary is trimmed along with everything else. */
   drawShapeLabelsFlat();
-
-  /* Cardinal direction markers, drawn last so they sit above
-     everything on the sheet.  See the module docstring,
-     CARDINAL DIRECTION MARKERS. */
-  drawFlatCardinalMarkers();
-
-  ctx.restore();
-}
-
-/* ==========================================================================
-   CARDINAL DIRECTION MARKERS
-   ==========================================================================
-   Small pins at the base line, at φ = 0, π/2, π, 3π/2.  Each pin is
-   a dark disc with an amber ring and a single letter, E / N / W / S,
-   sitting just above the s = 0 line.
-
-   The four base points are fixed at (R, 0), (0, R), (−R, 0), (0, −R)
-   in world coordinates, where R = coneR().  The apex can be dragged
-   anywhere within the cone's own reach limit, but it does not move
-   the base ring, so the pins never move.
-
-   Drawn without a save/restore of its own — it inherits the clip
-   and the coordinate system of drawFlatView. */
-
-function drawFlatCardinalMarkers() {
-  const r     = flatRect();
-  const yBase = r.y0 + r.h;
-
-  const R_PIN = 9;
-  const yPin  = yBase - R_PIN - 3;
-
-  const cards = [
-    { key: "E", phi: 0               },
-    { key: "N", phi: Math.PI / 2     },
-    { key: "W", phi: Math.PI         },
-    { key: "S", phi: 3 * Math.PI / 2 },
-  ];
-
-  ctx.save();
-  ctx.font = "700 11px 'JetBrains Mono', 'Fira Code', monospace";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-
-  for (const c of cards) {
-    const [sx] = flatToScreen(c.phi, 0);
-
-    /* Short stem connecting the pin to the base line, so the pin
-       reads as "anchored here on the s = 0 edge". */
-    ctx.beginPath();
-    ctx.moveTo(sx, yBase);
-    ctx.lineTo(sx, yBase - 4);
-    ctx.strokeStyle = "rgba(255, 200, 90, 0.35)";
-    ctx.lineWidth = 1.0;
-    ctx.stroke();
-
-    /* Pin: dark fill so it reads over any underlying shape, amber
-       ring and letter for the marker itself. */
-    ctx.beginPath();
-    ctx.arc(sx, yPin, R_PIN, 0, Math.PI * 2);
-    ctx.fillStyle = "rgba(11, 16, 24, 0.88)";
-    ctx.fill();
-    ctx.strokeStyle = "rgba(255, 200, 90, 0.85)";
-    ctx.lineWidth = 1.3;
-    ctx.stroke();
-
-    ctx.fillStyle = "rgba(255, 200, 90, 0.95)";
-    ctx.fillText(c.key, sx, yPin + 0.5);
-  }
 
   ctx.restore();
 }
@@ -417,14 +338,6 @@ function drawFlatQuad(q, selected) {
   }
 }
 
-/* The patch is the plane a shape sits on.  It gets a DASHED outline,
-   a very faint fill, and no corner or rotate handles.  Everything
-   the eye reads as "an object on the sheet" — solid stroke, handles,
-   a filled body — belongs to the shapes.
-
-   When shape-editing is enabled the patch corners carry small dots
-   drawn in the patch hue; those dots are the only handle-like
-   feature a patch has, and they are dormant while the flag is off. */
 function drawFlatQuadShifted(q, selected, shift) {
   const hue = patchHue(q);
   const pts = quadCorners(q).map(c =>
@@ -458,15 +371,6 @@ function drawFlatQuadShifted(q, selected, shift) {
 
   ctx.restore();
 }
-
-/* ==========================================================================
-   PER-SQUARE DRAWING IN THE FLAT BAND
-   ==========================================================================
-   Extracted so both the original and the mirror copy can be drawn
-   through the same code.  The mirror copy is dimmed and carries no
-   handles; the original carries handles when it is the selected
-   square.  The wrapping by `_phiCopies` and the intersection hint
-   are the same in both cases. */
 
 function _drawFlatSquareOne(sq, isSel, isMirror) {
   const corners = squareFlatCorners(sq);
@@ -503,8 +407,6 @@ function _drawFlatSquareOne(sq, isSel, isMirror) {
     ctx.lineWidth = lineW;
     ctx.stroke();
 
-    /* Intersection with the patch plane, when tilted.  Drawn
-       per wrapped copy, same as the polygon and its handles. */
     if (sq.slope && Math.abs(sq.slope) > 1e-6) {
       const isect = squarePlaneIntersectionFlat(sq);
       if (isect) {
@@ -567,7 +469,9 @@ function _drawFlatSquareOne(sq, isSel, isMirror) {
   }
 }
 
-/* ---- Hit testing ------------------------------------------------ */
+/* ==========================================================================
+   HIT TESTING
+   ========================================================================== */
 
 const FLAT_HANDLE_R = 10;
 const FLAT_EDGE_R   = 6;
@@ -642,7 +546,9 @@ function flatHitTest(sx, sy) {
   return null;
 }
 
-/* ---- Shape re-clamp after a patch mutation ---------------------- */
+/* ==========================================================================
+   SHAPE RE-CLAMP AFTER PATCH MUTATION
+   ========================================================================== */
 
 function _reclampShapesOnPatch(q) {
   if (!q) return;
@@ -656,19 +562,9 @@ function _reclampShapesOnPatch(q) {
   }
 }
 
-/* ---- Patch drag -------------------------------------------------
-   Start-anchored, with the Shift-held constraint to the patch's
-   centre→apex axis.
-
-   On the cone's lateral surface, the direction from a patch's
-   centre toward the apex is the meridian: φ stays put, only s
-   moves.  Constraining the drag to that axis therefore drops the φ
-   component of the delta and lets s move freely in both directions
-   — the axis is fixed, the sign is not.
-
-   Both the cone view's drag handler and the flat view's route
-   through this same function, so a constrained patch drag behaves
-   identically in both bands. */
+/* ==========================================================================
+   PATCH DRAG AND MUTATORS
+   ========================================================================== */
 
 function applyPatchDragFromStart(q, dp, curPhi, curS, constrain) {
   let rawPhi = curPhi - dp.startPhi;
@@ -679,11 +575,6 @@ function applyPatchDragFromStart(q, dp, curPhi, curS, constrain) {
   let dPhi = rawPhi;
   const dS = rawS;
 
-  /* Shift held: the drag is constrained to the direction from the
-     patch's centre toward the apex.  On the cone surface that is
-     the meridian — φ stays put, only s moves.  Both directions
-     along the meridian are allowed; the axis is fixed, not the
-     sign. */
   if (constrain) {
     dPhi = 0;
   }
@@ -701,11 +592,6 @@ function applyPatchDragFromStart(q, dp, curPhi, curS, constrain) {
 
   _reclampShapesOnPatch(q);
 }
-
-/* ---- Drag application -------------------------------------------
-   The three mutators below are the shape-editing paths for patches.
-   They are unreferenced while PATCH_SHAPE_EDIT_ENABLED is false, but
-   they remain fully functional. */
 
 function flatMoveCorner(q, cornerIdx, phi, s) {
   if (cornerIdx === 0) {
@@ -747,10 +633,6 @@ function flatMoveEdge(q, edge, phi, s) {
   _reclampShapesOnPatch(q);
 }
 
-/* Incremental patch translation.  Kept as the low-level mutator and
-   as the reference implementation for the clamp/wrap behaviour that
-   applyPatchDragFromStart mirrors; the drag handlers now use the
-   start-anchored version. */
 function flatMoveBody(q, dPhi, dS) {
   q.phi0 += dPhi;
   q.phi1 += dPhi;

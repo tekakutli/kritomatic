@@ -3,25 +3,16 @@ cone_kra.py — turn the cone playground into a .kra.
 
 Five export modes, selected by options.text_warp_mode:
 
-    "square" (default)
-        One group + one transform mask per square.
-
-    "patch"
-        One group + one transform mask per patch.  All texts on the
-        patch share the patch's mask.
-
-    "text"
-        One group + one transform mask per text.  Each text's mask
-        is a copy of the SQUARE'S own mask.
-
-    "text-shear"
-        No masks.  One direct vector layer per text, carrying a full
-        affine transform computed on the JS side to reproduce the
-        mask-mode result.
-
-    "patch-shear"
-        No masks.  One group per patch; each text on the patch is a
-        direct vector layer inside the group, with its own affine.
+    "square" (default)   One group + one transform mask per square.
+    "patch"              One group + one mask per PATCH.  All texts
+                         on the patch share the patch's mask.
+    "text"               One group + one mask per TEXT.  Each text's
+                         mask is a copy of the SQUARE'S own mask.
+    "text-shear"         No masks.  One direct vector layer per
+                         text, carrying a full affine transform.
+    "patch-shear"        No masks.  One group per patch; each text
+                         on the patch is a direct vector layer inside
+                         the group, with its own affine.
 
 No background layer is created in any mode.
 
@@ -36,47 +27,24 @@ and NO x/y attributes on the <text> element.  Krita then draws two
 vertical "inline-size handles" at the left and right edges of the
 wrapping area, and the text wraps within that area.
 
-The handles sit, in the shape's canvas frame, at
-
-    T.map(alpha * I, 0)   and   T.map(beta * I, 0)
-
-where T is the shape's own transform and alpha / beta depend on
-the anchor mode:
-
-    text-anchor="start"    alpha = 0     beta = +1
-    text-anchor="middle"   alpha = -0.5  beta = +0.5
-    text-anchor="end"      alpha = -1    beta = 0
-
 To put the handles on the polygon's edges, the shear modes follow
 each add_vector_text with two move_text_handle commands — one for
 the left handle, one for the right.  The targets are the midpoints
 of the polygon's two edges farthest apart along the text baseline
-direction (m11, m12).  Those are the polygon edges that run
-perpendicular to the baseline, which is where the wrapping area's
-left and right edges can coincide with them.
+direction.
 
-MIRROR
-======
-When a patch's `mirror` flag is on, the JS side emits a mirror
-copy of every square on that patch.  All five modes export that
-copy:
-
-    - "square" and "patch" modes emit the mirror in the same
-      per-square or per-patch group structure as the original,
-      with a `_mirror` suffix on every layer name;
-
-    - "text" and "text-shear" modes emit the mirror per text, again
-      with a `_mirror` suffix on the layer names;
-
-    - "patch-shear" mode emits a second group per patch, named
-      `<patch>_mirror`, holding the mirror squares' own text
-      layers.
-
-Mirror entries carry the same text label as the original (the
-plain square name); the LAYER names are what differ.
+STAGE 1 CLEANUP
+===============
+`_emit_handle_moves` used to `print(..., file=sys.stderr)` six
+diagnostic lines per text (layer name, x/y, transform, polygon,
+targets).  On a 20-square export that's ~120 lines of debug noise
+in the server terminal.  The prints are now gated behind the
+environment variable `CONE_KRA_DEBUG`.  Set `CONE_KRA_DEBUG=1` to
+re-enable them for a specific run.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -111,6 +79,14 @@ DEFAULT_FONT_FAMILY = "sans-serif"
 FONT_FRACTION = 0.40
 
 EXPORT_GROUP_NAME = "Export"
+
+_DEBUG = bool(os.environ.get("CONE_KRA_DEBUG"))
+
+
+def _debug(*args, **kwargs):
+    if _DEBUG:
+        kwargs.setdefault("file", sys.stderr)
+        print(*args, **kwargs)
 
 
 def _fallback_anchor(W, H):
@@ -168,13 +144,10 @@ def _common_header(band, doc_name):
 
 
 def _inline_size_for(font_px, width=None):
-    """Return the wrap width for one exported text.
-
-    When the source width is available in the payload (`natural_w`
-    on shapes, `src_w` on texts) we use it directly.  Otherwise we
-    recover it from the font size: the JS side computed
-    font_px = min(W, H) * FONT_FRACTION, and every square in this
-    project is square, so font_px / FONT_FRACTION recovers W."""
+    """Return the wrap width for one exported text.  Uses the source
+    width directly when available; otherwise recovers it from the
+    font size (font_px = min(W, H) * FONT_FRACTION, and every square
+    in this project is square)."""
     if width is not None:
         try:
             w = float(width)
@@ -212,13 +185,7 @@ def _coerce_transform(raw):
 
 def _polygon_target_edges(polygon_pts, baseline_dir):
     """Return (target_left, target_right), the two polygon edge
-    midpoints farthest apart along the baseline direction.
-
-    polygon_pts: list of (x, y) canvas coordinates.
-    baseline_dir: (m11, m12) — the text's local X axis in canvas
-    coordinates, which is the direction along which the two handles
-    are separated.
-    """
+    midpoints farthest apart along the baseline direction."""
     n = len(polygon_pts)
     if n < 3:
         return None
@@ -246,27 +213,28 @@ def _polygon_target_edges(polygon_pts, baseline_dir):
 
 
 def _emit_handle_moves(commands, layer_name, t, polygon_pts):
-    import sys
     affine = _coerce_transform(t.get("transform"))
-    print("=" * 60, file=sys.stderr)
-    print("text layer_name = %r" % layer_name, file=sys.stderr)
-    print("  t['name']     = %r" % t.get("name"), file=sys.stderr)
-    print("  t['x']  t['y'] = %r  %r" % (t.get("x"), t.get("y")), file=sys.stderr)
-    print("  t['transform']= %r" % t.get("transform"), file=sys.stderr)
-    print("  polygon_pts   = %r" % (polygon_pts,), file=sys.stderr)
+
+    _debug("=" * 60)
+    _debug("text layer_name = %r" % layer_name)
+    _debug("  t['name']     = %r" % t.get("name"))
+    _debug("  t['x']  t['y'] = %r  %r" % (t.get("x"), t.get("y")))
+    _debug("  t['transform']= %r" % t.get("transform"))
+    _debug("  polygon_pts   = %r" % (polygon_pts,))
+
     if not polygon_pts or len(polygon_pts) < 4:
-        print("  -> SKIP (no polygon pts)", file=sys.stderr)
+        _debug("  -> SKIP (no polygon pts)")
         return
     if affine is None:
-        print("  -> SKIP (bad transform)", file=sys.stderr)
+        _debug("  -> SKIP (bad transform)")
         return
     targets = _polygon_target_edges(polygon_pts, (affine[0], affine[1]))
     if targets is None:
-        print("  -> SKIP (targets None)", file=sys.stderr)
+        _debug("  -> SKIP (targets None)")
         return
     tl, tr = targets
-    print("  target_left  = %r" % (tl,), file=sys.stderr)
-    print("  target_right = %r" % (tr,), file=sys.stderr)
+    _debug("  target_left  = %r" % (tl,))
+    _debug("  target_right = %r" % (tr,))
 
     commands.append({
         "type": "move_text_handle",
@@ -516,13 +484,8 @@ def _build_text_mode(texts, rects, opts, band, doc_name):
 
 
 def _build_shear_mode(texts, rects, opts, band, doc_name):
-    """No masks.  One vector layer per text.  Position and full
-    affine are computed on the JS side, then the handles are moved
-    onto the polygon's edges by two move_text_handle commands per
-    text."""
     commands = _common_header(band, doc_name)
 
-    # Emit the polygons.
     for rect in (rects or []):
         rect_layer = rect["name"] + "_rect"
         commands.append({
@@ -544,7 +507,6 @@ def _build_shear_mode(texts, rects, opts, band, doc_name):
             "stroke_opacity": rect.get("stroke_opacity", 1.0),
         })
 
-    # Map polygon names to their corner lists, for the handle moves.
     rect_by_name = {}
     for rect in (rects or []):
         name = rect.get("name")
@@ -552,7 +514,6 @@ def _build_shear_mode(texts, rects, opts, band, doc_name):
         if name and pts and len(pts) >= 3:
             rect_by_name[name] = pts
 
-    # Emit the texts and the two handle moves that follow each.
     for t in texts:
         layer_name = t["name"] + "_text"
 
@@ -583,21 +544,8 @@ def _build_shear_mode(texts, rects, opts, band, doc_name):
 
 
 def _build_patch_shear_mode(patches, opts, band, doc_name):
-    """No masks.  One group per patch; each text inside its patch's
-    group as a direct vector layer.  Handles are aligned to the
-    polygon edges by two move_text_handle commands per text.
-
-    Group nesting:
-        group <batchid>_Export
-            vector layer <sq>_rect ...
-            group <patch>
-                vector layer <sq>_text ...
-            group <patch>_mirror
-                vector layer <sq>_mirror_text ...
-    """
     commands = _common_header(band, doc_name)
 
-    # Emit every rectangle, across every patch, into the export group.
     for patch in patches:
         for rect in patch.get("rects", []):
             rect_layer = rect["name"] + "_rect"
@@ -620,7 +568,6 @@ def _build_patch_shear_mode(patches, opts, band, doc_name):
                 "stroke_opacity": rect.get("stroke_opacity", 1.0),
             })
 
-    # Build a global name -> points map.
     rect_by_name = {}
     for patch in patches:
         for rect in patch.get("rects", []):
@@ -629,7 +576,6 @@ def _build_patch_shear_mode(patches, opts, band, doc_name):
             if name and pts and len(pts) >= 3:
                 rect_by_name[name] = pts
 
-    # Emit each patch's texts into the patch's own group.
     for patch in patches:
         group_name = patch["name"]
 

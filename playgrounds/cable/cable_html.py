@@ -254,7 +254,6 @@ _BOOT_JS = r"""
            symmetry with the other playgrounds. */
     step("installShellControls",       () => m.shell.installShellControls());
     step("installDarkScreenStyles",    () => m.panel.installDarkScreenStyles());
-    step("installPanelFade",           () => m.panel.installPanelFade());
     step("installInstructionsPopover", () => m.panel.installInstructionsPopover());
     step("installExportButton",        () => m.expEntry.installExportButton());
     step("installArrowDiagButton",     () => m.arrowDiag.installArrowDiagButton());

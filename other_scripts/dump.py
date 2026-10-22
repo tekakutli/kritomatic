@@ -3,7 +3,7 @@
 Dump files (filtered by extension) into a single markdown file.
 
 Usage:
-    dump.py [-a AFFIX] [-r] [-t] [FILE ...]
+    dump.py [-a AFFIX] [-r] [-t] [-o PATH] [FILE ...]
 
 If one or more FILE positional arguments are provided, ONLY those files are
 dumped (deduplicated, in sorted order). Their paths are interpreted relative
@@ -15,23 +15,32 @@ parent directory of the listed files.
 When no FILE arguments are given, the script scans DEFAULT_DIR using the
 configured filters below — behavior identical to the original version.
 
-All configuration (directory, output path, extensions, default affix,
-default recursion, tree-only, excluded directories, included/excluded
-filename substrings) is done via the variables at the top of this file.
-The only CLI flags are -a/--affix, -r/--recursive and -t/--tree-only,
-which override their DEFAULT_* counterparts when provided.
+All configuration (directory, extensions, default affix, default recursion,
+tree-only, excluded directories, included/excluded filename substrings) is
+done via the variables at the top of this file. The CLI flags -a/--affix,
+-r/--recursive, and -t/--tree-only override their DEFAULT_* counterparts
+when provided.
 
-The scanned directory is always recorded at the top of the output, and
-its basename is appended to the output filename (e.g. project_dump.md
-becomes project_dump_myproject.md when scanning ".../myproject").
-When recursion is enabled (-r or DEFAULT_RECURSIVE = True), or files are
-listed explicitly, a directory tree is also prepended. The tree shows
-every directory under the scanned root (even ones excluded from dumping),
-minus anything listed in DEFAULT_TREE_EXCLUDE_DIRS; only files that were
-actually dumped are listed inside it.
+The output filename has two modes:
 
-With -t/--tree-only the file contents are omitted: only the directory
-tree is written. This flag implies recursion.
+    · Default (no -o/--output): DEFAULT_OUT (e.g. "project_dump.md") with
+      the scanned directory's basename appended before the suffix, so
+      scanning ".../myproject" writes "project_dump_myproject.md" in the
+      CURRENT directory.
+
+    · -o PATH: write exactly to PATH, no suffix transformation.  Use this
+      when the caller needs a deterministic filename and location (e.g.
+      deeppeek's evolve pipeline writes both dumps into a temp workspace).
+
+The scanned directory is always recorded at the top of the output. When
+recursion is enabled (-r or DEFAULT_RECURSIVE = True), or files are listed
+explicitly, a directory tree is also prepended. The tree shows every
+directory under the scanned root (even ones excluded from dumping), minus
+anything listed in DEFAULT_TREE_EXCLUDE_DIRS; only files that were actually
+dumped are listed inside it.
+
+With -t/--tree-only the file contents are omitted: only the directory tree
+is written. This flag implies recursion.
 """
 
 import argparse
@@ -370,9 +379,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Dump files into a markdown file. "
                     "All paths/extensions come from variables in the script; "
-                    "only the affix, recursion, and tree-only mode can be "
-                    "overridden on the CLI. Pass one or more FILE arguments "
-                    "to dump only those files."
+                    "only the affix, recursion, tree-only mode, and output "
+                    "path can be overridden on the CLI. Pass one or more "
+                    "FILE arguments to dump only those files."
     )
     parser.add_argument(
         "files", nargs="*",
@@ -399,10 +408,18 @@ def main() -> int:
               "contents. Implies recursion. "
               f"(hardcoded default: {DEFAULT_TREE_ONLY})"),
     )
+    parser.add_argument(
+        "-o", "--output", type=Path, default=None,
+        help=("Write the dump to this exact path. No directory-name suffix "
+              "is applied — the file is created exactly where you say "
+              f"(default: {DEFAULT_OUT} with _<scanned-dir> appended)"),
+    )
     args = parser.parse_args()
 
     root = Path(DEFAULT_DIR)
-    out = Path(DEFAULT_OUT)
+    # If -o/--output was given, honour it exactly. Otherwise use DEFAULT_OUT
+    # and let output_path_with_dirname add the scanned directory's basename.
+    out = args.output if args.output else Path(DEFAULT_OUT)
 
     extensions = [e for e in (normalize_ext(x) for x in DEFAULT_EXTENSIONS) if e]
     exclude_dirs = [d for d in DEFAULT_EXCLUDE_DIRS if d]
@@ -474,10 +491,17 @@ def main() -> int:
 
     total = len(files)
 
-    # Resolve the tree root to an absolute path, and derive both the
-    # human-readable label and the output filename suffix from it.
+    # Resolve the tree root to an absolute path, and derive the
+    # human-readable label used in the "SCANNED DIRECTORY:" header.
     scanned_dir = Path(os.path.abspath(str(tree_root)))
-    out = output_path_with_dirname(out, scanned_dir)
+
+    # If no explicit -o was given, decorate DEFAULT_OUT with the scanned
+    # directory's basename (original behaviour).  With -o, the caller owns
+    # the exact path — write there verbatim.
+    if not args.output:
+        out = output_path_with_dirname(out, scanned_dir)
+
+    out.parent.mkdir(parents=True, exist_ok=True)
 
     with out.open("w", encoding="utf-8") as fh:
         # Always record which directory was scanned

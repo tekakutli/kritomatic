@@ -13,7 +13,6 @@ ES module.  Owns:
     installDarkScreenStyles    no-op.  All CSS now lives in
                                `pg_base.PG_CSS`.
 
-    installPanelFade           panel idle-fade tracking
     installInstructionsPopover attach the ? button's click handler
                                to the baked `#helpBtn`; create the
                                popover shell at boot (it's
@@ -64,13 +63,6 @@ identical DOM nodes.
 """
 
 PANEL_JS = r"""
-import {
-  WALL, WALL_HEIGHT, layout, viewFloor, viewWall,
-  state, mouse, panelState,
-  PALETTE, FONT_MONO, FONT_SANS,
-  callDraw,
-  w2sWall, s2wWall,
-} from "./pg_state.js";
 import {
   flashStatus,
   collapsePanel, restorePanel,
@@ -141,53 +133,6 @@ export function installVerticalMenu() {
 
 export function installDarkScreenStyles() {
   /* no-op */
-}
-
-/* ==========================================================================
-   PANEL FADE
-   ========================================================================== */
-
-export function installPanelFade() {
-  const ui = document.getElementById("ui");
-  if (!ui) return;
-  ui.style.transition = "opacity 0.3s ease";
-  ui.addEventListener("mouseenter", () => {
-    panelState.hovered = true;
-    updatePanelOpacity();
-  });
-  ui.addEventListener("mouseleave", () => {
-    panelState.hovered = false;
-    panelState.lastActivity = performance.now();
-    updatePanelOpacity();
-  });
-  ui.addEventListener("mousedown", () => {
-    panelState.lastActivity = performance.now();
-  });
-
-  window.addEventListener("mousemove", (e) => {
-    if (ui.contains(e.target)) return;
-    panelState.lastActivity = performance.now();
-  }, { passive: true });
-
-  setInterval(updatePanelOpacity, 500);
-}
-
-export function updatePanelOpacity() {
-  const ui = document.getElementById("ui");
-  if (!ui) return;
-  if (ui.classList.contains("collapsed")) return;
-  if (panelState.hovered || state.drawing ||
-      state.dragGrid || state.dragVertex ||
-      state.pan || state.ruler.active) {
-    ui.style.opacity = "";
-    return;
-  }
-  if (!mouse.inside) {
-    ui.style.opacity = "";
-    return;
-  }
-  const idle = performance.now() - panelState.lastActivity;
-  ui.style.opacity = idle > 1800 ? "0.42" : "";
 }
 
 /* ==========================================================================

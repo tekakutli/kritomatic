@@ -277,14 +277,6 @@ export const mouse = {
   sx: 0, sy: 0, view: null, inside: false, alt: false, shift: false,
 };
 
-/* ==========================================================================
-   PANEL / MOUSE-IDLE STATE
-   ========================================================================== */
-
-export const panelState = {
-  hovered:      false,
-  lastActivity: 0,
-};
 
 /* ==========================================================================
    ANCHORS + JUNCTION GRAPH

@@ -188,6 +188,7 @@ playgrounds/board/board_drops/
 *.step
 
 *project_dump*
+*deeppeek
 
 # Specific
 */room/room_boxes.json

@@ -3,7 +3,17 @@
 Dump files (filtered by extension) into a single markdown file.
 
 Usage:
-    dump.py [-a AFFIX] [-r] [-t]
+    dump.py [-a AFFIX] [-r] [-t] [FILE ...]
+
+If one or more FILE positional arguments are provided, ONLY those files are
+dumped (deduplicated, in sorted order). Their paths are interpreted relative
+to DEFAULT_DIR (falling back to the current directory). In this mode all
+extension / affix / include / exclude filters are bypassed: what you list is
+what you get. A directory tree is always rendered, rooted at the common
+parent directory of the listed files.
+
+When no FILE arguments are given, the script scans DEFAULT_DIR using the
+configured filters below — behavior identical to the original version.
 
 All configuration (directory, output path, extensions, default affix,
 default recursion, tree-only, excluded directories, included/excluded
@@ -14,9 +24,9 @@ which override their DEFAULT_* counterparts when provided.
 The scanned directory is always recorded at the top of the output, and
 its basename is appended to the output filename (e.g. project_dump.md
 becomes project_dump_myproject.md when scanning ".../myproject").
-When recursion is enabled (-r or DEFAULT_RECURSIVE = True), a directory
-tree of the scanned directory is also prepended. The tree shows every
-directory under the scanned root (even ones excluded from dumping),
+When recursion is enabled (-r or DEFAULT_RECURSIVE = True), or files are
+listed explicitly, a directory tree is also prepended. The tree shows
+every directory under the scanned root (even ones excluded from dumping),
 minus anything listed in DEFAULT_TREE_EXCLUDE_DIRS; only files that were
 actually dumped are listed inside it.
 
@@ -42,7 +52,7 @@ DEFAULT_OUT        = "project_dump.md" # output markdown file
 #   .service  systemd unit files
 #   .md       Markdown
 #   .toml     TOML
-DEFAULT_EXTENSIONS = [".py", ".sh", "yaml", ".md", ".conf", ".toml", ".js", ".el"]
+DEFAULT_EXTENSIONS = [".py", ".sh", "yaml", ".md", ".conf", ".toml", ".js", ".el", ".json"]
 DEFAULT_AFFIX      = None             # e.g. "_test" (substring matched in filename)
 DEFAULT_RECURSIVE  = False            # descend into subdirectories
 DEFAULT_TREE_ONLY  = False            # only emit the directory tree, no file contents
@@ -58,6 +68,7 @@ DEFAULT_TREE_ONLY  = False            # only emit the directory tree, no file co
 # also listed in DEFAULT_TREE_EXCLUDE_DIRS below.
 DEFAULT_EXCLUDE_DIRS = [
     ".git", "__pycache__", ".venv", "venv", "node_modules",
+    "lib", "bin",
     "kritomatic_xremap", "other_scripts", "playgrounds",
     "data/comfy_panel",
     # e.g. "src/vendor" to skip only ./src/vendor
@@ -69,6 +80,7 @@ DEFAULT_EXCLUDE_DIRS = [
 # rendering — it never changes which files are dumped. An empty list means
 # every directory is shown in the tree.
 DEFAULT_TREE_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules",
+                             "lib", "bin",
                              "target", "release",
                              "data/comfy_panel", "other_scripts/room/leader_optimizer",
 ]
@@ -245,6 +257,44 @@ def build_tree(
     return tree
 
 
+def build_tree_from_files(
+    root: Path,
+    files: list[Path],
+    tree_exclude_dirs: list[str],
+) -> dict:
+    """Build a tree dict from an explicit file list.
+
+    Unlike `build_tree`, this does not walk the filesystem: only the
+    directories that lead to one of `files` appear in the tree. Files still
+    inside a directory matched by `tree_exclude_dirs` are pruned from the
+    tree (but they will still be dumped — this only affects rendering).
+    """
+    tree: dict = {}
+    for f in files:
+        try:
+            rel = f.relative_to(root)
+        except ValueError:
+            continue
+        parts = rel.parts
+        node = tree
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node.setdefault(_FILES, []).append(parts[-1])
+
+    def prune(node: dict, rel_dir: Path) -> None:
+        for key in list(node.keys()):
+            if key == _FILES:
+                continue
+            sub_rel = rel_dir / key
+            if dir_matches(sub_rel, key, tree_exclude_dirs):
+                del node[key]
+            else:
+                prune(node[key], sub_rel)
+
+    prune(tree, Path("."))
+    return tree
+
+
 def render_tree(tree: dict, label: str) -> str:
     """Return a unix-`tree`-style rendering of a tree dict."""
     if label in ("", "."):
@@ -253,6 +303,32 @@ def render_tree(tree: dict, label: str) -> str:
     lines = [label + "/"]
     lines.extend(_render_tree(tree, ""))
     return "\n".join(lines)
+
+
+def resolve_listed_files(file_args: list[str], base_dir: Path) -> list[Path]:
+    """Resolve the user-supplied file arguments to absolute, deduplicated,
+    sorted Paths. Warnings are printed for arguments that are not files.
+    """
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for arg in file_args:
+        p = Path(arg)
+        if not p.is_absolute():
+            p = base_dir / p
+        try:
+            p = p.resolve()
+        except OSError:
+            print(f"Warning: cannot resolve {arg!r}, skipped", file=sys.stderr)
+            continue
+        if not p.is_file():
+            print(f"Warning: not a regular file, skipped: {arg}", file=sys.stderr)
+            continue
+        if p in seen:
+            continue
+        seen.add(p)
+        result.append(p)
+    result.sort()
+    return result
 
 
 def output_path_with_dirname(base_out: Path, scanned_dir: Path) -> Path:
@@ -268,12 +344,42 @@ def output_path_with_dirname(base_out: Path, scanned_dir: Path) -> Path:
     return base_out.with_name(f"{base_out.stem}_{dirname}{base_out.suffix}")
 
 
+def _emit_file_contents(fh, files, display_fn, total):
+    """Write `FILE i/N:` blocks for each file into `fh`.
+
+    `display_fn(f)` returns the path string shown in the header.
+    """
+    for i, f in enumerate(files, 1):
+        fh.write(HEADER + "\n")
+        fh.write(f"FILE {i}/{total}: {display_fn(f)}\n")
+        fh.write(HEADER + "\n")
+        fh.write("```python\n")
+
+        try:
+            content = f.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            content = f"# ERROR READING FILE: {e}\n"
+
+        fh.write(content)
+        if content and not content.endswith("\n"):
+            fh.write("\n")
+        fh.write("```\n\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Dump files into a markdown file. "
                     "All paths/extensions come from variables in the script; "
                     "only the affix, recursion, and tree-only mode can be "
-                    "overridden on the CLI."
+                    "overridden on the CLI. Pass one or more FILE arguments "
+                    "to dump only those files."
+    )
+    parser.add_argument(
+        "files", nargs="*",
+        help=("Optional explicit list of files to dump. When provided, the "
+              "directory scan and all filters are bypassed; a tree rooted at "
+              "the files' common parent is always emitted. Paths are "
+              "interpreted relative to DEFAULT_DIR."),
     )
     parser.add_argument(
         "-a", "--affix", default=None,
@@ -305,47 +411,72 @@ def main() -> int:
     include_file_substrings = [s for s in DEFAULT_INCLUDE_FILE_SUBSTRINGS if s]
     exclude_file_substrings = [s for s in DEFAULT_EXCLUDE_FILE_SUBSTRINGS if s]
 
-    # Affix: CLI overrides hardcoded default; "" means "no affix"
-    affix = args.affix if args.affix is not None else DEFAULT_AFFIX
-    if affix == "":
-        affix = None
-
     # Tree-only: CLI forces True, otherwise fall back to the hardcoded default
     tree_only = True if args.tree_only else DEFAULT_TREE_ONLY
 
-    # Recursive: -r forces True, -t also forces True; otherwise the default
-    recursive = True if (args.recursive or tree_only) else DEFAULT_RECURSIVE
+    if args.files:
+        # ------------------------------------------------------------------
+        # File-list mode: user gave explicit files, bypass the scanner.
+        # ------------------------------------------------------------------
+        files = resolve_listed_files(args.files, root)
+        if not files:
+            print("No valid files provided.", file=sys.stderr)
+            return 1
 
-    files = find_files(
-        root,
-        extensions,
-        affix,
-        exclude_dirs,
-        include_dirs,
-        include_file_substrings,
-        exclude_file_substrings,
-        recursive,
-    )
-    if not files:
-        msg = f"No files found in '{root}'"
-        if extensions:
-            msg += f" with extensions {extensions}"
-        if affix:
-            msg += f" matching affix '{affix}'"
-        if include_file_substrings:
-            msg += f" matching any of {include_file_substrings}"
-        if include_dirs:
-            msg += f" under any of {sorted(include_dirs)}"
-        if not recursive:
-            msg += " (non-recursive)"
-        print(msg, file=sys.stderr)
-        return 1
+        # Tree root = common parent of all listed files.
+        try:
+            common = Path(os.path.commonpath([str(f) for f in files]))
+        except ValueError:
+            common = files[0].parent
+        if common.is_file():
+            common = common.parent
+        if not common.is_dir():
+            common = common.parent
+
+        tree_root = common
+        # A tree is always emitted in file-list mode.
+        recursive = True
+    else:
+        # ------------------------------------------------------------------
+        # Directory-scan mode: identical to the original script.
+        # ------------------------------------------------------------------
+        affix = args.affix if args.affix is not None else DEFAULT_AFFIX
+        if affix == "":
+            affix = None
+
+        recursive = True if (args.recursive or tree_only) else DEFAULT_RECURSIVE
+
+        files = find_files(
+            root,
+            extensions,
+            affix,
+            exclude_dirs,
+            include_dirs,
+            include_file_substrings,
+            exclude_file_substrings,
+            recursive,
+        )
+        if not files:
+            msg = f"No files found in '{root}'"
+            if extensions:
+                msg += f" with extensions {extensions}"
+            if affix:
+                msg += f" matching affix '{affix}'"
+            if include_file_substrings:
+                msg += f" matching any of {include_file_substrings}"
+            if include_dirs:
+                msg += f" under any of {sorted(include_dirs)}"
+            if not recursive:
+                msg += " (non-recursive)"
+            print(msg, file=sys.stderr)
+            return 1
+        tree_root = root
 
     total = len(files)
 
-    # Resolve the scanned directory to an absolute path, and derive both the
+    # Resolve the tree root to an absolute path, and derive both the
     # human-readable label and the output filename suffix from it.
-    scanned_dir = Path(os.path.abspath(str(root)))
+    scanned_dir = Path(os.path.abspath(str(tree_root)))
     out = output_path_with_dirname(out, scanned_dir)
 
     with out.open("w", encoding="utf-8") as fh:
@@ -359,31 +490,24 @@ def main() -> int:
             fh.write("DIRECTORY TREE\n")
             fh.write(HEADER + "\n")
             fh.write("```\n")
-            tree = build_tree(root, include_dirs, tree_exclude_dirs, files)
-            fh.write(render_tree(tree, str(root)) + "\n")
+            if args.files:
+                tree = build_tree_from_files(tree_root, files, tree_exclude_dirs)
+            else:
+                tree = build_tree(tree_root, include_dirs, tree_exclude_dirs, files)
+            fh.write(render_tree(tree, str(tree_root)) + "\n")
             fh.write("```\n\n")
 
         # Skip the file contents entirely in tree-only mode
         if not tree_only:
-            for i, f in enumerate(files, 1):
-                display = str(f)
-                if display.startswith("./"):
-                    display = display[2:]
-
-                fh.write(HEADER + "\n")
-                fh.write(f"FILE {i}/{total}: {display}\n")
-                fh.write(HEADER + "\n")
-                fh.write("```python\n")
-
-                try:
-                    content = f.read_text(encoding="utf-8", errors="replace")
-                except OSError as e:
-                    content = f"# ERROR READING FILE: {e}\n"
-
-                fh.write(content)
-                if content and not content.endswith("\n"):
-                    fh.write("\n")
-                fh.write("```\n\n")
+            if args.files:
+                # File-list mode: show paths relative to the tree root.
+                display_fn = lambda f: os.path.relpath(str(f), str(scanned_dir))
+            else:
+                # Scan mode: preserve original behaviour exactly.
+                def display_fn(f):
+                    s = str(f)
+                    return s[2:] if s.startswith("./") else s
+            _emit_file_contents(fh, files, display_fn, total)
 
     # Count and report the total number of lines in the output file (stdout)
     with out.open("r", encoding="utf-8") as fh:

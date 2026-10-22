@@ -1,0 +1,23 @@
+[package]
+name = "leader_optimizer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lib]
+name = "leader_optimizer"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "leader_optimizer"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

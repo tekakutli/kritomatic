@@ -31,7 +31,7 @@ export async function fetchStatus() {
   }
 }
 
-export async function runSegment() {
+export async function runSegment(opts = {}) {
   if (!board.imageHash) {
     flashStatus("Load an image first", "warn");
     return null;
@@ -39,14 +39,16 @@ export async function runSegment() {
   if (_inFlight) {
     await interruptSegmentation();
   }
+  const skipPoints = !!opts.skipPoints;
+
   _inFlight = true;
   board.running = true;
   pgkitNotifyAll();
 
   const body = {
     hash:              board.imageHash,
-    positive:          board.positive,
-    negative:          board.negative,
+    positive:          skipPoints ? [] : board.positive,
+    negative:          skipPoints ? [] : board.negative,
     text:              board.textPrompt,
     threshold:         board.threshold,
     refine_iterations: board.refineIterations,

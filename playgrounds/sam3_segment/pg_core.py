@@ -11,7 +11,7 @@ export const board = {
   imageWidth:    0,
   imageHeight:   0,
   imageDataUrl:  null,
-  imageEl:       null,   // HTMLImageElement, once loaded
+  imageEl:       null,
 
   // Prompt
   textPrompt:    "",
@@ -25,15 +25,38 @@ export const board = {
   individualMasks:  true,
 
   // Results
-  masks:         [],     // [{b64, img, w, h}]
-  selectedMaskIdx: -1,
+  masks:               [],   // [{b64, img, w, h, loaded}]
+  selectedMaskIndices: [],   // sorted int array
+  hoveredMaskIdx:      -1,
 
   // Runtime
   running:       false,
   lastTiming:    null,
 };
 
-/* ---- image ---- */
+/* ============================================================
+   Mask palette — one color per mask, cycled by index
+   ============================================================ */
+
+export const MASK_COLORS = [
+  { r: 255, g:  90, b: 105 },
+  { r: 120, g: 220, b: 255 },
+  { r: 255, g: 200, b:  90 },
+  { r: 140, g: 225, b: 160 },
+  { r: 180, g: 155, b: 255 },
+  { r: 255, g: 165, b: 105 },
+  { r: 110, g: 220, b: 210 },
+  { r: 220, g: 230, b: 120 },
+];
+
+export function maskColor(idx) {
+  return MASK_COLORS[((idx % MASK_COLORS.length)
+                      + MASK_COLORS.length) % MASK_COLORS.length];
+}
+
+/* ============================================================
+   Image
+   ============================================================ */
 
 export function setImage(hash, dataUrl, width, height) {
   board.imageHash    = hash;
@@ -60,7 +83,9 @@ export function clearImage() {
   clearMasks();
 }
 
-/* ---- points ---- */
+/* ============================================================
+   Points
+   ============================================================ */
 
 export function addPoint(x, y, isPositive) {
   if (x < 0 || y < 0 || x >= board.imageWidth || y >= board.imageHeight) return;
@@ -74,18 +99,21 @@ export function clearPoints() {
 }
 
 function _recount() {
-  board.positive = board.points.filter(p => p.isPositive)
+  board.positive = board.points.filter(p =>  p.isPositive)
                                   .map(p => ({x: p.x, y: p.y}));
   board.negative = board.points.filter(p => !p.isPositive)
                                   .map(p => ({x: p.x, y: p.y}));
 }
 
-/* ---- masks ---- */
+/* ============================================================
+   Masks
+   ============================================================ */
 
 export function setMasks(b64List) {
   board.masks = b64List.map(b64 => {
     const img = new Image();
-    const entry = { b64, img, w: 0, h: 0, loaded: false };
+    const entry = { b64, img, w: 0, h: 0, loaded: false,
+                    _pixels: null, _tinted: null, _tintedKey: null };
     img.onload = () => {
       entry.w = img.width; entry.h = img.height; entry.loaded = true;
       _scheduleDraw();
@@ -93,26 +121,109 @@ export function setMasks(b64List) {
     img.src = "data:image/png;base64," + b64;
     return entry;
   });
-  board.selectedMaskIdx = board.masks.length > 0 ? 0 : -1;
+  board.selectedMaskIndices = board.masks.length > 0 ? [0] : [];
+  board.hoveredMaskIdx = -1;
+  _scheduleDraw();
 }
 
 export function clearMasks() {
   board.masks = [];
-  board.selectedMaskIdx = -1;
-}
-
-export function setSelectedMask(idx) {
-  if (idx < -1 || idx >= board.masks.length) return;
-  board.selectedMaskIdx = idx;
+  board.selectedMaskIndices = [];
+  board.hoveredMaskIdx = -1;
   _scheduleDraw();
 }
 
-export function getSelectedMask() {
-  if (board.selectedMaskIdx < 0) return null;
-  return board.masks[board.selectedMaskIdx] || null;
+export function isMaskSelected(idx) {
+  return board.selectedMaskIndices.indexOf(idx) >= 0;
 }
 
-/* ---- image-fit rect ---- */
+export function toggleMaskSelection(idx) {
+  if (idx < 0 || idx >= board.masks.length) return;
+  const pos = board.selectedMaskIndices.indexOf(idx);
+  if (pos >= 0) board.selectedMaskIndices.splice(pos, 1);
+  else          board.selectedMaskIndices.push(idx);
+  board.selectedMaskIndices.sort((a, b) => a - b);
+  _scheduleDraw();
+}
+
+export function addMaskToSelection(idx) {
+  if (idx < 0 || idx >= board.masks.length) return;
+  if (board.selectedMaskIndices.indexOf(idx) >= 0) return;
+  board.selectedMaskIndices.push(idx);
+  board.selectedMaskIndices.sort((a, b) => a - b);
+  _scheduleDraw();
+}
+
+export function replaceMaskSelection(idx) {
+  if (idx < 0 || idx >= board.masks.length) {
+    clearMaskSelection();
+    return;
+  }
+  board.selectedMaskIndices = [idx];
+  _scheduleDraw();
+}
+
+export function clearMaskSelection() {
+  board.selectedMaskIndices = [];
+  _scheduleDraw();
+}
+
+export function selectAllMasks() {
+  board.selectedMaskIndices = board.masks.map((_, i) => i);
+  _scheduleDraw();
+}
+
+export function getSelectedMasks() {
+  return board.selectedMaskIndices
+    .map(i => board.masks[i])
+    .filter(m => m && m.loaded);
+}
+
+/* ---- pixel access (cached) ---- */
+
+function _maskPixelData(mask) {
+  if (mask._pixels) return mask._pixels;
+  if (!mask.img || !mask.img.width) return null;
+  const off = document.createElement("canvas");
+  off.width  = mask.img.width;
+  off.height = mask.img.height;
+  const octx = off.getContext("2d");
+  octx.drawImage(mask.img, 0, 0);
+  try {
+    mask._pixels = octx.getImageData(0, 0, off.width, off.height).data;
+    return mask._pixels;
+  } catch (e) {
+    return null;
+  }
+}
+
+export function maskPixelData(mask) {
+  return _maskPixelData(mask);
+}
+
+export function hitTestMaskAtPoint(ix, iy) {
+  const x = Math.floor(ix), y = Math.floor(iy);
+  if (x < 0 || y < 0) return -1;
+  // Iterate reversed: the last mask in the list wins if multiple
+  // overlap. In practice SAM3 returns masks in detection order, so
+  // this gives "most recent detection" priority, which is usually
+  // what the user wants on Alt+click. Shift+Alt adds instead of
+  // replacing, so multiple overlapping masks are reachable.
+  for (let i = board.masks.length - 1; i >= 0; i--) {
+    const m = board.masks[i];
+    if (!m || !m.loaded) continue;
+    if (x >= m.img.width || y >= m.img.height) continue;
+    const px = _maskPixelData(m);
+    if (!px) continue;
+    const off = (y * m.img.width + x) * 4;
+    if (px[off] >= 128) return i;
+  }
+  return -1;
+}
+
+/* ============================================================
+   Image-fit rect
+   ============================================================ */
 
 export function fittedImageRect() {
   const cw = window.innerWidth, ch = window.innerHeight;
@@ -140,7 +251,9 @@ export function screenToImage(sx, sy) {
   return [(sx - r.x0) / r.s, (sy - r.y0) / r.s];
 }
 
-/* ---- draw scheduling ---- */
+/* ============================================================
+   Draw scheduling
+   ============================================================ */
 
 let _drawScheduled = false;
 let _drawFn = null;
@@ -157,7 +270,9 @@ export function _scheduleDraw() {
   }
 }
 
-/* ---- resize ---- */
+/* ============================================================
+   Resize
+   ============================================================ */
 
 export function resize() {
   dpr = window.devicePixelRatio || 1;

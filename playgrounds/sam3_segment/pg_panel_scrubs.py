@@ -1,11 +1,14 @@
 PANEL_SCRUBS_JS = r"""
-import { board, setMasks } from "./pg_core.js";
+import {
+  board, clearMaskSelection, replaceMaskSelection,
+} from "./pg_core.js";
 import { _installScrubInput } from "./pgkit/panel_core.js";
-import { pgkitRegisterField, pgkitNotifyAll, pgkitNotifyLocal }
+import { pgkitRegisterField, pgkitNotifyLocal }
   from "./pgkit/remote_client.js";
-import { flashStatus } from "./pgkit/panel_core.js";
 
-/* ---- scrubbable inputs ---- */
+/* ============================================================
+   Scrubbable inputs
+   ============================================================ */
 
 const thresholdEl = document.getElementById("thresholdVal");
 if (thresholdEl) _installScrubInput(thresholdEl, {
@@ -45,11 +48,13 @@ if (promptEl) {
   });
 }
 
-/* ---- field registrations (for the remote panel) ---- */
+/* ============================================================
+   Field registrations (remote panel)
+   ============================================================ */
 
 pgkitRegisterField("image.hash", {
   get: () => board.imageHash || "",
-  set: () => {},   // set externally via upload
+  set: () => {},
   meta: { kind: "text", label: "Image hash" },
 });
 
@@ -131,14 +136,29 @@ pgkitRegisterField("masks.count", {
 });
 
 pgkitRegisterField("masks.selectedIndex", {
-  get: () => board.selectedMaskIdx,
+  get: () => board.selectedMaskIndices.length > 0
+    ? board.selectedMaskIndices[0] : -1,
   set: (v) => {
     const n = parseInt(v, 10);
     if (!isFinite(n)) return;
-    if (n < 0 || n >= board.masks.length) return;
-    board.selectedMaskIdx = n;
+    if (n < 0 || n >= board.masks.length) clearMaskSelection();
+    else                                   replaceMaskSelection(n);
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   },
-  meta: { kind: "number", label: "Selected mask index" },
+  meta: { kind: "number", label: "First selected mask" },
+});
+
+pgkitRegisterField("masks.selectedIndices", {
+  get: () => board.selectedMaskIndices.slice(),
+  set: (v) => {
+    if (!Array.isArray(v)) return;
+    const clean = v
+      .map(x => parseInt(x, 10))
+      .filter(x => isFinite(x) && x >= 0 && x < board.masks.length);
+    board.selectedMaskIndices =
+      Array.from(new Set(clean)).sort((a, b) => a - b);
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  },
+  meta: { kind: "text", label: "Selected mask indices (array)" },
 });
 """

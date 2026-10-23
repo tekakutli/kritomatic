@@ -1,13 +1,14 @@
 PANEL_BINDINGS_JS = r"""
 import {
-  board, setImage, clearImage, clearPoints, setMasks, setSelectedMask,
+  board, setImage, clearImage, clearPoints, setMasks,
+  clearMaskSelection, replaceMaskSelection,
 } from "./pg_core.js";
 import { syncMaskList } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
 import { uploadImageFile, runSegment, interruptSegmentation, fetchStatus }
   from "./pg_comfy_client.js";
 import {
-  pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyAll, pgkitNotifyLocal,
+  pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyAll,
 } from "./pgkit/remote_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
 
@@ -62,6 +63,23 @@ async function _runAction() {
   if (board.running) return;
   flashStatus("running\u2026", "");
   const payload = await runSegment();
+  if (!payload) return;
+  setMasks(payload.masks);
+  flashStatus(
+    "done: " + payload.masks.length + " mask(s) in "
+    + payload.timing.toFixed(2) + "s", "ok",
+  );
+  syncMaskList();
+  syncPanelFields();
+  pgkitNotifyAll();
+  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+}
+
+async function _segmentAllAction() {
+  if (!board.imageHash) { flashStatus("Load an image first", "warn"); return; }
+  if (board.running) return;
+  flashStatus("running (all)\u2026", "");
+  const payload = await runSegment({ skipPoints: true });
   if (!payload) return;
   setMasks(payload.masks);
   flashStatus(
@@ -129,25 +147,96 @@ async function _checkStatusAction() {
 }
 
 /* ============================================================
+   Export
+   ============================================================ */
+
+function _downloadDataUrl(dataUrl, filename) {
+  const a = document.createElement("a");
+  a.href = dataUrl;
+  a.download = filename;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+function _sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+async function _exportAction() {
+  const indices = board.selectedMaskIndices.slice();
+  if (indices.length === 0) {
+    flashStatus("no masks selected", "warn"); return;
+  }
+  let count = 0;
+  for (const i of indices) {
+    const m = board.masks[i];
+    if (!m || !m.b64) continue;
+    _downloadDataUrl(
+      "data:image/png;base64," + m.b64,
+      "mask_" + String(i + 1).padStart(2, "0") + ".png",
+    );
+    count += 1;
+    // Browsers throttle rapid sequential downloads; 120ms spacing
+    // lets the "multiple downloads" prompt handle them cleanly.
+    await _sleep(120);
+  }
+  flashStatus("exported " + count + " mask(s)", "ok");
+}
+
+async function _exportCombinedAction() {
+  const indices = board.selectedMaskIndices.slice();
+  if (indices.length === 0) {
+    flashStatus("no masks selected", "warn"); return;
+  }
+  const first = board.masks[indices[0]];
+  if (!first || !first.img) {
+    flashStatus("masks not loaded yet", "warn"); return;
+  }
+  const W = first.img.width, H = first.img.height;
+
+  const off = document.createElement("canvas");
+  off.width = W; off.height = H;
+  const octx = off.getContext("2d");
+  octx.fillStyle = "black";
+  octx.fillRect(0, 0, W, H);
+  // Additive blending produces the union: black+black=black,
+  // white+anything=white (clamped).
+  octx.globalCompositeOperation = "lighter";
+  for (const i of indices) {
+    const m = board.masks[i];
+    if (!m || !m.img) continue;
+    octx.drawImage(m.img, 0, 0, W, H);
+  }
+  const dataUrl = off.toDataURL("image/png");
+  _downloadDataUrl(dataUrl, "masks_combined.png");
+  flashStatus("exported combined mask (" + indices.length + ")", "ok");
+}
+
+/* ============================================================
    Install buttons
    ============================================================ */
 
 export function installPanelBindings() {
   const runBtn      = document.getElementById("runBtn");
+  const segAllBtn   = document.getElementById("segmentAllBtn");
   const cancelBtn   = document.getElementById("cancelBtn");
   const clearPts    = document.getElementById("clearPointsBtn");
   const pickBtn     = document.getElementById("pickImageBtn");
   const clearImgBtn = document.getElementById("clearImageBtn");
+  const exportBtn   = document.getElementById("exportBtn");
+  const exportCombBtn = document.getElementById("exportCombinedBtn");
 
-  if (runBtn)      runBtn.addEventListener("click", _runAction);
-  if (cancelBtn)   cancelBtn.addEventListener("click", _cancelAction);
-  if (clearPts)    clearPts.addEventListener("click", _clearPointsAction);
-  if (pickBtn)     pickBtn.addEventListener("click", _pickImageAction);
-  if (clearImgBtn) clearImgBtn.addEventListener("click", _clearImageAction);
+  if (runBtn)         runBtn.addEventListener("click", _runAction);
+  if (segAllBtn)      segAllBtn.addEventListener("click", _segmentAllAction);
+  if (cancelBtn)      cancelBtn.addEventListener("click", _cancelAction);
+  if (clearPts)       clearPts.addEventListener("click", _clearPointsAction);
+  if (pickBtn)        pickBtn.addEventListener("click", _pickImageAction);
+  if (clearImgBtn)    clearImgBtn.addEventListener("click", _clearImageAction);
+  if (exportBtn)      exportBtn.addEventListener("click", _exportAction);
+  if (exportCombBtn)  exportCombBtn.addEventListener("click", _exportCombinedAction);
 
-  // Status line is also the "re-check ComfyUI" button. flashStatus
-  // overwrites its text, but the listener lives on the element, so a
-  // click anywhere on the visible text re-runs the check.
   const statusEl = document.getElementById("statusLine");
   if (statusEl) {
     statusEl.style.cursor = "pointer";
@@ -155,10 +244,9 @@ export function installPanelBindings() {
     statusEl.addEventListener("click", _checkStatusAction);
   }
 
-  // drop overlay handlers
   _installDropOverlay();
   let _dragDepth = 0;
-  window.addEventListener("dragenter", (e) => {
+  window.addEventListener("dragenter", () => {
     _dragDepth += 1;
     if (_dragDepth > 0) _showDropOverlay(true);
   });
@@ -180,11 +268,15 @@ export function installPanelBindings() {
 }
 
 /* ============================================================
-   Register actions
+   Actions
    ============================================================ */
 
 pgkitRegisterAction("action.run", {
   label: "Run", scope: "global", run: _runAction,
+  meta: { variant: "primary" },
+});
+pgkitRegisterAction("action.segmentAll", {
+  label: "Segment All", scope: "global", run: _segmentAllAction,
   meta: { variant: "primary" },
 });
 pgkitRegisterAction("action.cancel", {
@@ -207,9 +299,17 @@ pgkitRegisterAction("action.checkStatus", {
   label: "Check connection", scope: "global", run: _checkStatusAction,
   meta: { variant: "plain" },
 });
+pgkitRegisterAction("action.exportSelected", {
+  label: "Export selected", scope: "global", run: _exportAction,
+  meta: { variant: "plain" },
+});
+pgkitRegisterAction("action.exportCombined", {
+  label: "Export combined", scope: "global", run: _exportCombinedAction,
+  meta: { variant: "plain" },
+});
 
 /* ============================================================
-   Register masks level
+   Masks level + row actions
    ============================================================ */
 
 pgkitRegisterLevel("masks", {
@@ -217,10 +317,11 @@ pgkitRegisterLevel("masks", {
   items: () => board.masks.map((m, i) => ({
     name:  "mask." + i,
     label: "Mask " + (i + 1),
-    extra: { size: m.w + "\u00d7" + m.h },
+    extra: { size: m.w + "\u00d7" + m.h,
+             selected: board.selectedMaskIndices.indexOf(i) >= 0 },
   })),
-  selected: () => board.selectedMaskIdx >= 0
-    ? "mask." + board.selectedMaskIdx : null,
+  selected: () => board.selectedMaskIndices.length > 0
+    ? "mask." + board.selectedMaskIndices[0] : null,
   parent: () => null,
 });
 
@@ -234,7 +335,7 @@ pgkitRegisterAction("action.selectMask", {
     if (!n.startsWith(prefix)) return;
     const idx = parseInt(n.slice(prefix.length), 10);
     if (!(idx >= 0 && idx < board.masks.length)) return;
-    setSelectedMask(idx);
+    replaceMaskSelection(idx);
     syncMaskList();
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   },
@@ -252,10 +353,14 @@ pgkitRegisterAction("action.deleteMask", {
     const idx = parseInt(n.slice(prefix.length), 10);
     if (!(idx >= 0 && idx < board.masks.length)) return;
     board.masks.splice(idx, 1);
-    if (board.selectedMaskIdx === idx)
-      board.selectedMaskIdx = board.masks.length > 0 ? 0 : -1;
-    else if (board.selectedMaskIdx > idx)
-      board.selectedMaskIdx -= 1;
+    const next = [];
+    for (const i of board.selectedMaskIndices) {
+      if (i < idx) next.push(i);
+      else if (i > idx) next.push(i - 1);
+    }
+    board.selectedMaskIndices = next;
+    if (board.hoveredMaskIdx === idx) board.hoveredMaskIdx = -1;
+    else if (board.hoveredMaskIdx > idx) board.hoveredMaskIdx -= 1;
     syncMaskList();
     pgkitNotifyAll();
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
@@ -274,7 +379,7 @@ export function pgkitHandleSelect(level, name) {
     if (!name.startsWith(prefix)) return false;
     const idx = parseInt(name.slice(prefix.length), 10);
     if (!(idx >= 0 && idx < board.masks.length)) return false;
-    setSelectedMask(idx);
+    replaceMaskSelection(idx);
     syncMaskList();
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
     return true;

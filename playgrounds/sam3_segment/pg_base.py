@@ -5,7 +5,7 @@ PG_CSS = r"""
     border-color: rgba(0, 229, 255, 0.72);
     color: #b8ecff;
   }
-  #ui button#runBtn:hover {
+  #ui button#runBtn:hover:not(:disabled) {
     border-color: rgba(140, 225, 255, 1.00);
     background: rgba(0, 229, 255, 0.10);
     color: #d8f4ff;
@@ -14,11 +14,24 @@ PG_CSS = r"""
     border-color: rgba(255, 200, 90, 0.72);
     color: #ffd89b;
   }
+  #ui button#segmentAllBtn {
+    border-color: rgba(120, 220, 255, 0.72);
+    color: #b8ecff;
+  }
+  #ui button#segmentAllBtn:hover:not(:disabled) {
+    border-color: rgba(140, 225, 255, 1.00);
+    background: rgba(120, 220, 255, 0.10);
+    color: #d8f4ff;
+  }
+  #ui button#segmentAllBtn.busy {
+    border-color: rgba(255, 200, 90, 0.72);
+    color: #ffd89b;
+  }
   #ui button#cancelBtn {
     border-color: rgba(255, 105, 125, 0.55);
     color: #ffb0bc;
   }
-  #ui button#cancelBtn:hover {
+  #ui button#cancelBtn:hover:not(:disabled) {
     border-color: rgba(255, 130, 150, 1.00);
     background: rgba(220, 90, 110, 0.10);
     color: #ffd0d8;
@@ -26,6 +39,17 @@ PG_CSS = r"""
   #ui button#pickImageBtn {
     border-color: rgba(120, 220, 255, 0.72);
     color: #b8ecff;
+  }
+  #ui button#exportBtn,
+  #ui button#exportCombinedBtn {
+    border-color: rgba(140, 225, 160, 0.72);
+    color: #b8ecff;
+  }
+  #ui button#exportBtn:hover:not(:disabled),
+  #ui button#exportCombinedBtn:hover:not(:disabled) {
+    border-color: rgba(160, 240, 180, 1.00);
+    background: rgba(140, 225, 160, 0.10);
+    color: #d8ffe0;
   }
 
   .maskList {
@@ -54,11 +78,6 @@ PG_CSS = r"""
   .maskRow:hover {
     border-color:#34445a; color:#dce6f2;
     background:rgba(220,230,242,0.03);
-  }
-  .maskRow.selected {
-    border-color:rgba(0, 229, 255, 0.72);
-    color:#b8ecff;
-    background:rgba(0, 229, 255, 0.06);
   }
   .maskSwatch {
     width:18px; height:18px;
@@ -125,7 +144,7 @@ PG_PANEL_BODY = r"""
       <summary>Image</summary>
       <div class="section-body">
         <div class="row">
-          <button id="pickImageBtn" title="Pick an image file from the server machine">+ Pick image…</button>
+          <button id="pickImageBtn" title="Pick an image file">+ Pick image…</button>
           <button id="clearImageBtn" title="Clear the current image">Clear</button>
         </div>
         <div id="imageInfo">No image loaded — drop one on the canvas</div>
@@ -171,8 +190,7 @@ PG_PANEL_BODY = r"""
         <div class="field">
           <label>Individual</label>
           <input type="checkbox" id="individualMasks" checked
-                 title="When on, SAM3 returns one mask per detected object.
-                        When off, a single mask is returned.">
+                 title="One mask per detected object vs. one merged mask.">
         </div>
       </div>
     </details>
@@ -182,6 +200,12 @@ PG_PANEL_BODY = r"""
       <div class="section-body">
         <div class="row">
           <button id="runBtn">Run</button>
+          <button id="segmentAllBtn"
+                  title="Ignore points; segment every object matching the prompt (empty prompt = main object)">
+            Segment All
+          </button>
+        </div>
+        <div class="row">
           <button id="cancelBtn">Cancel</button>
         </div>
         <div id="statusLine">idle</div>
@@ -192,10 +216,20 @@ PG_PANEL_BODY = r"""
       <summary>Masks</summary>
       <div class="section-body">
         <div class="field" style="margin-bottom:2px;">
-          <label>Results</label>
-          <span id="maskCount" style="font-size:10px;color:#5a6774;">0</span>
+          <label>Selected</label>
+          <span id="maskCount" style="font-size:10px;color:#5a6774;">0 / 0</span>
         </div>
         <div id="maskList" class="maskList"></div>
+        <div class="row" style="margin-top:6px;">
+          <button id="exportBtn"
+                  title="Download each selected mask as a separate PNG">
+            Export selected
+          </button>
+          <button id="exportCombinedBtn"
+                  title="Download a single PNG containing the union of selected masks">
+            Export combined
+          </button>
+        </div>
       </div>
     </details>
 """

@@ -60,7 +60,6 @@ by name — it is a Python-side tool, not a JS source, and any
 """
 
 import argparse
-import os
 import re
 import sys
 from pathlib import Path

@@ -15,6 +15,51 @@ opening the WebSocket.  All cross-module injectors are set by the
 boot module *after* this one is imported — but before any command
 arrives over the socket, since the WebSocket handshake takes at
 least one round trip.
+
+Async command handlers
+======================
+`pgkitRemoteHandleCommand` is `async`, and it `await`s each of the
+three injected handler calls (action `run`, `select`, `deselect`,
+plus the extra-command fallback).  A project whose `run` function is
+an `async function` will have its `command_result` fire only after
+the async work settles; a project whose `run` function is
+synchronous is unaffected (`await` on a non-Promise resolves in one
+microtask tick, which is unobservable on the wire).
+
+This is what makes `remote_cli`'s `command(kind, payload)` — and
+`bundle(actions=[...])` — block until the action is *done*, not
+merely *dispatched*.  Without the `await`, an action whose `run` is
+async would return its `command_result` in the tens of milliseconds
+before its HTTP round-trip even started, and a script like
+
+    action action.segmentAll
+    select masks mask.0
+
+would race: `select` would fire while `segmentAll` was still
+running, and the `command_result` for `select` would report the
+mask missing.
+
+Sync actions never opt in and never see a change.  Async actions
+opt in just by being `async function` — the `await` in this file
+makes their settle-time the reply-time automatically.
+
+Sync-wrapper actions opt in by `return`ing their async work's
+Promise.  A sync wrapper that dispatches an async function without
+returning the Promise breaks the guarantee for that action; the
+correct fix is on the playground side (change the wrapper to
+`async function`, or to `return someAsyncCall()`).
+
+Overlapping commands do not queue.  Two `command` messages that
+arrive back to back start their async work concurrently, and each
+reply goes out when *its* work settles.  The CLI's `command()`
+method serializes its own sends (it blocks on each `command_result`
+before sending the next), so this overlap does not arise from the
+CLI.  A browser-side caller that fires two commands without
+waiting — a rapid double-click, a script author writing against
+`remote_panel` — may see the replies out of order; both replies
+carry their originating `id`, so the recipient matches them
+correctly.  Introducing a queue would break `cancel`, which is
+exactly the action a user fires *while* another action is running.
 """
 
 REMOTE_CLIENT_JS = r"""
@@ -386,7 +431,16 @@ function pgkitRemoteHandle(msg) {
       break;
 
     case "command":
-      pgkitRemoteHandleCommand(msg);
+      /* Async because pgkitRemoteHandleCommand is async.  The
+       * promise resolves when the command's reply has been sent;
+       * we do not wait on it here, and we do not need to.  The
+       * .catch is defensive: the function already wraps its whole
+       * body in try/catch, but _pgkitRemoteSend lives outside that
+       * try, so a WebSocket close between settle and send would
+       * otherwise surface as an unhandled rejection. */
+      pgkitRemoteHandleCommand(msg).catch((e) => {
+        console.error("command handler threw:", e);
+      });
       break;
 
     case "presence":
@@ -420,9 +474,22 @@ function pgkitRemoteApplyPatch(values) {
 
 /* ==========================================================================
    COMMANDS
-   ========================================================================== */
+   ==========================================================================
+   Async: `await` on each injected handler means a `command_result`
+   fires when the handler's work has *settled*, not when it was
+   dispatched.  A synchronous handler resolves in one microtask tick
+   (unobservable on the wire); an async handler resolves when its
+   promise does.  This is what makes `remote_cli`'s `command()`
+   block until an action is done, without any per-playground
+   `status.running` field.
 
-function pgkitRemoteHandleCommand(msg) {
+   The `reset_view` global lookup that used to live here was removed:
+   `resetView` is not a global in any ES-module playground, so the
+   guard was never true.  A playground that wants a reset action
+   registers one via `pgkitRegisterAction`, and it is dispatched
+   through the registry like any other action. */
+
+async function pgkitRemoteHandleCommand(msg) {
   let ok = true;
   let error = null;
   let result;
@@ -432,12 +499,12 @@ function pgkitRemoteHandleCommand(msg) {
     const entry = _pgkitRemote.registry[kind];
 
     if (entry && entry.isAction) {
-      try { result = entry.run(msg.payload || {}); }
+      try { result = await entry.run(msg.payload || {}); }
       catch (e) { ok = false; error = String(e); }
     } else if (kind === "select") {
       const payload = msg.payload || {};
       if (_selectFn) {
-        const selOk = _selectFn(payload.level, payload.name);
+        const selOk = await _selectFn(payload.level, payload.name);
         if (!selOk) { ok = false; error = "select failed"; }
         else { pgkitNotifyAll(); }
       } else {
@@ -445,13 +512,11 @@ function pgkitRemoteHandleCommand(msg) {
         error = "no select handler";
       }
     } else if (kind === "deselect") {
-      if (_deselectFn) _deselectFn();
+      if (_deselectFn) await _deselectFn();
       if (_drawFn) _drawFn();
       pgkitNotifyAll();
-    } else if (kind === "reset_view" && typeof resetView === "function") {
-      resetView();
     } else if (_extraCommandFn) {
-      const handled = _extraCommandFn(kind, msg.payload || {});
+      const handled = await _extraCommandFn(kind, msg.payload || {});
       if (!handled) { ok = false; error = "unknown command"; }
     } else {
       ok = false;

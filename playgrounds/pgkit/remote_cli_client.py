@@ -35,23 +35,42 @@ Sends
 Waits
     .wait_value(name, predicate, timeout=10.0)
     .wait_change(fields=None, timeout=10.0)
-    .wait_until_settled(name, timeout=60.0)
+    .wait_until_settled(name, timeout=60.0)     legacy; see below
 
 Convenience
     .bundle(set=None, actions=None, select=None,
-            wait_for_running=True, timeout=60.0, on_progress=None)
+            wait_for_running=False, timeout=60.0, on_progress=None)
 
 Events
     .on(msg_type, callback)
     .off(msg_type, callback)
 
-Design notes
-============
-Reader thread + condition variable. The reader thread updates the
-caches under `self._cv` and notifies; every wait method parks on the
-condition variable and re-checks its predicate on each notification.
-Sends are gated by a separate `_send_lock` so a slow send never blocks
-a state update.
+Async actions
+=============
+`command()` blocks until the action's observable work settles, because
+`pgkit/remote_client.js`'s `pgkitRemoteHandleCommand` `await`s the
+action's `run` function. A playground whose `run` is `async function`,
+or whose `run` is a sync function that `return`s its async work's
+Promise, gets this for free: `command()` returns only after the work
+is done, and a subsequent `state_request` sees the side effects. The
+same guarantee holds for `select` (via `pgkitHandleSelect`) and
+`deselect` (via the injected deselect handler).
+
+Playgrounds whose action `run` is a sync function that calls async
+work *without returning the Promise* do not get this guarantee — the
+`command_result` fires at the moment `run` returns, before the async
+work has started.  The correct fix is on the playground side: make
+`run` return the Promise, or wrap the body in `async function`.  The
+`wait_until_settled` / `bundle(wait_for_running=True)` mechanism is a
+legacy best-effort safety net for such playgrounds; it is not relied
+on by well-formed callers and its default is now off.
+
+Reader thread + condition variable
+==================================
+The reader thread updates the caches under `self._cv` and notifies;
+every wait method parks on the condition variable and re-checks its
+predicate on each notification. Sends are gated by a separate
+`_send_lock` so a slow send never blocks a state update.
 
 Echo suppression: the hub forwards a `patch` to every client except
 its sender, so this client never receives its own patches. That is
@@ -65,12 +84,11 @@ a fresh `state_request` on the 0→1 browser transition, so a CLI that
 connected to a browser-less hub learns the schema the moment a
 browser appears.
 
-Async actions: playground actions return before any HTTP round-trip
-finishes. `bundle(wait_for_running=True)` inserts a
-`wait_until_settled("status.running")` between sequential actions.
-`wait_until_settled` first does a `state_request` to see whether the
-action is actually running (sync actions never set the flag), then
-waits for the flag to go False if it is.
+Disconnect handling: when the WebSocket closes or `close()` is called,
+every pending `command()` is failed immediately with
+`RemoteNotConnected`. A `command()` that was waiting on a
+`command_result` does not block out its full timeout; it raises the
+underlying disconnect immediately.
 """
 
 from __future__ import annotations
@@ -262,8 +280,21 @@ class RemoteCliClient:
                     raise RemoteTimeout("no hello_ack from playground")
                 self._cv.wait(timeout=min(remaining, 0.5))
 
-            # Give the hub a moment to deliver presence.
-            presence_deadline = min(deadline, time.monotonic() + 3.0)
+            # Wait for the first presence event so we learn whether a
+            # browser is connected.  When `require_browser` is set,
+            # wait the full connection timeout — the caller explicitly
+            # asked for a browser, so a slow one (ngrok handshake, a
+            # tab reload in progress) should not be mistaken for none.
+            # Otherwise use a short cap so a browser-less session
+            # returns promptly and the caller can start a command that
+            # will wait for the browser to appear.
+            if require_browser:
+                presence_deadline = deadline
+            else:
+                presence_deadline = min(
+                    deadline, time.monotonic() + 3.0
+                )
+
             while (self._presence["browser"] == 0
                    and self._presence["remote"] <= 1):
                 remaining = presence_deadline - time.monotonic()
@@ -275,8 +306,9 @@ class RemoteCliClient:
 
             if require_browser and not have_browser:
                 raise RemoteCliError(
-                    f"no browser connected at {self._url}. "
-                    f"Open the playground in a browser tab first."
+                    f"no browser connected at {self._url} after "
+                    f"{timeout:.0f}s. Open the playground in a browser "
+                    f"tab first, or increase --timeout."
                 )
 
             if have_browser:
@@ -307,6 +339,13 @@ class RemoteCliClient:
         with self._cv:
             self._connected = False
             self._cv.notify_all()
+        # Defensive: if the reader thread already failed the pending
+        # commands when it noticed the socket close, this is a no-op
+        # (each pending event is already set).  If close() raced the
+        # reader and the reader hasn't yet reached its own finally,
+        # this fails them now so the caller does not wait out a
+        # command timeout.
+        self._fail_pending(RemoteNotConnected("client closed"))
 
     def __enter__(self):
         self.connect()
@@ -344,6 +383,9 @@ class RemoteCliClient:
             with self._cv:
                 self._connected = False
                 self._cv.notify_all()
+            self._fail_pending(RemoteNotConnected(
+                "connection closed before command result"
+            ))
 
     def _handle(self, msg: dict) -> None:
         t = msg.get("type")
@@ -401,6 +443,21 @@ class RemoteCliClient:
                 cb(msg)
             except Exception:
                 pass
+
+    def _fail_pending(self, exc: Exception) -> None:
+        """Set `error` on every pending command and wake its waiter.
+
+        Called from the reader loop's shutdown path and from close().
+        The `is_set` guard makes it idempotent: the first call wins,
+        subsequent calls are no-ops.
+        """
+        with self._lock:
+            snapshot = list(self._pending.values())
+        for pending in snapshot:
+            if pending["event"].is_set():
+                continue
+            pending["error"] = exc
+            pending["event"].set()
 
     # ------------------------------------------------------------------
     #  Send
@@ -493,6 +550,17 @@ class RemoteCliClient:
 
     def patch_and_verify(self, values: dict,
                          timeout: float = 5.0) -> dict:
+        """Send a patch, wait for the resulting state, return applied.
+
+        Returns a dict mapping each requested field to the value the
+        browser reports after the patch.  A field whose applied value
+        differs from the requested value was clamped, rejected, or
+        not applied at all; the caller compares.  If the state does
+        not arrive within `timeout`, the returned dict reflects the
+        last-known cache (which may be pre-patch); the caller can
+        distinguish "applied a different value" from "could not
+        verify" only by repeating the read.
+        """
         self.patch(values)
         try:
             self.request_state_and_wait(timeout=timeout)
@@ -507,8 +575,26 @@ class RemoteCliClient:
 
     def command(self, kind: str, payload: Optional[dict] = None,
                 timeout: float = 30.0) -> dict:
+        """Send one command and block until it settles.
+
+        Returns the `command_result` message on `ok: true`.  Raises
+        `RemoteCommandFailed` on `ok: false`.  Raises
+        `RemoteNotConnected` if the connection closes while the
+        command is in flight — the disconnect is surfaced immediately
+        rather than after `timeout`.  Raises `RemoteTimeout` if the
+        command does not settle within `timeout`.
+
+        See "Async actions" in the module docstring for what "settles"
+        means: on a correctly-fixed playground, `command()` returns
+        after the action's observable work is done, not merely after
+        the action was dispatched.
+        """
         cmd_id = "cli-" + uuid.uuid4().hex[:12]
-        pending = {"event": threading.Event(), "result": None}
+        pending = {
+            "event":  threading.Event(),
+            "result": None,
+            "error":  None,
+        }
         with self._lock:
             self._pending[cmd_id] = pending
         try:
@@ -526,6 +612,8 @@ class RemoteCliClient:
             with self._lock:
                 self._pending.pop(cmd_id, None)
 
+        if pending["error"] is not None:
+            raise pending["error"]
         result = pending["result"]
         if result is None:
             raise RemoteCommandFailed(kind, "no result", None)
@@ -602,18 +690,27 @@ class RemoteCliClient:
 
     def wait_until_settled(self, name: str,
                            timeout: float = 60.0) -> None:
-        """Wait for a bool field to finish running.
+        """Legacy safety net: wait for a bool field to finish running.
 
-        If the field is already False when the wait starts (sync
-        action, or an async action that finished before the wait
-        began), returns immediately. Otherwise waits for the field to
-        become False.
+        On a correctly-fixed playground, `command()` already blocks
+        until the action's work settles (see "Async actions" in the
+        module docstring).  By the time `command()` returns,
+        `status.running` is already False, and this method returns
+        immediately after one `state_request` round trip.  It is a
+        no-op.
 
-        The first check goes through a fresh `state_request` so the
-        decision is made on current state, not on a possibly stale
-        cache. That first check costs one round trip (~10ms on
-        localhost) and prevents the "wait starts before the browser
-        has flipped the flag" race entirely.
+        On a playground whose action `run` dispatches async work
+        *without* returning the Promise, `command()` returns
+        immediately and the action's work may still be in flight.
+        This method does one `state_request` and checks the flag: if
+        it reads True, it waits for the flag to go False; if it
+        reads False, it returns.
+
+        This is best-effort and racy.  A wrapper that has not yet
+        flipped the flag when the `state_request` reaches the browser
+        is missed.  The correct fix is on the playground side (make
+        `run` return its Promise, or wrap its body in `async
+        function`), not here.
         """
         try:
             self.request_state_and_wait(timeout=min(2.0, timeout))
@@ -648,26 +745,65 @@ class RemoteCliClient:
     def bundle(self, *, set: Optional[dict] = None,
                actions: Optional[list] = None,
                select: Optional[tuple] = None,
-               wait_for_running: bool = True,
+               wait_for_running: bool = False,
                timeout: float = 60.0,
                on_progress: Optional[Callable[[str, dict], None]] = None,
                ) -> dict:
         """Apply a coordinated set of writes and actions.
 
-        `set`       : one patch with N field updates (1 round trip)
-        `actions`   : sequential commands, one round trip + one wait each
-        `select`    : one final `select` command
-        Then a single refresh and return of the fresh values/entities.
+        `set`       : one patch with N field updates, then one
+                      `state_request` to verify.  A field whose
+                      applied value differs from the requested value
+                      (setter clamped it, rejected it, or the patch
+                      never landed) appears in the returned
+                      `mismatched` dict.
+
+        `actions`   : sequential commands, one round trip each.
+                      `command()` blocks until the action's work
+                      settles on a correctly-fixed playground, so
+                      sequential actions can rely on the previous
+                      having taken effect.  See "Async actions" in
+                      the module docstring.
+
+        `select`    : one final `select` command.
+
+        Then a single refresh and return of the fresh values,
+        entities, and any set mismatches.
 
         `wait_for_running` inserts a `wait_until_settled("status.running")`
-        after each action *if* the playground publishes that field.
-        Playgrounds without `status.running` are unaffected.
+        after each action.  This is a legacy safety net for
+        playgrounds whose `run` dispatches async work without
+        returning the Promise; it is best-effort and racy (see
+        `wait_until_settled`'s docstring).  Defaults to False.  On a
+        correctly-fixed playground, leave it False — you would pay
+        one extra round trip per action for no correctness gain.
+
+        Returns:
+            {
+              "values":     dict of all current field values,
+              "entities":   dict of level -> items, or None,
+              "mismatched": dict of {field: {"requested": x,
+                                             "applied":   y}}
+                            for any `set` field whose applied value
+                            differs from the requested value.
+                            Empty when `set` is None or the patch
+                            applied cleanly.
+            }
         """
         progress = on_progress or (lambda kind, data: None)
+        mismatched: dict = {}
 
         if set:
-            self.patch(set)
-            progress("patch", {"values": dict(set)})
+            applied = self.patch_and_verify(set, timeout=5.0)
+            mismatched = {
+                k: {"requested": set[k], "applied": applied.get(k)}
+                for k in set
+                if applied.get(k) != set[k]
+            }
+            progress("patch", {
+                "values":     dict(set),
+                "mismatched": mismatched,
+            })
 
         if actions:
             has_running = "status.running" in self.schema()
@@ -705,7 +841,8 @@ class RemoteCliClient:
 
         with self._lock:
             return {
-                "values": dict(self._values),
-                "entities": (dict(self._entities)
-                             if self._entities is not None else None),
+                "values":     dict(self._values),
+                "entities":   (dict(self._entities)
+                               if self._entities is not None else None),
+                "mismatched": mismatched,
             }

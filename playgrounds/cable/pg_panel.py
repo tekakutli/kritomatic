@@ -60,6 +60,26 @@ buttons have their labels set by `updateDrawButton` /
 None of those cause a flash: their initial DOM state comes from the
 baked markup, and the updates happen at boot's draw time on
 identical DOM nodes.
+
+RETURN-YOUR-ASYNC-WORK
+======================
+Every `pgkitRegisterAction` whose `run` function is not itself an
+`async function` must `return` the promise from any async call it
+makes.  `pgkit/remote_client.js`'s `pgkitRemoteHandleCommand` does
+`await entry.run(...)`; a `run` that dispatches async work without
+returning it resolves in a microtask, and `command_result {ok: true}`
+fires before the work starts.  The CLI's `command()` — and the
+`bundle()` sequencing built on it — block on `command_result`, so a
+sync wrapper that drops its promise silently breaks script
+sequencing.
+
+Three wrappers in this file were affected (`_exportRunsAction`,
+`_diagnosticsAction`, `_toggleArrowsAction`).  Each now `return`s
+its promise chain and threads the inner call's return value through
+the `.then` callback, so `await entry.run(...)` in pgkit waits for
+the exported rendering / diagnostic dump / visibility flip to
+complete.  The other eleven actions are either `async function`
+themselves (`doSave`) or do only synchronous work.
 """
 
 PANEL_JS = r"""
@@ -425,7 +445,14 @@ pgkitRegisterLevel("vertices", {
 
 /* ==========================================================================
    PGKIT ACTIONS
-   ========================================================================== */
+   ==========================================================================
+   Every `run` below is either an `async function` itself, or a sync
+   function whose body ends in `return <Promise>`.  pgkit's
+   `await entry.run(...)` in `pgkitRemoteHandleCommand` depends on
+   this: a `run` that dispatches async work without returning it
+   resolves immediately, and `command_result {ok: true}` fires before
+   the work starts.  The CLI's `command()` and `bundle()` block on
+   `command_result`, so a broken `run` breaks script sequencing. */
 
 function _toggleDrawAction() {
   if (state.drawing) cancelDraw(false);
@@ -445,21 +472,39 @@ function _resetViewAction() {
   pgkitNotifyLocal("wall.panY");
 }
 
+/* `exportAllCableRuns` is `async function` — it awaits one
+   `renderCableRunToCanvas` per cable.  The outer `return` returns the
+   dynamic-import promise; the inner `return` threads the export's own
+   promise through the `.then` callback.  `await entry.run(...)` in
+   pgkit therefore waits for the export loop to finish, not for the
+   module load to start. */
 function _exportRunsAction() {
-  import("./pg_export_entry.js").then(m => {
-    if (typeof m.exportAllCableRuns === "function") m.exportAllCableRuns();
+  return import("./pg_export_entry.js").then(m => {
+    if (typeof m.exportAllCableRuns === "function")
+      return m.exportAllCableRuns();
   }).catch(() => {});
 }
 
+/* `dumpArrowsDiagnostics` is sync, but it lives inside `.then` — so
+   without the outer `return` the diagnostic dump fires on a later
+   microtask than `command_result`.  On a cold session (the module
+   has not been imported yet), the module load itself happens between
+   the two, so `command_result` precedes the console output.  The
+   `return` closes that. */
 function _diagnosticsAction() {
-  import("./pg_arrows_diag.js").then(m => {
-    if (typeof m.dumpArrowsDiagnostics === "function") m.dumpArrowsDiagnostics();
+  return import("./pg_arrows_diag.js").then(m => {
+    if (typeof m.dumpArrowsDiagnostics === "function")
+      return m.dumpArrowsDiagnostics();
   }).catch(() => {});
 }
 
+/* Same shape as `_diagnosticsAction`: `toggleArrowVisibility` is sync,
+   but the module might be cold.  `return` makes `command_result` wait
+   until the flag has flipped. */
 function _toggleArrowsAction() {
-  import("./pg_arrows_diag.js").then(m => {
-    if (typeof m.toggleArrowVisibility === "function") m.toggleArrowVisibility();
+  return import("./pg_arrows_diag.js").then(m => {
+    if (typeof m.toggleArrowVisibility === "function")
+      return m.toggleArrowVisibility();
   }).catch(() => {});
 }
 

@@ -29,6 +29,16 @@ by the hub — it never reaches any client.  This is the single most
 likely failure mode when a new message type is introduced; if a
 level or a field shows up on the browser but not on the remote
 panel, this tuple is the first place to check.
+
+DUPLICATE HELLO
+===============
+A client may only send `hello` once per connection.  A second
+`hello` on the same socket is treated as a protocol violation and
+the connection is closed by the server loop (via an exception that
+propagates out of `handle_message`).  This prevents a client from
+silently switching its role mid-session, which would leave the
+hub's role counts inconsistent and confuse presence-driven panel
+visibility.
 """
 
 import json
@@ -118,10 +128,20 @@ class Hub:
 
 
 def handle_message(hub, client, msg):
-    """Interpret one JSON message from `client` and dispatch."""
+    """Interpret one JSON message from `client` and dispatch.
+
+    Raises on protocol violations (currently: a duplicate `hello` on
+    the same connection).  The server loop catches exceptions from
+    this function and closes the connection.
+    """
     t = msg.get("type")
 
     if t == "hello":
+        if client.role is not None:
+            raise RuntimeError(
+                f"duplicate hello on connection {client.id} "
+                f"(role was already {client.role!r})"
+            )
         client.role = msg.get("role") or "remote"
         client.send({
             "type":     "hello_ack",

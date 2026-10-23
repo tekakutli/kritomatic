@@ -25,6 +25,29 @@ calls to wire the panel lives:
     _rotateSelected           shared by keyboard, buttons, and actions
     _flashPlacedOk            flash messages used by bx_dispatch
 
+RETURN-YOUR-ASYNC-WORK
+======================
+Every action whose `run` calls an async helper must `return` that
+helper's Promise (or be `async function` itself).  pgkit's
+`pgkitRemoteHandleCommand` does `await entry.run(...)`; if the
+wrapper returns `undefined` because it called the async function
+without returning it, the `await` resolves in one microtask and the
+`command_result {ok: true}` fires *before* the async work has
+started.  A script that issues `action action.saveBoard` and then
+reads state would race.
+
+The sync-only actions (clearAll, resetView, help, rotateXxx,
+deleteBox, selectBox) do their work synchronously and return
+undefined — nothing to wait on.
+
+`printPNG` is special: the wrapper calls `renderFloorPlanPNG`,
+which is synchronous up to the point where it hands the canvas to
+`cv.toBlob()`.  The encode and the download happen asynchronously
+afterwards.  `renderFloorPlanPNG` is therefore Promise-returning
+in this revision, and `_printPngAction` returns it — otherwise a
+script that fires `action.printPNG` and then `action.clearAll`
+could capture post-clear state in the PNG.
+
 Handling the old installers
 ---------------------------
 The old `installVerticalMenu` and `installDarkScreenStyles` moved
@@ -51,33 +74,14 @@ Every action follows the pgkit pattern — `scope`, optional `level`,
 optional `appliesTo` for row scope, optional `requires` for
 payloads, optional `variant` for the button's color.
 
-Boxes' action set:
-
-    saveBoard           scope: global
-    clearAll            scope: global     (variant: danger)
-    drawBox             scope: global
-    resetView           scope: global
-    printPNG            scope: global
-    listBoxes           scope: global
-    help                scope: global
-    rotateL90           scope: global
-    rotateR90           scope: global
-    rotateL15           scope: global
-    rotateR15           scope: global
-    deleteBox           scope: selection  (level: boxes)
-    selectBox           scope: row        (level: boxes)
-
-A plain `action.selectBox` is not strictly required by the pgkit
-protocol — the remote client uses the `select` command — but we
-register it anyway so a remote UI that lists actions on the level
-sees the click-to-select affordance it expects.
-
 WHY DYNAMIC IMPORTS
 ===================
-Several handlers call `draw()` (in bx_dispatch) and `renderFloorPlanPNG`
-(in bx_png).  A static import of either from this module creates a
-cycle through bx_dispatch → this module.  Dynamic imports are the
-smallest non-cyclic path.
+Several handlers call `draw()` (in bx_dispatch) and
+`renderFloorPlanPNG` (in bx_png).  A static import of either from
+this module creates a cycle through bx_dispatch → this module.
+Dynamic imports are the smallest non-cyclic path; when a wrapper
+awaits or returns one, it becomes Promise-returning, which is what
+the action protocol wants.
 """
 
 PANEL_BINDINGS_JS = r"""
@@ -199,11 +203,6 @@ export function installPanelFade() {
   });
 }
 
-/* Update the panel opacity.  In practice we leave it fully opaque —
-   the original model faded after 1.8s idle, but the fade is a
-   preference, and the current boxes renderer does not toggle the
-   style.opacity field.  Keeping the function is necessary because
-   draw() calls it. */
 export function updatePanelOpacity() {
   /* No-op.  Retained for call sites that expect to invoke it. */
 }
@@ -249,7 +248,10 @@ export function _rotateSelected(deg) {
    ========================================================================== */
 
 function _saveAction() {
-  doSave(true);
+  // doSave is async (writes to localStorage, awaits a server save,
+  // then dynamically imports two modules for the flash message).
+  // Return its promise so command_result fires when the save is done.
+  return doSave(true);
 }
 
 function _clearAllAction() {
@@ -267,9 +269,12 @@ function _clearAllAction() {
 }
 
 function _drawBoxToggleAction() {
-  import("./bx_dispatch.js").then(m => {
+  // The setDrawBoxMode call lives on bx_dispatch, which imports
+  // this module — dynamic import to break the cycle.  Return the
+  // promise so command_result fires after the toggle has landed.
+  return import("./bx_dispatch.js").then(m => {
     m.setDrawBoxMode(!state.dragBoxMode);
-  }).catch(() => {});
+  });
 }
 
 function _resetViewAction() {
@@ -281,11 +286,19 @@ function _resetViewAction() {
 }
 
 function _printPngAction() {
-  renderFloorPlanPNG();
+  // renderFloorPlanPNG is Promise-returning (see bx_png.py).  The
+  // PNG encode runs on a web worker (spec: cv.toBlob fires the
+  // callback in a task, not a microtask), so without returning the
+  // promise a script that does `printPNG` then `clearAll` could
+  // capture post-clear state.
+  return renderFloorPlanPNG();
 }
 
 function _listBoxesAction() {
-  printBoxList();
+  // printBoxList is async (POSTs to /print, falls back to a console
+  // dump on failure).  Return its promise so command_result fires
+  // after the table has been emitted.
+  return printBoxList();
 }
 
 function _helpAction() {

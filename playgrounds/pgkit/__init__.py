@@ -10,13 +10,15 @@ Layered so each project can adopt what it needs:
     pgkit.modules           pgkit_modules() — the module_sources dict
                             for the kit's own JS
     pgkit.js_check          per-module syntax pre-flight
-    pgkit.math              common JS math (color, affine, homography)
-    pgkit.schema            schema runtime (JS): field descriptors
-    pgkit.render            schema → panel DOM and bindings (JS)
+    pgkit.lint              static check for ES-module import/export
+                            consistency across a playground
     pgkit.remote_client     browser-side WebSocket client (ES module)
+    pgkit.remote_cli_client Python client for the same protocol;
+                            the transport under remote_cli
     pgkit.ws                minimal WebSocket framing (Python)
     pgkit.remote_hub        server-side client registry and relay
-    pgkit.server            HTTP + WebSocket server, and /modules/ serving
+    pgkit.server            HTTP + WebSocket server, and /modules/
+                            serving
 
 A playground wires these together with its own model, views, and
 scene format.  See the module docstrings for the contracts.
@@ -34,6 +36,13 @@ Splitting each panel file into its own module is what makes
 cross-file references loud instead of silent: a missing export is a
 load error naming both files, not a ReferenceError hidden 100
 kilobytes into a bundle.
+
+PYTHON CLIENTS
+==============
+`pgkit.remote_cli_client` is the Python-side counterpart to
+`pgkit.remote_client`.  It speaks the same wire protocol and is what
+`remote_cli/` is built on.  Any Python script can import it to drive a
+running playground — see the module docstring for the full contract.
 """
 
 __version__ = "0.2.0"

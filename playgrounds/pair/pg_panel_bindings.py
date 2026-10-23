@@ -52,6 +52,30 @@ board and referenced a symbol that never existed in this project.
 equivalent of "fit" — it recomputes the world-to-screen transform
 from `view.zoom` and `view.panX/Y`), not a hypothetical `fitAll()`.
 
+RETURN-YOUR-ASYNC-WORK
+======================
+`action.generateKra` is the only action whose wrapper calls an
+async helper.  `generateKraToPath` and `generateKraFromScene` in
+`pg_kra.js` are both `async function`; `generateKraToPath` does an
+`await fetch("/generate-kra", ...)` that is the whole point of the
+action (Krita writes the .kra during that fetch).  Without a
+`return`, `entry.run()` returns `undefined`, `await entry.run()` in
+`pgkitRemoteHandleCommand` resolves in one microtask, and
+`command_result {ok: true}` fires before the fetch is even sent —
+the CLI thinks the .kra exists when it does not.
+
+`_generateKraAction` therefore `return`s the promise from whichever
+entry point it calls.
+
+`action.loadScene` also `return`s its boolean result.  Not because
+the function is async (`loadSceneFromText` is synchronous), but so
+that a CLI script can tell load success from load failure via
+`command_result.result`.  The `flashStatus` on failure stays — that
+feedback is for the user, not for the caller.  The file-picker
+branch returns `undefined` (opening the picker is a synchronous
+action; the user's later file pick is a DOM event the CLI cannot
+wait on).
+
 WHY DYNAMIC IMPORTS
 ===================
 `import("./pg_dispatch.js").then(m => m.draw())` appears in several
@@ -353,9 +377,12 @@ pgkitRegisterAction("action.loadScene", {
     if (payload && typeof payload.scene_json === "string") {
       const ok = loadSceneFromText(payload.scene_json);
       if (!ok && typeof flashStatus === "function") flashStatus("Remote load failed", "bad");
-    } else {
-      promptLoadScene();
+      // Propagate the boolean so the CLI can tell success from failure
+      // via command_result.result.  loadSceneFromText is synchronous;
+      // the flash is for the user, the return is for the caller.
+      return ok;
     }
+    promptLoadScene();
   },
   meta: {
     variant: "plain",
@@ -372,8 +399,13 @@ pgkitRegisterAction("action.generateKra", {
   run: (payload) => {
     const path = payload && typeof payload.output_path === "string"
       ? payload.output_path.trim() : "";
-    if (path) generateKraToPath(path);
-    else generateKraFromScene();
+    // Both entry points in pg_kra.js are `async function` — the
+    // whole Krita export happens inside generateKraToPath's awaited
+    // fetch.  Return the promise so command_result fires when the
+    // .kra has been written, not when the fetch was dispatched.
+    // See the module docstring, RETURN-YOUR-ASYNC-WORK.
+    if (path) return generateKraToPath(path);
+    return generateKraFromScene();
   },
   meta: {
     variant: "danger",

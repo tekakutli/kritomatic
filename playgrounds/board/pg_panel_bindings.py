@@ -43,6 +43,31 @@ in its own body, matching text_board's convention.  Cleaner for
 board's eight actions, none of which share a common mutation
 pattern.
 
+RETURN-YOUR-ASYNC-WORK
+======================
+Five action wrappers in this file call an `async function` and
+discard its Promise.  All five are the same shape: the underlying
+helper does an `await fetch("/krita/...")` that is the whole point
+of the action, so without a `return` the `command_result` fires
+before the fetch is even sent:
+
+    _addFilesAction        → pickFilesViaServer()
+    _retrieveOpenAction    → retrieveOpenFromKrita()
+    _openAllAction         → openAllMissing()
+    _loadBoardFromPayload  → loadBoardFromText(board_json)
+    _projectOverlapsAction → projectSelectedOntoOverlaps()
+
+Each is now `return <helper>(...)`.  In the loadBoard case the
+helper also returns `true`/`false`, so the boolean reaches
+`command_result.result` — the same reasoning as pair and cone.
+
+`_openItemByTarget` was already correct: both branches
+(`return activateFile(f)` and `return openFileInKrita(f).then(…)`)
+propagate the promise.  `_deleteItemByTarget` is fully
+synchronous.  The sync helpers (`_arrangeGridAction`, `_fitAction`,
+`_resetViewAction`, `_clearBoardAction`, `_saveSceneAction`) do
+their work synchronously and correctly return `undefined`.
+
 WHY DYNAMIC IMPORTS ARE NOT NEEDED HERE
 =======================================
 Every handler calls `syncFileList`, `draw`, `pgkitNotifyAll`
@@ -72,11 +97,36 @@ import {
 } from "./pgkit/remote_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
 
-function _addFilesAction() { pickFilesViaServer(); }
-function _retrieveOpenAction() { retrieveOpenFromKrita(); }
-function _openAllAction() { openAllMissing(); }
-function _arrangeGridAction() { arrangeGrid(); draw(); flashStatus("arranged " + board.files.length + " cards", "ok"); }
-function _fitAction() { fitAll(); }
+// Five wrappers below call an async helper and would otherwise
+// discard its Promise.  See the module docstring, RETURN-YOUR-
+// ASYNC-WORK.  In each case the helper does an `await fetch(...)`
+// that IS the action — the fetch completes when the .kra has been
+// opened / the picker has been dispatched / the layout has been
+// merged / the transforms have been pasted — so the wrapper must
+// return the promise for `command_result` to fire at the right
+// moment.
+
+function _addFilesAction() {
+  return pickFilesViaServer();
+}
+
+function _retrieveOpenAction() {
+  return retrieveOpenFromKrita();
+}
+
+function _openAllAction() {
+  return openAllMissing();
+}
+
+function _arrangeGridAction() {
+  arrangeGrid();
+  draw();
+  flashStatus("arranged " + board.files.length + " cards", "ok");
+}
+
+function _fitAction() {
+  fitAll();
+}
 
 function _resetViewAction() {
   view.zoom = 1;
@@ -98,14 +148,27 @@ function _clearBoardAction() {
   pgkitNotifyAll();
 }
 
-function _saveSceneAction() { saveBoardJSON(); }
-
-function _loadBoardFromPayload(payload) {
-  if (!payload || typeof payload.board_json !== "string") return;
-  loadBoardFromText(payload.board_json);
+function _saveSceneAction() {
+  saveBoardJSON();
 }
 
-function _projectOverlapsAction() { projectSelectedOntoOverlaps(); }
+function _loadBoardFromPayload(payload) {
+  if (!payload || typeof payload.board_json !== "string") {
+    promptLoadBoard();
+    return;
+  }
+  // loadBoardFromText is `async function` — it applies the layout,
+  // then awaits openAllMissing() so every closed file is opened in
+  // Krita before the refresh.  Return the promise so command_result
+  // fires when the whole load-and-open sequence has finished, and
+  // propagate the boolean so a CLI script can tell success from
+  // failure.
+  return loadBoardFromText(payload.board_json);
+}
+
+function _projectOverlapsAction() {
+  return projectSelectedOntoOverlaps();
+}
 
 function _openItemByTarget(payload) {
   if (!payload || !payload.target) return;
@@ -116,7 +179,9 @@ function _openItemByTarget(payload) {
   if (!(idx >= 0 && idx < board.files.length)) return;
   const f = board.files[idx];
   if (f.open) return activateFile(f);
-  return openFileInKrita(f).then(ok => { if (ok) refreshFromKrita(); });
+  return openFileInKrita(f).then(ok => {
+    if (ok) refreshFromKrita();
+  });
 }
 
 function _deleteItemByTarget(payload) {

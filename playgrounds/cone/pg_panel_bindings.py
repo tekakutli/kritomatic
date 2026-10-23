@@ -38,6 +38,30 @@ On `squares` level:
     action.cloneSquare          selection scope
     action.deleteSquare         row scope (button label `×`)
 
+RETURN-YOUR-ASYNC-WORK
+======================
+`action.generateKra` is the only action in this file whose wrapper
+calls an async helper.  `generateKraToPath` and `generateKraFromScene`
+in `pg_kra.js` are both `async function` — `generateKraToPath` does an
+`await fetch("/generate-kra", ...)` that is the whole point of the
+action (Krita exports the .kra during that fetch).  Without a `return`
+in the wrapper, `entry.run()` returns `undefined`, `await entry.run()`
+in `pgkitRemoteHandleCommand` resolves in one microtask, and
+`command_result {ok: true}` fires before the fetch is even sent — the
+CLI thinks the .kra exists when it does not.
+
+`_generateKraAction` therefore `return`s the promise from whichever
+entry point it calls.  With that in place, `command_result` fires when
+the fetch returns, which is what a caller expects.
+
+`_loadSceneFromPayload` also `return`s its result — not because the
+function is async (it isn't; `loadSceneFromText` is synchronous and
+returns a boolean), but so the boolean reaches `command_result.result`
+and a CLI script can tell load success from load failure.  The
+file-picker branch returns `undefined` because opening the picker is
+the synchronous action; the user's subsequent file pick is a separate
+DOM event that the CLI cannot wait on.
+
 WHY NO AFTER-CHANGE HOOK HERE
 =============================
 The after-change hook (`pg_state.setAfterChange`) is wired in
@@ -531,7 +555,9 @@ function _loadSceneFromPayload(payload) {
     promptLoadScene();
     return;
   }
-  loadSceneFromText(payload.scene_json);
+  // loadSceneFromText is synchronous and returns a boolean; propagate
+  // it so the CLI sees success/failure in command_result.result.
+  return loadSceneFromText(payload.scene_json);
 }
 
 function _exportVisualAction() {
@@ -541,8 +567,13 @@ function _exportVisualAction() {
 function _generateKraAction(payload) {
   const path = payload && typeof payload.output_path === "string"
     ? payload.output_path.trim() : "";
-  if (path) generateKraToPath(path);
-  else generateKraFromScene();
+  // Both generateKraToPath and generateKraFromScene are async — the
+  // whole Krita export happens inside their awaited fetch.  Return the
+  // promise so command_result fires when the .kra has been written,
+  // not when the fetch has been dispatched.  See the module docstring,
+  // RETURN-YOUR-ASYNC-WORK.
+  if (path) return generateKraToPath(path);
+  return generateKraFromScene();
 }
 
 /* ==========================================================================

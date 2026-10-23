@@ -4,6 +4,27 @@ pgkitHandleSelect, and pgkitBootSync.
 
 Exports: installPanelBindings, pgkitHandleSelect, pgkitBootSync,
 plus helper functions the boot module's actions use.
+
+RETURN-YOUR-ASYNC-WORK
+======================
+Every action whose `run` calls an async function must `return` that
+call's Promise (or be `async function` itself).  pgkit's
+`pgkitRemoteHandleCommand` does `await entry.run(...)`; if the
+wrapper returns `undefined` — because it called the async function
+without returning it — the `await` resolves in one microtask, and
+the `command_result {ok: true}` fires *before* the async work has
+started.  A script that does `action action.X` then reads state
+immediately would race.
+
+The five `_*ByTarget` / `_*Action` helpers below all call an async
+function and therefore `return` that call.  The sync-only actions
+(arrangeGrid, fit, resetView, groupByFormat, exportCanvasJSON,
+saveBoard, clearBoard, deleteItem) do their work synchronously and
+return undefined, which is correct — there is nothing to wait on.
+
+The dynamically-imported `draw()` calls inside the sync helpers are
+fire-and-forget on purpose: a re-draw that would have happened
+anyway does not gate any state the caller reads.
 """
 
 TB_PANEL_BINDINGS_JS = r"""
@@ -72,8 +93,11 @@ function _activateSelectedAction() {
   const idx = board.selectedIdx;
   const it = (idx >= 0 && idx < board.items.length) ? board.items[idx] : null;
   if (!it) { flashStatus("no card selected", "warn"); return; }
-  activateItemDocument(it);
   flashStatus("activating " + (it.documentName || "document"), "ok");
+  // Return the promise — the fetch completes *after* this function
+  // returns, and command_result must fire on the fetch, not on the
+  // dispatch.
+  return activateItemDocument(it);
 }
 
 function _activateItemByTarget(payload) {
@@ -83,7 +107,7 @@ function _activateItemByTarget(payload) {
   if (!name.startsWith(prefix)) return;
   const idx = parseInt(name.slice(prefix.length), 10);
   if (!(idx >= 0 && idx < board.items.length)) return;
-  activateItemDocument(board.items[idx]);
+  return activateItemDocument(board.items[idx]);
 }
 
 function _deleteItemByTarget(payload) {
@@ -109,7 +133,7 @@ function _openDocumentByTarget(payload) {
   const paths = _sortedDocumentPaths();
   const idx = parseInt(name.slice(prefix.length), 10);
   if (!(idx >= 0 && idx < paths.length)) return;
-  openOneFileInKrita(paths[idx]);
+  return openOneFileInKrita(paths[idx]);
 }
 
 function _addFilesWithPaths(payload) {
@@ -118,12 +142,18 @@ function _addFilesWithPaths(payload) {
   for (const p of parts) addWantedPath(p);
   syncItemList();
   import("./tb_dispatch.js").then(m => m.draw()).catch(() => {});
-  openAllClosed();
+  // openAllClosed is async — return it so the command_result fires
+  // when the open calls and the trailing refresh complete, not when
+  // they are dispatched.
+  return openAllClosed();
 }
 
 function _loadBoardFromPayload(payload) {
   if (!payload || typeof payload.board_json !== "string") return;
-  loadBoardFromText(payload.board_json);
+  // loadBoardFromText is async (it re-parses, applies, refreshes from
+  // Krita, re-applies).  Return the promise so a subsequent step does
+  // not run against the pre-load scene.
+  return loadBoardFromText(payload.board_json);
 }
 
 function _sortedDocumentPaths() {

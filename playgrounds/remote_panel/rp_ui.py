@@ -10,6 +10,17 @@ Adds:
     rpDownloadState()      download as remote_panel_state.json
 
 Plus the "State JSON" button binding.
+
+VISIBLE:FALSE FIELDS
+====================
+`rpBuildFieldRow` (in rp_client.py) returns null for any field whose
+schema entry carries `visible: false` — the documented pgkit contract
+for "API-only, no DOM" (see pgkit/schema.py, and pgkit/render.py's
+matching behaviour).  `rpRebuildFields` below must check for that
+null return before calling `body.appendChild`, or the entire panel
+rebuild aborts at the first such field with a `TypeError` and every
+section after it fails to render.  The two-line guard at the fix
+site is what keeps that contract whole.
 """
 
 RP_UI_JS = r"""
@@ -198,7 +209,14 @@ function rpRebuildFields() {
     const body = document.createElement("div");
     body.className = "field-body";
     for (const name of bySection.get(section).sort()) {
-      body.appendChild(rpBuildFieldRow(name));
+      // `rpBuildFieldRow` returns null for fields whose schema entry
+      // carries `visible: false` (the documented "API-only, no DOM"
+      // contract — see pgkit/schema.py and pgkit/render.py).  A null
+      // return must be skipped, not appended: `body.appendChild(null)`
+      // throws TypeError and aborts the entire rebuild, leaving every
+      // section after the first `visible: false` field unrendered.
+      const row = rpBuildFieldRow(name);
+      if (row) body.appendChild(row);
     }
     card.appendChild(body);
     container.appendChild(card);

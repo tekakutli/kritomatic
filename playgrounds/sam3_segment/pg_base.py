@@ -68,16 +68,19 @@ PG_CSS = r"""
     padding:4px 6px;outline:none;resize:vertical;
   }
 
-  .modelRow {
+  .modelRow, .toolRow {
     display: flex; gap: 12px; align-items: center;
     margin: 4px 0 2px;
     font-size: 11px;
+    flex-wrap: wrap;
   }
-  .modelRow label {
+  .modelRow label, .toolRow label {
     display: flex; align-items: center; gap: 4px;
     cursor: pointer; color: #a8b5c4;
   }
-  .modelRow input[type=radio] { accent-color: #00e5ff; }
+  .modelRow input[type=radio], .toolRow input[type=radio] {
+    accent-color: #00e5ff;
+  }
 
   .maskList {
     display:flex; flex-direction:column;
@@ -242,6 +245,38 @@ PG_PANEL_BODY = r"""
     </details>
 
     <details class="section" open>
+      <summary>Refine region</summary>
+      <div class="section-body">
+        <div class="field">
+          <label>Paint</label>
+          <input type="checkbox" id="regionMode"
+                 title="When on, paint the region on the canvas. Refine only rewrites pixels inside it.">
+          <span style="font-size:9px;color:#3d4756;margin-left:6px;">edit region</span>
+        </div>
+        <div class="toolRow" style="margin-top:4px;">
+          <span style="color:#5a6774;font-size:9px;letter-spacing:0.14em;text-transform:uppercase;font-weight:700;">Tool</span>
+          <label><input type="radio" name="regionTool" id="regionToolBrush" checked> Brush</label>
+          <label><input type="radio" name="regionTool" id="regionToolLasso"> Lasso</label>
+        </div>
+        <div class="field" id="regionSizeRow">
+          <label>Size</label>
+          <input type="text" id="regionSize" class="scrubInput"
+                 value="30" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="row" style="margin-top:4px;">
+          <button id="clearRegionBtn" style="flex:0 0 auto;">Clear region</button>
+          <span id="regionStatus" style="flex:1 1 auto;font-size:10px;color:#5a6774;margin-left:8px;">no region</span>
+        </div>
+        <div class="runHint" style="margin-top:6px;">
+          Brush: left-drag paints, right-drag erases.<br>
+          Lasso: left-click places vertices; click first vertex or
+          double-click to close; right-click closes as erase.<br>
+          B toggles brush/lasso.
+        </div>
+      </div>
+    </details>
+
+    <details class="section" open>
       <summary>Refine</summary>
       <div class="section-body">
         <div class="modelRow">
@@ -259,11 +294,11 @@ PG_PANEL_BODY = r"""
         </div>
         <div id="statusLine">idle</div>
         <div class="runHint">
-          Canvas: click adds positive point, Shift+click adds negative,
-          Alt+click selects a mask.<br>
-          No mask selected → staging points feed Segment All.<br>
-          Mask selected → points go to that mask's refinement.<br>
-          Ctrl+Z undoes. M toggles refine model.
+          Canvas: click = positive point, Shift+click = negative point,
+          Alt+click = select mask.<br>
+          No mask → staging points. Mask selected → mask points.<br>
+          Region painted → refine only rewrites inside the region.<br>
+          Ctrl+Z undoes, M toggles refine model.
         </div>
       </div>
     </details>

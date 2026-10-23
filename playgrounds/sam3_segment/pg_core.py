@@ -14,16 +14,23 @@ export const board = {
   imageDataUrl:  null,
   imageEl:       null,
 
-  textPrompt:    "",           // global — used by Segment All only
-  stagingPoints: [],           // [{x, y, isPositive}] — pre-mask, Segment All only
-  refineModel:   'sam2',       // 'sam2' | 'sam3'
+  textPrompt:    "",
+  stagingPoints: [],
+  refineModel:   'sam2',
 
   threshold:        0.5,
   refineIterations: 2,
   individualMasks:  true,
   autoRun:          false,
 
-  masks:               [],     // [{b64, img, w, h, loaded, points, textPrompt, caches...}]
+  regionMode:       false,
+  regionTool:       'brush',   // 'brush' | 'lasso'
+  regionSize:       30,
+  lassoPoints:      [],        // [{x,y}] draft vertices in image coords
+
+  mouse: { x: 0, y: 0, inside: false },   // image coords, for cursor overlay
+
+  masks:               [],
   selectedMaskIndices: [],
   hoveredMaskIdx:      -1,
 
@@ -70,6 +77,7 @@ export function setImage(hash, dataUrl, width, height) {
 
   clearMasks();
   board.stagingPoints = [];
+  board.lassoPoints = [];
   board.opLog = [];
 }
 
@@ -81,19 +89,21 @@ export function clearImage() {
   board.imageEl = null;
   clearMasks();
   board.stagingPoints = [];
+  board.lassoPoints = [];
   board.opLog = [];
 }
 
 /* ============================================================
-   Mask list
+   Mask entries
    ============================================================ */
 
-function _makeMaskEntry(b64, points, textPrompt) {
+function _makeMaskEntry(b64, points, textPrompt, regionCanvas) {
   const img = new Image();
   const entry = {
     b64, img, w: 0, h: 0, loaded: false,
     points: points ? points.map(p => ({ x: p.x, y: p.y, isPositive: p.isPositive })) : [],
     textPrompt: textPrompt != null ? textPrompt : "",
+    regionCanvas: regionCanvas || null,
     _pixels: null, _tinted: null, _tintedKey: null, _bbox: null,
   };
   img.onload = () => {
@@ -105,9 +115,10 @@ function _makeMaskEntry(b64, points, textPrompt) {
 }
 
 export function setMasks(b64List) {
-  board.masks = b64List.map(b64 => _makeMaskEntry(b64, [], ""));
+  board.masks = b64List.map(b64 => _makeMaskEntry(b64, [], "", null));
   board.selectedMaskIndices = b64List.length > 0 ? [0] : [];
   board.hoveredMaskIdx = -1;
+  board.lassoPoints = [];
   _scheduleDraw();
 }
 
@@ -115,16 +126,17 @@ export function replaceMaskAt(idx, b64, points) {
   if (idx < 0 || idx >= board.masks.length) return;
   const old = board.masks[idx];
   const prevPoints = (points !== undefined) ? points : old.points;
-  board.masks[idx] = _makeMaskEntry(b64, prevPoints, old.textPrompt);
+  board.masks[idx] = _makeMaskEntry(b64, prevPoints, old.textPrompt, old.regionCanvas);
   board.hoveredMaskIdx = -1;
   _scheduleDraw();
 }
 
 export function restoreMasks(maskSnapshots, selection) {
   board.masks = maskSnapshots.map(m =>
-    _makeMaskEntry(m.b64, m.points, m.textPrompt));
+    _makeMaskEntry(m.b64, m.points, m.textPrompt, null));
   board.selectedMaskIndices = selection.slice();
   board.hoveredMaskIdx = -1;
+  board.lassoPoints = [];
   _scheduleDraw();
 }
 
@@ -132,11 +144,12 @@ export function clearMasks() {
   board.masks = [];
   board.selectedMaskIndices = [];
   board.hoveredMaskIdx = -1;
+  board.lassoPoints = [];
   _scheduleDraw();
 }
 
 /* ============================================================
-   Selection
+   Selection (each cancels any in-progress lasso draft)
    ============================================================ */
 
 export function isMaskSelected(idx) {
@@ -145,6 +158,7 @@ export function isMaskSelected(idx) {
 
 export function toggleMaskSelection(idx) {
   if (idx < 0 || idx >= board.masks.length) return;
+  board.lassoPoints = [];
   const pos = board.selectedMaskIndices.indexOf(idx);
   if (pos >= 0) board.selectedMaskIndices.splice(pos, 1);
   else          board.selectedMaskIndices.push(idx);
@@ -155,12 +169,14 @@ export function toggleMaskSelection(idx) {
 export function addMaskToSelection(idx) {
   if (idx < 0 || idx >= board.masks.length) return;
   if (board.selectedMaskIndices.indexOf(idx) >= 0) return;
+  board.lassoPoints = [];
   board.selectedMaskIndices.push(idx);
   board.selectedMaskIndices.sort((a, b) => a - b);
   _scheduleDraw();
 }
 
 export function replaceMaskSelection(idx) {
+  board.lassoPoints = [];
   if (idx < 0 || idx >= board.masks.length) {
     board.selectedMaskIndices = [];
   } else {
@@ -170,11 +186,13 @@ export function replaceMaskSelection(idx) {
 }
 
 export function clearMaskSelection() {
+  board.lassoPoints = [];
   board.selectedMaskIndices = [];
   _scheduleDraw();
 }
 
 export function selectAllMasks() {
+  board.lassoPoints = [];
   board.selectedMaskIndices = board.masks.map((_, i) => i);
   _scheduleDraw();
 }
@@ -190,7 +208,7 @@ export function selectedMask() {
 }
 
 /* ============================================================
-   Staging points (no mask selected)
+   Staging points
    ============================================================ */
 
 export function addStagingPoint(x, y, isPositive) {
@@ -221,16 +239,8 @@ export function removeStagingPoint(idx) {
   return true;
 }
 
-export function stagingPositive() {
-  return board.stagingPoints.filter(p =>  p.isPositive);
-}
-
-export function stagingNegative() {
-  return board.stagingPoints.filter(p => !p.isPositive);
-}
-
 /* ============================================================
-   Per-mask points
+   Per-mask points + prompt
    ============================================================ */
 
 export function addPointToSelectedMask(x, y, isPositive) {
@@ -272,6 +282,70 @@ export function removePointFromSelectedMask(idx) {
 export function setMaskPrompt(idx, text) {
   if (idx < 0 || idx >= board.masks.length) return;
   board.masks[idx].textPrompt = String(text || "");
+}
+
+/* ============================================================
+   Region canvas
+   ============================================================ */
+
+export function _ensureRegionCanvas(mask) {
+  if (mask.regionCanvas) return mask.regionCanvas;
+  const c = document.createElement("canvas");
+  c.width = board.imageWidth;
+  c.height = board.imageHeight;
+  mask.regionCanvas = c;
+  return c;
+}
+
+export function clearSelectedMaskRegion() {
+  const m = selectedMask();
+  if (!m || !m.regionCanvas) return false;
+  m.regionCanvas = null;
+  _scheduleDraw();
+  return true;
+}
+
+/* Brush stroke — paints or erases a circular disc at (ix, iy) interpolated
+   from (lastX, lastY). Does not render; caller calls drawView(). */
+export function paintRegionStroke(ix, iy, isErase, lastX, lastY) {
+  const m = selectedMask();
+  if (!m) return false;
+  const c = _ensureRegionCanvas(m);
+  const rctx = c.getContext("2d");
+  const r = Math.max(1, board.regionSize) / 2;
+  const color = isErase ? "rgba(0,0,0,1)" : "rgba(255, 200, 80, 1)";
+  rctx.globalCompositeOperation = isErase ? "destination-out" : "source-over";
+
+  const dist = Math.hypot(ix - lastX, iy - lastY);
+  const stepPx = Math.max(1, r * 0.5);
+  const steps = Math.max(1, Math.ceil(dist / stepPx));
+  for (let s = 0; s <= steps; s++) {
+    const t = s / steps;
+    const px = lastX + (ix - lastX) * t;
+    const py = lastY + (iy - lastY) * t;
+    rctx.beginPath();
+    rctx.arc(px, py, r, 0, Math.PI * 2);
+    rctx.fillStyle = color;
+    rctx.fill();
+  }
+  return true;
+}
+
+/* Lasso polygon fill — fills a polygon (or erases it) into the region.
+   Does not render; caller calls drawView(). */
+export function fillLassoPolygonInRegion(points, isErase) {
+  const m = selectedMask();
+  if (!m || points.length < 3) return false;
+  const c = _ensureRegionCanvas(m);
+  const rctx = c.getContext("2d");
+  rctx.globalCompositeOperation = isErase ? "destination-out" : "source-over";
+  rctx.beginPath();
+  rctx.moveTo(points[0].x, points[0].y);
+  for (let i = 1; i < points.length; i++) rctx.lineTo(points[i].x, points[i].y);
+  rctx.closePath();
+  rctx.fillStyle = isErase ? "rgba(0,0,0,1)" : "rgba(255, 200, 80, 1)";
+  rctx.fill();
+  return true;
 }
 
 /* ============================================================
@@ -435,6 +509,74 @@ export function snapshotSegmentAll() {
     prevStagingPoints: board.stagingPoints.map(p =>
       ({ x: p.x, y: p.y, isPositive: p.isPositive })),
   };
+}
+
+/* ============================================================
+   Region composite
+   ============================================================ */
+
+function _loadImageB64(b64) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = "data:image/png;base64," + b64;
+  });
+}
+
+export async function compositeRefineWithRegion(oldB64, newB64, regionCanvas) {
+  if (!regionCanvas) return newB64;
+  const W = regionCanvas.width, H = regionCanvas.height;
+  if (W !== board.imageWidth || H !== board.imageHeight) return newB64;
+
+  const [oldImg, newImg] = await Promise.all([
+    _loadImageB64(oldB64), _loadImageB64(newB64),
+  ]);
+
+  const oldCv = document.createElement("canvas");
+  oldCv.width = W; oldCv.height = H;
+  const oldCx = oldCv.getContext("2d");
+  oldCx.drawImage(oldImg, 0, 0, W, H);
+  const oldPx = oldCx.getImageData(0, 0, W, H).data;
+
+  const newCv = document.createElement("canvas");
+  newCv.width = W; newCv.height = H;
+  const newCx = newCv.getContext("2d");
+  newCx.drawImage(newImg, 0, 0, W, H);
+  const newPx = newCx.getImageData(0, 0, W, H).data;
+
+  const regionCv = document.createElement("canvas");
+  regionCv.width = W; regionCv.height = H;
+  const regionCx = regionCv.getContext("2d");
+  regionCx.drawImage(regionCanvas, 0, 0, W, H);
+  const regionPx = regionCx.getImageData(0, 0, W, H).data;
+
+  let anyInRegion = false;
+  const out = new Uint8ClampedArray(oldPx.length);
+  for (let i = 0; i < out.length; i += 4) {
+    if (regionPx[i + 3] > 128) {
+      out[i]     = newPx[i];
+      out[i + 1] = newPx[i + 1];
+      out[i + 2] = newPx[i + 2];
+      out[i + 3] = newPx[i + 3];
+      anyInRegion = true;
+    } else {
+      out[i]     = oldPx[i];
+      out[i + 1] = oldPx[i + 1];
+      out[i + 2] = oldPx[i + 2];
+      out[i + 3] = oldPx[i + 3];
+    }
+  }
+
+  if (!anyInRegion) return oldB64;
+
+  const comp = document.createElement("canvas");
+  comp.width = W; comp.height = H;
+  const compCx = comp.getContext("2d");
+  const imgData = compCx.createImageData(W, H);
+  imgData.data.set(out);
+  compCx.putImageData(imgData, 0, 0);
+  return comp.toDataURL("image/png").replace(/^data:image\/png;base64,/, "");
 }
 
 /* ============================================================

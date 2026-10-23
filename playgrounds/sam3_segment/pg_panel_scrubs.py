@@ -7,6 +7,10 @@ import { _installScrubInput } from "./pgkit/panel_core.js";
 import { pgkitRegisterField, pgkitNotifyLocal }
   from "./pgkit/remote_client.js";
 
+/* ============================================================
+   Scrub inputs
+   ============================================================ */
+
 const thresholdEl = document.getElementById("thresholdVal");
 if (thresholdEl) _installScrubInput(thresholdEl, {
   rate: 0.002, snapStep: 0.05,
@@ -27,6 +31,21 @@ if (refineEl) _installScrubInput(refineEl, {
   },
 });
 
+const regionSizeEl = document.getElementById("regionSize");
+if (regionSizeEl) _installScrubInput(regionSizeEl, {
+  rate: 0.5, snapStep: 5,
+  read: () => board.regionSize,
+  write: (raw) => {
+    board.regionSize = Math.max(2, Math.min(500, Math.round(raw)));
+    pgkitNotifyLocal("region.size");
+    import("./pg_dispatch.js").then(m => m.drawView?.() || m.draw()).catch(() => {});
+  },
+});
+
+/* ============================================================
+   Checkboxes
+   ============================================================ */
+
 const individualEl = document.getElementById("individualMasks");
 if (individualEl) {
   individualEl.checked = !!board.individualMasks;
@@ -46,6 +65,51 @@ if (autoRunEl) {
   });
 }
 
+const regionModeEl = document.getElementById("regionMode");
+if (regionModeEl) {
+  regionModeEl.checked = !!board.regionMode;
+  regionModeEl.addEventListener("change", () => {
+    board.regionMode = !!regionModeEl.checked;
+    board.lassoPoints = [];
+    pgkitNotifyLocal("region.mode");
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  });
+}
+
+/* ============================================================
+   Region tool radios
+   ============================================================ */
+
+const regionToolBrush = document.getElementById("regionToolBrush");
+const regionToolLasso = document.getElementById("regionToolLasso");
+function _syncRegionToolRadios() {
+  if (regionToolBrush) regionToolBrush.checked = (board.regionTool === 'brush');
+  if (regionToolLasso) regionToolLasso.checked = (board.regionTool === 'lasso');
+}
+_syncRegionToolRadios();
+if (regionToolBrush) regionToolBrush.addEventListener("change", () => {
+  if (regionToolBrush.checked) {
+    board.regionTool = 'brush';
+    board.lassoPoints = [];
+    pgkitNotifyLocal("region.tool");
+    import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  }
+});
+if (regionToolLasso) regionToolLasso.addEventListener("change", () => {
+  if (regionToolLasso.checked) {
+    board.regionTool = 'lasso';
+    board.lassoPoints = [];
+    pgkitNotifyLocal("region.tool");
+    import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  }
+});
+
+/* ============================================================
+   Text inputs
+   ============================================================ */
+
 const promptEl = document.getElementById("promptText");
 if (promptEl) {
   promptEl.value = board.textPrompt || "";
@@ -64,6 +128,10 @@ if (maskPromptEl) {
     pgkitNotifyLocal("mask.textPrompt");
   });
 }
+
+/* ============================================================
+   Model radios
+   ============================================================ */
 
 const modelSam2 = document.getElementById("modelSam2");
 const modelSam3 = document.getElementById("modelSam3");
@@ -100,19 +168,7 @@ pgkitRegisterField("prompt.text", {
     const el = document.getElementById("promptText");
     if (el && document.activeElement !== el) el.value = board.textPrompt;
   },
-  meta: { kind: "text", label: "Global prompt (Segment All)" },
-});
-
-pgkitRegisterField("staging.positive_count", {
-  get: () => board.stagingPoints.filter(p =>  p.isPositive).length,
-  set: () => {},
-  meta: { kind: "number", label: "Staging positive points" },
-});
-
-pgkitRegisterField("staging.negative_count", {
-  get: () => board.stagingPoints.filter(p => !p.isPositive).length,
-  set: () => {},
-  meta: { kind: "number", label: "Staging negative points" },
+  meta: { kind: "text", label: "Global prompt" },
 });
 
 pgkitRegisterField("mask.textPrompt", {
@@ -127,7 +183,7 @@ pgkitRegisterField("mask.textPrompt", {
     const el = document.getElementById("maskPromptText");
     if (el && document.activeElement !== el) el.value = String(v || "");
   },
-  meta: { kind: "text", label: "Selected mask prompt (SAM3 refine)" },
+  meta: { kind: "text", label: "Selected mask prompt" },
 });
 
 pgkitRegisterField("refine.model", {
@@ -140,6 +196,43 @@ pgkitRegisterField("refine.model", {
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   },
   meta: { kind: "enum", label: "Refine model", options: ["sam2", "sam3"] },
+});
+
+pgkitRegisterField("region.mode", {
+  get: () => !!board.regionMode,
+  set: (v) => {
+    board.regionMode = !!v;
+    board.lassoPoints = [];
+    if (regionModeEl && document.activeElement !== regionModeEl)
+      regionModeEl.checked = board.regionMode;
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  },
+  meta: { kind: "bool", label: "Region paint mode" },
+});
+
+pgkitRegisterField("region.tool", {
+  get: () => board.regionTool,
+  set: (v) => {
+    if (v !== 'brush' && v !== 'lasso') return;
+    board.regionTool = v;
+    board.lassoPoints = [];
+    _syncRegionToolRadios();
+    import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  },
+  meta: { kind: "enum", label: "Region tool", options: ["brush", "lasso"] },
+});
+
+pgkitRegisterField("region.size", {
+  get: () => board.regionSize,
+  set: (v) => {
+    const n = parseFloat(v);
+    if (!isFinite(n)) return;
+    board.regionSize = Math.max(2, Math.min(500, Math.round(n)));
+    if (regionSizeEl && document.activeElement !== regionSizeEl)
+      regionSizeEl.value = String(board.regionSize);
+  },
+  meta: { kind: "number", label: "Region brush size", min: 2, max: 500 },
 });
 
 pgkitRegisterField("settings.threshold", {
@@ -172,9 +265,8 @@ pgkitRegisterField("settings.individualMasks", {
   get: () => !!board.individualMasks,
   set: (v) => {
     board.individualMasks = !!v;
-    const el = document.getElementById("individualMasks");
-    if (el && document.activeElement !== el)
-      el.checked = board.individualMasks;
+    if (individualEl && document.activeElement !== individualEl)
+      individualEl.checked = board.individualMasks;
   },
   meta: { kind: "bool", label: "Individual masks (Segment All)" },
 });
@@ -183,8 +275,8 @@ pgkitRegisterField("settings.autoRun", {
   get: () => !!board.autoRun,
   set: (v) => {
     board.autoRun = !!v;
-    const el = document.getElementById("autoRun");
-    if (el && document.activeElement !== el) el.checked = board.autoRun;
+    if (autoRunEl && document.activeElement !== autoRunEl)
+      autoRunEl.checked = board.autoRun;
   },
   meta: { kind: "bool", label: "Auto-run" },
 });

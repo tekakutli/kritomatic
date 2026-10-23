@@ -4,6 +4,7 @@ import {
   snapshotRefine, snapshotSegmentAll, pushOp, popOp,
   restoreMasks, replaceMaskAt, selectedMask, selectedMaskIdx,
   clearPointsOnSelectedMask, clearStagingPoints,
+  clearSelectedMaskRegion, compositeRefineWithRegion,
   clearMaskSelection, replaceMaskSelection,
 } from "./pg_core.js";
 import { syncMaskList } from "./pg_panel_lists.js";
@@ -74,7 +75,7 @@ export async function runSegmentAllAction() {
 
   pushOp(snapshot);
   setMasks(payload.masks);
-  board.stagingPoints = [];   // consumed; Undo restores them
+  board.stagingPoints = [];
 
   flashStatus(
     "detected " + payload.masks.length + " object(s) in "
@@ -87,7 +88,7 @@ export async function runSegmentAllAction() {
 }
 
 /* ============================================================
-   Refine (SAM2 or SAM3, user's choice)
+   Refine (region-constrained when a region exists)
    ============================================================ */
 
 async function _unionMasksB64(b64List) {
@@ -125,7 +126,10 @@ export async function runRefineAction() {
 
   const snapshot = snapshotRefine(maskIdx);
   const modelLabel = board.refineModel.toUpperCase();
-  flashStatus("refining mask #" + (maskIdx + 1) + " via " + modelLabel + "\u2026", "");
+  const regionSuffix = mask.regionCanvas ? " (region)" : "";
+  flashStatus(
+    "refining mask #" + (maskIdx + 1)
+    + " via " + modelLabel + regionSuffix + "\u2026", "");
 
   const payload = await runRefine(maskIdx);
   if (!payload) return;
@@ -133,17 +137,33 @@ export async function runRefineAction() {
   pushOp(snapshot);
 
   try {
-    const combinedB64 = await _unionMasksB64(payload.masks);
+    let combinedB64 = await _unionMasksB64(payload.masks);
     if (!combinedB64) {
       flashStatus("refine returned no mask", "warn");
       popOp();
       return;
     }
+
+    // Region composite: only rewrite inside the painted region.
+    if (mask.regionCanvas) {
+      try {
+        combinedB64 = await compositeRefineWithRegion(
+          snapshot.prevB64, combinedB64, mask.regionCanvas,
+        );
+      } catch (e) {
+        flashStatus(
+          "region composite failed: " + e.message
+          + " (used full refine)", "warn");
+        // continue with unconstrained refined mask
+      }
+    }
+
     replaceMaskAt(maskIdx, combinedB64, mask.points);
     const backend = payload.backend || modelLabel.toLowerCase();
     flashStatus(
       "refined mask #" + (maskIdx + 1)
       + " via " + backend
+      + (mask.regionCanvas ? " (region)" : "")
       + " in " + payload.timing.toFixed(2) + "s", "ok",
     );
   } catch (e) {
@@ -199,6 +219,13 @@ function _clearPointsAction() {
     ? clearPointsOnSelectedMask()
     : clearStagingPoints();
   if (!changed) return;
+  syncPanelFields();
+  pgkitNotifyAll();
+  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+}
+
+function _clearRegionAction() {
+  if (!clearSelectedMaskRegion()) return;
   syncPanelFields();
   pgkitNotifyAll();
   import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
@@ -309,7 +336,7 @@ export function installPanelBindings() {
   const el = {};
   const ids = [
     "runBtn", "segmentAllBtn", "cancelBtn", "undoBtn",
-    "clearPointsBtn", "pickImageBtn", "clearImageBtn",
+    "clearPointsBtn", "clearRegionBtn", "pickImageBtn", "clearImageBtn",
     "exportBtn", "exportCombinedBtn",
   ];
   for (const id of ids) el[id] = document.getElementById(id);
@@ -319,6 +346,7 @@ export function installPanelBindings() {
   if (el.cancelBtn)     el.cancelBtn.addEventListener("click", _cancelAction);
   if (el.undoBtn)       el.undoBtn.addEventListener("click", undoAction);
   if (el.clearPointsBtn) el.clearPointsBtn.addEventListener("click", _clearPointsAction);
+  if (el.clearRegionBtn) el.clearRegionBtn.addEventListener("click", _clearRegionAction);
   if (el.pickImageBtn)  el.pickImageBtn.addEventListener("click", _pickImageAction);
   if (el.clearImageBtn) el.clearImageBtn.addEventListener("click", _clearImageAction);
   if (el.exportBtn)     el.exportBtn.addEventListener("click", _exportAction);
@@ -376,6 +404,10 @@ pgkitRegisterAction("action.clearPoints", {
   label: "Clear points", scope: "global", run: _clearPointsAction,
   meta: { variant: "plain" },
 });
+pgkitRegisterAction("action.clearRegion", {
+  label: "Clear region", scope: "global", run: _clearRegionAction,
+  meta: { variant: "plain" },
+});
 pgkitRegisterAction("action.clearMasks", {
   label: "Clear masks", scope: "global", run: _clearMasksAction,
   meta: { variant: "plain" },
@@ -408,7 +440,8 @@ pgkitRegisterLevel("masks", {
     label: "Mask " + (i + 1),
     extra: { size: m.w + "\u00d7" + m.h,
              selected: board.selectedMaskIndices.indexOf(i) >= 0,
-             points: (m.points || []).length },
+             points: (m.points || []).length,
+             hasRegion: !!m.regionCanvas },
   })),
   selected: () => board.selectedMaskIndices.length > 0
     ? "mask." + board.selectedMaskIndices[0] : null,

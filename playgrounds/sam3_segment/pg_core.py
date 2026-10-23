@@ -7,6 +7,10 @@ export const view = { zoom: 1, panX: 0, panY: 0 };
 
 export const OP_LOG_MAX = 20;
 
+export const VIEW_ZOOM_MIN = 0.10;
+export const VIEW_ZOOM_MAX = 32.0;
+export const VIEW_PAN_MARGIN = 40;
+
 export const board = {
   imageHash:     null,
   imageWidth:    0,
@@ -23,12 +27,19 @@ export const board = {
   individualMasks:  true,
   autoRun:          false,
 
-  regionMode:       false,
-  regionTool:       'brush',   // 'brush' | 'lasso'
-  regionSize:       30,
-  lassoPoints:      [],        // [{x,y}] draft vertices in image coords
+  regionMode:          false,
+  regionTool:          'brush',
+  regionSubtract:      false,
+  regionSize:          30,
+  regionStrokeActive:  false,
+  regionStrokeIsErase: false,
+  freehandActive:      false,
+  freehandIsErase:     false,
+  freehandPoints:      [],
+  resizeAnchor:        null,
+  lassoPoints:         [],
 
-  mouse: { x: 0, y: 0, inside: false },   // image coords, for cursor overlay
+  mouse: { x: 0, y: 0, inside: false },
 
   masks:               [],
   selectedMaskIndices: [],
@@ -61,6 +72,68 @@ export function maskColor(idx) {
 }
 
 /* ============================================================
+   View: zoom / pan
+   ============================================================ */
+
+export function resetView() {
+  view.zoom = 1;
+  view.panX = 0;
+  view.panY = 0;
+}
+
+/* Clamp pan so at least VIEW_PAN_MARGIN screen pixels of image stay
+   inside the viewport on each axis. Called after any pan/zoom change
+   and on window resize. */
+export function clampPan() {
+  if (!board.imageWidth || !board.imageHeight) return;
+  const cw = window.innerWidth, ch = window.innerHeight;
+  const pad = 40;
+  const sx = (cw - 2 * pad) / board.imageWidth;
+  const sy = (ch - 2 * pad) / board.imageHeight;
+  const baseS = Math.min(sx, sy);
+  const s = baseS * view.zoom;
+  const w = board.imageWidth  * s;
+  const h = board.imageHeight * s;
+  const baseX = (cw - w) / 2;
+  const baseY = (ch - h) / 2;
+  const m = VIEW_PAN_MARGIN;
+
+  // x0 = baseX + panX.  Constraints:
+  //   x0 + w >= m        (right edge visible)
+  //   x0     <= cw - m   (left edge visible)
+  const minPanX = m - baseX - w;
+  const maxPanX = cw - m - baseX;
+  view.panX = Math.max(minPanX, Math.min(maxPanX, view.panX));
+
+  const minPanY = m - baseY - h;
+  const maxPanY = ch - m - baseY;
+  view.panY = Math.max(minPanY, Math.min(maxPanY, view.panY));
+}
+
+/* Zoom to `newZoom`, anchored at the given screen coordinate so the
+   image point currently under the cursor stays under the cursor. */
+export function zoomAt(screenX, screenY, newZoom) {
+  const r0 = fittedImageRect();
+  if (!r0) return;
+  const ix = (screenX - r0.x0) / r0.s;
+  const iy = (screenY - r0.y0) / r0.s;
+
+  view.zoom = Math.max(VIEW_ZOOM_MIN,
+                       Math.min(VIEW_ZOOM_MAX, newZoom));
+
+  // Where does (ix, iy) land on screen with the new zoom, old pan?
+  const r1 = fittedImageRect();
+  const newSx = r1.x0 + ix * r1.s;
+  const newSy = r1.y0 + iy * r1.s;
+
+  // Compensate pan so the anchored image point stays under the cursor.
+  view.panX += screenX - newSx;
+  view.panY += screenY - newSy;
+
+  clampPan();
+}
+
+/* ============================================================
    Image
    ============================================================ */
 
@@ -75,9 +148,13 @@ export function setImage(hash, dataUrl, width, height) {
   img.onerror = () => { board.imageEl = null; _scheduleDraw(); };
   img.src = dataUrl;
 
+  resetView();
   clearMasks();
   board.stagingPoints = [];
   board.lassoPoints = [];
+  board.freehandPoints = [];
+  board.freehandActive = false;
+  board.freehandIsErase = false;
   board.opLog = [];
 }
 
@@ -87,9 +164,13 @@ export function clearImage() {
   board.imageWidth = 0;
   board.imageHeight = 0;
   board.imageEl = null;
+  resetView();
   clearMasks();
   board.stagingPoints = [];
   board.lassoPoints = [];
+  board.freehandPoints = [];
+  board.freehandActive = false;
+  board.freehandIsErase = false;
   board.opLog = [];
 }
 
@@ -104,6 +185,8 @@ function _makeMaskEntry(b64, points, textPrompt, regionCanvas) {
     points: points ? points.map(p => ({ x: p.x, y: p.y, isPositive: p.isPositive })) : [],
     textPrompt: textPrompt != null ? textPrompt : "",
     regionCanvas: regionCanvas || null,
+    _regionEdgePoints: null,   // cached flat [x1,y1,x2,y2,...] of edge pixels
+    _regionChains: null,       // cached traced polylines for even dot spacing
     _pixels: null, _tinted: null, _tintedKey: null, _bbox: null,
   };
   img.onload = () => {
@@ -119,6 +202,10 @@ export function setMasks(b64List) {
   board.selectedMaskIndices = b64List.length > 0 ? [0] : [];
   board.hoveredMaskIdx = -1;
   board.lassoPoints = [];
+  board.freehandPoints = [];
+  board.freehandActive = false;
+  board.freehandIsErase = false;
+  board.regionStrokeActive = false;
   _scheduleDraw();
 }
 
@@ -137,6 +224,10 @@ export function restoreMasks(maskSnapshots, selection) {
   board.selectedMaskIndices = selection.slice();
   board.hoveredMaskIdx = -1;
   board.lassoPoints = [];
+  board.freehandPoints = [];
+  board.freehandActive = false;
+  board.freehandIsErase = false;
+  board.regionStrokeActive = false;
   _scheduleDraw();
 }
 
@@ -145,11 +236,15 @@ export function clearMasks() {
   board.selectedMaskIndices = [];
   board.hoveredMaskIdx = -1;
   board.lassoPoints = [];
+  board.freehandPoints = [];
+  board.freehandActive = false;
+  board.freehandIsErase = false;
+  board.regionStrokeActive = false;
   _scheduleDraw();
 }
 
 /* ============================================================
-   Selection (each cancels any in-progress lasso draft)
+   Selection
    ============================================================ */
 
 export function isMaskSelected(idx) {
@@ -301,12 +396,13 @@ export function clearSelectedMaskRegion() {
   const m = selectedMask();
   if (!m || !m.regionCanvas) return false;
   m.regionCanvas = null;
+  m._regionEdgePoints = null;
+  m._regionChains = null;
+  board.regionStrokeActive = false;
   _scheduleDraw();
   return true;
 }
 
-/* Brush stroke — paints or erases a circular disc at (ix, iy) interpolated
-   from (lastX, lastY). Does not render; caller calls drawView(). */
 export function paintRegionStroke(ix, iy, isErase, lastX, lastY) {
   const m = selectedMask();
   if (!m) return false;
@@ -328,11 +424,14 @@ export function paintRegionStroke(ix, iy, isErase, lastX, lastY) {
     rctx.fillStyle = color;
     rctx.fill();
   }
+
+  board.regionStrokeActive = true;
+  board.regionStrokeIsErase = !!isErase;
+  m._regionEdgePoints = null;   // invalidate edge cache
+  m._regionChains = null;       // invalidate even-dot chain cache
   return true;
 }
 
-/* Lasso polygon fill — fills a polygon (or erases it) into the region.
-   Does not render; caller calls drawView(). */
 export function fillLassoPolygonInRegion(points, isErase) {
   const m = selectedMask();
   if (!m || points.length < 3) return false;
@@ -345,6 +444,8 @@ export function fillLassoPolygonInRegion(points, isErase) {
   rctx.closePath();
   rctx.fillStyle = isErase ? "rgba(0,0,0,1)" : "rgba(255, 200, 80, 1)";
   rctx.fill();
+  m._regionEdgePoints = null;
+  m._regionChains = null;
   return true;
 }
 
@@ -580,7 +681,7 @@ export async function compositeRefineWithRegion(oldB64, newB64, regionCanvas) {
 }
 
 /* ============================================================
-   Image-fit rect
+   Image-fit rect — applies view.zoom and view.panX/panY
    ============================================================ */
 
 export function fittedImageRect() {
@@ -589,11 +690,12 @@ export function fittedImageRect() {
   const pad = 40;
   const sx = (cw - 2 * pad) / board.imageWidth;
   const sy = (ch - 2 * pad) / board.imageHeight;
-  const s  = Math.min(sx, sy, 1.0);
-  const w  = board.imageWidth  * s;
-  const h  = board.imageHeight * s;
-  const x0 = (cw - w) / 2;
-  const y0 = (ch - h) / 2;
+  const baseS = Math.min(sx, sy);
+  const s = baseS * view.zoom;
+  const w = board.imageWidth  * s;
+  const h = board.imageHeight * s;
+  const x0 = (cw - w) / 2 + view.panX;
+  const y0 = (ch - h) / 2 + view.panY;
   return { x0, y0, w, h, s };
 }
 
@@ -640,6 +742,7 @@ export function resize() {
   canvas.style.width  = cw + "px";
   canvas.style.height = ch + "px";
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  clampPan();
   if (_drawFn) _drawFn();
 }
 window.addEventListener("resize", resize);

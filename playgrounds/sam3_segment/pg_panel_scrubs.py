@@ -38,7 +38,7 @@ if (regionSizeEl) _installScrubInput(regionSizeEl, {
   write: (raw) => {
     board.regionSize = Math.max(2, Math.min(500, Math.round(raw)));
     pgkitNotifyLocal("region.size");
-    import("./pg_dispatch.js").then(m => m.drawView?.() || m.draw()).catch(() => {});
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   },
 });
 
@@ -71,39 +71,60 @@ if (regionModeEl) {
   regionModeEl.addEventListener("change", () => {
     board.regionMode = !!regionModeEl.checked;
     board.lassoPoints = [];
+    board.freehandPoints = [];
+    board.freehandActive = false;
     pgkitNotifyLocal("region.mode");
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   });
 }
 
+const regionSubtractEl = document.getElementById("regionSubtract");
+if (regionSubtractEl) {
+  regionSubtractEl.checked = !!board.regionSubtract;
+  regionSubtractEl.addEventListener("change", () => {
+    board.regionSubtract = !!regionSubtractEl.checked;
+    pgkitNotifyLocal("region.subtract");
+    // Redraw so the cursor/outline color switches immediately,
+    // and refresh the status line flag.
+    import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  });
+}
+
 /* ============================================================
-   Region tool radios
+   Tool radios
    ============================================================ */
 
-const regionToolBrush = document.getElementById("regionToolBrush");
-const regionToolLasso = document.getElementById("regionToolLasso");
+const regionToolBrush    = document.getElementById("regionToolBrush");
+const regionToolLasso    = document.getElementById("regionToolLasso");
+const regionToolFreehand = document.getElementById("regionToolFreehand");
+
 function _syncRegionToolRadios() {
-  if (regionToolBrush) regionToolBrush.checked = (board.regionTool === 'brush');
-  if (regionToolLasso) regionToolLasso.checked = (board.regionTool === 'lasso');
+  if (regionToolBrush)    regionToolBrush.checked    = (board.regionTool === 'brush');
+  if (regionToolLasso)    regionToolLasso.checked    = (board.regionTool === 'lasso');
+  if (regionToolFreehand) regionToolFreehand.checked = (board.regionTool === 'freehand');
 }
 _syncRegionToolRadios();
+
+function _setRegionTool(tool) {
+  board.regionTool = tool;
+  board.lassoPoints = [];
+  board.freehandPoints = [];
+  board.freehandActive = false;
+  board.freehandIsErase = false;
+  pgkitNotifyLocal("region.tool");
+  import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
+  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+}
+
 if (regionToolBrush) regionToolBrush.addEventListener("change", () => {
-  if (regionToolBrush.checked) {
-    board.regionTool = 'brush';
-    board.lassoPoints = [];
-    pgkitNotifyLocal("region.tool");
-    import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
-    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-  }
+  if (regionToolBrush.checked) _setRegionTool('brush');
 });
 if (regionToolLasso) regionToolLasso.addEventListener("change", () => {
-  if (regionToolLasso.checked) {
-    board.regionTool = 'lasso';
-    board.lassoPoints = [];
-    pgkitNotifyLocal("region.tool");
-    import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
-    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-  }
+  if (regionToolLasso.checked) _setRegionTool('lasso');
+});
+if (regionToolFreehand) regionToolFreehand.addEventListener("change", () => {
+  if (regionToolFreehand.checked) _setRegionTool('freehand');
 });
 
 /* ============================================================
@@ -203,6 +224,8 @@ pgkitRegisterField("region.mode", {
   set: (v) => {
     board.regionMode = !!v;
     board.lassoPoints = [];
+    board.freehandPoints = [];
+    board.freehandActive = false;
     if (regionModeEl && document.activeElement !== regionModeEl)
       regionModeEl.checked = board.regionMode;
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
@@ -213,14 +236,29 @@ pgkitRegisterField("region.mode", {
 pgkitRegisterField("region.tool", {
   get: () => board.regionTool,
   set: (v) => {
-    if (v !== 'brush' && v !== 'lasso') return;
+    if (v !== 'brush' && v !== 'lasso' && v !== 'freehand') return;
     board.regionTool = v;
     board.lassoPoints = [];
+    board.freehandPoints = [];
+    board.freehandActive = false;
     _syncRegionToolRadios();
     import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   },
-  meta: { kind: "enum", label: "Region tool", options: ["brush", "lasso"] },
+  meta: { kind: "enum", label: "Region tool",
+          options: ["brush", "lasso", "freehand"] },
+});
+
+pgkitRegisterField("region.subtract", {
+  get: () => !!board.regionSubtract,
+  set: (v) => {
+    board.regionSubtract = !!v;
+    if (regionSubtractEl && document.activeElement !== regionSubtractEl)
+      regionSubtractEl.checked = board.regionSubtract;
+    import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  },
+  meta: { kind: "bool", label: "Region subtract mode" },
 });
 
 pgkitRegisterField("region.size", {

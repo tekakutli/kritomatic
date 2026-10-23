@@ -70,7 +70,6 @@ export function syncPanelFields() {
     }
   }
 
-  // Region size row only visible when tool = brush
   if (e.regionSizeRow) {
     e.regionSizeRow.style.display = (board.regionTool === 'brush') ? "" : "none";
   }
@@ -78,8 +77,12 @@ export function syncPanelFields() {
   if (e.regionStatus) {
     let text;
     if (!m) text = "select a mask";
-    else if (board.lassoPoints.length > 0) {
+    else if (board.freehandActive) {
+      text = "freehand \u2014 " + board.freehandPoints.length + " pts";
+    } else if (board.lassoPoints.length > 0) {
       text = "lasso drafting \u2014 " + board.lassoPoints.length + " vertex/vertices";
+    } else if (board.regionStrokeActive) {
+      text = "painting\u2026";
     } else if (m.regionCanvas) {
       text = "region active \u2014 refine is constrained";
     } else {
@@ -102,6 +105,7 @@ export function syncPanelFields() {
     const flags = [];
     if (board.autoRun)    flags.push("auto-run");
     if (board.regionMode) flags.push("region:" + board.regionTool);
+    if (board.regionMode && board.regionSubtract) flags.push("subtract");
     const suffix = flags.length ? " \u00b7 " + flags.join(" \u00b7 ") : "";
     let text, cls = "";
     if (board.running) {

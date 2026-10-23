@@ -7,6 +7,10 @@ Routes:
   POST /comfy/refine         Refine mask → SAM2 (true refine) or SAM3 (re-detect)
   POST /comfy/interrupt      forward POST /interrupt to ComfyUI
   GET  /comfy/status         preflight
+
+  GET  /krita/status         kritomatic daemon reachable?
+  POST /krita/apply          send a mask to Krita (selection / transparency mask)
+  POST /krita/import         fetch active document composite from Krita
 """
 
 from __future__ import annotations
@@ -25,6 +29,8 @@ from pg_comfy import (
     EncodedImage, KritaResources, expand_custom, get_client, reset_client,
 )
 from pg_comfy.image import make_encoded_image
+
+import krita_client
 
 
 COMFY_HOST = "127.0.0.1"
@@ -267,8 +273,6 @@ def _build_segment_params(payload: dict, image_w: int, image_h: int,
     }
 
 
-# ---------- Segment All (SAM3, no mask) -----------------------------------
-
 def handle_segment(payload: dict) -> dict:
     hash_hex = payload.get("hash")
     if not hash_hex:
@@ -309,8 +313,6 @@ def handle_segment(payload: dict) -> dict:
         result["backend"] = "sam3"
     return result
 
-
-# ---------- Refine --------------------------------------------------------
 
 def _build_refine_sam2_params(payload: dict) -> dict:
     """SAM2 coordinate format: [{"x": int, "y": int}, ...].
@@ -368,9 +370,6 @@ def _run_refine_sam3(payload: dict, image_entry: dict,
         canvas_image=image_enc,
         canvas_extent=(image_enc.width, image_enc.height),
     )
-    # SAM3 refine path: force individual_masks=true so all detections
-    # in the mask's bbox can contribute. Client sends mask.textPrompt
-    # as `text`, and `bbox` = mask bbox expanded by positive points.
     params = _build_segment_params(
         payload, image_entry["width"], image_entry["height"],
         individual_masks_override=True,
@@ -406,11 +405,9 @@ def handle_refine(payload: dict) -> dict:
         return {"success": False,
                 "message": f"ComfyUI unreachable: {e}"}
 
-    # User explicitly wants SAM3.
     if model == "sam3":
         return _run_refine_sam3(payload, image_entry, client)
 
-    # User wants SAM2: try SAM2, fall back to SAM3 on any failure.
     refine_wf = _get_refine_workflow()
     if refine_wf is not None and _SAM2_NODE in info:
         try:
@@ -434,11 +431,121 @@ def handle_interrupt(_payload) -> dict:
         return {"success": False, "message": str(e)}
 
 
+# -- Krita export / import ------------------------------------------------
+
+def handle_krita_status(_payload) -> dict:
+    reachable = krita_client.is_reachable()
+    return {"success": True, "reachable": reachable}
+
+
+def handle_krita_apply(payload: dict) -> dict:
+    """Forward a mask to Krita via the kritomatic daemon.
+
+    Modes:
+      'selection'    → daemon command set_selection_from_mask_b64
+      'transparency' → daemon command apply_transparency_mask_b64
+    """
+    mask_b64 = payload.get("mask_b64")
+    if not mask_b64:
+        return {"success": False, "message": "no mask_b64"}
+
+    mode = payload.get("mode")
+    if mode not in ("selection", "transparency"):
+        return {"success": False, "message": f"unknown mode: {mode!r}"}
+
+    if mode == "selection":
+        sel_mode = payload.get("sel_mode") or "replace"
+        if sel_mode not in ("replace", "add", "subtract"):
+            return {"success": False,
+                    "message": f"unknown sel_mode: {sel_mode!r}"}
+        command = {
+            "type": "set_selection_from_mask_b64",
+            "mask_b64": mask_b64,
+            "mode": sel_mode,
+        }
+    else:  # transparency
+        command = {
+            "type": "apply_transparency_mask_b64",
+            "mask_b64": mask_b64,
+            "layer_name": payload.get("layer_name") or "",
+            "invert": bool(payload.get("invert", False)),
+        }
+
+    response = krita_client.send(command, timeout=60.0)
+    if response.get("status") == "success":
+        return {
+            "success": True,
+            "message": response.get("message") or "applied",
+            "data": response.get("data") or {},
+        }
+    return {
+        "success": False,
+        "message": response.get("message") or "daemon rejected the command",
+    }
+
+
+def handle_krita_import(payload: dict) -> dict:
+    """Fetch the active document's composite from Krita and cache it.
+
+    Returns the same {hash, width, height, data_url} shape as the
+    upload endpoint, so the browser can call setImage() exactly as it
+    would after a file upload.
+    """
+    name = None
+    if isinstance(payload, dict):
+        name = payload.get("name")
+    command = {"type": "get_document_composite_b64"}
+    if name:
+        command["name"] = name
+
+    response = krita_client.send(command, timeout=60.0)
+    if response.get("status") != "success":
+        return {"success": False,
+                "message": response.get("message") or "daemon rejected"}
+
+    data = response.get("data") or {}
+    data_url = data.get("data_url")
+    if not data_url:
+        return {"success": False, "message": "daemon returned no data_url"}
+    if not data_url.startswith("data:image/png;base64,"):
+        return {"success": False,
+                "message": f"unexpected data_url prefix: {data_url[:30]!r}"}
+
+    try:
+        png_bytes = base64.b64decode(data_url.split(",", 1)[1])
+    except Exception as e:
+        return {"success": False,
+                "message": f"could not decode base64: {e}"}
+
+    try:
+        encoded = make_encoded_image(png_bytes)
+    except Exception as e:
+        return {"success": False,
+                "message": f"could not decode image: {e}"}
+
+    h = encoded.content_hash
+    filename = data.get("name") or "krita_composite"
+    _cache_image(h, png_bytes, encoded.width, encoded.height, filename)
+    _log(f"import {filename!r} {encoded.width}x{encoded.height} → {h}")
+
+    return {
+        "success": True,
+        "hash": h,
+        "width": encoded.width,
+        "height": encoded.height,
+        "data_url": data_url,
+        "filename": filename,
+    }
+
+
 ROUTES = {
     "/comfy/status":    handle_status,
     "/comfy/segment":   handle_segment,
     "/comfy/refine":    handle_refine,
     "/comfy/interrupt": handle_interrupt,
+    "/krita/status":    handle_krita_status,
+    "/krita/apply":     handle_krita_apply,
+    "/krita/import":    handle_krita_import,
 }
 
 RAW_ROUTES = {

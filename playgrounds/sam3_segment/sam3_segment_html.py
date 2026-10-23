@@ -14,6 +14,7 @@ from pg_core import CORE_JS
 from pg_view import VIEW_JS
 from pg_dispatch import DISPATCH_JS
 from pg_comfy_client import COMFY_CLIENT_JS
+from pg_krita_client import KRITA_CLIENT_JS
 from pg_panel_fields import PANEL_FIELDS_JS
 from pg_panel_lists import PANEL_LISTS_JS
 from pg_panel_scrubs import PANEL_SCRUBS_JS
@@ -72,6 +73,7 @@ _MODULE_SOURCES = {
     "pg_view.js":             VIEW_JS,
     "pg_dispatch.js":         DISPATCH_JS,
     "pg_comfy_client.js":     COMFY_CLIENT_JS,
+    "pg_krita_client.js":     KRITA_CLIENT_JS,
     "pg_panel_fields.js":     PANEL_FIELDS_JS,
     "pg_panel_lists.js":      PANEL_LISTS_JS,
     "pg_panel_scrubs.js":     PANEL_SCRUBS_JS,

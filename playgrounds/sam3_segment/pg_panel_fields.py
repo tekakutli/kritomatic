@@ -25,6 +25,10 @@ function _get() {
     clearPointsBtn: document.getElementById("clearPointsBtn"),
     exportBtn:      document.getElementById("exportBtn"),
     exportCombBtn:  document.getElementById("exportCombinedBtn"),
+    kritaStatus:    document.getElementById("kritaStatus"),
+    kritaImportBtn: document.getElementById("kritaImportBtn"),
+    kritaSelBtn:    document.getElementById("kritaSelectionBtn"),
+    kritaTransBtn:  document.getElementById("kritaTransparencyBtn"),
   };
   return _els;
 }
@@ -160,5 +164,9 @@ export function syncPanelFields() {
   }
   if (e.exportBtn)     e.exportBtn.disabled = !hasMasks;
   if (e.exportCombBtn) e.exportCombBtn.disabled = !hasMasks;
+
+  if (e.kritaImportBtn) e.kritaImportBtn.disabled = busy;
+  if (e.kritaSelBtn)    e.kritaSelBtn.disabled    = !hasMasks;
+  if (e.kritaTransBtn)  e.kritaTransBtn.disabled  = !hasMasks;
 }
 """

@@ -84,8 +84,6 @@ if (regionSubtractEl) {
   regionSubtractEl.addEventListener("change", () => {
     board.regionSubtract = !!regionSubtractEl.checked;
     pgkitNotifyLocal("region.subtract");
-    // Redraw so the cursor/outline color switches immediately,
-    // and refresh the status line flag.
     import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   });
@@ -330,5 +328,17 @@ pgkitRegisterField("masks.selectedIndex", {
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   },
   meta: { kind: "number", label: "First selected mask" },
+});
+
+pgkitRegisterField("krita.targetLayer", {
+  get: () => {
+    const el = document.getElementById("kritaTargetLayer");
+    return el ? (el.value || "") : "";
+  },
+  set: (v) => {
+    const el = document.getElementById("kritaTargetLayer");
+    if (el && document.activeElement !== el) el.value = String(v || "");
+  },
+  meta: { kind: "text", label: "Krita target layer" },
 });
 """

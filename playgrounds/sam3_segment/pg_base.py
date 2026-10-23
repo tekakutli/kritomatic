@@ -61,6 +61,48 @@ PG_CSS = r"""
     color: #d8ffe0;
   }
 
+  /* Export to Krita */
+  #ui button#kritaCheckBtn {
+    border-color: rgba(140, 225, 160, 0.72);
+    color: #b8ecff;
+    font-size: 9px;
+    padding: 2px 8px;
+    width: auto;
+  }
+  #ui button#kritaCheckBtn:hover:not(:disabled) {
+    border-color: rgba(160, 240, 180, 1.00);
+    background: rgba(140, 225, 160, 0.10);
+    color: #d8ffe0;
+  }
+  #ui button#kritaSelectionBtn,
+  #ui button#kritaTransparencyBtn {
+    border-color: rgba(140, 225, 160, 0.72);
+    color: #b8ecff;
+  }
+  #ui button#kritaSelectionBtn:hover:not(:disabled),
+  #ui button#kritaTransparencyBtn:hover:not(:disabled) {
+    border-color: rgba(160, 240, 180, 1.00);
+    background: rgba(140, 225, 160, 0.10);
+    color: #d8ffe0;
+  }
+  #ui button#kritaImportBtn {
+    border-color: rgba(140, 225, 160, 0.72);
+    color: #b8ecff;
+  }
+  #ui button#kritaImportBtn:hover:not(:disabled) {
+    border-color: rgba(160, 240, 180, 1.00);
+    background: rgba(140, 225, 160, 0.10);
+    color: #d8ffe0;
+  }
+  #kritaStatus {
+    font-size: 10px;
+    color: #5a6774;
+    margin-left: 8px;
+  }
+  #kritaStatus.ok   { color: #00e5ff; }
+  #kritaStatus.bad  { color: #d48590; }
+  #kritaStatus.warn { color: #ffe600; }
+
   #maskPromptRow textarea {
     width:100%;background:#0d1219;color:#00e5ff;
     border:1px solid #223040;border-radius:2px;
@@ -181,6 +223,10 @@ PG_PANEL_BODY = r"""
       <div class="section-body">
         <div class="row">
           <button id="pickImageBtn" title="Pick an image file">+ Pick image…</button>
+          <button id="kritaImportBtn"
+                  title="Import the active document's composite from Krita">
+            + Import from Krita
+          </button>
           <button id="clearImageBtn" title="Clear the current image">Clear</button>
         </div>
         <div id="imageInfo">No image loaded — drop one on the canvas</div>
@@ -314,6 +360,43 @@ PG_PANEL_BODY = r"""
                   title="Download a single PNG containing the union of selected masks">
             Export combined
           </button>
+        </div>
+      </div>
+    </details>
+
+    <details class="section" open>
+      <summary>Export to Krita</summary>
+      <div class="section-body">
+        <div class="row">
+          <button id="kritaCheckBtn">Check Krita</button>
+          <span id="kritaStatus">not checked</span>
+        </div>
+        <div class="field" style="margin-top:4px;">
+          <label>Target layer</label>
+          <input type="text" id="kritaTargetLayer" autocomplete="off"
+                 spellcheck="false" placeholder="(blank = active layer)"
+                 style="flex:1 1 auto;min-width:0;background:transparent;
+                        border:0;border-bottom:1px solid #223040;
+                        color:#00e5ff;font-family:inherit;font-size:12px;
+                        font-weight:700;padding:2px 4px;outline:none;">
+        </div>
+        <div class="row">
+          <button id="kritaSelectionBtn"
+                  title="Set the document selection from the selected masks (union)">
+            Set as selection
+          </button>
+        </div>
+        <div class="row">
+          <button id="kritaTransparencyBtn"
+                  title="Add a transparency mask to the target layer using the selected masks (union)">
+            Add transparency mask
+          </button>
+        </div>
+        <div class="runHint">
+          Requires the kritomatic daemon running in Krita with
+          <code>set_selection_from_mask_b64</code> and
+          <code>apply_transparency_mask_b64</code> registered.
+          Blank target layer = current active layer.
         </div>
       </div>
     </details>

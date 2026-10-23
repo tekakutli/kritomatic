@@ -630,3 +630,81 @@ class DocumentHandler(AutoDispatchHandler):
                     'message': f'Opened a view for {doc.name() or key}'}
         except Exception as e:
             return {'success': False, 'message': str(e)}
+
+    @command(
+        category='doc',
+        help_text='Get a full-resolution base64 PNG data URL of a '
+                  'document composite (all visible layers flattened).',
+        args={
+            '--name': {'type': 'str', 'required': False,
+                       'help': 'Document name (defaults to active)'},
+        }
+    )
+    def get_document_composite_b64(self, params):
+        try:
+            app = Krita.instance()
+            name = params.get('name') if isinstance(params, dict) else None
+            if name:
+                doc = next((d for d in app.documents()
+                            if d.name() == name), None)
+            else:
+                doc = app.activeDocument()
+
+            if not doc:
+                return {'success': False,
+                        'message': 'No matching document'}
+
+            # projection() returns a null QImage when the document's
+            # composite cache has been invalidated — e.g. a fresh
+            # load where no repaint pass has run yet, or a doc whose
+            # active layer was just switched from another thread.
+            # The same fallback ladder _fresh_thumbnail uses for
+            # get_all_document_thumbnails is what's needed here:
+            # try projection(), force a refreshProjection() and
+            # retry, and finally fall back to doc.thumbnail() at
+            # full resolution, which goes through a different render
+            # path.
+            #
+            # Threading: this command is dispatched through
+            # _HandlerBox.dispatch, which only spawns a worker thread
+            # for commands whose type starts with 'comfy_'.  A
+            # non-comfy command runs synchronously on the GUI thread,
+            # so refreshProjection() here is safe — it is the same
+            # call _fresh_thumbnail already makes when the Krita
+            # docker asks for a thumbnail.
+            qimg = doc.projection()
+
+            if qimg is None or qimg.isNull():
+                try:
+                    doc.refreshProjection()
+                    qimg = doc.projection()
+                except Exception:
+                    pass
+
+            if qimg is None or qimg.isNull():
+                try:
+                    qimg = doc.thumbnail(doc.width(), doc.height())
+                except Exception:
+                    qimg = None
+
+            if qimg is None or qimg.isNull():
+                return {'success': False,
+                        'message': 'Document composite is null'}
+
+            data_url = self._qimage_to_data_url(qimg)
+            if data_url is None:
+                return {'success': False,
+                        'message': 'Could not encode composite as PNG'}
+
+            return {
+                'success': True,
+                'message': f'Got composite for {doc.name()}',
+                'data': {
+                    'name':     doc.name(),
+                    'width':    doc.width(),
+                    'height':   doc.height(),
+                    'data_url': data_url,
+                },
+            }
+        except Exception as e:
+            return {'success': False, 'message': str(e)}

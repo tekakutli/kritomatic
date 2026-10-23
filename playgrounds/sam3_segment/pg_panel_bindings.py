@@ -12,6 +12,8 @@ import { syncPanelFields } from "./pg_panel_fields.js";
 import { uploadImageFile, runSegmentAll, runRefine,
          interruptSegmentation, fetchStatus }
   from "./pg_comfy_client.js";
+import { checkKritaStatus, applyToKrita, importFromKrita }
+  from "./pg_krita_client.js";
 import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyAll,
 } from "./pgkit/remote_client.js";
@@ -144,7 +146,6 @@ export async function runRefineAction() {
       return;
     }
 
-    // Region composite: only rewrite inside the painted region.
     if (mask.regionCanvas) {
       try {
         combinedB64 = await compositeRefineWithRegion(
@@ -154,7 +155,6 @@ export async function runRefineAction() {
         flashStatus(
           "region composite failed: " + e.message
           + " (used full refine)", "warn");
-        // continue with unconstrained refined mask
       }
     }
 
@@ -329,6 +329,127 @@ async function _exportCombinedAction() {
 }
 
 /* ============================================================
+   Export to Krita
+   ============================================================ */
+
+function _kritaMarkReachable() {
+  const el = document.getElementById("kritaStatus");
+  if (!el) return;
+  el.textContent = "\u2713 reachable";
+  el.className = "ok";
+  el.title = "Kritomatic daemon at localhost:12346";
+}
+
+function _kritaMarkUnreachable(reason) {
+  const el = document.getElementById("kritaStatus");
+  if (!el) return;
+  el.textContent = "\u2717 " + (reason || "not reachable");
+  el.className = "bad";
+  el.title = "Start Krita with the Kritomatic Daemon plugin enabled";
+}
+
+async function _kritaStatusRefresh() {
+  const s = await checkKritaStatus();
+  if (s.reachable) _kritaMarkReachable();
+  else             _kritaMarkUnreachable(s.message || "not reachable");
+}
+
+function _kritaGetTargetLayer() {
+  const el = document.getElementById("kritaTargetLayer");
+  return el ? (el.value || "").trim() : "";
+}
+
+async function _kritaExportSelection() {
+  const indices = board.selectedMaskIndices.slice();
+  if (indices.length === 0) {
+    flashStatus("no masks selected", "warn");
+    return;
+  }
+  const b64s = indices.map(i => board.masks[i].b64);
+  const unionB64 = await _unionMasksB64(b64s);
+  if (!unionB64) {
+    flashStatus("could not combine masks", "bad");
+    return;
+  }
+  flashStatus("sending selection to Krita\u2026", "");
+  const res = await applyToKrita({
+    maskB64: unionB64,
+    mode: "selection",
+    selMode: "replace",
+  });
+  if (res.success) {
+    flashStatus("selection applied to Krita", "ok");
+    _kritaMarkReachable();
+  } else {
+    flashStatus("failed: " + (res.message || "unknown"), "bad");
+    if (/unreachable|connect|refused|timeout/i.test(res.message || "")) {
+      _kritaMarkUnreachable(res.message);
+    }
+  }
+}
+
+async function _kritaExportTransparency() {
+  const indices = board.selectedMaskIndices.slice();
+  if (indices.length === 0) {
+    flashStatus("no masks selected", "warn");
+    return;
+  }
+  const b64s = indices.map(i => board.masks[i].b64);
+  const unionB64 = await _unionMasksB64(b64s);
+  if (!unionB64) {
+    flashStatus("could not combine masks", "bad");
+    return;
+  }
+  flashStatus("sending transparency mask to Krita\u2026", "");
+  const res = await applyToKrita({
+    maskB64: unionB64,
+    mode: "transparency",
+    layerName: _kritaGetTargetLayer(),
+  });
+  if (res.success) {
+    const d = res.data || {};
+    const target = d.layer_name ? (" on " + d.layer_name) : "";
+    flashStatus("transparency mask applied" + target, "ok");
+    _kritaMarkReachable();
+  } else {
+    flashStatus("failed: " + (res.message || "unknown"), "bad");
+    if (/unreachable|connect|refused|timeout/i.test(res.message || "")) {
+      _kritaMarkUnreachable(res.message);
+    }
+  }
+}
+
+/* ============================================================
+   Import from Krita
+   ============================================================ */
+
+async function _kritaImportAction() {
+  flashStatus("importing from Krita\u2026", "");
+  try {
+    const res = await importFromKrita({});
+    if (!res.success) {
+      flashStatus("import failed: " + (res.message || "unknown"), "bad");
+      if (/unreachable|connect|refused|timeout/i.test(res.message || "")) {
+        _kritaMarkUnreachable(res.message);
+      }
+      return;
+    }
+    setImage(res.hash, res.data_url, res.width, res.height);
+    flashStatus(
+      "imported from Krita: " + (res.filename || "") +
+      " (" + res.width + "\u00d7" + res.height + ")", "ok",
+    );
+    _kritaMarkReachable();
+    syncPanelFields();
+    syncMaskList();
+    pgkitNotifyAll();
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  } catch (e) {
+    flashStatus("import failed: " + e.message, "bad");
+  }
+}
+
+/* ============================================================
    Install buttons
    ============================================================ */
 
@@ -337,7 +458,9 @@ export function installPanelBindings() {
   const ids = [
     "runBtn", "segmentAllBtn", "cancelBtn", "undoBtn",
     "clearPointsBtn", "clearRegionBtn", "pickImageBtn", "clearImageBtn",
+    "kritaImportBtn",
     "exportBtn", "exportCombinedBtn",
+    "kritaCheckBtn", "kritaSelectionBtn", "kritaTransparencyBtn",
   ];
   for (const id of ids) el[id] = document.getElementById(id);
 
@@ -349,8 +472,13 @@ export function installPanelBindings() {
   if (el.clearRegionBtn) el.clearRegionBtn.addEventListener("click", _clearRegionAction);
   if (el.pickImageBtn)  el.pickImageBtn.addEventListener("click", _pickImageAction);
   if (el.clearImageBtn) el.clearImageBtn.addEventListener("click", _clearImageAction);
+  if (el.kritaImportBtn) el.kritaImportBtn.addEventListener("click", _kritaImportAction);
   if (el.exportBtn)     el.exportBtn.addEventListener("click", _exportAction);
   if (el.exportCombinedBtn) el.exportCombinedBtn.addEventListener("click", _exportCombinedAction);
+
+  if (el.kritaCheckBtn)        el.kritaCheckBtn.addEventListener("click", _kritaStatusRefresh);
+  if (el.kritaSelectionBtn)    el.kritaSelectionBtn.addEventListener("click", _kritaExportSelection);
+  if (el.kritaTransparencyBtn) el.kritaTransparencyBtn.addEventListener("click", _kritaExportTransparency);
 
   const statusEl = document.getElementById("statusLine");
   if (statusEl) {
@@ -427,6 +555,23 @@ pgkitRegisterAction("action.exportSelected", {
 pgkitRegisterAction("action.exportCombined", {
   label: "Export combined", scope: "global", run: _exportCombinedAction,
   meta: { variant: "plain" },
+});
+
+pgkitRegisterAction("action.kritaCheck", {
+  label: "Check Krita", scope: "global", run: _kritaStatusRefresh,
+  meta: { variant: "plain" },
+});
+pgkitRegisterAction("action.kritaImport", {
+  label: "Import from Krita", scope: "global", run: _kritaImportAction,
+  meta: { variant: "plain" },
+});
+pgkitRegisterAction("action.kritaSelection", {
+  label: "Set as selection", scope: "global", run: _kritaExportSelection,
+  meta: { variant: "primary" },
+});
+pgkitRegisterAction("action.kritaTransparency", {
+  label: "Add transparency mask", scope: "global", run: _kritaExportTransparency,
+  meta: { variant: "primary" },
 });
 
 /* ============================================================
@@ -510,5 +655,6 @@ export function samBootSync() {
   syncMaskList();
   pgkitNotifyAll();
   _checkStatusAction();
+  _kritaStatusRefresh();
 }
 """

@@ -1,7 +1,8 @@
 import base64
+import uuid
 import numpy as np
 from PyQt6.QtGui import QImage
-from PyQt6.QtCore import QByteArray, Qt
+from PyQt6.QtCore import QByteArray, QBuffer, QIODevice, Qt
 
 from krita import *
 from ..decorators import command, AutoDispatchHandler
@@ -640,5 +641,445 @@ class MaskHandler(AutoDispatchHandler):
                              'mode': mode,
                              'bounds': {'x': bx, 'y': by,
                                         'w': bw, 'h': bh}}}
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    # ------------------------------------------------------------------
+    # Import masks from Krita into the playground's mask stack
+    # ------------------------------------------------------------------
+    #
+    # Reads one or more Krita layers as grayscale PNG masks. The
+    # playground uses this to pull masks that already exist in the
+    # user's document — a hand-painted silhouette, a transparency mask
+    # applied to a layer, a selection the user made before opening the
+    # playground — into its own mask stack for refinement or export.
+    #
+    # Two kinds of layer are usable as a mask:
+    #
+    #   - mask-type layers (transparencymask, selectionmask): their
+    #     grayscale pixel data IS the mask, taken directly.
+    #
+    #   - image-bearing layers (paint, group, file, vector, clone,
+    #     fill, filter): their projection's alpha channel is the mask,
+    #     so "what is opaque" becomes "what is selected".
+    #
+    # Which layers get read:
+    #
+    #   - If `layer_names` is given, exactly those, in order.
+    #   - Otherwise, the currently selected layer(s) in Krita. Krita's
+    #     Python API exposes multi-layer selection inconsistently
+    #     across versions; this command tries four accessors in order
+    #     and falls back to `Document.activeNode()`. The response
+    #     message reflects which path succeeded so the caller can tell
+    #     "I selected three masks and got three" from "multi-select
+    #     detection wasn't available, only the active one came through".
+    #
+    # Dimension note: masks are returned at the document's full canvas
+    # dimensions, matching what the playground image will be when the
+    # user imported it from Krita. If the playground image has a
+    # different size, the JS side scales masks at use time (the same
+    # way masks from Segment All do), so this is safe but the caller
+    # should warn about mismatches.
+
+    @command(
+        category='mask',
+        help_text='Read one or more Krita layers as base64 PNG masks. '
+                  'Used by the playground to import masks that already '
+                  'exist in the document into its mask stack.',
+        args={
+            '--layer_names': {'type': 'str', 'required': False,
+                              'help': 'Comma-separated layer names. Empty '
+                                      '= use the selected layer(s) in '
+                                      'Krita, falling back to the active '
+                                      'layer if multi-selection detection '
+                                      'is unavailable.'},
+            '--include_paint_alpha': {'type': 'bool', 'default': True,
+                                      'help': 'For paint/group layers, '
+                                              'use the alpha channel as a '
+                                              'mask. Set false to import '
+                                              'only actual mask layers '
+                                              '(transparency / selection).'},
+        },
+    )
+    def import_krita_masks_b64(self, params):
+        try:
+            doc = Krita.instance().activeDocument()
+            if not doc:
+                return {'success': False, 'message': 'No active document'}
+
+            names_raw = params.get('layer_names', '') or ''
+            names = [p.strip() for p in str(names_raw).split(',') if p.strip()]
+            include_paint_alpha = bool(params.get('include_paint_alpha', True))
+
+            # Pick which nodes to read
+            selection_path = 'layer_names'
+            if names:
+                nodes = []
+                for name in names:
+                    node = resolve_node(doc, name)
+                    if node:
+                        nodes.append(node)
+            else:
+                nodes, selection_path = self._get_selected_or_active_nodes(doc)
+
+            if not nodes:
+                return {'success': False,
+                        'message': 'No layers selected and no layer names '
+                                   'given.'}
+
+            doc_w = int(doc.width())
+            doc_h = int(doc.height())
+            if doc_w <= 0 or doc_h <= 0:
+                return {'success': False,
+                        'message': f'Document has no drawable extent '
+                                   f'({doc_w}x{doc_h}).'}
+
+            masks = []
+            skipped = []
+
+            for node in nodes:
+                name = node.name() or '(unnamed)'
+                ntype = node.type() or ''
+                try:
+                    result = self._read_node_as_mask(
+                        node, doc_w, doc_h, include_paint_alpha
+                    )
+                except Exception as e:
+                    skipped.append({'name': name, 'reason': str(e)})
+                    continue
+
+                if result is None:
+                    skipped.append({
+                        'name': name,
+                        'reason': f'layer type {ntype!r} cannot be read as '
+                                  f'a mask'
+                                  + ('' if include_paint_alpha
+                                     else ' (paint-alpha disabled)'),
+                    })
+                    continue
+
+                mask_b64, kind = result
+                masks.append({
+                    'name': name,
+                    'type': ntype,
+                    'source': kind,   # 'mask' for mask layers, 'alpha' for image layers
+                    'width': doc_w,
+                    'height': doc_h,
+                    'mask_b64': mask_b64,
+                })
+
+            msg = f'Imported {len(masks)} mask(s)'
+            if skipped:
+                msg += f', {len(skipped)} skipped'
+            if selection_path == 'active_only':
+                msg += ' (multi-selection unavailable; imported active layer)'
+
+            return {
+                'success': True,
+                'message': msg,
+                'data': {
+                    'masks': masks,
+                    'skipped': skipped,
+                    'selection_path': selection_path,
+                },
+            }
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    def _get_selected_or_active_nodes(self, doc):
+        """Best-effort multi-layer selection detection.
+
+        Krita's Python API exposes `activeNode()` reliably but not
+        multi-layer selection consistently. Different Krita builds
+        expose the selection state through different accessors. This
+        method tries four candidates in order:
+
+          1. View.selectedNodes()      — the view object's own list
+          2. Document.selectedNodes()  — the document object's own list
+          3. Node.isSelected() walk    — per-node selection predicate
+          4. Fallback: activeNode()    — always available, single node
+
+        Returns (nodes, path_label), where path_label is one of
+        'view.selectedNodes', 'doc.selectedNodes', 'node.isSelected',
+        or 'active_only'.
+        """
+        # 1. View.selectedNodes()
+        try:
+            view = Krita.instance().activeWindow().activeView()
+            if view is not None and hasattr(view, 'selectedNodes'):
+                try:
+                    nodes = list(view.selectedNodes())
+                    if nodes:
+                        return nodes, 'view.selectedNodes'
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 2. Document.selectedNodes()
+        try:
+            if hasattr(doc, 'selectedNodes'):
+                try:
+                    nodes = list(doc.selectedNodes())
+                    if nodes:
+                        return nodes, 'doc.selectedNodes'
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 3. Node.isSelected() walk
+        try:
+            acc = []
+            def walk(node):
+                try:
+                    if hasattr(node, 'isSelected') and node.isSelected():
+                        acc.append(node)
+                except Exception:
+                    pass
+                try:
+                    for child in node.childNodes():
+                        walk(child)
+                except Exception:
+                    pass
+            walk(doc.rootNode())
+            if acc:
+                return acc, 'node.isSelected'
+        except Exception:
+            pass
+
+        # 4. Fallback
+        active = doc.activeNode()
+        if active:
+            return [active], 'active_only'
+        return [], 'active_only'
+
+    def _read_node_as_mask(self, node, doc_w, doc_h, include_paint_alpha):
+        """Read one layer as a grayscale PNG mask.
+
+        Returns (mask_b64, kind) where kind is 'mask' or 'alpha', or
+        None if the layer cannot be read as a mask.
+
+        mask-type layers (transparencymask, selectionmask):
+            read pixelData directly. Krita returns grayscale bytes at
+            full canvas extent, padded with 0 (unselected) outside the
+            mask's own bounds, which matches the playground's
+            full-canvas mask convention.
+
+        image-bearing layers (paint, group, file, vector, clone, fill,
+        filter):
+            read projectionPixelData (RGBA), take every 4th byte (alpha
+            channel) as the mask. Enabled by `include_paint_alpha`.
+        """
+        if node is None or doc_w <= 0 or doc_h <= 0:
+            return None
+
+        ntype = node.type() or ''
+        mask_types = ('transparencymask', 'selectionmask')
+        image_types = ('paintlayer', 'grouplayer', 'filelayer',
+                       'vectorlayer', 'clonelayer', 'filllayer',
+                       'filterlayer')
+
+        if ntype in mask_types:
+            try:
+                raw = bytes(node.pixelData(0, 0, doc_w, doc_h))
+            except Exception:
+                return None
+            if len(raw) != doc_w * doc_h:
+                return None
+            kind = 'mask'
+            img = QImage(raw, doc_w, doc_h, doc_w,
+                         QImage.Format.Format_Grayscale8).copy()
+        elif ntype in image_types and include_paint_alpha:
+            try:
+                raw = bytes(node.projectionPixelData(0, 0, doc_w, doc_h))
+            except Exception:
+                return None
+            if len(raw) != doc_w * doc_h * 4:
+                return None
+            # Every 4th byte starting at offset 3 is the alpha channel.
+            # Building a bytes slice of length doc_w * doc_h matches what
+            # Format_Grayscale8 expects as a full-canvas mask.
+            alpha = raw[3::4]
+            if len(alpha) != doc_w * doc_h:
+                return None
+            kind = 'alpha'
+            img = QImage(alpha, doc_w, doc_h, doc_w,
+                         QImage.Format.Format_Grayscale8).copy()
+        else:
+            return None
+
+        if img is None or img.isNull():
+            return None
+
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        ok = img.save(buf, "PNG")
+        png = bytes(buf.data())
+        buf.close()
+        if not ok or not png:
+            return None
+
+        return base64.b64encode(png).decode('ascii'), kind
+
+    # ------------------------------------------------------------------
+    # Mask-as-paint-layer
+    # ------------------------------------------------------------------
+    #
+    # Creates a paint layer whose visible pixels are exactly the mask:
+    # white where the mask is selected, fully transparent where it is
+    # not. This is what the playground's "Export selected" / "Export
+    # combined" buttons invoke when "To Krita" is checked, so that
+    # clicking "Export" drops the masks straight into the document
+    # rather than saving PNGs to the user's Downloads directory.
+    #
+    # Two placement modes, controlled by `above_layer`:
+    #
+    #   ""        (empty)   the new layer goes at the top of the
+    #                        document root.
+    #   "@active"           the new layer is placed directly above
+    #                        the currently active layer. If no layer
+    #                        is active, falls back to top.
+    #   "<name>"            the new layer is placed directly above the
+    #                        named layer. If the name doesn't resolve,
+    #                        the command fails with a clear message
+    #                        rather than silently misplacing the layer.
+    #
+    # Returns data.layer_name so a caller that batches multiple masks
+    # (one layer each, as "Export selected" does) can chain follow-up
+    # commands against each individual result.
+    #
+    # Feather and the other edge-cleanup args are honoured; a feathered
+    # mask becomes a soft-edged white paint layer, which is directly
+    # useful as a brush-on overlay without further processing.
+
+    @command(
+        category='mask',
+        help_text='Create a paint layer whose pixels are the mask '
+                  '(white on transparent), optionally placed above a '
+                  'named layer or the active layer.',
+        args={
+            '--mask_b64': {'type': 'str', 'required': True,
+                           'help': 'Base64 PNG mask (white = selected)'},
+            '--name': {'type': 'str', 'default': '',
+                       'help': 'Layer name; empty = auto-generated '
+                               'Mask_<uuid>.'},
+            '--above_layer': {'type': 'str', 'default': '',
+                              'help': 'Place the new layer above this '
+                                      'layer. Empty = top of stack. '
+                                      '"@active" = above the active '
+                                      'layer.'},
+            '--threshold': {'type': 'int', 'default': 128,
+                            'help': 'Pixel intensity threshold (0-255)'},
+            '--invert': {'type': 'bool', 'default': False,
+                         'help': 'Invert the mask before painting it'},
+            '--expand_pixels': {'type': 'int', 'default': 0,
+                                'help': 'Grow the mask outward by N pixels'},
+            '--contract_pixels': {'type': 'int', 'default': 0,
+                                  'help': 'Shrink the mask inward by N pixels'},
+            '--smooth_iterations': {'type': 'int', 'default': 0,
+                                    'help': 'Morphological open+close iterations'},
+            '--feather_radius': {'type': 'int', 'default': 0,
+                                 'help': 'Box-blur radius in pixels'},
+        },
+    )
+    def create_paint_layer_from_mask_b64(
+        self,
+        mask_b64="",
+        name="",
+        above_layer="",
+        threshold=128,
+        invert=False,
+        expand_pixels=0,
+        contract_pixels=0,
+        smooth_iterations=0,
+        feather_radius=0,
+    ):
+        try:
+            doc = Krita.instance().activeDocument()
+            if not doc:
+                return {'success': False, 'message': 'No active document'}
+            if not mask_b64:
+                return {'success': False, 'message': 'mask_b64 required'}
+
+            doc_w, doc_h = doc.width(), doc.height()
+            binary, err = self._decode_mask_to_binary(
+                mask_b64, doc_w, doc_h, threshold,
+            )
+            if err:
+                return {'success': False, 'message': err}
+
+            binary = self._apply_edge_cleanup(
+                binary,
+                expand_pixels=expand_pixels,
+                contract_pixels=contract_pixels,
+                smooth_iterations=smooth_iterations,
+                feather_radius=feather_radius,
+            )
+            if invert:
+                binary = 255 - binary
+
+            # RGBA layout: white everywhere, alpha = mask value. When
+            # the mask is binary (no feather), each pixel is either
+            # fully opaque white (selected) or fully transparent
+            # (not selected). Feather produces intermediate alpha,
+            # which is exactly the soft-edge paint layer we want.
+            h, w = binary.shape
+            rgba = np.zeros((h, w, 4), dtype=np.uint8)
+            rgba[:, :, 0] = 255
+            rgba[:, :, 1] = 255
+            rgba[:, :, 2] = 255
+            rgba[:, :, 3] = binary
+
+            layer_name = name or f"Mask_{uuid.uuid4().hex[:8]}"
+            new_layer = doc.createNode(layer_name, "paintlayer")
+            if not new_layer:
+                return {'success': False, 'message': 'Failed to create layer'}
+
+            # Resolve placement. Three cases:
+            #   ""        → top of stack
+            #   "@active" → above the currently active layer (or top
+            #               if no active layer)
+            #   "<name>"  → above that layer; error if not found
+            placement = 'top'
+            above_node = None
+            if above_layer == "@active":
+                above_node = doc.activeNode()
+                if above_node is not None:
+                    placement = f'above_active ({above_node.name()})'
+                else:
+                    placement = 'top (no active layer)'
+            elif above_layer:
+                above_node = resolve_node(doc, above_layer)
+                if above_node is None:
+                    return {'success': False,
+                            'message': f'above_layer "{above_layer}" not found'}
+                placement = f'above "{above_layer}"'
+
+            if above_node is not None:
+                parent = above_node.parentNode()
+                if parent is None:
+                    return {'success': False,
+                            'message': 'Reference layer has no parent'}
+                parent.addChildNode(new_layer, above_node)
+            else:
+                doc.rootNode().addChildNode(new_layer, None)
+
+            new_layer.setPixelData(QByteArray(rgba.tobytes()), 0, 0, w, h)
+
+            doc.setActiveNode(new_layer)
+            register_node(layer_name, new_layer)
+            doc.refreshProjection()
+
+            return {
+                'success': True,
+                'message': f'Created mask paint layer "{layer_name}" ({placement})',
+                'data': {
+                    'layer_name': layer_name,
+                    'placement': placement,
+                    'width': w,
+                    'height': h,
+                },
+            }
         except Exception as e:
             return {'success': False, 'message': str(e)}

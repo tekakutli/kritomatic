@@ -9,8 +9,9 @@ Routes:
   GET  /comfy/status         preflight
 
   GET  /krita/status         kritomatic daemon reachable?
-  POST /krita/apply          send a mask to Krita (selection / transparency mask / layer extraction)
+  POST /krita/apply          send a mask to Krita (selection / transparency mask / layer extraction / paint layer)
   POST /krita/import         fetch active document composite from Krita
+  POST /krita/import_masks   fetch selected mask or paint layer(s) as base64 masks
 """
 
 from __future__ import annotations
@@ -449,7 +450,7 @@ def handle_krita_status(_payload) -> dict:
 def _coerce_edge_args(payload: dict) -> dict:
     """Pull the shared edge-cleanup args out of an apply payload.
 
-    Shared between all four apply modes. Missing keys default to 0/False
+    Shared between all five apply modes. Missing keys default to 0/False
     so an old client that doesn't send them still gets the pre-cleanup
     behaviour (no dilate, no erode, no smooth, no feather, no invert).
     """
@@ -599,8 +600,10 @@ def handle_krita_apply(payload: dict) -> dict:
       'transparency'        → daemon command apply_transparency_mask_b64
       'extract_new_layer'   → daemon command extract_mask_to_layer (new_layer)
       'extract_duplicate'   → daemon command extract_mask_to_layer (duplicate)
+      'export_layer'        → daemon command create_paint_layer_from_mask_b64
+                              (mask painted as a white-on-transparent layer)
 
-    All four accept the shared edge-cleanup args (expand_pixels,
+    All modes accept the shared edge-cleanup args (expand_pixels,
     contract_pixels, smooth_iterations, feather_radius, invert).
 
     Extract modes additionally accept --blend_mode, --opacity, and
@@ -608,6 +611,11 @@ def handle_krita_apply(payload: dict) -> dict:
     stays single-purpose); this handler composes them by calling
     set_layer_blend_mode, set_layer_opacity, and move_layer_to_group
     against the new layer's name after extraction succeeds.
+
+    Export mode accepts --above_layer ("", "@active", or a name) and
+    --name. Placement is delegated to the daemon, which resolves
+    "@active" itself so the JS client doesn't need a second round-trip
+    to look up the currently active layer name.
     """
     mask_b64 = payload.get("mask_b64")
     if not mask_b64:
@@ -615,7 +623,8 @@ def handle_krita_apply(payload: dict) -> dict:
 
     mode = payload.get("mode")
     if mode not in ("selection", "transparency",
-                    "extract_new_layer", "extract_duplicate"):
+                    "extract_new_layer", "extract_duplicate",
+                    "export_layer"):
         return {"success": False, "message": f"unknown mode: {mode!r}"}
 
     edge = _coerce_edge_args(payload)
@@ -638,6 +647,16 @@ def handle_krita_apply(payload: dict) -> dict:
             "type": "apply_transparency_mask_b64",
             "mask_b64": mask_b64,
             "layer_name": payload.get("layer_name") or "",
+            **edge,
+        }
+        return _normalize_response(krita_client.send(command, timeout=60.0))
+
+    if mode == "export_layer":
+        command = {
+            "type": "create_paint_layer_from_mask_b64",
+            "mask_b64": mask_b64,
+            "name": payload.get("name") or "",
+            "above_layer": payload.get("above_layer") or "",
             **edge,
         }
         return _normalize_response(krita_client.send(command, timeout=60.0))
@@ -700,14 +719,61 @@ def handle_krita_import(payload: dict) -> dict:
     }
 
 
+def handle_krita_import_masks(payload: dict) -> dict:
+    """Fetch selected mask or paint layer(s) from Krita as base64 masks.
+
+    Mirrors handle_krita_import but for mask layers rather than the
+    document composite. The daemon's `import_krita_masks_b64` command
+    handles the multi-selection detection and the per-layer read; this
+    route just forwards the args and shapes the response for the JS
+    client, which expects `masks` and `skipped` at the top level (the
+    daemon returns them under `data`).
+
+    `layer_names` and `include_paint_alpha` are forwarded verbatim if
+    present. Both are optional: omitting `layer_names` means "read the
+    user's current selection in Krita" (falling back to the active
+    layer), and omitting `include_paint_alpha` uses the daemon's
+    default of True.
+    """
+    command = {"type": "import_krita_masks_b64"}
+    if isinstance(payload, dict):
+        if "layer_names" in payload and payload["layer_names"]:
+            command["layer_names"] = str(payload["layer_names"])
+        if "include_paint_alpha" in payload:
+            command["include_paint_alpha"] = bool(
+                payload["include_paint_alpha"]
+            )
+
+    response = krita_client.send(command, timeout=60.0)
+    if response.get("status") != "success":
+        return {
+            "success": False,
+            "message": response.get("message") or "daemon rejected",
+        }
+
+    data = response.get("data") or {}
+    masks = data.get("masks") or []
+    skipped = data.get("skipped") or []
+    selection_path = data.get("selection_path") or "unknown"
+
+    return {
+        "success": True,
+        "masks": masks,
+        "skipped": skipped,
+        "selection_path": selection_path,
+        "message": response.get("message") or f"{len(masks)} mask(s)",
+    }
+
+
 ROUTES = {
-    "/comfy/status":    handle_status,
-    "/comfy/segment":   handle_segment,
-    "/comfy/refine":    handle_refine,
-    "/comfy/interrupt": handle_interrupt,
-    "/krita/status":    handle_krita_status,
-    "/krita/apply":     handle_krita_apply,
-    "/krita/import":    handle_krita_import,
+    "/comfy/status":        handle_status,
+    "/comfy/segment":       handle_segment,
+    "/comfy/refine":        handle_refine,
+    "/comfy/interrupt":     handle_interrupt,
+    "/krita/status":        handle_krita_status,
+    "/krita/apply":         handle_krita_apply,
+    "/krita/import":        handle_krita_import,
+    "/krita/import_masks":  handle_krita_import_masks,
 }
 
 RAW_ROUTES = {

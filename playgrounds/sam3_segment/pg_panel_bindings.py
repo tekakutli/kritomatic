@@ -1,6 +1,6 @@
 PANEL_BINDINGS_JS = r"""
 import {
-  board, setImage, clearImage, setMasks,
+  board, setImage, clearImage, setMasks, addMaskFromB64,
   snapshotRefine, snapshotSegmentAll, pushOp, pushRedo, popOp, popRedo,
   restoreMasks, replaceMaskAt, selectedMask, selectedMaskIdx,
   clearPointsOnSelectedMask, clearStagingPoints,
@@ -13,7 +13,7 @@ import { uploadImageFile, runSegmentAll, runRefine,
          interruptSegmentation, fetchStatus }
   from "./pg_comfy_client.js";
 import { checkKritaStatus, applyToKrita, extractMaskToLayer,
-         importFromKrita }
+         exportMaskAsLayer, importFromKrita, importKritaMasks }
   from "./pg_krita_client.js";
 import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyAll,
@@ -345,7 +345,53 @@ async function _checkStatusAction() {
 }
 
 /* ============================================================
-   Export
+   Export options helpers
+   ============================================================
+   Two checkboxes in the Masks section gate what the two "Export"
+   buttons do:
+
+     exportToKrita         true  → drop the mask into Krita as a
+                                   white-on-transparent paint layer
+                           false → save as PNG file(s) (legacy
+                                   behaviour)
+                           default: true
+
+     exportAtCurrentLayer  true  → place the new paint layer(s)
+                                   directly above the currently
+                                   selected layer in Krita
+                           false → place at the top of the stack
+                           default: true
+
+   When exportToKrita is false, exportAtCurrentLayer is meaningless
+   and gets disabled in the UI. The helper below returns the
+   above_layer argument the daemon expects, resolving through the
+   "Target layer" field first (so a user who filled in a specific
+   layer name targets that one), then falling back to "@active"
+   which the daemon resolves to whatever is active in Krita right
+   now — one round trip saved. */
+
+function _getExportToKrita() {
+  const el = document.getElementById("exportToKrita");
+  return el ? !!el.checked : true;
+}
+
+function _getExportPositionArg() {
+  const atCurrent = document.getElementById("exportAtCurrentLayer");
+  const useCurrent = atCurrent ? !!atCurrent.checked : true;
+  if (!useCurrent) return "";
+
+  // Prefer the explicit "Target layer" field when filled, so a user
+  // who typed a specific name for extraction also gets that name for
+  // export. Otherwise fall back to the daemon-side "@active" token,
+  // which resolves to the currently active layer without an extra
+  // round trip.
+  const targetEl = document.getElementById("kritaTargetLayer");
+  const targetName = targetEl ? (targetEl.value || "").trim() : "";
+  return targetName || "@active";
+}
+
+/* ============================================================
+   Export (checkbox-aware)
    ============================================================ */
 
 function _downloadDataUrl(dataUrl, filename) {
@@ -363,6 +409,57 @@ function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 async function _exportAction() {
   const indices = board.selectedMaskIndices.slice();
   if (indices.length === 0) { flashStatus("no masks selected", "warn"); return; }
+
+  if (_getExportToKrita()) {
+    // Create one paint layer per selected mask in Krita.
+    const aboveLayer = _getExportPositionArg();
+    const edge = _getKritaEdgeOptions();
+    flashStatus("exporting " + indices.length + " mask(s) to Krita\u2026", "");
+    let ok = 0, failed = 0;
+    let firstError = "";
+    let lastLayer = "";
+    for (const i of indices) {
+      const m = board.masks[i];
+      if (!m || !m.b64) continue;
+      try {
+        const res = await exportMaskAsLayer({
+          maskB64: m.b64,
+          name: "Mask_" + (i + 1),
+          aboveLayer: aboveLayer,
+          invert: edge.invert,
+          expandPixels: edge.expandPixels,
+          contractPixels: edge.contractPixels,
+          smoothIterations: edge.smoothIterations,
+          featherRadius: edge.featherRadius,
+        });
+        if (res && res.success) {
+          ok += 1;
+          const nm = (res.data || {}).layer_name;
+          if (nm) lastLayer = nm;
+        } else {
+          failed += 1;
+          if (!firstError) firstError = (res && res.message) || "unknown";
+        }
+      } catch (e) {
+        failed += 1;
+        if (!firstError) firstError = e.message;
+      }
+    }
+    if (ok === 0) {
+      flashStatus("export failed: " + firstError, "bad");
+      if (/unreachable|connect|refused|timeout/i.test(firstError)) {
+        _kritaMarkUnreachable(firstError);
+      }
+      return;
+    }
+    let msg = "exported " + ok + " mask layer(s) to Krita";
+    if (failed) msg += " (" + failed + " failed: " + firstError + ")";
+    flashStatus(msg, failed ? "warn" : "ok");
+    _kritaMarkReachable();
+    return;
+  }
+
+  // Legacy: save as PNG files.
   let count = 0;
   for (const i of indices) {
     const m = board.masks[i];
@@ -374,7 +471,7 @@ async function _exportAction() {
     count += 1;
     await _sleep(120);
   }
-  flashStatus("exported " + count + " mask(s)", "ok");
+  flashStatus("exported " + count + " mask file(s)", "ok");
 }
 
 async function _exportCombinedAction() {
@@ -394,12 +491,47 @@ async function _exportCombinedAction() {
     if (!m || !m.img) continue;
     octx.drawImage(m.img, 0, 0, W, H);
   }
+  const combinedB64 = off.toDataURL("image/png")
+                          .replace(/^data:image\/png;base64,/, "");
+
+  if (_getExportToKrita()) {
+    const aboveLayer = _getExportPositionArg();
+    const edge = _getKritaEdgeOptions();
+    flashStatus("exporting combined mask to Krita\u2026", "");
+    try {
+      const res = await exportMaskAsLayer({
+        maskB64: combinedB64,
+        name: "Combined_Mask",
+        aboveLayer: aboveLayer,
+        invert: edge.invert,
+        expandPixels: edge.expandPixels,
+        contractPixels: edge.contractPixels,
+        smoothIterations: edge.smoothIterations,
+        featherRadius: edge.featherRadius,
+      });
+      if (res && res.success) {
+        const nm = (res.data || {}).layer_name || "Combined_Mask";
+        flashStatus("exported combined mask \u2192 " + nm, "ok");
+        _kritaMarkReachable();
+      } else {
+        const msg = (res && res.message) || "unknown";
+        flashStatus("export failed: " + msg, "bad");
+        if (/unreachable|connect|refused|timeout/i.test(msg)) {
+          _kritaMarkUnreachable(msg);
+        }
+      }
+    } catch (e) {
+      flashStatus("export failed: " + e.message, "bad");
+    }
+    return;
+  }
+
   _downloadDataUrl(off.toDataURL("image/png"), "masks_combined.png");
-  flashStatus("exported combined (" + indices.length + ")", "ok");
+  flashStatus("exported combined file (" + indices.length + " mask(s))", "ok");
 }
 
 /* ============================================================
-   Export to Krita
+   Export to Krita (specific modes)
    ============================================================ */
 
 function _kritaMarkReachable() {
@@ -643,6 +775,71 @@ async function _kritaImportAction() {
   }
 }
 
+async function _kritaImportMasksAction() {
+  flashStatus("importing masks from Krita\u2026", "");
+  try {
+    const res = await importKritaMasks({});
+    if (!res.success) {
+      flashStatus("import failed: " + (res.message || "unknown"), "bad");
+      if (/unreachable|connect|refused|timeout/i.test(res.message || "")) {
+        _kritaMarkUnreachable(res.message);
+      }
+      return;
+    }
+
+    const masks = res.masks || [];
+    const skipped = res.skipped || [];
+    const selectionPath = res.selection_path || "unknown";
+
+    if (masks.length === 0) {
+      const reason = skipped.length
+        ? " (" + skipped.map(s => s.name + ": " + s.reason).join("; ") + ")"
+        : "";
+      flashStatus("no masks to import" + reason, "warn");
+      _kritaMarkReachable();
+      return;
+    }
+
+    let dimWarn = "";
+    if (board.imageWidth && board.imageHeight) {
+      const mism = masks.find(m =>
+        m.width !== board.imageWidth || m.height !== board.imageHeight);
+      if (mism) {
+        dimWarn = " \u2014 mask '" + mism.name + "' is "
+                  + mism.width + "\u00d7" + mism.height
+                  + ", image is "
+                  + board.imageWidth + "\u00d7" + board.imageHeight
+                  + " (will scale)";
+      }
+    }
+
+    const startIdx = board.masks.length;
+    for (const m of masks) {
+      addMaskFromB64(m.mask_b64);
+    }
+    board.selectedMaskIndices = masks.map((_, i) => startIdx + i);
+
+    const skippedMsg = skipped.length
+      ? " (" + skipped.length + " skipped)"
+      : "";
+    const multiMsg = (selectionPath === "active_only" && masks.length === 1)
+      ? " (active layer only; multi-select unavailable)"
+      : "";
+    flashStatus(
+      "imported " + masks.length + " mask(s)" + skippedMsg + multiMsg + dimWarn,
+      dimWarn || multiMsg ? "warn" : "ok"
+    );
+    _kritaMarkReachable();
+
+    syncMaskList();
+    syncPanelFields();
+    pgkitNotifyAll();
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  } catch (e) {
+    flashStatus("import failed: " + e.message, "bad");
+  }
+}
+
 /* ============================================================
    Install buttons
    ============================================================ */
@@ -652,7 +849,7 @@ export function installPanelBindings() {
   const ids = [
     "runBtn", "segmentAllBtn", "cancelBtn", "undoBtn", "redoBtn",
     "clearPointsBtn", "clearRegionBtn", "pickImageBtn", "clearImageBtn",
-    "kritaImportBtn",
+    "kritaImportBtn", "kritaImportMasksBtn",
     "exportBtn", "exportCombinedBtn",
     "kritaCheckBtn", "kritaSelectionBtn", "kritaTransparencyBtn",
     "kritaExtractNewLayerBtn", "kritaExtractDuplicateBtn",
@@ -669,6 +866,7 @@ export function installPanelBindings() {
   if (el.pickImageBtn)  el.pickImageBtn.addEventListener("click", _pickImageAction);
   if (el.clearImageBtn) el.clearImageBtn.addEventListener("click", _clearImageAction);
   if (el.kritaImportBtn) el.kritaImportBtn.addEventListener("click", _kritaImportAction);
+  if (el.kritaImportMasksBtn) el.kritaImportMasksBtn.addEventListener("click", _kritaImportMasksAction);
   if (el.exportBtn)     el.exportBtn.addEventListener("click", _exportAction);
   if (el.exportCombinedBtn) el.exportCombinedBtn.addEventListener("click", _exportCombinedAction);
 
@@ -679,6 +877,21 @@ export function installPanelBindings() {
     () => _kritaExportExtract("extract_new_layer"));
   if (el.kritaExtractDuplicateBtn) el.kritaExtractDuplicateBtn.addEventListener("click",
     () => _kritaExportExtract("extract_duplicate"));
+
+  // Wire the two export-option checkboxes: toggling exportToKrita
+  // disables/enables exportAtCurrentLayer (position is meaningless
+  // when exporting to files). The default states (checked, checked)
+  // mirror the requested defaults: export-to-Krita enabled, at
+  // current layer position.
+  const toKritaEl = document.getElementById("exportToKrita");
+  const atCurrentEl = document.getElementById("exportAtCurrentLayer");
+  if (toKritaEl && atCurrentEl) {
+    const sync = () => {
+      atCurrentEl.disabled = !toKritaEl.checked;
+    };
+    sync();
+    toKritaEl.addEventListener("change", sync);
+  }
 
   const statusEl = document.getElementById("statusLine");
   if (statusEl) {
@@ -713,7 +926,7 @@ export function installPanelBindings() {
    ============================================================ */
 
 pgkitRegisterAction("action.run", {
-  label: "Run", scope: "global", run: runRefineAction,
+  label: "Refine", scope: "global", run: runRefineAction,
   meta: { variant: "primary" },
 });
 pgkitRegisterAction("action.segmentAll", {
@@ -768,6 +981,18 @@ pgkitRegisterAction("action.kritaCheck", {
 pgkitRegisterAction("action.kritaImport", {
   label: "Import from Krita", scope: "global", run: _kritaImportAction,
   meta: { variant: "plain" },
+});
+pgkitRegisterAction("action.kritaImportMasks", {
+  label: "Import masks from Krita", scope: "global",
+  run: _kritaImportMasksAction,
+  meta: { variant: "plain",
+          description: "Read the selected mask or paint layer(s) in " +
+                       "Krita as base64 masks and append them to the " +
+                       "playground mask stack. Multi-selection works on " +
+                       "Krita builds that expose the selection via " +
+                       "View.selectedNodes / Document.selectedNodes / " +
+                       "Node.isSelected; otherwise the active layer is " +
+                       "imported." },
 });
 pgkitRegisterAction("action.kritaSelection", {
   label: "Set as selection", scope: "global", run: _kritaExportSelection,

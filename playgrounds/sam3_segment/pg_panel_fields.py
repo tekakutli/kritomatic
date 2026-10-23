@@ -137,7 +137,7 @@ export function syncPanelFields() {
   const hasMasks = selCount > 0;
 
   if (e.runBtn) {
-    e.runBtn.textContent = busy ? "Running\u2026" : "Run";
+    e.runBtn.textContent = busy ? "Refining\u2026" : "Refine";
     e.runBtn.classList.toggle("busy", busy);
     e.runBtn.disabled = !canRefine;
     e.runBtn.title = selCount === 0

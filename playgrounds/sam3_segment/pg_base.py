@@ -70,6 +70,41 @@ PG_CSS = r"""
     color: #d8ffe0;
   }
 
+  /* Export-option checkboxes next to the two Export buttons.
+     Small pill-shaped labels so they read as inline toggles rather
+     than separate form fields. Checked state uses the same accent
+     color as other interactive controls so the "on" state is
+     visually consistent with the rest of the panel. */
+  .exportOpt {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 10px;
+    color: #a8b5c4;
+    cursor: pointer;
+    padding: 4px 6px;
+    border: 1px solid #223040;
+    border-radius: 2px;
+    background: transparent;
+    letter-spacing: 0.02em;
+    user-select: none;
+  }
+  .exportOpt:hover {
+    border-color: #34445a;
+    color: #dce6f2;
+  }
+  .exportOpt input[type=checkbox] {
+    margin: 0;
+    width: 12px;
+    height: 12px;
+    accent-color: #00e5ff;
+  }
+  .exportOpt input[type=checkbox]:disabled {
+    opacity: 0.4;
+  }
+  .exportOpt:has(input[type=checkbox]:disabled) {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
   /* Export to Krita */
   #ui button#kritaCheckBtn {
     border-color: rgba(140, 225, 160, 0.72);
@@ -113,6 +148,15 @@ PG_CSS = r"""
     border-color: rgba(160, 240, 180, 1.00);
     background: rgba(140, 225, 160, 0.10);
     color: #d8ffe0;
+  }
+  #ui button#kritaImportMasksBtn {
+    border-color: rgba(180, 155, 255, 0.72);
+    color: #d5c8ff;
+  }
+  #ui button#kritaImportMasksBtn:hover:not(:disabled) {
+    border-color: rgba(200, 180, 255, 1.00);
+    background: rgba(180, 155, 255, 0.10);
+    color: #e8e0ff;
   }
   #kritaStatus {
     font-size: 10px;
@@ -263,11 +307,19 @@ PG_PANEL_BODY = r"""
       <div class="section-body">
         <div class="row">
           <button id="pickImageBtn" title="Pick an image file">+ Pick image…</button>
-          <button id="kritaImportBtn"
-                  title="Import the active document's composite from Krita">
-            + Import from Krita
-          </button>
           <button id="clearImageBtn" title="Clear the current image">Clear</button>
+        </div>
+        <div class="row">
+          <button id="kritaImportBtn"
+                  title="Import the active document's composite from Krita as the playground image">
+            + Import image from Krita
+          </button>
+        </div>
+        <div class="row">
+          <button id="kritaImportMasksBtn"
+                  title="Import the selected mask or paint layer(s) from Krita into the playground's mask stack. If multiple layers are selected in Krita, all are imported. Paint layers contribute their alpha channel; mask layers contribute their grayscale pixels.">
+            + Import masks from Krita
+          </button>
         </div>
         <div id="imageInfo">No image loaded — drop one on the canvas</div>
       </div>
@@ -380,7 +432,7 @@ PG_PANEL_BODY = r"""
           author a fresh mask, SAM2 to nudge an existing one.
         </div>
         <div class="row">
-          <button id="runBtn">Run</button>
+          <button id="runBtn">Refine</button>
           <button id="segmentAllBtn">Segment All</button>
         </div>
         <div class="row">
@@ -400,15 +452,27 @@ PG_PANEL_BODY = r"""
           <span id="maskCount" style="font-size:10px;color:#5a6774;">0 / 0</span>
         </div>
         <div id="maskList" class="maskList"></div>
-        <div class="row" style="margin-top:6px;">
+        <div class="row" style="margin-top:6px; flex-wrap:wrap; gap:6px;">
           <button id="exportBtn"
-                  title="Download each selected mask as a separate PNG">
+                  title="Export the selected mask(s). With 'To Krita' checked, each becomes a white-on-transparent paint layer in Krita; unchecked, each becomes a PNG file.">
             Export selected
           </button>
           <button id="exportCombinedBtn"
-                  title="Download a single PNG containing the union of selected masks">
+                  title="Export the union of the selected masks. With 'To Krita' checked, becomes a single white-on-transparent paint layer; unchecked, becomes a single PNG file.">
             Export combined
           </button>
+        </div>
+        <div class="row" style="margin-top:4px; flex-wrap:wrap; gap:6px;">
+          <label class="exportOpt"
+                 title="Create paint layer(s) in Krita instead of saving PNG files. Each mask becomes a white-on-transparent paint layer.">
+            <input type="checkbox" id="exportToKrita" checked>
+            To Krita
+          </label>
+          <label class="exportOpt"
+                 title="Place the exported paint layer(s) directly above the currently selected layer in Krita. Uncheck to place at the top of the stack instead. Uses the 'Target layer' field below if filled, otherwise the active layer.">
+            <input type="checkbox" id="exportAtCurrentLayer" checked>
+            At current layer
+          </label>
         </div>
       </div>
     </details>
@@ -538,16 +602,6 @@ PG_PANEL_BODY = r"""
                   title="Duplicate the target layer in place, and attach a transparency mask for the masked region.">
             Duplicate with mask
           </button>
-        </div>
-        <div class="runHint">
-          Requires the kritomatic daemon running in Krita with
-          <code>set_selection_from_mask_b64</code>,
-          <code>apply_transparency_mask_b64</code>,
-          <code>extract_mask_to_layer</code>,
-          <code>set_layer_blend_mode</code>,
-          <code>set_layer_opacity</code>, and
-          <code>move_layer_to_group</code> registered.
-          Blank target layer = current active layer.
         </div>
       </div>
     </details>

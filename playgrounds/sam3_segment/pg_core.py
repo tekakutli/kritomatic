@@ -242,6 +242,23 @@ export function setMasks(b64List) {
   _scheduleDraw();
 }
 
+/* Append one mask to the existing stack. Used by the "import masks
+   from Krita" flow, which layers imported masks on top of whatever
+   is already present rather than replacing. Returns the new index so
+   a caller can select it. */
+export function addMaskFromB64(b64, options) {
+  const opts = options || {};
+  const entry = _makeMaskEntry(
+    b64,
+    opts.points || [],
+    opts.textPrompt || "",
+    opts.regionCanvas || null,
+  );
+  board.masks.push(entry);
+  _scheduleDraw();
+  return board.masks.length - 1;
+}
+
 export function replaceMaskAt(idx, b64, points) {
   if (idx < 0 || idx >= board.masks.length) return;
   const old = board.masks[idx];
@@ -506,16 +523,25 @@ export function maskPixelData(mask) {
   return _maskPixelData(mask);
 }
 
+/* Hit test a mask at a point given in image coordinates. Scales the
+   point into the mask's own pixel grid so imported masks whose
+   dimensions differ from the playground image still hit-test
+   correctly. When m.img dimensions match board.image dimensions
+   (the common case for Segment All masks) the scale factor is 1.0
+   and the arithmetic reduces to the direct lookup it always was. */
 export function hitTestMaskAtPoint(ix, iy) {
-  const x = Math.floor(ix), y = Math.floor(iy);
-  if (x < 0 || y < 0) return -1;
+  if (ix < 0 || iy < 0) return -1;
+  const imgW = board.imageWidth  || 1;
+  const imgH = board.imageHeight || 1;
   for (let i = board.masks.length - 1; i >= 0; i--) {
     const m = board.masks[i];
     if (!m || !m.loaded) continue;
-    if (x >= m.img.width || y >= m.img.height) continue;
+    const mx = Math.floor(ix * m.img.width  / imgW);
+    const my = Math.floor(iy * m.img.height / imgH);
+    if (mx < 0 || my < 0 || mx >= m.img.width || my >= m.img.height) continue;
     const px = _maskPixelData(m);
     if (!px) continue;
-    const off = (y * m.img.width + x) * 4;
+    const off = (my * m.img.width + mx) * 4;
     if (px[off] >= 128) return i;
   }
   return -1;

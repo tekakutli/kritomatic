@@ -1,8 +1,19 @@
+"""The mask list panel row renderer.  Called once per frame from
+`pg_dispatch.draw()`.
+
+IMPORT SPLIT
+============
+`board` and `maskColor` come from `pg_state.js`.  The selection
+operations (`isMaskSelected`, `toggleMaskSelection`,
+`addMaskToSelection`, `replaceMaskSelection`) come from `pg_masks.js`.
+Neither import changes the body; only the header."""
+
 PANEL_LISTS_JS = r"""
+import { board, maskColor } from "./pg_state.js";
 import {
-  board, isMaskSelected, toggleMaskSelection, addMaskToSelection,
-  replaceMaskSelection, maskColor,
-} from "./pg_core.js";
+  isMaskSelected, toggleMaskSelection, addMaskToSelection,
+  replaceMaskSelection,
+} from "./pg_masks.js";
 import { pgkitNotifyEntities } from "./pgkit/remote_client.js";
 
 export function syncMaskList() {

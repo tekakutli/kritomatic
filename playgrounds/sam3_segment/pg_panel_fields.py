@@ -1,5 +1,19 @@
+"""Per-frame panel sync: image info, points count, region status,
+button enablement, mask count, inpaint section visibility.
+
+The function is called once per frame from `pg_dispatch.draw()`.
+Every DOM write is guarded against the current DOM value so a
+steady-state frame touches nothing.
+
+IMPORT SPLIT
+============
+`board` comes from `pg_state.js` (leaf).  `selectedMask` and
+`selectedMaskIdx` come from `pg_masks.js`.  Neither import changes
+the body; only the header."""
+
 PANEL_FIELDS_JS = r"""
-import { board, selectedMask, selectedMaskIdx } from "./pg_core.js";
+import { board } from "./pg_state.js";
+import { selectedMask, selectedMaskIdx } from "./pg_masks.js";
 
 let _els = null;
 

@@ -1,4 +1,14 @@
-"""SAM3 playground's panel body and CSS."""
+"""SAM3 playground's panel body and CSS.
+
+CHANGELOG
+=========
+The Inpainting section no longer carries a "Name" text input.  It was a
+placeholder from the initial implementation with no meaningful
+semantics; the two fields the section needs are `inpaintEnabled` (a
+checkbox) and `inpaintPrompt` (a textarea).  The `runHint` has been
+updated to describe the border-band-move behaviour that the inpaint
+context rectangle actually supports (border or interior → move,
+handle → resize)."""
 
 PG_CSS = r"""
   #ui button#inpaintBtn {
@@ -629,15 +639,6 @@ PG_PANEL_BODY = r"""
           <span style="font-size:9px;color:#3d4756;margin-left:6px;">inpainting</span>
         </div>
         <div id="inpaintControls" style="display:none;margin-top:6px;">
-          <div class="field">
-            <label>Name</label>
-            <input type="text" id="inpaintName" autocomplete="off"
-                   spellcheck="false" placeholder="(optional)"
-                   style="flex:1 1 auto;min-width:0;background:transparent;
-                          border:0;border-bottom:1px solid #223040;
-                          color:#00e5ff;font-family:inherit;font-size:12px;
-                          font-weight:700;padding:2px 4px;outline:none;">
-          </div>
           <div class="field" style="align-items:flex-start;flex-direction:column;margin-top:6px;">
             <label style="text-align:left;flex:0 0 auto;margin-bottom:4px;">
               Inpaint prompt
@@ -657,9 +658,10 @@ PG_PANEL_BODY = r"""
             </button>
           </div>
           <div class="runHint" style="margin-top:4px;">
-            Drag the context rectangle's corners or edges in the canvas
-            to resize. Hold Shift to resize symmetrically around the
-            center. Drag the interior to move it.
+            Drag anywhere on the context rectangle's border or interior
+            to move it. Drag a handle (four corners, four edge midpoints)
+            to resize. Hold Shift while dragging a handle to resize
+            symmetrically around the center.
           </div>
         </div>
       </div>

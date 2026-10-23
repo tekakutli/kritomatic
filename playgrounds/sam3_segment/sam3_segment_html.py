@@ -1,4 +1,15 @@
-"""SAM3 playground HTML assembly and module manifest."""
+"""SAM3 playground HTML assembly and module manifest.
+
+MODULE MANIFEST
+===============
+The module list is ordered from leaf to entry point.  `pgkit_modules()`
+supplies the shared shell.  Every other module is a Python-side string
+constant (the `_JS` suffix) imported from its own Python file; the
+file name in `_MODULE_SOURCES` is the `.js` name the browser sees.
+
+The order in the manifest does not affect runtime — every module is an
+ES module with its own imports resolved at load time.  It only affects
+the readability of `curl /modules/pg_state.js` debug output."""
 
 import os
 import sys
@@ -10,8 +21,20 @@ for _p in (_HERE, _PARENT):
         sys.path.insert(0, _p)
 
 from pg_base import PG_CSS, PG_PANEL_BODY
-from pg_core import CORE_JS
+from pg_tuning import TUNING_JS
+from pg_state import STATE_JS
+from pg_pixels import PIXELS_JS
+from pg_masks import MASKS_JS
+from pg_region import REGION_JS
+from pg_oplog import OPLOG_JS
+from pg_composite import COMPOSITE_JS
+from pg_inpaint import INPAINT_JS
 from pg_view import VIEW_JS
+from pg_view_image import VIEW_IMAGE_JS
+from pg_view_points import VIEW_POINTS_JS
+from pg_view_region import VIEW_REGION_JS
+from pg_view_brush import VIEW_BRUSH_JS
+from pg_view_inpaint import VIEW_INPAINT_JS
 from pg_dispatch import DISPATCH_JS
 from pg_comfy_client import COMFY_CLIENT_JS
 from pg_krita_client import KRITA_CLIENT_JS
@@ -37,9 +60,7 @@ import {
   installPanelBindings, pgkitHandleSelect, samBootSync,
 } from "./pg_panel_bindings.js";
 import { draw }                             from "./pg_dispatch.js";
-import {
-  board, resize, _setDraw,
-} from "./pg_core.js";
+import { board, resize, _setDraw }          from "./pg_state.js";
 import { syncMaskList }                     from "./pg_panel_lists.js";
 import { syncPanelFields }                  from "./pg_panel_fields.js";
 
@@ -69,8 +90,20 @@ try {
 
 _MODULE_SOURCES = {
     **pgkit_modules(),
-    "pg_core.js":             CORE_JS,
+    "pg_tuning.js":           TUNING_JS,
+    "pg_state.js":            STATE_JS,
+    "pg_pixels.js":           PIXELS_JS,
+    "pg_masks.js":            MASKS_JS,
+    "pg_region.js":           REGION_JS,
+    "pg_oplog.js":            OPLOG_JS,
+    "pg_composite.js":        COMPOSITE_JS,
+    "pg_inpaint.js":          INPAINT_JS,
     "pg_view.js":             VIEW_JS,
+    "pg_view_image.js":       VIEW_IMAGE_JS,
+    "pg_view_points.js":      VIEW_POINTS_JS,
+    "pg_view_region.js":      VIEW_REGION_JS,
+    "pg_view_brush.js":       VIEW_BRUSH_JS,
+    "pg_view_inpaint.js":     VIEW_INPAINT_JS,
     "pg_dispatch.js":         DISPATCH_JS,
     "pg_comfy_client.js":     COMFY_CLIENT_JS,
     "pg_krita_client.js":     KRITA_CLIENT_JS,

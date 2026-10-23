@@ -19,6 +19,17 @@ Clicking an item in the remote panel sends a `select` command with
 `{level, name}`.  The playground's `pgkitHandleSelect` translates
 that to its own selection.  A subsequent entities refresh shows the
 new selection.
+
+VISIBLE:FALSE FIELDS
+====================
+`pgkit/schema.py` documents `visible: false` as "API-only, no DOM";
+`pgkit/render.py` (the in-Krita panel renderer) already honours it.
+Before the `status.running` field was added (see the playground's
+`pg_panel_scrubs.py`), no playground used `visible: false`, so a
+mismatch here was latent.  `rpBuildFieldRow` now honours it too:
+a `visible: false` field produces no DOM row, and `rpRebuildFields`
+skips the `null` return.  `rpUpdateWidget` and `rpOnState` need no
+change — they already no-op for names with no `_rp.fields` entry.
 """
 
 RP_CLIENT_JS = r"""
@@ -300,10 +311,19 @@ function _rpSectionLabel(section) {
 
 /* ==========================================================================
    FIELD WIDGETS
-   ========================================================================== */
+   ==========================================================================
+   A field whose schema entry has `visible: false` is API-only —
+   see `pgkit/schema.py`.  The playground's `pgkit/render.py` honours
+   that flag; so does this renderer.  A null return propagates up to
+   `rpRebuildFields`, which drops the row.  `rpUpdateWidget` finds no
+   `_rp.fields[name]` entry for such a field and no-ops, so live
+   patches for it (e.g. `status.running` toggling during an action)
+   do not touch the DOM either. */
 
 function rpBuildFieldRow(name) {
   const meta  = _rp.schema[name] || {};
+  if (meta.visible === false) return null;
+
   const value = _rp.values[name];
   const short = name.indexOf(".") >= 0
     ? name.slice(name.indexOf(".") + 1)

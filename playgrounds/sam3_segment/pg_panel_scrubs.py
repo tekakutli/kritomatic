@@ -1,8 +1,44 @@
+"""Scrub inputs, checkboxes, tool radios, text inputs, and the
+`pgkitRegisterField` registrations for every panel field.
+
+NO `inpaintName` FIELD
+======================
+The Inpainting section used to carry a "Name" text input.  It was a
+placeholder from the initial implementation with no meaningful
+semantics; it has been removed.  The section now has two fields:
+`inpaintEnabled` (a checkbox) and `inpaintPrompt` (a textarea), plus
+the placeholder Inpaint button.  The `inpaint.enabled` handler
+initialises the context rectangle to a centered 50%-of-image box the
+first time the section is enabled.
+
+STATUS.RUNNING
+==============
+`status.running` is a read-only boolean registered at the bottom of
+this file.  It exposes `board.running` — already toggled by
+`pg_comfy_client.py` around every HTTP round-trip — as a pgkit field
+that scripting clients (the CLI, `remote_panel`, any Python using
+`RemoteCliClient`) can wait on.  `bundle(wait_for_running=True)` in
+`pgkit.remote_cli_client` waits on exactly this name; without the
+registration the CLI silently falls back to `wait_change`, which is
+imprecise for back-to-back actions.
+
+No calls to `pgkitNotifyAll` need adding: `pg_comfy_client.py` already
+calls it immediately after every `board.running` flip, so the notify
+path is already in place.
+
+`visible: false` marks the field as API-only — `pgkit/render.py`
+already honours this, and `remote_panel/rp_client.py` was updated in
+parallel to match that contract.  If a future build omits the
+`rp_client.py` guard, the field would render as a checkbox the user
+could click with no effect; the guard is what keeps the panel honest."""
+
 PANEL_SCRUBS_JS = r"""
+import { board } from "./pg_state.js";
 import {
-  board, selectedMask, selectedMaskIdx,
+  selectedMask, selectedMaskIdx,
   clearMaskSelection, replaceMaskSelection, setMaskPrompt,
-} from "./pg_core.js";
+} from "./pg_masks.js";
+import { ensureDefaultContext } from "./pg_inpaint.js";
 import { _installScrubInput } from "./pgkit/panel_core.js";
 import {
   pgkitRegisterField, pgkitNotifyLocal,
@@ -309,26 +345,13 @@ if (inpaintEnabledEl) {
   inpaintEnabledEl.checked = !!board.inpaintEnabled;
   inpaintEnabledEl.addEventListener("change", () => {
     board.inpaintEnabled = !!inpaintEnabledEl.checked;
-    if (board.inpaintEnabled
-        && board.inpaintContext.w === 0
-        && board.imageWidth > 0 && board.imageHeight > 0) {
-      // Default: centered 50% of the image.
-      board.inpaintContext.x = Math.round(board.imageWidth  * 0.25);
-      board.inpaintContext.y = Math.round(board.imageHeight * 0.25);
-      board.inpaintContext.w = Math.round(board.imageWidth  * 0.50);
-      board.inpaintContext.h = Math.round(board.imageHeight * 0.50);
+    if (board.inpaintEnabled) {
+      // Lazy default: a centered 50%-of-image rect the first time
+      // the section is enabled against a loaded image.  Idempotent.
+      ensureDefaultContext();
     }
     pgkitNotifyLocal("inpaint.enabled");
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-  });
-}
-
-const inpaintNameEl = document.getElementById("inpaintName");
-if (inpaintNameEl) {
-  inpaintNameEl.value = board.inpaintName || "";
-  inpaintNameEl.addEventListener("input", () => {
-    board.inpaintName = inpaintNameEl.value;
-    pgkitNotifyLocal("inpaint.name");
   });
 }
 
@@ -549,7 +572,7 @@ pgkitRegisterField("krita.contract", {
 });
 
 pgkitRegisterField("krita.smooth", {
-  get: () => board.kritaContract,
+  get: () => board.kritaSmooth,
   set: (v) => {
     const n = parseInt(v, 10);
     if (!isFinite(n)) return;
@@ -637,19 +660,10 @@ pgkitRegisterField("inpaint.enabled", {
     board.inpaintEnabled = !!v;
     const el = document.getElementById("inpaintEnabled");
     if (el && document.activeElement !== el) el.checked = board.inpaintEnabled;
+    if (board.inpaintEnabled) ensureDefaultContext();
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   },
   meta: { kind: "bool", label: "Inpainting enabled" },
-});
-
-pgkitRegisterField("inpaint.name", {
-  get: () => board.inpaintName || "",
-  set: (v) => {
-    board.inpaintName = String(v || "");
-    const el = document.getElementById("inpaintName");
-    if (el && document.activeElement !== el) el.value = board.inpaintName;
-  },
-  meta: { kind: "text", label: "Inpaint operation name" },
 });
 
 pgkitRegisterField("inpaint.prompt", {
@@ -660,5 +674,32 @@ pgkitRegisterField("inpaint.prompt", {
     if (el && document.activeElement !== el) el.value = board.inpaintPrompt;
   },
   meta: { kind: "text", label: "Inpaint prompt" },
+});
+
+/* ============================================================
+   Status: running
+   ============================================================
+   A read-only boolean that the remote CLI (and remote_panel) can use
+   to sequence async actions. `board.running` is already toggled by
+   `pg_comfy_client.py` around the HTTP round-trips; `pgkitNotifyAll()`
+   there already includes this field, so no additional notify calls
+   are needed.
+
+   Marked `visible: false` so the panel does not render a toggle the
+   user could click (nothing happens; `set` is a no-op). The field
+   still appears in `schema` and `state`, so scripting clients see it.
+
+   Convention: any playground whose actions are async should publish
+   a bool field named `status.running`. `bundle(wait_for_running=True)`
+   waits on exactly this name. */
+
+pgkitRegisterField("status.running", {
+  get: () => !!board.running,
+  set: () => {},
+  meta: {
+    kind: "bool",
+    label: "Running",
+    visible: false,
+  },
 });
 """

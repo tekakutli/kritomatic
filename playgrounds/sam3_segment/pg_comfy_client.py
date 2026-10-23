@@ -1,5 +1,16 @@
+"""HTTP bridge to the ComfyUI backend.  Every action is a fetch to the
+Python server; the server does the ComfyUI heavy lifting.
+
+IMPORT SPLIT
+============
+`board` comes from `pg_state.js` (leaf).  `computeEffectiveBBox` comes
+from `pg_pixels.js`.  Neither import changes the body; only the header.
+The old import line was `import { board, computeEffectiveBBox } from
+"./pg_core.js"`."""
+
 COMFY_CLIENT_JS = r"""
-import { board, computeEffectiveBBox } from "./pg_core.js";
+import { board } from "./pg_state.js";
+import { computeEffectiveBBox } from "./pg_pixels.js";
 import { pgkitNotifyAll } from "./pgkit/remote_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
 

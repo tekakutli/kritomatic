@@ -1,12 +1,35 @@
+"""Panel button handlers, pgkit actions, mask list levels, undo/redo,
+and the boot-sync routine.
+
+UPDATE LOG
+==========
+This file is unchanged from the pre-refactor version except:
+
+  - the top import block now pulls each symbol from its new home
+    (`pg_state`, `pg_masks`, `pg_oplog`, `pg_region`, `pg_composite`)
+    instead of from `pg_core.js`
+  - `_inpaintAction` no longer echoes a name that no longer exists
+    (the whole name-echo string was `board.inpaintName ? " (...)" : ""`
+    and is gone)
+
+Every other line — the export/import actions, the Krita actions, the
+pgkit registrations, the mask-row select/delete actions, `pgkitHandleSelect`,
+`samBootSync` — is identical."""
+
 PANEL_BINDINGS_JS = r"""
+import { board, setImage, clearImage } from "./pg_state.js";
 import {
-  board, setImage, clearImage, setMasks, addMaskFromB64,
-  snapshotRefine, snapshotSegmentAll, pushOp, pushRedo, popOp, popRedo,
-  restoreMasks, replaceMaskAt, selectedMask, selectedMaskIdx,
+  setMasks, addMaskFromB64, restoreMasks, replaceMaskAt,
+  selectedMask, selectedMaskIdx,
   clearPointsOnSelectedMask, clearStagingPoints,
-  clearSelectedMaskRegion, compositeRefineWithRegion,
   clearMaskSelection, replaceMaskSelection,
-} from "./pg_core.js";
+} from "./pg_masks.js";
+import {
+  snapshotRefine, snapshotSegmentAll,
+  pushOp, pushRedo, popOp, popRedo,
+} from "./pg_oplog.js";
+import { clearSelectedMaskRegion } from "./pg_region.js";
+import { compositeRefineWithRegion } from "./pg_composite.js";
 import { syncMaskList } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
 import { uploadImageFile, runSegmentAll, runRefine,
@@ -349,7 +372,6 @@ function _inpaintAction() {
   // so the button is visibly hooked up for future wiring.
   flashStatus(
     "inpainting is not wired up yet"
-    + (board.inpaintName ? " (" + board.inpaintName + ")" : "")
     + " — context rect at ["
     + board.inpaintContext.x + ","
     + board.inpaintContext.y + "] "

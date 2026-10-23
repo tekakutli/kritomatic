@@ -8,6 +8,7 @@ import {
   toggleMaskSelection, addMaskToSelection, replaceMaskSelection,
   clearMaskSelection, selectAllMasks,
   view, clampPan, zoomAt, resetView,
+  contextRectScreen, contextHandles,
 } from "./pg_core.js";
 import { drawView } from "./pg_view.js";
 import { syncMaskList } from "./pg_panel_lists.js";
@@ -68,6 +69,88 @@ let _panStartScreenY = 0;
 let _panStartPanX = 0;
 let _panStartPanY = 0;
 let _spaceDown = false;
+
+// Inpaint context drag state. `handle` is one of 'nw','ne','sw','se',
+// 'n','s','e','w', or 'move'. startIx/startIy are in image coords;
+// startRect is the rect captured at mousedown so each mousemove can
+// recompute from the original anchor rather than accumulating error.
+let _contextDrag = {
+  active: false,
+  handle: null,
+  startIx: 0,
+  startIy: 0,
+  startRect: null,
+};
+
+const CONTEXT_MIN_SIZE = 16;   // image px
+const CONTEXT_HANDLE_HALF = 10; // screen px
+
+function _handleCursor(name) {
+  switch (name) {
+    case 'nw': case 'se': return 'nwse-resize';
+    case 'ne': case 'sw': return 'nesw-resize';
+    case 'n':  case 's':  return 'ns-resize';
+    case 'e':  case 'w':  return 'ew-resize';
+    default:              return 'default';
+  }
+}
+
+function _applyContextDrag(ix, iy, shiftKey) {
+  const st = _contextDrag;
+  if (!st.active || !st.startRect) return;
+  const dx = ix - st.startIx;
+  const dy = iy - st.startIy;
+  const { x, y, w, h } = st.startRect;
+
+  let x0 = x, x1 = x + w, y0 = y, y1 = y + h;
+
+  if (st.handle === 'move') {
+    x0 += dx; x1 += dx;
+    y0 += dy; y1 += dy;
+  } else {
+    const movesW = st.handle.includes('w');
+    const movesE = st.handle.includes('e');
+    const movesN = st.handle.includes('n');
+    const movesS = st.handle.includes('s');
+
+    if (shiftKey) {
+      // Symmetric around the center: both opposite sides move.
+      if (movesW) { x0 += dx; x1 -= dx; }
+      if (movesE) { x0 -= dx; x1 += dx; }
+      if (movesN) { y0 += dy; y1 -= dy; }
+      if (movesS) { y0 -= dy; y1 += dy; }
+    } else {
+      // One side anchored: only the dragged side moves.
+      if (movesW) x0 += dx;
+      if (movesE) x1 += dx;
+      if (movesN) y0 += dy;
+      if (movesS) y1 += dy;
+    }
+  }
+
+  // Minimum size — collapse around the current center.
+  if (x1 - x0 < CONTEXT_MIN_SIZE) {
+    const cx = (x0 + x1) / 2;
+    x0 = cx - CONTEXT_MIN_SIZE / 2;
+    x1 = cx + CONTEXT_MIN_SIZE / 2;
+  }
+  if (y1 - y0 < CONTEXT_MIN_SIZE) {
+    const cy = (y0 + y1) / 2;
+    y0 = cy - CONTEXT_MIN_SIZE / 2;
+    y1 = cy + CONTEXT_MIN_SIZE / 2;
+  }
+
+  // Clamp to image bounds.
+  x0 = Math.max(0, Math.min(board.imageWidth,  x0));
+  y0 = Math.max(0, Math.min(board.imageHeight, y0));
+  x1 = Math.max(0, Math.min(board.imageWidth,  x1));
+  y1 = Math.max(0, Math.min(board.imageHeight, y1));
+
+  board.inpaintContext.x = x0;
+  board.inpaintContext.y = y0;
+  board.inpaintContext.w = x1 - x0;
+  board.inpaintContext.h = y1 - y0;
+}
 
 function _endResize() {
   if (!_resizeActive) return;
@@ -181,6 +264,65 @@ canvas.addEventListener("mousedown", (e) => {
   const overImage = sx >= r.x0 && sx <= r.x0 + r.w
                     && sy >= r.y0 && sy <= r.y0 + r.h;
   const [ix, iy] = screenToImage(sx, sy);
+
+  // ========== INPAINT CONTEXT RECT ==========
+  // Highest priority after pan. When inpainting is enabled, a click
+  // on a handle starts a resize; a click inside the rect starts a
+  // move. Both consume the event so the region tools and point
+  // placement don't fire underneath.
+  if (board.inpaintEnabled && e.button === 0) {
+    // Lazy-init the rect if this is the first interaction after
+    // enabling the section without having resized yet.
+    if (board.inpaintContext.w === 0
+        && board.imageWidth > 0 && board.imageHeight > 0) {
+      board.inpaintContext.x = Math.round(board.imageWidth  * 0.25);
+      board.inpaintContext.y = Math.round(board.imageHeight * 0.25);
+      board.inpaintContext.w = Math.round(board.imageWidth  * 0.50);
+      board.inpaintContext.h = Math.round(board.imageHeight * 0.50);
+    }
+
+    const handles = contextHandles(r);
+    const crect   = contextRectScreen(r);
+
+    let hitHandle = null;
+    if (handles) {
+      for (const hd of handles) {
+        if (Math.abs(sx - hd.x) <= CONTEXT_HANDLE_HALF &&
+            Math.abs(sy - hd.y) <= CONTEXT_HANDLE_HALF) {
+          hitHandle = hd.name;
+          break;
+        }
+      }
+    }
+
+    let hitInterior = false;
+    if (!hitHandle && crect) {
+      if (sx >= crect.x0 && sx <= crect.x1
+          && sy >= crect.y0 && sy <= crect.y1) {
+        hitInterior = true;
+      }
+    }
+
+    if (hitHandle || hitInterior) {
+      e.preventDefault();
+      _contextDrag.active    = true;
+      _contextDrag.handle    = hitHandle || 'move';
+      _contextDrag.startIx   = ix;
+      _contextDrag.startIy   = iy;
+      _contextDrag.startRect = {
+        x: board.inpaintContext.x,
+        y: board.inpaintContext.y,
+        w: board.inpaintContext.w,
+        h: board.inpaintContext.h,
+      };
+      board.inpaintContext.activeHandle = _contextDrag.handle;
+      canvas.style.cursor = (_contextDrag.handle === 'move')
+        ? 'grabbing'
+        : _handleCursor(_contextDrag.handle);
+      drawView();
+      return;
+    }
+  }
 
   // Resize: shift + left-click in brush region mode. Anchors the ring
   // at (ix, iy); the brush itself does not move during resize.
@@ -351,6 +493,17 @@ canvas.addEventListener("mousemove", (e) => {
     return;
   }
 
+  // Inpaint context drag in progress.
+  if (_contextDrag.active && r) {
+    const [ix, iy] = screenToImage(sx, sy);
+    _applyContextDrag(ix, iy, e.shiftKey);
+    canvas.style.cursor = (_contextDrag.handle === 'move')
+      ? 'grabbing'
+      : _handleCursor(_contextDrag.handle);
+    drawView();
+    return;
+  }
+
   // Resize in progress. The brush cursor is locked to the anchor;
   // only the size changes. Ends on button-up or shift-up.
   if (_resizeActive) {
@@ -412,6 +565,34 @@ canvas.addEventListener("mousemove", (e) => {
   if (board.lassoPoints.length > 0) {
     drawView();
     return;
+  }
+
+  // Inpaint context hover cursor (handles + interior).
+  if (board.inpaintEnabled && r && !_contextDrag.active) {
+    const handles = contextHandles(r);
+    const crect   = contextRectScreen(r);
+    let hintCursor = null;
+    if (handles) {
+      for (const hd of handles) {
+        if (Math.abs(sx - hd.x) <= CONTEXT_HANDLE_HALF &&
+            Math.abs(sy - hd.y) <= CONTEXT_HANDLE_HALF) {
+          hintCursor = _handleCursor(hd.name);
+          break;
+        }
+      }
+    }
+    if (!hintCursor && crect) {
+      if (sx >= crect.x0 && sx <= crect.x1
+          && sy >= crect.y0 && sy <= crect.y1) {
+        hintCursor = "move";
+      }
+    }
+    if (hintCursor) {
+      canvas.style.cursor = hintCursor;
+      if (board.hoveredMaskIdx !== -1) board.hoveredMaskIdx = -1;
+      drawView();
+      return;
+    }
   }
 
   let hoveredMask = -1;
@@ -483,6 +664,15 @@ window.addEventListener("mouseup", () => {
   if (_regionStroke.active) {
     _regionStroke.active = false;
     board.regionStrokeActive = false;
+    pgkitNotifyAll();
+    drawView();
+  }
+  if (_contextDrag.active) {
+    _contextDrag.active = false;
+    _contextDrag.handle = null;
+    _contextDrag.startRect = null;
+    board.inpaintContext.activeHandle = null;
+    canvas.style.cursor = "crosshair";
     pgkitNotifyAll();
     drawView();
   }

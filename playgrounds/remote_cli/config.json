@@ -1,0 +1,11 @@
+{
+  "default_url": "ws://127.0.0.1:8773/remote",
+  "targets": {
+    "sam3":       "ws://127.0.0.1:8773/remote",
+    "pair":       "ws://127.0.0.1:8767/remote",
+    "cone":       "ws://127.0.0.1:8766/remote",
+    "board":      "ws://127.0.0.1:8770/remote",
+    "text_board": "ws://127.0.0.1:8771/remote"
+  },
+  "timeout": 10.0
+}

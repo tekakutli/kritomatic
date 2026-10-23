@@ -344,6 +344,20 @@ async function _checkStatusAction() {
               s.has_sam3 && s.has_sam2 ? "ok" : "warn");
 }
 
+function _inpaintAction() {
+  // Placeholder — no backend wired up yet. Flashes a status message
+  // so the button is visibly hooked up for future wiring.
+  flashStatus(
+    "inpainting is not wired up yet"
+    + (board.inpaintName ? " (" + board.inpaintName + ")" : "")
+    + " — context rect at ["
+    + board.inpaintContext.x + ","
+    + board.inpaintContext.y + "] "
+    + board.inpaintContext.w + "\u00d7" + board.inpaintContext.h,
+    "warn",
+  );
+}
+
 /* ============================================================
    Export options helpers
    ============================================================
@@ -853,6 +867,7 @@ export function installPanelBindings() {
     "exportBtn", "exportCombinedBtn",
     "kritaCheckBtn", "kritaSelectionBtn", "kritaTransparencyBtn",
     "kritaExtractNewLayerBtn", "kritaExtractDuplicateBtn",
+    "inpaintBtn",
   ];
   for (const id of ids) el[id] = document.getElementById(id);
 
@@ -877,6 +892,8 @@ export function installPanelBindings() {
     () => _kritaExportExtract("extract_new_layer"));
   if (el.kritaExtractDuplicateBtn) el.kritaExtractDuplicateBtn.addEventListener("click",
     () => _kritaExportExtract("extract_duplicate"));
+
+  if (el.inpaintBtn) el.inpaintBtn.addEventListener("click", _inpaintAction);
 
   // Wire the two export-option checkboxes: toggling exportToKrita
   // disables/enables exportAtCurrentLayer (position is meaningless
@@ -1011,6 +1028,13 @@ pgkitRegisterAction("action.kritaExtractDuplicate", {
   label: "Duplicate with mask", scope: "global",
   run: () => _kritaExportExtract("extract_duplicate"),
   meta: { variant: "primary" },
+});
+
+pgkitRegisterAction("action.inpaint", {
+  label: "Inpaint", scope: "global", run: _inpaintAction,
+  meta: { variant: "primary",
+          description: "Run inpainting within the context rectangle. " +
+                       "Placeholder — no backend wired up yet." },
 });
 
 /* ============================================================

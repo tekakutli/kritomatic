@@ -301,6 +301,47 @@ if (kritaBlendModeEl) {
 }
 
 /* ============================================================
+   Inpainting section
+   ============================================================ */
+
+const inpaintEnabledEl = document.getElementById("inpaintEnabled");
+if (inpaintEnabledEl) {
+  inpaintEnabledEl.checked = !!board.inpaintEnabled;
+  inpaintEnabledEl.addEventListener("change", () => {
+    board.inpaintEnabled = !!inpaintEnabledEl.checked;
+    if (board.inpaintEnabled
+        && board.inpaintContext.w === 0
+        && board.imageWidth > 0 && board.imageHeight > 0) {
+      // Default: centered 50% of the image.
+      board.inpaintContext.x = Math.round(board.imageWidth  * 0.25);
+      board.inpaintContext.y = Math.round(board.imageHeight * 0.25);
+      board.inpaintContext.w = Math.round(board.imageWidth  * 0.50);
+      board.inpaintContext.h = Math.round(board.imageHeight * 0.50);
+    }
+    pgkitNotifyLocal("inpaint.enabled");
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  });
+}
+
+const inpaintNameEl = document.getElementById("inpaintName");
+if (inpaintNameEl) {
+  inpaintNameEl.value = board.inpaintName || "";
+  inpaintNameEl.addEventListener("input", () => {
+    board.inpaintName = inpaintNameEl.value;
+    pgkitNotifyLocal("inpaint.name");
+  });
+}
+
+const inpaintPromptEl = document.getElementById("inpaintPrompt");
+if (inpaintPromptEl) {
+  inpaintPromptEl.value = board.inpaintPrompt || "";
+  inpaintPromptEl.addEventListener("input", () => {
+    board.inpaintPrompt = inpaintPromptEl.value;
+    pgkitNotifyLocal("inpaint.prompt");
+  });
+}
+
+/* ============================================================
    Field registrations
    ============================================================ */
 
@@ -508,7 +549,7 @@ pgkitRegisterField("krita.contract", {
 });
 
 pgkitRegisterField("krita.smooth", {
-  get: () => board.kritaSmooth,
+  get: () => board.kritaContract,
   set: (v) => {
     const n = parseInt(v, 10);
     if (!isFinite(n)) return;
@@ -588,5 +629,36 @@ pgkitRegisterField("krita.group", {
     if (el && document.activeElement !== el) el.value = board.kritaGroup;
   },
   meta: { kind: "text", label: "Target group (extract only)" },
+});
+
+pgkitRegisterField("inpaint.enabled", {
+  get: () => !!board.inpaintEnabled,
+  set: (v) => {
+    board.inpaintEnabled = !!v;
+    const el = document.getElementById("inpaintEnabled");
+    if (el && document.activeElement !== el) el.checked = board.inpaintEnabled;
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  },
+  meta: { kind: "bool", label: "Inpainting enabled" },
+});
+
+pgkitRegisterField("inpaint.name", {
+  get: () => board.inpaintName || "",
+  set: (v) => {
+    board.inpaintName = String(v || "");
+    const el = document.getElementById("inpaintName");
+    if (el && document.activeElement !== el) el.value = board.inpaintName;
+  },
+  meta: { kind: "text", label: "Inpaint operation name" },
+});
+
+pgkitRegisterField("inpaint.prompt", {
+  get: () => board.inpaintPrompt || "",
+  set: (v) => {
+    board.inpaintPrompt = String(v || "");
+    const el = document.getElementById("inpaintPrompt");
+    if (el && document.activeElement !== el) el.value = board.inpaintPrompt;
+  },
+  meta: { kind: "text", label: "Inpaint prompt" },
 });
 """

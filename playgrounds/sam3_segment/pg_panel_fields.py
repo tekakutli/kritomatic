@@ -32,6 +32,9 @@ function _get() {
     kritaTransBtn:  document.getElementById("kritaTransparencyBtn"),
     kritaExtractNewBtn: document.getElementById("kritaExtractNewLayerBtn"),
     kritaExtractDupBtn: document.getElementById("kritaExtractDuplicateBtn"),
+    inpaintEnabled:   document.getElementById("inpaintEnabled"),
+    inpaintControls:  document.getElementById("inpaintControls"),
+    inpaintBtn:       document.getElementById("inpaintBtn"),
   };
   return _els;
 }
@@ -180,5 +183,23 @@ export function syncPanelFields() {
   if (e.kritaTransBtn)  e.kritaTransBtn.disabled  = !hasMasks;
   if (e.kritaExtractNewBtn) e.kritaExtractNewBtn.disabled = !hasMasks;
   if (e.kritaExtractDupBtn) e.kritaExtractDupBtn.disabled = !hasMasks;
+
+  // Inpainting section: the controls block is hidden until the
+  // enable checkbox is checked; the Inpaint button is a placeholder
+  // and stays disabled until an image is loaded.
+  if (e.inpaintEnabled && document.activeElement !== e.inpaintEnabled) {
+    e.inpaintEnabled.checked = !!board.inpaintEnabled;
+  }
+  if (e.inpaintControls) {
+    e.inpaintControls.style.display = board.inpaintEnabled ? "" : "none";
+  }
+  if (e.inpaintBtn) {
+    e.inpaintBtn.disabled = !board.inpaintEnabled || !board.imageHash;
+    e.inpaintBtn.title = !board.inpaintEnabled
+      ? "Enable inpainting first"
+      : (!board.imageHash
+          ? "Load an image first"
+          : "Run inpainting inside the context rectangle (placeholder)");
+  }
 }
 """

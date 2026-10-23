@@ -51,6 +51,20 @@ export const board = {
   running:       false,
   lastTiming:    null,
 
+  // Inpainting section state. The section is collapsed by default;
+  // enabling `inpaintEnabled` shows the controls and paints the
+  // context rectangle on the canvas. The rect coordinates live in
+  // image space so it pans/zooms with the image. `activeHandle` is
+  // set by the dispatch layer during a drag so the view can
+  // highlight the handle being manipulated.
+  inpaintEnabled: false,
+  inpaintName:    "",
+  inpaintPrompt:  "",
+  inpaintContext: {
+    x: 0, y: 0, w: 0, h: 0,
+    activeHandle: null,
+  },
+
   // Krita export options. Persist across runs so a user who tunes
   // feather once doesn't re-tune it on every mask; the values are
   // copied into every applyToKrita / extractMaskToLayer call.
@@ -188,6 +202,7 @@ export function setImage(hash, dataUrl, width, height) {
   board.freehandIsErase = false;
   board.opLog = [];
   board.redoLog = [];
+  board.inpaintContext = { x: 0, y: 0, w: 0, h: 0, activeHandle: null };
 }
 
 export function clearImage() {
@@ -205,6 +220,7 @@ export function clearImage() {
   board.freehandIsErase = false;
   board.opLog = [];
   board.redoLog = [];
+  board.inpaintContext = { x: 0, y: 0, w: 0, h: 0, activeHandle: null };
 }
 
 /* ============================================================
@@ -794,6 +810,37 @@ export function screenToImage(sx, sy) {
   const r = fittedImageRect();
   if (!r) return [0, 0];
   return [(sx - r.x0) / r.s, (sy - r.y0) / r.s];
+}
+
+/* ============================================================
+   Inpaint context rect — screen-space helpers
+   ============================================================ */
+
+export function contextRectScreen(r) {
+  const c = board.inpaintContext;
+  if (!r || c.w === 0 || c.h === 0) return null;
+  return {
+    x0: r.x0 + c.x * r.s,
+    y0: r.y0 + c.y * r.s,
+    x1: r.x0 + (c.x + c.w) * r.s,
+    y1: r.y0 + (c.y + c.h) * r.s,
+  };
+}
+
+export function contextHandles(r) {
+  const rect = contextRectScreen(r);
+  if (!rect) return null;
+  const { x0, y0, x1, y1 } = rect;
+  return [
+    { name: 'nw', x: x0, y: y0 },
+    { name: 'ne', x: x1, y: y0 },
+    { name: 'sw', x: x0, y: y1 },
+    { name: 'se', x: x1, y: y1 },
+    { name: 'n',  x: (x0 + x1) / 2, y: y0 },
+    { name: 's',  x: (x0 + x1) / 2, y: y1 },
+    { name: 'w',  x: x0, y: (y0 + y1) / 2 },
+    { name: 'e',  x: x1, y: (y0 + y1) / 2 },
+  ];
 }
 
 /* ============================================================

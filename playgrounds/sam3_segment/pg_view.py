@@ -2,6 +2,7 @@ VIEW_JS = r"""
 import {
   ctx, board, view, fittedImageRect, imageToScreen,
   maskColor, maskPixelData, selectedMask, selectedMaskIdx,
+  contextRectScreen, contextHandles,
 } from "./pg_core.js";
 
 function _tintedMask(mask, color) {
@@ -602,6 +603,90 @@ function _drawFreehandDraft() {
 }
 
 /* ============================================================
+   Inpaint context rectangle — outline + corner/edge handles
+   ============================================================ */
+
+function _drawInpaintContext(r) {
+  if (!board.inpaintEnabled) return;
+  if (!board.imageEl) return;
+
+  const c = board.inpaintContext;
+  // Lazy-init: default to a centered 50%-of-image rect the first
+  // time the section is enabled against a loaded image.
+  if ((c.w === 0 || c.h === 0)
+      && board.imageWidth > 0 && board.imageHeight > 0) {
+    c.x = Math.round(board.imageWidth  * 0.25);
+    c.y = Math.round(board.imageHeight * 0.25);
+    c.w = Math.round(board.imageWidth  * 0.50);
+    c.h = Math.round(board.imageHeight * 0.50);
+  }
+
+  const rect = contextRectScreen(r);
+  if (!rect) return;
+  const { x0, y0, x1, y1 } = rect;
+  const w = x1 - x0, h = y1 - y0;
+
+  const bright = "rgba(180, 155, 255, 1.0)";
+  const soft   = "rgba(180, 155, 255, 0.08)";
+  const halo   = "rgba(8, 10, 14, 0.82)";
+
+  ctx.save();
+  ctx.lineJoin = "round";
+  ctx.lineCap  = "round";
+
+  // Faint interior fill — signals the rect is live without
+  // competing with the mask overlays.
+  ctx.fillStyle = soft;
+  ctx.fillRect(x0, y0, w, h);
+
+  // Dashed dark halo, then dashed bright line — same visual
+  // language as the lasso draft, different hue so the two are
+  // never confused.
+  ctx.beginPath();
+  ctx.rect(x0, y0, w, h);
+  ctx.strokeStyle = halo;
+  ctx.lineWidth   = 6.0;
+  ctx.setLineDash([7, 5]);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.rect(x0, y0, w, h);
+  ctx.strokeStyle = bright;
+  ctx.lineWidth   = 2.8;
+  ctx.setLineDash([7, 5]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Corner + edge handles.
+  const handles = contextHandles(r);
+  if (handles) {
+    const HS = 7;
+    const active = c.activeHandle;
+    for (const hd of handles) {
+      ctx.fillStyle = "rgba(8, 10, 14, 0.85)";
+      ctx.fillRect(hd.x - HS - 2, hd.y - HS - 2, (HS + 2) * 2, (HS + 2) * 2);
+      ctx.fillStyle = (active === hd.name)
+        ? "rgba(255, 255, 255, 1.0)"
+        : bright;
+      ctx.fillRect(hd.x - HS, hd.y - HS, HS * 2, HS * 2);
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(hd.x - HS, hd.y - HS, HS * 2, HS * 2);
+    }
+  }
+
+  // Label — always drawn inside the top-left of the rect so it
+  // stays visible regardless of zoom or pan.
+  ctx.font = "700 10px 'JetBrains Mono', monospace";
+  ctx.fillStyle = bright;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillText("CONTEXT", x0 + 4, y0 + 4);
+
+  ctx.restore();
+}
+
+/* ============================================================
    Main draw
    ============================================================ */
 
@@ -652,6 +737,8 @@ export function drawView() {
     }
   }
 
+  _drawInpaintContext(r);
+
   for (const p of board.stagingPoints) {
     _drawPoint(p.x, p.y, p.isPositive, false);
   }
@@ -688,6 +775,10 @@ export function drawView() {
     ctxLabel = "STAGING MODE \u2014 place points then Segment All";
   } else {
     ctxLabel = "NO MASK SELECTED";
+  }
+
+  if (board.inpaintEnabled) {
+    ctxLabel += " \u00b7 INPAINT";
   }
 
   ctx.save();

@@ -1,7 +1,7 @@
 PANEL_BINDINGS_JS = r"""
 import {
   board, setImage, clearImage, setMasks,
-  snapshotRefine, snapshotSegmentAll, pushOp, popOp,
+  snapshotRefine, snapshotSegmentAll, pushOp, pushRedo, popOp, popRedo,
   restoreMasks, replaceMaskAt, selectedMask, selectedMaskIdx,
   clearPointsOnSelectedMask, clearStagingPoints,
   clearSelectedMaskRegion, compositeRefineWithRegion,
@@ -12,7 +12,8 @@ import { syncPanelFields } from "./pg_panel_fields.js";
 import { uploadImageFile, runSegmentAll, runRefine,
          interruptSegmentation, fetchStatus }
   from "./pg_comfy_client.js";
-import { checkKritaStatus, applyToKrita, importFromKrita }
+import { checkKritaStatus, applyToKrita, extractMaskToLayer,
+         importFromKrita }
   from "./pg_krita_client.js";
 import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyAll,
@@ -178,8 +179,43 @@ export async function runRefineAction() {
 }
 
 /* ============================================================
-   Undo
-   ============================================================ */
+   Undo / redo
+   ============================================================
+   Undo pops the "before" state off opLog, captures the current
+   "after" state into redoLog, and applies the "before".
+   Redo pops the "after" state off redoLog, captures the current
+   "before" state back into opLog (without clearing redoLog, so a
+   second redo can follow), and applies the "after".
+
+   pushOp's default clearRedo=true invalidates the redo history on
+   every new action, which is the standard contract. The redo path
+   passes clearRedo=false so this "undo the redo" op leaves the
+   remaining redo history intact. */
+
+function _captureCurrentRefine(maskIdx) {
+  const m = board.masks[maskIdx];
+  if (!m) return null;
+  return {
+    type: 'refine',
+    maskIdx,
+    prevB64: m.b64,
+    points: m.points.map(p => ({ x: p.x, y: p.y, isPositive: p.isPositive })),
+  };
+}
+
+function _captureCurrentSegmentAll() {
+  return {
+    type: 'segmentAll',
+    prevMasks: board.masks.map(m => ({
+      b64: m.b64,
+      points: m.points.map(p => ({ x: p.x, y: p.y, isPositive: p.isPositive })),
+      textPrompt: m.textPrompt || "",
+    })),
+    prevSelection: board.selectedMaskIndices.slice(),
+    prevStagingPoints: board.stagingPoints.map(p =>
+      ({ x: p.x, y: p.y, isPositive: p.isPositive })),
+  };
+}
 
 export async function undoAction() {
   if (board.running) return;
@@ -187,15 +223,48 @@ export async function undoAction() {
   if (!op) { flashStatus("nothing to undo", "warn"); return; }
 
   if (op.type === 'refine') {
+    const after = _captureCurrentRefine(op.maskIdx);
+    if (after) pushRedo(after);
     replaceMaskAt(op.maskIdx, op.prevB64);
     flashStatus("undid mask #" + (op.maskIdx + 1) + " edit", "ok");
   } else if (op.type === 'segmentAll') {
+    const after = _captureCurrentSegmentAll();
+    pushRedo(after);
     restoreMasks(op.prevMasks, op.prevSelection);
     if (op.prevStagingPoints) {
       board.stagingPoints = op.prevStagingPoints.map(p =>
         ({ x: p.x, y: p.y, isPositive: p.isPositive }));
     }
     flashStatus("undid Segment All", "ok");
+  }
+
+  syncMaskList();
+  syncPanelFields();
+  pgkitNotifyAll();
+  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+}
+
+export async function redoAction() {
+  if (board.running) return;
+  const op = popRedo();
+  if (!op) { flashStatus("nothing to redo", "warn"); return; }
+
+  if (op.type === 'refine') {
+    const before = _captureCurrentRefine(op.maskIdx);
+    // clearRedo=false keeps the rest of the redo history intact so a
+    // second redo can follow without re-pushing.
+    if (before) pushOp(before, false);
+    replaceMaskAt(op.maskIdx, op.prevB64);
+    flashStatus("redid mask #" + (op.maskIdx + 1) + " edit", "ok");
+  } else if (op.type === 'segmentAll') {
+    const before = _captureCurrentSegmentAll();
+    pushOp(before, false);
+    restoreMasks(op.prevMasks, op.prevSelection);
+    if (op.prevStagingPoints) {
+      board.stagingPoints = op.prevStagingPoints.map(p =>
+        ({ x: p.x, y: p.y, isPositive: p.isPositive }));
+    }
+    flashStatus("redid Segment All", "ok");
   }
 
   syncMaskList();
@@ -234,6 +303,7 @@ function _clearRegionAction() {
 function _clearMasksAction() {
   setMasks([]);
   board.opLog = [];
+  board.redoLog = [];
   syncMaskList();
   syncPanelFields();
   pgkitNotifyAll();
@@ -359,6 +429,67 @@ function _kritaGetTargetLayer() {
   return el ? (el.value || "").trim() : "";
 }
 
+function _getKritaSelMode() {
+  const el = document.getElementById("kritaSelMode");
+  return el ? el.value : "replace";
+}
+
+function _getKritaEdgeOptions() {
+  const featherEl  = document.getElementById("kritaFeather");
+  const expandEl   = document.getElementById("kritaExpand");
+  const contractEl = document.getElementById("kritaContract");
+  const smoothEl   = document.getElementById("kritaSmooth");
+  const invertEl   = document.getElementById("kritaInvert");
+
+  const readInt = (el, dflt) => {
+    if (!el) return dflt;
+    const n = parseInt(el.value, 10);
+    return isFinite(n) ? Math.max(0, n) : dflt;
+  };
+
+  return {
+    featherRadius:    readInt(featherEl, 0),
+    expandPixels:     readInt(expandEl, 0),
+    contractPixels:   readInt(contractEl, 0),
+    smoothIterations: readInt(smoothEl, 0),
+    invert:           invertEl ? !!invertEl.checked : false,
+  };
+}
+
+/* Post-apply options for extract modes. Blend mode is "" when the
+   user hasn't chosen one (skip set_layer_blend_mode). Group is ""
+   when blank (skip move_layer_to_group).
+
+   Opacity is the one field whose units change at this boundary.
+   Every other place in the playground — the scrub input, the field
+   registration, the value a remote client sends and receives — uses
+   PERCENT (0-100), which is how a user reads "opacity". Krita's
+   set_layer_opacity expects 0-255. Converting here means the
+   conversion has exactly one call site, and everything upstream of
+   it can stay percent. */
+function _getKritaExtractOptions() {
+  const blendEl    = document.getElementById("kritaBlendMode");
+  const opacityEl  = document.getElementById("kritaOpacity");
+  const opEnableEl = document.getElementById("kritaOpacityEnabled");
+  const groupEl    = document.getElementById("kritaGroup");
+
+  const blendMode = blendEl ? (blendEl.value || "") : "";
+
+  let opacity = "";
+  if (opEnableEl && opEnableEl.checked && opacityEl) {
+    const n = parseInt(opacityEl.value, 10);
+    if (isFinite(n)) {
+      const pct = Math.max(0, Math.min(100, n));
+      // Round to nearest byte; 100% → 255, 50% → 128, 0% → 0.
+      opacity = String(Math.round(pct * 255 / 100));
+    }
+  }
+
+  const groupName = groupEl ? (groupEl.value || "").trim() : "";
+
+  return { blendMode, opacity, groupName };
+}
+
 async function _kritaExportSelection() {
   const indices = board.selectedMaskIndices.slice();
   if (indices.length === 0) {
@@ -371,14 +502,21 @@ async function _kritaExportSelection() {
     flashStatus("could not combine masks", "bad");
     return;
   }
+  const selMode = _getKritaSelMode();
+  const edge = _getKritaEdgeOptions();
   flashStatus("sending selection to Krita\u2026", "");
   const res = await applyToKrita({
     maskB64: unionB64,
     mode: "selection",
-    selMode: "replace",
+    selMode: selMode,
+    invert: edge.invert,
+    expandPixels: edge.expandPixels,
+    contractPixels: edge.contractPixels,
+    smoothIterations: edge.smoothIterations,
+    featherRadius: edge.featherRadius,
   });
   if (res.success) {
-    flashStatus("selection applied to Krita", "ok");
+    flashStatus("selection applied to Krita (" + selMode + ")", "ok");
     _kritaMarkReachable();
   } else {
     flashStatus("failed: " + (res.message || "unknown"), "bad");
@@ -400,16 +538,72 @@ async function _kritaExportTransparency() {
     flashStatus("could not combine masks", "bad");
     return;
   }
+  const edge = _getKritaEdgeOptions();
   flashStatus("sending transparency mask to Krita\u2026", "");
   const res = await applyToKrita({
     maskB64: unionB64,
     mode: "transparency",
     layerName: _kritaGetTargetLayer(),
+    invert: edge.invert,
+    expandPixels: edge.expandPixels,
+    contractPixels: edge.contractPixels,
+    smoothIterations: edge.smoothIterations,
+    featherRadius: edge.featherRadius,
   });
   if (res.success) {
     const d = res.data || {};
     const target = d.layer_name ? (" on " + d.layer_name) : "";
     flashStatus("transparency mask applied" + target, "ok");
+    _kritaMarkReachable();
+  } else {
+    flashStatus("failed: " + (res.message || "unknown"), "bad");
+    if (/unreachable|connect|refused|timeout/i.test(res.message || "")) {
+      _kritaMarkUnreachable(res.message);
+    }
+  }
+}
+
+async function _kritaExportExtract(mode) {
+  // mode is 'extract_new_layer' or 'extract_duplicate'
+  const indices = board.selectedMaskIndices.slice();
+  if (indices.length === 0) {
+    flashStatus("no masks selected", "warn");
+    return;
+  }
+  const b64s = indices.map(i => board.masks[i].b64);
+  const unionB64 = await _unionMasksB64(b64s);
+  if (!unionB64) {
+    flashStatus("could not combine masks", "bad");
+    return;
+  }
+  const edge = _getKritaEdgeOptions();
+  const extra = _getKritaExtractOptions();
+  const isNewLayer = (mode === "extract_new_layer");
+  const verb = isNewLayer ? "extracting to new layer" : "duplicating with mask";
+  flashStatus(verb + "\u2026", "");
+  const res = await extractMaskToLayer({
+    maskB64: unionB64,
+    mode: mode,
+    layerName: _kritaGetTargetLayer(),
+    newLayerName: "",
+    blendMode: extra.blendMode,
+    opacity: extra.opacity,
+    groupName: extra.groupName,
+    invert: edge.invert,
+    expandPixels: edge.expandPixels,
+    contractPixels: edge.contractPixels,
+    smoothIterations: edge.smoothIterations,
+    featherRadius: edge.featherRadius,
+  });
+  if (res.success) {
+    const d = res.data || {};
+    const nameSuffix = d.new_layer ? (" \u2192 " + d.new_layer) : "";
+    const warnings = (d.post_warnings || []).join("; ");
+    flashStatus(
+      (isNewLayer ? "extracted" : "duplicated") + nameSuffix +
+      (warnings ? " \u2014 " + warnings : ""),
+      warnings ? "warn" : "ok"
+    );
     _kritaMarkReachable();
   } else {
     flashStatus("failed: " + (res.message || "unknown"), "bad");
@@ -456,11 +650,12 @@ async function _kritaImportAction() {
 export function installPanelBindings() {
   const el = {};
   const ids = [
-    "runBtn", "segmentAllBtn", "cancelBtn", "undoBtn",
+    "runBtn", "segmentAllBtn", "cancelBtn", "undoBtn", "redoBtn",
     "clearPointsBtn", "clearRegionBtn", "pickImageBtn", "clearImageBtn",
     "kritaImportBtn",
     "exportBtn", "exportCombinedBtn",
     "kritaCheckBtn", "kritaSelectionBtn", "kritaTransparencyBtn",
+    "kritaExtractNewLayerBtn", "kritaExtractDuplicateBtn",
   ];
   for (const id of ids) el[id] = document.getElementById(id);
 
@@ -468,6 +663,7 @@ export function installPanelBindings() {
   if (el.segmentAllBtn) el.segmentAllBtn.addEventListener("click", runSegmentAllAction);
   if (el.cancelBtn)     el.cancelBtn.addEventListener("click", _cancelAction);
   if (el.undoBtn)       el.undoBtn.addEventListener("click", undoAction);
+  if (el.redoBtn)       el.redoBtn.addEventListener("click", redoAction);
   if (el.clearPointsBtn) el.clearPointsBtn.addEventListener("click", _clearPointsAction);
   if (el.clearRegionBtn) el.clearRegionBtn.addEventListener("click", _clearRegionAction);
   if (el.pickImageBtn)  el.pickImageBtn.addEventListener("click", _pickImageAction);
@@ -479,6 +675,10 @@ export function installPanelBindings() {
   if (el.kritaCheckBtn)        el.kritaCheckBtn.addEventListener("click", _kritaStatusRefresh);
   if (el.kritaSelectionBtn)    el.kritaSelectionBtn.addEventListener("click", _kritaExportSelection);
   if (el.kritaTransparencyBtn) el.kritaTransparencyBtn.addEventListener("click", _kritaExportTransparency);
+  if (el.kritaExtractNewLayerBtn) el.kritaExtractNewLayerBtn.addEventListener("click",
+    () => _kritaExportExtract("extract_new_layer"));
+  if (el.kritaExtractDuplicateBtn) el.kritaExtractDuplicateBtn.addEventListener("click",
+    () => _kritaExportExtract("extract_duplicate"));
 
   const statusEl = document.getElementById("statusLine");
   if (statusEl) {
@@ -522,6 +722,10 @@ pgkitRegisterAction("action.segmentAll", {
 });
 pgkitRegisterAction("action.undo", {
   label: "Undo", scope: "global", run: undoAction,
+  meta: { variant: "plain" },
+});
+pgkitRegisterAction("action.redo", {
+  label: "Redo", scope: "global", run: redoAction,
   meta: { variant: "plain" },
 });
 pgkitRegisterAction("action.cancel", {
@@ -571,6 +775,16 @@ pgkitRegisterAction("action.kritaSelection", {
 });
 pgkitRegisterAction("action.kritaTransparency", {
   label: "Add transparency mask", scope: "global", run: _kritaExportTransparency,
+  meta: { variant: "primary" },
+});
+pgkitRegisterAction("action.kritaExtractNewLayer", {
+  label: "Extract as new layer", scope: "global",
+  run: () => _kritaExportExtract("extract_new_layer"),
+  meta: { variant: "primary" },
+});
+pgkitRegisterAction("action.kritaExtractDuplicate", {
+  label: "Duplicate with mask", scope: "global",
+  run: () => _kritaExportExtract("extract_duplicate"),
   meta: { variant: "primary" },
 });
 

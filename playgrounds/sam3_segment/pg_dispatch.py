@@ -570,7 +570,26 @@ window.addEventListener("keydown", (e) => {
     return;
   }
 
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+  // Ctrl+Shift+Z and Ctrl+Y are redo. Checked BEFORE the plain Ctrl+Z
+  // undo path so that Ctrl+Shift+Z doesn't fall through to undo.
+  // e.key.toLowerCase() === "z" matches both "z" and "Z"; the shift
+  // state disambiguates.
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "z") {
+    e.preventDefault();
+    import("./pg_panel_bindings.js")
+      .then(m => m.redoAction())
+      .catch(() => {});
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "y") {
+    e.preventDefault();
+    import("./pg_panel_bindings.js")
+      .then(m => m.redoAction())
+      .catch(() => {});
+    return;
+  }
+
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z") {
     e.preventDefault();
     import("./pg_panel_bindings.js")
       .then(m => m.undoAction())

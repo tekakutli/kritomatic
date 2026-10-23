@@ -15,7 +15,7 @@ class LayerBasicHandler(AutoDispatchHandler):
             if child == node:
                 return prev_node
             prev_node = child
-        return prev_node
+        return None
 
     def _insert_layer_at_position(self, new_layer, position_type, current_layer, reference_layer_name, doc):
         if position_type == 'above_current' and current_layer:
@@ -248,6 +248,47 @@ class LayerBasicHandler(AutoDispatchHandler):
             register_node(new_name, layer)
             refresh(doc)
             return {'success': True, 'message': f'Renamed "{old_name}" to "{new_name}"'}
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    @command(
+        category='layer',
+        help_text='Set the opacity of an existing layer',
+        args={
+            '--layer_name': {'type': 'str', 'default': '',
+                             'help': 'Target layer name; empty = active layer'},
+            '--opacity': {'type': 'int', 'required': True,
+                          'help': 'Layer opacity (0-255)'}
+        }
+    )
+    def set_layer_opacity(self, params):
+        try:
+            doc = Krita.instance().activeDocument()
+            if not doc:
+                return {'success': False, 'message': 'No active document'}
+
+            layer_name = params.get('layer_name', '')
+            opacity = params.get('opacity', 255)
+
+            if layer_name:
+                target = resolve_node(doc, layer_name)
+                if not target:
+                    return {'success': False,
+                            'message': f'Layer "{layer_name}" not found'}
+            else:
+                target = doc.activeNode()
+                if not target:
+                    return {'success': False, 'message': 'No active layer'}
+
+            opacity = max(0, min(255, int(opacity)))
+            target.setOpacity(opacity)
+            refresh(doc)
+
+            return {
+                'success': True,
+                'message': f'Opacity of "{target.name()}" set to {opacity}',
+                'data': {'layer_name': target.name(), 'opacity': opacity}
+            }
         except Exception as e:
             return {'success': False, 'message': str(e)}
 

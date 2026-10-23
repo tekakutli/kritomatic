@@ -45,6 +45,15 @@ PG_CSS = r"""
     background: rgba(180, 155, 255, 0.10);
     color: #e8e0ff;
   }
+  #ui button#redoBtn {
+    border-color: rgba(180, 155, 255, 0.72);
+    color: #d5c8ff;
+  }
+  #ui button#redoBtn:hover:not(:disabled) {
+    border-color: rgba(200, 180, 255, 1.00);
+    background: rgba(180, 155, 255, 0.10);
+    color: #e8e0ff;
+  }
   #ui button#pickImageBtn {
     border-color: rgba(120, 220, 255, 0.72);
     color: #b8ecff;
@@ -85,6 +94,17 @@ PG_CSS = r"""
     background: rgba(140, 225, 160, 0.10);
     color: #d8ffe0;
   }
+  #ui button#kritaExtractNewLayerBtn,
+  #ui button#kritaExtractDuplicateBtn {
+    border-color: rgba(180, 155, 255, 0.72);
+    color: #d5c8ff;
+  }
+  #ui button#kritaExtractNewLayerBtn:hover:not(:disabled),
+  #ui button#kritaExtractDuplicateBtn:hover:not(:disabled) {
+    border-color: rgba(200, 180, 255, 1.00);
+    background: rgba(180, 155, 255, 0.10);
+    color: #e8e0ff;
+  }
   #ui button#kritaImportBtn {
     border-color: rgba(140, 225, 160, 0.72);
     color: #b8ecff;
@@ -108,6 +128,26 @@ PG_CSS = r"""
     border:1px solid #223040;border-radius:2px;
     font-family:inherit;font-size:12px;
     padding:4px 6px;outline:none;resize:vertical;
+  }
+
+  /* Sub-header inside a section — small uppercase label that groups
+     related controls. Used to split "Edge cleanup", "Selection",
+     "Transparency mask", and "Extract" inside the Export to Krita
+     block. */
+  .section-subhead {
+    font-size: 9px;
+    color: #5a6774;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    font-weight: 700;
+    margin: 10px 0 4px;
+    padding: 4px 0 2px;
+    border-top: 1px solid #1e2836;
+  }
+  .section-subhead:first-child {
+    margin-top: 4px;
+    border-top: none;
+    padding-top: 0;
   }
 
   .modelRow, .toolRow {
@@ -328,8 +368,16 @@ PG_PANEL_BODY = r"""
       <div class="section-body">
         <div class="modelRow">
           <span style="color:#5a6774;font-size:9px;letter-spacing:0.14em;text-transform:uppercase;font-weight:700;">Model</span>
-          <label><input type="radio" name="refineModel" id="modelSam2" checked> SAM2 (true refine)</label>
-          <label><input type="radio" name="refineModel" id="modelSam3"> SAM3 (re-detect)</label>
+          <label title="SAM2 refines the existing mask incrementally: each click nudges the current mask toward the prompt. Preserves everything the mask already covers.">
+            <input type="radio" name="refineModel" id="modelSam2" checked> SAM2 (true refine)
+          </label>
+          <label title="SAM3 re-detects from points + prompt + bbox. Each click produces a fresh detection, which can move the whole shape rather than nudging it. Useful for re-authoring a bad mask; not incremental.">
+            <input type="radio" name="refineModel" id="modelSam3"> SAM3 (re-detect)
+          </label>
+        </div>
+        <div class="runHint" style="margin-top:2px;">
+          SAM2 preserves the mask; SAM3 re-detects it. Use SAM3 to
+          author a fresh mask, SAM2 to nudge an existing one.
         </div>
         <div class="row">
           <button id="runBtn">Run</button>
@@ -338,6 +386,7 @@ PG_PANEL_BODY = r"""
         <div class="row">
           <button id="cancelBtn">Cancel</button>
           <button id="undoBtn">Undo</button>
+          <button id="redoBtn">Redo</button>
         </div>
         <div id="statusLine">idle</div>
       </div>
@@ -380,22 +429,124 @@ PG_PANEL_BODY = r"""
                         color:#00e5ff;font-family:inherit;font-size:12px;
                         font-weight:700;padding:2px 4px;outline:none;">
         </div>
+
+        <div class="section-subhead">Edge cleanup</div>
+        <div class="field">
+          <label>Feather</label>
+          <input type="text" id="kritaFeather" class="scrubInput"
+                 value="0" autocomplete="off" spellcheck="false"
+                 title="Box-blur the mask edge by N pixels; softens the boundary between kept and dropped pixels.">
+          <span style="font-size:9px;color:#3d4756;margin-left:6px;">px</span>
+        </div>
+        <div class="field">
+          <label>Expand</label>
+          <input type="text" id="kritaExpand" class="scrubInput"
+                 value="0" autocomplete="off" spellcheck="false"
+                 title="Dilate the mask outward by N pixels. Applied before contract.">
+          <span style="font-size:9px;color:#3d4756;margin-left:6px;">px</span>
+        </div>
+        <div class="field">
+          <label>Contract</label>
+          <input type="text" id="kritaContract" class="scrubInput"
+                 value="0" autocomplete="off" spellcheck="false"
+                 title="Erode the mask inward by N pixels. Applied after expand.">
+          <span style="font-size:9px;color:#3d4756;margin-left:6px;">px</span>
+        </div>
+        <div class="field">
+          <label>Smooth</label>
+          <input type="text" id="kritaSmooth" class="scrubInput"
+                 value="0" autocomplete="off" spellcheck="false"
+                 title="Morphological open+close iterations. Removes small islands and fills small holes without moving the overall edge.">
+          <span style="font-size:9px;color:#3d4756;margin-left:6px;">iter</span>
+        </div>
+        <div class="field">
+          <label>Invert</label>
+          <input type="checkbox" id="kritaInvert"
+                 title="Invert the mask before applying. Use this to keep the region you masked *out*.">
+          <span style="font-size:9px;color:#3d4756;margin-left:6px;">invert mask</span>
+        </div>
+
+        <div class="section-subhead">Selection</div>
+        <div class="field">
+          <label>Sel mode</label>
+          <select id="kritaSelMode" title="How the mask combines with the document's current selection.">
+            <option value="replace">replace</option>
+            <option value="add">add</option>
+            <option value="subtract">subtract</option>
+            <option value="intersect">intersect</option>
+          </select>
+        </div>
         <div class="row">
           <button id="kritaSelectionBtn"
                   title="Set the document selection from the selected masks (union)">
             Set as selection
           </button>
         </div>
+
+        <div class="section-subhead">Transparency mask</div>
         <div class="row">
           <button id="kritaTransparencyBtn"
                   title="Add a transparency mask to the target layer using the selected masks (union)">
             Add transparency mask
           </button>
         </div>
+
+        <div class="section-subhead">Extract</div>
+        <div class="field">
+          <label>Blend</label>
+          <select id="kritaBlendMode" title="Blend mode to apply to the extracted layer. Leave on (keep) to inherit the source's blend mode.">
+            <option value="">(keep)</option>
+            <option value="normal">normal</option>
+            <option value="multiply">multiply</option>
+            <option value="screen">screen</option>
+            <option value="overlay">overlay</option>
+            <option value="add">add</option>
+            <option value="difference">difference</option>
+            <option value="color">color</option>
+            <option value="saturation">saturation</option>
+            <option value="hue">hue</option>
+            <option value="luminosity">luminosity</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Opacity</label>
+          <input type="checkbox" id="kritaOpacityEnabled"
+                 title="When checked, override the extracted layer's opacity. When unchecked, the extracted layer inherits the source's opacity.">
+          <input type="text" id="kritaOpacity" class="scrubInput"
+                 value="100" autocomplete="off" spellcheck="false"
+                 title="0-100 percent. Applied only when the checkbox to the left is on.">
+          <span style="font-size:9px;color:#3d4756;margin-left:6px;">%</span>
+        </div>
+        <div class="field">
+          <label>Group</label>
+          <input type="text" id="kritaGroup" autocomplete="off"
+                 spellcheck="false" placeholder="(blank = no group)"
+                 style="flex:1 1 auto;min-width:0;background:transparent;
+                        border:0;border-bottom:1px solid #223040;
+                        color:#00e5ff;font-family:inherit;font-size:12px;
+                        font-weight:700;padding:2px 4px;outline:none;"
+                 title="If set, move the extracted layer into this group. The group must already exist.">
+        </div>
+        <div class="row">
+          <button id="kritaExtractNewLayerBtn"
+                  title="Extract the masked region of the target layer into a fresh paint layer, preserving the source layer.">
+            Extract as new layer
+          </button>
+        </div>
+        <div class="row">
+          <button id="kritaExtractDuplicateBtn"
+                  title="Duplicate the target layer in place, and attach a transparency mask for the masked region.">
+            Duplicate with mask
+          </button>
+        </div>
         <div class="runHint">
           Requires the kritomatic daemon running in Krita with
-          <code>set_selection_from_mask_b64</code> and
-          <code>apply_transparency_mask_b64</code> registered.
+          <code>set_selection_from_mask_b64</code>,
+          <code>apply_transparency_mask_b64</code>,
+          <code>extract_mask_to_layer</code>,
+          <code>set_layer_blend_mode</code>,
+          <code>set_layer_opacity</code>, and
+          <code>move_layer_to_group</code> registered.
           Blank target layer = current active layer.
         </div>
       </div>

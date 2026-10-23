@@ -46,9 +46,40 @@ export const board = {
   hoveredMaskIdx:      -1,
 
   opLog:    [],
+  redoLog:  [],
 
   running:       false,
   lastTiming:    null,
+
+  // Krita export options. Persist across runs so a user who tunes
+  // feather once doesn't re-tune it on every mask; the values are
+  // copied into every applyToKrita / extractMaskToLayer call.
+  //
+  // kritaOpacity is in PERCENT (0-100), not Krita's native 0-255.
+  // Every UI surface here — the scrub input, the field registration,
+  // the number a remote client sees — uses percent. The single
+  // conversion to 0-255 happens at the boundary in
+  // pg_panel_bindings._getKritaExtractOptions, right before the
+  // extract payload is built. That keeps the daemon's byte-range
+  // contract the daemon's problem, and keeps the user's mental model
+  // ("I want 50% opacity") straightforward.
+  //
+  // kritaOpacityEnabled gates the opacity value: when false, no
+  // set_layer_opacity command is issued during extraction, so the
+  // new layer inherits whatever opacity the source has (relevant for
+  // duplicate mode where the dup inherits from the source). When
+  // true, the value is applied explicitly, overriding whatever the
+  // source carried.
+  kritaFeather:        0,
+  kritaExpand:         0,
+  kritaContract:       0,
+  kritaSmooth:         0,
+  kritaInvert:         false,
+  kritaSelMode:        "replace",
+  kritaBlendMode:      "",
+  kritaOpacity:        100,
+  kritaOpacityEnabled: false,
+  kritaGroup:          "",
 };
 
 /* ============================================================
@@ -156,6 +187,7 @@ export function setImage(hash, dataUrl, width, height) {
   board.freehandActive = false;
   board.freehandIsErase = false;
   board.opLog = [];
+  board.redoLog = [];
 }
 
 export function clearImage() {
@@ -172,6 +204,7 @@ export function clearImage() {
   board.freehandActive = false;
   board.freehandIsErase = false;
   board.opLog = [];
+  board.redoLog = [];
 }
 
 /* ============================================================
@@ -580,16 +613,42 @@ export function computeEffectiveBBox(idx) {
 }
 
 /* ============================================================
-   Op log
-   ============================================================ */
+   Op log / redo log
+   ============================================================
+   Two independent stacks:
 
-export function pushOp(op) {
+     opLog     the "before" states of every applied operation.
+               Pushed by pushOp(op), popped by popOp().
+               Capped at OP_LOG_MAX entries.
+
+     redoLog   the "after" states of every undone operation.
+               Pushed by pushRedo(op), popped by popRedo().
+               Same cap. Cleared by every new pushOp — a fresh
+               action invalidates the redo history, which is the
+               standard undo/redo contract.
+
+   pushOp has an optional `clearRedo` flag. Ordinary action flow
+   passes true (default). The redo handler passes false, because
+   the "new" op it pushes is itself a redo — clearing the redo
+   stack would prevent a second redo. */
+
+export function pushOp(op, clearRedo = true) {
   board.opLog.push(op);
   if (board.opLog.length > OP_LOG_MAX) board.opLog.shift();
+  if (clearRedo) board.redoLog = [];
 }
 
 export function popOp() {
   return board.opLog.pop() || null;
+}
+
+export function pushRedo(op) {
+  board.redoLog.push(op);
+  if (board.redoLog.length > OP_LOG_MAX) board.redoLog.shift();
+}
+
+export function popRedo() {
+  return board.redoLog.pop() || null;
 }
 
 export function snapshotRefine(maskIdx) {

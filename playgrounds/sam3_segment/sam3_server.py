@@ -9,7 +9,7 @@ Routes:
   GET  /comfy/status         preflight
 
   GET  /krita/status         kritomatic daemon reachable?
-  POST /krita/apply          send a mask to Krita (selection / transparency mask)
+  POST /krita/apply          send a mask to Krita (selection / transparency mask / layer extraction)
   POST /krita/import         fetch active document composite from Krita
 """
 
@@ -361,6 +361,14 @@ def _run_refine_sam2(payload: dict, image_entry: dict,
 
 def _run_refine_sam3(payload: dict, image_entry: dict,
                      client: ComfyClient) -> dict:
+    """SAM3 refine re-detects.
+
+    Unlike SAM2 refine, SAM3's detect node has no `mask` input — the
+    workflow can only pass points, prompt, and bbox. So each click
+    produces a fresh detection rather than an incremental refinement
+    of the previous mask. This is a semantic difference the UI documents
+    via the model radio tooltip; the handler itself just routes.
+    """
     workflow = _get_segment_workflow()
     if workflow is None:
         return {"success": False, "message": "no segment workflow for SAM3 refine"}
@@ -438,40 +446,30 @@ def handle_krita_status(_payload) -> dict:
     return {"success": True, "reachable": reachable}
 
 
-def handle_krita_apply(payload: dict) -> dict:
-    """Forward a mask to Krita via the kritomatic daemon.
+def _coerce_edge_args(payload: dict) -> dict:
+    """Pull the shared edge-cleanup args out of an apply payload.
 
-    Modes:
-      'selection'    → daemon command set_selection_from_mask_b64
-      'transparency' → daemon command apply_transparency_mask_b64
+    Shared between all four apply modes. Missing keys default to 0/False
+    so an old client that doesn't send them still gets the pre-cleanup
+    behaviour (no dilate, no erode, no smooth, no feather, no invert).
     """
-    mask_b64 = payload.get("mask_b64")
-    if not mask_b64:
-        return {"success": False, "message": "no mask_b64"}
+    def _int(key):
+        v = payload.get(key, 0)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
 
-    mode = payload.get("mode")
-    if mode not in ("selection", "transparency"):
-        return {"success": False, "message": f"unknown mode: {mode!r}"}
+    return {
+        "expand_pixels":     _int("expand_pixels"),
+        "contract_pixels":   _int("contract_pixels"),
+        "smooth_iterations": _int("smooth_iterations"),
+        "feather_radius":    _int("feather_radius"),
+        "invert":            bool(payload.get("invert", False)),
+    }
 
-    if mode == "selection":
-        sel_mode = payload.get("sel_mode") or "replace"
-        if sel_mode not in ("replace", "add", "subtract"):
-            return {"success": False,
-                    "message": f"unknown sel_mode: {sel_mode!r}"}
-        command = {
-            "type": "set_selection_from_mask_b64",
-            "mask_b64": mask_b64,
-            "mode": sel_mode,
-        }
-    else:  # transparency
-        command = {
-            "type": "apply_transparency_mask_b64",
-            "mask_b64": mask_b64,
-            "layer_name": payload.get("layer_name") or "",
-            "invert": bool(payload.get("invert", False)),
-        }
 
-    response = krita_client.send(command, timeout=60.0)
+def _normalize_response(response: dict) -> dict:
     if response.get("status") == "success":
         return {
             "success": True,
@@ -482,6 +480,170 @@ def handle_krita_apply(payload: dict) -> dict:
         "success": False,
         "message": response.get("message") or "daemon rejected the command",
     }
+
+
+def _extract_with_post_apply(payload: dict, edge: dict) -> dict:
+    """Orchestrate extract_mask_to_layer + optional post-apply.
+
+    The daemon stays primitive: extract does extraction only, blend and
+    opacity live on their own commands, grouping lives on
+    move_layer_to_group. This function chains them server-side because
+    each follow-up needs the layer NAME returned by the extract step.
+
+    Order:
+      1. extract_mask_to_layer — hard failure if this fails; nothing
+         else runs and the caller gets the daemon's error verbatim.
+      2. set_layer_blend_mode — soft failure: extraction succeeded, so
+         report the post-apply error as a warning and continue.
+      3. set_layer_opacity    — same soft-fail policy.
+      4. move_layer_to_group  — same soft-fail policy. If the group
+         doesn't exist, the error is reported but the extracted layer
+         stays where it landed.
+    """
+    daemon_mode = ("new_layer" if payload.get("mode") == "extract_new_layer"
+                   else "duplicate")
+
+    extract_cmd = {
+        "type": "extract_mask_to_layer",
+        "mask_b64": payload.get("mask_b64"),
+        "layer_name": payload.get("layer_name") or "",
+        "new_layer_name": payload.get("new_layer_name") or "",
+        "mode": daemon_mode,
+        **edge,
+    }
+    extract_resp = krita_client.send(extract_cmd, timeout=60.0)
+    if extract_resp.get("status") != "success":
+        return {
+            "success": False,
+            "message": extract_resp.get("message") or "extraction failed",
+        }
+
+    new_layer = ((extract_resp.get("data") or {}).get("new_layer") or "")
+    if not new_layer:
+        return {
+            "success": False,
+            "message": "extraction succeeded but daemon returned no layer name",
+        }
+
+    post_warnings: list = []
+
+    blend_mode = payload.get("blend_mode") or ""
+    if blend_mode:
+        r = krita_client.send({
+            "type": "set_layer_blend_mode",
+            "layer_name": new_layer,
+            "blend_mode": blend_mode,
+        }, timeout=30.0)
+        if r.get("status") != "success":
+            post_warnings.append(
+                f"blend mode: {r.get('message') or 'unknown error'}"
+            )
+
+    opacity = payload.get("opacity")
+    if opacity is not None and opacity != "":
+        try:
+            op_int = int(opacity)
+        except (TypeError, ValueError):
+            post_warnings.append(f"opacity not an integer: {opacity!r}")
+        else:
+            if 0 <= op_int <= 255:
+                r = krita_client.send({
+                    "type": "set_layer_opacity",
+                    "layer_name": new_layer,
+                    "opacity": op_int,
+                }, timeout=30.0)
+                if r.get("status") != "success":
+                    post_warnings.append(
+                        f"opacity: {r.get('message') or 'unknown error'}"
+                    )
+            else:
+                post_warnings.append(
+                    f"opacity {op_int} out of range (0-255); skipped"
+                )
+
+    group_name = payload.get("group_name") or ""
+    if group_name:
+        r = krita_client.send({
+            "type": "move_layer_to_group",
+            "layer_name": new_layer,
+            "group_name": group_name,
+            "position": "inside",
+        }, timeout=30.0)
+        if r.get("status") != "success":
+            post_warnings.append(
+                f"group '{group_name}': "
+                f"{r.get('message') or 'move failed'}"
+            )
+
+    result_data = dict(extract_resp.get("data") or {})
+    if post_warnings:
+        result_data["post_warnings"] = post_warnings
+
+    verb = "Extracted" if daemon_mode == "new_layer" else "Duplicated"
+    msg = f"{verb} to '{new_layer}'"
+    if post_warnings:
+        msg += " (" + "; ".join(post_warnings) + ")"
+
+    return {
+        "success": True,
+        "message": msg,
+        "data": result_data,
+    }
+
+
+def handle_krita_apply(payload: dict) -> dict:
+    """Forward a mask to Krita via the kritomatic daemon.
+
+    Modes:
+      'selection'           → daemon command set_selection_from_mask_b64
+      'transparency'        → daemon command apply_transparency_mask_b64
+      'extract_new_layer'   → daemon command extract_mask_to_layer (new_layer)
+      'extract_duplicate'   → daemon command extract_mask_to_layer (duplicate)
+
+    All four accept the shared edge-cleanup args (expand_pixels,
+    contract_pixels, smooth_iterations, feather_radius, invert).
+
+    Extract modes additionally accept --blend_mode, --opacity, and
+    --group_name. These are NOT passed to extract_mask_to_layer (which
+    stays single-purpose); this handler composes them by calling
+    set_layer_blend_mode, set_layer_opacity, and move_layer_to_group
+    against the new layer's name after extraction succeeds.
+    """
+    mask_b64 = payload.get("mask_b64")
+    if not mask_b64:
+        return {"success": False, "message": "no mask_b64"}
+
+    mode = payload.get("mode")
+    if mode not in ("selection", "transparency",
+                    "extract_new_layer", "extract_duplicate"):
+        return {"success": False, "message": f"unknown mode: {mode!r}"}
+
+    edge = _coerce_edge_args(payload)
+
+    if mode == "selection":
+        sel_mode = payload.get("sel_mode") or "replace"
+        if sel_mode not in ("replace", "add", "subtract", "intersect"):
+            return {"success": False,
+                    "message": f"unknown sel_mode: {sel_mode!r}"}
+        command = {
+            "type": "set_selection_from_mask_b64",
+            "mask_b64": mask_b64,
+            "mode": sel_mode,
+            **edge,
+        }
+        return _normalize_response(krita_client.send(command, timeout=60.0))
+
+    if mode == "transparency":
+        command = {
+            "type": "apply_transparency_mask_b64",
+            "mask_b64": mask_b64,
+            "layer_name": payload.get("layer_name") or "",
+            **edge,
+        }
+        return _normalize_response(krita_client.send(command, timeout=60.0))
+
+    # Extract modes: orchestrate extract + post-apply composition
+    return _extract_with_post_apply(payload, edge)
 
 
 def handle_krita_import(payload: dict) -> dict:

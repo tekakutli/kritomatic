@@ -22,6 +22,7 @@ function _get() {
     segAllBtn:      document.getElementById("segmentAllBtn"),
     cancelBtn:      document.getElementById("cancelBtn"),
     undoBtn:        document.getElementById("undoBtn"),
+    redoBtn:        document.getElementById("redoBtn"),
     clearPointsBtn: document.getElementById("clearPointsBtn"),
     exportBtn:      document.getElementById("exportBtn"),
     exportCombBtn:  document.getElementById("exportCombinedBtn"),
@@ -29,6 +30,8 @@ function _get() {
     kritaImportBtn: document.getElementById("kritaImportBtn"),
     kritaSelBtn:    document.getElementById("kritaSelectionBtn"),
     kritaTransBtn:  document.getElementById("kritaTransparencyBtn"),
+    kritaExtractNewBtn: document.getElementById("kritaExtractNewLayerBtn"),
+    kritaExtractDupBtn: document.getElementById("kritaExtractDuplicateBtn"),
   };
   return _els;
 }
@@ -130,6 +133,7 @@ export function syncPanelFields() {
   const canRefine = hasImage && !busy && selCount === 1;
   const canSegmentAll = hasImage && !busy;
   const canUndo = board.opLog.length > 0 && !busy;
+  const canRedo = board.redoLog.length > 0 && !busy;
   const hasMasks = selCount > 0;
 
   if (e.runBtn) {
@@ -156,6 +160,12 @@ export function syncPanelFields() {
       ? "Undo (" + board.opLog.length + ")"
       : "Undo";
   }
+  if (e.redoBtn) {
+    e.redoBtn.disabled = !canRedo;
+    e.redoBtn.textContent = board.redoLog.length > 0
+      ? "Redo (" + board.redoLog.length + ")"
+      : "Redo";
+  }
   if (e.clearPointsBtn) {
     const hasActivePoints = m
       ? m.points.length > 0
@@ -168,5 +178,7 @@ export function syncPanelFields() {
   if (e.kritaImportBtn) e.kritaImportBtn.disabled = busy;
   if (e.kritaSelBtn)    e.kritaSelBtn.disabled    = !hasMasks;
   if (e.kritaTransBtn)  e.kritaTransBtn.disabled  = !hasMasks;
+  if (e.kritaExtractNewBtn) e.kritaExtractNewBtn.disabled = !hasMasks;
+  if (e.kritaExtractDupBtn) e.kritaExtractDupBtn.disabled = !hasMasks;
 }
 """

@@ -1,12 +1,8 @@
 VIEW_JS = r"""
 import {
   ctx, board, fittedImageRect, imageToScreen,
-  maskColor, maskPixelData,
+  maskColor, maskPixelData, selectedMask,
 } from "./pg_core.js";
-
-/* ============================================================
-   Tinted mask overlay — cached per mask per color
-   ============================================================ */
 
 function _tintedMask(mask, color) {
   const key = color.r + "," + color.g + "," + color.b;
@@ -22,8 +18,8 @@ function _tintedMask(mask, color) {
   const out = imgData.data;
 
   for (let i = 0; i < px.length; i += 4) {
-    const m = px[i] / 255;              // R channel is the mask value
-    const a = px[i + 3] / 255;          // preserve original alpha if any
+    const m = px[i] / 255;
+    const a = px[i + 3] / 255;
     out[i]     = color.r;
     out[i + 1] = color.g;
     out[i + 2] = color.b;
@@ -36,48 +32,28 @@ function _tintedMask(mask, color) {
   return off;
 }
 
-/* ============================================================
-   Legend
-   ============================================================ */
-
-function _drawSelectionLegend(cw) {
-  if (board.selectedMaskIndices.length === 0) return;
-
-  const pad = 8;
-  const boxW = 92;
-  const lineH = 18;
-  const boxH = pad * 2 + lineH * board.selectedMaskIndices.length;
-  const bx = cw - boxW - 14;
-  const by = 14;
-
-  ctx.save();
-  ctx.fillStyle = "rgba(10, 14, 20, 0.86)";
-  ctx.strokeStyle = "#1e2836";
-  ctx.lineWidth = 1;
-  ctx.fillRect(bx, by, boxW, boxH);
-  ctx.strokeRect(bx + 0.5, by + 0.5, boxW - 1, boxH - 1);
-
-  ctx.font = "700 10px 'JetBrains Mono', monospace";
-  ctx.textBaseline = "middle";
-  ctx.textAlign = "left";
-
-  for (let n = 0; n < board.selectedMaskIndices.length; n++) {
-    const i = board.selectedMaskIndices[n];
-    const c = maskColor(i);
-    const y = by + pad + n * lineH + lineH / 2;
-
-    ctx.fillStyle = "rgb(" + c.r + "," + c.g + "," + c.b + ")";
-    ctx.fillRect(bx + pad, y - 5, 10, 10);
-
-    ctx.fillStyle = "#a8b5c4";
-    ctx.fillText("Mask " + (i + 1), bx + pad + 16, y);
+function _drawPoint(x, y, isPositive, filled) {
+  const [sx, sy] = imageToScreen(x, y);
+  ctx.beginPath();
+  ctx.arc(sx, sy, 6, 0, Math.PI * 2);
+  if (filled) {
+    ctx.fillStyle = isPositive
+      ? "rgba(0, 229, 255, 0.92)"
+      : "rgba(255, 90, 105, 0.92)";
+    ctx.fill();
+    ctx.strokeStyle = "#0a0e14";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  } else {
+    ctx.strokeStyle = isPositive
+      ? "rgba(0, 229, 255, 0.70)"
+      : "rgba(255, 90, 105, 0.70)";
+    ctx.lineWidth = 1.6;
+    ctx.setLineDash([3, 2]);
+    ctx.stroke();
+    ctx.setLineDash([]);
   }
-  ctx.restore();
 }
-
-/* ============================================================
-   View
-   ============================================================ */
 
 export function drawView() {
   const cw = window.innerWidth, ch = window.innerHeight;
@@ -106,37 +82,45 @@ export function drawView() {
   // Selected masks
   const selectedSet = new Set(board.selectedMaskIndices);
   for (let i = 0; i < board.masks.length; i++) {
+    if (!selectedSet.has(i)) continue;
     const m = board.masks[i];
     if (!m || !m.loaded) continue;
-    const isSelected = selectedSet.has(i);
-    if (!isSelected) continue;
-
     const tinted = _tintedMask(m, maskColor(i));
     if (!tinted) continue;
-
     const isHovered = (i === board.hoveredMaskIdx);
-    const alpha = isHovered ? 0.55 : 0.40;
-
     ctx.save();
-    ctx.globalAlpha = alpha;
+    ctx.globalAlpha = isHovered ? 0.55 : 0.40;
     ctx.drawImage(tinted, r.x0, r.y0, r.w, r.h);
     ctx.restore();
   }
 
-  // Points
-  for (const p of board.points) {
-    const [sx, sy] = imageToScreen(p.x, p.y);
-    ctx.beginPath();
-    ctx.arc(sx, sy, 6, 0, Math.PI * 2);
-    ctx.fillStyle = p.isPositive ? "rgba(0, 229, 255, 0.90)"
-                                 : "rgba(255, 90, 105, 0.90)";
-    ctx.fill();
-    ctx.strokeStyle = "#0a0e14";
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
+  // Staging points — hollow rings, always visible when present
+  for (const p of board.stagingPoints) {
+    _drawPoint(p.x, p.y, p.isPositive, false);
   }
 
-  _drawSelectionLegend(cw);
+  // Selected mask points — filled circles
+  const sm = selectedMask();
+  if (sm) {
+    for (const p of sm.points) {
+      _drawPoint(p.x, p.y, p.isPositive, true);
+    }
+  }
+
+  // Header
+  const selIdx = (board.selectedMaskIndices.length === 1)
+    ? board.selectedMaskIndices[0] : -1;
+  let ctxLabel;
+  if (selIdx >= 0) {
+    ctxLabel = "REFINING MASK " + (selIdx + 1)
+             + " via " + board.refineModel.toUpperCase();
+  } else if (board.selectedMaskIndices.length > 1) {
+    ctxLabel = "MULTIPLE SELECTED";
+  } else if (board.masks.length === 0) {
+    ctxLabel = "STAGING MODE \u2014 place points then Segment All";
+  } else {
+    ctxLabel = "NO MASK SELECTED";
+  }
 
   ctx.save();
   ctx.font = "700 10px 'JetBrains Mono', monospace";
@@ -145,9 +129,9 @@ export function drawView() {
   ctx.textBaseline = "top";
   ctx.fillText(
     "IMAGE " + board.imageWidth + "\u00d7" + board.imageHeight
-    + "   \u00b7   POINTS " + board.points.length
-    + "   \u00b7   MASKS " + board.selectedMaskIndices.length
-    + " / " + board.masks.length,
+    + "   \u00b7   " + ctxLabel
+    + "   \u00b7   STAGING " + board.stagingPoints.length
+    + "   \u00b7   MASKS " + board.masks.length,
     14, 14,
   );
   ctx.restore();

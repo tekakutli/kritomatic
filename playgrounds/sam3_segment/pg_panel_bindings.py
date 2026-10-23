@@ -1,11 +1,15 @@
 PANEL_BINDINGS_JS = r"""
 import {
-  board, setImage, clearImage, clearPoints, setMasks,
+  board, setImage, clearImage, setMasks,
+  snapshotRefine, snapshotSegmentAll, pushOp, popOp,
+  restoreMasks, replaceMaskAt, selectedMask, selectedMaskIdx,
+  clearPointsOnSelectedMask, clearStagingPoints,
   clearMaskSelection, replaceMaskSelection,
 } from "./pg_core.js";
 import { syncMaskList } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
-import { uploadImageFile, runSegment, interruptSegmentation, fetchStatus }
+import { uploadImageFile, runSegmentAll, runRefine,
+         interruptSegmentation, fetchStatus }
   from "./pg_comfy_client.js";
 import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyAll,
@@ -55,18 +59,25 @@ function _fileToDataUrl(file) {
 }
 
 /* ============================================================
-   Actions
+   Segment All
    ============================================================ */
 
-async function _runAction() {
+export async function runSegmentAllAction() {
   if (!board.imageHash) { flashStatus("Load an image first", "warn"); return; }
   if (board.running) return;
-  flashStatus("running\u2026", "");
-  const payload = await runSegment();
+
+  const snapshot = snapshotSegmentAll();
+  flashStatus("detecting\u2026", "");
+
+  const payload = await runSegmentAll();
   if (!payload) return;
+
+  pushOp(snapshot);
   setMasks(payload.masks);
+  board.stagingPoints = [];   // consumed; Undo restores them
+
   flashStatus(
-    "done: " + payload.masks.length + " mask(s) in "
+    "detected " + payload.masks.length + " object(s) in "
     + payload.timing.toFixed(2) + "s", "ok",
   );
   syncMaskList();
@@ -75,22 +86,107 @@ async function _runAction() {
   import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
 }
 
-async function _segmentAllAction() {
+/* ============================================================
+   Refine (SAM2 or SAM3, user's choice)
+   ============================================================ */
+
+async function _unionMasksB64(b64List) {
+  if (b64List.length === 0) return null;
+  if (b64List.length === 1) return b64List[0];
+  const imgs = await Promise.all(b64List.map(b64 => new Promise((res, rej) => {
+    const i = new Image();
+    i.onload = () => res(i);
+    i.onerror = rej;
+    i.src = "data:image/png;base64," + b64;
+  })));
+  const W = imgs[0].width, H = imgs[0].height;
+  const c = document.createElement("canvas");
+  c.width = W; c.height = H;
+  const cx = c.getContext("2d");
+  cx.globalCompositeOperation = "lighter";
+  for (const im of imgs) cx.drawImage(im, 0, 0, W, H);
+  return c.toDataURL("image/png").replace(/^data:image\/png;base64,/, "");
+}
+
+export async function runRefineAction() {
   if (!board.imageHash) { flashStatus("Load an image first", "warn"); return; }
   if (board.running) return;
-  flashStatus("running (all)\u2026", "");
-  const payload = await runSegment({ skipPoints: true });
+
+  const maskIdx = selectedMaskIdx();
+  if (maskIdx < 0) {
+    flashStatus("Select a single mask to refine", "warn");
+    return;
+  }
+  const mask = board.masks[maskIdx];
+  if (!mask || !mask.loaded) {
+    flashStatus("Mask not loaded yet", "warn");
+    return;
+  }
+
+  const snapshot = snapshotRefine(maskIdx);
+  const modelLabel = board.refineModel.toUpperCase();
+  flashStatus("refining mask #" + (maskIdx + 1) + " via " + modelLabel + "\u2026", "");
+
+  const payload = await runRefine(maskIdx);
   if (!payload) return;
-  setMasks(payload.masks);
-  flashStatus(
-    "done: " + payload.masks.length + " mask(s) in "
-    + payload.timing.toFixed(2) + "s", "ok",
-  );
+
+  pushOp(snapshot);
+
+  try {
+    const combinedB64 = await _unionMasksB64(payload.masks);
+    if (!combinedB64) {
+      flashStatus("refine returned no mask", "warn");
+      popOp();
+      return;
+    }
+    replaceMaskAt(maskIdx, combinedB64, mask.points);
+    const backend = payload.backend || modelLabel.toLowerCase();
+    flashStatus(
+      "refined mask #" + (maskIdx + 1)
+      + " via " + backend
+      + " in " + payload.timing.toFixed(2) + "s", "ok",
+    );
+  } catch (e) {
+    flashStatus("refine failed: " + e.message, "bad");
+    popOp();
+  }
+
   syncMaskList();
   syncPanelFields();
   pgkitNotifyAll();
   import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
 }
+
+/* ============================================================
+   Undo
+   ============================================================ */
+
+export async function undoAction() {
+  if (board.running) return;
+  const op = popOp();
+  if (!op) { flashStatus("nothing to undo", "warn"); return; }
+
+  if (op.type === 'refine') {
+    replaceMaskAt(op.maskIdx, op.prevB64);
+    flashStatus("undid mask #" + (op.maskIdx + 1) + " edit", "ok");
+  } else if (op.type === 'segmentAll') {
+    restoreMasks(op.prevMasks, op.prevSelection);
+    if (op.prevStagingPoints) {
+      board.stagingPoints = op.prevStagingPoints.map(p =>
+        ({ x: p.x, y: p.y, isPositive: p.isPositive }));
+    }
+    flashStatus("undid Segment All", "ok");
+  }
+
+  syncMaskList();
+  syncPanelFields();
+  pgkitNotifyAll();
+  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+}
+
+/* ============================================================
+   Misc actions
+   ============================================================ */
 
 async function _cancelAction() {
   if (!board.running) return;
@@ -99,7 +195,10 @@ async function _cancelAction() {
 }
 
 function _clearPointsAction() {
-  clearPoints();
+  const changed = selectedMask()
+    ? clearPointsOnSelectedMask()
+    : clearStagingPoints();
+  if (!changed) return;
   syncPanelFields();
   pgkitNotifyAll();
   import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
@@ -107,6 +206,7 @@ function _clearPointsAction() {
 
 function _clearMasksAction() {
   setMasks([]);
+  board.opLog = [];
   syncMaskList();
   syncPanelFields();
   pgkitNotifyAll();
@@ -138,12 +238,13 @@ async function _checkStatusAction() {
     flashStatus("ComfyUI unreachable: " + (s.message || ""), "bad");
     return;
   }
-  const parts = [];
-  parts.push("ComfyUI \u2713");
-  parts.push("SAM3 " + (s.has_sam3 ? "\u2713" : "\u2717"));
-  parts.push("tooling " + (s.has_tooling ? "\u2713" : "\u2717"));
+  const parts = [
+    "ComfyUI \u2713",
+    "SAM3 " + (s.has_sam3 ? "\u2713" : "\u2717"),
+    "SAM2 " + (s.has_sam2 ? "\u2713" : "\u2717"),
+  ];
   flashStatus(parts.join(" \u00b7 "),
-              s.has_sam3 && s.has_tooling ? "ok" : "warn");
+              s.has_sam3 && s.has_sam2 ? "ok" : "warn");
 }
 
 /* ============================================================
@@ -160,15 +261,11 @@ function _downloadDataUrl(dataUrl, filename) {
   document.body.removeChild(a);
 }
 
-function _sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
+function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function _exportAction() {
   const indices = board.selectedMaskIndices.slice();
-  if (indices.length === 0) {
-    flashStatus("no masks selected", "warn"); return;
-  }
+  if (indices.length === 0) { flashStatus("no masks selected", "warn"); return; }
   let count = 0;
   for (const i of indices) {
     const m = board.masks[i];
@@ -178,8 +275,6 @@ async function _exportAction() {
       "mask_" + String(i + 1).padStart(2, "0") + ".png",
     );
     count += 1;
-    // Browsers throttle rapid sequential downloads; 120ms spacing
-    // lets the "multiple downloads" prompt handle them cleanly.
     await _sleep(120);
   }
   flashStatus("exported " + count + " mask(s)", "ok");
@@ -187,31 +282,23 @@ async function _exportAction() {
 
 async function _exportCombinedAction() {
   const indices = board.selectedMaskIndices.slice();
-  if (indices.length === 0) {
-    flashStatus("no masks selected", "warn"); return;
-  }
+  if (indices.length === 0) { flashStatus("no masks selected", "warn"); return; }
   const first = board.masks[indices[0]];
-  if (!first || !first.img) {
-    flashStatus("masks not loaded yet", "warn"); return;
-  }
+  if (!first || !first.img) { flashStatus("masks not loaded yet", "warn"); return; }
   const W = first.img.width, H = first.img.height;
-
   const off = document.createElement("canvas");
   off.width = W; off.height = H;
   const octx = off.getContext("2d");
   octx.fillStyle = "black";
   octx.fillRect(0, 0, W, H);
-  // Additive blending produces the union: black+black=black,
-  // white+anything=white (clamped).
   octx.globalCompositeOperation = "lighter";
   for (const i of indices) {
     const m = board.masks[i];
     if (!m || !m.img) continue;
     octx.drawImage(m.img, 0, 0, W, H);
   }
-  const dataUrl = off.toDataURL("image/png");
-  _downloadDataUrl(dataUrl, "masks_combined.png");
-  flashStatus("exported combined mask (" + indices.length + ")", "ok");
+  _downloadDataUrl(off.toDataURL("image/png"), "masks_combined.png");
+  flashStatus("exported combined (" + indices.length + ")", "ok");
 }
 
 /* ============================================================
@@ -219,23 +306,23 @@ async function _exportCombinedAction() {
    ============================================================ */
 
 export function installPanelBindings() {
-  const runBtn      = document.getElementById("runBtn");
-  const segAllBtn   = document.getElementById("segmentAllBtn");
-  const cancelBtn   = document.getElementById("cancelBtn");
-  const clearPts    = document.getElementById("clearPointsBtn");
-  const pickBtn     = document.getElementById("pickImageBtn");
-  const clearImgBtn = document.getElementById("clearImageBtn");
-  const exportBtn   = document.getElementById("exportBtn");
-  const exportCombBtn = document.getElementById("exportCombinedBtn");
+  const el = {};
+  const ids = [
+    "runBtn", "segmentAllBtn", "cancelBtn", "undoBtn",
+    "clearPointsBtn", "pickImageBtn", "clearImageBtn",
+    "exportBtn", "exportCombinedBtn",
+  ];
+  for (const id of ids) el[id] = document.getElementById(id);
 
-  if (runBtn)         runBtn.addEventListener("click", _runAction);
-  if (segAllBtn)      segAllBtn.addEventListener("click", _segmentAllAction);
-  if (cancelBtn)      cancelBtn.addEventListener("click", _cancelAction);
-  if (clearPts)       clearPts.addEventListener("click", _clearPointsAction);
-  if (pickBtn)        pickBtn.addEventListener("click", _pickImageAction);
-  if (clearImgBtn)    clearImgBtn.addEventListener("click", _clearImageAction);
-  if (exportBtn)      exportBtn.addEventListener("click", _exportAction);
-  if (exportCombBtn)  exportCombBtn.addEventListener("click", _exportCombinedAction);
+  if (el.runBtn)        el.runBtn.addEventListener("click", runRefineAction);
+  if (el.segmentAllBtn) el.segmentAllBtn.addEventListener("click", runSegmentAllAction);
+  if (el.cancelBtn)     el.cancelBtn.addEventListener("click", _cancelAction);
+  if (el.undoBtn)       el.undoBtn.addEventListener("click", undoAction);
+  if (el.clearPointsBtn) el.clearPointsBtn.addEventListener("click", _clearPointsAction);
+  if (el.pickImageBtn)  el.pickImageBtn.addEventListener("click", _pickImageAction);
+  if (el.clearImageBtn) el.clearImageBtn.addEventListener("click", _clearImageAction);
+  if (el.exportBtn)     el.exportBtn.addEventListener("click", _exportAction);
+  if (el.exportCombinedBtn) el.exportCombinedBtn.addEventListener("click", _exportCombinedAction);
 
   const statusEl = document.getElementById("statusLine");
   if (statusEl) {
@@ -261,9 +348,7 @@ export function installPanelBindings() {
     _showDropOverlay(false);
     const file = e.dataTransfer && e.dataTransfer.files
                  && e.dataTransfer.files[0];
-    if (file && file.type.startsWith("image/")) {
-      _handleDroppedFile(file);
-    }
+    if (file && file.type.startsWith("image/")) _handleDroppedFile(file);
   });
 }
 
@@ -272,12 +357,16 @@ export function installPanelBindings() {
    ============================================================ */
 
 pgkitRegisterAction("action.run", {
-  label: "Run", scope: "global", run: _runAction,
+  label: "Run", scope: "global", run: runRefineAction,
   meta: { variant: "primary" },
 });
 pgkitRegisterAction("action.segmentAll", {
-  label: "Segment All", scope: "global", run: _segmentAllAction,
+  label: "Segment All", scope: "global", run: runSegmentAllAction,
   meta: { variant: "primary" },
+});
+pgkitRegisterAction("action.undo", {
+  label: "Undo", scope: "global", run: undoAction,
+  meta: { variant: "plain" },
 });
 pgkitRegisterAction("action.cancel", {
   label: "Cancel", scope: "global", run: _cancelAction,
@@ -318,7 +407,8 @@ pgkitRegisterLevel("masks", {
     name:  "mask." + i,
     label: "Mask " + (i + 1),
     extra: { size: m.w + "\u00d7" + m.h,
-             selected: board.selectedMaskIndices.indexOf(i) >= 0 },
+             selected: board.selectedMaskIndices.indexOf(i) >= 0,
+             points: (m.points || []).length },
   })),
   selected: () => board.selectedMaskIndices.length > 0
     ? "mask." + board.selectedMaskIndices[0] : null,
@@ -330,10 +420,8 @@ pgkitRegisterAction("action.selectMask", {
   appliesTo: () => true,
   run: (payload) => {
     const n = payload?.target?.name;
-    if (typeof n !== "string") return;
-    const prefix = "mask.";
-    if (!n.startsWith(prefix)) return;
-    const idx = parseInt(n.slice(prefix.length), 10);
+    if (typeof n !== "string" || !n.startsWith("mask.")) return;
+    const idx = parseInt(n.slice(5), 10);
     if (!(idx >= 0 && idx < board.masks.length)) return;
     replaceMaskSelection(idx);
     syncMaskList();
@@ -347,10 +435,8 @@ pgkitRegisterAction("action.deleteMask", {
   appliesTo: () => true,
   run: (payload) => {
     const n = payload?.target?.name;
-    if (typeof n !== "string") return;
-    const prefix = "mask.";
-    if (!n.startsWith(prefix)) return;
-    const idx = parseInt(n.slice(prefix.length), 10);
+    if (typeof n !== "string" || !n.startsWith("mask.")) return;
+    const idx = parseInt(n.slice(5), 10);
     if (!(idx >= 0 && idx < board.masks.length)) return;
     board.masks.splice(idx, 1);
     const next = [];
@@ -375,9 +461,8 @@ pgkitRegisterAction("action.deleteMask", {
 export function pgkitHandleSelect(level, name) {
   if (typeof name !== "string") return false;
   if (level === "masks") {
-    const prefix = "mask.";
-    if (!name.startsWith(prefix)) return false;
-    const idx = parseInt(name.slice(prefix.length), 10);
+    if (!name.startsWith("mask.")) return false;
+    const idx = parseInt(name.slice(5), 10);
     if (!(idx >= 0 && idx < board.masks.length)) return false;
     replaceMaskSelection(idx);
     syncMaskList();
@@ -386,10 +471,6 @@ export function pgkitHandleSelect(level, name) {
   }
   return false;
 }
-
-/* ============================================================
-   Boot hook
-   ============================================================ */
 
 export function samBootSync() {
   syncPanelFields();

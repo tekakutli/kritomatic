@@ -5,37 +5,36 @@ export let   dpr    = window.devicePixelRatio || 1;
 
 export const view = { zoom: 1, panX: 0, panY: 0 };
 
+export const OP_LOG_MAX = 20;
+
 export const board = {
-  // Image (uploaded)
   imageHash:     null,
   imageWidth:    0,
   imageHeight:   0,
   imageDataUrl:  null,
   imageEl:       null,
 
-  // Prompt
-  textPrompt:    "",
-  points:        [],     // [{x, y, isPositive}]
-  positive:      [],     // [{x, y}]
-  negative:      [],
+  textPrompt:    "",           // global — used by Segment All only
+  stagingPoints: [],           // [{x, y, isPositive}] — pre-mask, Segment All only
+  refineModel:   'sam2',       // 'sam2' | 'sam3'
 
-  // Settings
   threshold:        0.5,
   refineIterations: 2,
   individualMasks:  true,
+  autoRun:          false,
 
-  // Results
-  masks:               [],   // [{b64, img, w, h, loaded}]
-  selectedMaskIndices: [],   // sorted int array
+  masks:               [],     // [{b64, img, w, h, loaded, points, textPrompt, caches...}]
+  selectedMaskIndices: [],
   hoveredMaskIdx:      -1,
 
-  // Runtime
+  opLog:    [],
+
   running:       false,
   lastTiming:    null,
 };
 
 /* ============================================================
-   Mask palette — one color per mask, cycled by index
+   Mask palette
    ============================================================ */
 
 export const MASK_COLORS = [
@@ -70,7 +69,8 @@ export function setImage(hash, dataUrl, width, height) {
   img.src = dataUrl;
 
   clearMasks();
-  clearPoints();
+  board.stagingPoints = [];
+  board.opLog = [];
 }
 
 export function clearImage() {
@@ -79,49 +79,51 @@ export function clearImage() {
   board.imageWidth = 0;
   board.imageHeight = 0;
   board.imageEl = null;
-  clearPoints();
   clearMasks();
+  board.stagingPoints = [];
+  board.opLog = [];
 }
 
 /* ============================================================
-   Points
+   Mask list
    ============================================================ */
 
-export function addPoint(x, y, isPositive) {
-  if (x < 0 || y < 0 || x >= board.imageWidth || y >= board.imageHeight) return;
-  board.points.push({x, y, isPositive});
-  _recount();
+function _makeMaskEntry(b64, points, textPrompt) {
+  const img = new Image();
+  const entry = {
+    b64, img, w: 0, h: 0, loaded: false,
+    points: points ? points.map(p => ({ x: p.x, y: p.y, isPositive: p.isPositive })) : [],
+    textPrompt: textPrompt != null ? textPrompt : "",
+    _pixels: null, _tinted: null, _tintedKey: null, _bbox: null,
+  };
+  img.onload = () => {
+    entry.w = img.width; entry.h = img.height; entry.loaded = true;
+    _scheduleDraw();
+  };
+  img.src = "data:image/png;base64," + b64;
+  return entry;
 }
-
-export function clearPoints() {
-  board.points = [];
-  _recount();
-}
-
-function _recount() {
-  board.positive = board.points.filter(p =>  p.isPositive)
-                                  .map(p => ({x: p.x, y: p.y}));
-  board.negative = board.points.filter(p => !p.isPositive)
-                                  .map(p => ({x: p.x, y: p.y}));
-}
-
-/* ============================================================
-   Masks
-   ============================================================ */
 
 export function setMasks(b64List) {
-  board.masks = b64List.map(b64 => {
-    const img = new Image();
-    const entry = { b64, img, w: 0, h: 0, loaded: false,
-                    _pixels: null, _tinted: null, _tintedKey: null };
-    img.onload = () => {
-      entry.w = img.width; entry.h = img.height; entry.loaded = true;
-      _scheduleDraw();
-    };
-    img.src = "data:image/png;base64," + b64;
-    return entry;
-  });
-  board.selectedMaskIndices = board.masks.length > 0 ? [0] : [];
+  board.masks = b64List.map(b64 => _makeMaskEntry(b64, [], ""));
+  board.selectedMaskIndices = b64List.length > 0 ? [0] : [];
+  board.hoveredMaskIdx = -1;
+  _scheduleDraw();
+}
+
+export function replaceMaskAt(idx, b64, points) {
+  if (idx < 0 || idx >= board.masks.length) return;
+  const old = board.masks[idx];
+  const prevPoints = (points !== undefined) ? points : old.points;
+  board.masks[idx] = _makeMaskEntry(b64, prevPoints, old.textPrompt);
+  board.hoveredMaskIdx = -1;
+  _scheduleDraw();
+}
+
+export function restoreMasks(maskSnapshots, selection) {
+  board.masks = maskSnapshots.map(m =>
+    _makeMaskEntry(m.b64, m.points, m.textPrompt));
+  board.selectedMaskIndices = selection.slice();
   board.hoveredMaskIdx = -1;
   _scheduleDraw();
 }
@@ -132,6 +134,10 @@ export function clearMasks() {
   board.hoveredMaskIdx = -1;
   _scheduleDraw();
 }
+
+/* ============================================================
+   Selection
+   ============================================================ */
 
 export function isMaskSelected(idx) {
   return board.selectedMaskIndices.indexOf(idx) >= 0;
@@ -156,10 +162,10 @@ export function addMaskToSelection(idx) {
 
 export function replaceMaskSelection(idx) {
   if (idx < 0 || idx >= board.masks.length) {
-    clearMaskSelection();
-    return;
+    board.selectedMaskIndices = [];
+  } else {
+    board.selectedMaskIndices = [idx];
   }
-  board.selectedMaskIndices = [idx];
   _scheduleDraw();
 }
 
@@ -173,13 +179,104 @@ export function selectAllMasks() {
   _scheduleDraw();
 }
 
-export function getSelectedMasks() {
-  return board.selectedMaskIndices
-    .map(i => board.masks[i])
-    .filter(m => m && m.loaded);
+export function selectedMaskIdx() {
+  return board.selectedMaskIndices.length === 1
+    ? board.selectedMaskIndices[0] : -1;
 }
 
-/* ---- pixel access (cached) ---- */
+export function selectedMask() {
+  const idx = selectedMaskIdx();
+  return idx >= 0 ? board.masks[idx] : null;
+}
+
+/* ============================================================
+   Staging points (no mask selected)
+   ============================================================ */
+
+export function addStagingPoint(x, y, isPositive) {
+  if (x < 0 || y < 0 || x >= board.imageWidth || y >= board.imageHeight) return false;
+  board.stagingPoints.push({ x, y, isPositive });
+  return true;
+}
+
+export function clearStagingPoints() {
+  if (board.stagingPoints.length === 0) return false;
+  board.stagingPoints = [];
+  return true;
+}
+
+export function hitTestStagingPoint(ix, iy, tolerancePx) {
+  const tol2 = tolerancePx * tolerancePx;
+  for (let i = board.stagingPoints.length - 1; i >= 0; i--) {
+    const p = board.stagingPoints[i];
+    const dx = p.x - ix, dy = p.y - iy;
+    if (dx * dx + dy * dy <= tol2) return i;
+  }
+  return -1;
+}
+
+export function removeStagingPoint(idx) {
+  if (idx < 0 || idx >= board.stagingPoints.length) return false;
+  board.stagingPoints.splice(idx, 1);
+  return true;
+}
+
+export function stagingPositive() {
+  return board.stagingPoints.filter(p =>  p.isPositive);
+}
+
+export function stagingNegative() {
+  return board.stagingPoints.filter(p => !p.isPositive);
+}
+
+/* ============================================================
+   Per-mask points
+   ============================================================ */
+
+export function addPointToSelectedMask(x, y, isPositive) {
+  const m = selectedMask();
+  if (!m) return false;
+  if (x < 0 || y < 0 || x >= board.imageWidth || y >= board.imageHeight) return false;
+  m.points.push({ x, y, isPositive });
+  return true;
+}
+
+export function clearPointsOnSelectedMask() {
+  const m = selectedMask();
+  if (!m) return false;
+  if (m.points.length === 0) return false;
+  m.points = [];
+  return true;
+}
+
+export function hitTestPointOnSelectedMask(ix, iy, tolerancePx) {
+  const m = selectedMask();
+  if (!m) return -1;
+  const tol2 = tolerancePx * tolerancePx;
+  for (let i = m.points.length - 1; i >= 0; i--) {
+    const p = m.points[i];
+    const dx = p.x - ix, dy = p.y - iy;
+    if (dx * dx + dy * dy <= tol2) return i;
+  }
+  return -1;
+}
+
+export function removePointFromSelectedMask(idx) {
+  const m = selectedMask();
+  if (!m) return false;
+  if (idx < 0 || idx >= m.points.length) return false;
+  m.points.splice(idx, 1);
+  return true;
+}
+
+export function setMaskPrompt(idx, text) {
+  if (idx < 0 || idx >= board.masks.length) return;
+  board.masks[idx].textPrompt = String(text || "");
+}
+
+/* ============================================================
+   Pixel access
+   ============================================================ */
 
 function _maskPixelData(mask) {
   if (mask._pixels) return mask._pixels;
@@ -204,11 +301,6 @@ export function maskPixelData(mask) {
 export function hitTestMaskAtPoint(ix, iy) {
   const x = Math.floor(ix), y = Math.floor(iy);
   if (x < 0 || y < 0) return -1;
-  // Iterate reversed: the last mask in the list wins if multiple
-  // overlap. In practice SAM3 returns masks in detection order, so
-  // this gives "most recent detection" priority, which is usually
-  // what the user wants on Alt+click. Shift+Alt adds instead of
-  // replacing, so multiple overlapping masks are reachable.
   for (let i = board.masks.length - 1; i >= 0; i--) {
     const m = board.masks[i];
     if (!m || !m.loaded) continue;
@@ -219,6 +311,130 @@ export function hitTestMaskAtPoint(ix, iy) {
     if (px[off] >= 128) return i;
   }
   return -1;
+}
+
+/* ============================================================
+   Bbox
+   ============================================================ */
+
+const BBOX_PAD = 4;
+const BBOX_MIN_SIZE = 8;
+const POINT_BBOX_PAD = 50;
+
+export function computeMaskBBox(idx) {
+  if (idx < 0 || idx >= board.masks.length) return null;
+  const m = board.masks[idx];
+  if (!m || !m.loaded) return null;
+  if (m._bbox) return m._bbox;
+
+  const px = _maskPixelData(m);
+  if (!px) return null;
+
+  const W = m.img.width, H = m.img.height;
+  let minX = W, minY = H, maxX = -1, maxY = -1;
+  for (let y = 0; y < H; y++) {
+    const rowBase = y * W * 4;
+    for (let x = 0; x < W; x++) {
+      if (px[rowBase + x * 4] >= 128) {
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < minX || maxY < minY) { m._bbox = null; return null; }
+
+  minX = Math.max(0, minX - BBOX_PAD);
+  minY = Math.max(0, minY - BBOX_PAD);
+  maxX = Math.min(W - 1, maxX + BBOX_PAD);
+  maxY = Math.min(H - 1, maxY + BBOX_PAD);
+
+  const sx = board.imageWidth  / W;
+  const sy = board.imageHeight / H;
+
+  let bx = Math.round(minX * sx);
+  let by = Math.round(minY * sy);
+  let bw = Math.round((maxX - minX + 1) * sx);
+  let bh = Math.round((maxY - minY + 1) * sy);
+
+  if (bw < BBOX_MIN_SIZE) { bx -= Math.ceil((BBOX_MIN_SIZE - bw) / 2); bw = BBOX_MIN_SIZE; }
+  if (bh < BBOX_MIN_SIZE) { by -= Math.ceil((BBOX_MIN_SIZE - bh) / 2); bh = BBOX_MIN_SIZE; }
+
+  bx = Math.max(0, Math.min(board.imageWidth  - 1, bx));
+  by = Math.max(0, Math.min(board.imageHeight - 1, by));
+  bw = Math.max(1, Math.min(board.imageWidth  - bx, bw));
+  bh = Math.max(1, Math.min(board.imageHeight - by, bh));
+
+  m._bbox = { x: bx, y: by, w: bw, h: bh };
+  return m._bbox;
+}
+
+export function computeEffectiveBBox(idx) {
+  const bbox = computeMaskBBox(idx);
+  const m = idx >= 0 ? board.masks[idx] : null;
+  if (!m) return bbox;
+  if (!bbox && m.points.length === 0) return null;
+
+  let minX = bbox ? bbox.x : Infinity;
+  let minY = bbox ? bbox.y : Infinity;
+  let maxX = bbox ? bbox.x + bbox.w : -Infinity;
+  let maxY = bbox ? bbox.y + bbox.h : -Infinity;
+
+  for (const p of m.points) {
+    if (!p.isPositive) continue;
+    if (p.x - POINT_BBOX_PAD < minX) minX = p.x - POINT_BBOX_PAD;
+    if (p.y - POINT_BBOX_PAD < minY) minY = p.y - POINT_BBOX_PAD;
+    if (p.x + POINT_BBOX_PAD > maxX) maxX = p.x + POINT_BBOX_PAD;
+    if (p.y + POINT_BBOX_PAD > maxY) maxY = p.y + POINT_BBOX_PAD;
+  }
+
+  if (!isFinite(minX) || !isFinite(minY)) return null;
+
+  minX = Math.max(0, minX);
+  minY = Math.max(0, minY);
+  maxX = Math.min(board.imageWidth, maxX);
+  maxY = Math.min(board.imageHeight, maxY);
+
+  return {
+    x: Math.round(minX),
+    y: Math.round(minY),
+    w: Math.round(maxX - minX),
+    h: Math.round(maxY - minY),
+  };
+}
+
+/* ============================================================
+   Op log
+   ============================================================ */
+
+export function pushOp(op) {
+  board.opLog.push(op);
+  if (board.opLog.length > OP_LOG_MAX) board.opLog.shift();
+}
+
+export function popOp() {
+  return board.opLog.pop() || null;
+}
+
+export function snapshotRefine(maskIdx) {
+  const m = board.masks[maskIdx];
+  if (!m) return null;
+  return { type: 'refine', maskIdx, prevB64: m.b64 };
+}
+
+export function snapshotSegmentAll() {
+  return {
+    type: 'segmentAll',
+    prevMasks: board.masks.map(m => ({
+      b64: m.b64,
+      points: m.points.map(p => ({ x: p.x, y: p.y, isPositive: p.isPositive })),
+      textPrompt: m.textPrompt || "",
+    })),
+    prevSelection: board.selectedMaskIndices.slice(),
+    prevStagingPoints: board.stagingPoints.map(p =>
+      ({ x: p.x, y: p.y, isPositive: p.isPositive })),
+  };
 }
 
 /* ============================================================

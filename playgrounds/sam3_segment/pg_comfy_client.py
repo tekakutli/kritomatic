@@ -1,11 +1,11 @@
 COMFY_CLIENT_JS = r"""
-import { board } from "./pg_core.js";
+import { board, computeEffectiveBBox } from "./pg_core.js";
 import { pgkitNotifyAll } from "./pgkit/remote_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
 
-let _inFlight = false;
+let _inFlightCount = 0;
 
-export function isBusy() { return _inFlight; }
+export function isBusy() { return _inFlightCount > 0; }
 
 export async function uploadImageFile(file) {
   const res = await fetch("/comfy/upload_image", {
@@ -31,29 +31,36 @@ export async function fetchStatus() {
   }
 }
 
-export async function runSegment(opts = {}) {
+/* ============================================================
+   Segment All — uses staging points + global prompt
+   ============================================================ */
+
+export async function runSegmentAll() {
   if (!board.imageHash) {
     flashStatus("Load an image first", "warn");
     return null;
   }
-  if (_inFlight) {
-    await interruptSegmentation();
-  }
-  const skipPoints = !!opts.skipPoints;
+  if (_inFlightCount > 0) await interruptSegmentation();
 
-  _inFlight = true;
+  _inFlightCount += 1;
   board.running = true;
   pgkitNotifyAll();
 
   const body = {
     hash:              board.imageHash,
-    positive:          skipPoints ? [] : board.positive,
-    negative:          skipPoints ? [] : board.negative,
+    positive:          board.stagingPoints
+                         .filter(p =>  p.isPositive)
+                         .map(p => ({ x: p.x, y: p.y })),
+    negative:          board.stagingPoints
+                         .filter(p => !p.isPositive)
+                         .map(p => ({ x: p.x, y: p.y })),
     text:              board.textPrompt,
     threshold:         board.threshold,
     refine_iterations: board.refineIterations,
-    individual_masks:  board.individualMasks,
+    individual_masks:  !!board.individualMasks,
+    bbox:              null,
   };
+
   try {
     const res = await fetch("/comfy/segment", {
       method: "POST",
@@ -62,7 +69,7 @@ export async function runSegment(opts = {}) {
     });
     const payload = await res.json();
     if (!payload.success) {
-      flashStatus("Segment failed: " + (payload.message || "unknown"), "bad");
+      flashStatus("Failed: " + (payload.message || "unknown"), "bad");
       return null;
     }
     board.lastTiming = payload.timing;
@@ -71,17 +78,77 @@ export async function runSegment(opts = {}) {
     flashStatus("Request failed: " + e.message, "bad");
     return null;
   } finally {
-    _inFlight = false;
-    board.running = false;
+    _inFlightCount -= 1;
+    if (_inFlightCount === 0) board.running = false;
+    pgkitNotifyAll();
+  }
+}
+
+/* ============================================================
+   Refine — per-mask points + per-mask prompt (SAM3) + mask_b64 (SAM2)
+   ============================================================ */
+
+export async function runRefine(maskIdx) {
+  if (!board.imageHash) {
+    flashStatus("Load an image first", "warn");
+    return null;
+  }
+  if (_inFlightCount > 0) await interruptSegmentation();
+
+  const mask = board.masks[maskIdx];
+  if (!mask || !mask.loaded) {
+    flashStatus("Mask not loaded yet", "warn");
+    return null;
+  }
+
+  _inFlightCount += 1;
+  board.running = true;
+  pgkitNotifyAll();
+
+  const positive = mask.points.filter(p =>  p.isPositive)
+                              .map(p => ({ x: p.x, y: p.y }));
+  const negative = mask.points.filter(p => !p.isPositive)
+                              .map(p => ({ x: p.x, y: p.y }));
+
+  // Unified payload. Server picks what it needs based on `model`.
+  const body = {
+    model:             board.refineModel,
+    hash:              board.imageHash,
+    mask_b64:          mask.b64,             // SAM2 only
+    positive,
+    negative,
+    text:              mask.textPrompt || "",// SAM3 only
+    threshold:         board.threshold,       // SAM3 only
+    refine_iterations: board.refineIterations,// SAM3 only
+    individual_masks:  true,                  // SAM3 refine: always
+    bbox:              computeEffectiveBBox(maskIdx), // SAM3 only
+  };
+
+  try {
+    const res = await fetch("/comfy/refine", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const payload = await res.json();
+    if (!payload.success) {
+      flashStatus("Failed: " + (payload.message || "unknown"), "bad");
+      return null;
+    }
+    board.lastTiming = payload.timing;
+    return payload;
+  } catch (e) {
+    flashStatus("Request failed: " + e.message, "bad");
+    return null;
+  } finally {
+    _inFlightCount -= 1;
+    if (_inFlightCount === 0) board.running = false;
     pgkitNotifyAll();
   }
 }
 
 export async function interruptSegmentation() {
-  try {
-    await fetch("/comfy/interrupt", { method: "POST" });
-  } catch (e) {
-    // ignore
-  }
+  try { await fetch("/comfy/interrupt", { method: "POST" }); }
+  catch (e) {}
 }
 """

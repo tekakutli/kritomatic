@@ -1,14 +1,11 @@
 PANEL_SCRUBS_JS = r"""
 import {
-  board, clearMaskSelection, replaceMaskSelection,
+  board, selectedMask, selectedMaskIdx,
+  clearMaskSelection, replaceMaskSelection, setMaskPrompt,
 } from "./pg_core.js";
 import { _installScrubInput } from "./pgkit/panel_core.js";
 import { pgkitRegisterField, pgkitNotifyLocal }
   from "./pgkit/remote_client.js";
-
-/* ============================================================
-   Scrubbable inputs
-   ============================================================ */
 
 const thresholdEl = document.getElementById("thresholdVal");
 if (thresholdEl) _installScrubInput(thresholdEl, {
@@ -39,6 +36,16 @@ if (individualEl) {
   });
 }
 
+const autoRunEl = document.getElementById("autoRun");
+if (autoRunEl) {
+  autoRunEl.checked = !!board.autoRun;
+  autoRunEl.addEventListener("change", () => {
+    board.autoRun = !!autoRunEl.checked;
+    pgkitNotifyLocal("settings.autoRun");
+    import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
+  });
+}
+
 const promptEl = document.getElementById("promptText");
 if (promptEl) {
   promptEl.value = board.textPrompt || "";
@@ -48,27 +55,43 @@ if (promptEl) {
   });
 }
 
+const maskPromptEl = document.getElementById("maskPromptText");
+if (maskPromptEl) {
+  maskPromptEl.addEventListener("input", () => {
+    const idx = selectedMaskIdx();
+    if (idx < 0) return;
+    setMaskPrompt(idx, maskPromptEl.value);
+    pgkitNotifyLocal("mask.textPrompt");
+  });
+}
+
+const modelSam2 = document.getElementById("modelSam2");
+const modelSam3 = document.getElementById("modelSam3");
+function _syncModelRadios() {
+  if (modelSam2) modelSam2.checked = (board.refineModel === 'sam2');
+  if (modelSam3) modelSam3.checked = (board.refineModel === 'sam3');
+}
+_syncModelRadios();
+if (modelSam2) modelSam2.addEventListener("change", () => {
+  if (modelSam2.checked) {
+    board.refineModel = 'sam2';
+    pgkitNotifyLocal("refine.model");
+    import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  }
+});
+if (modelSam3) modelSam3.addEventListener("change", () => {
+  if (modelSam3.checked) {
+    board.refineModel = 'sam3';
+    pgkitNotifyLocal("refine.model");
+    import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  }
+});
+
 /* ============================================================
-   Field registrations (remote panel)
+   Field registrations
    ============================================================ */
-
-pgkitRegisterField("image.hash", {
-  get: () => board.imageHash || "",
-  set: () => {},
-  meta: { kind: "text", label: "Image hash" },
-});
-
-pgkitRegisterField("image.width", {
-  get: () => board.imageWidth,
-  set: () => {},
-  meta: { kind: "number", label: "Image width" },
-});
-
-pgkitRegisterField("image.height", {
-  get: () => board.imageHeight,
-  set: () => {},
-  meta: { kind: "number", label: "Image height" },
-});
 
 pgkitRegisterField("prompt.text", {
   get: () => board.textPrompt || "",
@@ -77,19 +100,46 @@ pgkitRegisterField("prompt.text", {
     const el = document.getElementById("promptText");
     if (el && document.activeElement !== el) el.value = board.textPrompt;
   },
-  meta: { kind: "text", label: "Text prompt" },
+  meta: { kind: "text", label: "Global prompt (Segment All)" },
 });
 
-pgkitRegisterField("prompt.positive_count", {
-  get: () => board.positive.length,
+pgkitRegisterField("staging.positive_count", {
+  get: () => board.stagingPoints.filter(p =>  p.isPositive).length,
   set: () => {},
-  meta: { kind: "number", label: "Positive points" },
+  meta: { kind: "number", label: "Staging positive points" },
 });
 
-pgkitRegisterField("prompt.negative_count", {
-  get: () => board.negative.length,
+pgkitRegisterField("staging.negative_count", {
+  get: () => board.stagingPoints.filter(p => !p.isPositive).length,
   set: () => {},
-  meta: { kind: "number", label: "Negative points" },
+  meta: { kind: "number", label: "Staging negative points" },
+});
+
+pgkitRegisterField("mask.textPrompt", {
+  get: () => {
+    const m = selectedMask();
+    return m ? (m.textPrompt || "") : "";
+  },
+  set: (v) => {
+    const idx = selectedMaskIdx();
+    if (idx < 0) return;
+    setMaskPrompt(idx, v);
+    const el = document.getElementById("maskPromptText");
+    if (el && document.activeElement !== el) el.value = String(v || "");
+  },
+  meta: { kind: "text", label: "Selected mask prompt (SAM3 refine)" },
+});
+
+pgkitRegisterField("refine.model", {
+  get: () => board.refineModel,
+  set: (v) => {
+    if (v !== 'sam2' && v !== 'sam3') return;
+    board.refineModel = v;
+    _syncModelRadios();
+    import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  },
+  meta: { kind: "enum", label: "Refine model", options: ["sam2", "sam3"] },
 });
 
 pgkitRegisterField("settings.threshold", {
@@ -126,13 +176,17 @@ pgkitRegisterField("settings.individualMasks", {
     if (el && document.activeElement !== el)
       el.checked = board.individualMasks;
   },
-  meta: { kind: "bool", label: "Individual masks" },
+  meta: { kind: "bool", label: "Individual masks (Segment All)" },
 });
 
-pgkitRegisterField("masks.count", {
-  get: () => board.masks.length,
-  set: () => {},
-  meta: { kind: "number", label: "Mask count" },
+pgkitRegisterField("settings.autoRun", {
+  get: () => !!board.autoRun,
+  set: (v) => {
+    board.autoRun = !!v;
+    const el = document.getElementById("autoRun");
+    if (el && document.activeElement !== el) el.checked = board.autoRun;
+  },
+  meta: { kind: "bool", label: "Auto-run" },
 });
 
 pgkitRegisterField("masks.selectedIndex", {
@@ -146,19 +200,5 @@ pgkitRegisterField("masks.selectedIndex", {
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   },
   meta: { kind: "number", label: "First selected mask" },
-});
-
-pgkitRegisterField("masks.selectedIndices", {
-  get: () => board.selectedMaskIndices.slice(),
-  set: (v) => {
-    if (!Array.isArray(v)) return;
-    const clean = v
-      .map(x => parseInt(x, 10))
-      .filter(x => isFinite(x) && x >= 0 && x < board.masks.length);
-    board.selectedMaskIndices =
-      Array.from(new Set(clean)).sort((a, b) => a - b);
-    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-  },
-  meta: { kind: "text", label: "Selected mask indices (array)" },
 });
 """

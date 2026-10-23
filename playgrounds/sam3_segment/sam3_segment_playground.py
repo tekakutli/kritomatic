@@ -3,8 +3,17 @@
     python sam3_segment_playground.py
 
 Writes sam3_segment.html, serves it at http://127.0.0.1:8773/, and
-serves /modules/* from the module manifest. ComfyUI must be running on
-127.0.0.1:8188; the playground checks on load and shows a clear status.
+serves /modules/* from the module manifest.
+
+Two ComfyUI workflows are expected:
+
+  sam3_segment.json   Segment All (detection)
+  sam2_refine.json    Run on a selected mask (refinement)
+
+ComfyUI must be running on 127.0.0.1:8188. The playground checks on
+load and shows status. If SAM2 isn't installed, refine falls back to
+SAM3 (individual_masks: true), which supports additions but not
+reliable negative-point shrinkage.
 """
 
 import os
@@ -33,7 +42,8 @@ def main():
         f.write(html)
     print(f"Wrote {HTML_FILE}")
     print(f"  comfyui  : http://{sam3_server.COMFY_HOST}:{sam3_server.COMFY_PORT}")
-    print(f"  workflow : {sam3_server.WORKFLOW_PATH}")
+    print(f"  segment  : {sam3_server.WORKFLOW_SEGMENT_PATH}")
+    print(f"  refine   : {sam3_server.WORKFLOW_REFINE_PATH}")
     print(f"  routes   : {', '.join(sorted(list(sam3_server.ROUTES) + list(sam3_server.RAW_ROUTES)))}")
 
     kit_serve(

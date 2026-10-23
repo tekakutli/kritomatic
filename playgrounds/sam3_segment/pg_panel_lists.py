@@ -18,7 +18,7 @@ export function syncMaskList() {
   if (board.masks.length === 0) {
     const el = document.createElement("div");
     el.className = "empty";
-    el.textContent = "no masks yet \u2014 click Run";
+    el.textContent = "no masks yet \u2014 click Segment All";
     list.appendChild(el);
     pgkitNotifyEntities();
     return;
@@ -28,6 +28,7 @@ export function syncMaskList() {
     const m = board.masks[i];
     const isSel = isMaskSelected(i);
     const c = maskColor(i);
+    const ptCount = m.points ? m.points.length : 0;
 
     const row = document.createElement("div");
     row.className = "maskRow" + (isSel ? " selected" : "");
@@ -55,41 +56,36 @@ export function syncMaskList() {
 
     const meta = document.createElement("span");
     meta.className = "maskMeta";
-    meta.textContent = m.w + "\u00d7" + m.h;
+    meta.textContent = m.w + "\u00d7" + m.h
+      + (ptCount > 0 ? " \u00b7 " + ptCount + "pt" : "");
     row.appendChild(meta);
 
     const del = document.createElement("button");
     del.className = "maskDel";
     del.textContent = "\u00d7";
     del.title = "Remove mask";
-    del.addEventListener("click", (e) => {
-      e.stopPropagation();
+    del.addEventListener("click", (ev) => {
+      ev.stopPropagation();
       board.masks.splice(i, 1);
-      // Drop indices >= i (shifted down), remove i if present.
       const next = [];
       for (const idx of board.selectedMaskIndices) {
         if (idx < i) next.push(idx);
         else if (idx > i) next.push(idx - 1);
-        // idx === i is dropped
       }
       board.selectedMaskIndices = next;
       if (board.hoveredMaskIdx === i) board.hoveredMaskIdx = -1;
       else if (board.hoveredMaskIdx > i) board.hoveredMaskIdx -= 1;
       syncMaskList();
-      import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+      import("./pg_dispatch.js").then(mm => mm.draw()).catch(() => {});
     });
     row.appendChild(del);
 
-    row.addEventListener("click", (e) => {
-      if (e.ctrlKey || e.metaKey) {
-        toggleMaskSelection(i);
-      } else if (e.shiftKey) {
-        addMaskToSelection(i);
-      } else {
-        replaceMaskSelection(i);
-      }
+    row.addEventListener("click", (ev) => {
+      if (ev.ctrlKey || ev.metaKey)      toggleMaskSelection(i);
+      else if (ev.shiftKey)              addMaskToSelection(i);
+      else                                replaceMaskSelection(i);
       syncMaskList();
-      import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+      import("./pg_dispatch.js").then(mm => mm.draw()).catch(() => {});
     });
 
     list.appendChild(row);

@@ -36,6 +36,15 @@ PG_CSS = r"""
     background: rgba(220, 90, 110, 0.10);
     color: #ffd0d8;
   }
+  #ui button#undoBtn {
+    border-color: rgba(180, 155, 255, 0.72);
+    color: #d5c8ff;
+  }
+  #ui button#undoBtn:hover:not(:disabled) {
+    border-color: rgba(200, 180, 255, 1.00);
+    background: rgba(180, 155, 255, 0.10);
+    color: #e8e0ff;
+  }
   #ui button#pickImageBtn {
     border-color: rgba(120, 220, 255, 0.72);
     color: #b8ecff;
@@ -51,6 +60,24 @@ PG_CSS = r"""
     background: rgba(140, 225, 160, 0.10);
     color: #d8ffe0;
   }
+
+  #maskPromptRow textarea {
+    width:100%;background:#0d1219;color:#00e5ff;
+    border:1px solid #223040;border-radius:2px;
+    font-family:inherit;font-size:12px;
+    padding:4px 6px;outline:none;resize:vertical;
+  }
+
+  .modelRow {
+    display: flex; gap: 12px; align-items: center;
+    margin: 4px 0 2px;
+    font-size: 11px;
+  }
+  .modelRow label {
+    display: flex; align-items: center; gap: 4px;
+    cursor: pointer; color: #a8b5c4;
+  }
+  .modelRow input[type=radio] { accent-color: #00e5ff; }
 
   .maskList {
     display:flex; flex-direction:column;
@@ -137,6 +164,12 @@ PG_CSS = r"""
   #statusLine.ok   { color:#00e5ff; }
   #statusLine.bad  { color:#d48590; }
   #statusLine.warn { color:#ffe600; }
+
+  .runHint {
+    font-size:9px; color:#3d4756; font-style:italic;
+    margin: 4px 0 0;
+    line-height: 1.45;
+  }
 """
 
 PG_PANEL_BODY = r"""
@@ -155,7 +188,9 @@ PG_PANEL_BODY = r"""
       <summary>Prompt</summary>
       <div class="section-body">
         <div class="field" style="align-items:flex-start;flex-direction:column;">
-          <label style="text-align:left;flex:0 0 auto;margin-bottom:4px;">Text</label>
+          <label style="text-align:left;flex:0 0 auto;margin-bottom:4px;">
+            Global prompt <span style="color:#3d4756;">(Segment All)</span>
+          </label>
           <textarea id="promptText" rows="2" spellcheck="false"
                     placeholder="woman, hair, eyes, legs"
                     style="width:100%;background:#0d1219;color:#00e5ff;
@@ -164,11 +199,17 @@ PG_PANEL_BODY = r"""
                            padding:4px 6px;outline:none;resize:vertical;"
           ></textarea>
         </div>
-        <div class="field">
-          <label>Points</label>
-          <span id="pointsInfo" style="font-size:10px;color:#7b8794;">
-            0 positive · 0 negative
-          </span>
+        <div class="field" id="maskPromptRow" style="display:none;align-items:flex-start;flex-direction:column;margin-top:6px;">
+          <label style="text-align:left;flex:0 0 auto;margin-bottom:4px;">
+            Mask prompt <span style="color:#3d4756;">(SAM3 refine only)</span>
+          </label>
+          <textarea id="maskPromptText" rows="2" spellcheck="false"
+                    placeholder="prompt used only when refining this mask"
+          ></textarea>
+        </div>
+        <div class="field" style="margin-top:6px;">
+          <label id="pointsLabel">Points</label>
+          <span id="pointsInfo" style="font-size:10px;color:#7b8794;">0 positive · 0 negative</span>
           <button id="clearPointsBtn" style="flex:0 0 auto;margin-left:auto;">Clear</button>
         </div>
       </div>
@@ -190,25 +231,40 @@ PG_PANEL_BODY = r"""
         <div class="field">
           <label>Individual</label>
           <input type="checkbox" id="individualMasks" checked
-                 title="One mask per detected object vs. one merged mask.">
+                 title="One mask per detected object (Segment All only).">
+        </div>
+        <div class="field">
+          <label>Auto-run</label>
+          <input type="checkbox" id="autoRun"
+                 title="Auto-refine 400 ms after any point change on the selected mask.">
         </div>
       </div>
     </details>
 
     <details class="section" open>
-      <summary>Run</summary>
+      <summary>Refine</summary>
       <div class="section-body">
+        <div class="modelRow">
+          <span style="color:#5a6774;font-size:9px;letter-spacing:0.14em;text-transform:uppercase;font-weight:700;">Model</span>
+          <label><input type="radio" name="refineModel" id="modelSam2" checked> SAM2 (true refine)</label>
+          <label><input type="radio" name="refineModel" id="modelSam3"> SAM3 (re-detect)</label>
+        </div>
         <div class="row">
           <button id="runBtn">Run</button>
-          <button id="segmentAllBtn"
-                  title="Ignore points; segment every object matching the prompt (empty prompt = main object)">
-            Segment All
-          </button>
+          <button id="segmentAllBtn">Segment All</button>
         </div>
         <div class="row">
           <button id="cancelBtn">Cancel</button>
+          <button id="undoBtn">Undo</button>
         </div>
         <div id="statusLine">idle</div>
+        <div class="runHint">
+          Canvas: click adds positive point, Shift+click adds negative,
+          Alt+click selects a mask.<br>
+          No mask selected → staging points feed Segment All.<br>
+          Mask selected → points go to that mask's refinement.<br>
+          Ctrl+Z undoes. M toggles refine model.
+        </div>
       </div>
     </details>
 

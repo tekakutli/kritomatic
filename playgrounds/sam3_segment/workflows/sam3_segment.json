@@ -10,26 +10,48 @@
       "negative_coords":   ["8", 0],
       "threshold":         ["9", 0],
       "refine_iterations": ["10", 0],
-      "individual_masks":  ["11", 0]
+      "individual_masks":  ["11", 0],
+      "bboxes":            ["17", 0]
     }
   },
   "3":  { "class_type": "MaskToImage",     "inputs": { "mask":   ["2", 0] } },
   "4":  { "class_type": "ETN_KritaOutput", "inputs": { "name": "mask", "images": ["3", 0] } },
-  "5":  { "class_type": "CheckpointLoaderSimple",
-          "inputs": { "ckpt_name": "segmentation/sam3.1_multiplex_fp16.safetensors" } },
+  "5":  {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": { "ckpt_name": "segmentation/sam3.1_multiplex_fp16.safetensors" }
+  },
   "6":  { "class_type": "CLIPTextEncode",
           "inputs": { "text": ["12", 0], "clip": ["5", 1] } },
+
   "7":  { "class_type": "ETN_Parameter",
-          "inputs": { "name": "positive_coords",   "type": "text",   "default": "[]" } },
+          "inputs": { "name": "positive_coords",   "type": "text",             "default": "[]" } },
   "8":  { "class_type": "ETN_Parameter",
-          "inputs": { "name": "negative_coords",   "type": "text",   "default": "[]" } },
+          "inputs": { "name": "negative_coords",   "type": "text",             "default": "[]" } },
   "9":  { "class_type": "ETN_Parameter",
-          "inputs": { "name": "threshold",         "type": "number", "default": 0.5 } },
+          "inputs": { "name": "threshold",         "type": "number",           "default": 0.5 } },
   "10": { "class_type": "ETN_Parameter",
           "inputs": { "name": "refine_iterations", "type": "number (integer)", "default": 2 } },
   "11": { "class_type": "ETN_Parameter",
-          "inputs": { "name": "individual_masks",  "type": "toggle", "default": true } },
+          "inputs": { "name": "individual_masks",  "type": "toggle",           "default": true } },
   "12": { "class_type": "ETN_Parameter",
           "inputs": { "name": "segment_text",      "type": "text",
-                      "default": "woman, hair, eyes, legs, " } }
+                      "default": "woman, hair, eyes, legs, " } },
+
+  "13": { "class_type": "ETN_Parameter",
+          "inputs": { "name": "bbox_x", "type": "number (integer)", "default": 0 } },
+  "14": { "class_type": "ETN_Parameter",
+          "inputs": { "name": "bbox_y", "type": "number (integer)", "default": 0 } },
+  "15": { "class_type": "ETN_Parameter",
+          "inputs": { "name": "bbox_w", "type": "number (integer)", "default": 512 } },
+  "16": { "class_type": "ETN_Parameter",
+          "inputs": { "name": "bbox_h", "type": "number (integer)", "default": 512 } },
+  "17": {
+    "class_type": "PrimitiveBoundingBox",
+    "inputs": {
+      "x":      ["13", 0],
+      "y":      ["14", 0],
+      "width":  ["15", 0],
+      "height": ["16", 0]
+    }
+  }
 }

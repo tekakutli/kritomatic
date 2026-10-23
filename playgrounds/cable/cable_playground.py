@@ -5,11 +5,16 @@ cable_playground.py — plan cable / pipe routes in a room.
     2. run cable_playground.py    → writes cable_playground.html and serves it.
     3. open the URL that this script prints.
 
+room.py and room_walls.json live at playgrounds/shared/, next to the
+shared playground_fonts.  `_SHARED` puts that directory on sys.path
+for `playground_fonts`, and cable_geometry resolves the JSON path
+relative to its own location.
+
 This module is the entry point.  The heavy lifting lives in:
 
-    cable_geometry     STEP + room_walls.json → a geometry dict
-    cable_html         the HTML/JS page and module manifest
-    pgkit.server       the HTTP + /modules/ server, plus /remote
+    cable_geometry     — room_walls.json → a geometry dict
+    cable_html         — the HTML/JS page and module manifest
+    pgkit.server       — the HTTP + /modules/ server, plus /remote
 
 The old `cable_server.py` is deleted.  `kit_serve` (from
 pgkit.server) handles the HTTP layer, the module serving at
@@ -53,9 +58,10 @@ import shutil
 import subprocess
 import sys
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
+_HERE   = os.path.dirname(os.path.abspath(__file__))
 _PARENT = os.path.dirname(_HERE)
-for _p in (_HERE, _PARENT):
+_SHARED = os.path.join(_PARENT, "shared")
+for _p in (_HERE, _PARENT, _SHARED):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 

@@ -72,9 +72,10 @@ import json
 import os
 import sys
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
+_HERE   = os.path.dirname(os.path.abspath(__file__))
 _PARENT = os.path.dirname(_HERE)
-for _p in (_HERE, _PARENT):
+_SHARED = os.path.join(_PARENT, "shared")
+for _p in (_HERE, _PARENT, _SHARED):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 

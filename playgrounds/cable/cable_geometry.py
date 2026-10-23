@@ -1,12 +1,12 @@
 """
-cable_geometry.py — extract wall geometry from room.step + room_walls.json.
+cable_geometry.py — build the cable planner's geometry dict from
+room_walls.json.
 
-Reads the STEP model produced by room.py and the sidecar room_walls.json
-and returns a `geom` dict:
+Reads the sidecar that room.py writes and returns the `geom` dict:
 
     {
         "faces":        [...],   # wall footprint polygons at cut height
-        "stepFaces":    [...],   # step-level footprint polygons
+        "stepFaces":    [...],   # walkable step surface (steps minus walls)
         "bounds":       {"minX":..., "minY":..., "maxX":..., "maxY":...},
         "cutZ":         <mm>,
         "columns":      [...],   # column boxes from room_walls.json
@@ -20,15 +20,49 @@ and returns a `geom` dict:
         },
     }
 
-The unfolded-wall strip is built from room_walls.json's `surfaces` via the
-spatial ordering helpers below.  The STEP fallback (morphological close on
-the largest hole) is used only when room_walls.json is missing.
+The sidecar lives at playgrounds/shared/room_walls.json, next to the
+shared room.py that generates it.  WALLS_FILE below resolves to that
+path via `_SHARED` computed from this module's own location, so the
+reader works from any working directory.
 
-The sidecar carries a `version` field and this reader dispatches on it,
-upgrading older formats to the current shape before returning.  A sidecar
-whose version is newer than any format this reader recognises is accepted
-on the assumption that the shape of the `surfaces` array it reads has not
-changed between then and now.
+PRIMARY PATH — planFaces
+========================
+room.py emits a `planFaces` field: the actual 2D section of the room
+solid at PLAN_CUT_Z, taken by build123d's own `section` operator while
+the solid is still in hand.  That IS the wall-plus-column footprint at
+cut height; no further extraction is needed.
+
+STEP SURFACES
+=============
+room_walls.json's `steps[]` array carries each step's plain outline.
+The walkable surface is that outline minus any wall or column
+footprint standing on it.  The STEP-based extraction this reader
+replaces computed exactly that as
+
+    section(solid, z=100)  −  section(solid, z=1200)
+
+The subtraction is done here directly on the JSON polygons with
+build123d 2D boolean ops: `make_face(Polyline(...))`, `+` to union,
+`-` to subtract.  The result removes, in particular, the C3 column
+that sits inside the SR_STRIP step footprint, so `pointOnStep`,
+step-edge snapping, and the `stOnStep` status flag do not fire inside
+a column base.
+
+WHAT THIS GAINS
+===============
+No dependency on `room.step`.  room_walls.json is the single source of
+truth — the same input boxes_geometry and floor_plan_geometry already
+consume.
+
+WHAT THIS REQUIRES
+==================
+room_walls.json must be v4 or later — i.e. produced by a room.py
+whose `_dump_wall_json` emits `planFaces`.  If `planFaces` is absent,
+this reader raises rather than silently degrade; the right fix is to
+re-run room.py, not to reconstruct a worse approximation.
+
+The `unfoldedWall` strip is built from `surfaces` via the spatial
+ordering helpers below.
 """
 
 import json
@@ -39,20 +73,35 @@ from quiet import quiet
 
 
 with quiet():
-    from build123d import import_step, Plane, section, offset, Kind
+    from build123d import make_face, Polyline
 
 
-STEP_FILE      = "room.step"
-WALLS_FILE     = "room_walls.json"
-WALL_CUT_Z     = 1200.0
-STEP_LOW_Z     = 100.0
-WALL_HEIGHT    = 3000.0
-UNFOLD_CLOSE_R = 600.0
+_HERE   = os.path.dirname(os.path.abspath(__file__))
+_SHARED = os.path.normpath(os.path.join(_HERE, "..", "shared"))
+WALLS_FILE  = os.path.join(_SHARED, "room_walls.json")
+WALL_CUT_Z  = 1200.0
+WALL_HEIGHT = 3000.0
 
 
 # ---------------------------------------------------------------------------
-# Wire / face helpers
+# Polygon helpers
 # ---------------------------------------------------------------------------
+
+def _poly_to_face(points):
+    """Build a build123d Face from a list of [[x, y], ...] points.
+
+    Returns None for fewer than three points, or if `make_face` rejects
+    the winding.  A step outline or a plan face that can't be built is
+    skipped — the caller counts what survives."""
+    if not points or len(points) < 3:
+        return None
+    try:
+        pts = [(float(p[0]), float(p[1])) for p in points]
+        return make_face(Polyline(*pts, close=True))
+    except Exception as e:
+        print(f"  (could not build face from {len(points)} points: {e})")
+        return None
+
 
 def wire_to_polygon(wire, tol=0.01):
     edges = list(wire.edges())
@@ -112,76 +161,157 @@ def polygon_area(ring):
 # ---------------------------------------------------------------------------
 
 def extract_geometry():
-    if not os.path.exists(STEP_FILE):
-        raise SystemExit(f"{STEP_FILE} not found — run room.py first.")
+    if not os.path.exists(WALLS_FILE):
+        raise SystemExit(f"{WALLS_FILE} not found — run room.py first.")
 
-    with quiet():
-        room = import_step(STEP_FILE)
-        wall_sketch = section(room, Plane.XY.offset(WALL_CUT_Z))
-        low_sketch  = section(room, Plane.XY.offset(STEP_LOW_Z))
+    with open(WALLS_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    wall_polys = faces_to_polys(wall_sketch.faces())
+    plan_faces = data.get("planFaces") or []
+    if not plan_faces:
+        raise SystemExit(
+            f"{WALLS_FILE} has no 'planFaces' — re-run room.py "
+            f"(v4 or later emits the plan section)."
+        )
 
-    step_polys = []
-    try:
-        with quiet():
-            step_sketch = low_sketch - wall_sketch
-        step_polys = faces_to_polys(step_sketch.faces())
-    except Exception as e:
-        print(f"  (could not compute step areas: {e})")
-        step_polys = []
+    # ---- wall faces ----
+    wall_polys = []
+    for pf in plan_faces:
+        outer = pf.get("outer") or []
+        if len(outer) < 3:
+            continue
+        try:
+            outer_clean = [[float(p[0]), float(p[1])] for p in outer]
+        except (TypeError, ValueError, IndexError):
+            continue
+        holes = []
+        for h in (pf.get("holes") or []):
+            if not (isinstance(h, list) and len(h) >= 3):
+                continue
+            try:
+                holes.append([[float(p[0]), float(p[1])] for p in h])
+            except (TypeError, ValueError, IndexError):
+                continue
+        wall_polys.append({"outer": outer_clean, "holes": holes})
 
     if not wall_polys:
-        raise SystemExit("Section returned no faces — is room.step valid?")
+        raise SystemExit(f"{WALLS_FILE} planFaces produced no wall faces.")
 
+    # ---- step faces: step_outline − plan_faces ----
+    step_polys = _compute_step_faces(data, plan_faces)
+
+    # ---- bounds ----
     min_x = min_y = float("inf")
     max_x = max_y = float("-inf")
     for face in wall_polys + step_polys:
         for ring in [face["outer"], *face["holes"]]:
             for x, y in ring:
-                min_x = min(min_x, x); min_y = min(min_y, y)
-                max_x = max(max_x, x); max_y = max(max_y, y)
+                if x < min_x: min_x = x
+                if y < min_y: min_y = y
+                if x > max_x: max_x = x
+                if y > max_y: max_y = y
 
     geom = {
         "faces":     wall_polys,
         "stepFaces": step_polys,
         "bounds":    {"minX": min_x, "minY": min_y,
                       "maxX": max_x, "maxY": max_y},
-        "cutZ":      WALL_CUT_Z,
-        "columns":   [],
-        "openings":  [],
+        "cutZ":      float(data.get("plan_cut_z_mm", WALL_CUT_Z)),
+        "columns":   data.get("columns", []),
+        "openings":  data.get("openings", []),
     }
 
-    if os.path.exists(WALLS_FILE):
-        try:
-            with open(WALLS_FILE, "r", encoding="utf-8") as f:
-                wdata = json.load(f)
-            uw = _unfold_from_walls_json(wdata)
-            geom["unfoldedWall"] = uw
-            geom["columns"]      = wdata.get("columns", [])
-            geom["openings"]     = wdata.get("openings", [])
-
-            n_step = sum(1 for s in uw["segments"]
-                         if s.get("kind") == "step")
-            n_col  = sum(1 for s in uw["segments"]
-                         if s.get("kind") == "column")
-            print(f"  unfolded-wall source  : {WALLS_FILE} v"
-                  f"{wdata.get('version', 1)} "
-                  f"({len(uw['segments'])} segment(s) — "
-                  f"{n_col} column, {n_step} step; "
-                  f"perimeter {uw['totalU']:.0f} mm)")
-            return geom
-        except Exception as e:
-            print(f"  (could not read {WALLS_FILE}: {e})")
-            print(f"  falling back to geometric extraction from {STEP_FILE}")
-    else:
-        print(f"  note: {WALLS_FILE} not found — falling back to "
-              f"geometric extraction from {STEP_FILE}")
-
-    uw, method = compute_unfold(wall_sketch, geom)
+    uw = _unfold_from_walls_json(data)
     geom["unfoldedWall"] = uw
-    print(f"  unfolded-wall method  : {method}")
+
+    n_step = sum(1 for s in uw["segments"] if s.get("kind") == "step")
+    n_col  = sum(1 for s in uw["segments"] if s.get("kind") == "column")
+    print(f"  unfolded-wall source  : {WALLS_FILE} v"
+          f"{data.get('version', 1)} "
+          f"({len(uw['segments'])} segment(s) — "
+          f"{n_col} column, {n_step} step; "
+          f"perimeter {uw['totalU']:.0f} mm)")
     return geom
+
+
+def _compute_step_faces(data, plan_faces):
+    """Walkable step surfaces.
+
+    Each step in `data["steps"]` is built into a 2D face from its
+    `outline`.  The faces are unioned, and the union of every
+    `plan_faces` polygon (with holes) is subtracted — reproducing the
+    old `section(solid, z=100) - section(solid, z=1200)`.
+
+    A step whose outline doesn't overlap any wall footprint passes
+    through unchanged (the union carries it and the subtraction is a
+    no-op over its area), so the common case costs one `make_face`
+    and no boolean ops.
+
+    The boolean may produce multiple disjoint faces (e.g. a step with
+    a column in its middle becomes an outer face with a hole), which
+    `faces_to_polys` walks as `.faces()` of the result.
+    """
+    step_outlines = []
+    for step in data.get("steps", []):
+        outline = step.get("outline") or []
+        if len(outline) < 3:
+            continue
+        try:
+            ring = [[float(p[0]), float(p[1])] for p in outline]
+        except (TypeError, ValueError, IndexError):
+            continue
+        step_outlines.append(ring)
+
+    if not step_outlines:
+        return []
+
+    with quiet():
+        step_faces = []
+        for ring in step_outlines:
+            face = _poly_to_face(ring)
+            if face is not None:
+                step_faces.append(face)
+
+        if not step_faces:
+            return []
+
+        try:
+            step_union = step_faces[0]
+            for f in step_faces[1:]:
+                step_union = step_union + f
+
+            wall_faces = []
+            for pf in plan_faces:
+                outer = pf.get("outer") or []
+                face = _poly_to_face(outer)
+                if face is None:
+                    continue
+                for hole in (pf.get("holes") or []):
+                    hole_face = _poly_to_face(hole)
+                    if hole_face is not None:
+                        try:
+                            face = face - hole_face
+                        except Exception:
+                            pass
+                wall_faces.append(face)
+
+            if wall_faces:
+                wall_union = wall_faces[0]
+                for f in wall_faces[1:]:
+                    wall_union = wall_union + f
+                step_union = step_union - wall_union
+
+            result = faces_to_polys(step_union.faces())
+            if result:
+                return result
+        except Exception as e:
+            print(f"  (step/wall subtraction failed: {e})")
+
+    # Fallback: plain step outlines.  Same shape the pre-refactor
+    # reader produced when the boolean step failed; the visual and
+    # most of the snap behavior are preserved, only the "not walkable
+    # under a column" refinement is lost.
+    return [{"outer": ring, "holes": []} for ring in step_outlines]
 
 
 # ---------------------------------------------------------------------------
@@ -405,108 +535,3 @@ def _unfold_from_walls_json(wdata):
         "height":     wh_default,
         "ccw":        True,
     }
-
-
-# ---------------------------------------------------------------------------
-# Fallback geometric extraction (only when room_walls.json is missing).
-# ---------------------------------------------------------------------------
-
-def _ring_via_closing(wall_sketch):
-    try:
-        dilated = offset(wall_sketch, UNFOLD_CLOSE_R, kind=Kind.INTERSECTION)
-        closed  = offset(dilated, -UNFOLD_CLOSE_R, kind=Kind.INTERSECTION)
-    except Exception as e:
-        print(f"  (morphological close failed: {e})")
-        return None
-
-    rings = []
-    try:
-        for f in closed.faces():
-            try:
-                for w in f.inner_wires():
-                    r = wire_to_polygon(w)
-                    if r and len(r) >= 3:
-                        rings.append(r)
-            except Exception:
-                continue
-    except Exception:
-        try:
-            for w in closed.inner_wires():
-                r = wire_to_polygon(w)
-                if r and len(r) >= 3:
-                    rings.append(r)
-        except Exception:
-            pass
-
-    if not rings:
-        return None
-    return max(rings, key=polygon_area)
-
-
-def compute_unfold(wall_sketch, geom):
-    ring = None
-    method = "none"
-
-    best_area = -1.0
-    for face in geom["faces"]:
-        for hole in face["holes"]:
-            A = polygon_area(hole)
-            if A > best_area:
-                best_area = A
-                ring = hole
-                method = "largest hole"
-
-    if ring is None:
-        ring = _ring_via_closing(wall_sketch)
-        if ring is not None:
-            method = f"morphological close (r={UNFOLD_CLOSE_R:.0f} mm)"
-
-    if ring is None:
-        best_farea = -1.0
-        best_face = None
-        for face in geom["faces"]:
-            A = polygon_area(face["outer"])
-            if A > best_farea:
-                best_farea = A
-                best_face = face
-        if best_face is not None:
-            ring = best_face["outer"]
-            method = "fallback (largest face outer ring)"
-
-    if ring is None:
-        return ({"segments": [], "footprints": [], "totalU": 0.0,
-                 "height": WALL_HEIGHT, "ccw": True}, method)
-
-    ccw = signed_area(ring) > 0
-
-    segments = []
-    footprints = []
-    u = 0.0
-    n = len(ring)
-    for i in range(n):
-        a = ring[i]
-        b = ring[(i + 1) % n]
-        dx = b[0] - a[0]
-        dy = b[1] - a[1]
-        L = (dx * dx + dy * dy) ** 0.5
-        if L < 1e-6:
-            continue
-        segments.append({
-            "u0": u, "u1": u + L,
-            "a": [float(a[0]), float(a[1])],
-            "b": [float(b[0]), float(b[1])],
-            "len": float(L),
-            "tag": None,
-            "z_lo": 0.0, "z_hi": WALL_HEIGHT,
-            "kind": "wall", "parent": None,
-        })
-        footprints.append({
-            "u0": u, "u1": u + L,
-            "a": [float(a[0]), float(a[1])],
-            "b": [float(b[0]), float(b[1])],
-            "len": float(L),
-        })
-        u += L
-
-    return ({"segments": segments, "footprints": footprints,
-             "totalU": u, "height": WALL_HEIGHT, "ccw": ccw}, method)

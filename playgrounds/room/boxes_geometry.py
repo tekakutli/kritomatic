@@ -11,6 +11,11 @@ rest of the boxes playground reads:
         "cutZ":      <mm>,
     }
 
+The sidecar lives at playgrounds/shared/room_walls.json, next to the
+shared room.py that generates it.  WALLS_FILE below resolves to that
+path via `_SHARED` computed from this module's own location, so the
+reader works from any working directory.
+
 Primary path — `planFaces`
 --------------------------
 room.py emits a `planFaces` field: the actual 2D section of the room
@@ -45,7 +50,9 @@ import json
 import os
 
 
-WALLS_FILE = "room_walls.json"
+_HERE   = os.path.dirname(os.path.abspath(__file__))
+_SHARED = os.path.normpath(os.path.join(_HERE, "..", "shared"))
+WALLS_FILE = os.path.join(_SHARED, "room_walls.json")
 DEFAULT_CUT_Z = 1200.0
 
 
@@ -217,7 +224,10 @@ def _finalize(faces, step_faces, data, fallback_cut_z):
     }
 
 
-def extract_from_json(json_path=WALLS_FILE, cut_z=DEFAULT_CUT_Z):
+def extract_from_json(json_path=None, cut_z=DEFAULT_CUT_Z):
+    if json_path is None:
+        json_path = WALLS_FILE
+
     if not os.path.exists(json_path):
         raise SystemExit(f"{json_path} not found — run room.py first.")
 

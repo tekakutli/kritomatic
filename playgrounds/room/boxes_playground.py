@@ -16,6 +16,11 @@ room.step.  Walls are the room's inner boundary surfaces; columns
 are taken verbatim from the columns array; steps are taken verbatim
 from the steps array that room.py emits alongside surfaces.
 
+room_walls.json lives at playgrounds/shared/room_walls.json, next to
+the shared room.py that generates it.  `_SHARED` puts that directory
+on sys.path for `playground_fonts`, and boxes_geometry resolves the
+JSON path relative to its own location.
+
 Data model (used by the browser-side JS)
 ----------------------------------------
 Box: an axis-aligned rectangle rotated by `rot` degrees about its own
@@ -46,9 +51,10 @@ one is added later, or falls back to a browser console dump).
 import os
 import sys
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
+_HERE   = os.path.dirname(os.path.abspath(__file__))
 _PARENT = os.path.dirname(_HERE)
-for _p in (_HERE, _PARENT):
+_SHARED = os.path.join(_PARENT, "shared")
+for _p in (_HERE, _PARENT, _SHARED):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 

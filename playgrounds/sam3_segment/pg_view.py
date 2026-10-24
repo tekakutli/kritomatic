@@ -4,30 +4,31 @@ In the old 800-line file this was one function that did everything.
 Now it is the orchestrator: call the layer renderers in order, then
 draw the header text.  The per-layer work lives in `pg_view_*.py`.
 
-Adding a new layer (a new mask channel, an inpaint spinner, a
-composited preview image) means: write a new `pg_view_*.py`, add one
-call to `drawView()`, done — no other file is touched.
+Adding a new layer (a new mask channel, a composited preview image)
+means: write a new `pg_view_*.py`, add one call to `drawView()`,
+done — no other file is touched.
 
 DRAW ORDER
 ==========
   1. image + selected-mask tinted overlays     (pg_view_image)
   2. live region preview OR region edge dots   (pg_view_region)
-  3. inpaint context rectangle                 (pg_view_inpaint)
-  4. staging points + per-mask points          (pg_view_points)
-  5. brush cursor, lasso draft, freehand draft (pg_view_brush)
-  6. chrome text (top-left status line)
+  3. staging points + per-mask points          (pg_view_points)
+  4. brush cursor, lasso draft, freehand draft (pg_view_brush)
+  5. chrome text (top-left status line)
 
-The order matches z-order intent: region and inpaint overlays sit on
-top of the image; points sit on top of the overlays (they must be
-visible against any mask); drafts sit on top of everything else
-because they follow the cursor."""
+The order matches z-order intent: region overlays sit on top of the
+image; points sit on top of the overlays (they must be visible against
+any mask); drafts sit on top of everything else because they follow
+the cursor.
+
+The inpaint context rectangle that used to render as step 3 now lives
+in the standalone inpaint playground (`playgrounds/inpaint`)."""
 
 VIEW_JS = r"""
 import { ctx, board, view, fittedImageRect } from "./pg_state.js";
 import { selectedMask } from "./pg_masks.js";
 import { drawImageLayer } from "./pg_view_image.js";
 import { drawRegionLayer } from "./pg_view_region.js";
-import { drawInpaintContext } from "./pg_view_inpaint.js";
 import { drawPoints } from "./pg_view_points.js";
 import {
   drawBrushCursor, drawLassoDraft, drawFreehandDraft,
@@ -41,11 +42,7 @@ import {
      single mask selected   "REFINING MASK N via SAM2" + region/lasso/freehand
      multiple selected      "MULTIPLE SELECTED"
      no masks yet           "STAGING MODE — place points then Segment All"
-     masks but none picked  "NO MASK SELECTED"
-
-   When inpainting is enabled, " · INPAINT" is appended so the user
-   never loses sight of the mode they enabled without seeing the rect
-   (e.g. after panning/zooming the rect off-screen). */
+     masks but none picked  "NO MASK SELECTED" */
 
 function _drawChromeText(sm) {
   const selIdx = (board.selectedMaskIndices.length === 1)
@@ -71,8 +68,6 @@ function _drawChromeText(sm) {
   } else {
     ctxLabel = "NO MASK SELECTED";
   }
-
-  if (board.inpaintEnabled) ctxLabel += " \u00b7 INPAINT";
 
   ctx.save();
   ctx.font = "700 10px 'JetBrains Mono', monospace";
@@ -117,18 +112,15 @@ export function drawView() {
   const sm = selectedMask();
   if (sm && sm.regionCanvas) drawRegionLayer(r, sm);
 
-  /* ---- 3. inpaint context rect ---- */
-  drawInpaintContext(r);
-
-  /* ---- 4. points ---- */
+  /* ---- 3. points ---- */
   drawPoints(r, sm);
 
-  /* ---- 5. cursor drafts ---- */
+  /* ---- 4. cursor drafts ---- */
   drawBrushCursor(r);
   drawLassoDraft();
   drawFreehandDraft();
 
-  /* ---- 6. chrome ---- */
+  /* ---- 5. chrome ---- */
   _drawChromeText(sm);
 }
 """

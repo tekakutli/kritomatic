@@ -6,17 +6,14 @@ Every other project module imports from here, and nothing here imports
 from the project's feature modules.  That is what lets the graph stay
 acyclic.
 
-`board` carries every piece of user-visible state.  There is no
-`inpaintName` field — the inpaint section has a prompt and an enable
-flag, nothing else.  If a future inpaint feature needs an identifier,
-add it deliberately and document why.
+`board` carries every piece of user-visible state.
 
 `setImage` and `clearImage` inline their board-resetting logic (mask
-array, staging points, region stroke, op log, inpaint rect) rather
-than importing `pg_masks.clearMasks`.  That preserves this module as a
-leaf.  The behaviour is identical to the original `clearMasks()` call
-chain — the whole synchronous reset block completes before the
-scheduled `requestAnimationFrame` fires."""
+array, staging points, region stroke, op log) rather than importing
+`pg_masks.clearMasks`.  That preserves this module as a leaf.  The
+behaviour is identical to the original `clearMasks()` call chain — the
+whole synchronous reset block completes before the scheduled
+`requestAnimationFrame` fires."""
 
 STATE_JS = r"""
 import {
@@ -124,7 +121,6 @@ export function setImage(hash, dataUrl, width, height) {
   board.regionStrokeActive = false;
   board.opLog = [];
   board.redoLog = [];
-  board.inpaintContext = { x: 0, y: 0, w: 0, h: 0, activeHandle: null };
   _scheduleDraw();
 }
 
@@ -146,7 +142,6 @@ export function clearImage() {
   board.regionStrokeActive = false;
   board.opLog = [];
   board.redoLog = [];
-  board.inpaintContext = { x: 0, y: 0, w: 0, h: 0, activeHandle: null };
   _scheduleDraw();
 }
 
@@ -213,20 +208,6 @@ export const board = {
 
   running:       false,
   lastTiming:    null,
-
-  // Inpainting section.  The section is collapsed by default;
-  // enabling `inpaintEnabled` shows the controls and paints the
-  // context rectangle on the canvas.  The rect coordinates live in
-  // image space so it pans/zooms with the image.  `activeHandle` is
-  // set by the dispatch layer during a drag so the view can
-  // highlight the handle being manipulated.  No `inpaintName` field:
-  // a name has no current meaning and would be a wasted message field.
-  inpaintEnabled: false,
-  inpaintPrompt:  "",
-  inpaintContext: {
-    x: 0, y: 0, w: 0, h: 0,
-    activeHandle: null,
-  },
 
   // Krita export options. Persist across runs so a user who tunes
   // feather once doesn't re-tune it on every mask; the values are

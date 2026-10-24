@@ -1,24 +1,20 @@
 """Inpainting context rectangle helpers.
 
-`inpaint` is brand-new and expected to grow.  This file is therefore
-deliberately small and contains *only* the pieces the context rect
-needs today:
+`inpaint` is the primary feature of this playground and expected to
+grow.  This file contains:
 
     - the tolerance constants
     - lazy-default initialisation of the rect
     - image→screen and screen-handle projections
     - the click classifier (handle vs border vs interior)
     - the pure drag math (resize with optional Shift symmetry + move)
+    - `buildContextMaskB64` — full-canvas mask of the context region
+    - `resizeMaskB64ToCanvas` — canvas-sized output from an arbitrary
+      input PNG
 
 The drag STATE (`_contextDrag = { active, handle, startIx, ... }`)
 stays in `pg_dispatch.js` because it is per-interaction, not
-per-document.  That way if a second inpaint mode is ever added, it can
-carry its own drag state without touching this module.
-
-When inpaint grows real functionality (running an inpainting model,
-exporting the context rect as a mask, etc.), the growth goes here —
-this module is the natural home, not `pg_dispatch` and not
-`pg_panel_bindings`."""
+per-document."""
 
 INPAINT_JS = r"""
 import { board } from "./pg_state.js";
@@ -100,15 +96,8 @@ export function handleCursor(name) {
 
 /* ============================================================
    Click classification
-   ============================================================
-   Classify a screen-space point against the inpaint context rect.
+   ============================================================ */
 
-   Returns { kind: 'handle', handle } | { kind: 'move' } | null.
-
-   Handles win over the border band.  Interior *and* a small band
-   around the outline both mean "drag to move" — the band extends
-   slightly outside the rect so the visible dashed outline is easy to
-   grab without needing pixel precision. */
 export function hitContextRect(r, sx, sy) {
   if (!r) return null;
   const crect = contextRectScreen(r);
@@ -134,17 +123,8 @@ export function hitContextRect(r, sx, sy) {
 
 /* ============================================================
    Pure drag math
-   ============================================================
-   Compute a new image-space rect from the drag start + current
-   delta.
+   ============================================================ */
 
-     handle    'move' or one of the 8 handle names
-     shiftKey  select symmetric resize around the center
-
-   Every mousemove recomputes from the ORIGINAL start rect rather
-   than accumulating deltas — that keeps the arithmetic exact even
-   after long drags, and lets the Shift key be pressed/released
-   mid-drag without drift. */
 export function applyContextDrag(startRect, startIx, startIy,
                                   currentIx, currentIy,
                                   handle, shiftKey) {
@@ -164,13 +144,11 @@ export function applyContextDrag(startRect, startIx, startIy,
     const movesS = handle.includes('s');
 
     if (shiftKey) {
-      // Symmetric around the center: both opposite sides move.
       if (movesW) { x0 += dx; x1 -= dx; }
       if (movesE) { x0 -= dx; x1 += dx; }
       if (movesN) { y0 += dy; y1 -= dy; }
       if (movesS) { y0 -= dy; y1 += dy; }
     } else {
-      // One side anchored: only the dragged side moves.
       if (movesW) x0 += dx;
       if (movesE) x1 += dx;
       if (movesN) y0 += dy;
@@ -178,7 +156,6 @@ export function applyContextDrag(startRect, startIx, startIy,
     }
   }
 
-  // Minimum size — collapse around the current center.
   if (x1 - x0 < CONTEXT_MIN_SIZE) {
     const cx = (x0 + x1) / 2;
     x0 = cx - CONTEXT_MIN_SIZE / 2;
@@ -190,12 +167,60 @@ export function applyContextDrag(startRect, startIx, startIy,
     y1 = cy + CONTEXT_MIN_SIZE / 2;
   }
 
-  // Clamp to image bounds.
   x0 = Math.max(0, Math.min(board.imageWidth,  x0));
   y0 = Math.max(0, Math.min(board.imageHeight, y0));
   x1 = Math.max(0, Math.min(board.imageWidth,  x1));
   y1 = Math.max(0, Math.min(board.imageHeight, y1));
 
   return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+}
+
+/* ============================================================
+   Mask building
+   ============================================================
+   `buildContextMaskB64` produces the `thecontext` blob fed to the
+   inpaint workflow:
+
+     inpaintEnabled = false   →  all-white (full canvas)
+     inpaintEnabled = true    →  black canvas, white rectangle
+
+   The daemon's InpaintCropImproved reads the mask to decide the crop
+   region; a full-white mask means "no context restriction", a
+   rectangle means "inpaint only inside this rectangle".
+
+   Output dimensions match the canvas (not the rect's dimensions), so
+   the workflow gets a mask of the same extent as `thecanvas`. */
+
+export function buildContextMaskB64() {
+  const W = board.imageWidth, H = board.imageHeight;
+  const c = document.createElement("canvas");
+  c.width = W; c.height = H;
+  const cx = c.getContext("2d");
+  if (board.inpaintEnabled) {
+    cx.fillStyle = "#000"; cx.fillRect(0, 0, W, H);
+    const r = board.inpaintContext;
+    cx.fillStyle = "#fff"; cx.fillRect(r.x, r.y, r.w, r.h);
+  } else {
+    cx.fillStyle = "#fff"; cx.fillRect(0, 0, W, H);
+  }
+  return c.toDataURL("image/png").replace(/^data:image\/png;base64,/, "");
+}
+
+/* ============================================================
+   Mask resize
+   ============================================================
+   Masks imported from Krita may have dimensions that differ from the
+   canvas. The daemon's `_decode_mask_to_binary` resizes anyway, but
+   producing a canvas-sized blob in JS keeps the wire payload honest
+   and makes the daemon's job trivial. */
+
+export function resizeMaskB64ToCanvas(b64, img) {
+  if (img.width === board.imageWidth && img.height === board.imageHeight) {
+    return b64;
+  }
+  const c = document.createElement("canvas");
+  c.width = board.imageWidth; c.height = board.imageHeight;
+  c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+  return c.toDataURL("image/png").replace(/^data:image\/png;base64,/, "");
 }
 """

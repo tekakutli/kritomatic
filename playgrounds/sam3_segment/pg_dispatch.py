@@ -15,21 +15,17 @@ module that actually owns the symbol:
     pg_masks      — mask selection, points, staging points
     pg_pixels     — pixel hit test
     pg_region     — region paint + lasso fill
-    pg_inpaint    — context rect hit test + drag math + cursor hint
 
-The inpaint drag STATE (`_contextDrag = { active, handle, startIx, ... }`)
-stays here because it is per-interaction, not per-document.  The pure
-math lives in `pg_inpaint.js` so a second inpaint mode could carry its
-own drag state without touching this module.
+The inpaint context rect and its drag state were part of this module
+before the split; they now live in `playgrounds/inpaint`.
 
 WHAT'S UNCHANGED
 ================
-Every listener body is identical to the pre-split version outside the
-inpaint block.  The pan state (`_panActive`, `_spaceDown`), the region
-stroke state (`_regionStroke`), the shift-drag resize state
-(`_resizeActive`), the lasso close-on-Enter, the freehand
-finish-on-mouseup, the undo/redo keyboard shortcuts, the region-tool
-cycle on B, the mask-selection-on-number keys — all untouched."""
+The pan state (`_panActive`, `_spaceDown`), the region stroke state
+(`_regionStroke`), the shift-drag resize state (`_resizeActive`), the
+lasso close-on-Enter, the freehand finish-on-mouseup, the undo/redo
+keyboard shortcuts, the region-tool cycle on B, the
+mask-selection-on-number keys — all untouched."""
 
 DISPATCH_JS = r"""
 import {
@@ -48,10 +44,6 @@ import { hitTestMaskAtPoint } from "./pg_pixels.js";
 import {
   paintRegionStroke, fillLassoPolygonInRegion,
 } from "./pg_region.js";
-import {
-  hitContextRect, handleCursor, applyContextDrag,
-  ensureDefaultContext,
-} from "./pg_inpaint.js";
 import { drawView } from "./pg_view.js";
 import { syncMaskList } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
@@ -111,18 +103,6 @@ let _panStartScreenY = 0;
 let _panStartPanX = 0;
 let _panStartPanY = 0;
 let _spaceDown = false;
-
-// Inpaint context drag state. `handle` is one of 'nw','ne','sw','se',
-// 'n','s','e','w', or 'move'. startIx/startIy are in image coords;
-// startRect is the rect captured at mousedown so each mousemove can
-// recompute from the original anchor rather than accumulating error.
-let _contextDrag = {
-  active: false,
-  handle: null,
-  startIx: 0,
-  startIy: 0,
-  startRect: null,
-};
 
 function _endResize() {
   if (!_resizeActive) return;
@@ -236,37 +216,6 @@ canvas.addEventListener("mousedown", (e) => {
   const overImage = sx >= r.x0 && sx <= r.x0 + r.w
                     && sy >= r.y0 && sy <= r.y0 + r.h;
   const [ix, iy] = screenToImage(sx, sy);
-
-  // ========== INPAINT CONTEXT RECT ==========
-  // Highest priority after pan. With inpainting enabled:
-  //   - a click on one of the 8 handles starts a resize
-  //   - a click on the border band OR anywhere inside the rect
-  //     starts a move
-  // Either branch consumes the event so the region tools and point
-  // placement don't fire underneath.
-  if (board.inpaintEnabled && e.button === 0) {
-    ensureDefaultContext();
-    const hit = hitContextRect(r, sx, sy);
-    if (hit) {
-      e.preventDefault();
-      _contextDrag.active    = true;
-      _contextDrag.handle    = (hit.kind === 'handle') ? hit.handle : 'move';
-      _contextDrag.startIx   = ix;
-      _contextDrag.startIy   = iy;
-      _contextDrag.startRect = {
-        x: board.inpaintContext.x,
-        y: board.inpaintContext.y,
-        w: board.inpaintContext.w,
-        h: board.inpaintContext.h,
-      };
-      board.inpaintContext.activeHandle = _contextDrag.handle;
-      canvas.style.cursor = (_contextDrag.handle === 'move')
-        ? 'grabbing'
-        : handleCursor(_contextDrag.handle);
-      drawView();
-      return;
-    }
-  }
 
   // Resize: shift + left-click in brush region mode. Anchors the ring
   // at (ix, iy); the brush itself does not move during resize.
@@ -437,26 +386,6 @@ canvas.addEventListener("mousemove", (e) => {
     return;
   }
 
-  // Inpaint context drag in progress.
-  if (_contextDrag.active && r) {
-    const [ix, iy] = screenToImage(sx, sy);
-    const newRect = applyContextDrag(
-      _contextDrag.startRect,
-      _contextDrag.startIx, _contextDrag.startIy,
-      ix, iy,
-      _contextDrag.handle,
-      e.shiftKey);
-    board.inpaintContext.x = newRect.x;
-    board.inpaintContext.y = newRect.y;
-    board.inpaintContext.w = newRect.w;
-    board.inpaintContext.h = newRect.h;
-    canvas.style.cursor = (_contextDrag.handle === 'move')
-      ? 'grabbing'
-      : handleCursor(_contextDrag.handle);
-    drawView();
-    return;
-  }
-
   // Resize in progress. The brush cursor is locked to the anchor;
   // only the size changes. Ends on button-up or shift-up.
   if (_resizeActive) {
@@ -518,19 +447,6 @@ canvas.addEventListener("mousemove", (e) => {
   if (board.lassoPoints.length > 0) {
     drawView();
     return;
-  }
-
-  // Inpaint context hover cursor (handles + border band + interior).
-  if (board.inpaintEnabled && r && !_contextDrag.active) {
-    const hit = hitContextRect(r, sx, sy);
-    if (hit) {
-      canvas.style.cursor = (hit.kind === 'handle')
-        ? handleCursor(hit.handle)
-        : handleCursor('move');
-      if (board.hoveredMaskIdx !== -1) board.hoveredMaskIdx = -1;
-      drawView();
-      return;
-    }
   }
 
   let hoveredMask = -1;
@@ -602,15 +518,6 @@ window.addEventListener("mouseup", () => {
   if (_regionStroke.active) {
     _regionStroke.active = false;
     board.regionStrokeActive = false;
-    pgkitNotifyAll();
-    drawView();
-  }
-  if (_contextDrag.active) {
-    _contextDrag.active = false;
-    _contextDrag.handle = null;
-    _contextDrag.startRect = null;
-    board.inpaintContext.activeHandle = null;
-    canvas.style.cursor = "crosshair";
     pgkitNotifyAll();
     drawView();
   }

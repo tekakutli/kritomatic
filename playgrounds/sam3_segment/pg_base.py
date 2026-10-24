@@ -1,29 +1,12 @@
 """SAM3 playground's panel body and CSS.
 
-CHANGELOG
-=========
-The Inpainting section no longer carries a "Name" text input.  It was a
-placeholder from the initial implementation with no meaningful
-semantics; the two fields the section needs are `inpaintEnabled` (a
-checkbox) and `inpaintPrompt` (a textarea).  The `runHint` has been
-updated to describe the border-band-move behaviour that the inpaint
-context rectangle actually supports (border or interior → move,
-handle → resize)."""
+This playground is segmentation-only: SAM3 detection, SAM2 refinement,
+region-constrained refinement, and mask export to Krita.  Inpainting
+lives in its own playground (`playgrounds/inpaint`); the Inpainting
+section, the inpaint button, and the inpaint context rectangle have been
+removed from this file along with the rest of the inpaint scaffolding."""
 
 PG_CSS = r"""
-  #ui button#inpaintBtn {
-    border-color: rgba(180, 155, 255, 0.72);
-    color: #d5c8ff;
-  }
-  #ui button#inpaintBtn:hover:not(:disabled) {
-    border-color: rgba(200, 180, 255, 1.00);
-    background: rgba(180, 155, 255, 0.10);
-    color: #e8e0ff;
-  }
-  #ui button#inpaintBtn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
   #ui button#runBtn {
     border-color: rgba(0, 229, 255, 0.72);
     color: #b8ecff;
@@ -625,44 +608,6 @@ PG_PANEL_BODY = r"""
                   title="Duplicate the target layer in place, and attach a transparency mask for the masked region.">
             Duplicate with mask
           </button>
-        </div>
-      </div>
-    </details>
-
-    <details class="section" open>
-      <summary>Inpainting</summary>
-      <div class="section-body">
-        <div class="field">
-          <label>Enable</label>
-          <input type="checkbox" id="inpaintEnabled"
-                 title="Show inpainting controls and the context rectangle on the canvas.">
-          <span style="font-size:9px;color:#3d4756;margin-left:6px;">inpainting</span>
-        </div>
-        <div id="inpaintControls" style="display:none;margin-top:6px;">
-          <div class="field" style="align-items:flex-start;flex-direction:column;margin-top:6px;">
-            <label style="text-align:left;flex:0 0 auto;margin-bottom:4px;">
-              Inpaint prompt
-            </label>
-            <textarea id="inpaintPrompt" rows="2" spellcheck="false"
-                      placeholder="what should appear in the context region"
-                      style="width:100%;background:#0d1219;color:#00e5ff;
-                             border:1px solid #223040;border-radius:2px;
-                             font-family:inherit;font-size:12px;
-                             padding:4px 6px;outline:none;resize:vertical;"
-            ></textarea>
-          </div>
-          <div class="row" style="margin-top:6px;">
-            <button id="inpaintBtn"
-                    title="Run inpainting inside the context rectangle. (Placeholder — not yet wired to a backend.)">
-              Inpaint
-            </button>
-          </div>
-          <div class="runHint" style="margin-top:4px;">
-            Drag anywhere on the context rectangle's border or interior
-            to move it. Drag a handle (four corners, four edge midpoints)
-            to resize. Hold Shift while dragging a handle to resize
-            symmetrically around the center.
-          </div>
         </div>
       </div>
     </details>

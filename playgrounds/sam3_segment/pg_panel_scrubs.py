@@ -1,16 +1,6 @@
 """Scrub inputs, checkboxes, tool radios, text inputs, and the
 `pgkitRegisterField` registrations for every panel field.
 
-NO `inpaintName` FIELD
-======================
-The Inpainting section used to carry a "Name" text input.  It was a
-placeholder from the initial implementation with no meaningful
-semantics; it has been removed.  The section now has two fields:
-`inpaintEnabled` (a checkbox) and `inpaintPrompt` (a textarea), plus
-the placeholder Inpaint button.  The `inpaint.enabled` handler
-initialises the context rectangle to a centered 50%-of-image box the
-first time the section is enabled.
-
 STATUS.RUNNING
 ==============
 `status.running` is a read-only boolean registered at the bottom of
@@ -38,7 +28,6 @@ import {
   selectedMask, selectedMaskIdx,
   clearMaskSelection, replaceMaskSelection, setMaskPrompt,
 } from "./pg_masks.js";
-import { ensureDefaultContext } from "./pg_inpaint.js";
 import { _installScrubInput } from "./pgkit/panel_core.js";
 import {
   pgkitRegisterField, pgkitNotifyLocal,
@@ -337,34 +326,6 @@ if (kritaBlendModeEl) {
 }
 
 /* ============================================================
-   Inpainting section
-   ============================================================ */
-
-const inpaintEnabledEl = document.getElementById("inpaintEnabled");
-if (inpaintEnabledEl) {
-  inpaintEnabledEl.checked = !!board.inpaintEnabled;
-  inpaintEnabledEl.addEventListener("change", () => {
-    board.inpaintEnabled = !!inpaintEnabledEl.checked;
-    if (board.inpaintEnabled) {
-      // Lazy default: a centered 50%-of-image rect the first time
-      // the section is enabled against a loaded image.  Idempotent.
-      ensureDefaultContext();
-    }
-    pgkitNotifyLocal("inpaint.enabled");
-    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-  });
-}
-
-const inpaintPromptEl = document.getElementById("inpaintPrompt");
-if (inpaintPromptEl) {
-  inpaintPromptEl.value = board.inpaintPrompt || "";
-  inpaintPromptEl.addEventListener("input", () => {
-    board.inpaintPrompt = inpaintPromptEl.value;
-    pgkitNotifyLocal("inpaint.prompt");
-  });
-}
-
-/* ============================================================
    Field registrations
    ============================================================ */
 
@@ -652,28 +613,6 @@ pgkitRegisterField("krita.group", {
     if (el && document.activeElement !== el) el.value = board.kritaGroup;
   },
   meta: { kind: "text", label: "Target group (extract only)" },
-});
-
-pgkitRegisterField("inpaint.enabled", {
-  get: () => !!board.inpaintEnabled,
-  set: (v) => {
-    board.inpaintEnabled = !!v;
-    const el = document.getElementById("inpaintEnabled");
-    if (el && document.activeElement !== el) el.checked = board.inpaintEnabled;
-    if (board.inpaintEnabled) ensureDefaultContext();
-    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-  },
-  meta: { kind: "bool", label: "Inpainting enabled" },
-});
-
-pgkitRegisterField("inpaint.prompt", {
-  get: () => board.inpaintPrompt || "",
-  set: (v) => {
-    board.inpaintPrompt = String(v || "");
-    const el = document.getElementById("inpaintPrompt");
-    if (el && document.activeElement !== el) el.value = board.inpaintPrompt;
-  },
-  meta: { kind: "text", label: "Inpaint prompt" },
 });
 
 /* ============================================================

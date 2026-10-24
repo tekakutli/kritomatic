@@ -3,18 +3,11 @@ and the boot-sync routine.
 
 UPDATE LOG
 ==========
-This file is unchanged from the pre-refactor version except:
-
-  - the top import block now pulls each symbol from its new home
-    (`pg_state`, `pg_masks`, `pg_oplog`, `pg_region`, `pg_composite`)
-    instead of from `pg_core.js`
-  - `_inpaintAction` no longer echoes a name that no longer exists
-    (the whole name-echo string was `board.inpaintName ? " (...)" : ""`
-    and is gone)
-
-Every other line — the export/import actions, the Krita actions, the
-pgkit registrations, the mask-row select/delete actions, `pgkitHandleSelect`,
-`samBootSync` — is identical."""
+The Inpainting section and its placeholder button have been removed —
+inpainting lives in its own playground (`playgrounds/inpaint`).  Every
+other action — export/import, Krita actions, pgkit registrations,
+mask-row select/delete, `pgkitHandleSelect`, `samBootSync` — is
+unchanged."""
 
 PANEL_BINDINGS_JS = r"""
 import { board, setImage, clearImage } from "./pg_state.js";
@@ -365,19 +358,6 @@ async function _checkStatusAction() {
   ];
   flashStatus(parts.join(" \u00b7 "),
               s.has_sam3 && s.has_sam2 ? "ok" : "warn");
-}
-
-function _inpaintAction() {
-  // Placeholder — no backend wired up yet. Flashes a status message
-  // so the button is visibly hooked up for future wiring.
-  flashStatus(
-    "inpainting is not wired up yet"
-    + " — context rect at ["
-    + board.inpaintContext.x + ","
-    + board.inpaintContext.y + "] "
-    + board.inpaintContext.w + "\u00d7" + board.inpaintContext.h,
-    "warn",
-  );
 }
 
 /* ============================================================
@@ -889,7 +869,6 @@ export function installPanelBindings() {
     "exportBtn", "exportCombinedBtn",
     "kritaCheckBtn", "kritaSelectionBtn", "kritaTransparencyBtn",
     "kritaExtractNewLayerBtn", "kritaExtractDuplicateBtn",
-    "inpaintBtn",
   ];
   for (const id of ids) el[id] = document.getElementById(id);
 
@@ -914,8 +893,6 @@ export function installPanelBindings() {
     () => _kritaExportExtract("extract_new_layer"));
   if (el.kritaExtractDuplicateBtn) el.kritaExtractDuplicateBtn.addEventListener("click",
     () => _kritaExportExtract("extract_duplicate"));
-
-  if (el.inpaintBtn) el.inpaintBtn.addEventListener("click", _inpaintAction);
 
   // Wire the two export-option checkboxes: toggling exportToKrita
   // disables/enables exportAtCurrentLayer (position is meaningless
@@ -1050,13 +1027,6 @@ pgkitRegisterAction("action.kritaExtractDuplicate", {
   label: "Duplicate with mask", scope: "global",
   run: () => _kritaExportExtract("extract_duplicate"),
   meta: { variant: "primary" },
-});
-
-pgkitRegisterAction("action.inpaint", {
-  label: "Inpaint", scope: "global", run: _inpaintAction,
-  meta: { variant: "primary",
-          description: "Run inpainting within the context rectangle. " +
-                       "Placeholder — no backend wired up yet." },
 });
 
 /* ============================================================

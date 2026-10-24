@@ -9,7 +9,11 @@ file name in `_MODULE_SOURCES` is the `.js` name the browser sees.
 
 The order in the manifest does not affect runtime — every module is an
 ES module with its own imports resolved at load time.  It only affects
-the readability of `curl /modules/pg_state.js` debug output."""
+the readability of `curl /modules/pg_state.js` debug output.
+
+This playground is segmentation-only.  Inpainting lives in
+`playgrounds/inpaint`; its `pg_inpaint.js` and `pg_view_inpaint.js`
+modules are not part of this manifest."""
 
 import os
 import sys
@@ -28,13 +32,11 @@ from pg_masks import MASKS_JS
 from pg_region import REGION_JS
 from pg_oplog import OPLOG_JS
 from pg_composite import COMPOSITE_JS
-from pg_inpaint import INPAINT_JS
 from pg_view import VIEW_JS
 from pg_view_image import VIEW_IMAGE_JS
 from pg_view_points import VIEW_POINTS_JS
 from pg_view_region import VIEW_REGION_JS
 from pg_view_brush import VIEW_BRUSH_JS
-from pg_view_inpaint import VIEW_INPAINT_JS
 from pg_dispatch import DISPATCH_JS
 from pg_comfy_client import COMFY_CLIENT_JS
 from pg_krita_client import KRITA_CLIENT_JS
@@ -97,13 +99,11 @@ _MODULE_SOURCES = {
     "pg_region.js":           REGION_JS,
     "pg_oplog.js":            OPLOG_JS,
     "pg_composite.js":        COMPOSITE_JS,
-    "pg_inpaint.js":          INPAINT_JS,
     "pg_view.js":             VIEW_JS,
     "pg_view_image.js":       VIEW_IMAGE_JS,
     "pg_view_points.js":      VIEW_POINTS_JS,
     "pg_view_region.js":      VIEW_REGION_JS,
     "pg_view_brush.js":       VIEW_BRUSH_JS,
-    "pg_view_inpaint.js":     VIEW_INPAINT_JS,
     "pg_dispatch.js":         DISPATCH_JS,
     "pg_comfy_client.js":     COMFY_CLIENT_JS,
     "pg_krita_client.js":     KRITA_CLIENT_JS,

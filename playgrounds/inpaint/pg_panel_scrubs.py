@@ -21,18 +21,6 @@ import {
    Inpainting section
    ============================================================ */
 
-const inpaintEnabledEl = document.getElementById("inpaintEnabled");
-if (inpaintEnabledEl) {
-  inpaintEnabledEl.checked = !!board.inpaintEnabled;
-  inpaintEnabledEl.addEventListener("change", () => {
-    board.inpaintEnabled = !!inpaintEnabledEl.checked;
-    if (board.inpaintEnabled) {
-      ensureDefaultContext();
-    }
-    pgkitNotifyLocal("inpaint.enabled");
-    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-  });
-}
 
 const inpaintPromptEl = document.getElementById("inpaintPrompt");
 if (inpaintPromptEl) {

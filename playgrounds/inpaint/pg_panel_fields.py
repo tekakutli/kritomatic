@@ -18,8 +18,6 @@ function _get() {
     imageInfo:       document.getElementById("imageInfo"),
     maskCount:       document.getElementById("maskCount"),
     statusLine:      document.getElementById("statusLine"),
-    inpaintEnabled:  document.getElementById("inpaintEnabled"),
-    inpaintControls: document.getElementById("inpaintControls"),
     inpaintPrompt:   document.getElementById("inpaintPrompt"),
     inpaintBtn:      document.getElementById("inpaintBtn"),
     cancelBtn:       document.getElementById("cancelBtn"),

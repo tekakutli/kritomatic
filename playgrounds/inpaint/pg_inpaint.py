@@ -179,30 +179,26 @@ export function applyContextDrag(startRect, startIx, startIy,
    Mask building
    ============================================================
    `buildContextMaskB64` produces the `thecontext` blob fed to the
-   inpaint workflow:
+   inpaint workflow: black canvas, white rectangle at the current
+   context rect position.  The daemon's InpaintCropImproved reads the
+   mask to decide the crop region.
 
-     inpaintEnabled = false   →  all-white (full canvas)
-     inpaintEnabled = true    →  black canvas, white rectangle
-
-   The daemon's InpaintCropImproved reads the mask to decide the crop
-   region; a full-white mask means "no context restriction", a
-   rectangle means "inpaint only inside this rectangle".
+   To use the full canvas as context, the user drags the rectangle
+   handles to the image edges.  The drag math clamps to image bounds,
+   so dragging past an edge gives a rect flush with that edge.
 
    Output dimensions match the canvas (not the rect's dimensions), so
    the workflow gets a mask of the same extent as `thecanvas`. */
 
 export function buildContextMaskB64() {
+  ensureDefaultContext();
   const W = board.imageWidth, H = board.imageHeight;
   const c = document.createElement("canvas");
   c.width = W; c.height = H;
   const cx = c.getContext("2d");
-  if (board.inpaintEnabled) {
-    cx.fillStyle = "#000"; cx.fillRect(0, 0, W, H);
-    const r = board.inpaintContext;
-    cx.fillStyle = "#fff"; cx.fillRect(r.x, r.y, r.w, r.h);
-  } else {
-    cx.fillStyle = "#fff"; cx.fillRect(0, 0, W, H);
-  }
+  cx.fillStyle = "#000"; cx.fillRect(0, 0, W, H);
+  const r = board.inpaintContext;
+  cx.fillStyle = "#fff"; cx.fillRect(r.x, r.y, r.w, r.h);
   return c.toDataURL("image/png").replace(/^data:image\/png;base64,/, "");
 }
 

@@ -102,12 +102,28 @@ canvas.addEventListener("mousedown", (e) => {
                     && sy >= r.y0 && sy <= r.y0 + r.h;
   const [ix, iy] = screenToImage(sx, sy);
 
-  // Inpaint context rectangle takes priority over everything else
-  // (except pan). With inpainting enabled:
+  // Alt+click selects a mask.  Takes priority over the context
+  // rectangle so selecting a mask works even when the rect covers
+  // the click point.
+  if (e.altKey && e.button === 0) {
+    if (overImage) {
+      const idx = hitTestMaskAtPoint(ix, iy);
+      if (idx >= 0) {
+        if (e.shiftKey)                  addMaskToSelection(idx);
+        else if (e.ctrlKey || e.metaKey) toggleMaskSelection(idx);
+        else                             replaceMaskSelection(idx);
+        pgkitNotifyAll();
+        draw();
+      }
+    }
+    return;
+  }
+
+  // Inpaint context rectangle:
   //   - a click on one of the 8 handles starts a resize
   //   - a click on the border band OR anywhere inside the rect
   //     starts a move
-  if (board.inpaintEnabled && e.button === 0) {
+  if (e.button === 0) {
     ensureDefaultContext();
     const hit = hitContextRect(r, sx, sy);
     if (hit) {
@@ -129,21 +145,6 @@ canvas.addEventListener("mousedown", (e) => {
       drawView();
       return;
     }
-  }
-
-  // Alt+click selects a mask.
-  if (e.altKey && e.button === 0) {
-    if (overImage) {
-      const idx = hitTestMaskAtPoint(ix, iy);
-      if (idx >= 0) {
-        if (e.shiftKey)                  addMaskToSelection(idx);
-        else if (e.ctrlKey || e.metaKey) toggleMaskSelection(idx);
-        else                             replaceMaskSelection(idx);
-        pgkitNotifyAll();
-        draw();
-      }
-    }
-    return;
   }
 });
 

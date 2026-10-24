@@ -16,7 +16,6 @@ import {
 } from "./pg_inpaint.js";
 
 export function drawInpaintContext(r) {
-  if (!board.inpaintEnabled) return;
   if (!board.imageEl) return;
 
   ensureDefaultContext();

@@ -1,6 +1,6 @@
 """Per-frame panel sync: image info, mask count, inpaint button
-enablement, cancel button enablement, inpaint controls visibility,
-status line.
+enablement, cancel button enablement, context-rectangle checkbox and
+hint visibility, status line.
 
 The function is called once per frame from `pg_dispatch.draw()`.
 Every DOM write is guarded against the current DOM value so a
@@ -11,21 +11,6 @@ import { board } from "./pg_state.js";
 import { selectedMask, selectedMaskIdx } from "./pg_masks.js";
 
 let _els = null;
-_els = {
-  imageInfo:       document.getElementById("imageInfo"),
-  maskCount:       document.getElementById("maskCount"),
-  statusLine:      document.getElementById("statusLine"),
-  inpaintEnabled:  document.getElementById("inpaintEnabled"),
-  inpaintRectHint: document.getElementById("inpaintRectHint"),
-  inpaintPrompt:   document.getElementById("inpaintPrompt"),
-  inpaintBtn:      document.getElementById("inpaintBtn"),
-  cancelBtn:       document.getElementById("cancelBtn"),
-  pickImageBtn:    document.getElementById("pickImageBtn"),
-  clearImageBtn:   document.getElementById("clearImageBtn"),
-  pickMaskBtn:     document.getElementById("pickMaskBtn"),
-  kritaImportBtn:  document.getElementById("kritaImportBtn"),
-  kritaImportMasksBtn: document.getElementById("kritaImportMasksBtn"),
-};
 
 function _get() {
   if (_els) return _els;
@@ -33,6 +18,8 @@ function _get() {
     imageInfo:       document.getElementById("imageInfo"),
     maskCount:       document.getElementById("maskCount"),
     statusLine:      document.getElementById("statusLine"),
+    inpaintEnabled:  document.getElementById("inpaintEnabled"),
+    inpaintRectHint: document.getElementById("inpaintRectHint"),
     inpaintPrompt:   document.getElementById("inpaintPrompt"),
     inpaintBtn:      document.getElementById("inpaintBtn"),
     cancelBtn:       document.getElementById("cancelBtn"),
@@ -69,7 +56,10 @@ export function syncPanelFields() {
     e.inpaintEnabled.checked = !!board.inpaintEnabled;
   }
   if (e.inpaintRectHint) {
-    e.inpaintRectHint.style.display = board.inpaintEnabled ? "" : "none";
+    const want = board.inpaintEnabled ? "block" : "none";
+    if (e.inpaintRectHint.style.display !== want) {
+      e.inpaintRectHint.style.display = want;
+    }
   }
 
   if (e.statusLine) {

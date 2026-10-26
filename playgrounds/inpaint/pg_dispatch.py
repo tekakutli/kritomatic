@@ -9,7 +9,8 @@ Input modes:
   - pan (space+drag, middle mouse)
   - zoom (wheel at cursor)
   - alt-click mask selection
-  - inpaint context rectangle drag (move / resize handles)
+  - inpaint context rectangle drag (move / resize handles), only
+    active when `board.inpaintEnabled` is true
 
 The inpaint drag STATE (`_contextDrag = { active, handle, startIx, ... }`)
 stays here because it is per-interaction, not per-document.  The pure
@@ -123,7 +124,11 @@ canvas.addEventListener("mousedown", (e) => {
   //   - a click on one of the 8 handles starts a resize
   //   - a click on the border band OR anywhere inside the rect
   //     starts a move
-  if (e.button === 0) {
+  //
+  // Suppressed when the Context rectangle checkbox is unchecked —
+  // there is nothing on screen to click, and dragging in the canvas
+  // should not silently start a rect drag the user cannot see.
+  if (e.button === 0 && board.inpaintEnabled) {
     ensureDefaultContext();
     const hit = hitContextRect(r, sx, sy);
     if (hit) {
@@ -212,6 +217,7 @@ canvas.addEventListener("mousemove", (e) => {
   }
 
   // Inpaint context hover cursor (handles + border band + interior).
+  // Skipped when the Context rectangle checkbox is unchecked.
   if (board.inpaintEnabled && r && !_contextDrag.active) {
     const hit = hitContextRect(r, sx, sy);
     if (hit) {

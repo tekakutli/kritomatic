@@ -7,7 +7,11 @@ the other view files.
 
 The rectangle's drag interaction (resize handles, border-band move,
 Shift-symmetric resize) is dispatched in `pg_dispatch.js`, which calls
-the pure helpers in `pg_inpaint.js`.  This module owns only the draw."""
+the pure helpers in `pg_inpaint.js`.  This module owns only the draw.
+
+The rectangle is drawn only when `board.inpaintEnabled` is true.  When
+false, the panel is in full-canvas mode and there is nothing on the
+canvas to draw for this layer."""
 
 VIEW_INPAINT_JS = r"""
 import { ctx, board } from "./pg_state.js";
@@ -16,6 +20,7 @@ import {
 } from "./pg_inpaint.js";
 
 export function drawInpaintContext(r) {
+  if (!board.inpaintEnabled) return;
   if (!board.imageEl) return;
 
   ensureDefaultContext();

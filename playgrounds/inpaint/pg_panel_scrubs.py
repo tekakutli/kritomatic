@@ -1,6 +1,6 @@
-"""Panel field wiring: the inpaint enable checkbox, the inpaint prompt
-textarea, and the field registrations that expose both as pgkit
-fields.
+"""Panel field wiring: the context-rectangle checkbox, the inpaint
+prompt textarea, and the field registrations that expose both as
+pgkit fields.
 
 Very little code here compared to a full-featured playground: this
 playground drives exactly one operation (inpaint), and its inputs are
@@ -21,6 +21,16 @@ import {
    Inpainting section
    ============================================================ */
 
+const inpaintEnabledEl = document.getElementById("inpaintEnabled");
+if (inpaintEnabledEl) {
+  inpaintEnabledEl.checked = !!board.inpaintEnabled;
+  inpaintEnabledEl.addEventListener("change", () => {
+    board.inpaintEnabled = !!inpaintEnabledEl.checked;
+    if (board.inpaintEnabled) ensureDefaultContext();
+    pgkitNotifyLocal("inpaint.enabled");
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  });
+}
 
 const inpaintPromptEl = document.getElementById("inpaintPrompt");
 if (inpaintPromptEl) {
@@ -45,7 +55,7 @@ pgkitRegisterField("inpaint.enabled", {
     if (board.inpaintEnabled) ensureDefaultContext();
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   },
-  meta: { kind: "bool", label: "Inpainting enabled" },
+  meta: { kind: "bool", label: "Context rectangle" },
 });
 
 pgkitRegisterField("inpaint.prompt", {

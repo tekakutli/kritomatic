@@ -2,7 +2,12 @@
 
 Three sections: Image, Masks, Inpainting.  Export-to-Krita is not
 wired here; mask editing and export live in `sam3_segment` or in
-Krita itself."""
+Krita itself.
+
+The context rectangle defaults to disabled: on page load the checkbox
+is unchecked, the rectangle is not drawn, and the inpaint workflow
+uses the full canvas as context.  Checking the box restricts
+inpainting to the rectangle drawn on the canvas."""
 
 PG_CSS = r"""
   #ui button#inpaintBtn {
@@ -81,11 +86,14 @@ PG_CSS = r"""
   #kritaStatus.bad  { color: #d48590; }
   #kritaStatus.warn { color: #ffe600; }
 
-  #inpaintControls textarea {
+  #inpaintPrompt {
     width:100%;background:#0d1219;color:#00e5ff;
     border:1px solid #223040;border-radius:2px;
     font-family:inherit;font-size:12px;
     padding:4px 6px;outline:none;resize:vertical;
+  }
+  #inpaintPrompt:disabled {
+    opacity: 0.5;
   }
 
   .maskList {
@@ -234,12 +242,16 @@ PG_PANEL_BODY = r"""
       <summary>Inpainting</summary>
       <div class="section-body">
         <div class="field">
-<label>Enable</label>
-       title="Restrict inpainting to a rectangle drawn on the canvas. When unchecked, the whole canvas is the context.">
-<span style="font-size:9px;color:#3d4756;margin-left:6px;">context rectangle</span>
           <label>Context rectangle</label>
-          <input type="checkbox" id="inpaintEnabled" checked
+          <input type="checkbox" id="inpaintEnabled"
                  title="When checked, inpainting is restricted to the rectangle drawn on the canvas. When unchecked, the whole canvas is the context and the rectangle is hidden.">
+        </div>
+        <div id="inpaintRectHint" class="runHint"
+             style="margin-top:4px;display:none;">
+          Drag anywhere on the context rectangle's border or interior
+          to move it. Drag a handle (four corners, four edge midpoints)
+          to resize. Hold Shift while dragging a handle to resize
+          symmetrically around the center.
         </div>
         <div class="field" style="align-items:flex-start;flex-direction:column;margin-top:6px;">
           <label style="text-align:left;flex:0 0 auto;margin-bottom:4px;">
@@ -248,12 +260,6 @@ PG_PANEL_BODY = r"""
           <textarea id="inpaintPrompt" rows="2" spellcheck="false"
                     placeholder="what should appear in the context region"
           ></textarea>
-        </div>
-        <div id="inpaintRectHint" class="runHint" style="margin-top:4px;">
-          Drag anywhere on the context rectangle's border or interior
-          to move it. Drag a handle (four corners, four edge midpoints)
-          to resize. Hold Shift while dragging a handle to resize
-          symmetrically around the center.
         </div>
         <div class="row" style="margin-top:8px;">
           <button id="inpaintBtn"

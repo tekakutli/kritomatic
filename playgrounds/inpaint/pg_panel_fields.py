@@ -11,6 +11,21 @@ import { board } from "./pg_state.js";
 import { selectedMask, selectedMaskIdx } from "./pg_masks.js";
 
 let _els = null;
+_els = {
+  imageInfo:       document.getElementById("imageInfo"),
+  maskCount:       document.getElementById("maskCount"),
+  statusLine:      document.getElementById("statusLine"),
+  inpaintEnabled:  document.getElementById("inpaintEnabled"),
+  inpaintRectHint: document.getElementById("inpaintRectHint"),
+  inpaintPrompt:   document.getElementById("inpaintPrompt"),
+  inpaintBtn:      document.getElementById("inpaintBtn"),
+  cancelBtn:       document.getElementById("cancelBtn"),
+  pickImageBtn:    document.getElementById("pickImageBtn"),
+  clearImageBtn:   document.getElementById("clearImageBtn"),
+  pickMaskBtn:     document.getElementById("pickMaskBtn"),
+  kritaImportBtn:  document.getElementById("kritaImportBtn"),
+  kritaImportMasksBtn: document.getElementById("kritaImportMasksBtn"),
+};
 
 function _get() {
   if (_els) return _els;
@@ -53,8 +68,8 @@ export function syncPanelFields() {
   if (e.inpaintEnabled && document.activeElement !== e.inpaintEnabled) {
     e.inpaintEnabled.checked = !!board.inpaintEnabled;
   }
-  if (e.inpaintControls) {
-    e.inpaintControls.style.display = board.inpaintEnabled ? "" : "none";
+  if (e.inpaintRectHint) {
+    e.inpaintRectHint.style.display = board.inpaintEnabled ? "" : "none";
   }
 
   if (e.statusLine) {

@@ -234,30 +234,30 @@ PG_PANEL_BODY = r"""
       <summary>Inpainting</summary>
       <div class="section-body">
         <div class="field">
-          <label>Enable</label>
-          <input type="checkbox" id="inpaintEnabled"
-                 title="Restrict inpainting to a rectangle drawn on the canvas. When unchecked, the whole canvas is the context.">
-          <span style="font-size:9px;color:#3d4756;margin-left:6px;">context rectangle</span>
+<label>Enable</label>
+       title="Restrict inpainting to a rectangle drawn on the canvas. When unchecked, the whole canvas is the context.">
+<span style="font-size:9px;color:#3d4756;margin-left:6px;">context rectangle</span>
+          <label>Context rectangle</label>
+          <input type="checkbox" id="inpaintEnabled" checked
+                 title="When checked, inpainting is restricted to the rectangle drawn on the canvas. When unchecked, the whole canvas is the context and the rectangle is hidden.">
         </div>
-        <div id="inpaintControls" style="display:none;margin-top:6px;">
-          <div class="field" style="align-items:flex-start;flex-direction:column;margin-top:6px;">
-            <label style="text-align:left;flex:0 0 auto;margin-bottom:4px;">
-              Inpaint prompt
-            </label>
-            <textarea id="inpaintPrompt" rows="2" spellcheck="false"
-                      placeholder="what should appear in the context region"
-            ></textarea>
-          </div>
-          <div class="runHint" style="margin-top:4px;">
-            Drag anywhere on the context rectangle's border or interior
-            to move it. Drag a handle (four corners, four edge midpoints)
-            to resize. Hold Shift while dragging a handle to resize
-            symmetrically around the center.
-          </div>
+        <div class="field" style="align-items:flex-start;flex-direction:column;margin-top:6px;">
+          <label style="text-align:left;flex:0 0 auto;margin-bottom:4px;">
+            Inpaint prompt
+          </label>
+          <textarea id="inpaintPrompt" rows="2" spellcheck="false"
+                    placeholder="what should appear in the context region"
+          ></textarea>
+        </div>
+        <div id="inpaintRectHint" class="runHint" style="margin-top:4px;">
+          Drag anywhere on the context rectangle's border or interior
+          to move it. Drag a handle (four corners, four edge midpoints)
+          to resize. Hold Shift while dragging a handle to resize
+          symmetrically around the center.
         </div>
         <div class="row" style="margin-top:8px;">
           <button id="inpaintBtn"
-                  title="Run the inpaint workflow with the current canvas, selected mask, and context rectangle.">
+                  title="Run the inpaint workflow with the current canvas, selected mask, and context.">
             Inpaint
           </button>
           <button id="cancelBtn">Cancel</button>

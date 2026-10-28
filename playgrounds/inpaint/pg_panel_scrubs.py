@@ -11,7 +11,7 @@ same convention as sam3_segment: scripting clients (CLI,
 `remote_panel`) can wait on this name to sequence async actions."""
 
 PANEL_SCRUBS_JS = r"""
-import { board } from "./pg_state.js";
+import { board, view, _applyRotation } from "./pg_state.js";
 import { ensureDefaultContext } from "./pg_inpaint.js";
 import {
   pgkitRegisterField, pgkitNotifyLocal,
@@ -96,6 +96,45 @@ pgkitRegisterField("masks.selectedIndex", {
    and `state` so scripting clients can wait on it, but not as a
    user-clickable widget in the panel. */
 
+/* ============================================================
+   View rotation
+   ============================================================ */
+
+const rotationEl = document.getElementById("viewRotation");
+const rotationValueEl = document.getElementById("viewRotationValue");
+
+function _syncRotationWidget() {
+  const deg = Math.round(view.rotation || 0);
+  if (rotationEl && document.activeElement !== rotationEl) {
+    rotationEl.value = String(deg);
+  }
+  if (rotationValueEl) rotationValueEl.textContent = deg + "\u00b0";
+}
+
+if (rotationEl) {
+  rotationEl.value = String(Math.round(view.rotation || 0));
+  _syncRotationWidget();
+  rotationEl.addEventListener("input", () => {
+    const v = parseFloat(rotationEl.value);
+    if (!isFinite(v)) return;
+    if (rotationValueEl) rotationValueEl.textContent = Math.round(v) + "\u00b0";
+    _applyRotation(v);
+    pgkitNotifyLocal("view.rotation");
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  });
+}
+
+pgkitRegisterField("view.rotation", {
+  get: () => view.rotation || 0,
+  set: (v) => {
+    const n = parseFloat(v);
+    if (!isFinite(n)) return;
+    _applyRotation(n);
+    _syncRotationWidget();
+    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  },
+  meta: { kind: "number", label: "Rotation (deg)", min: 0, max: 360 },
+});
 pgkitRegisterField("status.running", {
   get: () => !!board.running,
   set: () => {},

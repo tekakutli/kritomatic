@@ -23,7 +23,10 @@ function _tintedMask(mask, color) {
   const px = maskPixelData(mask);
   if (!px) return null;
 
-  const W = mask.img.width, H = mask.img.height;
+  const W = mask.rotatedCanvas ? mask.rotatedW : mask.w;
+  const H = mask.rotatedCanvas ? mask.rotatedH : mask.h;
+  if (!W || !H) return null;
+
   const off = document.createElement("canvas");
   off.width = W; off.height = H;
   const octx = off.getContext("2d");

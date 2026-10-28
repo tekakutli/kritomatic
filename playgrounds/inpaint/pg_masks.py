@@ -6,7 +6,7 @@ metadata — inpaint masks are just a base64 PNG plus selection state.
 directly to keep `pg_state` a leaf."""
 
 MASKS_JS = r"""
-import { board, _scheduleDraw } from "./pg_state.js";
+import { board, view, _scheduleDraw, _rotateMask } from "./pg_state.js";
 
 /* ============================================================
    Mask entries
@@ -16,10 +16,16 @@ function _makeMaskEntry(b64) {
   const img = new Image();
   const entry = {
     b64, img, w: 0, h: 0, loaded: false,
-    _pixels: null, _tinted: null, _tintedKey: null,
+    rotatedCanvas: null, rotatedW: 0, rotatedH: 0,
+    _pixels: null, _tinted: null, _tintedKey: null, _bbox: null,
   };
   img.onload = () => {
-    entry.w = img.width; entry.h = img.height; entry.loaded = true;
+    entry.w = img.width;
+    entry.h = img.height;
+    entry.loaded = true;
+    // Rotation state at the moment the mask loads; if the user
+    // rotates after this point, `_applyRotation` re-rotates.
+    _rotateMask(entry, view.rotation);
     _scheduleDraw();
   };
   img.src = "data:image/png;base64," + b64;

@@ -224,6 +224,30 @@ PG_PANEL_BODY = r"""
     </details>
 
     <details class="section" open>
+          <summary>View</summary>
+          <div class="section-body">
+            <div class="field" style="align-items:center;">
+              <label>Rotation</label>
+              <div style="display:flex;align-items:center;gap:8px;">
+                <input type="range" id="viewRotation"
+                       min="0" max="360" step="1" value="0"
+                       style="flex:1;min-width:0;">
+                <span id="viewRotationValue"
+                      style="font-variant-numeric:tabular-nums;
+                             color:#7b8794;font-size:11px;
+                             min-width:36px;text-align:right;">0&#176;</span>
+              </div>
+            </div>
+            <div class="runHint" style="margin-top:4px;">
+              Rotates the displayed image, masks, and context rectangle
+              together. The inpaint result is un-rotated before being pasted
+              back into Krita, so Krita always ends up in its original
+              orientation.
+            </div>
+          </div>
+        </details>
+
+    <details class="section" open>
       <summary>Masks</summary>
       <div class="section-body">
         <div class="field" style="margin-bottom:2px;">

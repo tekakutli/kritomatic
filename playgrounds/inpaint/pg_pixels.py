@@ -15,14 +15,18 @@ import { BBOX_PAD, BBOX_MIN_SIZE, POINT_BBOX_PAD } from "./pg_tuning.js";
 
 function _maskPixelData(mask) {
   if (mask._pixels) return mask._pixels;
-  if (!mask.img || !mask.img.width) return null;
+  const src = mask.rotatedCanvas || mask.img;
+  if (!src) return null;
+  const sw = mask.rotatedCanvas ? mask.rotatedW : mask.w;
+  const sh = mask.rotatedCanvas ? mask.rotatedH : mask.h;
+  if (!sw || !sh) return null;
   const off = document.createElement("canvas");
-  off.width  = mask.img.width;
-  off.height = mask.img.height;
+  off.width = sw;
+  off.height = sh;
   const octx = off.getContext("2d");
-  octx.drawImage(mask.img, 0, 0);
+  octx.drawImage(src, 0, 0);
   try {
-    mask._pixels = octx.getImageData(0, 0, off.width, off.height).data;
+    mask._pixels = octx.getImageData(0, 0, sw, sh).data;
     return mask._pixels;
   } catch (e) {
     return null;
@@ -50,12 +54,16 @@ export function hitTestMaskAtPoint(ix, iy) {
   for (let i = board.masks.length - 1; i >= 0; i--) {
     const m = board.masks[i];
     if (!m || !m.loaded) continue;
-    const mx = Math.floor(ix * m.img.width  / imgW);
-    const my = Math.floor(iy * m.img.height / imgH);
-    if (mx < 0 || my < 0 || mx >= m.img.width || my >= m.img.height) continue;
+    const src = m.rotatedCanvas || m.img;
+    const srcW = m.rotatedCanvas ? m.rotatedW : m.w;
+    const srcH = m.rotatedCanvas ? m.rotatedH : m.h;
+    if (!src || !srcW || !srcH) continue;
+    const mx = Math.floor(ix * srcW / imgW);
+    const my = Math.floor(iy * srcH / imgH);
+    if (mx < 0 || my < 0 || mx >= srcW || my >= srcH) continue;
     const px = _maskPixelData(m);
     if (!px) continue;
-    const off = (my * m.img.width + mx) * 4;
+    const off = (my * srcW + mx) * 4;
     if (px[off] >= 128) return i;
   }
   return -1;
@@ -74,7 +82,8 @@ export function computeMaskBBox(idx) {
   const px = _maskPixelData(m);
   if (!px) return null;
 
-  const W = m.img.width, H = m.img.height;
+  const W = m.rotatedCanvas ? m.rotatedW : m.w;
+  const H = m.rotatedCanvas ? m.rotatedH : m.h;
   let minX = W, minY = H, maxX = -1, maxY = -1;
   for (let y = 0; y < H; y++) {
     const rowBase = y * W * 4;

@@ -5,6 +5,7 @@ Operations exposed by this playground:
   - Load image (file, drop, import from Krita)
   - Load masks (import from Krita, pick a PNG file)
   - Select / delete masks
+  - Rotate the playground view (slider)
   - Inpaint
   - Cancel
   - ComfyUI / Krita status checks
@@ -14,7 +15,8 @@ Refine, mask prompt, region painting, points, undo/redo, export to
 Krita."""
 
 PANEL_BINDINGS_JS = r"""
-import { board, setImage, clearImage, _scheduleDraw } from "./pg_state.js";
+import { board, setImage, clearImage, _scheduleDraw,
+         view, _applyRotation } from "./pg_state.js";
 import {
   setMasks, addMaskFromB64,
   selectedMask, selectedMaskIdx,
@@ -112,6 +114,12 @@ function _pickMaskAction() {
 
 function _clearImageAction() {
   clearImage();
+  // clearImage resets view.rotation to 0; sync the widget so the
+  // user does not see a stale angle on a cleared canvas.
+  const rotEl = document.getElementById("viewRotation");
+  if (rotEl) rotEl.value = "0";
+  const rotVal = document.getElementById("viewRotationValue");
+  if (rotVal) rotVal.textContent = "0\u00b0";
   syncPanelFields();
   syncMaskList();
   pgkitNotifyAll();
@@ -121,6 +129,42 @@ function _clearImageAction() {
 /* ============================================================
    Inpaint
    ============================================================ */
+
+function _rotatedMaskToCanvasB64(mask) {
+  // Return a base64 PNG of the mask in the current rotated frame,
+  // resized to the rotated canvas dimensions. When the mask has no
+  // rotated version (rotation is 0), this is `resizeMaskB64ToCanvas`
+  // by another route, but it goes through the same scaling the
+  // context mask uses, so the three blobs are always the same size.
+  const src = mask.rotatedCanvas || mask.img;
+  const sw  = mask.rotatedCanvas ? mask.rotatedW : mask.w;
+  const sh  = mask.rotatedCanvas ? mask.rotatedH : mask.h;
+  if (!src || !sw || !sh) return mask.b64;
+
+  const c = document.createElement("canvas");
+  c.width  = board.imageWidth;
+  c.height = board.imageHeight;
+  c.getContext("2d").drawImage(src, 0, 0, c.width, c.height);
+  return c.toDataURL("image/png")
+          .replace(/^data:image\/png;base64,/, "");
+}
+
+function _setOriginalFromB64(b64) {
+  // The composite comes from Krita in its ORIGINAL orientation.
+  // Store it as the new source and re-apply the current rotation
+  // for display, so the user's view stays in the frame they chose.
+  const dataUrl = "data:image/png;base64," + b64;
+  const img = new Image();
+  img.onload = () => {
+    board.originalImageEl  = img;
+    board.originalWidth    = img.width;
+    board.originalHeight   = img.height;
+    board.originalDataUrl  = dataUrl;
+    board.imageHash        = "inpaint_" + Date.now();
+    _applyRotation(view.rotation);
+  };
+  img.src = dataUrl;
+}
 
 async function _inpaintAction() {
   if (!board.imageHash) { flashStatus("Load an image first", "warn"); return; }
@@ -137,11 +181,11 @@ async function _inpaintAction() {
     flashStatus("Mask not loaded", "warn"); return;
   }
 
-  // The three pixel inputs. Canvas and selection masks are the same
-  // for every run; the context mask is either the rectangle (if
-  // inpainting is enabled) or the full canvas.
+  // All three blobs are in the *rotated* frame, matching what the
+  // user sees. ComfyUI's bounding-box machinery now operates on
+  // axis-aligned rectangles in the frame the user drew them in.
   const canvasB64    = board.imageDataUrl.replace(/^data:image\/png;base64,/, "");
-  const selectionB64 = resizeMaskB64ToCanvas(mask.b64, mask.img);
+  const selectionB64 = _rotatedMaskToCanvasB64(mask);
   const contextB64   = buildContextMaskB64();
 
   flashStatus("inpainting\u2026", "");
@@ -151,18 +195,20 @@ async function _inpaintAction() {
     selectionB64,
     contextB64,
     prompt: board.inpaintPrompt,
+    outputRotation: -view.rotation,
   });
   if (!payload) return;
 
-  // Replace the canvas with the result. Mask stack, view transform,
-  // and inpaint context rect are preserved so the user can iterate
-  // (adjust mask, adjust rect, run again).
-  board.imageDataUrl = "data:image/png;base64," + payload.image_b64;
-  const img = new Image();
-  img.onload = () => { board.imageEl = img; _scheduleDraw(); };
-  img.src = board.imageDataUrl;
+  // The composite comes from Krita in its ORIGINAL orientation.
+  // Load it as the new original; _applyRotation re-rotates for
+  // display, so the user's view stays in the frame they chose.
+  _setOriginalFromB64(payload.image_b64);
 
-  flashStatus("inpainted in " + payload.timing.toFixed(2) + "s", "ok");
+  const statusCls = (payload.paste_ok === false) ? "warn" : "ok";
+  const statusMsg = payload.message
+    || ("inpainted in " + payload.timing.toFixed(2) + "s");
+  flashStatus(statusMsg, statusCls);
+
   syncPanelFields();
   pgkitNotifyAll();
   import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});

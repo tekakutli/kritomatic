@@ -398,7 +398,8 @@ def paste_image(doc,
                 name: str,
                 *,
                 blend_mode: str = "normal",
-                make_active: bool = True):
+                make_active: bool = True,
+                rotation: float = 0.0):
     """Decode a PNG and write it as a new paint layer at (x, y).
 
     The PNG comes straight from ComfyUI. QImage decodes it to
@@ -428,10 +429,25 @@ def paste_image(doc,
     canvas draws from fresh pixels when it does repaint.
 
     Returns the new layer's `Node`.
+
+    `rotation` is degrees, positive = clockwise on screen. When
+    nonzero, the image is rotated about its center, then
+    center-cropped to the document's current dimensions before
+    being written. This undoes a rotation the caller applied to
+    the image before ComfyUI saw it: for a workflow run in a
+    rotated frame, passing `-θ` here produces a paste back in the
+    document's original orientation. `_center_crop` handles the
+    sub-pixel rounding at the edges (the double rotation leaves
+    an empty border up to 1–2 px wide).
     """
     img = _decode_png(image_png)
-    w, h = img.width(), img.height()
 
+    if rotation and rotation % 360 != 0:
+        img = _rotate_about_center(img, rotation)
+        doc_w, doc_h = int(doc.width()), int(doc.height())
+        img = _center_crop(img, doc_w, doc_h)
+
+    w, h = img.width(), img.height()
     doc_w, doc_h = int(doc.width()), int(doc.height())
     if x < 0 or y < 0 or x + w > doc_w or y + h > doc_h:
         raise ValueError(
@@ -451,7 +467,6 @@ def paste_image(doc,
     if make_active:
         doc.setActiveNode(node)
 
-    # ---- Force the canvas to actually show the new layer. ----
     try:
         doc.refreshProjection()
     except Exception:
@@ -474,8 +489,8 @@ def paste_batch_as_layers(doc,
                           x: int, y: int,
                           base_name: str,
                           *,
-                          blend_mode: str = "normal") -> list:
-    """One layer per image in the batch, prefixed `[Layer i] `."""
+                          blend_mode: str = "normal",
+                          rotation: float = 0.0) -> list:
     nodes = []
     for i, png in enumerate(images):
         name = f"[Layer {i + 1}] {base_name}"
@@ -483,6 +498,7 @@ def paste_batch_as_layers(doc,
             doc, png, x, y, name,
             blend_mode=blend_mode,
             make_active=(i == 0),
+            rotation=rotation,
         ))
     return nodes
 
@@ -581,6 +597,27 @@ def _decode_png(png_bytes: bytes) -> QImage:
         img = img.convertToFormat(QImage.Format.Format_ARGB32)
     return img
 
+
+def _rotate_about_center(img: QImage, angle_deg: float) -> QImage:
+    from PyQt6.QtGui import QTransform
+    from PyQt6.QtCore import Qt
+    return img.transformed(
+        QTransform().rotate(float(angle_deg)),
+        Qt.TransformationMode.SmoothTransformation,
+    )
+
+
+def _center_crop(img: QImage, target_w: int, target_h: int) -> QImage:
+    w, h = img.width(), img.height()
+    if w == target_w and h == target_h:
+        return img
+    crop_x = max(0, (w - target_w) // 2)
+    crop_y = max(0, (h - target_h) // 2)
+    crop_w = min(target_w, w)
+    crop_h = min(target_h, h)
+    if crop_w <= 0 or crop_h <= 0:
+        return img
+    return img.copy(crop_x, crop_y, crop_w, crop_h)
 
 def _qimage_to_argb32_bytes(img: QImage) -> bytes:
     """Extract pixel bytes in Krita's `setPixelData` layout."""

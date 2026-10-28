@@ -24,15 +24,18 @@ import {
 export const canvas = document.getElementById("c");
 export const ctx    = canvas.getContext("2d");
 
-/* `dpr` is module-private.  The original pg_core exported it, but
-   nothing outside the module ever read it; it only fed `resize()`. */
 let _dpr = window.devicePixelRatio || 1;
 
 /* ============================================================
-   View (zoom + pan)
+   View (zoom + pan + rotation)
    ============================================================ */
 
-export const view = { zoom: 1, panX: 0, panY: 0 };
+export const view = {
+  zoom: 1,
+  panX: 0,
+  panY: 0,
+  rotation: 0,   // degrees; clockwise on screen
+};
 
 export function resetView() {
   view.zoom = 1;
@@ -40,9 +43,6 @@ export function resetView() {
   view.panY = 0;
 }
 
-/* Clamp pan so at least VIEW_PAN_MARGIN screen pixels of image stay
-   inside the viewport on each axis.  Called after any pan/zoom change
-   and on window resize. */
 export function clampPan() {
   if (!board.imageWidth || !board.imageHeight) return;
   const cw = window.innerWidth, ch = window.innerHeight;
@@ -66,8 +66,6 @@ export function clampPan() {
   view.panY = Math.max(minPanY, Math.min(maxPanY, view.panY));
 }
 
-/* Zoom to `newZoom`, anchored at the given screen coordinate so the
-   image point currently under the cursor stays under the cursor. */
 export function zoomAt(screenX, screenY, newZoom) {
   const r0 = fittedImageRect();
   if (!r0) return;
@@ -87,39 +85,180 @@ export function zoomAt(screenX, screenY, newZoom) {
 }
 
 /* ============================================================
+   Rotation
+   ============================================================
+   `_rotateImage` returns a new HTMLCanvasElement holding the
+   image rotated by `angleDeg` about its center, sized to the
+   axis-aligned bounding box of the rotated rectangle. The
+   corners of the bbox outside the rotated image are
+   transparent.
+
+   Positive `angleDeg` rotates clockwise on screen (matching
+   `ctx.rotate` and Qt's `QTransform.rotate` in screen coords),
+   so the daemon's un-rotation is `QTransform().rotate(-θ)` for
+   the playground's `θ`.
+
+   `_applyRotation` is idempotent — it always starts from
+   `board.originalImageEl`, so setting the field to 30° twice
+   produces the same result as setting it once. Every image
+   import goes through it.
+
+   `_rotateMask` mirrors this for masks. Masks are rotated at
+   load time (from `_makeMaskEntry`) so `_maskPixelData` and hit
+   testing operate on the rotated data. The caches (`_pixels`,
+   `_bbox`, `_tinted`, `_tintedKey`) are cleared on every
+   rotation change.
+*/
+
+function _rotateImage(img, angleDeg) {
+  if (!img) return null;
+  const W = img.naturalWidth || img.width;
+  const H = img.naturalHeight || img.height;
+  if (!W || !H) return null;
+
+  const rad = (angleDeg % 360) * Math.PI / 180;
+  const cos = Math.abs(Math.cos(rad));
+  const sin = Math.abs(Math.sin(rad));
+  const newW = Math.max(1, Math.round(W * cos + H * sin));
+  const newH = Math.max(1, Math.round(W * sin + H * cos));
+
+  const c = document.createElement("canvas");
+  c.width = newW;
+  c.height = newH;
+  const cx = c.getContext("2d");
+  cx.imageSmoothingEnabled = true;
+  cx.imageSmoothingQuality = "high";
+  cx.translate(newW / 2, newH / 2);
+  cx.rotate(rad);
+  cx.drawImage(img, -W / 2, -H / 2);
+  return c;
+}
+
+export function _rotateMask(entry, angle) {
+  entry._pixels = null;
+  entry._bbox = null;
+  entry._tinted = null;
+  entry._tintedKey = null;
+
+  if (!entry.loaded || !entry.img) {
+    entry.rotatedCanvas = null;
+    entry.rotatedW = 0;
+    entry.rotatedH = 0;
+    return;
+  }
+  if (!angle || angle % 360 === 0) {
+    entry.rotatedCanvas = null;
+    entry.rotatedW = entry.w;
+    entry.rotatedH = entry.h;
+    return;
+  }
+  const rc = _rotateImage(entry.img, angle);
+  entry.rotatedCanvas = rc;
+  entry.rotatedW = rc ? rc.width : 0;
+  entry.rotatedH = rc ? rc.height : 0;
+}
+
+export function _applyRotation(angle) {
+  view.rotation = ((Number(angle) || 0) % 360 + 360) % 360;
+
+  if (!board.originalImageEl) {
+    // No image loaded yet; when it loads, its onload will call us.
+    _scheduleDraw();
+    return;
+  }
+
+  if (view.rotation === 0) {
+    board.imageEl     = board.originalImageEl;
+    board.imageWidth  = board.originalWidth;
+    board.imageHeight = board.originalHeight;
+    board.imageDataUrl = board.originalDataUrl;
+  } else {
+    const rc = _rotateImage(board.originalImageEl, view.rotation);
+    if (!rc) {
+      board.imageEl = null;
+      board.imageWidth = 0;
+      board.imageHeight = 0;
+      board.imageDataUrl = null;
+      _scheduleDraw();
+      return;
+    }
+    board.imageEl     = rc;
+    board.imageWidth  = rc.width;
+    board.imageHeight = rc.height;
+    board.imageDataUrl = rc.toDataURL("image/png");
+  }
+
+  for (const m of board.masks) _rotateMask(m, view.rotation);
+
+  // Context rect coordinates were in the previous frame; reset.
+  board.inpaintContext = {
+    x: 0, y: 0, w: 0, h: 0, activeHandle: null,
+  };
+
+  clampPan();
+  _scheduleDraw();
+}
+
+/* ============================================================
    Image loading / clearing
    ============================================================ */
 
 export function setImage(hash, dataUrl, width, height) {
-  board.imageHash    = hash;
-  board.imageDataUrl = dataUrl;
-  board.imageWidth   = width;
-  board.imageHeight  = height;
+  board.imageHash     = hash;
+  board.originalDataUrl = dataUrl;
+  board.originalWidth   = width;
+  board.originalHeight  = height;
+  board.originalImageEl = null;
 
-  const img = new Image();
-  img.onload  = () => { board.imageEl = img;  _scheduleDraw(); };
-  img.onerror = () => { board.imageEl = null; _scheduleDraw(); };
-  img.src = dataUrl;
+  // Until the source loads, the visible fields stay empty; a
+  // rotation field change before that point is a no-op (bailed
+  // above) and will be re-applied once onload fires.
+  board.imageEl      = null;
+  board.imageWidth   = 0;
+  board.imageHeight  = 0;
+  board.imageDataUrl = null;
 
-  resetView();
   board.masks = [];
   board.selectedMaskIndices = [];
   board.hoveredMaskIdx = -1;
-  board.inpaintContext = { x: 0, y: 0, w: 0, h: 0, activeHandle: null };
+  board.inpaintContext = {
+    x: 0, y: 0, w: 0, h: 0, activeHandle: null,
+  };
+  resetView();
+
+  const img = new Image();
+  img.onload = () => {
+    board.originalImageEl = img;
+    _applyRotation(view.rotation);
+  };
+  img.onerror = () => {
+    board.originalImageEl = null;
+    _scheduleDraw();
+  };
+  img.src = dataUrl;
   _scheduleDraw();
 }
 
 export function clearImage() {
-  board.imageHash    = null;
-  board.imageDataUrl = null;
+  board.imageHash     = null;
+  board.originalDataUrl = null;
+  board.originalWidth   = 0;
+  board.originalHeight  = 0;
+  board.originalImageEl = null;
+
+  board.imageEl      = null;
   board.imageWidth   = 0;
   board.imageHeight  = 0;
-  board.imageEl      = null;
+  board.imageDataUrl = null;
+
+  view.rotation = 0;
   resetView();
   board.masks = [];
   board.selectedMaskIndices = [];
   board.hoveredMaskIdx = -1;
-  board.inpaintContext = { x: 0, y: 0, w: 0, h: 0, activeHandle: null };
+  board.inpaintContext = {
+    x: 0, y: 0, w: 0, h: 0, activeHandle: null,
+  };
   _scheduleDraw();
 }
 
@@ -154,6 +293,13 @@ export const board = {
   imageDataUrl:  null,
   imageEl:       null,
 
+  // The un-rotated source. `imageEl` / `imageWidth` / etc. above
+  // are derived from these by `_applyRotation`.
+  originalImageEl:  null,
+  originalWidth:    0,
+  originalHeight:   0,
+  originalDataUrl:  null,
+
   mouse: { x: 0, y: 0, inside: false },
 
   masks:               [],
@@ -163,15 +309,6 @@ export const board = {
   running:       false,
   lastTiming:    null,
 
-  // Inpainting section.  The section is open by default; enabling
-  // `inpaintEnabled` shows the context rectangle on the canvas.  The
-  // rect coordinates live in image space so it pans/zooms with the
-  // image.  `activeHandle` is set by the dispatch layer during a drag
-  // so the view can highlight the handle being manipulated.
-  //
-  // If `inpaintEnabled` is false the context mask fed to the workflow
-  // is the full canvas (all white); if true it is the rectangle in
-  // black-outside-white-inside form.
   inpaintEnabled: false,
   inpaintPrompt:  "",
   inpaintContext: {
@@ -224,9 +361,15 @@ export function _scheduleDraw() {
   if (_drawScheduled) return;
   _drawScheduled = true;
   if (typeof requestAnimationFrame === "function") {
-    requestAnimationFrame(() => { _drawScheduled = false; if (_drawFn) _drawFn(); });
+    requestAnimationFrame(() => {
+      _drawScheduled = false;
+      if (_drawFn) _drawFn();
+    });
   } else {
-    setTimeout(() => { _drawScheduled = false; if (_drawFn) _drawFn(); }, 16);
+    setTimeout(() => {
+      _drawScheduled = false;
+      if (_drawFn) _drawFn();
+    }, 16);
   }
 }
 

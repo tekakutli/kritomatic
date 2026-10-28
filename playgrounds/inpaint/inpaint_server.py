@@ -150,6 +150,10 @@ def handle_inpaint(payload: dict) -> dict:
     except (TypeError, ValueError):
         timeout = INPAINT_TIMEOUT
 
+    try:
+        output_rotation = float(payload.get("output_rotation") or 0.0)
+    except (TypeError, ValueError):
+        output_rotation = 0.0
     if not canvas_b64 or not selection_b64 or not context_b64:
         return {"success": False,
                 "message": "canvas_b64, selection_b64, context_b64 are required"}
@@ -180,7 +184,8 @@ def handle_inpaint(payload: dict) -> dict:
             {"type": "comfy_set_layer_pixels", "name": "thecontext",
              "image_b64": context_b64, "is_mask": True},
             {"type": "comfy_set_param", "name": "prompt", "value": prompt},
-            {"type": "comfy_generate", "timeout": 55.0, "no_paste": True},
+            {"type": "comfy_generate", "timeout": 55.0,
+             "output_rotation": output_rotation},
         ],
     }
 

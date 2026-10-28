@@ -166,8 +166,9 @@ Command surface
     comfy_bind_selection   --source global|none|layer --layer_name?
                            --context entire_image|automatic|mask_bounds
                            --padding <int>
+    comfy_set_layer_pixels --name <n> --image_b64 <b64> --is_mask?
     comfy_generate         --timeout <s>? --output_name <n>?
-                           --count <n>? --seed <s>?
+                           --count <n>? --seed <s>? --output_rotation <deg>?
     comfy_generate_async
     comfy_wait             --prompt_id <id> --timeout <s>?
                            --output_name <n>?
@@ -1323,6 +1324,117 @@ class ComfyUIHandler(AutoDispatchHandler):
         }
 
     # ------------------------------------------------------------------
+    #  Scratch-layer pixel write
+    # ------------------------------------------------------------------
+
+    @command(
+        category="comfyui",
+        help_text="Create or update a layer's pixels from a base64 PNG. "
+                  "Used by the inpaint playground to push the canvas, "
+                  "selection and context blobs into the document before "
+                  "calling comfy_generate. The layer is hidden after "
+                  "writing — scratch layers should not contribute to "
+                  "the composite; the workflow reads them via "
+                  "projectionPixelData, which ignores visibility.",
+        args={
+            "--name": {"type": "str", "required": True,
+                       "help": "Layer name."},
+            "--image_b64": {"type": "str", "required": True,
+                            "help": "Base64-encoded PNG."},
+            "--is_mask": {"type": "bool", "default": False,
+                          "help": "If true, the PNG is a mask "
+                                  "(white=selected)."},
+        },
+    )
+    def comfy_set_layer_pixels(self, params):
+        import base64
+        from PyQt6.QtGui import QImage
+        from PyQt6.QtCore import QByteArray, Qt
+
+        name = params.get("name") or ""
+        image_b64 = params.get("image_b64") or ""
+        is_mask = bool(params.get("is_mask", False))
+
+        if not name:
+            return {"success": False, "message": "name is required"}
+        if not image_b64:
+            return {"success": False, "message": "image_b64 is required"}
+
+        doc = Krita.instance().activeDocument()
+        if doc is None:
+            return {"success": False, "message": "no active document"}
+
+        try:
+            png_bytes = base64.b64decode(image_b64)
+        except Exception as e:
+            return {"success": False,
+                    "message": f"could not decode base64: {e}"}
+
+        img = QImage()
+        if not img.loadFromData(png_bytes, "PNG"):
+            return {"success": False, "message": "could not decode PNG"}
+        if img.format() != QImage.Format.Format_ARGB32:
+            img = img.convertToFormat(QImage.Format.Format_ARGB32)
+
+        W, H = int(doc.width()), int(doc.height())
+        if img.width() != W or img.height() != H:
+            img = img.scaled(
+                W, H,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            img = img.convertToFormat(QImage.Format.Format_ARGB32)
+
+        ptr = img.constBits()
+        ptr.setsize(img.sizeInBytes())
+        src = bytes(ptr)
+
+        if is_mask:
+            # Opaque white/black PNG -> white with alpha = luminance.
+            # Iterate the source as ARGB32 (bytes are BGRA in memory);
+            # the source is grayscale so R==G==B, and we use R for the
+            # mask value. RGBA out is white with alpha = mask.
+            out = bytearray(W * H * 4)
+            for i in range(W * H):
+                r = src[i * 4 + 2]      # R channel
+                out[i * 4]     = 255    # B
+                out[i * 4 + 1] = 255    # G
+                out[i * 4 + 2] = 255    # R
+                out[i * 4 + 3] = r      # A = luminance
+            pixel_bytes = bytes(out)
+        else:
+            pixel_bytes = src
+
+        existing = doc.nodeByName(name)
+        if existing is not None:
+            try:
+                existing.setPixelData(QByteArray(pixel_bytes), 0, 0, W, H)
+                existing.setVisible(False)
+            except Exception as e:
+                return {"success": False,
+                        "message": f"could not update layer {name!r}: {e}"}
+            doc.refreshProjection()
+            return {
+                "success": True,
+                "message": f"Updated {name!r} (hidden)",
+                "data": {"name": name, "created": False},
+            }
+
+        node = doc.createNode(name, "paintlayer")
+        if node is None:
+            return {"success": False,
+                    "message": f"could not create layer {name!r}"}
+        doc.rootNode().addChildNode(node, None)
+        node.setPixelData(QByteArray(pixel_bytes), 0, 0, W, H)
+        node.setVisible(False)
+        doc.refreshProjection()
+        return {
+            "success": True,
+            "message": f"Created {name!r} (hidden)",
+            "data": {"name": name, "created": True},
+        }
+
+    # ------------------------------------------------------------------
     #  Generation
     # ------------------------------------------------------------------
 
@@ -1342,6 +1454,15 @@ class ComfyUIHandler(AutoDispatchHandler):
             "--seed": {"type": "int", "required": False,
                        "help": "Base seed. Run i uses base+i. Omit for "
                                "a random base."},
+            "--output_rotation": {"type": "float", "default": 0.0,
+                                  "help": "Degrees to rotate the "
+                                          "generation output by before "
+                                          "pasting. Positive = "
+                                          "clockwise on screen. Used by "
+                                          "workflows run in a rotated "
+                                          "frame; the paste lands in the "
+                                          "document's original "
+                                          "orientation."},
         },
     )
     def comfy_generate(self, params):
@@ -1362,6 +1483,10 @@ class ComfyUIHandler(AutoDispatchHandler):
         count = requested_count
         timeout = float(params.get("timeout", 55.0))
         output_name = params.get("output_name") or None
+        try:
+            output_rotation = float(params.get("output_rotation") or 0.0)
+        except (TypeError, ValueError):
+            output_rotation = 0.0
 
         raw_seed = params.get("seed")
         if raw_seed in (None, ""):
@@ -1598,6 +1723,7 @@ class ComfyUIHandler(AutoDispatchHandler):
                             blend_mode="normal",
                             output_name=output_name,
                             seed_suffix=seed_i if count > 1 else None,
+                            output_rotation=output_rotation,
                         )
                     except Exception as e:
                         import traceback
@@ -1714,7 +1840,7 @@ class ComfyUIHandler(AutoDispatchHandler):
                     )
                     msg = f"Generation failed: {first_error}"
                 if warnings:
-                    msg += " — " + "; ".join(warnings)
+                    msg += " \u2014 " + "; ".join(warnings)
                 return {"success": False,
                         "message": msg,
                         "data": response_data}
@@ -1730,7 +1856,7 @@ class ComfyUIHandler(AutoDispatchHandler):
                 msg = (f"Batch of {requested_count}: " + ", ".join(parts)
                        + f"; pasted {total_layers} layer(s)")
             if warnings:
-                msg += " — " + "; ".join(warnings)
+                msg += " \u2014 " + "; ".join(warnings)
 
             return {"success": True, "message": msg, "data": response_data}
 
@@ -2118,7 +2244,8 @@ class ComfyUIHandler(AutoDispatchHandler):
                       name_override: Optional[str] = None,
                       blend_mode: str = "normal",
                       output_name: Optional[str] = None,
-                      seed_suffix: Optional[int] = None) -> dict:
+                      seed_suffix: Optional[int] = None,
+                      output_rotation: float = 0.0) -> dict:
         if not result.images:
             return {"success": True, "message": "No images to paste"}
 
@@ -2144,7 +2271,7 @@ class ComfyUIHandler(AutoDispatchHandler):
                     "message": (
                         f"No output node named {output_name!r}. "
                         f"Available names: "
-                        f"{available or '(none — outputs are unnamed)'}"
+                        f"{available or '(none \u2014 outputs are unnamed)'}"
                     ),
                 }
             groups = filtered
@@ -2189,19 +2316,22 @@ class ComfyUIHandler(AutoDispatchHandler):
                         pasted_layers.append(f"[Animation] {group_name}")
                         continue
                     node = paste_image(doc, images[0], x, y, group_name,
-                                       blend_mode=blend_mode)
+                                       blend_mode=blend_mode,
+                                       rotation=output_rotation)
                     pasted_layers.append(node.name())
 
                 elif first_info.batch_mode == "layers" and len(images) > 1:
                     nodes = paste_batch_as_layers(
                         doc, images, x, y, group_name,
                         blend_mode=blend_mode,
+                        rotation=output_rotation,
                     )
                     pasted_layers.extend(n.name() for n in nodes)
 
                 else:
                     node = paste_image(doc, images[0], x, y, group_name,
-                                       blend_mode=blend_mode)
+                                       blend_mode=blend_mode,
+                                       rotation=output_rotation)
                     pasted_layers.append(node.name())
 
             except ValueError as e:

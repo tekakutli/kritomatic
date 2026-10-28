@@ -47,7 +47,8 @@ export async function fetchStatus() {
    Inpaint — the single operation this playground performs
    ============================================================ */
 
-export async function runInpaint({ canvasB64, selectionB64, contextB64, prompt }) {
+export async function runInpaint({ canvasB64, selectionB64, contextB64,
+                                   prompt, outputRotation }) {
   if (_inFlightCount > 0) await interruptInpaint();
 
   _inFlightCount += 1;
@@ -63,6 +64,7 @@ export async function runInpaint({ canvasB64, selectionB64, contextB64, prompt }
         selection_b64: selectionB64,
         context_b64:   contextB64,
         prompt:        prompt,
+        output_rotation: outputRotation || 0,
       }),
     });
     const payload = await res.json();

@@ -11,7 +11,14 @@ the pure helpers in `pg_inpaint.js`.  This module owns only the draw.
 
 The rectangle is drawn only when `board.inpaintEnabled` is true.  When
 false, the panel is in full-canvas mode and there is nothing on the
-canvas to draw for this layer."""
+canvas to draw for this layer.
+
+The rectangle is deliberately NOT drawn under the rotation transform
+that `pg_view_image.js` applies to the image: it stays visually fixed
+on screen while the image rotates underneath it.  `board.inpaintContext`
+lives in un-rotated image coords; `contextRectScreen(r)` projects that
+to a fixed screen position; the draw uses those screen coordinates
+directly."""
 
 VIEW_INPAINT_JS = r"""
 import { ctx, board } from "./pg_state.js";

@@ -96,6 +96,26 @@ PG_CSS = r"""
     opacity: 0.5;
   }
 
+  #viewRotationNum {
+    width:60px;
+    background:#0d1219;
+    color:#00e5ff;
+    border:1px solid #223040;
+    border-radius:2px;
+    font-family:inherit;
+    font-size:11px;
+    padding:2px 4px;
+    text-align:right;
+    outline:none;
+    font-variant-numeric:tabular-nums;
+    -moz-appearance:textfield;
+  }
+  #viewRotationNum::-webkit-outer-spin-button,
+  #viewRotationNum::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+
   .maskList {
     display:flex; flex-direction:column;
     gap:3px; margin:6px 0 0;
@@ -232,17 +252,18 @@ PG_PANEL_BODY = r"""
                 <input type="range" id="viewRotation"
                        min="0" max="360" step="1" value="0"
                        style="flex:1;min-width:0;">
-                <span id="viewRotationValue"
-                      style="font-variant-numeric:tabular-nums;
-                             color:#7b8794;font-size:11px;
-                             min-width:36px;text-align:right;">0&#176;</span>
+                <input type="number" id="viewRotationNum"
+                       min="0" max="360" step="1" value="0"
+                       title="Type a precise angle in degrees">
+                <span style="color:#7b8794;font-size:11px;">&#176;</span>
               </div>
             </div>
             <div class="runHint" style="margin-top:4px;">
               Rotates the displayed image, masks, and context rectangle
               together. The inpaint result is un-rotated before being pasted
               back into Krita, so Krita always ends up in its original
-              orientation.
+              orientation. The drag control has a step of 1&#176;; type into the
+              box for an exact value.
             </div>
           </div>
         </details>

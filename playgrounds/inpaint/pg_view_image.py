@@ -3,10 +3,13 @@
 The single most stable view file — the image is always drawn first,
 the overlays are always tinted from the same palette.  Every layer
 here is drawn against the fitted image rect `r` (from
-`pg_state.fittedImageRect`)."""
+`pg_state.fittedImageRect`), wrapped in the same rotation transform
+that `pg_view_inpaint.js` uses for the context rectangle, so the
+image, mask overlays, and context rect stay visually aligned at
+every angle."""
 
 VIEW_IMAGE_JS = r"""
-import { ctx, board, maskColor } from "./pg_state.js";
+import { ctx, board, maskColor, view } from "./pg_state.js";
 import { maskPixelData } from "./pg_pixels.js";
 
 /* ============================================================
@@ -50,9 +53,23 @@ function _tintedMask(mask, color) {
 
 /* ============================================================
    The image layer
-   ============================================================ */
+   ============================================================
+   The image, its border, and every selected-mask overlay are
+   drawn against the *un-rotated* fit rect `r`, wrapped in a
+   `translate(cx,cy); rotate(rad); translate(-cx,-cy)` transform.
+   That gives the visual rotation without changing any image
+   dimensions or the fit scale. */
 
 export function drawImageLayer(r) {
+  const cx = r.x0 + r.w / 2;
+  const cy = r.y0 + r.h / 2;
+  const rad = view.rotation * Math.PI / 180;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(rad);
+  ctx.translate(-cx, -cy);
+
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
   ctx.drawImage(board.imageEl, r.x0, r.y0, r.w, r.h);
@@ -74,5 +91,7 @@ export function drawImageLayer(r) {
     ctx.drawImage(tinted, r.x0, r.y0, r.w, r.h);
     ctx.restore();
   }
+
+  ctx.restore();
 }
 """

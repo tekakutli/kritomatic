@@ -15,12 +15,25 @@ Input modes:
 The inpaint drag STATE (`_contextDrag = { active, handle, startIx, ... }`)
 stays here because it is per-interaction, not per-document.  The pure
 math lives in `pg_inpaint.js` so a second inpaint mode could carry
-its own drag state without touching this module."""
+its own drag state without touching this module.
+
+Screen-coordinate mapping is split into two flavours:
+
+  - `screenToImage`         applies the rotation inverse.  Used when
+                            the caller needs the actual image pixel
+                            under the cursor (mask hit-test, hover).
+  - `screenToImageUnrotated` skips the rotation.  Used for the inpaint
+                            context rectangle, which is anchored to
+                            the un-rotated fit rect and stays visually
+                            fixed while the image rotates under it.
+
+`overImage` is decided in rotated image coords (via `screenToImage`),
+so alt-click mask selection works on the actual rotated extent."""
 
 DISPATCH_JS = r"""
 import {
-  canvas, board, screenToImage, fittedImageRect,
-  view, clampPan, zoomAt, resetView,
+  canvas, board, screenToImage, screenToImageUnrotated,
+  fittedImageRect, view, clampPan, zoomAt, resetView,
 } from "./pg_state.js";
 import {
   selectedMask,
@@ -56,7 +69,8 @@ let _panStartPanY = 0;
 let _spaceDown = false;
 
 // Inpaint context drag state. `handle` is one of 'nw','ne','sw','se',
-// 'n','s','e','w', or 'move'. startIx/startIy are in image coords;
+// 'n','s','e','w', or 'move'. startIx/startIy are in UN-ROTATED image
+// coords (the rectangle is anchored to the un-rotated fit rect);
 // startRect is the rect captured at mousedown so each mousemove can
 // recompute from the original anchor rather than accumulating error.
 let _contextDrag = {
@@ -99,13 +113,15 @@ canvas.addEventListener("mousedown", (e) => {
   const r = fittedImageRect();
   if (!r) return;
 
-  const overImage = sx >= r.x0 && sx <= r.x0 + r.w
-                    && sy >= r.y0 && sy <= r.y0 + r.h;
+  // Rotated inverse — the actual pixel under the cursor.
   const [ix, iy] = screenToImage(sx, sy);
+  // Un-rotated — what the context rectangle's coords live in.
+  const [uix, uiy] = screenToImageUnrotated(sx, sy);
 
-  // Alt+click selects a mask.  Takes priority over the context
-  // rectangle so selecting a mask works even when the rect covers
-  // the click point.
+  const overImage = ix >= 0 && ix <= board.imageWidth
+                 && iy >= 0 && iy <= board.imageHeight;
+
+  // Alt+click selects a mask.
   if (e.altKey && e.button === 0) {
     if (overImage) {
       const idx = hitTestMaskAtPoint(ix, iy);
@@ -124,10 +140,6 @@ canvas.addEventListener("mousedown", (e) => {
   //   - a click on one of the 8 handles starts a resize
   //   - a click on the border band OR anywhere inside the rect
   //     starts a move
-  //
-  // Suppressed when the Context rectangle checkbox is unchecked —
-  // there is nothing on screen to click, and dragging in the canvas
-  // should not silently start a rect drag the user cannot see.
   if (e.button === 0 && board.inpaintEnabled) {
     ensureDefaultContext();
     const hit = hitContextRect(r, sx, sy);
@@ -135,8 +147,8 @@ canvas.addEventListener("mousedown", (e) => {
       e.preventDefault();
       _contextDrag.active    = true;
       _contextDrag.handle    = (hit.kind === 'handle') ? hit.handle : 'move';
-      _contextDrag.startIx   = ix;
-      _contextDrag.startIy   = iy;
+      _contextDrag.startIx   = uix;
+      _contextDrag.startIy   = uiy;
       _contextDrag.startRect = {
         x: board.inpaintContext.x,
         y: board.inpaintContext.y,
@@ -154,7 +166,7 @@ canvas.addEventListener("mousedown", (e) => {
 });
 
 /* ============================================================
-   Contextmenu — suppressed to keep browser menu out of the canvas
+   Contextmenu
    ============================================================ */
 
 canvas.addEventListener("contextmenu", (e) => {
@@ -169,14 +181,16 @@ canvas.addEventListener("mousemove", (e) => {
   const rect = canvas.getBoundingClientRect();
   const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
   const r = fittedImageRect();
-  const overImage = r && sx >= r.x0 && sx <= r.x0 + r.w
-                       && sy >= r.y0 && sy <= r.y0 + r.h;
 
+  let ix = 0, iy = 0, uix = 0, uiy = 0, overImage = false;
   if (r) {
-    const [ix, iy] = screenToImage(sx, sy);
+    [ix, iy] = screenToImage(sx, sy);
+    [uix, uiy] = screenToImageUnrotated(sx, sy);
     board.mouse.x = ix;
     board.mouse.y = iy;
-    board.mouse.inside = !!overImage;
+    overImage = ix >= 0 && ix <= board.imageWidth
+             && iy >= 0 && iy <= board.imageHeight;
+    board.mouse.inside = overImage;
   }
 
   // Pan takes priority over everything else.
@@ -196,13 +210,13 @@ canvas.addEventListener("mousemove", (e) => {
     return;
   }
 
-  // Inpaint context drag in progress.
+  // Inpaint context drag in progress — uses un-rotated image coords
+  // because the rectangle itself isn't rotated.
   if (_contextDrag.active && r) {
-    const [ix, iy] = screenToImage(sx, sy);
     const newRect = applyContextDrag(
       _contextDrag.startRect,
       _contextDrag.startIx, _contextDrag.startIy,
-      ix, iy,
+      uix, uiy,
       _contextDrag.handle,
       e.shiftKey);
     board.inpaintContext.x = newRect.x;
@@ -216,8 +230,7 @@ canvas.addEventListener("mousemove", (e) => {
     return;
   }
 
-  // Inpaint context hover cursor (handles + border band + interior).
-  // Skipped when the Context rectangle checkbox is unchecked.
+  // Inpaint context hover cursor.
   if (board.inpaintEnabled && r && !_contextDrag.active) {
     const hit = hitContextRect(r, sx, sy);
     if (hit) {
@@ -233,7 +246,6 @@ canvas.addEventListener("mousemove", (e) => {
   // Hover state for mask overlay highlight.
   let hoveredMask = -1;
   if (overImage) {
-    const [ix, iy] = screenToImage(sx, sy);
     hoveredMask = hitTestMaskAtPoint(ix, iy);
   }
 
@@ -262,14 +274,11 @@ canvas.addEventListener("wheel", (e) => {
   const factor = Math.exp(-dy * 0.0015);
   zoomAt(mx, my, view.zoom * factor);
 
-  const r = fittedImageRect();
-  if (r) {
-    const [ix, iy] = screenToImage(mx, my);
-    board.mouse.x = ix;
-    board.mouse.y = iy;
-    board.mouse.inside = mx >= r.x0 && mx <= r.x0 + r.w
-                      && my >= r.y0 && my <= r.y0 + r.h;
-  }
+  const [ix, iy] = screenToImage(mx, my);
+  board.mouse.x = ix;
+  board.mouse.y = iy;
+  board.mouse.inside = ix >= 0 && ix <= board.imageWidth
+                    && iy >= 0 && iy <= board.imageHeight;
   drawView();
 }, { passive: false });
 
@@ -328,7 +337,6 @@ window.addEventListener("keydown", (e) => {
   if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA"
             || t.tagName === "SELECT")) return;
 
-  // Space: press-and-hold pan modifier.
   if (e.key === " " || e.key === "Spacebar") {
     e.preventDefault();
     if (!_spaceDown) {
@@ -338,7 +346,6 @@ window.addEventListener("keydown", (e) => {
     return;
   }
 
-  // Home: reset zoom + pan.
   if (e.key === "Home") {
     e.preventDefault();
     resetView();
@@ -356,7 +363,6 @@ window.addEventListener("keydown", (e) => {
 
   if (e.ctrlKey || e.metaKey) return;
 
-  // Numbers 1..9 select a mask.
   const n = parseInt(e.key, 10);
   if (n >= 1 && n <= 9 && board.masks.length >= n) {
     e.preventDefault();

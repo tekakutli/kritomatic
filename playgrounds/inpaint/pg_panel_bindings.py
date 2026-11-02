@@ -16,13 +16,16 @@ Krita."""
 
 PANEL_BINDINGS_JS = r"""
 import { board, setImage, clearImage, _scheduleDraw,
-         view, _applyRotation } from "./pg_state.js";
+         view, _applyRotation, _rotateImage } from "./pg_state.js";
 import {
   setMasks, addMaskFromB64,
   selectedMask, selectedMaskIdx,
   replaceMaskSelection,
 } from "./pg_masks.js";
-import { buildContextMaskB64, resizeMaskB64ToCanvas } from "./pg_inpaint.js";
+import {
+  buildContextMaskB64, buildRotatedContextMaskB64,
+  resizeMaskB64ToCanvas,
+} from "./pg_inpaint.js";
 import { syncMaskList } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
 import { uploadImageFile, fetchStatus, runInpaint, interruptInpaint }
@@ -114,12 +117,12 @@ function _pickMaskAction() {
 
 function _clearImageAction() {
   clearImage();
-  // clearImage resets view.rotation to 0; sync the widget so the
+  // clearImage resets view.rotation to 0; sync the widgets so the
   // user does not see a stale angle on a cleared canvas.
   const rotEl = document.getElementById("viewRotation");
   if (rotEl) rotEl.value = "0";
-  const rotVal = document.getElementById("viewRotationValue");
-  if (rotVal) rotVal.textContent = "0\u00b0";
+  const rotNumEl = document.getElementById("viewRotationNum");
+  if (rotNumEl) rotNumEl.value = "0";
   syncPanelFields();
   syncMaskList();
   pgkitNotifyAll();
@@ -127,40 +130,122 @@ function _clearImageAction() {
 }
 
 /* ============================================================
+   Inpaint payload builders
+   ============================================================
+   The daemon works in the *rotated* frame — that is the frame the
+   user is looking at when they click Inpaint.  Since the board now
+   stores the ORIGINAL, un-rotated raster (rotation is display-only),
+   the inpaint action must materialise the rotated canvas, rotated
+   selection mask, and rotated context mask once per run.
+
+   All three blobs must come out at the SAME pixel dimensions (the
+   axis-aligned bounding box of the rotated rectangle) so the
+   daemon's crop, mask decode, and output rotation all line up.
+
+   `outputRotation: -view.rotation` tells the daemon how to rotate
+   the composite back to the original orientation before it returns
+   it — the caller then `_setOriginalFromB64`s that composite and
+   the display transform re-rotates it for the user's current view.
+
+   Cropping: when `board.inpaintEnabled === true`, the rotated
+   context mask has a white rectangle; the daemon finds its
+   axis-aligned bbox and crops canvas + selection to it.  When
+   false, the rotated context mask is full white, so the bbox is the
+   full rotated canvas and no crop happens.  The context rectangle's
+   user-visible size and position are the ONLY thing that determine
+   this crop — the rotation slider cannot affect it because
+   `board.inpaintContext` lives in original-image coords and is
+   untouched by `_applyRotation`. */
+
+function _rotateCanvasWithBlack(canvas0, angle) {
+  const W = canvas0.width, H = canvas0.height;
+  const rad = (angle % 360) * Math.PI / 180;
+  const cos = Math.abs(Math.cos(rad));
+  const sin = Math.abs(Math.sin(rad));
+  const newW = Math.max(1, Math.round(W * cos + H * sin));
+  const newH = Math.max(1, Math.round(W * sin + H * cos));
+  const rc = document.createElement("canvas");
+  rc.width = newW; rc.height = newH;
+  const cx = rc.getContext("2d");
+  cx.imageSmoothingEnabled = true;
+  cx.imageSmoothingQuality = "high";
+  cx.fillStyle = "#000";
+  cx.fillRect(0, 0, newW, newH);
+  cx.translate(newW / 2, newH / 2);
+  cx.rotate(rad);
+  cx.drawImage(canvas0, -W / 2, -H / 2);
+  return rc;
+}
+
+function _canvasB64ForInpaint() {
+  const angle = view.rotation;
+  if (!angle || angle % 360 === 0) {
+    return board.imageDataUrl.replace(/^data:image\/png;base64,/, "");
+  }
+  const rc = _rotateImage(board.originalImageEl, angle);
+  return rc.toDataURL("image/png").replace(/^data:image\/png;base64,/, "");
+}
+
+/* Produce the selection mask as an opaque grayscale PNG at the same
+   rotated dims as the canvas.  Mask value is `R * A / 255` — same
+   convention `_maskToGrayscaleCanvas` used to enforce before this
+   file stopped pre-rotating masks.  Steps:
+
+     1. Composite mask.img onto a black canvas sized to the
+        ORIGINAL image dims.  This converts RGBA-with-mask-in-R-or-A
+        into an unambiguous opaque grayscale raster: black where
+        the mask is 0, the mask value in all three channels
+        elsewhere.
+     2. If `view.rotation` is non-zero, rotate that raster into a
+        fresh canvas at the rotated bbox dims, black-filled so the
+        rotation's corner regions decode as not-selected. */
+
+function _selectionB64ForInpaint(mask) {
+  if (!mask || !mask.img) return mask.b64;
+  const targetW = board.imageWidth;
+  const targetH = board.imageHeight;
+
+  const base = document.createElement("canvas");
+  base.width = targetW;
+  base.height = targetH;
+  const bx = base.getContext("2d");
+  bx.imageSmoothingEnabled = true;
+  bx.imageSmoothingQuality = "high";
+  bx.fillStyle = "#000";
+  bx.fillRect(0, 0, targetW, targetH);
+  bx.drawImage(mask.img, 0, 0, targetW, targetH);
+
+  const angle = view.rotation;
+  const out = (!angle || angle % 360 === 0)
+    ? base
+    : _rotateCanvasWithBlack(base, angle);
+
+  return out.toDataURL("image/png").replace(/^data:image\/png;base64,/, "");
+}
+
+/* ============================================================
    Inpaint
    ============================================================ */
 
-function _rotatedMaskToCanvasB64(mask) {
-  // Return a base64 PNG of the mask in the current rotated frame,
-  // resized to the rotated canvas dimensions. When the mask has no
-  // rotated version (rotation is 0), this is `resizeMaskB64ToCanvas`
-  // by another route, but it goes through the same scaling the
-  // context mask uses, so the three blobs are always the same size.
-  const src = mask.rotatedCanvas || mask.img;
-  const sw  = mask.rotatedCanvas ? mask.rotatedW : mask.w;
-  const sh  = mask.rotatedCanvas ? mask.rotatedH : mask.h;
-  if (!src || !sw || !sh) return mask.b64;
-
-  const c = document.createElement("canvas");
-  c.width  = board.imageWidth;
-  c.height = board.imageHeight;
-  c.getContext("2d").drawImage(src, 0, 0, c.width, c.height);
-  return c.toDataURL("image/png")
-          .replace(/^data:image\/png;base64,/, "");
-}
-
 function _setOriginalFromB64(b64) {
   // The composite comes from Krita in its ORIGINAL orientation.
-  // Store it as the new source and re-apply the current rotation
-  // for display, so the user's view stays in the frame they chose.
+  // It becomes the new source; the display transform re-rotates it
+  // for the user's current view.  Because rotation is display-only
+  // now, `board.imageEl` / `imageWidth` / `imageHeight` /
+  // `imageDataUrl` must be set directly here — `_applyRotation`
+  // no longer derives them.
   const dataUrl = "data:image/png;base64," + b64;
   const img = new Image();
   img.onload = () => {
-    board.originalImageEl  = img;
-    board.originalWidth    = img.width;
-    board.originalHeight   = img.height;
-    board.originalDataUrl  = dataUrl;
-    board.imageHash        = "inpaint_" + Date.now();
+    board.originalImageEl = img;
+    board.originalWidth   = img.naturalWidth;
+    board.originalHeight  = img.naturalHeight;
+    board.originalDataUrl = dataUrl;
+    board.imageEl         = img;
+    board.imageWidth      = img.naturalWidth;
+    board.imageHeight     = img.naturalHeight;
+    board.imageDataUrl    = dataUrl;
+    board.imageHash       = "inpaint_" + Date.now();
     _applyRotation(view.rotation);
   };
   img.src = dataUrl;
@@ -181,12 +266,14 @@ async function _inpaintAction() {
     flashStatus("Mask not loaded", "warn"); return;
   }
 
-  // All three blobs are in the *rotated* frame, matching what the
-  // user sees. ComfyUI's bounding-box machinery now operates on
-  // axis-aligned rectangles in the frame the user drew them in.
-  const canvasB64    = board.imageDataUrl.replace(/^data:image\/png;base64,/, "");
-  const selectionB64 = _rotatedMaskToCanvasB64(mask);
-  const contextB64   = buildContextMaskB64();
+  // All three blobs are built in the *rotated* frame, matching
+  // what the user sees and what the daemon expects.  The rotated
+  // context mask lets the daemon crop to the user's rectangle —
+  // and only that rectangle, since rotation itself never touches
+  // `board.inpaintContext`.
+  const canvasB64    = _canvasB64ForInpaint();
+  const selectionB64 = _selectionB64ForInpaint(mask);
+  const contextB64   = buildRotatedContextMaskB64(view.rotation);
 
   flashStatus("inpainting\u2026", "");
 
@@ -200,8 +287,8 @@ async function _inpaintAction() {
   if (!payload) return;
 
   // The composite comes from Krita in its ORIGINAL orientation.
-  // Load it as the new original; _applyRotation re-rotates for
-  // display, so the user's view stays in the frame they chose.
+  // Load it as the new original; the display transform re-rotates
+  // for display, so the user's view stays in the frame they chose.
   _setOriginalFromB64(payload.image_b64);
 
   const statusCls = (payload.paste_ok === false) ? "warn" : "ok";

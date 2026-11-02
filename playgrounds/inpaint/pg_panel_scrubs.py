@@ -98,31 +98,73 @@ pgkitRegisterField("masks.selectedIndex", {
 
 /* ============================================================
    View rotation
-   ============================================================ */
+   ============================================================
+   Two controls for the same value: a range slider for quick
+   dragging and a number input for typing an exact angle.  Both
+   stay in sync via `_syncRotationWidget()`; whichever control
+   the user is currently focused on is left alone so a value
+   that hasn't been re-formatted (e.g. "045" while typing) isn't
+   stomped by a redraw. */
 
-const rotationEl = document.getElementById("viewRotation");
-const rotationValueEl = document.getElementById("viewRotationValue");
+const rotationEl    = document.getElementById("viewRotation");
+const rotationNumEl = document.getElementById("viewRotationNum");
 
 function _syncRotationWidget() {
   const deg = Math.round(view.rotation || 0);
   if (rotationEl && document.activeElement !== rotationEl) {
     rotationEl.value = String(deg);
   }
-  if (rotationValueEl) rotationValueEl.textContent = deg + "\u00b0";
+  if (rotationNumEl && document.activeElement !== rotationNumEl) {
+    rotationNumEl.value = String(deg);
+  }
+}
+
+function _commitRotation(raw, source) {
+  const v = parseFloat(raw);
+  if (!isFinite(v)) return;
+  // Clamp to [0, 360]; _applyRotation wraps 360 to 0 internally.
+  const clamped = Math.max(0, Math.min(360, v));
+  _applyRotation(clamped);
+  // Update the *other* control immediately so the user sees the
+  // clamped value reflected, but leave the source control as-is
+  // while it still has focus (the browser manages its contents).
+  if (source !== "slider" && rotationEl) {
+    rotationEl.value = String(Math.round(clamped));
+  }
+  if (source !== "number" && rotationNumEl) {
+    rotationNumEl.value = String(Math.round(clamped));
+  }
+  pgkitNotifyLocal("view.rotation");
+  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
 }
 
 if (rotationEl) {
   rotationEl.value = String(Math.round(view.rotation || 0));
-  _syncRotationWidget();
   rotationEl.addEventListener("input", () => {
-    const v = parseFloat(rotationEl.value);
-    if (!isFinite(v)) return;
-    if (rotationValueEl) rotationValueEl.textContent = Math.round(v) + "\u00b0";
-    _applyRotation(v);
-    pgkitNotifyLocal("view.rotation");
-    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+    _commitRotation(rotationEl.value, "slider");
   });
 }
+
+if (rotationNumEl) {
+  rotationNumEl.value = String(Math.round(view.rotation || 0));
+  // `change` fires on blur and on Enter, which is when we want to
+  // apply the typed value — firing on every keystroke would apply
+  // "4" then "45" as separate rotations.
+  rotationNumEl.addEventListener("change", () => {
+    _commitRotation(rotationNumEl.value, "number");
+    // Normalise the displayed value after commit (e.g. "045" -> "45").
+    rotationNumEl.value = String(Math.round(view.rotation || 0));
+  });
+  // Enter should also blur so `change` fires.
+  rotationNumEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      rotationNumEl.blur();
+    }
+  });
+}
+
+_syncRotationWidget();
 
 pgkitRegisterField("view.rotation", {
   get: () => view.rotation || 0,

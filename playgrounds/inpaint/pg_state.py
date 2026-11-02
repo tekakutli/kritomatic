@@ -28,7 +28,25 @@ let _dpr = window.devicePixelRatio || 1;
 
 /* ============================================================
    View (zoom + pan + rotation)
-   ============================================================ */
+   ============================================================
+   `view.rotation` is a *display-only* angle.  `board.imageWidth`,
+   `board.imageHeight`, `board.imageDataUrl`, and `board.imageEl`
+   are always the ORIGINAL un-rotated source.  Rotation is applied
+   as a 2D canvas transform at draw time (in `pg_view_image.js`),
+   not by pre-rendering a rotated copy.
+
+   This is what makes rotating the slider rotate the picture in
+   place without changing its on-screen size.
+
+   `board.inpaintContext` lives in un-rotated image pixel coords,
+   which map to a fixed screen position via `fittedImageRect()`.
+   The rectangle is drawn WITHOUT the rotation transform, so it
+   stays visually where the user put it even while the image
+   rotates underneath.  Only the drag interaction in
+   `pg_dispatch.js` changes its `x/y/w/h`.
+
+   The inpaint action materialises a rotated raster once per run
+   and crops it to the rectangle's screen-fixed position. */
 
 export const view = {
   zoom: 1,
@@ -51,66 +69,62 @@ export function clampPan() {
   const sy = (ch - 2 * pad) / board.imageHeight;
   const baseS = Math.min(sx, sy);
   const s = baseS * view.zoom;
-  const w = board.imageWidth  * s;
-  const h = board.imageHeight * s;
-  const baseX = (cw - w) / 2;
-  const baseY = (ch - h) / 2;
+
+  // Pan clamp uses the ROTATED bounding box, so at non-cardinal
+  // angles the user can still pan far enough to see the corners.
+  const rad = view.rotation * Math.PI / 180;
+  const cos = Math.abs(Math.cos(rad));
+  const sin = Math.abs(Math.sin(rad));
+  const bw = (board.imageWidth  * cos + board.imageHeight * sin) * s;
+  const bh = (board.imageWidth  * sin + board.imageHeight * cos) * s;
+  const baseX = (cw - bw) / 2;
+  const baseY = (ch - bh) / 2;
   const m = VIEW_PAN_MARGIN;
 
-  const minPanX = m - baseX - w;
+  const minPanX = m - baseX - bw;
   const maxPanX = cw - m - baseX;
   view.panX = Math.max(minPanX, Math.min(maxPanX, view.panX));
 
-  const minPanY = m - baseY - h;
+  const minPanY = m - baseY - bh;
   const maxPanY = ch - m - baseY;
   view.panY = Math.max(minPanY, Math.min(maxPanY, view.panY));
 }
 
+/* Zoom around the cursor, rotation-safe. */
 export function zoomAt(screenX, screenY, newZoom) {
-  const r0 = fittedImageRect();
-  if (!r0) return;
-  const ix = (screenX - r0.x0) / r0.s;
-  const iy = (screenY - r0.y0) / r0.s;
-
+  const [ix0, iy0] = screenToImage(screenX, screenY);
   view.zoom = Math.max(VIEW_ZOOM_MIN, Math.min(VIEW_ZOOM_MAX, newZoom));
-
-  const r1 = fittedImageRect();
-  const newSx = r1.x0 + ix * r1.s;
-  const newSy = r1.y0 + iy * r1.s;
-
-  view.panX += screenX - newSx;
-  view.panY += screenY - newSy;
-
+  const [sx1, sy1] = imageToScreen(ix0, iy0);
+  view.panX += screenX - sx1;
+  view.panY += screenY - sy1;
   clampPan();
 }
 
 /* ============================================================
    Rotation
    ============================================================
-   `_rotateImage` returns a new HTMLCanvasElement holding the
-   image rotated by `angleDeg` about its center, sized to the
-   axis-aligned bounding box of the rotated rectangle. The
-   corners of the bbox outside the rotated image are
-   transparent.
+   `_applyRotation` only sets the display angle.  It does not
+   re-render the image, does not touch `board.imageWidth/Height`,
+   does not touch `board.inpaintContext`, and does not re-rotate
+   mask pixel caches.  The visual rotation happens inside
+   `drawImageLayer`, which applies the
+   `translate(cx,cy); rotate(rad); translate(-cx,-cy)` transform
+   around the image center.
 
-   Positive `angleDeg` rotates clockwise on screen (matching
-   `ctx.rotate` and Qt's `QTransform.rotate` in screen coords),
-   so the daemon's un-rotation is `QTransform().rotate(-θ)` for
-   the playground's `θ`.
+   `_rotateImage` is retained as a helper for the inpaint action,
+   which needs to materialise a rotated raster exactly once per
+   run.  `_rotateMask` just nulls out `rotatedCanvas`; mask pixel
+   data always lives in the original image frame now.  The
+   function exists so `pg_masks.py`'s `_makeMaskEntry` (which
+   calls it at mask-load time) keeps working without edits. */
 
-   `_applyRotation` is idempotent — it always starts from
-   `board.originalImageEl`, so setting the field to 30° twice
-   produces the same result as setting it once. Every image
-   import goes through it.
+export function _applyRotation(angle) {
+  view.rotation = ((Number(angle) || 0) % 360 + 360) % 360;
+  clampPan();
+  _scheduleDraw();
+}
 
-   `_rotateMask` mirrors this for masks. Masks are rotated at
-   load time (from `_makeMaskEntry`) so `_maskPixelData` and hit
-   testing operate on the rotated data. The caches (`_pixels`,
-   `_bbox`, `_tinted`, `_tintedKey`) are cleared on every
-   rotation change.
-*/
-
-function _rotateImage(img, angleDeg) {
+export function _rotateImage(img, angleDeg) {
   if (!img) return null;
   const W = img.naturalWidth || img.width;
   const H = img.naturalHeight || img.height;
@@ -135,68 +149,14 @@ function _rotateImage(img, angleDeg) {
 }
 
 export function _rotateMask(entry, angle) {
-  entry._pixels = null;
-  entry._bbox = null;
-  entry._tinted = null;
-  entry._tintedKey = null;
-
-  if (!entry.loaded || !entry.img) {
-    entry.rotatedCanvas = null;
-    entry.rotatedW = 0;
-    entry.rotatedH = 0;
-    return;
-  }
-  if (!angle || angle % 360 === 0) {
-    entry.rotatedCanvas = null;
-    entry.rotatedW = entry.w;
-    entry.rotatedH = entry.h;
-    return;
-  }
-  const rc = _rotateImage(entry.img, angle);
-  entry.rotatedCanvas = rc;
-  entry.rotatedW = rc ? rc.width : 0;
-  entry.rotatedH = rc ? rc.height : 0;
-}
-
-export function _applyRotation(angle) {
-  view.rotation = ((Number(angle) || 0) % 360 + 360) % 360;
-
-  if (!board.originalImageEl) {
-    // No image loaded yet; when it loads, its onload will call us.
-    _scheduleDraw();
-    return;
-  }
-
-  if (view.rotation === 0) {
-    board.imageEl     = board.originalImageEl;
-    board.imageWidth  = board.originalWidth;
-    board.imageHeight = board.originalHeight;
-    board.imageDataUrl = board.originalDataUrl;
-  } else {
-    const rc = _rotateImage(board.originalImageEl, view.rotation);
-    if (!rc) {
-      board.imageEl = null;
-      board.imageWidth = 0;
-      board.imageHeight = 0;
-      board.imageDataUrl = null;
-      _scheduleDraw();
-      return;
-    }
-    board.imageEl     = rc;
-    board.imageWidth  = rc.width;
-    board.imageHeight = rc.height;
-    board.imageDataUrl = rc.toDataURL("image/png");
-  }
-
-  for (const m of board.masks) _rotateMask(m, view.rotation);
-
-  // Context rect coordinates were in the previous frame; reset.
-  board.inpaintContext = {
-    x: 0, y: 0, w: 0, h: 0, activeHandle: null,
-  };
-
-  clampPan();
-  _scheduleDraw();
+  // Invalidate the rotated-canvas cache.  Mask pixel data always
+  // reads `mask.img` in the original image frame now, and the
+  // inpaint action rotates the raw mask itself when needed.
+  // Caches that depend on the original pixels (`_pixels`, `_bbox`,
+  // `_tinted`) stay valid across rotation and are not cleared.
+  entry.rotatedCanvas = null;
+  entry.rotatedW = entry.w || 0;
+  entry.rotatedH = entry.h || 0;
 }
 
 /* ============================================================
@@ -210,9 +170,6 @@ export function setImage(hash, dataUrl, width, height) {
   board.originalHeight  = height;
   board.originalImageEl = null;
 
-  // Until the source loads, the visible fields stay empty; a
-  // rotation field change before that point is a no-op (bailed
-  // above) and will be re-applied once onload fires.
   board.imageEl      = null;
   board.imageWidth   = 0;
   board.imageHeight  = 0;
@@ -229,6 +186,12 @@ export function setImage(hash, dataUrl, width, height) {
   const img = new Image();
   img.onload = () => {
     board.originalImageEl = img;
+    board.originalWidth   = img.naturalWidth;
+    board.originalHeight  = img.naturalHeight;
+    board.imageEl         = img;
+    board.imageWidth      = img.naturalWidth;
+    board.imageHeight     = img.naturalHeight;
+    board.imageDataUrl    = dataUrl;
     _applyRotation(view.rotation);
   };
   img.onerror = () => {
@@ -293,8 +256,7 @@ export const board = {
   imageDataUrl:  null,
   imageEl:       null,
 
-  // The un-rotated source. `imageEl` / `imageWidth` / etc. above
-  // are derived from these by `_applyRotation`.
+  // The un-rotated source.  Mirrors the visible fields above.
   originalImageEl:  null,
   originalWidth:    0,
   originalHeight:   0,
@@ -318,7 +280,9 @@ export const board = {
 };
 
 /* ============================================================
-   Image-fit rect — applies view.zoom and view.panX/panY
+   Image-fit rect — the axis-aligned screen rect the ORIGINAL,
+   un-rotated image occupies.  Rotation is applied on top of this
+   by the draw layer; the rect itself never changes with rotation.
    ============================================================ */
 
 export function fittedImageRect() {
@@ -336,13 +300,47 @@ export function fittedImageRect() {
   return { x0, y0, w, h, s };
 }
 
+/* Image -> screen, WITH rotation.  Used for mask pixel hit-testing
+   (mask data is in the original frame) and for drawing the image
+   layer itself. */
 export function imageToScreen(x, y) {
   const r = fittedImageRect();
   if (!r) return [x, y];
-  return [r.x0 + x * r.s, r.y0 + y * r.s];
+  const cx = r.x0 + r.w / 2;
+  const cy = r.y0 + r.h / 2;
+  const dx = (x - board.imageWidth  / 2) * r.s;
+  const dy = (y - board.imageHeight / 2) * r.s;
+  const rad = view.rotation * Math.PI / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  const rx = dx * cos - dy * sin;
+  const ry = dx * sin + dy * cos;
+  return [cx + rx, cy + ry];
 }
 
+/* Screen -> image, WITH rotation inverse.  Use this when the caller
+   needs the actual pixel under the cursor (mask hit-test, hover). */
 export function screenToImage(sx, sy) {
+  const r = fittedImageRect();
+  if (!r) return [0, 0];
+  const cx = r.x0 + r.w / 2;
+  const cy = r.y0 + r.h / 2;
+  const dx = sx - cx;
+  const dy = sy - cy;
+  const rad = view.rotation * Math.PI / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  const rx =  dx * cos + dy * sin;
+  const ry = -dx * sin + dy * cos;
+  return [board.imageWidth  / 2 + rx / r.s,
+          board.imageHeight / 2 + ry / r.s];
+}
+
+/* Screen -> image, WITHOUT rotation.  Use this for anything anchored
+   to the un-rotated fit rect — notably the inpaint context
+   rectangle, whose position is fixed on screen even while the image
+   rotates underneath it. */
+export function screenToImageUnrotated(sx, sy) {
   const r = fittedImageRect();
   if (!r) return [0, 0];
   return [(sx - r.x0) / r.s, (sy - r.y0) / r.s];

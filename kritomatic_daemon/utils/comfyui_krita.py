@@ -274,7 +274,8 @@ def build_krita_resources(doc,
                           selection_context: str = "entire_image",
                           selection_padding: int = 0,
                           layer_aliases: Optional[dict[str, str]] = None,
-                          params: Optional[dict] = None) -> KritaResources:
+                          params: Optional[dict] = None,
+                          scratch_blobs: Optional[dict] = None) -> KritaResources:
     """Read exactly what `reqs` asked for and pack it into KritaResources.
 
     The caller obtains `reqs` by calling
@@ -290,6 +291,14 @@ def build_krita_resources(doc,
     lookup; the key used in the returned `KritaResources` is still the
     workflow's declared name, so `expand_custom` continues to find the
     blob under the name the graph expects.
+
+    `scratch_blobs` is an optional dict keyed by blob name, each value
+    `{"encoded": EncodedImage}`. When a workflow declares a layer name
+    that matches a scratch blob (checked first under the workflow's
+    logical name, then under the alias target if it differs), the blob
+    is used instead of reading the document. This is what lets the
+    inpaint playground push transient blobs to ComfyUI without creating
+    Krita layers.
 
     `bounds` defaults to the full canvas. When `reqs.needs_selection` is
     set, the crop region is recomputed from the selection's bounding box
@@ -325,9 +334,27 @@ def build_krita_resources(doc,
         resources.selection_bounds = crop
 
     aliases = layer_aliases or {}
+    scratch = scratch_blobs or {}
 
     for name in reqs.layer_images:
         actual = aliases.get(name, name)
+        entry = scratch.get(name) or scratch.get(actual)
+        if entry is not None:
+            encoded = entry["encoded"]
+            if encoded.is_mask:
+                raise ValueError(
+                    f"scratch blob {name!r} is a mask but the workflow "
+                    f"expects an image under that name "
+                    f"(ETN_KritaImageLayer)"
+                )
+            if (encoded.width, encoded.height) != (crop[2], crop[3]):
+                raise ValueError(
+                    f"scratch blob {name!r} is "
+                    f"{encoded.width}\u00d7{encoded.height} but the "
+                    f"workflow expects {crop[2]}\u00d7{crop[3]}"
+                )
+            resources.layer_images[name] = encoded
+            continue
         try:
             resources.layer_images[name] = read_layer_pixels(doc, actual, crop)
         except ValueError as e:
@@ -340,6 +367,23 @@ def build_krita_resources(doc,
 
     for name in reqs.layer_masks:
         actual = aliases.get(name, name)
+        entry = scratch.get(name) or scratch.get(actual)
+        if entry is not None:
+            encoded = entry["encoded"]
+            if not encoded.is_mask:
+                raise ValueError(
+                    f"scratch blob {name!r} is an image but the workflow "
+                    f"expects a mask under that name "
+                    f"(ETN_KritaMaskLayer)"
+                )
+            if (encoded.width, encoded.height) != (crop[2], crop[3]):
+                raise ValueError(
+                    f"scratch blob {name!r} is "
+                    f"{encoded.width}\u00d7{encoded.height} but the "
+                    f"workflow expects {crop[2]}\u00d7{crop[3]}"
+                )
+            resources.layer_masks[name] = encoded
+            continue
         try:
             resources.layer_masks[name] = read_layer_mask(doc, actual, crop)
         except ValueError as e:

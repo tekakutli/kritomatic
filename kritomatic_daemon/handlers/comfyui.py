@@ -100,6 +100,35 @@ docker's dropdowns intersect the flat list against the kind-appropriate
 bucket, so an alias for a mask layer never appears at the top of an
 image dropdown.
 
+Scratch blobs
+=============
+`comfy_set_layer_pixels` defaults to keeping the decoded PNG in an
+in-memory `_scratch_blobs` dict on the handler instead of creating or
+updating a Krita layer. The inpaint playground relies on this: its
+`thecanvas` / `theselection` / `thecontext` blobs must reach ComfyUI
+but must not appear in the document.
+
+`build_krita_resources` checks the scratch store before reading from
+the document, so a scratch blob shadows a same-named Krita layer when
+both exist. The blob's format on disk is exactly what the workflow
+would have seen if it had been read from a Krita layer — an RGBA PNG
+for images, a grayscale (`Format_Grayscale8`) PNG for masks, both at
+the document's dimensions.
+
+Passing `--persist_in_doc true` to `comfy_set_layer_pixels` restores
+the old behavior of creating a hidden `paintlayer` in the document
+with that name. The delete-then-create logic on that path stays — it
+avoids the pre-existing `selectionmask`-shadowing bug that a previous
+version had when the playground's `theselection` name collided with a
+mask layer.
+
+Scratch blobs are per-handler-session, cleared by
+`comfy_clear_scratch_blob` / `comfy_clear_all_scratch_blobs`, dumped
+to disk with `comfy_dump_scratch_blobs`, and inspected with
+`comfy_list_scratch_blobs`. They are not cleared on workflow change
+because a workflow swap does not change the fact that the next
+`comfy_generate` may want the same blobs.
+
 Output nodes
 ============
 A workflow may contain more than one ETN_KritaOutput node. Each fires
@@ -167,6 +196,11 @@ Command surface
                            --context entire_image|automatic|mask_bounds
                            --padding <int>
     comfy_set_layer_pixels --name <n> --image_b64 <b64> --is_mask?
+                           --persist_in_doc?
+    comfy_list_scratch_blobs
+    comfy_dump_scratch_blobs --dir <path>
+    comfy_clear_scratch_blob --name <n>
+    comfy_clear_all_scratch_blobs
     comfy_generate         --timeout <s>? --output_name <n>?
                            --count <n>? --seed <s>? --output_rotation <deg>?
     comfy_generate_async
@@ -209,6 +243,8 @@ from ..utils.comfyui_client import (
     get_client,
 )
 from ..utils.comfyui_krita import (
+    _encode_argb32_png,
+    _encode_grayscale_png,
     build_krita_resources,
     paste_animation,
     paste_batch_as_layers,
@@ -216,6 +252,7 @@ from ..utils.comfyui_krita import (
     resize_canvas,
 )
 from ..utils.comfyui_tooling import (
+    EncodedImage,
     ExpansionError,
     expand_custom,
     scan_requirements,
@@ -252,6 +289,8 @@ _READ_ONLY_COMMANDS = frozenset({
     "comfy_list_workflows",
     "comfy_history",
     "comfy_list_recent_aliases",
+    "comfy_list_scratch_blobs",
+    "comfy_dump_scratch_blobs",
 })
 
 
@@ -296,6 +335,66 @@ def _save_recent_aliases(aliases: list) -> None:
         )
     except Exception:
         pass
+
+
+# ============================================================================
+#  Scratch-blob PNG decoding
+# ============================================================================
+
+def _png_bytes_to_encoded(png_bytes: bytes,
+                          is_mask: bool,
+                          target_w: Optional[int] = None,
+                          target_h: Optional[int] = None) -> EncodedImage:
+    """Decode a playground PNG into an EncodedImage ready for upload.
+
+    For images, keep RGBA bytes as-is.
+    For masks, extract the mask value (R channel of the ARGB32 view)
+    into a Format_Grayscale8 PNG — this matches what `_encode_alpha8_png`
+    produces when reading a mask from a Krita layer, so the workflow
+    sees the same shape either way.
+
+    If `target_w` / `target_h` are given and differ from the PNG's
+    natural dimensions, the image is scaled before re-encoding. This
+    mirrors the doc-dimension scaling that the persist-in-doc path
+    applies, so a scratch blob is always the same size as the document
+    the workflow would have read from.
+    """
+    from PyQt6.QtGui import QImage
+    from PyQt6.QtCore import Qt
+
+    img = QImage()
+    if not img.loadFromData(png_bytes, "PNG"):
+        raise ValueError("could not decode PNG")
+    if img.format() != QImage.Format.Format_ARGB32:
+        img = img.convertToFormat(QImage.Format.Format_ARGB32)
+
+    if target_w and target_h and (
+        img.width() != target_w or img.height() != target_h
+    ):
+        img = img.scaled(
+            target_w, target_h,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        img = img.convertToFormat(QImage.Format.Format_ARGB32)
+
+    w, h = img.width(), img.height()
+    ptr = img.constBits()
+    ptr.setsize(img.sizeInBytes())
+    src = bytes(ptr)
+
+    if is_mask:
+        gray = bytearray(w * h)
+        for i in range(w * h):
+            gray[i] = src[i * 4 + 2]  # R channel = mask value
+        return EncodedImage(
+            data=_encode_grayscale_png(bytes(gray), w, h),
+            width=w, height=h, is_mask=True,
+        )
+    return EncodedImage(
+        data=_encode_argb32_png(src, w, h),
+        width=w, height=h, is_mask=False,
+    )
 
 
 # ============================================================================
@@ -507,6 +606,14 @@ class ComfyUIHandler(AutoDispatchHandler):
 
         self._params: dict = {}
         self._layer_aliases: dict = {}
+
+        # In-memory blob store. Populated by `comfy_set_layer_pixels`
+        # when `--persist_in_doc` is false (the default). Keyed by
+        # blob name; each value is `{"encoded": EncodedImage}`.
+        # `build_krita_resources` consults this before reading from
+        # the document, so a scratch blob shadows a same-named
+        # Krita layer.
+        self._scratch_blobs: dict = {}
 
         # Recent-alias history. Loaded once at construction; updated
         # on every `comfy_bind_layer_alias`. Not cleared on
@@ -860,6 +967,7 @@ class ComfyUIHandler(AutoDispatchHandler):
                 ),
                 "params": dict(self._params),
                 "layer_aliases": dict(self._layer_aliases),
+                "scratch_blobs": sorted(self._scratch_blobs.keys()),
                 "canvas_source": self._canvas_source,
                 "canvas_layer": self._canvas_layer,
                 "selection_source": self._selection_source,
@@ -1324,26 +1432,31 @@ class ComfyUIHandler(AutoDispatchHandler):
         }
 
     # ------------------------------------------------------------------
-    #  Scratch-layer pixel write
+    #  Scratch-blob pixel write (in-memory by default)
     # ------------------------------------------------------------------
 
     @command(
         category="comfyui",
-        help_text="Create or update a layer's pixels from a base64 PNG. "
-                  "Used by the inpaint playground to push the canvas, "
-                  "selection and context blobs into the document before "
-                  "calling comfy_generate. The layer is hidden after "
-                  "writing — scratch layers should not contribute to "
-                  "the composite; the workflow reads them via "
-                  "projectionPixelData, which ignores visibility.",
+        help_text="Store an image blob for use by the next comfy_generate "
+                  "call. By default the PNG is kept in memory (a "
+                  "'scratch blob') and does not appear in the document. "
+                  "Pass --persist_in_doc true to instead create/update a "
+                  "hidden Krita paint layer with that name (old "
+                  "behavior).",
         args={
             "--name": {"type": "str", "required": True,
-                       "help": "Layer name."},
+                       "help": "Blob name (matches a workflow's "
+                               "ETN_KritaImageLayer / "
+                               "ETN_KritaMaskLayer `name` widget)."},
             "--image_b64": {"type": "str", "required": True,
                             "help": "Base64-encoded PNG."},
             "--is_mask": {"type": "bool", "default": False,
-                          "help": "If true, the PNG is a mask "
-                                  "(white=selected)."},
+                          "help": "If true, the PNG's R channel is the "
+                                  "mask value."},
+            "--persist_in_doc": {"type": "bool", "default": False,
+                                 "help": "If true, create/update a Krita "
+                                         "paint layer with that name "
+                                         "instead of storing in memory."},
         },
     )
     def comfy_set_layer_pixels(self, params):
@@ -1354,6 +1467,7 @@ class ComfyUIHandler(AutoDispatchHandler):
         name = params.get("name") or ""
         image_b64 = params.get("image_b64") or ""
         is_mask = bool(params.get("is_mask", False))
+        persist = bool(params.get("persist_in_doc", False))
 
         if not name:
             return {"success": False, "message": "name is required"}
@@ -1370,13 +1484,38 @@ class ComfyUIHandler(AutoDispatchHandler):
             return {"success": False,
                     "message": f"could not decode base64: {e}"}
 
+        W, H = int(doc.width()), int(doc.height())
+
+        if not persist:
+            # In-memory scratch blob path (default).
+            try:
+                encoded = _png_bytes_to_encoded(
+                    png_bytes, is_mask, target_w=W, target_h=H,
+                )
+            except ValueError as e:
+                return {"success": False, "message": str(e)}
+            self._scratch_blobs[name] = {"encoded": encoded}
+            print(f"[comfyui] comfy_set_layer_pixels: stored scratch blob "
+                  f"{name!r} ({encoded.width}x{encoded.height}, "
+                  f"is_mask={encoded.is_mask}, {len(encoded.data)} bytes)",
+                  flush=True)
+            return {
+                "success": True,
+                "message": f"Stored scratch blob {name!r}",
+                "data": {"name": name,
+                         "width": encoded.width,
+                         "height": encoded.height,
+                         "is_mask": encoded.is_mask,
+                         "persist_in_doc": False},
+            }
+
+        # Persist-in-doc path (old behavior).
         img = QImage()
         if not img.loadFromData(png_bytes, "PNG"):
             return {"success": False, "message": "could not decode PNG"}
         if img.format() != QImage.Format.Format_ARGB32:
             img = img.convertToFormat(QImage.Format.Format_ARGB32)
 
-        W, H = int(doc.width()), int(doc.height())
         if img.width() != W or img.height() != H:
             img = img.scaled(
                 W, H,
@@ -1391,9 +1530,6 @@ class ComfyUIHandler(AutoDispatchHandler):
 
         if is_mask:
             # Opaque white/black PNG -> white with alpha = luminance.
-            # Iterate the source as ARGB32 (bytes are BGRA in memory);
-            # the source is grayscale so R==G==B, and we use R for the
-            # mask value. RGBA out is white with alpha = mask.
             out = bytearray(W * H * 4)
             for i in range(W * H):
                 r = src[i * 4 + 2]      # R channel
@@ -1405,20 +1541,31 @@ class ComfyUIHandler(AutoDispatchHandler):
         else:
             pixel_bytes = src
 
-        existing = doc.nodeByName(name)
-        if existing is not None:
+        # Delete any pre-existing node with the target name, regardless
+        # of type, before creating a fresh paintlayer. Krita permits a
+        # paintlayer and a mask layer to share a name at the same scope
+        # and nodeByName returns only one of them; setPixelData on a
+        # selectionmask with 4-byte ARGB is rejected or truncated,
+        # yielding a garbage mask downstream. Scratch layers are
+        # short-lived by design; there is no state worth preserving
+        # across a delete-then-recreate.
+        removed_types = []
+        while True:
+            existing = doc.nodeByName(name)
+            if existing is None:
+                break
+            removed_types.append(existing.type())
             try:
-                existing.setPixelData(QByteArray(pixel_bytes), 0, 0, W, H)
-                existing.setVisible(False)
+                existing.remove()
             except Exception as e:
                 return {"success": False,
-                        "message": f"could not update layer {name!r}: {e}"}
-            doc.refreshProjection()
-            return {
-                "success": True,
-                "message": f"Updated {name!r} (hidden)",
-                "data": {"name": name, "created": False},
-            }
+                        "message": f"could not remove existing layer "
+                                   f"{name!r} (type={existing.type()!r}): "
+                                   f"{e}"}
+        if removed_types:
+            print(f"[comfyui] comfy_set_layer_pixels: removed "
+                  f"pre-existing {name!r} of type(s) {removed_types}",
+                  flush=True)
 
         node = doc.createNode(name, "paintlayer")
         if node is None:
@@ -1428,11 +1575,104 @@ class ComfyUIHandler(AutoDispatchHandler):
         node.setPixelData(QByteArray(pixel_bytes), 0, 0, W, H)
         node.setVisible(False)
         doc.refreshProjection()
+        print(f"[comfyui] comfy_set_layer_pixels: created {name!r} "
+              f"(paintlayer, is_mask={is_mask})", flush=True)
         return {
             "success": True,
             "message": f"Created {name!r} (hidden)",
-            "data": {"name": name, "created": True},
+            "data": {"name": name, "created": True,
+                     "persist_in_doc": True},
         }
+
+    @command(
+        category="comfyui",
+        help_text="List the in-memory scratch blobs.",
+        args={},
+    )
+    def comfy_list_scratch_blobs(self, params):
+        items = []
+        for name, entry in sorted(self._scratch_blobs.items()):
+            enc = entry["encoded"]
+            items.append({
+                "name": name,
+                "width": enc.width,
+                "height": enc.height,
+                "is_mask": enc.is_mask,
+                "size_bytes": len(enc.data),
+            })
+        return {
+            "success": True,
+            "message": f"{len(items)} scratch blob(s)",
+            "data": {"blobs": items},
+        }
+
+    @command(
+        category="comfyui",
+        help_text="Write the current scratch blobs to a directory as "
+                  "PNG files (one per blob).",
+        args={
+            "--dir": {"type": "str", "required": True,
+                      "help": "Output directory."},
+        },
+    )
+    def comfy_dump_scratch_blobs(self, params):
+        out_dir = params.get("dir") or ""
+        if not out_dir:
+            return {"success": False, "message": "dir is required"}
+        path = Path(out_dir).expanduser()
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return {"success": False,
+                    "message": f"could not create dir: {e}"}
+        written = []
+        for name, entry in sorted(self._scratch_blobs.items()):
+            enc = entry["encoded"]
+            safe = "".join(
+                ch if ch.isalnum() or ch in "-_." else "_" for ch in name
+            ) or "blob"
+            p = path / f"{safe}.png"
+            try:
+                p.write_bytes(enc.data)
+                written.append(str(p))
+            except Exception as e:
+                return {"success": False,
+                        "message": f"write failed for {name!r}: {e}"}
+        return {
+            "success": True,
+            "message": f"Dumped {len(written)} blob(s)",
+            "data": {"paths": written},
+        }
+
+    @command(
+        category="comfyui",
+        help_text="Clear one in-memory scratch blob.",
+        args={
+            "--name": {"type": "str", "required": True, "help": "Blob name."},
+        },
+    )
+    def comfy_clear_scratch_blob(self, params):
+        name = params.get("name") or ""
+        if not name:
+            return {"success": False, "message": "name is required"}
+        if name not in self._scratch_blobs:
+            return {"success": False,
+                    "message": f"No scratch blob {name!r}",
+                    "data": {"available":
+                             sorted(self._scratch_blobs.keys())}}
+        del self._scratch_blobs[name]
+        return {"success": True, "message": f"Cleared {name!r}"}
+
+    @command(
+        category="comfyui",
+        help_text="Clear every in-memory scratch blob.",
+        args={},
+    )
+    def comfy_clear_all_scratch_blobs(self, params):
+        n = len(self._scratch_blobs)
+        self._scratch_blobs.clear()
+        return {"success": True,
+                "message": f"Cleared {n} scratch blob(s)"}
 
     # ------------------------------------------------------------------
     #  Generation
@@ -1527,16 +1767,7 @@ class ComfyUIHandler(AutoDispatchHandler):
                         "message": "Not connected; run comfy_connect first",
                         "data": {"batch_id": batch_id}}
 
-            # Announce the batch start. `execute()` publishes a state
-            # change after every state-mutating command, but
-            # `_comfy_generate_impl` doesn't return until the run
-            # finishes — so without this publish, subscribers (docker,
-            # web panel) never see the batch while it is running. That
-            # leaves any `cancel_all` button gated on `active_batches`
-            # dark for the entire duration of the run, even though the
-            # daemon knows about the batch and would happily cancel it.
-            # The completion publish still fires normally, via
-            # `execute()`'s wrapper when this method returns.
+            # Announce the batch start.
             self._publish_state_change()
 
             has_seed_param = any(
@@ -1610,6 +1841,7 @@ class ComfyUIHandler(AutoDispatchHandler):
                         selection_context=self._selection_context,
                         selection_padding=self._selection_padding,
                         layer_aliases=dict(self._layer_aliases),
+                        scratch_blobs=dict(self._scratch_blobs),
                     )
                 except (ValueError, ExpansionError) as e:
                     run_records.append({
@@ -2077,6 +2309,7 @@ class ComfyUIHandler(AutoDispatchHandler):
                     selection_context=self._selection_context,
                     selection_padding=self._selection_padding,
                     layer_aliases=dict(self._layer_aliases),
+                    scratch_blobs=dict(self._scratch_blobs),
                 )
             except (ValueError, ExpansionError) as e:
                 return None, {"success": False, "message": str(e)}

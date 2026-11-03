@@ -230,7 +230,7 @@ class KritomaticDaemon(Extension):
 
         for attempt in range(MAX_ATTEMPTS):
             try:
-                result = comfy.comfy_connect({
+                result = comfy.execute('comfy_connect', {
                     "watch": True,
                     "check": True,
                     "subscribe_timeout": 5.0,
@@ -250,7 +250,7 @@ class KritomaticDaemon(Extension):
                     and (result.get("data") or {}).get("subscribed", False)):
                 for _ in range(5):
                     time.sleep(1.0)
-                    status = comfy.comfy_status({})
+                    status = comfy.execute('comfy_status', {})
                     status_data = (status.get("data") or {}) \
                         if status.get("success") else {}
                     workflow = status_data.get("workflow")

@@ -44,7 +44,9 @@ Two kinds of clients connect with `role="panel"`:
         (so its launcher can compute the hub URL and open the panel
         through the proxy), appears in `/__playgrounds`, and is
         filtered out of the target dropdown by its role field. It
-        also joins `panel_socks` so it receives `playgrounds`
+        is NOT added to `panel_socks` — a registered panel is a
+        client that only reads; it never sends `kill` /
+        `shutdown_hub` and it does not need `playgrounds`
         broadcasts. `_kill_playground` refuses to kill it — panels
         are the management UI, and killing one removes the very
         interface the user is managing the hub from. A hung panel
@@ -54,14 +56,45 @@ Two kinds of clients connect with `role="panel"`:
         The browser-side management WebSocket that
         `remote_panel/rp_client.py` opens. It carries no name and no
         port, only `role="panel"`. It is not registered; it joins
-        `panel_socks` for broadcasts and can send `kill` /
-        `shutdown_hub` commands, but has no entry in
+        `panel_socks` for `playgrounds` broadcasts and can send
+        `kill` / `shutdown_hub` commands, but has no entry in
         `registrations` and cannot be addressed by name.
 
 Both kinds use the same connection path — the dispatch in
 `_serve_hub_ws` distinguishes them by whether the hello carries a
-name and port. Registered panels get hello_ack; listeners don't need
-one.
+name and port. Registered panels get hello_ack and use the read-only
+loop; listeners don't need hello_ack and use the command loop.
+
+ABSOLUTE-PATH FETCHES FROM PANELS
+=================================
+Panel JS uses `fetch("/krita/import")` and similar absolute paths
+throughout the playgrounds — inpaint, sam3, board, text_board all
+do. Under the hub, the panel page is at
+`/<name>/<name>_playground.html`, but an absolute-path fetch
+resolves against the **hub root**, not the panel's directory. So
+the request arrives at `/krita/import` and the first path segment
+(`krita`) is treated as a playground name, producing a misleading
+`unknown playground: krita` 404.
+
+The resolver therefore has two rules:
+
+    1. Explicit prefix: `/<registered-name>/<rest>` → forward to
+       `/<rest>` on that playground. This is what every module
+       import, every `<script src>`, every WS connection, and every
+       direct URL navigation uses.
+
+    2. Referer fallback: the first segment is NOT a registered
+       playground, but the request's `Referer` header is a
+       `/`-prefixed URL whose first segment IS a registered
+       playground → forward the request path unchanged to that
+       playground. Every absolute-path `fetch()` a panel makes
+       carries `Referer: http://hub/<name>/<name>_playground.html`,
+       so this rule handles every panel fetch without touching a
+       single playground file.
+
+The fallback is a no-op for direct hub traffic (no Referer, or
+Referer not from a panel), and a no-op for explicitly-prefixed
+requests (rule 1 wins). See `Handler._resolve_proxy_target`.
 """
 
 import argparse
@@ -303,6 +336,54 @@ class Handler(BaseHTTPRequestHandler):
         rest = "/" + parts[1] if len(parts) > 1 else "/"
         return name, rest
 
+    def _resolve_proxy_target(self, path):
+        """Return (name, forward_path) or None.
+
+        Two resolution rules:
+
+        1. Explicit prefix: `/<registered-name>/<rest>` → forward to
+           `/<rest>` on that playground. Used by module imports,
+           `<script src>`, WS connections, and direct URL
+           navigation.
+
+        2. Referer fallback: the first path segment is not a
+           registered playground, but the Referer header is a
+           `/`-prefixed URL whose first segment IS a registered
+           playground → forward the full request path unchanged to
+           that playground. Used by every absolute-path `fetch()`
+           a panel makes (`fetch("/krita/import")` and friends).
+
+        `__`-prefixed paths are hub-management and never fall through
+        to the Referer rule — `/__playgrounds` and `/__hub_ws` are
+        already handled before proxy dispatch, and any other `__`
+        path that reaches here is genuinely unknown.
+        """
+        name, rest = self._split_name(path)
+
+        if name and _HUB.has(name):
+            return name, rest
+
+        if name and not name.startswith("__"):
+            referer = self.headers.get("Referer", "") or ""
+            if referer:
+                try:
+                    ref_path = urlparse(referer).path
+                    ref_parts = ref_path.lstrip("/").split("/", 1)
+                    ref_name = ref_parts[0] if ref_parts else ""
+                    if ref_name and _HUB.has(ref_name):
+                        return ref_name, path
+                except Exception:
+                    pass
+
+        return None
+
+    def _unknown_target_json(self, path):
+        name, _ = self._split_name(path)
+        self._send_json(
+            {"success": False, "message": f"unknown playground: {name}"},
+            404,
+        )
+
     # ---- management WS -----------------------------------------------
 
     def _serve_hub_ws(self):
@@ -318,7 +399,6 @@ class Handler(BaseHTTPRequestHandler):
         sock.settimeout(None)
 
         role = None
-        name = None
         registered_name = None
 
         try:
@@ -352,12 +432,12 @@ class Handler(BaseHTTPRequestHandler):
             elif role == "panel":
                 # Registered panel: the Python HubConnection of a
                 # remote_panel process. Behaves like a playground
-                # registration (register, hello_ack) so its launcher
-                # learns the hub URL and opens the panel through the
-                # proxy, and so it appears in /__playgrounds with
-                # role="panel" (excluded from the target dropdown
-                # by the panel's own role filter, shown in the
-                # management list with "(no actions)").
+                # registration — register, hello_ack, then a
+                # read-only loop. It is NOT added to panel_socks: a
+                # registered panel never sends kill / shutdown_hub
+                # and does not need playgrounds broadcasts (its
+                # browser-side counterpart opens a separate
+                # anonymous WS to receive those).
                 if name and port:
                     reg = Registration(name, port, role, pid, sock,
                                        html_file=html_file)
@@ -367,12 +447,14 @@ class Handler(BaseHTTPRequestHandler):
                         reg.send({"type": "hello_ack", "name": name})
                     except OSError:
                         return
-                # All panels (registered or anonymous browser
-                # listeners) join panel_socks so they receive
-                # `playgrounds` broadcasts. The `if name and port`
-                # above only adds to registrations.
-                _HUB.add_panel(sock)
-                self._read_panel_loop(sock)
+                    self._read_playground_loop(sock, name)
+                else:
+                    # Anonymous listener: the browser-side
+                    # management WS opened by rp_client.py. No name,
+                    # no port; joins panel_socks for `playgrounds`
+                    # broadcasts; can send `kill` / `shutdown_hub`.
+                    _HUB.add_panel(sock)
+                    self._read_panel_loop(sock)
 
         except Exception:
             pass
@@ -384,9 +466,10 @@ class Handler(BaseHTTPRequestHandler):
                 # the newer registration.
                 _HUB.deregister(registered_name, sock=sock)
             elif role == "panel":
-                _HUB.remove_panel(sock)
                 if registered_name:
                     _HUB.deregister(registered_name, sock=sock)
+                else:
+                    _HUB.remove_panel(sock)
             try:
                 sock.close()
             except OSError:
@@ -452,13 +535,18 @@ class Handler(BaseHTTPRequestHandler):
     # If it ever does, chunked decoding is a bounded addition here.
 
     def _proxy_http(self, path):
-        name, rest = self._split_name(path)
+        parsed = urlparse(self.path)
+        query = parsed.query
+
+        resolved = self._resolve_proxy_target(path)
+        if resolved is None:
+            self._unknown_target_json(path)
+            return
+        name, forward_path = resolved
+
         reg = _HUB.find(name)
         if reg is None:
-            self._send_json(
-                {"success": False, "message": f"unknown playground: {name}"},
-                404,
-            )
+            self._unknown_target_json(path)
             return
 
         try:
@@ -479,7 +567,11 @@ class Handler(BaseHTTPRequestHandler):
             headers["Host"] = f"{HUB_HOST}:{reg.port}"
             headers["Connection"] = "close"
 
-            req = f"{method} {rest} HTTP/1.1\r\n"
+            forward_with_query = (
+                forward_path + ("?" + query if query else "")
+            )
+
+            req = f"{method} {forward_with_query} HTTP/1.1\r\n"
             for k, v in headers.items():
                 req += f"{k}: {v}\r\n"
             req += "\r\n"
@@ -519,7 +611,15 @@ class Handler(BaseHTTPRequestHandler):
     # the socket is closed — no explicit deadline needed.
 
     def _proxy_ws(self, path):
-        name, rest = self._split_name(path)
+        parsed = urlparse(self.path)
+        query = parsed.query
+
+        resolved = self._resolve_proxy_target(path)
+        if resolved is None:
+            self.send_error(404, f"unknown playground: {path}")
+            return
+        name, forward_path = resolved
+
         reg = _HUB.find(name)
         if reg is None:
             self.send_error(404, f"unknown playground: {name}")
@@ -537,7 +637,11 @@ class Handler(BaseHTTPRequestHandler):
             headers = dict(self.headers.items())
             headers["Host"] = f"{HUB_HOST}:{reg.port}"
 
-            req = f"GET {rest} HTTP/1.1\r\n"
+            forward_with_query = (
+                forward_path + ("?" + query if query else "")
+            )
+
+            req = f"GET {forward_with_query} HTTP/1.1\r\n"
             for k, v in headers.items():
                 req += f"{k}: {v}\r\n"
             req += "\r\n"

@@ -43,6 +43,27 @@ so `rpPopulateTargets` knows whether to overwrite its value when the
 preset selection changes. Set on input, cleared on dropdown change.
 See rpPopulateTargets in rp_client.py for the consumer side.
 
+HUB SHUTDOWN FLOW
+=================
+The "Shut down hub" button in the management modal calls
+`rpShutdownHub()` (in rp_client.py) and renders its result into
+`#rpMgmtStatus`.  The button is disabled while the request is in
+flight and re-enabled only on failure; a successful ack leaves it
+disabled, since the hub process is about to exit.
+
+The status span cycles through:
+
+    ""                              (nothing sent yet)
+    "waiting for hub acknowledgment…"  (request in flight)
+    "hub is shutting down…"            (ack received)
+    "no acknowledgment from hub within 5s"  (timeout)
+    "hub not connected" / "send failed: …"  (preconditions)
+
+A successful shutdown leaves `_rp.shuttingDown` set, so reopening the
+modal afterwards shows the same "hub is shutting down…" state; the
+button stays disabled.  A failed one resets the flag, so reopening
+shows the fresh "Shut down hub" button, ready to retry.
+
 OPEN BUTTON URL
 ===============
 The Open button builds its URL from the registration entry's own
@@ -299,6 +320,7 @@ function rpBuildStateJSON() {
     hub: {
       url:         _rp.hubUrl,
       connected:   _rp.hubConnected,
+      shuttingDown: _rp.shuttingDown,
       playgrounds: _rp.playgrounds,
     },
   };
@@ -368,12 +390,42 @@ function rpDownloadState() {
    The Open button's URL is built from `pg.html_file`, which the
    playground carries in its registration (see hub_client.py and
    hub.py).  The `<name>_playground.html` fallback covers old hubs
-   that don't yet send the field. */
+   that don't yet send the field.
+
+   `#rpMgmtStatus` reports the hub-shutdown flow's state.  It is
+   reset on open only when `_rp.shuttingDown` is false: a successful
+   shutdown leaves the flag set and the modal shows the same
+   "hub is shutting down…" state on reopening.  A failed one resets
+   the flag so reopening shows the fresh button. */
 
 function rpOpenManagement() {
   const modal = document.getElementById("rpMgmtModal");
   if (!modal) return;
   rpRebuildManagementList();
+
+  const btn    = document.getElementById("rpMgmtShutdownHub");
+  const status = document.getElementById("rpMgmtStatus");
+
+  if (!_rp.shuttingDown) {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Shut down hub";
+    }
+    if (status) {
+      status.textContent = "";
+      status.className = "rp-modal-status";
+    }
+  } else {
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Shutting down\u2026";
+    }
+    if (status) {
+      status.textContent = "hub is shutting down\u2026";
+      status.className = "rp-modal-status ok";
+    }
+  }
+
   modal.hidden = false;
 }
 
@@ -618,6 +670,7 @@ function rpRebuildManagementList() {
   const mgmtClose    = document.getElementById("rpMgmtClose");
   const mgmtModal    = document.getElementById("rpMgmtModal");
   const mgmtShutdown = document.getElementById("rpMgmtShutdownHub");
+  const mgmtStatus   = document.getElementById("rpMgmtStatus");
 
   if (mgmtClose) mgmtClose.addEventListener("click", rpCloseManagement);
   if (mgmtModal) {
@@ -625,19 +678,71 @@ function rpRebuildManagementList() {
       if (e.target === mgmtModal) rpCloseManagement();
     });
   }
+
+  /* ---- hub shutdown button ------------------------------------ */
+  //
+  // Flow (see rp_client.py::rpShutdownHub's docstring for the
+  // full lifecycle):
+  //
+  //   1. Native confirm — the action is destructive and cannot
+  //      be undone (the hub and every playground exit).
+  //   2. Disable the button, mark it "Shutting down…", and put the
+  //      status span into a "waiting for ack" state.
+  //   3. Await rpShutdownHub().  It resolves when the ack arrives,
+  //      or fails after 5s.
+  //   4. On success: flip the status to "hub is shutting down…",
+  //      close the modal after a brief pause so the user reads it.
+  //   5. On failure: restore the button and status so the user can
+  //      retry.
+
   if (mgmtShutdown) {
-    mgmtShutdown.addEventListener("click", () => {
+    mgmtShutdown.addEventListener("click", async () => {
       if (!_rp.hubConnected) {
-        alert("Hub is not connected.");
+        if (mgmtStatus) {
+          mgmtStatus.textContent = "hub not connected";
+          mgmtStatus.className = "rp-modal-status bad";
+        }
         return;
       }
-      if (!confirm("Shut down the hub AND every playground it manages?")) {
+      if (!confirm(
+            "Shut down the hub AND every playground it manages?\n\n"
+          + "This will close every playground process and the hub "
+          + "itself. You'll need to start a playground again to "
+          + "bring the hub back up."
+      )) {
         return;
       }
-      try {
-        _rp.hubSocket.send(JSON.stringify({ type: "shutdown_hub" }));
-      } catch (e) {}
-      rpCloseManagement();
+
+      mgmtShutdown.disabled = true;
+      mgmtShutdown.textContent = "Shutting down\u2026";
+      if (mgmtStatus) {
+        mgmtStatus.textContent = "waiting for hub acknowledgment\u2026";
+        mgmtStatus.className = "rp-modal-status warn";
+      }
+
+      const result = await rpShutdownHub();
+
+      if (result.ok) {
+        if (mgmtStatus) {
+          mgmtStatus.textContent = "hub is shutting down\u2026";
+          mgmtStatus.className = "rp-modal-status ok";
+        }
+        // Leave the modal open briefly so the user sees the
+        // confirmation; after that the underlying WS is dead and
+        // the modal is no longer useful.
+        setTimeout(() => {
+          const m = document.getElementById("rpMgmtModal");
+          if (m) m.hidden = true;
+        }, 1500);
+      } else {
+        if (mgmtStatus) {
+          mgmtStatus.textContent =
+            result.error || "shutdown failed";
+          mgmtStatus.className = "rp-modal-status bad";
+        }
+        mgmtShutdown.disabled = false;
+        mgmtShutdown.textContent = "Shut down hub";
+      }
     });
   }
 

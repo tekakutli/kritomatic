@@ -46,7 +46,7 @@ class CommandHandler(AutoDispatchHandler):
         # The lambda is deferred, so the comfyui handler only needs to
         # exist by the time the panel handler calls it, not now.
         self.handlers['panel'].set_comfy_status_puller(
-            lambda: self.handlers['comfyui'].comfy_status({})
+            lambda: self.handlers['comfyui'].execute('comfy_status', {})
         )
 
         self._sub_handlers = list(self.handlers.values())

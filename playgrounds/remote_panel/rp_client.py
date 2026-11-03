@@ -88,6 +88,38 @@ VISIBLE:FALSE FIELDS
 no DOM row, and `rpRebuildFields` skips the `null` return.
 `rpUpdateWidget` and `rpOnState` need no change — they already
 no-op for names with no `_rp.fields` entry.
+
+HUB SHUTDOWN FLOW
+=================
+`rpShutdownHub()` is the JS-side promise wrapper around the
+`shutdown_hub` message.  It is called by the "Shut down hub"
+button in `rp_ui.py`'s management modal.  Its lifecycle:
+
+    1. Sets `_rp.shuttingDown = true` before sending.  This is what
+       stops `_rpScheduleHubReconnect` and `rpScheduleReconnect`
+       from firing while we're waiting — without it, the WS close
+       that follows would kick both into retry loops.
+
+    2. Sends `{type: "shutdown_hub"}` over the management WS.
+
+    3. Waits for `shutdown_ack`.  The hub handler ack's immediately
+       and schedules `os._exit(0)` for 0.5s later; the ack arrives
+       while the WS is still open.
+
+    4. On ack: resolves `{ok: true}`, disconnects the playground
+       WS cleanly, marks `_rp.connected`, `_rp.hubConnected`, and
+       `_rp.clientId` false/null, and leaves `_rp.shuttingDown`
+       true so neither WS tries to reconnect.
+
+    5. On timeout (5s) or send failure: resolves `{ok: false,
+       error: ...}` and resets `_rp.shuttingDown` to false so
+       reconnects resume — the user can retry.
+
+The hub itself sends `shutdown` (not `shutdown_ack`) to *other*
+registered panels before exiting.  `_rpHandleHubMessage` treats
+that identically to a `shutdown_ack` (it doesn't carry a
+`request_id` the client cares about) so a second tab that didn't
+initiate the shutdown also stops reconnecting.
 """
 
 RP_CLIENT_JS = r"""
@@ -125,6 +157,19 @@ const _rp = {
                              //    connected_at }]
   hubReconnectMs:    1000,
   hubReconnectTimer: null,
+
+  // ---- hub shutdown flow -----------------------------------------
+  // Set to true by rpShutdownHub() before sending shutdown_hub; both
+  // reconnect schedulers bail when it's set.  Also set to true by
+  // _rpHandleHubMessage on a shutdown_ack or a shutdown notice from
+  // the hub, so the resulting WS close doesn't kick a retry loop.
+  shuttingDown:      false,
+  // Timer armed by rpShutdownHub() that fails the promise if no
+  // acknowledgment arrives within 5s.  Cleared by the ack handler.
+  shutdownTimeoutId: null,
+  // The resolver passed into the promise.  Called exactly once, either
+  // by _rpHandleHubMessage (ack/shutdown notice) or by the timeout.
+  shutdownResolve:   null,
 };
 
 const RP_PROTOCOL_VERSION = 1;
@@ -186,7 +231,9 @@ function rpConnect(target) {
     _rp.clientId  = null;
     rpSetStatus("disconnected");
     rpLog("info", "disconnected");
-    rpScheduleReconnect();
+    // Do not schedule a reconnect if the hub is shutting down — the
+    // close is the expected end of the shutdown flow, not a blip.
+    if (!_rp.shuttingDown) rpScheduleReconnect();
   });
 
   sock.addEventListener("error", () => {});
@@ -210,12 +257,17 @@ function rpDisconnect() {
 }
 
 function rpScheduleReconnect() {
+  // Never retry when the hub has been deliberately shut down.  This
+  // is set either by rpShutdownHub() (our own click) or by
+  // _rpHandleHubMessage (another tab's shutdown, delivered as the
+  // hub's `shutdown` message).
+  if (_rp.shuttingDown) return;
   if (!_rp.everConnected) return;
   if (!_rp.target) return;
   if (_rp.reconnectTimer) return;
   _rp.reconnectTimer = setTimeout(() => {
     _rp.reconnectTimer = null;
-    if (!_rp.connected && _rp.target) {
+    if (!_rp.connected && _rp.target && !_rp.shuttingDown) {
       rpLog("info", "reconnecting to " + _rp.target + "\u2026");
       rpConnect(_rp.target);
     }
@@ -760,6 +812,10 @@ function _rpConnectHub() {
     _rp.hubSocket = null;
   }
   if (!_rp.hubUrl) return;
+  // Don't reconnect if we've deliberately shut the hub down (or
+  // received a shutdown notice for it).  This guard also means the
+  // boot's setTimeout(rpDiscoverHub, 200) is a no-op after shutdown.
+  if (_rp.shuttingDown) return;
 
   let sock;
   try { sock = new WebSocket(_rp.hubUrl); }
@@ -786,13 +842,23 @@ function _rpConnectHub() {
     _rp.playgrounds = [];
     rpLog("info", "hub management disconnected");
     rpPopulateTargets();
-    rpScheduleHubReconnect();
+    if (typeof rpRebuildManagementList === "function") {
+      rpRebuildManagementList();
+    }
+    // The close listener fires whether the hub died, we closed it,
+    // or the network dropped.  Only schedule a reconnect in the
+    // last case: `shuttingDown` covers the first two.
+    if (!_rp.shuttingDown) _rpScheduleHubReconnect();
   });
 
   sock.addEventListener("error", () => {});
 }
 
 function _rpScheduleHubReconnect() {
+  // Same guard as rpScheduleReconnect: once the user (or another
+  // panel) has shut the hub down, retrying is a no-op that would
+  // spin against a dead socket forever.
+  if (_rp.shuttingDown) return;
   if (_rp.hubReconnectTimer) return;
   _rp.hubReconnectTimer = setTimeout(() => {
     _rp.hubReconnectTimer = null;
@@ -824,9 +890,115 @@ function _rpHandleHubMessage(msg) {
     return;
   }
   if (msg.type === "shutdown_ack") {
+    // The hub accepted our shutdown_hub request.  Resolve the
+    // promise (so the modal's click handler can update its status),
+    // disconnect the playground WS cleanly, and mark state so that
+    // no reconnect fires when the hub closes the WS half a second
+    // later (it calls os._exit).
     rpLog("info", "hub shutdown acknowledged");
+    if (_rp.shutdownResolve) {
+      _rp.shutdownResolve({ ok: true });
+    }
+    if (_rp.socket) {
+      try { _rp.socket.close(); } catch (e) {}
+      _rp.socket = null;
+    }
+    _rp.connected     = false;
+    _rp.clientId      = null;
+    _rp.hubConnected  = false;
+    _rp.playgrounds   = [];
+    rpSetStatus("disconnected");
     return;
   }
+  if (msg.type === "shutdown") {
+    // The hub is shutting down (this arrives on *other* registered
+    // panels; the initiator gets `shutdown_ack` instead).  Same
+    // state treatment so a second tab doesn't retry forever either.
+    rpLog("info", "hub is shutting down (received shutdown notice)");
+    _rp.shuttingDown = true;
+    if (_rp.shutdownResolve) {
+      _rp.shutdownResolve({ ok: true });
+    }
+    if (_rp.socket) {
+      try { _rp.socket.close(); } catch (e) {}
+      _rp.socket = null;
+    }
+    _rp.connected     = false;
+    _rp.clientId      = null;
+    _rp.hubConnected  = false;
+    _rp.playgrounds   = [];
+    rpSetStatus("disconnected");
+    return;
+  }
+}
+
+/* ==========================================================================
+   HUB SHUTDOWN
+   ==========================================================================
+   Promise-returning wrapper for the `shutdown_hub` request.  Called
+   by the "Shut down hub" button in rp_ui.py.  The lifecycle is
+   documented in the module docstring (HUB SHUTDOWN FLOW).
+
+   Resolution values:
+     {ok: true}                     hub acked; state is already torn
+                                    down by _rpHandleHubMessage.
+     {ok: false, error: "..."}      one of:
+                                      - "hub not connected"
+                                      - "already shutting down"
+                                      - "send failed: <msg>"
+                                      - "no acknowledgment from hub
+                                         within 5s" */
+
+function rpShutdownHub() {
+  return new Promise((resolve) => {
+    if (!_rp.hubSocket || !_rp.hubConnected) {
+      resolve({ ok: false, error: "hub not connected" });
+      return;
+    }
+    if (_rp.shuttingDown) {
+      resolve({ ok: false, error: "already shutting down" });
+      return;
+    }
+
+    if (_rp.shutdownTimeoutId) {
+      clearTimeout(_rp.shutdownTimeoutId);
+      _rp.shutdownTimeoutId = null;
+    }
+
+    _rp.shuttingDown = true;
+
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      if (_rp.shutdownTimeoutId) {
+        clearTimeout(_rp.shutdownTimeoutId);
+        _rp.shutdownTimeoutId = null;
+      }
+      // On failure reset the flag so reconnect schedulers resume and
+      // the user can retry.  On success leave it set — _rpHandleHubMessage
+      // has already torn down both sockets and set the flag.
+      if (!result.ok) _rp.shuttingDown = false;
+      _rp.shutdownResolve = null;
+      resolve(result);
+    };
+
+    _rp.shutdownResolve = finish;
+
+    _rp.shutdownTimeoutId = setTimeout(() => {
+      finish({
+        ok: false,
+        error: "no acknowledgment from hub within 5s",
+      });
+    }, 5000);
+
+    try {
+      _rp.hubSocket.send(JSON.stringify({ type: "shutdown_hub" }));
+      rpLog("info", "sent shutdown_hub; waiting for ack\u2026");
+    } catch (e) {
+      finish({ ok: false, error: "send failed: " + e.message });
+    }
+  });
 }
 
 function rpKillPlayground(name, hard) {

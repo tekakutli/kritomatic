@@ -1,29 +1,15 @@
 """
 rp_base.py — the remote panel's CSS and HTML structure.
 
-This revision adds a "Manage" button and a management modal
-(`#rpMgmtModal`) that shows the pgkit hub's registered playgrounds
-and offers cooperative (Kill) and escalated (Force) shutdowns.  The
-modal's contents are populated by `rpRebuildManagementList` in
-`rp_ui.py` from the `playgrounds` events on the hub WS.  It is
-disabled when the hub is not reachable — see `rpDiscoverHub` in
-`rp_client.py`.
+Adds a small `#rpMgmtStatus` span to the Manage modal's footer so the
+shutdown flow can report state ("waiting for hub acknowledgment…",
+"hub is shutting down…", "no acknowledgment within 5s") without the
+user having to open the collapsed log panel.  `.rp-modal-status`
+carries the color classes used by that span.
 
-The "State JSON" modal from the previous revision is unchanged.
-
-TEMPLATE IS REGISTRY-FIRST
-==========================
-The `#rpPreset` dropdown contains a single `custom` option and
-nothing else.  `rpPopulateTargets` in `rp_client.py` populates it
-from the hub registry on every `playgrounds` event; the template
-must not carry a stale static list, because a static list would
-contradict the "registry is the only source of truth" design
-decision the panel just adopted.
-
-The `#rpTarget` placeholder is likewise neutral (`ws://host:port/
-remote`) — a concrete example URL baked into the template would be
-out of date the moment any playground's default port changed, and
-the placeholder only ever shows when the field is empty anyway.
+Everything else — topbar, actions panel, fields panel, log panel,
+action-form modal, state-JSON modal, kill/force buttons, management
+list rows — is unchanged.
 """
 
 RP_CSS = r"""
@@ -643,7 +629,7 @@ RP_CSS = r"""
     text-transform: uppercase;
     font-weight: 700;
   }
-  .rp-modal-buttons button:hover {
+  .rp-modal-buttons button:hover:not(:disabled) {
     border-color: var(--border-3);
     color: var(--text);
     background: rgba(220,230,242,0.03);
@@ -653,6 +639,28 @@ RP_CSS = r"""
     border-color: var(--border);
     cursor: not-allowed;
   }
+
+  /* Inline status text in the modal footer.  Sits to the left of the
+     buttons (the buttons carry `flex: 0 0 auto` implicitly; the span
+     grows to fill the space in between).  Used by the hub-shutdown
+     flow to report state without requiring the log panel to be
+     open. */
+  .rp-modal-status {
+    flex: 1 1 auto;
+    align-self: center;
+    font-size: 10px;
+    color: var(--text-mute);
+    letter-spacing: 0.02em;
+    text-align: right;
+    padding-right: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .rp-modal-status.ok   { color: var(--accent); }
+  .rp-modal-status.warn { color: var(--warn); }
+  .rp-modal-status.bad  { color: var(--danger); }
+
   #rpModalSend,
   #rpStateDownload {
     border-color: rgba(0,229,255,0.55);
@@ -854,6 +862,7 @@ RP_BODY = r"""
                 border:1px solid #1e2836;border-radius:2px;">
     </div>
     <div class="rp-modal-buttons">
+      <span id="rpMgmtStatus" class="rp-modal-status"></span>
       <button id="rpMgmtShutdownHub"
               title="Ask the hub to shut down, and every playground
                      it manages with it.">

@@ -16,13 +16,15 @@ Built-in colon commands:
     :quit / :q   exit
 
 Hub-management verbs (available from any REPL; they act on the hub,
-not the connected playground):
+not on the connected playground):
     pg-list                list every playground registered with the hub
     kill NAME [--force]    shut down a playground (cooperative, or SIGTERM
                            escalation with --force)
+    shutdown-hub           ask the hub to exit (takes every playground
+                           with it)
 
-Both `pg-list` and `kill` are one-shot: they open a short-lived
-connection to the hub's management WS, act, and close.  No polling.
+All three are one-shot: they open a short-lived connection to the
+hub's management WS, act, and close.  No polling.
 
 TAG
 ===
@@ -73,6 +75,8 @@ Hub management (one-shot, event-driven, no polling):
   pg-list                      List playgrounds registered with the hub
   kill NAME [--force]          Shut down a playground (cooperative;
                                --force escalates to SIGTERM)
+  shutdown-hub                 Ask the hub to exit (takes every
+                               playground with it)
 
 Colon commands:
   :refresh                     Request fresh state from the browser
@@ -121,7 +125,7 @@ def _refresh_completion(client: RemoteCliClient) -> None:
             "ls", "show", "schema", "actions", "entities",
             "presence", "state", "set", "action",
             "select", "deselect", "raw",
-            "pg-list", "kill",
+            "pg-list", "kill", "shutdown-hub",
             "help", "quit", "exit",
         ],
     })
@@ -398,6 +402,8 @@ def _dispatch(client: RemoteCliClient, config: dict, line: str) -> bool:
             name = rest[0]
             hard = "--force" in rest[1:] or "-f" in rest[1:]
             _repl_kill(config, name, hard)
+        elif verb == "shutdown-hub":
+            _repl_shutdown_hub(config)
         else:
             print(f"unknown command: {verb}", file=sys.stderr)
 
@@ -442,6 +448,18 @@ def _repl_kill(config: dict, name: str, hard: bool):
     else:
         print(f"error: {msg.get('message', 'kill failed')}",
               file=sys.stderr)
+
+
+def _repl_shutdown_hub(config: dict):
+    msg = _hub_one_shot(
+        config,
+        send_msg={"type": "shutdown_hub"},
+        wait_for="shutdown_ack",
+        timeout=5.0,
+    )
+    if msg is None:
+        return
+    print("ok: hub shutdown requested (all playgrounds will exit)")
 
 
 def _print_ls(client, prefix):

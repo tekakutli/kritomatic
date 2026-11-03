@@ -106,6 +106,9 @@ import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitRegisterField,
   pgkitNotifyLocal, pgkitNotifyAll,
 } from "./pgkit/remote_client.js";
+import {
+  state, viewFloor, viewWall, callDraw,
+} from "./pg_state.js";
 
 /* ==========================================================================
    VERTICAL MENU — translation pass

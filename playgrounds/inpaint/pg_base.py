@@ -77,6 +77,22 @@ PG_CSS = r"""
     background: rgba(180, 155, 255, 0.10);
     color: #e8e0ff;
   }
+  #ui button#maskFromRectBtn {
+    border-color: rgba(180, 155, 255, 0.72);
+    color: #d5c8ff;
+    font-size: 9px;
+    padding: 2px 8px;
+    width: auto;
+  }
+  #ui button#maskFromRectBtn:hover:not(:disabled) {
+    border-color: rgba(200, 180, 255, 1.00);
+    background: rgba(180, 155, 255, 0.10);
+    color: #e8e0ff;
+  }
+  #ui button#maskFromRectBtn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
   #kritaStatus {
     font-size: 10px;
     color: #5a6774;
@@ -288,8 +304,13 @@ PG_PANEL_BODY = r"""
       <div class="section-body">
         <div class="field">
           <label>Context rectangle</label>
-          <input type="checkbox" id="inpaintEnabled"
-                 title="When checked, inpainting is restricted to the rectangle drawn on the canvas. When unchecked, the whole canvas is the context and the rectangle is hidden.">
+          <span style="display:flex;gap:6px;align-items:center;">
+            <input type="checkbox" id="inpaintEnabled"
+                   title="When checked, inpainting is restricted to the rectangle drawn on the canvas. When unchecked, the whole canvas is the context and the rectangle is hidden.">
+            <button id="maskFromRectBtn"
+                    title="Create a new mask from the current context rectangle (white = inside, black = outside). The new mask is placed at the top of the mask stack and selected."
+                    disabled>+ As mask</button>
+          </span>
         </div>
         <div id="inpaintRectHint" class="runHint"
              style="margin-top:4px;display:none;">

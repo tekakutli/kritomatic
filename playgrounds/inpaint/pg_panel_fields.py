@@ -1,6 +1,6 @@
 """Per-frame panel sync: image info, mask count, inpaint button
-enablement, cancel button enablement, context-rectangle checkbox and
-hint visibility, status line.
+enablement, cancel button enablement, mask-from-rect enablement,
+context-rectangle checkbox and hint visibility, status line.
 
 The function is called once per frame from `pg_dispatch.draw()`.
 Every DOM write is guarded against the current DOM value so a
@@ -28,6 +28,7 @@ function _get() {
     pickMaskBtn:     document.getElementById("pickMaskBtn"),
     kritaImportBtn:  document.getElementById("kritaImportBtn"),
     kritaImportMasksBtn: document.getElementById("kritaImportMasksBtn"),
+    maskFromRectBtn: document.getElementById("maskFromRectBtn"),
   };
   return _els;
 }
@@ -93,6 +94,26 @@ export function syncPanelFields() {
     else                        e.inpaintBtn.title = "Run the inpaint workflow";
   }
   if (e.cancelBtn) e.cancelBtn.disabled = !busy;
+
+  // maskFromRectBtn: needs an image, a drawn rect, and inpaint mode
+  // active — otherwise the button has nothing meaningful to turn
+  // into a mask (buildContextMaskB64 would either fail or return
+  // the "whole canvas is the context" white mask).
+  const hasRect = !!(board.inpaintContext
+                     && board.inpaintContext.w > 0
+                     && board.inpaintContext.h > 0);
+  if (e.maskFromRectBtn) {
+    e.maskFromRectBtn.disabled =
+      !hasImage || !board.inpaintEnabled || !hasRect || busy;
+    if (!hasImage)                  e.maskFromRectBtn.title =
+      "Load an image first";
+    else if (!board.inpaintEnabled) e.maskFromRectBtn.title =
+      "Enable the context rectangle first";
+    else if (!hasRect)              e.maskFromRectBtn.title =
+      "Draw the context rectangle first";
+    else                            e.maskFromRectBtn.title =
+      "Create a new mask from the current context rectangle (white = inside, black = outside). The new mask is placed at the top of the mask stack and selected.";
+  }
 
   if (e.pickImageBtn) e.pickImageBtn.disabled = busy;
   if (e.clearImageBtn) e.clearImageBtn.disabled = busy;

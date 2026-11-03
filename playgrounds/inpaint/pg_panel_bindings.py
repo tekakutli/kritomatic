@@ -6,6 +6,7 @@ Operations exposed by this playground:
   - Load masks (import from Krita, pick a PNG file)
   - Select / delete masks
   - Rotate the playground view (slider)
+  - Materialise the context rectangle as a mask
   - Inpaint
   - Cancel
   - ComfyUI / Krita status checks
@@ -22,6 +23,7 @@ import {
   selectedMask, selectedMaskIdx,
   replaceMaskSelection,
 } from "./pg_masks.js";
+import { buildMaskFromContextRectB64 } from "./pg_inpaint.js";
 import { syncMaskList } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
 import { uploadImageFile, fetchStatus, runInpaint, interruptInpaint }
@@ -121,6 +123,58 @@ function _clearImageAction() {
   if (rotNumEl) rotNumEl.value = "0";
   syncPanelFields();
   syncMaskList();
+  pgkitNotifyAll();
+  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+}
+
+/* ============================================================
+   Mask from context rectangle
+   ============================================================
+   Materialises the current context rectangle as a new mask
+   entry in the stack.
+
+   The mask is built via `buildMaskFromContextRectB64`, which
+   stores the rect *inverse-rotated* by `view.rotation` around
+   the image centre.  Every mask is drawn under the view's
+   rotation transform, so the inverse rotation cancels on
+   display and the mask lands on screen exactly where the
+   axis-aligned context rectangle appears.  Storing the plain
+   axis-aligned rect (as `buildContextMaskB64` does) would make
+   the mask appear rotated on screen, off-position relative to
+   the visible context rect.
+
+   Only meaningful when the rectangle is enabled: when
+   `inpaintEnabled === false`, there is no rectangle to convert.
+   The button is disabled in that state; the check below is the
+   belt-and-braces version. */
+
+function _maskFromRectAction() {
+  if (!board.imageHash) {
+    flashStatus("Load an image first", "warn");
+    return;
+  }
+  if (!board.inpaintEnabled) {
+    flashStatus("Enable the context rectangle first", "warn");
+    return;
+  }
+  const c = board.inpaintContext;
+  if (!c || c.w <= 0 || c.h <= 0) {
+    flashStatus("Draw the context rectangle first", "warn");
+    return;
+  }
+
+  const b64 = buildMaskFromContextRectB64();
+  if (!b64) {
+    flashStatus("Could not build mask", "bad");
+    return;
+  }
+
+  const idx = addMaskFromB64(b64);
+  board.selectedMaskIndices = [idx];
+
+  flashStatus("created mask " + (idx + 1) + " from context rectangle", "ok");
+  syncMaskList();
+  syncPanelFields();
   pgkitNotifyAll();
   import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
 }
@@ -511,6 +565,7 @@ export function installPanelBindings() {
     "pickImageBtn", "clearImageBtn", "pickMaskBtn",
     "kritaImportBtn", "kritaImportMasksBtn",
     "kritaCheckBtn",
+    "maskFromRectBtn",
   ];
   for (const id of ids) el[id] = document.getElementById(id);
 
@@ -522,6 +577,7 @@ export function installPanelBindings() {
   if (el.kritaImportBtn) el.kritaImportBtn.addEventListener("click", _kritaImportAction);
   if (el.kritaImportMasksBtn) el.kritaImportMasksBtn.addEventListener("click", _kritaImportMasksAction);
   if (el.kritaCheckBtn) el.kritaCheckBtn.addEventListener("click", _kritaStatusRefresh);
+  if (el.maskFromRectBtn) el.maskFromRectBtn.addEventListener("click", _maskFromRectAction);
 
   const statusEl = document.getElementById("statusLine");
   if (statusEl) {
@@ -584,6 +640,11 @@ pgkitRegisterAction("action.kritaImport", {
 pgkitRegisterAction("action.kritaImportMasks", {
   label: "Import masks from Krita", scope: "global",
   run: _kritaImportMasksAction,
+  meta: { variant: "plain" },
+});
+pgkitRegisterAction("action.maskFromRect", {
+  label: "Mask from context rectangle", scope: "global",
+  run: _maskFromRectAction,
   meta: { variant: "plain" },
 });
 

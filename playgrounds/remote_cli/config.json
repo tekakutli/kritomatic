@@ -1,5 +1,5 @@
 {
   "hub": "ws://127.0.0.1:8780",
-  "default_target": "sam3",
+  "default_target": "segment",
   "timeout": 10.0
 }

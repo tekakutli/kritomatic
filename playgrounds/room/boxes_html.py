@@ -64,8 +64,8 @@ import sys
 
 _HERE   = os.path.dirname(os.path.abspath(__file__))
 _PARENT = os.path.dirname(_HERE)
-_SHARED = os.path.join(_PARENT, "shared")
-for _p in (_HERE, _PARENT, _SHARED):
+_SHARED_CABLE_ROOM = os.path.join(_PARENT, "shared_cable_room")
+for _p in (_HERE, _PARENT, _SHARED_CABLE_ROOM):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 

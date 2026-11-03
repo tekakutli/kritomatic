@@ -1,4 +1,4 @@
-"""Vendored ComfyUI client + tooling for the SAM3 playground.
+"""Vendored ComfyUI client + tooling for the browser playgrounds.
 
 `client.py` and `tooling.py` are copied verbatim from
 kritomatic_daemon/utils/comfyui_client.py and comfyui_tooling.py

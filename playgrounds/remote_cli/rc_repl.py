@@ -1,7 +1,7 @@
 """
 rc_repl — interactive readline shell for a pgkit playground.
 
-    remote_cli --target sam3      # enter REPL
+    remote_cli --target segment      # enter REPL
 
 Verbs mirror the one-shot CLI subcommands. Tab completion covers
 field names (from `schema`), action kinds, level names and item names
@@ -28,8 +28,8 @@ hub's management WS, act, and close.  No polling.
 
 TAG
 ===
-The prompt shows the target name (`sam3>`) when the REPL was entered
-via `--target sam3`; it shows the full URL when entered via `--url`.
+The prompt shows the target name (`segment>`) when the REPL was entered
+via `--target segment`; it shows the full URL when entered via `--url`.
 `main()` passes the name through `target_name=`, so the REPL does not
 need to reverse-look it up.
 """

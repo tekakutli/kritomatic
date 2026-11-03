@@ -2,7 +2,7 @@
 """
 remote_cli — command-line client for pgkit playgrounds.
 
-    python remote_cli.py --target sam3 [COMMAND ...]
+    python remote_cli.py --target segment [COMMAND ...]
     python remote_cli.py --url ws://127.0.0.1:8773/remote [COMMAND ...]
     python remote_cli.py [COMMAND ...]           # uses default_target
 
@@ -129,7 +129,7 @@ CONFIG_PATH = _HERE / "config.json"
 
 DEFAULT_CONFIG = {
     "hub": "ws://127.0.0.1:8780",
-    "default_target": "sam3",
+    "default_target": "segment",
     "timeout": 10.0,
 }
 
@@ -696,15 +696,15 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  remote_cli --target sam3 ls\n"
-            "  remote_cli --target sam3 set settings.threshold=0.55\n"
-            "  remote_cli --target sam3 action action.segmentAll\n"
-            "  remote_cli --target sam3 script flow.json\n"
+            "  remote_cli --target segment ls\n"
+            "  remote_cli --target segment set settings.threshold=0.55\n"
+            "  remote_cli --target segment action action.segmentAll\n"
+            "  remote_cli --target segment script flow.json\n"
             "  remote_cli --target board --direct ls     # bypass hub proxy\n"
             "  remote_cli --url ws://127.0.0.1:8773/remote ls  # standalone\n"
             "  remote_cli list-targets\n"
             "  remote_cli shutdown-hub\n"
-            "  remote_cli --target sam3\n"
+            "  remote_cli --target segment\n"
         ),
     )
     p.add_argument("--url", default=None,

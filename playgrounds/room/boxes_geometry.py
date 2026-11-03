@@ -11,9 +11,9 @@ rest of the boxes playground reads:
         "cutZ":      <mm>,
     }
 
-The sidecar lives at playgrounds/shared/room_walls.json, next to the
+The sidecar lives at playgrounds/shared_cable_room/room_walls.json, next to the
 shared room.py that generates it.  WALLS_FILE below resolves to that
-path via `_SHARED` computed from this module's own location, so the
+path via `_SHARED_CABLE_ROOM` computed from this module's own location, so the
 reader works from any working directory.
 
 Primary path — `planFaces`
@@ -51,8 +51,9 @@ import os
 
 
 _HERE   = os.path.dirname(os.path.abspath(__file__))
-_SHARED = os.path.normpath(os.path.join(_HERE, "..", "shared"))
-WALLS_FILE = os.path.join(_SHARED, "room_walls.json")
+_SHARED_CABLE_ROOM = os.path.normpath(
+    os.path.join(_HERE, "..", "shared_cable_room"))
+WALLS_FILE = os.path.join(_SHARED_CABLE_ROOM, "room_walls.json")
 DEFAULT_CUT_Z = 1200.0
 
 

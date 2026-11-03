@@ -1,4 +1,4 @@
-"""Minimal image utilities for the SAM3 playground.
+"""Minimal image utilities for the browser playgrounds.
 
 Replaces the Krita-specific parts of kritomatic's comfyui_krita.py. Only
 what a browser-driven workflow needs: raw bytes → PNG, PNG → raw bytes,

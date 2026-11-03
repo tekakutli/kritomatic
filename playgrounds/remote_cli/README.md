@@ -50,7 +50,7 @@ is checked into the repo, and is edited in place.
 ```json
 {
   "hub": "ws://127.0.0.1:8780",
-  "default_target": "sam3",
+  "default_target": "segment",
   "timeout": 10.0
 }
 ```
@@ -70,19 +70,19 @@ a one-line warning on stderr; the CLI keeps working either way.
 python remote_cli/remote_cli.py list-targets
 
 # Inspect a playground
-python remote_cli/remote_cli.py --target sam3 ls
-python remote_cli/remote_cli.py --target sam3 schema
-python remote_cli/remote_cli.py --target sam3 actions
-python remote_cli/remote_cli.py --target sam3 entities
+python remote_cli/remote_cli.py --target segment ls
+python remote_cli/remote_cli.py --target segment schema
+python remote_cli/remote_cli.py --target segment actions
+python remote_cli/remote_cli.py --target segment entities
 
 # Set fields and run actions
-python remote_cli/remote_cli.py --target sam3 set settings.threshold=0.55
-python remote_cli/remote_cli.py --target sam3 action action.segmentAll
-python remote_cli/remote_cli.py --target sam3 select masks mask.0
+python remote_cli/remote_cli.py --target segment set settings.threshold=0.55
+python remote_cli/remote_cli.py --target segment action action.segmentAll
+python remote_cli/remote_cli.py --target segment select masks mask.0
 
 # Scripted sequences with waits and asserts
-python remote_cli/remote_cli.py --target sam3 script flow.json
-python remote_cli/remote_cli.py --target sam3 validate flow.json
+python remote_cli/remote_cli.py --target segment script flow.json
+python remote_cli/remote_cli.py --target segment validate flow.json
 
 # Bypass the hub proxy, still using the registry
 python remote_cli/remote_cli.py --target board --direct ls
@@ -100,12 +100,12 @@ structured form (`ls`, `show`, `schema`, `actions`, `entities`,
 Running `remote_cli` with no subcommand enters a readline shell:
 
 ```bash
-python remote_cli/remote_cli.py --target sam3
-sam3> ls
-sam3> set settings.threshold 0.55
-sam3> action action.segmentAll
-sam3> entities
-sam3> quit
+python remote_cli/remote_cli.py --target segment
+segment> ls
+segment> set settings.threshold 0.55
+segment> action action.segmentAll
+segment> entities
+segment> quit
 ```
 
 The prompt shows the target name when entered via `--target`, or the
@@ -126,9 +126,9 @@ are one-shot — they open a short-lived WS to `/__hub_ws`, act, and
 close — so they never leave a dangling panel connection behind.
 
 ```
-sam3> pg-list                # list every playground registered with the hub
-sam3> kill board             # cooperative shutdown (WS shutdown message)
-sam3> kill board --force     # escalate to SIGTERM if cooperative fails
+segment> pg-list                # list every playground registered with the hub
+segment> kill board             # cooperative shutdown (WS shutdown message)
+segment> kill board --force     # escalate to SIGTERM if cooperative fails
 ```
 
 `pg-list` also populates the tab-completion cache for `kill`'s target

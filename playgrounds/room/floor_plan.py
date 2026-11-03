@@ -19,10 +19,11 @@ import build123d.  The heavy lifting lives in:
     floor_plan_png        SVG → PNG via cairosvg (optional)
     floor_plan_i18n       the translation table and the T() accessor
 
-The two sidecars live at playgrounds/shared/.  `_SHARED` puts that
-directory on sys.path for `playground_fonts` (imported by
-floor_plan_draw), and floor_plan_geometry resolves the two JSON paths
-relative to its own location.
+The two sidecars live at playgrounds/shared_cable_room/.
+`_SHARED_CABLE_ROOM` puts that directory on sys.path for
+`playground_fonts` (imported by floor_plan_draw), and
+floor_plan_geometry resolves the two JSON paths relative to its own
+location.
 
 Language
 --------
@@ -40,8 +41,8 @@ import sys
 
 _HERE   = os.path.dirname(os.path.abspath(__file__))
 _PARENT = os.path.dirname(_HERE)
-_SHARED = os.path.join(_PARENT, "shared")
-for _p in (_HERE, _PARENT, _SHARED):
+_SHARED_CABLE_ROOM = os.path.join(_PARENT, "shared_cable_room")
+for _p in (_HERE, _PARENT, _SHARED_CABLE_ROOM):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 

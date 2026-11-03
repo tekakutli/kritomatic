@@ -2,7 +2,7 @@
 floor_plan_geometry.py — read the two room sidecars into the geom dict
 the floor-plan drawer consumes.
 
-room.py writes two files, both at playgrounds/shared/:
+room.py writes two files, both at playgrounds/shared_cable_room/:
 
     room_walls.json        the built geometry — surfaces, planFaces,
                            columns, steps, openings
@@ -10,7 +10,7 @@ room.py writes two files, both at playgrounds/shared/:
                            entries and notes-block lines
 
 DEFAULT_WALLS_FILE and DEFAULT_DIMENSIONS_FILE below resolve to those
-paths via `_SHARED` computed from this module's own location, so the
+paths via `_SHARED_CABLE_ROOM` computed from this module's own location, so the
 reader works from any working directory.
 
 The drawer reads both.  It does not read room.step and does not
@@ -24,9 +24,10 @@ from floor_plan_i18n import T
 
 
 _HERE   = os.path.dirname(os.path.abspath(__file__))
-_SHARED = os.path.normpath(os.path.join(_HERE, "..", "shared"))
-DEFAULT_WALLS_FILE      = os.path.join(_SHARED, "room_walls.json")
-DEFAULT_DIMENSIONS_FILE = os.path.join(_SHARED, "room_dimensions.json")
+_SHARED_CABLE_ROOM = os.path.normpath(
+    os.path.join(_HERE, "..", "shared_cable_room"))
+DEFAULT_WALLS_FILE      = os.path.join(_SHARED_CABLE_ROOM, "room_walls.json")
+DEFAULT_DIMENSIONS_FILE = os.path.join(_SHARED_CABLE_ROOM, "room_dimensions.json")
 
 
 def _signed_area(ring):

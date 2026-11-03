@@ -53,6 +53,7 @@ def main():
         routes         = sam3_server.ROUTES,
         raw_routes     = sam3_server.RAW_ROUTES,
         module_sources = sam3_segment_html.module_sources(),
+        hub_name       = "sam3",
     )
 
 

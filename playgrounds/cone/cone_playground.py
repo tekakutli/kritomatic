@@ -56,6 +56,7 @@ def main():
             html_file      = HTML_FILE,
             routes         = {"/generate-kra": cone_kra.generate},
             module_sources = cone_html.module_sources(),
+            hub_name       = "cone",
         )
     else:
         print(f"  open : file://{os.path.abspath(HTML_FILE)}")

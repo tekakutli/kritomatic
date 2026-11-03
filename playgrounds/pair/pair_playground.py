@@ -47,6 +47,7 @@ def main():
             html_file      = HTML_FILE,
             routes         = {"/generate-kra": pair_kra.generate},
             module_sources = pair_html.module_sources(),
+            hub_name       = "pair",
         )
     else:
         print(f"  open : file://{os.path.abspath(HTML_FILE)}")

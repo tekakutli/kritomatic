@@ -14,6 +14,22 @@ Built-in colon commands:
     :schema      dump schema
     :entities    dump entities
     :quit / :q   exit
+
+Hub-management verbs (available from any REPL; they act on the hub,
+not the connected playground):
+    pg-list                list every playground registered with the hub
+    kill NAME [--force]    shut down a playground (cooperative, or SIGTERM
+                           escalation with --force)
+
+Both `pg-list` and `kill` are one-shot: they open a short-lived
+connection to the hub's management WS, act, and close.  No polling.
+
+TAG
+===
+The prompt shows the target name (`sam3>`) when the REPL was entered
+via `--target sam3`; it shows the full URL when entered via `--url`.
+`main()` passes the name through `target_name=`, so the REPL does not
+need to reverse-look it up.
 """
 
 from __future__ import annotations
@@ -53,6 +69,11 @@ Commands:
   deselect                     Deselect the current item
   raw JSON                     Send an arbitrary JSON message
 
+Hub management (one-shot, event-driven, no polling):
+  pg-list                      List playgrounds registered with the hub
+  kill NAME [--force]          Shut down a playground (cooperative;
+                               --force escalates to SIGTERM)
+
 Colon commands:
   :refresh                     Request fresh state from the browser
   :schema / :entities          Dump schema / entities as JSON
@@ -67,7 +88,6 @@ Tab completes field names, action kinds, and entity items.
 #  Completion
 # ============================================================================
 
-# Populated by _install_completion(); refreshed on every state update.
 _completion_source = {
     "fields":  [],
     "actions": [],
@@ -101,6 +121,7 @@ def _refresh_completion(client: RemoteCliClient) -> None:
             "ls", "show", "schema", "actions", "entities",
             "presence", "state", "set", "action",
             "select", "deselect", "raw",
+            "pg-list", "kill",
             "help", "quit", "exit",
         ],
     })
@@ -143,6 +164,11 @@ def _compute_completions(tokens, text):
             level = tokens[1]
             return _filter(src["items"].get(level, []), text)
 
+    if verb == "kill":
+        # Complete from the cached hub registry (populated by pg-list).
+        if len(tokens) == 2:
+            return _filter(_hub_pg_names, text)
+
     return []
 
 
@@ -161,16 +187,92 @@ def _install_completion():
 
 
 # ============================================================================
+#  Hub helpers (one-shot WS to /__hub_ws; no persistent connection)
+# ============================================================================
+
+# Cached from the last `pg-list`, used only for tab completion on `kill`.
+_hub_pg_names = []
+
+
+def _hub_ws_url(config: dict) -> str:
+    hub = config.get("hub", "ws://127.0.0.1:8780")
+    return hub.rstrip("/") + "/__hub_ws"
+
+
+def _hub_one_shot(config: dict, send_msg: dict,
+                  wait_for: str, timeout: float = 5.0):
+    """Open a one-shot management WS, send one message, wait for a
+    reply of type `wait_for`, close.  Returns the reply dict or None.
+
+    The hub pushes an initial `playgrounds` event on every connect;
+    `send_msg` may be None to just read that first event.
+    """
+    try:
+        from websockets.sync.client import connect as _ws_connect
+    except ImportError:
+        print("error: 'websockets' library is required for hub actions",
+              file=sys.stderr)
+        return None
+
+    url = _hub_ws_url(config)
+    try:
+        ws = _ws_connect(url, open_timeout=timeout, close_timeout=2.0)
+    except Exception as e:
+        print(f"error: could not connect to hub at {url}: {e}",
+              file=sys.stderr)
+        return None
+
+    try:
+        ws.send(json.dumps({"type": "hello", "role": "panel"}))
+        if send_msg is not None:
+            ws.send(json.dumps(send_msg))
+
+        import time as _time
+        deadline = _time.monotonic() + timeout
+        while True:
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                print("error: hub did not respond in time", file=sys.stderr)
+                return None
+            try:
+                raw = ws.recv(timeout=min(remaining, 1.0))
+            except TimeoutError:
+                continue
+            except Exception as e:
+                print(f"error: hub connection failed: {e}", file=sys.stderr)
+                return None
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            if msg.get("type") == wait_for:
+                return msg
+            # Store the initial playground list for later completion.
+            if msg.get("type") == "playgrounds":
+                _hub_pg_names[:] = [
+                    p.get("name") for p in (msg.get("playgrounds") or [])
+                    if p.get("name")
+                ]
+                # If we only wanted the playgrounds event, return now.
+                if wait_for == "playgrounds":
+                    return msg
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+# ============================================================================
 #  Dispatch
 # ============================================================================
 
-def _dispatch(client: RemoteCliClient, line: str) -> bool:
+def _dispatch(client: RemoteCliClient, config: dict, line: str) -> bool:
     """Run one line of input. Returns False to exit."""
     line = line.strip()
     if not line:
         return True
 
-    # Colon commands
     if line.startswith(":"):
         verb = line[1:].split()[0] if line[1:] else ""
         if verb in ("q", "quit", "exit"):
@@ -198,7 +300,6 @@ def _dispatch(client: RemoteCliClient, line: str) -> bool:
         print(f"unknown command :{verb}", file=sys.stderr)
         return True
 
-    # Regular verbs
     try:
         tokens = shlex.split(line)
     except ValueError as e:
@@ -288,6 +389,15 @@ def _dispatch(client: RemoteCliClient, line: str) -> bool:
                 return True
             client.raw_send(msg)
             print("sent")
+        elif verb == "pg-list":
+            _repl_pg_list(config)
+        elif verb == "kill":
+            if not rest:
+                print("usage: kill NAME [--force]", file=sys.stderr)
+                return True
+            name = rest[0]
+            hard = "--force" in rest[1:] or "-f" in rest[1:]
+            _repl_kill(config, name, hard)
         else:
             print(f"unknown command: {verb}", file=sys.stderr)
 
@@ -299,6 +409,39 @@ def _dispatch(client: RemoteCliClient, line: str) -> bool:
         print(f"error: {e}", file=sys.stderr)
 
     return True
+
+
+def _repl_pg_list(config: dict):
+    msg = _hub_one_shot(config, send_msg=None, wait_for="playgrounds")
+    if msg is None:
+        return
+    pgs = msg.get("playgrounds") or []
+    if not pgs:
+        print("(no playgrounds registered)")
+        return
+    for pg in pgs:
+        line = (f"  {pg.get('name', '?'):<16}"
+                f" {pg.get('role', '?'):<10}"
+                f" :{pg.get('port', '?')}")
+        if pg.get("pid"):
+            line += f"  pid {pg['pid']}"
+        print(line)
+
+
+def _repl_kill(config: dict, name: str, hard: bool):
+    msg = _hub_one_shot(
+        config,
+        send_msg={"type": "kill", "name": name, "hard": hard},
+        wait_for="kill_result",
+        timeout=10.0 if hard else 6.0,
+    )
+    if msg is None:
+        return
+    if msg.get("success"):
+        print(f"ok: {msg.get('message', name + ' shut down')}")
+    else:
+        print(f"error: {msg.get('message', 'kill failed')}",
+              file=sys.stderr)
 
 
 def _print_ls(client, prefix):
@@ -392,7 +535,8 @@ def _parse_set_args(args):
 #  Entry point
 # ============================================================================
 
-def run(url: str, config: dict, *, verbose: bool = False) -> int:
+def run(url: str, config: dict, *, target_name: Optional[str] = None,
+        verbose: bool = False) -> int:
     client = RemoteCliClient(url)
     try:
         client.connect(require_browser=False)
@@ -403,10 +547,7 @@ def run(url: str, config: dict, *, verbose: bool = False) -> int:
     _refresh_completion(client)
     _install_completion()
 
-    preset_name = next((k for k, v in
-                        (config.get("targets") or {}).items()
-                        if v == url), None)
-    tag = preset_name or url
+    tag = target_name or url
     presence = client.presence()
     if presence["browser"] == 0:
         print(f"connected to {tag} (no browser connected)")
@@ -416,7 +557,6 @@ def run(url: str, config: dict, *, verbose: bool = False) -> int:
               f"({presence['browser']} browser, "
               f"{presence['remote']} remote)")
 
-    # Refresh completion when a browser appears later.
     def on_presence(msg):
         _refresh_completion(client)
     client.on("presence", on_presence)
@@ -428,7 +568,7 @@ def run(url: str, config: dict, *, verbose: bool = False) -> int:
             print()
             break
         try:
-            if not _dispatch(client, line):
+            if not _dispatch(client, config, line):
                 break
         except Exception as e:
             print(f"error: {e}", file=sys.stderr)

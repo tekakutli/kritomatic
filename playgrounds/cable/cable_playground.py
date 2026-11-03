@@ -205,6 +205,7 @@ def main():
                 "/optimize-leaders":  _optimize_route,
             },
             module_sources = cable_html.module_sources(geom),
+            hub_name       = "cable",
         )
     else:
         print(f"  open                  : file://{os.path.abspath(HTML_FILE)}")

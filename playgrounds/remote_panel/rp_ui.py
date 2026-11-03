@@ -3,13 +3,17 @@ rp_ui.py — the remote panel's DOM wiring.
 
 Adds:
 
-    rpRenderStateJSON()    dump of everything the panel knows
-    rpOpenStateModal()     opens the modal, fills in the JSON
-    rpCloseStateModal()    closes it
-    rpCopyState()          copy to clipboard
-    rpDownloadState()      download as remote_panel_state.json
+    rpRenderStateJSON()       dump of everything the panel knows
+    rpOpenStateModal()        opens the state-JSON modal
+    rpCloseStateModal()       closes it
+    rpCopyState()             copy to clipboard
+    rpDownloadState()         download as remote_panel_state.json
 
-Plus the "State JSON" button binding.
+    rpOpenManagement()        opens the hub-management modal
+    rpCloseManagement()       closes it
+    rpRebuildManagementList() render rows from _rp.playgrounds
+
+Plus the "State JSON" and "Manage" button bindings.
 
 VISIBLE:FALSE FIELDS
 ====================
@@ -21,6 +25,34 @@ null return before calling `body.appendChild`, or the entire panel
 rebuild aborts at the first such field with a `TypeError` and every
 section after it fails to render.  The two-line guard at the fix
 site is what keeps that contract whole.
+
+HUB DISCOVERY, NOT POLLING
+==========================
+The target dropdown is populated by `rpPopulateTargets` (defined in
+rp_client.py), which runs from three places: (1) install time
+(registry-only; the dropdown has only "custom" until the hub WS
+connects), (2) every `playgrounds` event from the hub WS, and
+(3) hub WS disconnect.  Nothing polls.  The management list is
+rebuilt on the same events.  The management modal is a passive
+viewer; opening it just re-renders the current `_rp.playgrounds`.
+
+TARGET FIELD EDITORIAL STATE
+============================
+The `#rpTarget` text field tracks a single flag, `dataset.userEdited`,
+so `rpPopulateTargets` knows whether to overwrite its value when the
+preset selection changes. Set on input, cleared on dropdown change.
+See rpPopulateTargets in rp_client.py for the consumer side.
+
+OPEN BUTTON URL
+===============
+The Open button builds its URL from the registration entry's own
+`html_file`, which the playground supplies to its hub registration
+(via `kit_serve(html_file=...)` → `ensure_running(html_file=...)` →
+the `hello` frame → `Registration.html_file` → `to_json()`).  No
+hardcoded filename map lives in the panel — a new playground is
+opened correctly without touching this file.  The fallback
+`<name>_playground.html` covers old hubs that don't yet carry the
+field.
 """
 
 RP_UI_JS = r"""
@@ -72,7 +104,6 @@ function rpRebuildActions() {
     if (btn) btn.textContent = "Hide";
   }
 
-  /* 1. Global actions. */
   if (globalActions.length > 0) {
     const group = document.createElement("div");
     group.className = "action-group";
@@ -90,7 +121,6 @@ function rpRebuildActions() {
     body.appendChild(group);
   }
 
-  /* 2. Level sections. */
   if (!_rp.entities) return;
   for (const levelName of _rp.entityOrder) {
     const level = _rp.entities[levelName];
@@ -188,7 +218,7 @@ function rpRebuildFields() {
 
   const openState = {};
   container.querySelectorAll("details.field-card").forEach((d) => {
-    const s = d.querySelector("summary");
+    const s = d.querySelector("h4");
     if (s) openState[s.textContent] = d.open;
   });
 
@@ -211,10 +241,10 @@ function rpRebuildFields() {
     for (const name of bySection.get(section).sort()) {
       // `rpBuildFieldRow` returns null for fields whose schema entry
       // carries `visible: false` (the documented "API-only, no DOM"
-      // contract — see pgkit/schema.py and pgkit/render.py).  A null
-      // return must be skipped, not appended: `body.appendChild(null)`
-      // throws TypeError and aborts the entire rebuild, leaving every
-      // section after the first `visible: false` field unrendered.
+      // contract).  A null return must be skipped, not appended:
+      // `body.appendChild(null)` throws TypeError and aborts the
+      // entire rebuild, leaving every section after the first such
+      // field unrendered.
       const row = rpBuildFieldRow(name);
       if (row) body.appendChild(row);
     }
@@ -254,11 +284,7 @@ function _rpTogglePanel(panelId, btnId, shownLabel, hiddenLabel) {
 
 /* ==========================================================================
    STATE JSON MODAL
-   ==========================================================================
-   Renders the panel's current knowledge as pretty-printed JSON:
-   connection, values, schema, entities, entity order.  Rebuilt on
-   every open so the view is always fresh — no polling, no
-   subscription.  Download and Copy operate on the same text. */
+   ========================================================================== */
 
 function rpBuildStateJSON() {
   return {
@@ -270,6 +296,11 @@ function rpBuildStateJSON() {
     entities:     _rp.entities,
     schema:       _rp.schema,
     values:       _rp.values,
+    hub: {
+      url:         _rp.hubUrl,
+      connected:   _rp.hubConnected,
+      playgrounds: _rp.playgrounds,
+    },
   };
 }
 
@@ -328,6 +359,150 @@ function rpDownloadState() {
 }
 
 /* ==========================================================================
+   MANAGEMENT MODAL
+   ==========================================================================
+   Rows are rebuilt from `_rp.playgrounds`.  `rpPopulateTargets` in
+   rp_client.py triggers `rpRebuildManagementList()` on every hub
+   event, so this list is always current without polling.
+
+   The Open button's URL is built from `pg.html_file`, which the
+   playground carries in its registration (see hub_client.py and
+   hub.py).  The `<name>_playground.html` fallback covers old hubs
+   that don't yet send the field. */
+
+function rpOpenManagement() {
+  const modal = document.getElementById("rpMgmtModal");
+  if (!modal) return;
+  rpRebuildManagementList();
+  modal.hidden = false;
+}
+
+function rpCloseManagement() {
+  const modal = document.getElementById("rpMgmtModal");
+  if (!modal) return;
+  modal.hidden = true;
+}
+
+function rpRebuildManagementList() {
+  const list = document.getElementById("rpMgmtList");
+  const hint = document.getElementById("rpMgmtHint");
+  if (!list) return;
+
+  if (!_rp.hubConnected) {
+    list.innerHTML = "";
+    const empty = document.createElement("div");
+    empty.className = "mgmt-empty";
+    empty.textContent =
+      "Not connected to a hub. Start any playground to spawn it.";
+    list.appendChild(empty);
+    if (hint) {
+      hint.textContent =
+        "The pgkit hub is spawned automatically by the first playground " +
+        "you run. Once it is up, playgrounds register with it and appear " +
+        "here. The hub outlives any individual playground's terminal.";
+    }
+    return;
+  }
+
+  if (hint) {
+    hint.textContent =
+      "Playgrounds are registered with the pgkit hub. Click Kill to " +
+      "ask one to shut down. Force escalates to SIGTERM if cooperative " +
+      "shutdown does not complete within five seconds.";
+  }
+
+  list.innerHTML = "";
+  const pgs = _rp.playgrounds.slice().sort(
+    (a, b) => (a.name || "").localeCompare(b.name || "")
+  );
+  if (pgs.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "mgmt-empty";
+    empty.textContent = "No playgrounds registered.";
+    list.appendChild(empty);
+    return;
+  }
+
+  const base = _hubHttpBase();
+
+  for (const pg of pgs) {
+    const row = document.createElement("div");
+    row.className = "mgmt-row";
+
+    const name = document.createElement("span");
+    name.className = "mgmt-name";
+    name.textContent = pg.name;
+    name.title = pg.name;
+    row.appendChild(name);
+
+    const role = document.createElement("span");
+    role.className = "mgmt-role";
+    role.textContent = pg.role || "?";
+    row.appendChild(role);
+
+    const port = document.createElement("span");
+    port.className = "mgmt-port";
+    port.textContent = ":" + (pg.port || "?");
+    row.appendChild(port);
+
+    const pid = document.createElement("span");
+    pid.className = "mgmt-pid";
+    pid.textContent = pg.pid ? ("pid " + pg.pid) : "\u2014";
+    row.appendChild(pid);
+
+    const actions = document.createElement("div");
+    actions.className = "mgmt-actions";
+
+    if (pg.role === "playground" && base) {
+      const openBtn = document.createElement("button");
+      openBtn.textContent = "Open";
+      openBtn.title = "Open " + pg.name + " in a new tab";
+      openBtn.addEventListener("click", () => {
+        // `pg.html_file` comes from the playground's own
+        // `kit_serve(html_file=...)` registration. The fallback
+        // only fires against old hubs that don't carry the field.
+        const html = pg.html_file || (pg.name + "_playground.html");
+        const url  = base + "/" + pg.name + "/" + html;
+        window.open(url, "_blank");
+      });
+      actions.appendChild(openBtn);
+
+      const killBtn = document.createElement("button");
+      killBtn.className = "danger";
+      killBtn.textContent = "Kill";
+      killBtn.title = "Ask " + pg.name + " to shut down cooperatively";
+      killBtn.addEventListener("click", () => {
+        rpKillPlayground(pg.name, false);
+      });
+      actions.appendChild(killBtn);
+
+      const hardBtn = document.createElement("button");
+      hardBtn.className = "danger";
+      hardBtn.textContent = "Force";
+      hardBtn.title =
+        "Escalate to SIGTERM if cooperative shutdown does not complete";
+      hardBtn.addEventListener("click", () => {
+        if (confirm("Force-kill " + pg.name
+                    + (pg.pid ? (" (pid " + pg.pid + ")") : "")
+                    + "?\n\nThis sends SIGTERM if cooperative shutdown "
+                    + "fails within five seconds.")) {
+          rpKillPlayground(pg.name, true);
+        }
+      });
+      actions.appendChild(hardBtn);
+    } else {
+      const note = document.createElement("span");
+      note.style.cssText = "font-size:10px;color:#5a6774;";
+      note.textContent = "(no actions)";
+      actions.appendChild(note);
+    }
+
+    row.appendChild(actions);
+    list.appendChild(row);
+  }
+}
+
+/* ==========================================================================
    INSTALL
    ========================================================================== */
 
@@ -340,34 +515,49 @@ function rpDownloadState() {
   const logBtn     = document.getElementById("rpLogToggle");
   const logClear   = document.getElementById("rpLogClear");
   const stateBtn   = document.getElementById("rpStateBtn");
+  const mgmtBtn    = document.getElementById("rpMgmtBtn");
+
+  // Populate the target dropdown before touching its selection.
+  // At install time the hub WS has not connected yet, so the
+  // dropdown contains only "custom"; the first `playgrounds` event
+  // from the hub replaces it with real entries. See rpPopulateTargets
+  // in rp_client.py.
+  rpPopulateTargets();
 
   let saved = null;
   try { saved = localStorage.getItem("rp.target"); } catch (e) {}
-  const initial = saved || "ws://127.0.0.1:8767/remote";
-  if (targetEl) targetEl.value = initial;
-  if (presetEl) {
-    let matched = false;
-    for (const opt of presetEl.options) {
-      if (opt.value && opt.value === initial) {
-        opt.selected = true;
-        matched = true;
-        break;
-      }
-    }
-    if (!matched) presetEl.value = "";
-  }
+  if (targetEl && saved) targetEl.value = saved;
+  // No fallback URL: if the hub never comes up, the user types a URL
+  // (custom) or starts a playground to spawn the hub. The first
+  // `playgrounds` event will sync the target field to the first real
+  // option when one exists and the user hasn't edited the field.
 
   if (presetEl) presetEl.addEventListener("change", () => {
-    if (presetEl.value) targetEl.value = presetEl.value;
+    if (presetEl.value) {
+      targetEl.value = presetEl.value;
+      // Dropdown choice is authoritative — clear the "user edited"
+      // flag so hub-driven preset updates can overwrite this field
+      // again.
+      delete targetEl.dataset.userEdited;
+    }
   });
 
   if (targetEl) targetEl.addEventListener("input", () => {
     if (presetEl && targetEl.value !== presetEl.value) presetEl.value = "";
+    // The user has typed something; rpPopulateTargets must no
+    // longer overwrite this field on hub events.
+    targetEl.dataset.userEdited = "1";
   });
 
   if (connectBtn) connectBtn.addEventListener("click", () => {
     const t = (targetEl.value || "").trim();
-    if (!t) return;
+    if (!t) {
+      rpLog("error", "no target URL — pick from the dropdown or type one");
+      if (typeof flashStatus === "function") {
+        flashStatus("no target URL", "warn");
+      }
+      return;
+    }
     rpConnect(t);
   });
 
@@ -421,12 +611,49 @@ function rpDownloadState() {
     });
   }
 
+  /* ---- management modal bindings ------------------------------- */
+
+  if (mgmtBtn) mgmtBtn.addEventListener("click", rpOpenManagement);
+
+  const mgmtClose    = document.getElementById("rpMgmtClose");
+  const mgmtModal    = document.getElementById("rpMgmtModal");
+  const mgmtShutdown = document.getElementById("rpMgmtShutdownHub");
+
+  if (mgmtClose) mgmtClose.addEventListener("click", rpCloseManagement);
+  if (mgmtModal) {
+    mgmtModal.addEventListener("click", (e) => {
+      if (e.target === mgmtModal) rpCloseManagement();
+    });
+  }
+  if (mgmtShutdown) {
+    mgmtShutdown.addEventListener("click", () => {
+      if (!_rp.hubConnected) {
+        alert("Hub is not connected.");
+        return;
+      }
+      if (!confirm("Shut down the hub AND every playground it manages?")) {
+        return;
+      }
+      try {
+        _rp.hubSocket.send(JSON.stringify({ type: "shutdown_hub" }));
+      } catch (e) {}
+      rpCloseManagement();
+    });
+  }
+
+  /* ---- keyboard -------------------------------------------------- */
+
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
-      if (!_rp._pendingAction &&
-          stateModal && !stateModal.hidden) {
+      if (_rp._pendingAction) return;  // action modal handles it
+      if (stateModal && !stateModal.hidden) {
         e.preventDefault();
         rpCloseStateModal();
+        return;
+      }
+      if (mgmtModal && !mgmtModal.hidden) {
+        e.preventDefault();
+        rpCloseManagement();
         return;
       }
     }

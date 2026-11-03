@@ -20,16 +20,74 @@ Clicking an item in the remote panel sends a `select` command with
 that to its own selection.  A subsequent entities refresh shows the
 new selection.
 
+HUB DISCOVERY (EVENTS, NOT POLLING)
+===================================
+The panel learns which playgrounds are alive from the pgkit hub
+(`pgkit/hub.py`), via a WebSocket on `ws://<hub>/__hub_ws` with
+`role=panel`.  The hub pushes a `playgrounds` event on every
+connect and on every registration or deregistration change — no
+polling.  Kill requests travel the same socket.
+
+TARGET DROPDOWN — REGISTRY-ONLY
+===============================
+The dropdown is populated exclusively from the hub registry.  There
+is no static fallback: a panel that has never seen the hub cannot
+know which playgrounds (or ports) are actually serving, and
+inventing names/URLs would be wrong by construction.  The "custom"
+option is the escape hatch — a user who knows a URL types it, and
+`localStorage` remembers it across reloads.
+
+The registry-only dropdown also handles the panel-first startup
+correctly: while the hub is up but no playground has registered, the
+dropdown contains only "custom" and the target field stays at
+whatever `localStorage` held.  The moment a playground joins, the
+next `playgrounds` event populates it.
+
+TARGET INPUT SYNC
+=================
+`rpPopulateTargets` also mirrors the current preset selection into
+the `#rpTarget` text field, but only when the user has not
+manually edited that field.  The "user has edited" flag is
+`#rpTarget.dataset.userEdited`; `rp_ui.py` sets it on `input` and
+clears it on dropdown `change`.
+
+The selection priority, applied when the options change:
+
+    1. An option whose value equals the current target field's
+       value.  This is what makes hub discovery seamless on a
+       running panel: the target field held a direct URL; after
+       the first `playgrounds` event the dropdown has hub URLs, and
+       the value match never fires, but the target field is then
+       rewritten by the sync step below when the dropdown default
+       changed.  Once the user has connected via a hub URL, the
+       field holds the hub URL, and this branch preserves it across
+       later events.
+    2. An option whose text equals the previously-selected option's
+       text.  This is what makes a later-joining playground preserve
+       the user's earlier choice by name across a rebuild.
+    3. The first real option — **only if the target field is empty**.
+       Fresh page + hub up + playgrounds present: the field is
+       empty, so default to the first hub option.  Fresh page +
+       hub up + no playgrounds: only "custom" exists, so the field
+       is empty and stays empty.  Fresh page + saved direct URL:
+       no option matches, but the field is non-empty, so "custom"
+       stays selected and the field is preserved — the user keeps
+       the URL they last used, and the dropdown honestly reports
+       that it cannot map it to a registered playground.
+
+Branch 3 used to fire whenever branches 1 and 2 didn't match, so
+a saved direct URL was silently replaced by whichever hub
+playground happened to sort first.  The "target field is empty"
+guard on branch 3 is what preserves the user's saved preference.
+
 VISIBLE:FALSE FIELDS
 ====================
 `pgkit/schema.py` documents `visible: false` as "API-only, no DOM";
 `pgkit/render.py` (the in-Krita panel renderer) already honours it.
-Before the `status.running` field was added (see the playground's
-`pg_panel_scrubs.py`), no playground used `visible: false`, so a
-mismatch here was latent.  `rpBuildFieldRow` now honours it too:
-a `visible: false` field produces no DOM row, and `rpRebuildFields`
-skips the `null` return.  `rpUpdateWidget` and `rpOnState` need no
-change — they already no-op for names with no `_rp.fields` entry.
+`rpBuildFieldRow` honours it too: a `visible: false` field produces
+no DOM row, and `rpRebuildFields` skips the `null` return.
+`rpUpdateWidget` and `rpOnState` need no change — they already
+no-op for names with no `_rp.fields` entry.
 """
 
 RP_CLIENT_JS = r"""
@@ -58,6 +116,15 @@ const _rp = {
   rebuildTimer:    null,
   log:             [],
   _pendingAction:  null,
+
+  // ---- hub management --------------------------------------------
+  hubSocket:         null,   // ws to /__hub_ws with role=panel
+  hubUrl:            null,   // e.g. "ws://127.0.0.1:8780/__hub_ws"
+  hubConnected:      false,
+  playgrounds:       [],     // [{ name, port, role, pid, html_file,
+                             //    connected_at }]
+  hubReconnectMs:    1000,
+  hubReconnectTimer: null,
 };
 
 const RP_PROTOCOL_VERSION = 1;
@@ -77,7 +144,7 @@ function rpLog(kind, text) {
 }
 
 /* ==========================================================================
-   CONNECT / DISCONNECT
+   CONNECT / DISCONNECT  (playground WS — the control channel)
    ========================================================================== */
 
 function rpConnect(target) {
@@ -157,7 +224,7 @@ function rpScheduleReconnect() {
 }
 
 /* ==========================================================================
-   WIRE
+   WIRE  (playground channel)
    ========================================================================== */
 
 function rpSend(msg) {
@@ -197,7 +264,7 @@ function rpSendCommand(kind, payload) {
 }
 
 /* ==========================================================================
-   MESSAGE HANDLING
+   MESSAGE HANDLING  (playground channel)
    ========================================================================== */
 
 function rpHandle(msg) {
@@ -317,8 +384,7 @@ function _rpSectionLabel(section) {
    that flag; so does this renderer.  A null return propagates up to
    `rpRebuildFields`, which drops the row.  `rpUpdateWidget` finds no
    `_rp.fields[name]` entry for such a field and no-ops, so live
-   patches for it (e.g. `status.running` toggling during an action)
-   do not touch the DOM either. */
+   patches for it do not touch the DOM either. */
 
 function rpBuildFieldRow(name) {
   const meta  = _rp.schema[name] || {};
@@ -663,4 +729,267 @@ function rpRenderPresence() {
   el.textContent = "browser=" + _rp.presence.browser
                  + "  remote=" + _rp.presence.remote;
 }
+
+/* ==========================================================================
+   HUB MANAGEMENT  (ws to /__hub_ws with role=panel)
+   ==========================================================================
+   The panel discovers the registered playground set from the hub
+   over a WebSocket, not by polling.  Kill requests travel the same
+   channel and return as `kill_result` events.  All of this is
+   disabled in standalone mode (no hub reachable); see rpDiscoverHub. */
+
+function rpDiscoverHub() {
+  try {
+    const u = new URL("/__hub_ws", document.baseURI);
+    u.protocol = (u.protocol === "https:") ? "wss:" : "ws:";
+    _rp.hubUrl = u.toString();
+  } catch (e) {
+    _rp.hubUrl = null;
+    return;
+  }
+  _rpConnectHub();
+}
+
+function _rpConnectHub() {
+  if (_rp.hubReconnectTimer) {
+    clearTimeout(_rp.hubReconnectTimer);
+    _rp.hubReconnectTimer = null;
+  }
+  if (_rp.hubSocket) {
+    try { _rp.hubSocket.close(); } catch (e) {}
+    _rp.hubSocket = null;
+  }
+  if (!_rp.hubUrl) return;
+
+  let sock;
+  try { sock = new WebSocket(_rp.hubUrl); }
+  catch (e) { _rpScheduleHubReconnect(); return; }
+  _rp.hubSocket = sock;
+
+  sock.addEventListener("open", () => {
+    _rp.hubConnected = true;
+    _rp.hubReconnectMs = 1000;
+    try {
+      sock.send(JSON.stringify({ type: "hello", role: "panel" }));
+    } catch (e) {}
+    rpLog("info", "hub management connected");
+  });
+
+  sock.addEventListener("message", (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    _rpHandleHubMessage(msg);
+  });
+
+  sock.addEventListener("close", () => {
+    _rp.hubConnected = false;
+    _rp.playgrounds = [];
+    rpLog("info", "hub management disconnected");
+    rpPopulateTargets();
+    rpScheduleHubReconnect();
+  });
+
+  sock.addEventListener("error", () => {});
+}
+
+function _rpScheduleHubReconnect() {
+  if (_rp.hubReconnectTimer) return;
+  _rp.hubReconnectTimer = setTimeout(() => {
+    _rp.hubReconnectTimer = null;
+    _rpConnectHub();
+  }, _rp.hubReconnectMs);
+  _rp.hubReconnectMs = Math.min(_rp.hubReconnectMs * 2, 10000);
+}
+
+function _rpHandleHubMessage(msg) {
+  if (msg.type === "playgrounds") {
+    _rp.playgrounds = msg.playgrounds || [];
+    rpLog("info", "hub: " + _rp.playgrounds.length + " playground(s)");
+    rpPopulateTargets();
+    if (typeof rpRebuildManagementList === "function") {
+      rpRebuildManagementList();
+    }
+    return;
+  }
+  if (msg.type === "kill_result") {
+    rpLog(msg.success ? "info" : "error",
+          "kill " + msg.name + ": " + (msg.message || ""));
+    if (typeof flashStatus === "function") {
+      flashStatus(
+        "kill " + msg.name + ": "
+          + (msg.success ? "ok" : (msg.message || "failed")),
+        msg.success ? "ok" : "bad"
+      );
+    }
+    return;
+  }
+  if (msg.type === "shutdown_ack") {
+    rpLog("info", "hub shutdown acknowledged");
+    return;
+  }
+}
+
+function rpKillPlayground(name, hard) {
+  if (!_rp.hubSocket || !_rp.hubConnected) {
+    rpLog("error", "kill: hub not connected");
+    return;
+  }
+  try {
+    _rp.hubSocket.send(JSON.stringify({
+      type: "kill",
+      name: name,
+      hard: !!hard,
+    }));
+    rpLog("info",
+          "kill requested: " + name + (hard ? " (hard)" : ""));
+  } catch (e) {
+    rpLog("error", "kill send failed: " + e.message);
+  }
+}
+
+/* ==========================================================================
+   TARGET DROPDOWN — REGISTRY-ONLY
+   ==========================================================================
+   Populated exclusively from the hub registry.  There is no static
+   fallback: a panel that has never seen the hub cannot know which
+   playgrounds (or ports) are actually serving, so it must not
+   invent names/URLs.  "custom" is the escape hatch — a user who
+   knows a URL types it into the target field, and `localStorage`
+   remembers it across reloads.
+
+   Selection priority after a rebuild (see module docstring for the
+   reasoning behind each branch):
+
+     1. An option whose value equals the current target field value.
+     2. An option whose text matches the previously-selected option.
+     3. The first real option — only when the target field is empty.
+        A non-empty target field that matches no option means the
+        user has a saved URL (typically a direct URL from a session
+        before the hub was running); "custom" stays selected and
+        the field is preserved.
+
+   Then, if the target field has not been edited by the user, it is
+   overwritten with the new selection's value.  `rp_ui.py` sets
+   `dataset.userEdited` on input and clears it on dropdown change. */
+
+function _hubHttpBase() {
+  if (!_rp.hubUrl) return null;
+  try {
+    const u = new URL(_rp.hubUrl);
+    const proto = (u.protocol === "wss:") ? "https:" : "http:";
+    return proto + "//" + u.host;
+  } catch (e) {
+    return null;
+  }
+}
+
+function rpPopulateTargets() {
+  const presetEl = document.getElementById("rpPreset");
+  if (!presetEl) return;
+
+  // Remember the previous selection *by text* (name) so a hub
+  // transition (empty → populated, or a later-joining playground)
+  // preserves the user's choice.
+  let prevName = null;
+  for (const opt of presetEl.options) {
+    if (opt.selected && opt.value) { prevName = opt.textContent; break; }
+    if (opt.selected && opt.value === "") { prevName = "custom"; break; }
+  }
+
+  presetEl.innerHTML = "";
+
+  // Everything comes from the hub registry.  There is no static
+  // fallback: without the hub, the panel has no way to know which
+  // playgrounds (and ports) are actually serving.
+  const base = _hubHttpBase();
+  const playgrounds = (_rp.hubConnected && base)
+    ? _rp.playgrounds.filter(p => p.role === "playground")
+    : [];
+  const wsBase = base ? base.replace(/^http/, "ws") : null;
+
+  const names = playgrounds
+    .map(p => p.name)
+    .filter(Boolean)
+    .sort();
+
+  for (const name of names) {
+    const opt = document.createElement("option");
+    opt.value = wsBase + "/" + name + "/remote";
+    opt.textContent = name;
+    presetEl.appendChild(opt);
+  }
+
+  const custom = document.createElement("option");
+  custom.value = "";
+  custom.textContent = "custom";
+  presetEl.appendChild(custom);
+
+  // ---- Selection: value → name → first real (guarded) ------------
+  const targetEl = document.getElementById("rpTarget");
+  const currentValue = targetEl ? targetEl.value : "";
+
+  let matched = false;
+  if (currentValue) {
+    for (const opt of presetEl.options) {
+      if (opt.value && opt.value === currentValue) {
+        opt.selected = true;
+        matched = true;
+        break;
+      }
+    }
+  }
+  if (!matched && prevName && prevName !== "custom") {
+    for (const opt of presetEl.options) {
+      if (opt.textContent === prevName) {
+        opt.selected = true;
+        matched = true;
+        break;
+      }
+    }
+  }
+  if (!matched) {
+    // If the target field carries a value that matches no current
+    // option — typically a saved direct URL from a session where
+    // the hub wasn't running, or a hub URL for a playground that
+    // has since deregistered — keep "custom" selected. The target
+    // field stays put; the sync step below is skipped because
+    // `presetEl.value` is empty.
+    //
+    // The alternative — defaulting to the first real option — would
+    // silently replace the user's saved preference with whichever
+    // playground happens to sort first, which is wrong whenever the
+    // saved URL names a specific playground.
+    if (currentValue) {
+      presetEl.value = "";
+    } else if (presetEl.options.length > 1) {
+      presetEl.selectedIndex = 0;
+    } else {
+      presetEl.value = "";
+    }
+  }
+
+  // Mirror the current preset selection into the target text field,
+  // but only if the user hasn't manually edited it.  On first load
+  // (before the hub WS connects) the dropdown has only "custom";
+  // the first `playgrounds` event from the hub triggers this
+  // function again with real entries, and the field is updated to
+  // reflect the hub URL — so clicking Connect without touching the
+  // dropdown connects through the hub, as intended.
+  if (targetEl && !targetEl.dataset.userEdited && presetEl.value) {
+    targetEl.value = presetEl.value;
+  }
+}
+
+/* ==========================================================================
+   BOOT — start hub discovery in parallel with the playground channel
+   ========================================================================== */
+
+(function rpHubBoot() {
+  function start() { setTimeout(rpDiscoverHub, 200); }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
+  }
+})();
 """

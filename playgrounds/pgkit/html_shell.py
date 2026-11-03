@@ -2,7 +2,7 @@
 pgkit.html_shell — assemble a playground's HTML page.
 
 The page is the shell (head, CSS, panel wrapper, canvas) plus exactly
-one `<script type="module" src="/modules/<boot_module>">`.  The boot
+one `<script type="module" src="modules/<boot_module>">`.  The boot
 module's imports load every other module.
 
 `page()` runs `js_check.check_js` on every module in
@@ -11,6 +11,27 @@ error aborts page assembly with a `JsSyntaxError` naming the file
 and line.  The caller catches it and reports; `*_html.py`'s caller
 in turn exits with status 1 so no HTML file is written and no
 server starts.
+
+BOOT SCRIPT URL IS RELATIVE
+===========================
+`src="modules/<boot_module>"` is a *relative* URL.  It resolves
+against the page's own URL:
+
+    standalone   http://host:87NN/board_playground.html
+                 →  http://host:87NN/modules/_boot.js
+
+    under hub    http://host:8780/board/board_playground.html
+                 →  http://host:8780/board/modules/_boot.js
+
+The boot module's *own* `import "./pgkit/shell.js"` resolves
+against the boot module's URL, so it lands on the right prefix
+without any `<base>` tag: the browser already has the URL.  This
+is why the kit does not emit `<base href="...">` — it would only
+re-duplicate information the page URL already carries, and would
+break the "same HTML file, two deployment shapes" property.
+
+The only place in the shell that used an absolute `/modules/` path
+was this script tag.  No other template needed a prefix.
 """
 
 from .js_check import JsSyntaxError, check_js
@@ -53,7 +74,7 @@ _PANEL_CLOSE = """
 """
 
 _BOOT_SCRIPT = """
-<script type="module" src="/modules/{boot_module}"></script>
+<script type="module" src="modules/{boot_module}"></script>
 </body>
 </html>
 """

@@ -95,6 +95,7 @@ def main():
             open_browser   = OPEN_BROWSER,
             html_file      = HTML_FILE,
             module_sources = boxes_html.module_sources(geom),
+            hub_name       = "boxes",
         )
     else:
         print(f"  open                     : "

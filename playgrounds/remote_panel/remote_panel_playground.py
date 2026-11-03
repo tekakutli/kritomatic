@@ -12,21 +12,24 @@ panel whenever a `remote` client is connected, and this page is that
 `remote` client — and to manipulate the playground's values from
 this page instead.
 
-The target is selectable at runtime.  The page remembers the last
-URL it connected to (in localStorage) and shows a dropdown of the
-four known playgrounds; you can also type any URL.
+Under the pgkit hub, `remote_panel` registers with `role="panel"`.
+That makes the hub refuse to kill it cooperatively, and it makes the
+panel's own target dropdown skip it (only `role="playground"` entries
+appear as targets). See pgkit/hub_client.py's docstring.
 
-The panel is built from the playground's advertised state and
-schema.  When the playground has been migrated to pgkit, the schema
-message gives the panel proper widgets (number inputs, checkboxes,
-enums).  Against an older playground that only sends values, the
-panel falls back to inferring the widget type from each value.
+The page does not proxy anything through its own server: the
+WebSocket goes directly from the browser to the target playground's
+`/remote` endpoint (via the hub if running). That means the target
+playground must have pgkit's WebSocket server running, which all
+entries do.
 
-The page does not proxy anything through its own server: the WebSocket
-goes directly from the browser to the target playground's `/remote`
-endpoint.  That means the target playground must have pgkit's
-WebSocket server running, which all pair/cone/board/text_board
-entries will once they are migrated.
+TARGETS ARE DISCOVERED, NOT LISTED
+==================================
+The startup banner below names only the hub URL. There is no
+hardcoded list of playgrounds or their ports — the hub's registry is
+the source of truth, and the panel's dropdown reflects it. The user
+sees their live playground set by opening the panel, not by reading
+a stale console line.
 """
 
 import os
@@ -54,16 +57,18 @@ def main():
     with open(HTML_FILE, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"Wrote {HTML_FILE}")
-    print(f"  default target: ws://127.0.0.1:8767/remote  (pair)")
-    print(f"  other targets : cone 8766, board 8770, text_board 8771")
+    print(f"  hub           : ws://127.0.0.1:8780  "
+          f"(registered targets appear as playgrounds start)")
 
     if SERVE:
         print()
         kit_serve(
-            port         = PORT,
-            open_browser = OPEN_BROWSER,
-            html_file    = HTML_FILE,
-            routes       = {},
+            port           = PORT,
+            open_browser   = OPEN_BROWSER,
+            html_file      = HTML_FILE,
+            routes         = {},
+            hub_name       = "remote_panel",
+            hub_role       = "panel",
         )
     else:
         print(f"  open : file://{os.path.abspath(HTML_FILE)}")

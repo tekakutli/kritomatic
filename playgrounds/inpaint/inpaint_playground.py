@@ -49,8 +49,8 @@ def main():
         routes         = inpaint_server.ROUTES,
         raw_routes     = inpaint_server.RAW_ROUTES,
         module_sources = inpaint_html.module_sources(),
+        hub_name       = "inpaint",
     )
-
 
 if __name__ == "__main__":
     main()

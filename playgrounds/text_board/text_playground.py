@@ -63,6 +63,7 @@ def main():
             html_file      = HTML_FILE,
             routes         = text_server.ROUTES,
             module_sources = text_board_html.module_sources(),
+            hub_name       = "text_board",
         )
     else:
         print(f"  open : file://{os.path.abspath(HTML_FILE)}")

@@ -1,13 +1,29 @@
 """
 rp_base.py — the remote panel's CSS and HTML structure.
 
-This revision adds a state-viewer modal (`#rpStateModal`) opened by
-a "State JSON" button in the top bar.  The modal shows a pretty-
-printed dump of everything the panel currently knows — connection
-state, values, schema, entities — with Copy and Download buttons.
-It's a debug view: what the panel *sees*, not what the playground
-*holds*.  The latter is available from the playground's own
-"Export visual state" action.
+This revision adds a "Manage" button and a management modal
+(`#rpMgmtModal`) that shows the pgkit hub's registered playgrounds
+and offers cooperative (Kill) and escalated (Force) shutdowns.  The
+modal's contents are populated by `rpRebuildManagementList` in
+`rp_ui.py` from the `playgrounds` events on the hub WS.  It is
+disabled when the hub is not reachable — see `rpDiscoverHub` in
+`rp_client.py`.
+
+The "State JSON" modal from the previous revision is unchanged.
+
+TEMPLATE IS REGISTRY-FIRST
+==========================
+The `#rpPreset` dropdown contains a single `custom` option and
+nothing else.  `rpPopulateTargets` in `rp_client.py` populates it
+from the hub registry on every `playgrounds` event; the template
+must not carry a stale static list, because a static list would
+contradict the "registry is the only source of truth" design
+decision the panel just adopted.
+
+The `#rpTarget` placeholder is likewise neutral (`ws://host:port/
+remote`) — a concrete example URL baked into the template would be
+out of date the moment any playground's default port changed, and
+the placeholder only ever shows when the field is empty anyway.
 """
 
 RP_CSS = r"""
@@ -148,6 +164,15 @@ RP_CSS = r"""
   #topbar #rpStateBtn:hover:not(:disabled) {
     border-color: var(--accent);
     background: rgba(0,229,255,0.08);
+  }
+  #topbar #rpMgmtBtn {
+    border-color: rgba(255,200,90,0.55);
+    color: #ffd89b;
+  }
+  #topbar #rpMgmtBtn:hover:not(:disabled) {
+    border-color: rgba(255,200,90,1.0);
+    background: rgba(255,200,90,0.08);
+    color: #ffe6b8;
   }
 
   #topbar .status {
@@ -498,7 +523,8 @@ RP_CSS = r"""
   .log-error     { color: var(--danger); }
 
   #rpModalBackdrop,
-  #rpStateModal {
+  #rpStateModal,
+  #rpMgmtModal {
     position: fixed; inset: 0; z-index: 100;
     background: rgba(0, 0, 0, 0.55);
     display: flex;
@@ -506,7 +532,8 @@ RP_CSS = r"""
     justify-content: center;
   }
   #rpModalBackdrop[hidden],
-  #rpStateModal[hidden] { display: none; }
+  #rpStateModal[hidden],
+  #rpMgmtModal[hidden] { display: none; }
 
   .rp-modal {
     background: var(--bg-panel);
@@ -523,6 +550,10 @@ RP_CSS = r"""
   #rpStateModal .rp-modal {
     width: 80vw;
     max-width: 900px;
+  }
+  #rpMgmtModal .rp-modal {
+    width: 80vw;
+    max-width: 720px;
   }
   .rp-modal-title {
     font-size: 11px;
@@ -632,6 +663,94 @@ RP_CSS = r"""
     border-color: var(--accent);
     background: rgba(0,229,255,0.08);
   }
+  #rpMgmtShutdownHub {
+    border-color: rgba(255,105,125,0.55);
+    color: var(--danger-b);
+  }
+  #rpMgmtShutdownHub:hover:not(:disabled) {
+    border-color: var(--danger-a);
+    background: rgba(255,90,105,0.08);
+    color: #ffd0d8;
+  }
+
+  /* Management list rows (built dynamically by rp_ui.py). */
+  #rpMgmtList .mgmt-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+  }
+  #rpMgmtList .mgmt-row:last-child { border-bottom: none; }
+  #rpMgmtList .mgmt-name {
+    flex: 0 0 130px;
+    font-weight: 700;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #rpMgmtList .mgmt-role {
+    flex: 0 0 78px;
+    font-size: 9px;
+    color: var(--text-mute);
+    text-transform: uppercase;
+    letter-spacing: 0.10em;
+    font-weight: 700;
+  }
+  #rpMgmtList .mgmt-port {
+    flex: 0 0 60px;
+    font-size: 10px;
+    color: var(--text-faint);
+    font-variant-numeric: tabular-nums;
+  }
+  #rpMgmtList .mgmt-pid {
+    flex: 0 0 90px;
+    font-size: 10px;
+    color: var(--text-faint);
+    font-variant-numeric: tabular-nums;
+  }
+  #rpMgmtList .mgmt-actions {
+    flex: 1 1 auto;
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+  }
+  #rpMgmtList .mgmt-actions button {
+    padding: 3px 10px;
+    cursor: pointer;
+    border: 1px solid var(--border-2);
+    background: transparent;
+    color: var(--text-dim);
+    border-radius: 2px;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-weight: 700;
+  }
+  #rpMgmtList .mgmt-actions button:hover {
+    border-color: var(--border-3);
+    color: var(--text);
+    background: rgba(220,230,242,0.03);
+  }
+  #rpMgmtList .mgmt-actions button.danger {
+    border-color: rgba(255,105,125,0.55);
+    color: var(--danger-b);
+  }
+  #rpMgmtList .mgmt-actions button.danger:hover {
+    border-color: var(--danger-a);
+    background: rgba(255,90,105,0.08);
+    color: #ffd0d8;
+  }
+  #rpMgmtList .mgmt-empty {
+    padding: 20px;
+    text-align: center;
+    font-size: 11px;
+    color: var(--text-faint);
+    font-style: italic;
+  }
 
   .rp-state-body {
     margin: 0;
@@ -661,18 +780,15 @@ RP_BODY = r"""
   <div class="title">Remote panel</div>
   <div class="conn">
     <input type="text" id="rpTarget"
-           placeholder="ws://127.0.0.1:8767/remote"
+           placeholder="ws://host:port/remote"
            autocomplete="off" spellcheck="false">
     <select id="rpPreset">
-      <option value="ws://127.0.0.1:8767/remote">pair</option>
-      <option value="ws://127.0.0.1:8766/remote">cone</option>
-      <option value="ws://127.0.0.1:8770/remote">board</option>
-      <option value="ws://127.0.0.1:8771/remote">text_board</option>
       <option value="">custom</option>
     </select>
     <button id="rpConnectBtn">Connect</button>
     <button id="rpDisconnectBtn" disabled>Disconnect</button>
     <button id="rpStateBtn" title="Show everything the panel knows">State JSON</button>
+    <button id="rpMgmtBtn" title="Manage playgrounds (requires hub)">Manage</button>
   </div>
   <div class="status">
     <span id="rpStatus">disconnected</span>
@@ -720,6 +836,30 @@ RP_BODY = r"""
       <button id="rpStateCopy">Copy</button>
       <button id="rpStateDownload">Download</button>
       <button id="rpStateClose">Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="rpMgmtModal" hidden>
+  <div class="rp-modal">
+    <div class="rp-modal-title">Manage playgrounds</div>
+    <div id="rpMgmtHint"
+         style="font-size:10px;color:#5a6774;line-height:1.5;">
+      Playgrounds are registered with the pgkit hub.  Click Kill to
+      ask one to shut down.  Force escalates to SIGTERM if cooperative
+      shutdown does not complete within five seconds.
+    </div>
+    <div id="rpMgmtList"
+         style="max-height:50vh;overflow:auto;
+                border:1px solid #1e2836;border-radius:2px;">
+    </div>
+    <div class="rp-modal-buttons">
+      <button id="rpMgmtShutdownHub"
+              title="Ask the hub to shut down, and every playground
+                     it manages with it.">
+        Shut down hub
+      </button>
+      <button id="rpMgmtClose">Close</button>
     </div>
   </div>
 </div>

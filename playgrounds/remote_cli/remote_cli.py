@@ -2,13 +2,52 @@
 """
 remote_cli — command-line client for pgkit playgrounds.
 
-    python remote_cli.py --url ws://127.0.0.1:8773/remote [COMMAND ...]
     python remote_cli.py --target sam3 [COMMAND ...]
-    python remote_cli.py [COMMAND ...]           # uses default_url
+    python remote_cli.py --url ws://127.0.0.1:8773/remote [COMMAND ...]
+    python remote_cli.py [COMMAND ...]           # uses default_target
 
 Without a subcommand, opens an interactive REPL.
 
 Run `python remote_cli.py --help` for the full command list.
+
+DISCOVERY, NOT CONFIGURATION
+============================
+Playgrounds register themselves with the pgkit hub at startup. The
+hub's `/__playgrounds` endpoint returns `{name, port, role, pid,
+html_file, connected_at}` for each. This CLI derives every URL it
+needs from that registry:
+
+    --target NAME          ws://<hub>/NAME/remote
+                           (through the hub proxy)
+
+    --target NAME --direct ws://<hub-host>:<NAME-port>/remote
+                           (bypass the hub proxy; the hub is still
+                           queried, but only for the port)
+
+    --url URL              literal; no discovery. Use this for
+                           standalone playgrounds when the hub is
+                           not running.
+
+There is no per-playground map in `config.json`. One hub URL and an
+optional `default_target` are the whole configuration. Any playground
+that registers with the hub is targetable by name; a new playground
+requires zero CLI changes.
+
+`list-targets` does the same `/__playgrounds` query and prints the
+result — no target connect, no WS traffic.
+
+EXIT CODES
+==========
+    0  success
+    1  runtime failure after connecting (a command the target
+       refused, a mid-command disconnect, a script step that
+       failed)
+    2  usage failure before connecting (bad flag, unknown target,
+       or the hub was required and could not be reached)
+
+`list-targets` obeys the same convention: a hub that cannot be
+queried is a usage-environment failure, not a runtime one, so it
+returns 2 to match `--target`/`--url` operations.
 
 Config
 ======
@@ -26,6 +65,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -52,24 +92,26 @@ from remote_cli import rc_repl    # noqa: E402
 
 
 # ============================================================================
+#  Exceptions
+# ============================================================================
+
+class HubUnreachable(Exception):
+    """The hub's /__playgrounds endpoint could not be queried."""
+
+
+class UnknownTarget(Exception):
+    """The named target is not in the hub's registry."""
+
+
+# ============================================================================
 #  Config
 # ============================================================================
 
-# The config lives in this file's directory. It ships with the CLI, is
-# checked into the repo, and is edited in place. There is no dotfile
-# dance and no cwd fallback — if you are running `remote_cli.py` from
-# anywhere, it reads `remote_cli/config.json` next to this file.
 CONFIG_PATH = _HERE / "config.json"
 
 DEFAULT_CONFIG = {
-    "default_url": "ws://127.0.0.1:8773/remote",
-    "targets": {
-        "sam3":       "ws://127.0.0.1:8773/remote",
-        "pair":       "ws://127.0.0.1:8767/remote",
-        "cone":       "ws://127.0.0.1:8766/remote",
-        "board":      "ws://127.0.0.1:8770/remote",
-        "text_board": "ws://127.0.0.1:8771/remote",
-    },
+    "hub": "ws://127.0.0.1:8780",
+    "default_target": "sam3",
     "timeout": 10.0,
 }
 
@@ -82,9 +124,14 @@ def _load_config() -> dict:
     config should not stop the CLI; it should tell the user where the
     problem is and continue with the built-in defaults.
 
-    User-supplied `targets` are merged onto the built-in targets rather
-    than replacing them. A config that adds one new playground should
-    not silently erase `sam3`, `pair`, and the rest.
+    Legacy keys (`targets`, `direct`) are accepted and ignored; they
+    were replaced by dynamic discovery from the hub. A legacy
+    `default_url` shaped like `ws://host/<name>/remote` is migrated to
+    `default_target = <name>` so old configs keep working when the hub
+    is up. A legacy direct-style `default_url` (e.g.
+    `ws://127.0.0.1:8773/remote`) cannot be migrated — there is no
+    name in it — so those users should either set `default_target` or
+    pass `--url`.
     """
     if not CONFIG_PATH.is_file():
         return dict(DEFAULT_CONFIG)
@@ -110,26 +157,100 @@ def _load_config() -> dict:
     merged = dict(DEFAULT_CONFIG)
     merged.update(data)
 
-    # Merge targets rather than replace, so removing a line from the
-    # user config does not erase that target from the CLI.
-    targets = dict(DEFAULT_CONFIG["targets"])
-    targets.update(data.get("targets") or {})
-    merged["targets"] = targets
+    # Legacy `default_url` → `default_target` migration for the
+    # hub-style URL shape only.
+    if not merged.get("default_target"):
+        old_url = merged.get("default_url") or ""
+        m = re.match(r"^wss?://[^/]+/([^/]+)/remote/?$", old_url)
+        if m:
+            merged["default_target"] = m.group(1)
 
     return merged
 
 
-def resolve_url(target: Optional[str], config: dict) -> str:
-    if not target:
-        return config["default_url"]
-    if target.startswith(("ws://", "wss://")):
-        return target
-    targets = config.get("targets") or {}
-    if target in targets:
-        return targets[target]
-    raise ValueError(
-        f"unknown alias {target!r}; known aliases: {sorted(targets)}"
-    )
+# ============================================================================
+#  Hub registry query
+# ============================================================================
+
+def _fetch_registry(config: dict):
+    """GET /__playgrounds, return (entries, hub_http).
+
+    `entries` is a list of dicts, each with `name`, `port`, `role`,
+    `pid`, `html_file`, `connected_at`. Raises HubUnreachable when the
+    hub does not respond.
+    """
+    hub_ws = config.get("hub", "ws://127.0.0.1:8780")
+    hub_http = hub_ws.replace("ws://", "http://") \
+                     .replace("wss://", "https://")
+    url = hub_http.rstrip("/") + "/__playgrounds"
+
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=3) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        raise HubUnreachable(
+            f"hub not reachable at {hub_http}: {e}"
+        ) from e
+
+    return (data.get("playgrounds") or []), hub_http
+
+
+def _hub_host(config: dict) -> str:
+    from urllib.parse import urlparse
+    hub_ws = config.get("hub", "ws://127.0.0.1:8780")
+    return urlparse(hub_ws).hostname or "127.0.0.1"
+
+
+# ============================================================================
+#  Target resolution
+# ============================================================================
+
+def resolve_target(config: dict, target_spec: Optional[str],
+                   direct: bool = False) -> str:
+    """Turn a `--target NAME` / `--url URL` / nothing into a ws URL.
+
+    A literal `ws://`/`wss://` string is returned unchanged. A name is
+    resolved against the hub's registry. `direct=True` bypasses the
+    hub's proxy but still asks the hub for the port.
+    """
+    if not target_spec:
+        target_spec = config.get("default_target") or ""
+    if not target_spec:
+        raise ValueError(
+            "no target specified; pass --target NAME or --url URL, "
+            "or set 'default_target' in config.json"
+        )
+
+    if target_spec.startswith(("ws://", "wss://")):
+        return target_spec
+
+    pgs, hub_http = _fetch_registry(config)
+
+    entry = next((p for p in pgs if p.get("name") == target_spec), None)
+    if entry is None:
+        names = sorted(
+            p.get("name") for p in pgs
+            if p.get("role") == "playground" and p.get("name")
+        )
+        raise UnknownTarget(
+            f"playground {target_spec!r} is not registered with the "
+            f"hub at {hub_http}. "
+            f"Registered playgrounds: {names or '(none)'}."
+        )
+
+    if direct:
+        host = _hub_host(config)
+        port = entry.get("port")
+        if not port:
+            raise UnknownTarget(
+                f"playground {target_spec!r} has no port in its "
+                f"hub registration; cannot construct a direct URL"
+            )
+        return f"ws://{host}:{port}/remote"
+
+    hub_ws = config.get("hub", "ws://127.0.0.1:8780").rstrip("/")
+    return f"{hub_ws}/{target_spec}/remote"
 
 
 # ============================================================================
@@ -178,6 +299,48 @@ def _print_json(obj) -> None:
 def _truncate(s: str, n: int) -> str:
     s = str(s)
     return s if len(s) <= n else s[:n - 1] + "…"
+
+
+# ============================================================================
+#  Hub query (used by `list-targets`)
+# ============================================================================
+#
+# EXIT-CODE SYMMETRY WITH --target / --url
+# =========================================
+# Both paths reach the hub's `/__playgrounds` endpoint. Both use
+# exit code 2 when the hub cannot be queried, because that is a
+# usage-environment failure ("the thing you need is not running"),
+# not a runtime failure of a connected command. Without this match,
+# `list-targets` (returns 1) and `--target board ls` (returns 2)
+# would answer the same "hub is down" condition with different
+# exit codes, which scripts could not distinguish from "bad input"
+# vs "connected but the command failed."
+
+def _list_targets_cli(config: dict, json_output: bool = False) -> int:
+    """Print the current hub registry. One-shot HTTP; no WS."""
+    try:
+        pgs, hub_http = _fetch_registry(config)
+    except HubUnreachable as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    if json_output:
+        _print_json({"hub": hub_http, "playgrounds": pgs})
+        return 0
+
+    if not pgs:
+        print(f"hub at {hub_http}: no playgrounds registered")
+        return 0
+
+    print(f"hub at {hub_http}:")
+    for pg in pgs:
+        line = (f"  {pg.get('name', '?'):<16}"
+                f" {pg.get('role', '?'):<10}"
+                f" :{pg.get('port', '?')}")
+        if pg.get("pid"):
+            line += f"  pid {pg['pid']}"
+        print(line)
+    return 0
 
 
 # ============================================================================
@@ -445,17 +608,28 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  remote_cli --url ws://127.0.0.1:8773/remote ls\n"
+            "  remote_cli --target sam3 ls\n"
             "  remote_cli --target sam3 set settings.threshold=0.55\n"
             "  remote_cli --target sam3 action action.segmentAll\n"
             "  remote_cli --target sam3 script flow.json\n"
+            "  remote_cli --target board --direct ls     # bypass hub proxy\n"
+            "  remote_cli --url ws://127.0.0.1:8773/remote ls  # standalone\n"
+            "  remote_cli list-targets\n"
             "  remote_cli --target sam3\n"
         ),
     )
     p.add_argument("--url", default=None,
-                   help="WebSocket URL (ws://host:port/remote) or alias")
+                   help="Literal WebSocket URL (ws://host:port/remote). "
+                        "Bypasses hub discovery. Use this for standalone "
+                        "playgrounds when the hub is not running.")
     p.add_argument("--target", default=None,
-                   help="Target alias from config (sam3, pair, cone, ...)")
+                   help="Playground name; resolved through the hub's "
+                        "registry (e.g. board, cone, sam3).")
+    p.add_argument("--direct", action="store_true",
+                   help="With --target: connect to the playground's own "
+                        "port instead of through the hub proxy. The hub "
+                        "is still queried for the port, so it must be "
+                        "reachable.")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Print every message sent/received")
     p.add_argument("--json", action="store_true",
@@ -532,6 +706,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Print the wire plan, do not send anything")
     script.set_defaults(fn=cmd_script)
 
+    # `list-targets` queries the hub directly. It has no client and
+    # never touches `args.fn`; the main() dispatcher special-cases it
+    # before connecting.
+    listtgt = sub.add_parser(
+        "list-targets",
+        help="List playgrounds registered with the hub (one-shot HTTP)",
+    )
+    listtgt.set_defaults(fn=None)
+
     return p
 
 
@@ -554,15 +737,26 @@ def main() -> int:
     if args.verbose:
         set_verbose(True)
 
+    # `list-targets` is a pure HTTP query; it never opens a WS to a
+    # playground, so it bypasses target resolution and the connect
+    # step entirely.
+    if args.cmd == "list-targets":
+        return _list_targets_cli(config, args.json)
+
+    target_spec = args.target or args.url
     try:
-        url = resolve_url(args.target or args.url, config)
-    except ValueError as e:
+        url = resolve_target(config, target_spec, direct=args.direct)
+    except (ValueError, HubUnreachable, UnknownTarget) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
     # No subcommand → REPL
     if args.cmd is None:
-        return rc_repl.run(url, config, verbose=args.verbose)
+        return rc_repl.run(
+            url, config,
+            target_name=args.target,
+            verbose=args.verbose,
+        )
 
     require_browser = args.cmd not in _NO_BROWSER_REQUIRED
 

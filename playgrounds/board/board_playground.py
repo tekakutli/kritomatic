@@ -51,6 +51,7 @@ def main():
             routes         = board_server.ROUTES,
             raw_routes     = board_server.RAW_ROUTES,
             module_sources = board_html.module_sources(),
+            hub_name       = "board",
         )
     else:
         print(f"  open : file://{os.path.abspath(HTML_FILE)}")

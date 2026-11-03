@@ -354,8 +354,15 @@ function _pgkitRemoteSend(msg) {
 }
 
 function pgkitRemoteConnect() {
-  const url = (location.protocol === "https:" ? "wss:" : "ws:")
-            + "//" + location.host + "/remote";
+  let url;
+  try {
+    const u = new URL("remote", document.baseURI);
+    u.protocol = (u.protocol === "https:") ? "wss:" : "ws:";
+    url = u.toString();
+  } catch (e) {
+    url = (location.protocol === "https:" ? "wss:" : "ws:")
+        + "//" + location.host + "/remote";
+  }
 
   let socket;
   try { socket = new WebSocket(url); }

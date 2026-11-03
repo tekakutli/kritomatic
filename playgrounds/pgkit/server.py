@@ -20,11 +20,29 @@ key and listing the keys that *are* present — the browser will show
 it in the network tab and the console, so a typo in an `import`
 path is visible without server access.
 
-Port selection is the same loop the pair and cone servers use.
+Hub registration
+================
+When `hub_name` is provided, the playground also registers with the
+pgkit hub (`pgkit.hub`) under that name. The hub is spawned detached
+if it is not already running. The browser is pointed at the hub URL
+if registration succeeded, and at the local URL otherwise. The
+fallback is silent and correct: a standalone playground is a valid
+deployment shape.
+
+`hub_role` selects the role the hub sees for this client. Defaults
+to `"playground"`; the remote panel passes `"panel"` so the hub
+treats it as unkillable and the panel's own UI filters it out of the
+target dropdown. See pgkit/hub_client.py's docstring.
+
+`html_file` (already a `serve()` parameter) is forwarded to the hub
+as part of the registration, so panels and the CLI can construct an
+Open URL from the registration entry alone. See
+pgkit/hub_client.py's docstring.
 """
 
 import json
 import os
+import sys
 import threading
 import traceback
 import webbrowser
@@ -37,8 +55,16 @@ from .remote_hub import Client, Hub, handle_message
 def serve(*, port=8766, open_browser=True,
           html_file="playground.html",
           routes=None, raw_routes=None,
-          module_sources=None, hub=None):
-    """Start the HTTP + WebSocket server and block until Ctrl+C."""
+          module_sources=None, hub=None,
+          hub_name=None, hub_role="playground"):
+    """Start the HTTP + WebSocket server and block until Ctrl+C.
+
+    When `hub_name` is provided, the playground also registers with
+    the pgkit hub (`pgkit.hub`) as this name and role. The hub is
+    spawned detached if absent. The browser opens the hub URL if
+    registration succeeded; otherwise it opens the local URL and the
+    playground runs standalone.
+    """
     routes         = routes or {}
     raw_routes     = raw_routes or {}
     module_sources = module_sources or {}
@@ -189,11 +215,37 @@ def serve(*, port=8766, open_browser=True,
         print("Could not find a free port in [%d, %d)." % (port, port + 20))
         return
 
-    url = "http://127.0.0.1:%d/%s" % (used_port, html_file)
+    # Hub registration is best-effort: if it fails, the playground
+    # keeps running standalone at its local URL.
+    hub_conn = None
+    registered = False
+    if hub_name:
+        try:
+            from .hub_client import ensure_running
+            hub_conn = ensure_running(
+                hub_name, used_port,
+                role=hub_role,
+                html_file=html_file,
+            )
+            registered = hub_conn.registered.is_set()
+        except Exception as e:
+            print(f"  hub registration failed: {e}", file=sys.stderr)
+
+    if registered:
+        url = hub_conn.hub_url + html_file
+    else:
+        url = "http://127.0.0.1:%d/%s" % (used_port, html_file)
+
     print("Serving %s" % os.getcwd())
     print("  -> open  %s" % url)
     print("  -> modules at /modules/ (%d file(s))" % len(module_sources))
     print("  -> remote ws at ws://127.0.0.1:%d/remote" % used_port)
+    if registered:
+        print("  -> registered as %r (role=%s) with pgkit hub (port %d)"
+              % (hub_name, hub_role, used_port))
+    elif hub_name:
+        print("  -> hub registration FAILED; running standalone at "
+              "http://127.0.0.1:%d/%s" % (used_port, html_file))
     print("  Press Ctrl+C to stop.")
 
     if open_browser:
@@ -205,3 +257,5 @@ def serve(*, port=8766, open_browser=True,
         print("\nStopped.")
     finally:
         httpd.server_close()
+        if hub_conn is not None:
+            hub_conn.stop_now()

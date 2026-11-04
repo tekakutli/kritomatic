@@ -316,6 +316,9 @@ Examples:
     Human: "which tool prints a sheet of text labels?"
     labels2grid
 
+    Human: "which tool makes a flowing sheet of images at a max cm size?"
+    imgs2size
+
     Human: "which tool makes slideshows?"
     No registered tool does that.
 
@@ -677,6 +680,30 @@ Human: "turn ~/pics into sheet.pdf, 2 by 2, no labels"
          SHOW_FILENAME=false is sufficient and follows the rule not to
          emit params at their default value.)
 
+Human: "turn ~/pics into sheet.pdf, images at most 6 by 7.5 cm, no
+        labels"
+
+    {
+      "tool": "imgs2size",
+      "params": {
+        "INPUT_DIR": "~/pics",
+        "OUTPUT_PDF": "sheet.pdf",
+        "MAX_IMAGE_WIDTH_CM": 6,
+        "MAX_IMAGE_HEIGHT_CM": 7.5,
+        "SHOW_FILENAME": false
+      }
+    }
+
+    (TOOL SELECTION: a folder of images scaled to a "6 by 7.5 cm" max
+         box on a flowing sheet -> imgs2size. NOT imgs2grid — that tool
+         is driven by a fixed C×R column/row count, and here the human
+         names a centimetre size box instead.
+     PATHS: both paths given verbatim.
+     "6 by 7.5 cm" -> MAX_IMAGE_WIDTH_CM=6, MAX_IMAGE_HEIGHT_CM=7.5,
+         following the convention "W cm by H cm" (first number is the
+         width, second is the height).
+     BOOLEAN FLAGS: "no labels" -> SHOW_FILENAME=false.)
+
 Human: "make me a slideshow of these pictures"
 
     {"error": "No registered tool creates slideshows."}
@@ -814,7 +841,8 @@ imgs2pdf
     image into a C×R grid of print tiles for reassembly into a larger
     poster — for that, use grid2pdf. Does not place a single image
     onto a single page at a chosen centimetre size — for that, use
-    solo2pdf.
+    solo2pdf. Does not flow images of a chosen centimetre size onto
+    pages — for that, use imgs2size.
 
   params:
     INPUT_DIR                str   default "/tmp/"
@@ -1074,10 +1102,13 @@ imgs2grid
     (no images), use labels2grid. Not a single-image poster splitter —
     for one image tiled across C×R pages for reassembly, use grid2pdf.
     Not a caption tool — for embedding text into a single image, use
-    captionize. Does not recurse into subdirectories — only top-level
-    files of INPUT_DIR are read. Does not lay out a single image
-    across pages. Does not place a single image, whole, onto one
-    Letter page at a chosen centimetre size — for that, use solo2pdf.
+    captionize. Not a flow-layout tool sized by a cm box — for
+    images scaled up or down to a max width × height in cm with
+    wrapping rows, use imgs2size. Does not recurse into
+    subdirectories — only top-level files of INPUT_DIR are read. Does
+    not lay out a single image across pages. Does not place a single
+    image, whole, onto one Letter page at a chosen centimetre size —
+    for that, use solo2pdf.
 
   params:
     INPUT_DIR      str   default "/tmp/"
@@ -1120,6 +1151,113 @@ imgs2grid
                    Number of image ROWS per page. spoken as: "N rows",
                    "N tall", "N high", "... by N" (the second number
                    of a "C by R" phrase maps here).
+
+imgs2size
+  file: imgs2size.py
+
+  description:
+    Converts every image in a directory into a single PDF of US Letter
+    pages, scaling each image (up or down) to fit inside a maximum
+    width × height box specified in centimetres while preserving
+    aspect ratio, and placing the scaled images in a wrapping flow
+    layout.
+
+  use_case:
+    The human wants a PDF where every image is scaled up or down to a
+    target printed size in cm — not shrunk into a fixed cell of a
+    column/row grid — and flows left-to-right, wrapping to new rows
+    and paginating as needed. Typical phrasings: "size each image to
+    6 by 7.5 cm", "make every photo at most 6 cm wide and 7.5 cm
+    tall", "scale images up or down to a max box", "flow layout of
+    images at 6 cm", "images at 6 cm wide in a flowing sheet", "put
+    each image at 5 cm on a letter page", "shrink or grow images to
+    fit a 6 by 7 cm box", "make a sheet where each image is at most N
+    cm", "images at max 8 by 8 cm, wrapping".
+
+  objective:
+    Turn a folder of images into a single PDF where each page is a US
+    Letter sheet at 300 DPI. Each image is scaled up OR down to fit
+    inside a MAX_IMAGE_WIDTH_CM × MAX_IMAGE_HEIGHT_CM box while
+    preserving aspect ratio, then placed in a flow layout: images go
+    left-to-right, wrap to a new row when they don't fit, and
+    paginate to a new page when the next row would overflow. Each
+    image can be labeled with its filename (without extension) or a
+    sequential number.
+
+  outputs:
+    One PDF file. Default name "output_size.pdf" (written to the
+    current working directory, so prefer an explicit OUTPUT_PDF).
+    Page count is determined dynamically by how many images fit — it
+    is not a fixed divisor of the image count. Pages are US Letter at
+    300 DPI. Also prints a progress log to stdout.
+
+  not_for:
+    Not a fixed C×R contact sheet — if the human names a column/row
+    count ("3 by 3", "4 columns", "nine per page"), use imgs2grid;
+    imgs2size is driven by a centimetre size box, not by a grid
+    dimension. Not the album layout — for one or two images per
+    portrait page, use imgs2pdf. Not a single-image poster splitter
+    — for one image tiled across C×R pages for reassembly, use
+    grid2pdf. Not a caption tool — for embedding text into a single
+    image, use captionize. Not a text-label sheet — for a grid of
+    text strings, use labels2grid. Not a one-image-per-page placer —
+    for a single image placed whole on one page at a cm size, use
+    solo2pdf. Does not recurse into subdirectories — only top-level
+    files of INPUT_DIR are read. Does not lay out a single image
+    across pages.
+
+  params:
+    INPUT_DIR             str   default "/tmp/"
+                          Directory containing the source images.
+                          spoken as: "the folder", "the images
+                          folder", "my photos", "the directory with
+                          the pictures".
+
+    OUTPUT_PDF            str   default "output_size.pdf"
+                          Filename/path of the PDF to write. spoken
+                          as: "save it as X", "call the output X",
+                          "write the PDF to X", "name it X". A value
+                          without an extension gets ".pdf" appended
+                          automatically by the router.
+
+    SHOW_FILENAME         bool  default true
+                          If true, draw the image's filename (without
+                          extension) in the label strip below its
+                          image. Overridden by NUMBER_IMAGES when
+                          both are true. spoken as: "with filenames",
+                          "show filenames", "labeled with names",
+                          "print the names", "filenames under each
+                          image" -> true; "no filenames", "without
+                          names", "no names" -> false.
+
+    NUMBER_IMAGES         bool  default false
+                          If true, draw a sequential number (1-based,
+                          running across pages) in the label strip
+                          below each image, instead of the filename.
+                          Labels are enabled when either SHOW_FILENAME
+                          or NUMBER_IMAGES is true; when both are
+                          true, NUMBER_IMAGES takes precedence and a
+                          number is printed. spoken as: "numbered",
+                          "with numbers", "number each image", "show
+                          numbers", "sequential numbers", "number
+                          them" -> true.
+
+    MAX_IMAGE_WIDTH_CM    float default 6.0
+                          Maximum image WIDTH in centimetres. Each
+                          image is scaled up or down so that neither
+                          this nor MAX_IMAGE_HEIGHT_CM is exceeded,
+                          preserving aspect ratio. spoken as: "N cm
+                          wide", "max N cm wide", "at most N cm wide",
+                          "N cm in width", "N cm width", "width N cm".
+
+    MAX_IMAGE_HEIGHT_CM   float default 7.5
+                          Maximum image HEIGHT in centimetres. Each
+                          image is scaled up or down so that neither
+                          this nor MAX_IMAGE_WIDTH_CM is exceeded,
+                          preserving aspect ratio. spoken as: "N cm
+                          tall", "N cm max tall", "at most N cm tall",
+                          "N cm high", "N cm in height", "N cm height",
+                          "height N cm".
 
 solo2pdf
   file: solo2pdf.py

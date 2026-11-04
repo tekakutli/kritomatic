@@ -341,6 +341,18 @@ TOOLS = {
             "GRID_ROWS",
         ],
     },
+    "imgs2size": {
+        "file": "imgs2size.py",
+        "entry": "main",
+        "params": [
+            "INPUT_DIR",
+            "OUTPUT_PDF",
+            "SHOW_FILENAME",
+            "NUMBER_IMAGES",
+            "MAX_IMAGE_WIDTH_CM",
+            "MAX_IMAGE_HEIGHT_CM",
+        ],
+    },
     "solo2pdf": {
         "file": "solo2pdf.py",
         "entry": "main",

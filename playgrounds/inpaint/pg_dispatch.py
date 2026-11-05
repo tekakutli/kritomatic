@@ -5,6 +5,15 @@ then syncs the panel fields, then syncs the mask list.  The canvas
 event listeners own the input lifecycle — mousedown, mousemove,
 mouseup, wheel, contextmenu, keydown, keyup.
 
+`drawView()` is the canvas-only redraw.  It is used wherever the
+state that changed is visible only on the canvas — pan, zoom,
+inpaint-context drag, hover highlight — and none of the panel
+fields or the mask list need to be re-synced.  Hover in particular
+runs on every mouse-move that crosses a mask boundary; using
+`draw()` there would rebuild the mask DOM and re-sync every panel
+field on every crossing, which was the largest per-frame cost after
+`syncMaskList`'s own rebuild.
+
 Input modes:
   - pan (space+drag, middle mouse)
   - zoom (wheel at cursor)
@@ -244,6 +253,14 @@ canvas.addEventListener("mousemove", (e) => {
   }
 
   // Hover state for mask overlay highlight.
+  //
+  // Hover affects only the canvas — drawImageLayer reads
+  // `board.hoveredMaskIdx` to vary globalAlpha.  It does NOT affect
+  // any panel field or the mask list DOM, so a canvas-only redraw
+  // is enough.  Using draw() here (which additionally runs
+  // syncPanelFields and syncMaskList) is what made hover across a
+  // mask boundary the largest per-frame cost after syncMaskList's
+  // own rebuild.
   let hoveredMask = -1;
   if (overImage) {
     hoveredMask = hitTestMaskAtPoint(ix, iy);
@@ -251,7 +268,7 @@ canvas.addEventListener("mousemove", (e) => {
 
   if (hoveredMask !== board.hoveredMaskIdx) {
     board.hoveredMaskIdx = hoveredMask;
-    draw();
+    drawView();
   }
 
   if (hoveredMask >= 0) canvas.style.cursor = "pointer";

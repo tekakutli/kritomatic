@@ -6,7 +6,18 @@ here is drawn against the fitted image rect `r` (from
 `pg_state.fittedImageRect`), wrapped in the same rotation transform
 that `pg_view_inpaint.js` uses for the context rectangle, so the
 image, mask overlays, and context rect stay visually aligned at
-every angle."""
+every angle.
+
+Mask overlays iterate `board.selectedMaskIndices` directly rather
+than allocating a `Set` and iterating the whole mask array.  Every
+mutator of `selectedMaskIndices` (`toggleMaskSelection`,
+`addMaskToSelection`, `replaceMaskSelection`, `clearMaskSelection`,
+`selectAllMasks`, the delete handlers in `pg_panel_lists.js` and
+`pg_panel_bindings.js`, `_kritaImportMasksAction`,
+`_maskFromRectAction`, `_pickMaskAction`, `setMasks`) keeps the
+array in ascending order, so direct iteration preserves the previous
+draw order — mask index ascending — while avoiding a per-frame
+allocation."""
 
 VIEW_IMAGE_JS = r"""
 import { ctx, board, maskColor, view } from "./pg_state.js";
@@ -58,7 +69,14 @@ function _tintedMask(mask, color) {
    drawn against the *un-rotated* fit rect `r`, wrapped in a
    `translate(cx,cy); rotate(rad); translate(-cx,-cy)` transform.
    That gives the visual rotation without changing any image
-   dimensions or the fit scale. */
+   dimensions or the fit scale.
+
+   The overlay loop iterates `board.selectedMaskIndices` directly.
+   The array is kept in ascending order by every mutator, so
+   iteration order matches the previous
+   `for i in 0..n-1, skip unless selected` loop.  Skipping the
+   `new Set(...)` allocation removes the only per-frame object
+   allocation in this function. */
 
 export function drawImageLayer(r) {
   const cx = r.x0 + r.w / 2;
@@ -78,9 +96,7 @@ export function drawImageLayer(r) {
   ctx.lineWidth = 1;
   ctx.strokeRect(r.x0 + 0.5, r.y0 + 0.5, r.w - 1, r.h - 1);
 
-  const selectedSet = new Set(board.selectedMaskIndices);
-  for (let i = 0; i < board.masks.length; i++) {
-    if (!selectedSet.has(i)) continue;
+  for (const i of board.selectedMaskIndices) {
     const m = board.masks[i];
     if (!m || !m.loaded) continue;
     const tinted = _tintedMask(m, maskColor(i));

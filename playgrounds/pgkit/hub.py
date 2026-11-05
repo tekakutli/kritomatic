@@ -5,8 +5,8 @@
 
 A single HTTP server (default 127.0.0.1:8780) that:
 
-    · accepts WebSocket registrations from playgrounds and panels
-      on  /__hub_ws
+    · accepts WebSocket registrations from playgrounds, panels, and
+      launchers on  /__hub_ws
     · proxies  /<name>/*  to  localhost:<registered_port>/*  for both
       HTTP and WebSocket upgrades
     · accepts  GET /__playgrounds  for one-shot CLI listings
@@ -15,22 +15,13 @@ A single HTTP server (default 127.0.0.1:8780) that:
     · broadcasts a `playgrounds` event to every connected panel
       whenever the registered set changes — no polling anywhere
 
-Playgrounds that spawn this themselves run it as a detached subprocess
-(`start_new_session=True`), so killing a playground's terminal does not
-kill the hub. `~/.pgkit/hub.log` carries its stderr/stdout; a fresh hub
-appends.
-
 REGISTRATION IDENTITY
 =====================
 A `Registration` records the WS socket that created it. `deregister`
 takes an optional `sock`: when it matches the current registration's
 socket, the registration is removed; when it doesn't, the caller is
 an old handler noticing its socket died *after* a newer connection
-already took the name, and the removal is a no-op. This is what makes
-transient WS reconnects safe: the old handler's `finally` block can
-fire after the new connection has registered, without wiping it out.
-The hard-kill escalation path calls `deregister(name)` without a
-socket to force removal; that use case is authoritative, not a race.
+already took the name, and the removal is a no-op.
 
 GROUPS
 ======
@@ -39,13 +30,27 @@ A registration may carry an optional `group` string (set by
 not routing: proxying, `/__playgrounds`, and target selection all
 treat each registration independently.  The group is consulted only
 by `_kill_playground`, which enriches the kill_result message to
-name the group and its member count.  Killing any member of a group
-that shares a Python process shuts down the process, and every
-registration it owned dies with it; the message reflects that.
+name the group and its member count.
 
-A `None` group (the default, and what every standalone launch uses)
-behaves exactly as before this field was added — the kill message
-names only the playground that was signalled.
+LAUNCHERS
+=========
+A launcher opens an additional WS with `role="launcher"` and the
+same `group` as its playgrounds.  This registration's purpose is to
+carry per-group control commands.  It carries an `available` field
+(a list of playground names the launcher can start); the field is
+pushed by the launcher via `launcher_state` messages and re-broadcast
+to panels as part of every `playgrounds` event.
+
+Panels send `launcher_start` / `launcher_stop` / `launcher_restart`
+messages over their own management WS; the hub finds the launcher
+whose `available` contains the target name and forwards the message.
+The launcher replies with `launcher_result`, which the hub broadcasts
+to every panel.
+
+Killing any *playground* in a group still shuts down the whole group
+(the cooperative `shutdown` message reaches the launcher process,
+which exits).  The new launcher_* commands are the way to stop or
+start an individual member without touching the rest.
 
 PANELS
 ======
@@ -55,61 +60,28 @@ Two kinds of clients connect with `role="panel"`:
         The Python-side HubConnection of a running remote_panel
         process. It carries a `name`, `port`, `pid`, and `html_file`
         in its hello frame, and becomes a first-class entry in
-        `registrations` with `role="panel"`. It receives hello_ack
-        (so its launcher can compute the hub URL and open the panel
-        through the proxy), appears in `/__playgrounds`, and is
-        filtered out of the target dropdown by its role field. It
-        is NOT added to `panel_socks` — a registered panel is a
-        client that only reads; it never sends `kill` /
-        `shutdown_hub` and it does not need `playgrounds`
-        broadcasts. `_kill_playground` refuses to kill it — panels
-        are the management UI, and killing one removes the very
-        interface the user is managing the hub from. A hung panel
-        must be killed from the shell with `kill <pid>`.
+        `registrations` with `role="panel"`.
 
     Listener panels
         The browser-side management WebSocket that
         `remote_panel/rp_client.py` opens. It carries no name and no
         port, only `role="panel"`. It is not registered; it joins
         `panel_socks` for `playgrounds` broadcasts and can send
-        `kill` / `shutdown_hub` commands, but has no entry in
-        `registrations` and cannot be addressed by name.
-
-Both kinds use the same connection path — the dispatch in
-`_serve_hub_ws` distinguishes them by whether the hello carries a
-name and port. Registered panels get hello_ack and use the read-only
-loop; listeners don't need hello_ack and use the command loop.
+        `kill`, `shutdown_hub`, and `launcher_*` commands.
 
 ABSOLUTE-PATH FETCHES FROM PANELS
 =================================
-Panel JS uses `fetch("/krita/import")` and similar absolute paths
-throughout the playgrounds — inpaint, sam3, board, text_board all
-do. Under the hub, the panel page is at
-`/<name>/<name>_playground.html`, but an absolute-path fetch
-resolves against the **hub root**, not the panel's directory. So
-the request arrives at `/krita/import` and the first path segment
-(`krita`) is treated as a playground name, producing a misleading
-`unknown playground: krita` 404.
-
-The resolver therefore has two rules:
+Panel JS uses `fetch("/krita/import")` and similar absolute paths.
+Under the hub, the panel page is at `/<name>/<name>_playground.html`,
+but an absolute-path fetch resolves against the hub root.  The
+resolver therefore has two rules:
 
     1. Explicit prefix: `/<registered-name>/<rest>` → forward to
-       `/<rest>` on that playground. This is what every module
-       import, every `<script src>`, every WS connection, and every
-       direct URL navigation uses.
+       `/<rest>` on that playground.
+    2. Referer fallback: first segment is not a playground, but the
+       Referer's first segment is → forward unchanged.
 
-    2. Referer fallback: the first segment is NOT a registered
-       playground, but the request's `Referer` header is a
-       `/`-prefixed URL whose first segment IS a registered
-       playground → forward the request path unchanged to that
-       playground. Every absolute-path `fetch()` a panel makes
-       carries `Referer: http://hub/<name>/<name>_playground.html`,
-       so this rule handles every panel fetch without touching a
-       single playground file.
-
-The fallback is a no-op for direct hub traffic (no Referer, or
-Referer not from a panel), and a no-op for explicitly-prefixed
-requests (rule 1 wins). See `Handler._resolve_proxy_target`.
+See `Handler._resolve_proxy_target`.
 """
 
 import argparse
@@ -138,23 +110,19 @@ HUB_PORT = 8780
 # ============================================================================
 
 class Registration:
-    """One playground's or panel's registration, held while its WS is
-    open.
+    """One peer's registration, held while its WS is open.
 
-    The WS socket is the only credential — any message on it is from
-    that client by construction. `send()` is the only way the hub
-    talks back to it. `html_file` is the client's own
-    `kit_serve(html_file=...)` value, forwarded so panels and the CLI
-    can construct an Open URL without a hardcoded filename map.
+    Fields:
+        name, port, role, pid, sock, html_file, group,
+        connected_at, send_lock
 
-    `group` is optional metadata (see the module docstring's GROUPS
-    section).  Its only consumer is `_kill_playground`, which
-    enriches the kill_result message when the group has more than
-    one member.
+    `available` is only meaningful for role="launcher"; it is the
+    list of playground names the launcher can start.  For any other
+    role it is None.
     """
 
     def __init__(self, name, port, role, pid, sock, html_file=None,
-                 group=None):
+                 group=None, available=None):
         self.name = name
         self.port = port
         self.role = role
@@ -162,6 +130,7 @@ class Registration:
         self.sock = sock
         self.html_file = html_file
         self.group = group
+        self.available = available
         self.connected_at = time.time()
         self.send_lock = threading.Lock()
 
@@ -171,7 +140,7 @@ class Registration:
             _ws.write_text_frame(self.sock, data)
 
     def to_json(self):
-        return {
+        d = {
             "name":         self.name,
             "port":         self.port,
             "role":         self.role,
@@ -180,6 +149,9 @@ class Registration:
             "group":        self.group,
             "connected_at": self.connected_at,
         }
+        if self.role == "launcher":
+            d["available"] = list(self.available or [])
+        return d
 
 
 class Hub:
@@ -200,14 +172,6 @@ class Hub:
         self.broadcast_playgrounds()
 
     def deregister(self, name, sock=None):
-        """Remove a registration.
-
-        When `sock` is given, removal is conditional on the current
-        registration owning that exact socket. A stale handler whose
-        WS was replaced by a newer connection therefore does not
-        remove the newer registration. When `sock` is None, removal is
-        unconditional — the hard-kill escalation path uses this.
-        """
         with self.lock:
             reg = self.registrations.get(name)
             if reg is None:
@@ -224,6 +188,14 @@ class Hub:
     def has(self, name):
         with self.lock:
             return name in self.registrations
+
+    def find_launcher_for(self, target):
+        """Return the launcher whose `available` contains `target`."""
+        with self.lock:
+            for r in self.registrations.values():
+                if r.role == "launcher" and target in (r.available or []):
+                    return r
+        return None
 
     def add_panel(self, sock):
         with self.lock:
@@ -256,6 +228,20 @@ class Hub:
         for sock in dead:
             self.remove_panel(sock)
 
+    def broadcast_to_panels(self, msg):
+        """Send one message to every connected listener panel."""
+        data = json.dumps(msg)
+        with self.lock:
+            socks = list(self.panel_socks)
+        dead = []
+        for sock in socks:
+            try:
+                _ws.write_text_frame(sock, data)
+            except OSError:
+                dead.append(sock)
+        for sock in dead:
+            self.remove_panel(sock)
+
 
 _HUB = Hub()
 
@@ -265,17 +251,8 @@ _HUB = Hub()
 # ============================================================================
 
 def _verify_pid(pid, name):
-    """Is PID plausibly this playground's process?
-
-    Linux: cross-checks /proc/<pid>/cmdline.
-    macOS/BSD: falls back to `ps -p <pid> -o command=`.
-    Any error → True. The cooperative path is the default; hard kill is
-    an explicit escalation, and a false negative here would just mean
-    "no hard kill available," which is a safe degradation.
-    """
     if not pid:
         return False
-
     proc = Path(f"/proc/{pid}/cmdline")
     if proc.exists():
         try:
@@ -285,8 +262,6 @@ def _verify_pid(pid, name):
             return (name in cmd) or ("playground" in cmd)
         except OSError:
             return True
-
-    # No /proc — try `ps` (macOS, BSD).
     try:
         import subprocess
         out = subprocess.check_output(
@@ -330,12 +305,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-
         if path == "/__shutdown":
             self._send_json({"success": True})
             threading.Timer(0.2, _shutdown_hub).start()
             return
-
         self._proxy_http(path)
 
     def do_PUT(self):    self._proxy_http(urlparse(self.path).path)
@@ -360,32 +333,9 @@ class Handler(BaseHTTPRequestHandler):
         return name, rest
 
     def _resolve_proxy_target(self, path):
-        """Return (name, forward_path) or None.
-
-        Two resolution rules:
-
-        1. Explicit prefix: `/<registered-name>/<rest>` → forward to
-           `/<rest>` on that playground. Used by module imports,
-           `<script src>`, WS connections, and direct URL
-           navigation.
-
-        2. Referer fallback: the first path segment is not a
-           registered playground, but the Referer header is a
-           `/`-prefixed URL whose first segment IS a registered
-           playground → forward the full request path unchanged to
-           that playground. Used by every absolute-path `fetch()`
-           a panel makes (`fetch("/krita/import")` and friends).
-
-        `__`-prefixed paths are hub-management and never fall through
-        to the Referer rule — `/__playgrounds` and `/__hub_ws` are
-        already handled before proxy dispatch, and any other `__`
-        path that reaches here is genuinely unknown.
-        """
         name, rest = self._split_name(path)
-
         if name and _HUB.has(name):
             return name, rest
-
         if name and not name.startswith("__"):
             referer = self.headers.get("Referer", "") or ""
             if referer:
@@ -397,7 +347,6 @@ class Handler(BaseHTTPRequestHandler):
                         return ref_name, path
                 except Exception:
                     pass
-
         return None
 
     def _unknown_target_json(self, path):
@@ -453,15 +402,21 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self._read_playground_loop(sock, name)
 
+            elif role == "launcher":
+                if not name:
+                    return
+                reg = Registration(name, port, role, pid, sock,
+                                   html_file=html_file, group=group,
+                                   available=[])
+                _HUB.register(reg)
+                registered_name = name
+                try:
+                    reg.send({"type": "hello_ack", "name": name})
+                except OSError:
+                    return
+                self._read_launcher_loop(sock, name)
+
             elif role == "panel":
-                # Registered panel: the Python HubConnection of a
-                # remote_panel process. Behaves like a playground
-                # registration — register, hello_ack, then a
-                # read-only loop. It is NOT added to panel_socks: a
-                # registered panel never sends kill / shutdown_hub
-                # and does not need playgrounds broadcasts (its
-                # browser-side counterpart opens a separate
-                # anonymous WS to receive those).
                 if name and port:
                     reg = Registration(name, port, role, pid, sock,
                                        html_file=html_file, group=group)
@@ -473,27 +428,16 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     self._read_playground_loop(sock, name)
                 else:
-                    # Anonymous listener: the browser-side
-                    # management WS opened by rp_client.py. No name,
-                    # no port; joins panel_socks for `playgrounds`
-                    # broadcasts; can send `kill` / `shutdown_hub`.
                     _HUB.add_panel(sock)
                     self._read_panel_loop(sock)
 
         except Exception:
             pass
         finally:
-            if role == "playground" and registered_name:
-                # Identity check: only remove the registration if it
-                # still belongs to this socket. A stale handler whose
-                # WS was replaced by a newer connection must not wipe
-                # the newer registration.
+            if registered_name:
                 _HUB.deregister(registered_name, sock=sock)
             elif role == "panel":
-                if registered_name:
-                    _HUB.deregister(registered_name, sock=sock)
-                else:
-                    _HUB.remove_panel(sock)
+                _HUB.remove_panel(sock)
             try:
                 sock.close()
             except OSError:
@@ -507,6 +451,31 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if opcode is None or opcode == 0x08:
                 return
+
+    def _read_launcher_loop(self, sock, name):
+        while True:
+            try:
+                opcode, payload = _ws.read_frame(sock)
+            except OSError:
+                return
+            if opcode is None or opcode == 0x08:
+                return
+            if opcode != 0x01:
+                continue
+            try:
+                msg = json.loads(payload.decode("utf-8"))
+            except Exception:
+                continue
+            t = msg.get("type")
+            if t == "launcher_state":
+                reg = _HUB.find(name)
+                if reg is None or reg.sock is not sock:
+                    return
+                with _HUB.lock:
+                    reg.available = list(msg.get("available") or [])
+                _HUB.broadcast_playgrounds()
+            elif t == "launcher_result":
+                _HUB.broadcast_to_panels(msg)
 
     def _read_panel_loop(self, sock):
         while True:
@@ -524,6 +493,7 @@ class Handler(BaseHTTPRequestHandler):
                 continue
 
             t = msg.get("type")
+
             if t == "kill":
                 target = msg.get("name") or ""
                 hard   = bool(msg.get("hard", False))
@@ -539,6 +509,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 except OSError:
                     return
+
             elif t == "shutdown_hub":
                 try:
                     _ws.write_text_frame(
@@ -549,25 +520,52 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Timer(0.5, _shutdown_hub).start()
                 return
 
+            elif t in ("launcher_start", "launcher_stop", "launcher_restart"):
+                target = msg.get("name") or ""
+                request_id = msg.get("request_id") or ""
+                launcher = _HUB.find_launcher_for(target)
+                if launcher is None:
+                    try:
+                        _ws.write_text_frame(sock, json.dumps({
+                            "type": "launcher_result",
+                            "request_id": request_id,
+                            "name": target,
+                            "success": False,
+                            "message": (f"no launcher manages {target!r} "
+                                        f"(is the playground running "
+                                        f"standalone?)"),
+                        }))
+                    except OSError:
+                        return
+                    continue
+                try:
+                    launcher.send({
+                        "type": t,
+                        "name": target,
+                        "request_id": request_id,
+                    })
+                except OSError:
+                    try:
+                        _ws.write_text_frame(sock, json.dumps({
+                            "type": "launcher_result",
+                            "request_id": request_id,
+                            "name": target,
+                            "success": False,
+                            "message": "launcher unreachable",
+                        }))
+                    except OSError:
+                        return
+
     # ---- HTTP proxy --------------------------------------------------
-    #
-    # LIMITATION: this reads Content-Length and forwards exactly that
-    # many bytes. A request that uses Transfer-Encoding: chunked (as
-    # some browsers will for large streamed uploads) is not supported —
-    # the backend would hang waiting for body data. All current
-    # playground routes use Content-Length, so this does not bite today.
-    # If it ever does, chunked decoding is a bounded addition here.
 
     def _proxy_http(self, path):
         parsed = urlparse(self.path)
         query = parsed.query
-
         resolved = self._resolve_proxy_target(path)
         if resolved is None:
             self._unknown_target_json(path)
             return
         name, forward_path = resolved
-
         reg = _HUB.find(name)
         if reg is None:
             self._unknown_target_json(path)
@@ -586,16 +584,13 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            method = self.command
             headers = dict(self.headers.items())
             headers["Host"] = f"{HUB_HOST}:{reg.port}"
             headers["Connection"] = "close"
-
             forward_with_query = (
                 forward_path + ("?" + query if query else "")
             )
-
-            req = f"{method} {forward_with_query} HTTP/1.1\r\n"
+            req = f"{self.command} {forward_with_query} HTTP/1.1\r\n"
             for k, v in headers.items():
                 req += f"{k}: {v}\r\n"
             req += "\r\n"
@@ -617,7 +612,6 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
-
         except Exception:
             pass
         finally:
@@ -628,22 +622,15 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     # ---- WS proxy ----------------------------------------------------
-    #
-    # `select()` has NO timeout in this pipe. An idle WebSocket must
-    # survive as long as either side wants it to. If the client or the
-    # backend goes away, `recv()` returns empty, the loop exits, and
-    # the socket is closed — no explicit deadline needed.
 
     def _proxy_ws(self, path):
         parsed = urlparse(self.path)
         query = parsed.query
-
         resolved = self._resolve_proxy_target(path)
         if resolved is None:
             self.send_error(404, f"unknown playground: {path}")
             return
         name, forward_path = resolved
-
         reg = _HUB.find(name)
         if reg is None:
             self.send_error(404, f"unknown playground: {name}")
@@ -660,18 +647,15 @@ class Handler(BaseHTTPRequestHandler):
         try:
             headers = dict(self.headers.items())
             headers["Host"] = f"{HUB_HOST}:{reg.port}"
-
             forward_with_query = (
                 forward_path + ("?" + query if query else "")
             )
-
             req = f"GET {forward_with_query} HTTP/1.1\r\n"
             for k, v in headers.items():
                 req += f"{k}: {v}\r\n"
             req += "\r\n"
             backend.sendall(req.encode("utf-8"))
 
-            # Read the backend's 101 handshake (headers only)
             response = b""
             while b"\r\n\r\n" not in response:
                 chunk = backend.recv(4096)
@@ -681,8 +665,6 @@ class Handler(BaseHTTPRequestHandler):
 
             self.connection.sendall(response)
 
-            # Bidirectional pipe. No timeout — idle WebSockets must
-            # survive arbitrarily long gaps in traffic.
             client = self.connection
             client.setblocking(False)
             backend.setblocking(False)
@@ -704,7 +686,6 @@ class Handler(BaseHTTPRequestHandler):
                         other.sendall(data)
                     except OSError:
                         return
-
         except Exception:
             pass
         finally:
@@ -724,23 +705,11 @@ def _kill_playground(name, hard):
     if reg is None:
         return {"success": False, "message": f"no such playground: {name}"}
 
-    # Panels are the management UI. Killing one from the CLI removes
-    # the interface the user is using to manage the hub. A hung panel
-    # must be killed from the shell with `kill <pid>`. The guard is
-    # unconditional — force does not bypass it.
     if reg.role == "panel":
         return {"success": False,
                 "message": f"{name} is a panel; "
                            f"kill the PID from the shell if it hangs"}
 
-    # Group bookkeeping.  A None group is the default and behaves
-    # exactly as before this field existed: only the one playground
-    # that was signalled is named in the reply.  A non-None group
-    # means other registrations share it (the shared-process
-    # launcher case); the reply names the group and its member count
-    # so a user who killed "board" is not surprised when the other
-    # five playgrounds disappear too.  See the module docstring's
-    # GROUPS section.
     group = reg.group
     group_count = 0
     group_msg = ""

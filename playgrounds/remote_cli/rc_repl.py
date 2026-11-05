@@ -1,12 +1,13 @@
 """
 rc_repl — interactive readline shell for a pgkit playground.
 
-    remote_cli --target segment      # enter REPL
+    remote_cli --target segment      # enter REPL bound to a playground
+    remote_cli                       # enter hub-only REPL (no target)
 
 Verbs mirror the one-shot CLI subcommands. Tab completion covers
 field names (from `schema`), action kinds, level names and item names
-(from `entities`), so a user can explore the playground without
-memorizing names.
+(from `entities`), and playground names (from the hub's `playgrounds`
+broadcast, running + available-to-start).
 
 Built-in colon commands:
     :help / :?   print this help
@@ -17,19 +18,36 @@ Built-in colon commands:
 
 Hub-management verbs (available from any REPL; they act on the hub,
 not on the connected playground):
+
     pg-list                list every playground registered with the hub
+    available              list playgrounds that a launcher can start
     kill NAME [--force]    shut down a playground (cooperative, or SIGTERM
-                           escalation with --force)
+                           escalation with --force).  For a grouped
+                           playground, this takes down its whole group.
+    start NAME             ask the launcher to start NAME in-process
+    stop NAME              ask the launcher to stop NAME (only NAME;
+                           the launcher and other members keep running)
+    restart NAME           stop, then start
     shutdown-hub           ask the hub to exit (takes every playground
                            with it)
 
-All three are one-shot: they open a short-lived connection to the
-hub's management WS, act, and close.  No polling.
+All hub-management verbs are one-shot: they open a short-lived
+connection to the hub's management WS, act, and close.  No polling.
+
+HUB-ONLY MODE
+=============
+`remote_cli` with no `--target` / `--url` starts the REPL with no
+client bound.  Target-bound verbs (`ls`, `show`, `schema`, `actions`,
+`entities`, `presence`, `state`, `set`, `action`, `select`,
+`deselect`, `raw`) print a hint and return.  Hub verbs work normally.
+This is the right starting point for a fresh session where nothing is
+running yet and the first thing you want to do is `start board`.
 
 TAG
 ===
-The prompt shows the target name (`segment>`) when the REPL was entered
-via `--target segment`; it shows the full URL when entered via `--url`.
+The prompt shows the target name (`segment>`) when the REPL was
+entered via `--target segment`; it shows `<hub>` when entered with no
+target; and it shows the full URL when entered via `--url`.
 `main()` passes the name through `target_name=`, so the REPL does not
 need to reverse-look it up.
 """
@@ -39,6 +57,7 @@ from __future__ import annotations
 import json
 import shlex
 import sys
+import uuid
 from typing import Optional
 
 try:
@@ -57,7 +76,7 @@ from pgkit.remote_cli_client import (
 
 
 HELP_TEXT = """\
-Commands:
+Target-bound commands:
   ls [PREFIX]                  List fields with values
   show NAME                    Show one field's value and metadata
   schema [PREFIX]              List field metadata
@@ -72,9 +91,17 @@ Commands:
   raw JSON                     Send an arbitrary JSON message
 
 Hub management (one-shot, event-driven, no polling):
-  pg-list                      List playgrounds registered with the hub
-  kill NAME [--force]          Shut down a playground (cooperative;
-                               --force escalates to SIGTERM)
+  pg-list                      List every registration (running,
+                               launchers with their available list,
+                               panels)
+  available                    List playgrounds a launcher can start
+  kill NAME [--force]          Shut down a playground (for a grouped
+                               playground this takes down its whole
+                               group; use `stop` to shut down one
+                               member without touching the rest)
+  start NAME                   Ask the launcher to start NAME
+  stop NAME                    Ask the launcher to stop just NAME
+  restart NAME                 Stop, then start
   shutdown-hub                 Ask the hub to exit (takes every
                                playground with it)
 
@@ -84,7 +111,8 @@ Colon commands:
   :quit / :q                   Exit
   :help / :?                   Print this help
 
-Tab completes field names, action kinds, and entity items.
+Tab completes field names, action kinds, entity items, and playground
+names (for kill / start / stop / restart).
 """
 
 
@@ -125,7 +153,8 @@ def _refresh_completion(client: RemoteCliClient) -> None:
             "ls", "show", "schema", "actions", "entities",
             "presence", "state", "set", "action",
             "select", "deselect", "raw",
-            "pg-list", "kill", "shutdown-hub",
+            "pg-list", "available", "kill",
+            "start", "stop", "restart", "shutdown-hub",
             "help", "quit", "exit",
         ],
     })
@@ -168,8 +197,9 @@ def _compute_completions(tokens, text):
             level = tokens[1]
             return _filter(src["items"].get(level, []), text)
 
-    if verb == "kill":
-        # Complete from the cached hub registry (populated by pg-list).
+    if verb in ("kill", "start", "stop", "restart"):
+        # Complete from the cached hub registry (running + available,
+        # populated by `pg-list` or by the initial pre-populate).
         if len(tokens) == 2:
             return _filter(_hub_pg_names, text)
 
@@ -194,8 +224,23 @@ def _install_completion():
 #  Hub helpers (one-shot WS to /__hub_ws; no persistent connection)
 # ============================================================================
 
-# Cached from the last `pg-list`, used only for tab completion on `kill`.
+# Cached from the last `pg-list`; also pre-populated on session start
+# so `start <TAB>` works before the user has run anything.  Includes
+# running names and launcher-available names.
 _hub_pg_names = []
+
+
+def _set_hub_pg_names_from_playgrounds(pgs):
+    names = set()
+    for p in pgs:
+        n = p.get("name")
+        if n and p.get("role") in ("playground", "launcher"):
+            names.add(n)
+        if p.get("role") == "launcher":
+            for a in (p.get("available") or []):
+                if a:
+                    names.add(a)
+    _hub_pg_names[:] = sorted(names)
 
 
 def _hub_ws_url(config: dict) -> str:
@@ -209,7 +254,9 @@ def _hub_one_shot(config: dict, send_msg: dict,
     reply of type `wait_for`, close.  Returns the reply dict or None.
 
     The hub pushes an initial `playgrounds` event on every connect;
-    `send_msg` may be None to just read that first event.
+    that event is used to update `_hub_pg_names` for completion, then
+    the loop continues waiting for `wait_for` unless `wait_for` is
+    `"playgrounds"` itself.
     """
     try:
         from websockets.sync.client import connect as _ws_connect
@@ -251,13 +298,10 @@ def _hub_one_shot(config: dict, send_msg: dict,
                 continue
             if msg.get("type") == wait_for:
                 return msg
-            # Store the initial playground list for later completion.
             if msg.get("type") == "playgrounds":
-                _hub_pg_names[:] = [
-                    p.get("name") for p in (msg.get("playgrounds") or [])
-                    if p.get("name")
-                ]
-                # If we only wanted the playgrounds event, return now.
+                _set_hub_pg_names_from_playgrounds(
+                    msg.get("playgrounds") or []
+                )
                 if wait_for == "playgrounds":
                     return msg
     finally:
@@ -267,155 +311,16 @@ def _hub_one_shot(config: dict, send_msg: dict,
             pass
 
 
+def _populate_hub_pg_names(config: dict) -> None:
+    """Best-effort: fetch the playground list once so tab-completion
+    works before the user has run `pg-list`."""
+    _hub_one_shot(config, send_msg=None, wait_for="playgrounds",
+                  timeout=3.0)
+
+
 # ============================================================================
-#  Dispatch
+#  Hub verbs
 # ============================================================================
-
-def _dispatch(client: RemoteCliClient, config: dict, line: str) -> bool:
-    """Run one line of input. Returns False to exit."""
-    line = line.strip()
-    if not line:
-        return True
-
-    if line.startswith(":"):
-        verb = line[1:].split()[0] if line[1:] else ""
-        if verb in ("q", "quit", "exit"):
-            return False
-        if verb in ("h", "help", "?"):
-            print(HELP_TEXT, end="")
-            return True
-        if verb == "refresh":
-            try:
-                client.request_state_and_wait(timeout=5.0)
-                _refresh_completion(client)
-                print("refreshed")
-            except RemoteTimeout:
-                print("refresh timed out", file=sys.stderr)
-            return True
-        if verb == "schema":
-            print(json.dumps(client.schema(), indent=2, default=str))
-            return True
-        if verb == "entities":
-            print(json.dumps({
-                "levels": client.entities() or {},
-                "order": client.entity_order(),
-            }, indent=2, default=str))
-            return True
-        print(f"unknown command :{verb}", file=sys.stderr)
-        return True
-
-    try:
-        tokens = shlex.split(line)
-    except ValueError as e:
-        print(f"parse error: {e}", file=sys.stderr)
-        return True
-
-    if not tokens:
-        return True
-
-    verb, rest = tokens[0], tokens[1:]
-
-    try:
-        if verb in ("q", "quit", "exit"):
-            return False
-        if verb in ("h", "help", "?"):
-            print(HELP_TEXT, end="")
-            return True
-        if verb == "ls":
-            prefix = rest[0] if rest else None
-            _print_ls(client, prefix)
-        elif verb == "show":
-            if not rest:
-                print("usage: show NAME", file=sys.stderr)
-                return True
-            _print_show(client, rest[0])
-        elif verb == "schema":
-            _print_schema(client, rest[0] if rest else None)
-        elif verb == "actions":
-            _print_actions(client, rest[0] if rest else None)
-        elif verb == "entities":
-            _print_entities(client)
-        elif verb == "presence":
-            p = client.presence()
-            print(f"browser={p['browser']}  remote={p['remote']}")
-        elif verb == "state":
-            print(json.dumps({
-                "values": client.values(),
-                "presence": client.presence(),
-            }, indent=2, default=str))
-        elif verb == "set":
-            values = _parse_set_args(rest)
-            if not values:
-                print("usage: set NAME=VALUE [NAME=VALUE ...]",
-                      file=sys.stderr)
-                return True
-            applied = client.patch_and_verify(values)
-            _refresh_completion(client)
-            for k, v in values.items():
-                if applied.get(k) != v:
-                    print(f"  {k}: requested {v!r} → applied "
-                          f"{applied.get(k)!r}")
-                else:
-                    print(f"  {k} = {v!r}")
-        elif verb == "action":
-            if not rest:
-                print("usage: action KIND [PAYLOAD_JSON]", file=sys.stderr)
-                return True
-            kind = rest[0]
-            payload = None
-            if len(rest) > 1:
-                try:
-                    payload = json.loads(rest[1])
-                except json.JSONDecodeError as e:
-                    print(f"invalid payload JSON: {e}", file=sys.stderr)
-                    return True
-            result = client.command(kind, payload)
-            print(f"ok: {kind}")
-            if result.get("result") is not None:
-                print(f"  {json.dumps(result['result'], default=str)}")
-        elif verb == "select":
-            if len(rest) < 2:
-                print("usage: select LEVEL NAME", file=sys.stderr)
-                return True
-            client.command("select", {"level": rest[0], "name": rest[1]})
-            print(f"ok: selected {rest[0]}/{rest[1]}")
-        elif verb == "deselect":
-            client.command("deselect", {})
-            print("ok: deselected")
-        elif verb == "raw":
-            if not rest:
-                print("usage: raw JSON", file=sys.stderr)
-                return True
-            try:
-                msg = json.loads(rest[0])
-            except json.JSONDecodeError as e:
-                print(f"invalid JSON: {e}", file=sys.stderr)
-                return True
-            client.raw_send(msg)
-            print("sent")
-        elif verb == "pg-list":
-            _repl_pg_list(config)
-        elif verb == "kill":
-            if not rest:
-                print("usage: kill NAME [--force]", file=sys.stderr)
-                return True
-            name = rest[0]
-            hard = "--force" in rest[1:] or "-f" in rest[1:]
-            _repl_kill(config, name, hard)
-        elif verb == "shutdown-hub":
-            _repl_shutdown_hub(config)
-        else:
-            print(f"unknown command: {verb}", file=sys.stderr)
-
-    except RemoteCommandFailed as e:
-        print(f"error: {e}", file=sys.stderr)
-    except RemoteTimeout as e:
-        print(f"error: {e}", file=sys.stderr)
-    except RemoteCliError as e:
-        print(f"error: {e}", file=sys.stderr)
-
-    return True
-
 
 def _repl_pg_list(config: dict):
     msg = _hub_one_shot(config, send_msg=None, wait_for="playgrounds")
@@ -425,13 +330,92 @@ def _repl_pg_list(config: dict):
     if not pgs:
         print("(no playgrounds registered)")
         return
-    for pg in pgs:
-        line = (f"  {pg.get('name', '?'):<16}"
-                f" {pg.get('role', '?'):<10}"
-                f" :{pg.get('port', '?')}")
-        if pg.get("pid"):
-            line += f"  pid {pg['pid']}"
-        print(line)
+
+    running = [p for p in pgs if p.get("role") == "playground"]
+    launchers = [p for p in pgs if p.get("role") == "launcher"]
+    panels = [p for p in pgs if p.get("role") == "panel"]
+    running_names = {p.get("name") for p in running}
+
+    if running:
+        print("Running:")
+        for pg in sorted(running, key=lambda p: p.get("name", "")):
+            line = f"  {pg.get('name', '?'):<16}"
+            line += f" :{pg.get('port', '?'):<6}"
+            if pg.get("group"):
+                line += f" group={pg['group']!r}"
+            if pg.get("pid"):
+                line += f"  pid {pg['pid']}"
+            print(line)
+
+    if launchers:
+        print()
+        print("Launchers:")
+        for lc in sorted(launchers, key=lambda p: p.get("name", "")):
+            grp = lc.get("group") or lc.get("name", "?")
+            avail = [n for n in (lc.get("available") or [])
+                     if n not in running_names]
+            print(f"  {lc.get('name', '?'):<16} group={grp!r}")
+            if avail:
+                print(f"    available: {', '.join(avail)}")
+
+    if panels:
+        print()
+        print("Panels:")
+        for pn in sorted(panels, key=lambda p: p.get("name", "")):
+            print(f"  {pn.get('name', '?'):<16} :{pn.get('port', '?')}")
+
+
+def _repl_available(config: dict):
+    msg = _hub_one_shot(config, send_msg=None, wait_for="playgrounds")
+    if msg is None:
+        return
+    pgs = msg.get("playgrounds") or []
+    running_names = {p.get("name") for p in pgs
+                     if p.get("role") == "playground"}
+    available = []
+    for lc in pgs:
+        if lc.get("role") != "launcher":
+            continue
+        for name in (lc.get("available") or []):
+            if name and name not in running_names:
+                available.append((name, lc.get("group")))
+    if not available:
+        print("(nothing available to start)")
+        return
+    for name, grp in sorted(available):
+        suffix = f"  (group={grp!r})" if grp else ""
+        print(f"  {name}{suffix}")
+
+
+def _repl_launcher_cmd(config: dict, kind: str, name: str):
+    """Send launcher_<kind> for `name` and print the result.
+
+    kind ∈ {"start", "stop", "restart"}.
+    """
+    if not name:
+        print(f"usage: {kind} NAME", file=sys.stderr)
+        return
+    msg = _hub_one_shot(
+        config,
+        send_msg={
+            "type":       f"launcher_{kind}",
+            "name":       name,
+            "request_id": uuid.uuid4().hex,
+        },
+        wait_for="launcher_result",
+        timeout=15.0,
+    )
+    if msg is None:
+        return
+    if msg.get("success"):
+        print(f"ok: {msg.get('message', kind + ' ' + name)}")
+    else:
+        reason = msg.get("message", f"{kind} failed")
+        print(f"error: {reason}", file=sys.stderr)
+        if "no launcher manages" in reason:
+            print(f"  ({name!r} is standalone; use `kill {name}` to shut it "
+                  f"down, but note that on a grouped playground `kill` "
+                  f"takes down its whole group)", file=sys.stderr)
 
 
 def _repl_kill(config: dict, name: str, hard: bool):
@@ -460,6 +444,19 @@ def _repl_shutdown_hub(config: dict):
     if msg is None:
         return
     print("ok: hub shutdown requested (all playgrounds will exit)")
+
+
+# ============================================================================
+#  Target-bound verbs (need a client)
+# ============================================================================
+
+def _require_client(client) -> bool:
+    if client is not None:
+        return True
+    print("no target bound to this session; pass --target NAME at start. "
+          "For hub-only work use pg-list / available / start / stop / kill.",
+          file=sys.stderr)
+    return False
 
 
 def _print_ls(client, prefix):
@@ -550,34 +547,233 @@ def _parse_set_args(args):
 
 
 # ============================================================================
+#  Dispatch
+# ============================================================================
+
+def _dispatch(client, config, line):
+    """Run one line of input. Returns False to exit."""
+    line = line.strip()
+    if not line:
+        return True
+
+    if line.startswith(":"):
+        verb = line[1:].split()[0] if line[1:] else ""
+        if verb in ("q", "quit", "exit"):
+            return False
+        if verb in ("h", "help", "?"):
+            print(HELP_TEXT, end="")
+            return True
+        if verb == "refresh":
+            if not _require_client(client): return True
+            try:
+                client.request_state_and_wait(timeout=5.0)
+                _refresh_completion(client)
+                print("refreshed")
+            except RemoteTimeout:
+                print("refresh timed out", file=sys.stderr)
+            return True
+        if verb == "schema":
+            if not _require_client(client): return True
+            print(json.dumps(client.schema(), indent=2, default=str))
+            return True
+        if verb == "entities":
+            if not _require_client(client): return True
+            print(json.dumps({
+                "levels": client.entities() or {},
+                "order": client.entity_order(),
+            }, indent=2, default=str))
+            return True
+        print(f"unknown command :{verb}", file=sys.stderr)
+        return True
+
+    try:
+        tokens = shlex.split(line)
+    except ValueError as e:
+        print(f"parse error: {e}", file=sys.stderr)
+        return True
+
+    if not tokens:
+        return True
+
+    verb, rest = tokens[0], tokens[1:]
+
+    try:
+        if verb in ("q", "quit", "exit"):
+            return False
+        if verb in ("h", "help", "?"):
+            print(HELP_TEXT, end="")
+            return True
+
+        # ---- hub verbs (work with or without a target) ----
+        if verb == "pg-list":
+            _repl_pg_list(config)
+        elif verb == "available":
+            _repl_available(config)
+        elif verb == "kill":
+            if not rest:
+                print("usage: kill NAME [--force]", file=sys.stderr)
+                return True
+            name = rest[0]
+            hard = "--force" in rest[1:] or "-f" in rest[1:]
+            _repl_kill(config, name, hard)
+        elif verb == "start":
+            _repl_launcher_cmd(config, "start",
+                               rest[0] if rest else "")
+        elif verb == "stop":
+            _repl_launcher_cmd(config, "stop",
+                               rest[0] if rest else "")
+        elif verb == "restart":
+            _repl_launcher_cmd(config, "restart",
+                               rest[0] if rest else "")
+        elif verb == "shutdown-hub":
+            _repl_shutdown_hub(config)
+
+        # ---- target-bound verbs ----
+        elif verb == "ls":
+            if not _require_client(client): return True
+            _print_ls(client, rest[0] if rest else None)
+        elif verb == "show":
+            if not _require_client(client): return True
+            if not rest:
+                print("usage: show NAME", file=sys.stderr)
+                return True
+            _print_show(client, rest[0])
+        elif verb == "schema":
+            if not _require_client(client): return True
+            _print_schema(client, rest[0] if rest else None)
+        elif verb == "actions":
+            if not _require_client(client): return True
+            _print_actions(client, rest[0] if rest else None)
+        elif verb == "entities":
+            if not _require_client(client): return True
+            _print_entities(client)
+        elif verb == "presence":
+            if not _require_client(client): return True
+            p = client.presence()
+            print(f"browser={p['browser']}  remote={p['remote']}")
+        elif verb == "state":
+            if not _require_client(client): return True
+            print(json.dumps({
+                "values": client.values(),
+                "presence": client.presence(),
+            }, indent=2, default=str))
+        elif verb == "set":
+            if not _require_client(client): return True
+            values = _parse_set_args(rest)
+            if not values:
+                print("usage: set NAME=VALUE [NAME=VALUE ...]",
+                      file=sys.stderr)
+                return True
+            applied = client.patch_and_verify(values)
+            _refresh_completion(client)
+            for k, v in values.items():
+                if applied.get(k) != v:
+                    print(f"  {k}: requested {v!r} → applied "
+                          f"{applied.get(k)!r}")
+                else:
+                    print(f"  {k} = {v!r}")
+        elif verb == "action":
+            if not _require_client(client): return True
+            if not rest:
+                print("usage: action KIND [PAYLOAD_JSON]", file=sys.stderr)
+                return True
+            kind = rest[0]
+            payload = None
+            if len(rest) > 1:
+                try:
+                    payload = json.loads(rest[1])
+                except json.JSONDecodeError as e:
+                    print(f"invalid payload JSON: {e}", file=sys.stderr)
+                    return True
+            result = client.command(kind, payload)
+            print(f"ok: {kind}")
+            if result.get("result") is not None:
+                print(f"  {json.dumps(result['result'], default=str)}")
+        elif verb == "select":
+            if not _require_client(client): return True
+            if len(rest) < 2:
+                print("usage: select LEVEL NAME", file=sys.stderr)
+                return True
+            client.command("select", {"level": rest[0], "name": rest[1]})
+            print(f"ok: selected {rest[0]}/{rest[1]}")
+        elif verb == "deselect":
+            if not _require_client(client): return True
+            client.command("deselect", {})
+            print("ok: deselected")
+        elif verb == "raw":
+            if not _require_client(client): return True
+            if not rest:
+                print("usage: raw JSON", file=sys.stderr)
+                return True
+            try:
+                msg = json.loads(rest[0])
+            except json.JSONDecodeError as e:
+                print(f"invalid JSON: {e}", file=sys.stderr)
+                return True
+            client.raw_send(msg)
+            print("sent")
+        else:
+            print(f"unknown command: {verb}", file=sys.stderr)
+
+    except RemoteCommandFailed as e:
+        print(f"error: {e}", file=sys.stderr)
+    except RemoteTimeout as e:
+        print(f"error: {e}", file=sys.stderr)
+    except RemoteCliError as e:
+        print(f"error: {e}", file=sys.stderr)
+
+    return True
+
+
+# ============================================================================
 #  Entry point
 # ============================================================================
 
-def run(url: str, config: dict, *, target_name: Optional[str] = None,
-        verbose: bool = False) -> int:
-    client = RemoteCliClient(url)
-    try:
-        client.connect(require_browser=False)
-    except RemoteCliError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
+def run(url, config, *, target_name=None, verbose=False):
+    """Enter the REPL.
 
-    _refresh_completion(client)
+    `url=None` means hub-only mode: no target client, hub verbs only.
+    Target-bound verbs print a hint on use.  The prompt shows `<hub>`.
+    """
+    client = None
+    if url is not None:
+        client = RemoteCliClient(url)
+        try:
+            client.connect(require_browser=False)
+        except RemoteCliError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        _refresh_completion(client)
+
+    # Best-effort pre-population of tab-completion sources for hub
+    # verbs.  If the hub is unreachable this is a no-op; the user can
+    # still use `pg-list` after the hub comes up.
+    try:
+        _populate_hub_pg_names(config)
+    except Exception:
+        pass
+
     _install_completion()
 
-    tag = target_name or url
-    presence = client.presence()
-    if presence["browser"] == 0:
-        print(f"connected to {tag} (no browser connected)")
-        print("Waiting for a browser tab; :quit to exit.", file=sys.stderr)
+    tag = target_name or ("<hub>" if url is None else url)
+    if client is not None:
+        presence = client.presence()
+        if presence["browser"] == 0:
+            print(f"connected to {tag} (no browser connected)")
+            print("Waiting for a browser tab; :quit to exit.",
+                  file=sys.stderr)
+        else:
+            print(f"connected to {tag} "
+                  f"({presence['browser']} browser, "
+                  f"{presence['remote']} remote)")
+        def on_presence(msg):
+            _refresh_completion(client)
+        client.on("presence", on_presence)
     else:
-        print(f"connected to {tag} "
-              f"({presence['browser']} browser, "
-              f"{presence['remote']} remote)")
-
-    def on_presence(msg):
-        _refresh_completion(client)
-    client.on("presence", on_presence)
+        print("Hub-only session.  'pg-list', 'available', 'start NAME', "
+              "'stop NAME', 'kill NAME', 'shutdown-hub'.")
+        print("For a target-bound REPL, start with --target NAME.")
+        print()
 
     while True:
         try:
@@ -591,5 +787,6 @@ def run(url: str, config: dict, *, target_name: Optional[str] = None,
         except Exception as e:
             print(f"error: {e}", file=sys.stderr)
 
-    client.close()
+    if client is not None:
+        client.close()
     return 0

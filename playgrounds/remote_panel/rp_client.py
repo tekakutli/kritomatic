@@ -1,125 +1,49 @@
 """
 rp_client.py — the remote panel's WebSocket client.
 
-BROWSER-SIDE, connecting TO a playground.  Receives `state`,
-`schema`, and `entities`.  Sends `patch` and `command`.
+The panel has two WS channels to the hub:
 
-ENTITIES
-========
-The `entities` message carries every level the playground declares,
-with its items, its selected item, and (for each row-scope action)
-whether the action applies to that item.  The client stores the
-message in `_rp.entities` and `_rp.entityOrder`, then triggers a
-panel rebuild — the layout is derived from the entities, not from
-the schema alone.
+  Control   role="panel", the anonymous listener socket.  Receives
+            `playgrounds` broadcasts and `launcher_result`; sends
+            `kill`, `shutdown_hub`, `launcher_start`, `launcher_stop`,
+            `launcher_restart`.
 
-SELECT
-======
-Clicking an item in the remote panel sends a `select` command with
-`{level, name}`.  The playground's `pgkitHandleSelect` translates
-that to its own selection.  A subsequent entities refresh shows the
-new selection.
+  Playground  a direct WS to the playground's /remote endpoint (via
+            the hub's proxy).  Drives a selected playground's values
+            and actions.  Unchanged by this file's extension.
 
-HUB DISCOVERY (EVENTS, NOT POLLING)
-===================================
-The panel learns which playgrounds are alive from the pgkit hub
-(`pgkit/hub.py`), via a WebSocket on `ws://<hub>/__hub_ws` with
-`role=panel`.  The hub pushes a `playgrounds` event on every
-connect and on every registration or deregistration change — no
-polling.  Kill requests travel the same socket.
+ENTITY AND TARGET FILTERS
+=========================
+`rpPopulateTargets` builds the target dropdown from
+`_rp.playgrounds.filter(role === "playground")`.  Launcher and panel
+entries in the same array are filtered out automatically.
 
-TARGET DROPDOWN — REGISTRY-ONLY
-===============================
-The dropdown is populated exclusively from the hub registry.  There
-is no static fallback: a panel that has never seen the hub cannot
-know which playgrounds (or ports) are actually serving, and
-inventing names/URLs would be wrong by construction.  The "custom"
-option is the escape hatch — a user who knows a URL types it, and
-`localStorage` remembers it across reloads.
+`rpRebuildManagementList` uses the same array to render two sections:
+the running-playgrounds list (role="playground") and the "Available
+to start" list (derived from each launcher's `available` field).
 
-The registry-only dropdown also handles the panel-first startup
-correctly: while the hub is up but no playground has registered, the
-dropdown contains only "custom" and the target field stays at
-whatever `localStorage` held.  The moment a playground joins, the
-next `playgrounds` event populates it.
-
-TARGET INPUT SYNC
+LAUNCHER COMMANDS
 =================
-`rpPopulateTargets` also mirrors the current preset selection into
-the `#rpTarget` text field, but only when the user has not
-manually edited that field.  The "user has edited" flag is
-`#rpTarget.dataset.userEdited`; `rp_ui.py` sets it on `input` and
-clears it on dropdown `change`.
+`rpLauncherStart(name)` and `rpLauncherStop(name)` send
+`launcher_start` / `launcher_stop` over the control WS.  The hub
+forwards to the launcher, which replies with `launcher_result`; the
+reply is handled in `_rpHandleHubMessage` and surfaced via
+`flashStatus`.
 
-The selection priority, applied when the options change:
-
-    1. An option whose value equals the current target field's
-       value.  This is what makes hub discovery seamless on a
-       running panel: the target field held a direct URL; after
-       the first `playgrounds` event the dropdown has hub URLs, and
-       the value match never fires, but the target field is then
-       rewritten by the sync step below when the dropdown default
-       changed.  Once the user has connected via a hub URL, the
-       field holds the hub URL, and this branch preserves it across
-       later events.
-    2. An option whose text equals the previously-selected option's
-       text.  This is what makes a later-joining playground preserve
-       the user's earlier choice by name across a rebuild.
-    3. The first real option — **only if the target field is empty**.
-       Fresh page + hub up + playgrounds present: the field is
-       empty, so default to the first hub option.  Fresh page +
-       hub up + no playgrounds: only "custom" exists, so the field
-       is empty and stays empty.  Fresh page + saved direct URL:
-       no option matches, but the field is non-empty, so "custom"
-       stays selected and the field is preserved — the user keeps
-       the URL they last used, and the dropdown honestly reports
-       that it cannot map it to a registered playground.
-
-Branch 3 used to fire whenever branches 1 and 2 didn't match, so
-a saved direct URL was silently replaced by whichever hub
-playground happened to sort first.  The "target field is empty"
-guard on branch 3 is what preserves the user's saved preference.
-
-VISIBLE:FALSE FIELDS
-====================
-`pgkit/schema.py` documents `visible: false` as "API-only, no DOM";
-`pgkit/render.py` (the in-Krita panel renderer) already honours it.
-`rpBuildFieldRow` honours it too: a `visible: false` field produces
-no DOM row, and `rpRebuildFields` skips the `null` return.
-`rpUpdateWidget` and `rpOnState` need no change — they already
-no-op for names with no `_rp.fields` entry.
+GROUPED PLAYGROUNDS
+===================
+A registration may carry a `group` string.  Groups are metadata, not
+routing; the target dropdown still lists each playground
+individually.  The visible consequence: the Kill/Force buttons'
+`title` and the Force confirm dialog mention the group when the
+field is non-None, and the Stop button on a grouped playground is
+offered as the "stop only this one" alternative to Kill (which shuts
+down the group).
 
 HUB SHUTDOWN FLOW
 =================
-`rpShutdownHub()` is the JS-side promise wrapper around the
-`shutdown_hub` message.  It is called by the "Shut down hub"
-button in `rp_ui.py`'s management modal.  Its lifecycle:
-
-    1. Sets `_rp.shuttingDown = true` before sending.  This is what
-       stops `_rpScheduleHubReconnect` and `rpScheduleReconnect`
-       from firing while we're waiting — without it, the WS close
-       that follows would kick both into retry loops.
-
-    2. Sends `{type: "shutdown_hub"}` over the management WS.
-
-    3. Waits for `shutdown_ack`.  The hub handler ack's immediately
-       and schedules `os._exit(0)` for 0.5s later; the ack arrives
-       while the WS is still open.
-
-    4. On ack: resolves `{ok: true}`, disconnects the playground
-       WS cleanly, marks `_rp.connected`, `_rp.hubConnected`, and
-       `_rp.clientId` false/null, and leaves `_rp.shuttingDown`
-       true so neither WS tries to reconnect.
-
-    5. On timeout (5s) or send failure: resolves `{ok: false,
-       error: ...}` and resets `_rp.shuttingDown` to false so
-       reconnects resume — the user can retry.
-
-The hub itself sends `shutdown` (not `shutdown_ack`) to *other*
-registered panels before exiting.  `_rpHandleHubMessage` treats
-that identically to a `shutdown_ack` (it doesn't carry a
-`request_id` the client cares about) so a second tab that didn't
-initiate the shutdown also stops reconnecting.
+Unchanged.  `rpShutdownHub()` promises a `shutdown_ack`; see the
+previous version's docstring for the full lifecycle.
 """
 
 RP_CLIENT_JS = r"""
@@ -149,26 +73,15 @@ const _rp = {
   log:             [],
   _pendingAction:  null,
 
-  // ---- hub management --------------------------------------------
-  hubSocket:         null,   // ws to /__hub_ws with role=panel
-  hubUrl:            null,   // e.g. "ws://127.0.0.1:8780/__hub_ws"
+  hubSocket:         null,
+  hubUrl:            null,
   hubConnected:      false,
-  playgrounds:       [],     // [{ name, port, role, pid, html_file,
-                             //    connected_at }]
+  playgrounds:       [],
   hubReconnectMs:    1000,
   hubReconnectTimer: null,
 
-  // ---- hub shutdown flow -----------------------------------------
-  // Set to true by rpShutdownHub() before sending shutdown_hub; both
-  // reconnect schedulers bail when it's set.  Also set to true by
-  // _rpHandleHubMessage on a shutdown_ack or a shutdown notice from
-  // the hub, so the resulting WS close doesn't kick a retry loop.
   shuttingDown:      false,
-  // Timer armed by rpShutdownHub() that fails the promise if no
-  // acknowledgment arrives within 5s.  Cleared by the ack handler.
   shutdownTimeoutId: null,
-  // The resolver passed into the promise.  Called exactly once, either
-  // by _rpHandleHubMessage (ack/shutdown notice) or by the timeout.
   shutdownResolve:   null,
 };
 
@@ -231,8 +144,6 @@ function rpConnect(target) {
     _rp.clientId  = null;
     rpSetStatus("disconnected");
     rpLog("info", "disconnected");
-    // Do not schedule a reconnect if the hub is shutting down — the
-    // close is the expected end of the shutdown flow, not a blip.
     if (!_rp.shuttingDown) rpScheduleReconnect();
   });
 
@@ -240,30 +151,17 @@ function rpConnect(target) {
 }
 
 function rpDisconnect() {
-  if (_rp.reconnectTimer) {
-    clearTimeout(_rp.reconnectTimer);
-    _rp.reconnectTimer = null;
-  }
-  if (_rp.stateTimer) {
-    clearTimeout(_rp.stateTimer);
-    _rp.stateTimer = null;
-  }
-  if (_rp.socket) {
-    try { _rp.socket.close(); } catch (e) {}
-    _rp.socket = null;
-  }
+  if (_rp.reconnectTimer) { clearTimeout(_rp.reconnectTimer); _rp.reconnectTimer = null; }
+  if (_rp.stateTimer)     { clearTimeout(_rp.stateTimer);     _rp.stateTimer     = null; }
+  if (_rp.socket) { try { _rp.socket.close(); } catch (e) {} _rp.socket = null; }
   _rp.connected = false;
   _rp.clientId  = null;
 }
 
 function rpScheduleReconnect() {
-  // Never retry when the hub has been deliberately shut down.  This
-  // is set either by rpShutdownHub() (our own click) or by
-  // _rpHandleHubMessage (another tab's shutdown, delivered as the
-  // hub's `shutdown` message).
-  if (_rp.shuttingDown) return;
+  if (_rp.shuttingDown)   return;
   if (!_rp.everConnected) return;
-  if (!_rp.target) return;
+  if (!_rp.target)        return;
   if (_rp.reconnectTimer) return;
   _rp.reconnectTimer = setTimeout(() => {
     _rp.reconnectTimer = null;
@@ -285,9 +183,7 @@ function rpSend(msg) {
   s.send(JSON.stringify(msg));
 }
 
-function rpRequestState() {
-  rpSend({ type: "state_request" });
-}
+function rpRequestState() { rpSend({ type: "state_request" }); }
 
 function rpScheduleStateRefresh() {
   if (_rp.stateTimer) clearTimeout(_rp.stateTimer);
@@ -332,9 +228,7 @@ function rpHandle(msg) {
         browser: msg.browser || 0,
         remote:  msg.remote  || 0,
       };
-      rpSetStatus(
-        _rp.presence.browser > 0 ? "connected" : "no-browser"
-      );
+      rpSetStatus(_rp.presence.browser > 0 ? "connected" : "no-browser");
       rpRenderPresence();
       rpLog("info", "presence: browser=" + _rp.presence.browser
                     + " remote=" + _rp.presence.remote);
@@ -430,13 +324,7 @@ function _rpSectionLabel(section) {
 
 /* ==========================================================================
    FIELD WIDGETS
-   ==========================================================================
-   A field whose schema entry has `visible: false` is API-only —
-   see `pgkit/schema.py`.  The playground's `pgkit/render.py` honours
-   that flag; so does this renderer.  A null return propagates up to
-   `rpRebuildFields`, which drops the row.  `rpUpdateWidget` finds no
-   `_rp.fields[name]` entry for such a field and no-ops, so live
-   patches for it do not touch the DOM either. */
+   ========================================================================== */
 
 function rpBuildFieldRow(name) {
   const meta  = _rp.schema[name] || {};
@@ -465,9 +353,7 @@ function rpBuildFieldRow(name) {
     widget = document.createElement("input");
     widget.type = "checkbox";
     widget.checked = !!value;
-    widget.addEventListener("change", () => {
-      rpSendPatch(name, !!widget.checked);
-    });
+    widget.addEventListener("change", () => rpSendPatch(name, !!widget.checked));
   } else if (kind === "enum" && Array.isArray(meta.options)) {
     widget = document.createElement("select");
     for (const opt of meta.options) {
@@ -477,9 +363,7 @@ function rpBuildFieldRow(name) {
       widget.appendChild(o);
     }
     widget.value = String(value == null ? "" : value);
-    widget.addEventListener("change", () => {
-      rpSendPatch(name, widget.value);
-    });
+    widget.addEventListener("change", () => rpSendPatch(name, widget.value));
   } else if (kind === "number") {
     widget = document.createElement("input");
     widget.type = "text";
@@ -490,14 +374,9 @@ function rpBuildFieldRow(name) {
     if (typeof meta.max === "number") widget.dataset.max = String(meta.max);
     const commit = () => {
       let v = parseFloat(widget.value);
-      if (!isFinite(v)) {
-        widget.value = String(_rp.values[name] == null ? "" : _rp.values[name]);
-        return;
-      }
-      const lo = widget.dataset.min !== undefined
-        ? parseFloat(widget.dataset.min) : null;
-      const hi = widget.dataset.max !== undefined
-        ? parseFloat(widget.dataset.max) : null;
+      if (!isFinite(v)) { widget.value = String(_rp.values[name] == null ? "" : _rp.values[name]); return; }
+      const lo = widget.dataset.min !== undefined ? parseFloat(widget.dataset.min) : null;
+      const hi = widget.dataset.max !== undefined ? parseFloat(widget.dataset.max) : null;
       if (lo !== null && v < lo) v = lo;
       if (hi !== null && v > hi) v = hi;
       widget.value = String(v);
@@ -598,10 +477,7 @@ function rpBuildRowActionButton(name, target) {
 
 /* ==========================================================================
    ACTION INVOCATION
-   ==========================================================================
-   A row action receives `target = {level, name}`.  A header or
-   global action receives null.  If the action declares `requires`,
-   the modal gathers the payload, merging in the target if any. */
+   ========================================================================== */
 
 function rpActionClick(name, target) {
   const meta = _rp.schema[name] || {};
@@ -716,8 +592,7 @@ function rpValidateModal() {
     } else {
       if (typeof values[req.name] !== "string"
           || values[req.name].trim() === "") {
-        ok = false;
-        break;
+        ok = false; break;
       }
     }
   }
@@ -783,12 +658,8 @@ function rpRenderPresence() {
 }
 
 /* ==========================================================================
-   HUB MANAGEMENT  (ws to /__hub_ws with role=panel)
-   ==========================================================================
-   The panel discovers the registered playground set from the hub
-   over a WebSocket, not by polling.  Kill requests travel the same
-   channel and return as `kill_result` events.  All of this is
-   disabled in standalone mode (no hub reachable); see rpDiscoverHub. */
+   HUB MANAGEMENT
+   ========================================================================== */
 
 function rpDiscoverHub() {
   try {
@@ -803,18 +674,9 @@ function rpDiscoverHub() {
 }
 
 function _rpConnectHub() {
-  if (_rp.hubReconnectTimer) {
-    clearTimeout(_rp.hubReconnectTimer);
-    _rp.hubReconnectTimer = null;
-  }
-  if (_rp.hubSocket) {
-    try { _rp.hubSocket.close(); } catch (e) {}
-    _rp.hubSocket = null;
-  }
+  if (_rp.hubReconnectTimer) { clearTimeout(_rp.hubReconnectTimer); _rp.hubReconnectTimer = null; }
+  if (_rp.hubSocket) { try { _rp.hubSocket.close(); } catch (e) {} _rp.hubSocket = null; }
   if (!_rp.hubUrl) return;
-  // Don't reconnect if we've deliberately shut the hub down (or
-  // received a shutdown notice for it).  This guard also means the
-  // boot's setTimeout(rpDiscoverHub, 200) is a no-op after shutdown.
   if (_rp.shuttingDown) return;
 
   let sock;
@@ -825,9 +687,7 @@ function _rpConnectHub() {
   sock.addEventListener("open", () => {
     _rp.hubConnected = true;
     _rp.hubReconnectMs = 1000;
-    try {
-      sock.send(JSON.stringify({ type: "hello", role: "panel" }));
-    } catch (e) {}
+    try { sock.send(JSON.stringify({ type: "hello", role: "panel" })); } catch (e) {}
     rpLog("info", "hub management connected");
   });
 
@@ -845,9 +705,6 @@ function _rpConnectHub() {
     if (typeof rpRebuildManagementList === "function") {
       rpRebuildManagementList();
     }
-    // The close listener fires whether the hub died, we closed it,
-    // or the network dropped.  Only schedule a reconnect in the
-    // last case: `shuttingDown` covers the first two.
     if (!_rp.shuttingDown) _rpScheduleHubReconnect();
   });
 
@@ -855,9 +712,6 @@ function _rpConnectHub() {
 }
 
 function _rpScheduleHubReconnect() {
-  // Same guard as rpScheduleReconnect: once the user (or another
-  // panel) has shut the hub down, retrying is a no-op that would
-  // spin against a dead socket forever.
   if (_rp.shuttingDown) return;
   if (_rp.hubReconnectTimer) return;
   _rp.hubReconnectTimer = setTimeout(() => {
@@ -870,7 +724,7 @@ function _rpScheduleHubReconnect() {
 function _rpHandleHubMessage(msg) {
   if (msg.type === "playgrounds") {
     _rp.playgrounds = msg.playgrounds || [];
-    rpLog("info", "hub: " + _rp.playgrounds.length + " playground(s)");
+    rpLog("info", "hub: " + _rp.playgrounds.length + " registration(s)");
     rpPopulateTargets();
     if (typeof rpRebuildManagementList === "function") {
       rpRebuildManagementList();
@@ -882,27 +736,28 @@ function _rpHandleHubMessage(msg) {
           "kill " + msg.name + ": " + (msg.message || ""));
     if (typeof flashStatus === "function") {
       flashStatus(
-        "kill " + msg.name + ": "
-          + (msg.success ? "ok" : (msg.message || "failed")),
+        "kill " + msg.name + ": " + (msg.success ? "ok" : (msg.message || "failed")),
+        msg.success ? "ok" : "bad"
+      );
+    }
+    return;
+  }
+  if (msg.type === "launcher_result") {
+    rpLog(msg.success ? "info" : "error",
+          "launcher " + (msg.name || "?") + ": " + (msg.message || ""));
+    if (typeof flashStatus === "function") {
+      flashStatus(
+        "launcher " + (msg.name || "?") + ": "
+          + (msg.message || (msg.success ? "ok" : "failed")),
         msg.success ? "ok" : "bad"
       );
     }
     return;
   }
   if (msg.type === "shutdown_ack") {
-    // The hub accepted our shutdown_hub request.  Resolve the
-    // promise (so the modal's click handler can update its status),
-    // disconnect the playground WS cleanly, and mark state so that
-    // no reconnect fires when the hub closes the WS half a second
-    // later (it calls os._exit).
     rpLog("info", "hub shutdown acknowledged");
-    if (_rp.shutdownResolve) {
-      _rp.shutdownResolve({ ok: true });
-    }
-    if (_rp.socket) {
-      try { _rp.socket.close(); } catch (e) {}
-      _rp.socket = null;
-    }
+    if (_rp.shutdownResolve) _rp.shutdownResolve({ ok: true });
+    if (_rp.socket) { try { _rp.socket.close(); } catch (e) {} _rp.socket = null; }
     _rp.connected     = false;
     _rp.clientId      = null;
     _rp.hubConnected  = false;
@@ -911,18 +766,10 @@ function _rpHandleHubMessage(msg) {
     return;
   }
   if (msg.type === "shutdown") {
-    // The hub is shutting down (this arrives on *other* registered
-    // panels; the initiator gets `shutdown_ack` instead).  Same
-    // state treatment so a second tab doesn't retry forever either.
     rpLog("info", "hub is shutting down (received shutdown notice)");
     _rp.shuttingDown = true;
-    if (_rp.shutdownResolve) {
-      _rp.shutdownResolve({ ok: true });
-    }
-    if (_rp.socket) {
-      try { _rp.socket.close(); } catch (e) {}
-      _rp.socket = null;
-    }
+    if (_rp.shutdownResolve) _rp.shutdownResolve({ ok: true });
+    if (_rp.socket) { try { _rp.socket.close(); } catch (e) {} _rp.socket = null; }
     _rp.connected     = false;
     _rp.clientId      = null;
     _rp.hubConnected  = false;
@@ -933,21 +780,44 @@ function _rpHandleHubMessage(msg) {
 }
 
 /* ==========================================================================
-   HUB SHUTDOWN
-   ==========================================================================
-   Promise-returning wrapper for the `shutdown_hub` request.  Called
-   by the "Shut down hub" button in rp_ui.py.  The lifecycle is
-   documented in the module docstring (HUB SHUTDOWN FLOW).
+   LAUNCHER COMMANDS
+   ========================================================================== */
 
-   Resolution values:
-     {ok: true}                     hub acked; state is already torn
-                                    down by _rpHandleHubMessage.
-     {ok: false, error: "..."}      one of:
-                                      - "hub not connected"
-                                      - "already shutting down"
-                                      - "send failed: <msg>"
-                                      - "no acknowledgment from hub
-                                         within 5s" */
+function rpLauncherStart(name) {
+  if (!_rp.hubSocket || !_rp.hubConnected) {
+    if (typeof flashStatus === "function") flashStatus("hub not connected", "warn");
+    return;
+  }
+  const request_id = "lreq-" + Math.random().toString(36).slice(2, 10);
+  try {
+    _rp.hubSocket.send(JSON.stringify({
+      type: "launcher_start", name, request_id,
+    }));
+    if (typeof flashStatus === "function") flashStatus("starting " + name + "\u2026", "warn");
+  } catch (e) {
+    if (typeof flashStatus === "function") flashStatus("send failed: " + e.message, "bad");
+  }
+}
+
+function rpLauncherStop(name) {
+  if (!_rp.hubSocket || !_rp.hubConnected) {
+    if (typeof flashStatus === "function") flashStatus("hub not connected", "warn");
+    return;
+  }
+  const request_id = "lreq-" + Math.random().toString(36).slice(2, 10);
+  try {
+    _rp.hubSocket.send(JSON.stringify({
+      type: "launcher_stop", name, request_id,
+    }));
+    if (typeof flashStatus === "function") flashStatus("stopping " + name + "\u2026", "warn");
+  } catch (e) {
+    if (typeof flashStatus === "function") flashStatus("send failed: " + e.message, "bad");
+  }
+}
+
+/* ==========================================================================
+   HUB SHUTDOWN
+   ========================================================================== */
 
 function rpShutdownHub() {
   return new Promise((resolve) => {
@@ -959,12 +829,10 @@ function rpShutdownHub() {
       resolve({ ok: false, error: "already shutting down" });
       return;
     }
-
     if (_rp.shutdownTimeoutId) {
       clearTimeout(_rp.shutdownTimeoutId);
       _rp.shutdownTimeoutId = null;
     }
-
     _rp.shuttingDown = true;
 
     let done = false;
@@ -975,9 +843,6 @@ function rpShutdownHub() {
         clearTimeout(_rp.shutdownTimeoutId);
         _rp.shutdownTimeoutId = null;
       }
-      // On failure reset the flag so reconnect schedulers resume and
-      // the user can retry.  On success leave it set — _rpHandleHubMessage
-      // has already torn down both sockets and set the flag.
       if (!result.ok) _rp.shuttingDown = false;
       _rp.shutdownResolve = null;
       resolve(result);
@@ -986,10 +851,7 @@ function rpShutdownHub() {
     _rp.shutdownResolve = finish;
 
     _rp.shutdownTimeoutId = setTimeout(() => {
-      finish({
-        ok: false,
-        error: "no acknowledgment from hub within 5s",
-      });
+      finish({ ok: false, error: "no acknowledgment from hub within 5s" });
     }, 5000);
 
     try {
@@ -1008,41 +870,17 @@ function rpKillPlayground(name, hard) {
   }
   try {
     _rp.hubSocket.send(JSON.stringify({
-      type: "kill",
-      name: name,
-      hard: !!hard,
+      type: "kill", name, hard: !!hard,
     }));
-    rpLog("info",
-          "kill requested: " + name + (hard ? " (hard)" : ""));
+    rpLog("info", "kill requested: " + name + (hard ? " (hard)" : ""));
   } catch (e) {
     rpLog("error", "kill send failed: " + e.message);
   }
 }
 
 /* ==========================================================================
-   TARGET DROPDOWN — REGISTRY-ONLY
-   ==========================================================================
-   Populated exclusively from the hub registry.  There is no static
-   fallback: a panel that has never seen the hub cannot know which
-   playgrounds (or ports) are actually serving, so it must not
-   invent names/URLs.  "custom" is the escape hatch — a user who
-   knows a URL types it into the target field, and `localStorage`
-   remembers it across reloads.
-
-   Selection priority after a rebuild (see module docstring for the
-   reasoning behind each branch):
-
-     1. An option whose value equals the current target field value.
-     2. An option whose text matches the previously-selected option.
-     3. The first real option — only when the target field is empty.
-        A non-empty target field that matches no option means the
-        user has a saved URL (typically a direct URL from a session
-        before the hub was running); "custom" stays selected and
-        the field is preserved.
-
-   Then, if the target field has not been edited by the user, it is
-   overwritten with the new selection's value.  `rp_ui.py` sets
-   `dataset.userEdited` on input and clears it on dropdown change. */
+   TARGET DROPDOWN
+   ========================================================================== */
 
 function _hubHttpBase() {
   if (!_rp.hubUrl) return null;
@@ -1059,9 +897,6 @@ function rpPopulateTargets() {
   const presetEl = document.getElementById("rpPreset");
   if (!presetEl) return;
 
-  // Remember the previous selection *by text* (name) so a hub
-  // transition (empty → populated, or a later-joining playground)
-  // preserves the user's choice.
   let prevName = null;
   for (const opt of presetEl.options) {
     if (opt.selected && opt.value) { prevName = opt.textContent; break; }
@@ -1070,19 +905,13 @@ function rpPopulateTargets() {
 
   presetEl.innerHTML = "";
 
-  // Everything comes from the hub registry.  There is no static
-  // fallback: without the hub, the panel has no way to know which
-  // playgrounds (and ports) are actually serving.
   const base = _hubHttpBase();
   const playgrounds = (_rp.hubConnected && base)
     ? _rp.playgrounds.filter(p => p.role === "playground")
     : [];
   const wsBase = base ? base.replace(/^http/, "ws") : null;
 
-  const names = playgrounds
-    .map(p => p.name)
-    .filter(Boolean)
-    .sort();
+  const names = playgrounds.map(p => p.name).filter(Boolean).sort();
 
   for (const name of names) {
     const opt = document.createElement("option");
@@ -1096,64 +925,33 @@ function rpPopulateTargets() {
   custom.textContent = "custom";
   presetEl.appendChild(custom);
 
-  // ---- Selection: value → name → first real (guarded) ------------
   const targetEl = document.getElementById("rpTarget");
   const currentValue = targetEl ? targetEl.value : "";
 
   let matched = false;
   if (currentValue) {
     for (const opt of presetEl.options) {
-      if (opt.value && opt.value === currentValue) {
-        opt.selected = true;
-        matched = true;
-        break;
-      }
+      if (opt.value && opt.value === currentValue) { opt.selected = true; matched = true; break; }
     }
   }
   if (!matched && prevName && prevName !== "custom") {
     for (const opt of presetEl.options) {
-      if (opt.textContent === prevName) {
-        opt.selected = true;
-        matched = true;
-        break;
-      }
+      if (opt.textContent === prevName) { opt.selected = true; matched = true; break; }
     }
   }
   if (!matched) {
-    // If the target field carries a value that matches no current
-    // option — typically a saved direct URL from a session where
-    // the hub wasn't running, or a hub URL for a playground that
-    // has since deregistered — keep "custom" selected. The target
-    // field stays put; the sync step below is skipped because
-    // `presetEl.value` is empty.
-    //
-    // The alternative — defaulting to the first real option — would
-    // silently replace the user's saved preference with whichever
-    // playground happens to sort first, which is wrong whenever the
-    // saved URL names a specific playground.
-    if (currentValue) {
-      presetEl.value = "";
-    } else if (presetEl.options.length > 1) {
-      presetEl.selectedIndex = 0;
-    } else {
-      presetEl.value = "";
-    }
+    if (currentValue) presetEl.value = "";
+    else if (presetEl.options.length > 1) presetEl.selectedIndex = 0;
+    else presetEl.value = "";
   }
 
-  // Mirror the current preset selection into the target text field,
-  // but only if the user hasn't manually edited it.  On first load
-  // (before the hub WS connects) the dropdown has only "custom";
-  // the first `playgrounds` event from the hub triggers this
-  // function again with real entries, and the field is updated to
-  // reflect the hub URL — so clicking Connect without touching the
-  // dropdown connects through the hub, as intended.
   if (targetEl && !targetEl.dataset.userEdited && presetEl.value) {
     targetEl.value = presetEl.value;
   }
 }
 
 /* ==========================================================================
-   BOOT — start hub discovery in parallel with the playground channel
+   BOOT
    ========================================================================== */
 
 (function rpHubBoot() {

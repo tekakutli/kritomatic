@@ -17,12 +17,19 @@
                           html_file="board_playground.html",
                           group="core")
     # ... same as the first form, but the registration carries the
-    #     group name.  Groups are metadata, not routing: proxying,
-    #     /__playgrounds, and target selection all treat each
-    #     registration independently.  The hub consults `group` only
-    #     when reporting a cooperative kill, so its message names the
-    #     whole group instead of only the one playground that was
-    #     signalled.  See pgkit/hub.py's GROUPS section.
+    #     group name.  Groups are metadata, not routing; see the
+    #     GROUPS section in pgkit/hub.py.
+
+    conn = ensure_running("core", 0,
+                          role="launcher", group="core",
+                          message_handler=on_cmd)
+    # ... a launcher's control channel.  The hub stores this as a
+    #     registration whose `available` field is a list of names the
+    #     launcher can start; panels use it to send launcher_start /
+    #     launcher_stop / launcher_restart commands, which the hub
+    #     forwards to this WS.  `message_handler` receives those
+    #     commands; the launcher replies via `conn.send(...)`.
+    #     Playgrounds still register individually, exactly as before.
 
 `html_file` is the playground's own `kit_serve(html_file=...)` value.
 It travels to the hub in the `hello` frame and to panels in every
@@ -32,8 +39,17 @@ hardcoded filename map.
 `group` is optional and defaults to None.  Standalone launchers pass
 nothing; the shared-process launcher (`pgkit/launcher.py`) passes the
 group name so every playground it starts joins the same group.  A
-`None` group behaves exactly as before this field was added — every
-existing standalone invocation is unchanged.
+`None` group behaves exactly as before this field was added.
+
+`message_handler` is optional.  When set, every WS message the hub
+sends that is not `hello_ack` or `shutdown` is passed to it as a dict
+(see `HubConnection._handle`).  The launcher uses this to receive
+launcher_* commands; playgrounds and panels leave it None.
+
+`HubConnection.send(msg)` sends an arbitrary JSON message back over
+the same WS.  Playgrounds never call it; the launcher uses it to push
+`launcher_state` (available names) and `launcher_result` (per-command
+replies).
 
 Detached hub spawn
 ==================
@@ -76,36 +92,16 @@ def ensure_running(playground_name, playground_port, *,
                    role="playground",
                    html_file=None,
                    group=None,
-                   hub_port=HUB_PORT, connect_timeout=10.0):
+                   hub_port=HUB_PORT,
+                   connect_timeout=10.0,
+                   message_handler=None):
     """Return a live HubConnection registered with the hub.
 
-    `role` is forwarded verbatim to the hub in the `hello` frame.
-    Playgrounds use the default `"playground"`; the remote panel
-    passes `"panel"` so the hub treats it as unkillable and the
-    panel's own UI filters it out of the target dropdown.
-
-    `html_file` is the playground's own served HTML filename. It is
-    forwarded to the hub (and from there to every panel) so consumers
-    can construct an Open URL from the registration entry alone,
-    without a hardcoded filename map. Playgrounds that don't pass it
-    are still registered; consumers fall back to
-    `<name>_playground.html`.
-
-    `group` is optional metadata.  A `None` group means "standalone";
-    the hub records it as null and the kill path's message names only
-    this playground.  A non-None group joins this registration to any
-    others with the same value; the hub's kill path then reports the
-    whole group shutting down.  Routes, target selection, and the
-    /__playgrounds shape are unchanged by this field.
-
-    Blocks up to `connect_timeout` seconds for the initial registration
-    handshake. If it times out, the returned connection keeps retrying
-    in the background but `conn.registered` will be clear — callers
-    can decide to fall back to a direct URL.
+    See the module docstring for the roles and the extra kwargs.
     """
     conn = HubConnection(playground_name, playground_port,
                          hub_port, role=role, html_file=html_file,
-                         group=group)
+                         group=group, message_handler=message_handler)
     conn.start(timeout=connect_timeout)
     return conn
 
@@ -116,13 +112,14 @@ def ensure_running(playground_name, playground_port, *,
 
 class HubConnection:
     def __init__(self, name, port, hub_port, role="playground",
-                 html_file=None, group=None):
+                 html_file=None, group=None, message_handler=None):
         self.name = name
         self.port = port
         self.hub_port = hub_port
         self.role = role
         self.html_file = html_file
         self.group = group
+        self.message_handler = message_handler
         self.hub_url = f"http://{HUB_HOST}:{hub_port}/{name}/"
         self.stop = threading.Event()
         self.registered = threading.Event()
@@ -143,8 +140,7 @@ class HubConnection:
 
     def stop_now(self):
         """Stop the connection loop. Closes the underlying socket so a
-        blocked `read_frame` returns immediately instead of waiting
-        for the hub to close from the other side."""
+        blocked `read_frame` returns immediately."""
         self.stop.set()
         with self._sock_lock:
             sock = self._sock
@@ -158,6 +154,23 @@ class HubConnection:
                 sock.close()
             except OSError:
                 pass
+
+    def send(self, msg):
+        """Send one JSON message over the registration WS.
+
+        Returns True if the frame was written, False otherwise.  The
+        launcher uses this to push `launcher_state` and
+        `launcher_result`; playgrounds and panels never call it.
+        """
+        with self._sock_lock:
+            sock = self._sock
+        if sock is None:
+            return False
+        try:
+            _ws.write_text_frame(sock, json.dumps(msg))
+            return True
+        except OSError:
+            return False
 
     # ---- hub spawn ---------------------------------------------------
 
@@ -174,8 +187,6 @@ class HubConnection:
     def _spawn_hub_if_needed(self):
         if self._hub_reachable():
             return
-
-        # Small grace period — another playground may be spawning it now.
         time.sleep(0.1)
         if self._hub_reachable():
             return
@@ -189,7 +200,6 @@ class HubConnection:
         env["PYTHONPATH"] = (
             str(pgkit_root) + (os.pathsep + prev if prev else "")
         )
-
         try:
             with open(log_path, "a") as log:
                 subprocess.Popen(
@@ -206,14 +216,11 @@ class HubConnection:
             print(f"{self._log_prefix} could not spawn hub: {e}",
                   file=sys.stderr)
             return
-
         deadline = time.time() + 5.0
         while time.time() < deadline:
             if self._hub_reachable():
                 return
             time.sleep(0.1)
-
-        # Show the tail of the hub log if it never came up.
         try:
             tail = log_path.read_text(errors="replace").splitlines()[-10:]
             if tail:
@@ -235,7 +242,6 @@ class HubConnection:
                 print(f"{self._log_prefix} {e}", file=sys.stderr)
             if self.stop.is_set():
                 return
-            # Only reconnect if we haven't been told to exit.
             time.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
 
@@ -264,7 +270,6 @@ class HubConnection:
                 if not chunk:
                     raise ConnectionError("hub closed during handshake")
                 response += chunk
-
             first_line = response.split(b"\r\n", 1)[0]
             if b"101" not in first_line:
                 raise ConnectionError(
@@ -297,7 +302,6 @@ class HubConnection:
                     continue
                 if not self._handle(msg, sock):
                     return
-
         finally:
             with self._sock_lock:
                 if self._sock is sock:
@@ -324,9 +328,13 @@ class HubConnection:
                 )
             except OSError:
                 pass
-            # Defer exit so the ack and the socket close have a chance
-            # to flush before the process dies.
             threading.Timer(0.2, lambda: os._exit(0)).start()
             self.stop.set()
             return False
+        if self.message_handler is not None:
+            try:
+                self.message_handler(msg)
+            except Exception as e:
+                print(f"{self._log_prefix} message_handler error: {e}",
+                      file=sys.stderr)
         return True

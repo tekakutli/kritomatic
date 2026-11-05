@@ -1,15 +1,46 @@
 #!/usr/bin/env python3
 """
-run_all.py — launch all six playgrounds in one shared Python process.
+run_all.py — launch playgrounds in one shared Python process.
 
-    python playgrounds/run_all.py
-    python playgrounds/run_all.py --only board,cone
-    python playgrounds/run_all.py --browser
-    python playgrounds/run_all.py --shutdown-hub
+    python playgrounds/run_all.py                       # start all six
+    python playgrounds/run_all.py --only board,cone     # start two
+    python playgrounds/run_all.py --browser             # open tabs too
 
-Six playgrounds, one interpreter, one Ctrl+C.  See
-pgkit/launcher.py's docstring for the shared-process model and its
-costs.
+    python playgrounds/run_all.py -i                    # all six, then REPL
+    python playgrounds/run_all.py -i --only ""          # start nothing, REPL only
+    python playgrounds/run_all.py -i --only board,cone  # two, then REPL
+
+    python playgrounds/run_all.py --shutdown-hub        # kill a running hub
+
+Two modes:
+
+  Fixed set (default)   Start the initial set, block until Ctrl+C,
+                        stop everything, exit.  The behavior described
+                        in `pgkit/launcher.py`'s docstring.
+
+  Interactive (-i)      Start the initial set, then drop into a REPL
+                        where you can `start <name>` / `stop <name>`
+                        at runtime, all still in this one process, all
+                        still registering under the same group.  Use
+                        this when you want to add a playground after
+                        the fact — for instance, start with board only,
+                        then add cone, inpaint, segment as you need
+                        them, and stop the ones you are done with.
+
+        REPL commands:
+            list              — running playgrounds and their URLs
+            available         — all known playgrounds, * marks running
+            start <name>      — start one playground
+            stop <name>       — stop one playground
+            restart <name>    — stop, then start
+            start-all         — start every not-yet-running
+            stop-all          — stop every running
+            help / ?          — this list
+            quit / Ctrl+D     — shut down the group and exit
+
+        Ctrl+C at the REPL prompt shuts down the whole group cleanly,
+        same as it does in fixed-set mode.  There is no "cancel current
+        command" gesture; the underlying operations are sub-second.
 
 Participants and ports
 ======================
@@ -49,7 +80,7 @@ about that before the kill.
 
 sys.path setup
 ==============
-Three directories must be importable:
+Two directories must be importable:
 
   _HERE                playgrounds/
                        → `from board import …`, `from pgkit.launcher
@@ -74,8 +105,10 @@ own `_find_repo_src()` helpers walk up from `__file__` to locate
 
 import argparse
 import os
+import queue
 import subprocess
 import sys
+import threading
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -84,7 +117,7 @@ for _p in (_HERE, _SHARED_CABLE_ROOM):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from pgkit.launcher import serve_group
+from pgkit.launcher import Launcher, serve_group
 
 from board      import board_html, board_server
 from cone       import cone_html, cone_kra
@@ -96,6 +129,10 @@ from text_wall  import text_wall_html, text_wall_kra
 
 GROUP_NAME = "core"
 
+
+# ============================================================================
+#  Descriptors
+# ============================================================================
 
 def _descriptors():
     return [
@@ -162,6 +199,10 @@ def _descriptors():
     ]
 
 
+# ============================================================================
+#  Hub shutdown (unchanged from previous revision)
+# ============================================================================
+
 def _shutdown_hub() -> None:
     """Ask a running pgkit hub to exit.
 
@@ -182,12 +223,184 @@ def _shutdown_hub() -> None:
     )
 
 
+# ============================================================================
+#  REPL — one stdin reader thread per session, no leaks
+# ============================================================================
+
+class _StdinReader:
+    """Read lines from stdin in a background thread.
+
+    One instance per REPL session.  `readline(abort_event)` polls the
+    internal queue with a 0.2s timeout so a signal handler that sets
+    `abort_event` breaks the block — but the reader thread itself
+    stays blocked in `sys.stdin.readline()`, which is fine: it is a
+    daemon, and it dies when the launcher process exits.
+
+    Using a dedicated thread rather than `select()` avoids the
+    buffered-stdin race (Python's `sys.stdin` may hold bytes that
+    `select` cannot see).  The cost is one thread for the whole
+    session, not one per prompt.
+    """
+
+    def __init__(self):
+        self._q = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run, name="run_all-stdin", daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self):
+        while True:
+            try:
+                line = sys.stdin.readline()
+            except Exception:
+                self._q.put(None)
+                return
+            if not line:
+                self._q.put(None)
+                return
+            self._q.put(line)
+
+    def readline(self, abort_event):
+        """Return one line (without trailing newline), or None on EOF
+        or abort.  "" means "Ctrl+C — treat as empty input"."""
+        while not abort_event.is_set():
+            try:
+                line = self._q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if line is None:
+                return None
+            return line.rstrip("\r\n")
+        return None
+
+
+def _dispatch(launcher, line):
+    """Handle one REPL command line.  Returns False to exit the REPL."""
+    parts = line.split(None, 1)
+    if not parts:
+        return True
+    cmd = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd in ("quit", "exit", "q"):
+        return False
+
+    if cmd in ("help", "?", "h"):
+        print("Commands:")
+        print("  list              — running playgrounds and their URLs")
+        print("  available         — all known playgrounds, * marks running")
+        print("  start <name>      — start one playground")
+        print("  stop <name>       — stop one playground")
+        print("  restart <name>    — stop, then start")
+        print("  start-all         — start every not-yet-running")
+        print("  stop-all          — stop every running")
+        print("  quit / Ctrl+D     — shut down the group and exit")
+        return True
+
+    if cmd in ("list", "ls"):
+        running = launcher.running()
+        if not running:
+            print("  (no playgrounds running)")
+        else:
+            for name in launcher.names():
+                if name in running:
+                    print(f"  {name:<12} {running[name]}")
+        return True
+
+    if cmd in ("available", "avail"):
+        running = launcher.running()
+        for name in launcher.names():
+            mark = "*" if name in running else " "
+            print(f"  {mark} {name}")
+        return True
+
+    if cmd == "start":
+        if not arg:
+            print("usage: start <name>")
+            return True
+        url = launcher.start(arg)
+        if url is None:
+            print(f"  could not start {arg!r} "
+                  f"(already running, or unknown)")
+        return True
+
+    if cmd == "stop":
+        if not arg:
+            print("usage: stop <name>")
+            return True
+        if not launcher.stop(arg):
+            print(f"  {arg!r} is not running")
+        return True
+
+    if cmd == "restart":
+        if not arg:
+            print("usage: restart <name>")
+            return True
+        launcher.stop(arg)
+        launcher.start(arg)
+        return True
+
+    if cmd in ("start-all", "startall"):
+        for name in launcher.names():
+            if not launcher.is_running(name):
+                launcher.start(name)
+        return True
+
+    if cmd in ("stop-all", "stopall"):
+        launcher.stop_all()
+        return True
+
+    print(f"  unknown command: {cmd!r} (type 'help')")
+    return True
+
+
+def _run_interactive(group, playgrounds, *, open_browser=False, only=None):
+    """Start the initial set, then drop into a REPL."""
+    launcher = Launcher(group, playgrounds, open_browser=open_browser)
+    initial = (list(only) if only is not None
+               else [p["name"] for p in playgrounds])
+    for name in initial:
+        launcher.start(name)
+    launcher.install_signal_handlers()
+
+    print()
+    print(f"Group '{group}' — {len(launcher.running())} running, "
+          f"{len(launcher.names())} total.")
+    print("Type 'help' for commands, 'quit' or Ctrl+D to exit.")
+
+    prompt = f"({group}) "
+    reader = _StdinReader()
+    try:
+        while not launcher._shutdown_event.is_set():
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+            line = reader.readline(launcher._shutdown_event)
+            if line is None:
+                break
+            if not _dispatch(launcher, line):
+                break
+    finally:
+        launcher.stop_all()
+        print("Stopped.")
+
+
+# ============================================================================
+#  Entry point
+# ============================================================================
+
 def main():
     p = argparse.ArgumentParser(prog="run_all.py")
     p.add_argument("--only", default=None,
-                   help="Comma-separated playground names.")
+                   help="Comma-separated playground names.  With -i, "
+                        "an empty value (--only \"\") starts nothing "
+                        "and opens the REPL.")
     p.add_argument("--browser", action="store_true",
-                   help="Open each playground in the browser on start.")
+                   help="Open each playground in the browser when it "
+                        "starts.")
+    p.add_argument("-i", "--interactive", action="store_true",
+                   help="After the initial set starts, enter a REPL "
+                        "for start/stop at runtime.")
     p.add_argument("--shutdown-hub", action="store_true",
                    help="Ask a running pgkit hub to exit, then exit.")
     args = p.parse_args()
@@ -197,15 +410,23 @@ def main():
         return
 
     only = None
-    if args.only:
+    if args.only is not None:
         only = {n.strip() for n in args.only.split(",") if n.strip()}
 
-    serve_group(
-        GROUP_NAME,
-        _descriptors(),
-        open_browser=args.browser,
-        only=only,
-    )
+    if args.interactive:
+        _run_interactive(
+            GROUP_NAME,
+            _descriptors(),
+            open_browser=args.browser,
+            only=only,
+        )
+    else:
+        serve_group(
+            GROUP_NAME,
+            _descriptors(),
+            open_browser=args.browser,
+            only=only,
+        )
 
 
 if __name__ == "__main__":

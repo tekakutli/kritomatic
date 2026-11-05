@@ -6,7 +6,9 @@ remote_cli — command-line client for pgkit playgrounds.
     python remote_cli.py --url ws://127.0.0.1:8773/remote [COMMAND ...]
     python remote_cli.py [COMMAND ...]           # uses default_target
 
-Without a subcommand, opens an interactive REPL.
+Without a subcommand, opens an interactive REPL.  Without --target and
+without --url, opens a hub-only REPL (target-bound verbs disabled, hub
+verbs available).
 
 Run `python remote_cli.py --help` for the full command list.
 
@@ -14,8 +16,7 @@ DISCOVERY, NOT CONFIGURATION
 ============================
 Playgrounds register themselves with the pgkit hub at startup. The
 hub's `/__playgrounds` endpoint returns `{name, port, role, pid,
-html_file, connected_at}` for each. This CLI derives every URL it
-needs from that registry:
+html_file, group, available}` for each registration.
 
     --target NAME          ws://<hub>/NAME/remote
                            (through the hub proxy)
@@ -28,44 +29,42 @@ needs from that registry:
                            standalone playgrounds when the hub is
                            not running.
 
-There is no per-playground map in `config.json`. One hub URL and an
-optional `default_target` are the whole configuration. Any playground
-that registers with the hub is targetable by name; a new playground
-requires zero CLI changes.
-
 `list-targets` does the same `/__playgrounds` query and prints the
 result — no target connect, no WS traffic.
 
-`shutdown-hub` opens the hub's management WS, sends `shutdown_hub`,
-waits for `shutdown_ack`, and exits. The hub then notifies every
-registered playground with a cooperative `shutdown` message and
-`os._exit`s. No target connect; same pre-dispatch handling as
-`list-targets`.
+LAUNCHER COMMANDS
+=================
+When a launcher (the shared-process runner) is present, the CLI can
+start/stop individual playgrounds from its control channel:
+
+    start NAME     ask the launcher to start NAME in-process
+    stop NAME      ask the launcher to stop just NAME (group stays up)
+    restart NAME   stop, then start
+    available      list playgrounds that a launcher can start
+
+These all run one-shot against the hub's management WS and do not
+require a target connection.  They can be used from scripts, and are
+mirrored as REPL verbs.
+
+`kill NAME` still shuts down the whole group when NAME is grouped.
+`stop NAME` is the "shut down only this one" alternative.
 
 ROLE FILTER
 ===========
 The hub's registry includes panels (remote_panel registers with
-`role="panel"`). Panels are the management UI and do not expose the
-playground remote protocol — a `--target remote_panel` would connect
-to a dummy `/remote` endpoint with no browser on the other side and
-hang for the full connect timeout before erroring. `resolve_target`
-therefore filters the lookup to `role == "playground"` and produces
-a distinct error message when the name matches a panel, so the user
-learns why the target is unavailable instead of watching a timeout.
+`role="panel"`) and launchers (`role="launcher"`). Neither accepts
+the playground remote protocol. `resolve_target` therefore filters
+the lookup to `role == "playground"` and produces a distinct error
+message when the name matches a panel or launcher.
 
 EXIT CODES
 ==========
     0  success
     1  runtime failure after connecting (a command the target
        refused, a mid-command disconnect, a script step that
-       failed)
+       failed, or a launcher operation the hub refused)
     2  usage failure before connecting (bad flag, unknown target,
        or the hub was required and could not be reached)
-
-`list-targets` and `shutdown-hub` obey the same convention: a hub
-that cannot be queried is a usage-environment failure, not a
-runtime one, so both return 2 to match `--target`/`--url`
-operations.
 
 Config
 ======
@@ -85,6 +84,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -135,25 +135,8 @@ DEFAULT_CONFIG = {
 
 
 def _load_config() -> dict:
-    """Load `remote_cli/config.json`, merged onto DEFAULT_CONFIG.
-
-    Missing file, unreadable file, or invalid JSON all fall back to
-    DEFAULT_CONFIG with a one-line warning on stderr. A malformed
-    config should not stop the CLI; it should tell the user where the
-    problem is and continue with the built-in defaults.
-
-    Legacy keys (`targets`, `direct`) are accepted and ignored; they
-    were replaced by dynamic discovery from the hub. A legacy
-    `default_url` shaped like `ws://host/<name>/remote` is migrated to
-    `default_target = <name>` so old configs keep working when the hub
-    is up. A legacy direct-style `default_url` (e.g.
-    `ws://127.0.0.1:8773/remote`) cannot be migrated — there is no
-    name in it — so those users should either set `default_target` or
-    pass `--url`.
-    """
     if not CONFIG_PATH.is_file():
         return dict(DEFAULT_CONFIG)
-
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
@@ -163,7 +146,6 @@ def _load_config() -> dict:
             file=sys.stderr,
         )
         return dict(DEFAULT_CONFIG)
-
     if not isinstance(data, dict):
         print(
             f"warning: {CONFIG_PATH} is not a JSON object; "
@@ -175,8 +157,6 @@ def _load_config() -> dict:
     merged = dict(DEFAULT_CONFIG)
     merged.update(data)
 
-    # Legacy `default_url` → `default_target` migration for the
-    # hub-style URL shape only.
     if not merged.get("default_target"):
         old_url = merged.get("default_url") or ""
         m = re.match(r"^wss?://[^/]+/([^/]+)/remote/?$", old_url)
@@ -191,12 +171,6 @@ def _load_config() -> dict:
 # ============================================================================
 
 def _fetch_registry(config: dict):
-    """GET /__playgrounds, return (entries, hub_http).
-
-    `entries` is a list of dicts, each with `name`, `port`, `role`,
-    `pid`, `html_file`, `connected_at`. Raises HubUnreachable when the
-    hub does not respond.
-    """
     hub_ws = config.get("hub", "ws://127.0.0.1:8780")
     hub_http = hub_ws.replace("ws://", "http://") \
                      .replace("wss://", "https://")
@@ -226,14 +200,6 @@ def _hub_host(config: dict) -> str:
 
 def resolve_target(config: dict, target_spec: Optional[str],
                    direct: bool = False) -> str:
-    """Turn a `--target NAME` / `--url URL` / nothing into a ws URL.
-
-    A literal `ws://`/`wss://` string is returned unchanged. A name is
-    resolved against the hub's registry, restricted to `role ==
-    "playground"` — panels are the management UI and do not expose the
-    playground remote protocol. `direct=True` bypasses the hub's proxy
-    but still asks the hub for the port.
-    """
     if not target_spec:
         target_spec = config.get("default_target") or ""
     if not target_spec:
@@ -247,10 +213,6 @@ def resolve_target(config: dict, target_spec: Optional[str],
 
     pgs, hub_http = _fetch_registry(config)
 
-    # Panels and playgrounds both live in the registry but only
-    # playgrounds accept the remote protocol. Filter the lookup and
-    # produce a distinct error for a panel name so the user is not
-    # left staring at a connect timeout.
     entry = next(
         (p for p in pgs
          if p.get("name") == target_spec
@@ -261,7 +223,7 @@ def resolve_target(config: dict, target_spec: Optional[str],
         panel_match = next(
             (p for p in pgs
              if p.get("name") == target_spec
-             and p.get("role") == "panel"),
+             and p.get("role") in ("panel", "launcher")),
             None,
         )
         names = sorted(
@@ -269,10 +231,10 @@ def resolve_target(config: dict, target_spec: Optional[str],
             if p.get("role") == "playground" and p.get("name")
         )
         if panel_match is not None:
+            role = panel_match.get("role")
             raise UnknownTarget(
-                f"{target_spec!r} is a panel, not a playground. Panels "
-                f"are the management UI and do not accept remote "
-                f"commands. Targetable playgrounds: {names or '(none)'}."
+                f"{target_spec!r} is a {role}, not a playground. "
+                f"Targetable playgrounds: {names or '(none)'}."
             )
         raise UnknownTarget(
             f"playground {target_spec!r} is not registered with the "
@@ -299,13 +261,6 @@ def resolve_target(config: dict, target_spec: Optional[str],
 # ============================================================================
 
 def parse_set_args(args: list) -> dict:
-    """Turn command-line args into a values dict.
-
-    Supports two forms:
-      - `NAME=VALUE NAME=VALUE ...` (all args contain '=')
-      - `NAME VALUE NAME VALUE ...` (even arg count, no '=')
-    Mixing the two is an error.
-    """
     if not args:
         return {}
     has_equals = [("=" in a) for a in args]
@@ -343,22 +298,16 @@ def _truncate(s: str, n: int) -> str:
 
 
 # ============================================================================
-#  Hub query (used by `list-targets` and `shutdown-hub`)
+#  Hub commands (list-targets, available, start, stop, restart,
+#  shutdown-hub)
 # ============================================================================
 #
-# EXIT-CODE SYMMETRY WITH --target / --url
-# =========================================
-# Both paths reach the hub's `/__playgrounds` endpoint. Both use
-# exit code 2 when the hub cannot be queried, because that is a
-# usage-environment failure ("the thing you need is not running"),
-# not a runtime failure of a connected command. Without this match,
-# `list-targets` (returns 1) and `--target board ls` (returns 2)
-# would answer the same "hub is down" condition with different
-# exit codes, which scripts could not distinguish from "bad input"
-# vs "connected but the command failed."
+# These do not require a target connection.  Their exit code follows
+# the same convention as target-bound operations: 2 for "the hub was
+# required and could not be reached", 1 for "hub reachable but the
+# operation failed", 0 for success.
 
 def _list_targets_cli(config: dict, json_output: bool = False) -> int:
-    """Print the current hub registry. One-shot HTTP; no WS."""
     try:
         pgs, hub_http = _fetch_registry(config)
     except HubUnreachable as e:
@@ -373,32 +322,113 @@ def _list_targets_cli(config: dict, json_output: bool = False) -> int:
         print(f"hub at {hub_http}: no playgrounds registered")
         return 0
 
+    running = [p for p in pgs if p.get("role") == "playground"]
+    launchers = [p for p in pgs if p.get("role") == "launcher"]
+    panels = [p for p in pgs if p.get("role") == "panel"]
+    running_names = {p.get("name") for p in running}
+
     print(f"hub at {hub_http}:")
-    for pg in pgs:
-        line = (f"  {pg.get('name', '?'):<16}"
-                f" {pg.get('role', '?'):<10}"
-                f" :{pg.get('port', '?')}")
-        if pg.get("pid"):
-            line += f"  pid {pg['pid']}"
-        print(line)
+    if running:
+        print("  Running:")
+        for pg in sorted(running, key=lambda p: p.get("name", "")):
+            line = f"    {pg.get('name', '?'):<16}"
+            line += f" :{pg.get('port', '?'):<6}"
+            if pg.get("group"):
+                line += f" group={pg['group']!r}"
+            if pg.get("pid"):
+                line += f"  pid {pg['pid']}"
+            print(line)
+    if launchers:
+        print("  Launchers:")
+        for lc in sorted(launchers, key=lambda p: p.get("name", "")):
+            grp = lc.get("group") or lc.get("name", "?")
+            avail = [n for n in (lc.get("available") or [])
+                     if n not in running_names]
+            print(f"    {lc.get('name', '?'):<16} group={grp!r}")
+            if avail:
+                print(f"      available: {', '.join(avail)}")
+    if panels:
+        print("  Panels:")
+        for pn in sorted(panels, key=lambda p: p.get("name", "")):
+            print(f"    {pn.get('name', '?'):<16} :{pn.get('port', '?')}")
     return 0
 
 
+def _available_cli(config: dict, json_output: bool = False) -> int:
+    try:
+        pgs, hub_http = _fetch_registry(config)
+    except HubUnreachable as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    running_names = {p.get("name") for p in pgs
+                     if p.get("role") == "playground"}
+    available = []
+    for lc in pgs:
+        if lc.get("role") != "launcher":
+            continue
+        for name in (lc.get("available") or []):
+            if name and name not in running_names:
+                available.append({"name": name, "group": lc.get("group")})
+
+    if json_output:
+        _print_json({"hub": hub_http, "available": available})
+        return 0
+
+    if not available:
+        print(f"hub at {hub_http}: nothing available to start")
+        return 0
+    print(f"hub at {hub_http}:")
+    for item in sorted(available, key=lambda x: x["name"]):
+        suffix = (f"  (group={item['group']!r})" if item.get("group")
+                  else "")
+        print(f"  {item['name']}{suffix}")
+    return 0
+
+
+def _launcher_cmd_cli(config: dict, kind: str, name: str,
+                      json_output: bool) -> int:
+    if not name:
+        print(f"error: missing NAME for {kind}", file=sys.stderr)
+        return 2
+
+    try:
+        _fetch_registry(config)
+    except HubUnreachable as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    msg = rc_repl._hub_one_shot(
+        config,
+        send_msg={
+            "type":       f"launcher_{kind}",
+            "name":       name,
+            "request_id": uuid.uuid4().hex,
+        },
+        wait_for="launcher_result",
+        timeout=15.0,
+    )
+    if msg is None:
+        if json_output:
+            print(json.dumps({
+                "success": False,
+                "message": "no response from hub",
+            }))
+        return 1
+
+    if json_output:
+        print(json.dumps(msg))
+    else:
+        if msg.get("success"):
+            print(f"ok: {msg.get('message', kind + ' ' + name)}")
+        else:
+            print(f"error: {msg.get('message', 'operation failed')}",
+                  file=sys.stderr)
+
+    return 0 if msg.get("success") else 1
+
+
 def _shutdown_hub_cli(config: dict, json_output: bool = False) -> int:
-    """Ask the hub to exit. One-shot WS; no target connect.
-
-    Sends `shutdown_hub` over the hub's management WS and waits for
-    `shutdown_ack`. On success the hub notifies every registered
-    playground with a cooperative `shutdown` message and then exits.
-
-    Exit codes match `list-targets`: 2 for "hub not reachable" (the
-    environment the user needs isn't running), 1 for "hub reachable
-    but did not ack", 0 for ack received.
-    """
-    # Reachability pre-check so "no hub running" is exit 2 (usage
-    # failure), matching list-targets. Without this, _hub_one_shot
-    # would print the same error but return None, and we'd have to
-    # guess the exit code.
     try:
         _fetch_registry(config)
     except HubUnreachable as e:
@@ -415,7 +445,6 @@ def _shutdown_hub_cli(config: dict, json_output: bool = False) -> int:
         timeout=5.0,
     )
     if msg is None:
-        # _hub_one_shot already printed the specific reason on stderr
         if json_output:
             print(json.dumps({
                 "success": False,
@@ -432,7 +461,7 @@ def _shutdown_hub_cli(config: dict, json_output: bool = False) -> int:
 
 
 # ============================================================================
-#  Command implementations
+#  Target-bound command implementations
 # ============================================================================
 
 def cmd_ls(client: RemoteCliClient, args) -> int:
@@ -703,8 +732,13 @@ def build_parser() -> argparse.ArgumentParser:
             "  remote_cli --target board --direct ls     # bypass hub proxy\n"
             "  remote_cli --url ws://127.0.0.1:8773/remote ls  # standalone\n"
             "  remote_cli list-targets\n"
+            "  remote_cli available\n"
+            "  remote_cli start segment\n"
+            "  remote_cli stop  board\n"
+            "  remote_cli restart cone\n"
             "  remote_cli shutdown-hub\n"
-            "  remote_cli --target segment\n"
+            "  remote_cli --target segment                # target-bound REPL\n"
+            "  remote_cli                                 # hub-only REPL\n"
         ),
     )
     p.add_argument("--url", default=None,
@@ -713,8 +747,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "playgrounds when the hub is not running.")
     p.add_argument("--target", default=None,
                    help="Playground name; resolved through the hub's "
-                        "registry (e.g. board, cone, sam3). Panels are "
-                        "listed by `list-targets` but cannot be targeted.")
+                        "registry (e.g. board, cone, sam3). Panels and "
+                        "launchers are listed by `list-targets` but "
+                        "cannot be targeted.")
     p.add_argument("--direct", action="store_true",
                    help="With --target: connect to the playground's own "
                         "port instead of through the hub proxy. The hub "
@@ -796,28 +831,48 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Print the wire plan, do not send anything")
     script.set_defaults(fn=cmd_script)
 
-    # `list-targets` queries the hub directly. It has no client and
-    # never touches `args.fn`; the main() dispatcher special-cases it
-    # before connecting.
     listtgt = sub.add_parser(
         "list-targets",
         help="List playgrounds registered with the hub (one-shot HTTP)",
     )
     listtgt.set_defaults(fn=None)
 
-    # `shutdown-hub` also queries the hub directly, no target connect.
-    # Like list-targets, main() dispatches it before resolve_target.
+    avail = sub.add_parser(
+        "available",
+        help="List playgrounds a launcher can start (one-shot HTTP)",
+    )
+    avail.set_defaults(fn=None)
+
+    start = sub.add_parser(
+        "start",
+        help="Ask the launcher to start a playground",
+    )
+    start.add_argument("name")
+    start.set_defaults(fn=None)
+
+    stop = sub.add_parser(
+        "stop",
+        help="Ask the launcher to stop a playground (keeps the group up)",
+    )
+    stop.add_argument("name")
+    stop.set_defaults(fn=None)
+
+    restart = sub.add_parser(
+        "restart",
+        help="Stop then start a playground",
+    )
+    restart.add_argument("name")
+    restart.set_defaults(fn=None)
+
     shutdown_hub = sub.add_parser(
         "shutdown-hub",
-        help="Ask the hub to shut down (and every playground it "
-             "manages)",
+        help="Ask the hub to shut down (and every playground it manages)",
     )
     shutdown_hub.set_defaults(fn=None)
 
     return p
 
 
-# Subcommands that can run without a browser tab connected.
 _NO_BROWSER_REQUIRED = {
     "presence", "raw", "state", "ls", "show",
     "schema", "actions", "entities",
@@ -836,31 +891,45 @@ def main() -> int:
     if args.verbose:
         set_verbose(True)
 
-    # `list-targets` is a pure HTTP query; it never opens a WS to a
-    # playground, so it bypasses target resolution and the connect
-    # step entirely.
+    # Hub commands that do not need a target connection.
     if args.cmd == "list-targets":
         return _list_targets_cli(config, args.json)
-
-    # `shutdown-hub` likewise bypasses target resolution: the hub is
-    # the only endpoint it talks to.
+    if args.cmd == "available":
+        return _available_cli(config, args.json)
+    if args.cmd == "start":
+        return _launcher_cmd_cli(config, "start", args.name, args.json)
+    if args.cmd == "stop":
+        return _launcher_cmd_cli(config, "stop", args.name, args.json)
+    if args.cmd == "restart":
+        return _launcher_cmd_cli(config, "restart", args.name, args.json)
     if args.cmd == "shutdown-hub":
         return _shutdown_hub_cli(config, args.json)
 
     target_spec = args.target or args.url
+
+    # No subcommand → REPL.  If no target is given, enter hub-only
+    # mode rather than erroring; hub verbs (start/stop/available/
+    # kill/shutdown-hub/pg-list) work without a target.
+    if args.cmd is None:
+        if not target_spec:
+            return rc_repl.run(None, config,
+                               target_name=None,
+                               verbose=args.verbose)
+        try:
+            url = resolve_target(config, target_spec, direct=args.direct)
+        except (ValueError, HubUnreachable, UnknownTarget) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        return rc_repl.run(url, config,
+                           target_name=args.target,
+                           verbose=args.verbose)
+
+    # A target-bound subcommand.  Resolve first, then connect.
     try:
         url = resolve_target(config, target_spec, direct=args.direct)
     except (ValueError, HubUnreachable, UnknownTarget) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-
-    # No subcommand → REPL
-    if args.cmd is None:
-        return rc_repl.run(
-            url, config,
-            target_name=args.target,
-            verbose=args.verbose,
-        )
 
     require_browser = args.cmd not in _NO_BROWSER_REQUIRED
 

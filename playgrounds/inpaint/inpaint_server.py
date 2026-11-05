@@ -46,6 +46,7 @@ from urllib.parse import unquote
 from pg_comfy import (
     ComfyClient, ComfyError, ComfyTimeout, ComfyCancelled,
     EncodedImage, KritaResources, expand_custom, get_client, reset_client,
+    cached_object_info,
 )
 # `make_encoded_image` is imported lazily inside the request handlers
 # that use it (`handle_upload`, `handle_krita_import`) so importing
@@ -100,7 +101,7 @@ def _cache_image(hash_hex, raw, width, height, filename):
 def handle_status(_payload) -> dict:
     try:
         client = get_client(COMFY_HOST, COMFY_PORT)
-        info = client.object_info()
+        info = cached_object_info(client)
     except ComfyError as e:
         reset_client()
         return {

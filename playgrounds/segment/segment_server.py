@@ -38,6 +38,7 @@ from urllib.parse import unquote
 from pg_comfy import (
     ComfyClient, ComfyError, ComfyTimeout, ComfyCancelled,
     EncodedImage, KritaResources, expand_custom, get_client, reset_client,
+    cached_object_info,
 )
 # `make_encoded_image` is imported lazily inside the request handlers
 # that use it so importing this module does not pull PIL.  See the
@@ -137,7 +138,7 @@ _TOOLING_NODES = ("ETN_LoadImageCache", "ETN_KritaOutput")
 def handle_status(_payload) -> dict:
     client = _get_client()
     try:
-        info = client.object_info()
+        info = cached_object_info(client)
     except ComfyError as e:
         _log(f"status check: unreachable: {e}")
         _reset_client()
@@ -196,7 +197,7 @@ def _run_workflow(workflow: dict, resources: KritaResources,
                   params: dict, client: ComfyClient,
                   label: str) -> dict:
     try:
-        object_info = client.object_info()
+        object_info = cached_object_info(client)
     except ComfyError as e:
         _reset_client()
         return {"success": False, "message": f"ComfyUI unreachable: {e}"}
@@ -307,7 +308,7 @@ def handle_segment(payload: dict) -> dict:
 
     client = _get_client()
     try:
-        info = client.object_info()
+        info = cached_object_info(client)
     except ComfyError as e:
         _reset_client()
         return {"success": False, "message": f"ComfyUI unreachable: {e}"}
@@ -428,7 +429,7 @@ def handle_refine(payload: dict) -> dict:
 
     client = _get_client()
     try:
-        info = client.object_info()
+        info = cached_object_info(client)
     except ComfyError as e:
         _reset_client()
         return {"success": False,

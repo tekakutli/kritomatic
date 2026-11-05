@@ -19,7 +19,19 @@ DEPENDENCY NOTE
 Until the daemon has it (along with `comfy_generate --no_paste` and
 the `comfy_load` inline-map clear), `/comfy/inpaint` will fail with
 "Unknown command 'comfy_set_layer_pixels'".  The rest of the routes
-are functional today."""
+are functional today.
+
+LAZY `pg_comfy.image` IMPORT
+============================
+`pg_comfy.image` pulls PIL, ~30 MB of RSS and ~500 ms of import time.
+This module does not touch image encoding at import time, so
+`make_encoded_image` is imported lazily inside the two handlers that
+use it (`handle_upload`, `handle_krita_import`).  The cost is paid on
+the first upload or Krita-import request, not at module load — and in
+grouped mode (`run_all.py`) a session that never exercises inpaint or
+segment never loads PIL at all.  See `pg_comfy/__init__.py`'s LAZY
+`image` note.
+"""
 
 from __future__ import annotations
 
@@ -35,7 +47,9 @@ from pg_comfy import (
     ComfyClient, ComfyError, ComfyTimeout, ComfyCancelled,
     EncodedImage, KritaResources, expand_custom, get_client, reset_client,
 )
-from pg_comfy.image import make_encoded_image
+# `make_encoded_image` is imported lazily inside the request handlers
+# that use it (`handle_upload`, `handle_krita_import`) so importing
+# this module does not pull PIL.
 
 from . import krita_client
 
@@ -110,6 +124,8 @@ def handle_status(_payload) -> dict:
 # ---------------------------------------------------------------------------
 
 def handle_upload(headers: dict, body: bytes) -> dict:
+    from pg_comfy.image import make_encoded_image
+
     if not body:
         return {"success": False, "message": "empty upload"}
 
@@ -268,6 +284,8 @@ def handle_krita_apply(payload: dict) -> dict:
 
 
 def handle_krita_import(payload: dict) -> dict:
+    from pg_comfy.image import make_encoded_image
+
     name = payload.get("name") if isinstance(payload, dict) else None
     command = {"type": "get_document_composite_b64"}
     if name:

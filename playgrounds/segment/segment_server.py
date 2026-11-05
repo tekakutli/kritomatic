@@ -12,6 +12,16 @@ Routes:
   POST /krita/apply          send a mask to Krita (selection / transparency mask / layer extraction / paint layer)
   POST /krita/import         fetch active document composite from Krita
   POST /krita/import_masks   fetch selected mask or paint layer(s) as base64 masks
+
+LAZY `pg_comfy.image` IMPORT
+============================
+`pg_comfy.image` pulls PIL, ~30 MB of RSS and ~500 ms of import time.
+This module does not touch image encoding at import time, so
+`make_encoded_image` is imported lazily inside the five handlers that
+use it (`handle_upload`, `handle_segment`, `_run_refine_sam2`,
+`_run_refine_sam3`, `handle_krita_import`).  The cost is paid on the
+first upload / segment / refine / import request, not at module load.
+See `pg_comfy/__init__.py`'s LAZY `image` note.
 """
 
 from __future__ import annotations
@@ -29,7 +39,9 @@ from pg_comfy import (
     ComfyClient, ComfyError, ComfyTimeout, ComfyCancelled,
     EncodedImage, KritaResources, expand_custom, get_client, reset_client,
 )
-from pg_comfy.image import make_encoded_image
+# `make_encoded_image` is imported lazily inside the request handlers
+# that use it so importing this module does not pull PIL.  See the
+# module docstring, LAZY `pg_comfy.image` IMPORT.
 
 from . import krita_client
 
@@ -154,6 +166,8 @@ def handle_status(_payload) -> dict:
 
 
 def handle_upload(headers: dict, body: bytes) -> dict:
+    from pg_comfy.image import make_encoded_image
+
     if not body:
         return {"success": False, "message": "empty upload"}
 
@@ -275,6 +289,8 @@ def _build_segment_params(payload: dict, image_w: int, image_h: int,
 
 
 def handle_segment(payload: dict) -> dict:
+    from pg_comfy.image import make_encoded_image
+
     hash_hex = payload.get("hash")
     if not hash_hex:
         return {"success": False, "message": "no image hash"}
@@ -336,6 +352,8 @@ def _build_refine_sam2_params(payload: dict) -> dict:
 
 def _run_refine_sam2(payload: dict, image_entry: dict,
                      workflow: dict, client: ComfyClient) -> dict:
+    from pg_comfy.image import make_encoded_image
+
     mask_b64 = payload.get("mask_b64")
     if not mask_b64:
         return {"success": False, "message": "no mask_b64 for SAM2 refine"}
@@ -370,6 +388,8 @@ def _run_refine_sam3(payload: dict, image_entry: dict,
     of the previous mask. This is a semantic difference the UI documents
     via the model radio tooltip; the handler itself just routes.
     """
+    from pg_comfy.image import make_encoded_image
+
     workflow = _get_segment_workflow()
     if workflow is None:
         return {"success": False, "message": "no segment workflow for SAM3 refine"}
@@ -672,6 +692,8 @@ def handle_krita_import(payload: dict) -> dict:
     upload endpoint, so the browser can call setImage() exactly as it
     would after a file upload.
     """
+    from pg_comfy.image import make_encoded_image
+
     name = None
     if isinstance(payload, dict):
         name = payload.get("name")

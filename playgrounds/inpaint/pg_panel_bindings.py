@@ -5,7 +5,8 @@ Operations exposed by this playground:
   - Load image (file, drop, import from Krita)
   - Load masks (import from Krita, pick a PNG file)
   - Select / delete masks
-  - Rotate the playground view (slider)
+  - Rotate the playground view (single scrub input: click-to-type,
+    drag-to-scrub, Shift-snap)
   - Materialise the context rectangle as a mask
   - Inpaint
   - Cancel
@@ -115,12 +116,10 @@ function _pickMaskAction() {
 
 function _clearImageAction() {
   clearImage();
-  // clearImage resets view.rotation to 0; sync the widgets so the
+  // clearImage resets view.rotation to 0; sync the widget so the
   // user does not see a stale angle on a cleared canvas.
   const rotEl = document.getElementById("viewRotation");
   if (rotEl) rotEl.value = "0";
-  const rotNumEl = document.getElementById("viewRotationNum");
-  if (rotNumEl) rotNumEl.value = "0";
   syncPanelFields();
   syncMaskList();
   pgkitNotifyAll();

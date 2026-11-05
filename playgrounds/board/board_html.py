@@ -75,25 +75,18 @@ and line, and exits with status 1; no HTML file is written and no
 server starts.
 """
 
-import os
 import sys
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_PARENT = os.path.dirname(_HERE)
-for _p in (_HERE, _PARENT):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from pg_base        import PG_CSS, PG_PANEL_BODY
-from pg_core        import CORE_JS
-from pg_view_board  import VIEW_BOARD_JS
-from pg_krita       import KRITA_JS
-from pg_panel_fields   import PG_PANEL_FIELDS_JS
-from pg_panel_lists    import PG_PANEL_LISTS_JS
-from pg_panel_scrubs   import PG_PANEL_SCRUBS_JS
-from pg_panel_bindings import PG_PANEL_BINDINGS_JS
-from pg_scene       import SCENE_JS
-from pg_dispatch    import DISPATCH_JS
+from .pg_base        import PG_CSS, PG_PANEL_BODY
+from .pg_core        import CORE_JS
+from .pg_view_board  import VIEW_BOARD_JS
+from .pg_krita       import KRITA_JS
+from .pg_panel_fields   import PG_PANEL_FIELDS_JS
+from .pg_panel_lists    import PG_PANEL_LISTS_JS
+from .pg_panel_scrubs   import PG_PANEL_SCRUBS_JS
+from .pg_panel_bindings import PG_PANEL_BINDINGS_JS
+from .pg_scene       import SCENE_JS
+from .pg_dispatch    import DISPATCH_JS
 
 from pgkit.html_shell  import page
 from pgkit.js_check    import JsSyntaxError

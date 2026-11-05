@@ -74,6 +74,20 @@ hardcoded filename map lives in the panel — a new playground is
 opened correctly without touching this file.  The fallback
 `<name>_playground.html` covers old hubs that don't yet carry the
 field.
+
+GROUPED PLAYGROUNDS
+===================
+A registration may carry a `group` string (see `pgkit/hub.py`'s
+GROUPS section and `pgkit/hub_client.py`).  Groups are metadata, not
+routing — the target dropdown still lists each playground
+individually, and the CLI still targets each by name.  The only
+visible consequence here is that the Kill/Force buttons' `title` and
+the Force confirm dialog mention the group when the field is
+non-None: a user who is about to kill "board" should know that the
+other five members of the shared-process group will go down with
+it.  `pg.group` is read from the same registration entry every
+other management-list field comes from; no new fetch, no new
+state.
 """
 
 RP_UI_JS = r"""
@@ -392,6 +406,14 @@ function rpDownloadState() {
    hub.py).  The `<name>_playground.html` fallback covers old hubs
    that don't yet send the field.
 
+   The Kill and Force buttons consult `pg.group` (optional metadata
+   on each registration; see pgkit/hub.py's GROUPS section).  When
+   the field is non-None, the buttons' `title` and the Force confirm
+   dialog say so — a user who is about to kill "board" should know
+   that every other member of the shared-process group will go down
+   with it.  A null group (standalone) leaves the titles and the
+   confirm dialog exactly as they were before this field existed.
+
    `#rpMgmtStatus` reports the hub-shutdown flow's state.  It is
    reset on open only when `_rp.shuttingDown` is false: a successful
    shutdown leaves the flag set and the modal shows the same
@@ -519,10 +541,22 @@ function rpRebuildManagementList() {
       });
       actions.appendChild(openBtn);
 
+      // Grouped playgrounds: killing one shuts down every
+      // registration in the same group (they share a Python
+      // process).  Surface that in the button titles and in the
+      // Force confirm dialog so a user does not discover the
+      // coupling by accident.  A null group leaves the strings
+      // exactly as they were before this field existed.
+      const groupNote = pg.group
+        ? " (group '" + pg.group + "'; killing this shuts down every "
+          + "playground in that group)"
+        : "";
+
       const killBtn = document.createElement("button");
       killBtn.className = "danger";
       killBtn.textContent = "Kill";
-      killBtn.title = "Ask " + pg.name + " to shut down cooperatively";
+      killBtn.title = "Ask " + pg.name + " to shut down cooperatively"
+                    + groupNote;
       killBtn.addEventListener("click", () => {
         rpKillPlayground(pg.name, false);
       });
@@ -531,13 +565,18 @@ function rpRebuildManagementList() {
       const hardBtn = document.createElement("button");
       hardBtn.className = "danger";
       hardBtn.textContent = "Force";
-      hardBtn.title =
-        "Escalate to SIGTERM if cooperative shutdown does not complete";
+      hardBtn.title = "Escalate to SIGTERM if cooperative shutdown "
+                    + "does not complete" + groupNote;
       hardBtn.addEventListener("click", () => {
-        if (confirm("Force-kill " + pg.name
-                    + (pg.pid ? (" (pid " + pg.pid + ")") : "")
-                    + "?\n\nThis sends SIGTERM if cooperative shutdown "
-                    + "fails within five seconds.")) {
+        let msg = "Force-kill " + pg.name
+                + (pg.pid ? (" (pid " + pg.pid + ")") : "")
+                + "?\n\nThis sends SIGTERM if cooperative shutdown "
+                + "fails within five seconds.";
+        if (pg.group) {
+          msg += "\n\nThis playground is in group '" + pg.group + "'. "
+               + "Killing it shuts down every playground in that group.";
+        }
+        if (confirm(msg)) {
           rpKillPlayground(pg.name, true);
         }
       });

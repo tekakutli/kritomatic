@@ -66,27 +66,20 @@ No HTML is written; no server starts.  That way the failure mode
 is a clear diagnostic, not a page-shaped shell that does nothing.
 """
 
-import os
 import sys
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_PARENT = os.path.dirname(_HERE)
-for _p in (_HERE, _PARENT):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from pg_base           import TEXT_WALL_CSS, TEXT_WALL_PANEL_BODY
-from pg_core           import CORE_JS
-from pg_view_canvas    import CANVAS_VIEW_JS
-from pg_view_segments  import SEGMENTS_VIEW_JS
-from pg_scene          import SCENE_JS
-from pg_export         import EXPORT_JS
-from pg_kra            import KRA_JS
-from pg_panel_fields   import TEXT_WALL_PANEL_FIELDS_JS
-from pg_panel_lists    import TEXT_WALL_PANEL_LISTS_JS
-from pg_panel_scrubs   import TEXT_WALL_PANEL_SCRUBS_JS
-from pg_panel_bindings import TEXT_WALL_PANEL_BINDINGS_JS
-from pg_dispatch       import DISPATCH_JS
+from  .pg_base           import TEXT_WALL_CSS, TEXT_WALL_PANEL_BODY
+from  .pg_core           import CORE_JS
+from  .pg_view_canvas    import CANVAS_VIEW_JS
+from  .pg_view_segments  import SEGMENTS_VIEW_JS
+from  .pg_scene          import SCENE_JS
+from  .pg_export         import EXPORT_JS
+from  .pg_kra            import KRA_JS
+from  .pg_panel_fields   import TEXT_WALL_PANEL_FIELDS_JS
+from  .pg_panel_lists    import TEXT_WALL_PANEL_LISTS_JS
+from  .pg_panel_scrubs   import TEXT_WALL_PANEL_SCRUBS_JS
+from  .pg_panel_bindings import TEXT_WALL_PANEL_BINDINGS_JS
+from  .pg_dispatch       import DISPATCH_JS
 
 from pgkit.html_shell  import page
 from pgkit.js_check    import JsSyntaxError

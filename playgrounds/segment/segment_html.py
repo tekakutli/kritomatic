@@ -15,35 +15,28 @@ This playground is segmentation-only.  Inpainting lives in
 `playgrounds/inpaint`; its `pg_inpaint.js` and `pg_view_inpaint.js`
 modules are not part of this manifest."""
 
-import os
 import sys
 
-_HERE   = os.path.dirname(os.path.abspath(__file__))
-_PARENT = os.path.dirname(_HERE)
-for _p in (_HERE, _PARENT):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from pg_base import PG_CSS, PG_PANEL_BODY
-from pg_tuning import TUNING_JS
-from pg_state import STATE_JS
-from pg_pixels import PIXELS_JS
-from pg_masks import MASKS_JS
-from pg_region import REGION_JS
-from pg_oplog import OPLOG_JS
-from pg_composite import COMPOSITE_JS
-from pg_view import VIEW_JS
-from pg_view_image import VIEW_IMAGE_JS
-from pg_view_points import VIEW_POINTS_JS
-from pg_view_region import VIEW_REGION_JS
-from pg_view_brush import VIEW_BRUSH_JS
-from pg_dispatch import DISPATCH_JS
-from pg_comfy_client import COMFY_CLIENT_JS
-from pg_krita_client import KRITA_CLIENT_JS
-from pg_panel_fields import PANEL_FIELDS_JS
-from pg_panel_lists import PANEL_LISTS_JS
-from pg_panel_scrubs import PANEL_SCRUBS_JS
-from pg_panel_bindings import PANEL_BINDINGS_JS
+from  .pg_base import PG_CSS, PG_PANEL_BODY
+from  .pg_tuning import TUNING_JS
+from  .pg_state import STATE_JS
+from  .pg_pixels import PIXELS_JS
+from  .pg_masks import MASKS_JS
+from  .pg_region import REGION_JS
+from  .pg_oplog import OPLOG_JS
+from  .pg_composite import COMPOSITE_JS
+from  .pg_view import VIEW_JS
+from  .pg_view_image import VIEW_IMAGE_JS
+from  .pg_view_points import VIEW_POINTS_JS
+from  .pg_view_region import VIEW_REGION_JS
+from  .pg_view_brush import VIEW_BRUSH_JS
+from  .pg_dispatch import DISPATCH_JS
+from  .pg_comfy_client import COMFY_CLIENT_JS
+from  .pg_krita_client import KRITA_CLIENT_JS
+from  .pg_panel_fields import PANEL_FIELDS_JS
+from  .pg_panel_lists import PANEL_LISTS_JS
+from  .pg_panel_scrubs import PANEL_SCRUBS_JS
+from  .pg_panel_bindings import PANEL_BINDINGS_JS
 
 from pgkit.html_shell import page
 from pgkit.js_check import JsSyntaxError

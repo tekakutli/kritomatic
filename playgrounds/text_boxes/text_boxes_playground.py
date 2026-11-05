@@ -14,13 +14,16 @@ import socket
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_PARENT = os.path.dirname(_HERE)
-for _p in (_HERE, _PARENT):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+_PLAYGROUNDS = os.path.dirname(_HERE)
 
-import text_boxes_html
-import text_boxes_server
+try:
+    sys.path.remove(_HERE)
+except ValueError:
+    pass
+if _PLAYGROUNDS not in sys.path:
+    sys.path.insert(0, _PLAYGROUNDS)
+
+from text_boxes import text_boxes_html, text_boxes_server
 
 from pgkit.server import serve as kit_serve
 

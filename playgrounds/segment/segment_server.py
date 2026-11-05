@@ -31,7 +31,7 @@ from pg_comfy import (
 )
 from pg_comfy.image import make_encoded_image
 
-import krita_client
+from . import krita_client
 
 
 COMFY_HOST = "127.0.0.1"

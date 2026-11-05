@@ -17,7 +17,7 @@ import datetime
 import os
 import socket
 
-import text_boxes_krita
+from . import text_boxes_krita
 
 
 def _log(msg):

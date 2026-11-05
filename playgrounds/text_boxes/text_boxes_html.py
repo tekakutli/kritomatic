@@ -56,25 +56,18 @@ mode would be a Python traceback rather than a clear "JS syntax
 error in tbox_core.py, line N".
 """
 
-import os
 import sys
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_PARENT = os.path.dirname(_HERE)
-for _p in (_HERE, _PARENT):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from tbox_base       import TEXT_BOXES_CSS, TEXT_BOXES_PANEL_BODY
-from tbox_core       import CORE_JS
-from tbox_view       import VIEW_JS
-from tbox_krita      import KRITA_JS
-from tbox_panel_fields   import TEXT_BOXES_PANEL_FIELDS_JS
-from tbox_panel_lists    import TEXT_BOXES_PANEL_LISTS_JS
-from tbox_panel_scrubs   import TEXT_BOXES_PANEL_SCRUBS_JS
-from tbox_panel_bindings import TEXT_BOXES_PANEL_BINDINGS_JS
-from tbox_scene      import SCENE_JS
-from tbox_dispatch   import DISPATCH_JS
+from  .tbox_base       import TEXT_BOXES_CSS, TEXT_BOXES_PANEL_BODY
+from  .tbox_core       import CORE_JS
+from  .tbox_view       import VIEW_JS
+from  .tbox_krita      import KRITA_JS
+from  .tbox_panel_fields   import TEXT_BOXES_PANEL_FIELDS_JS
+from  .tbox_panel_lists    import TEXT_BOXES_PANEL_LISTS_JS
+from  .tbox_panel_scrubs   import TEXT_BOXES_PANEL_SCRUBS_JS
+from  .tbox_panel_bindings import TEXT_BOXES_PANEL_BINDINGS_JS
+from  .tbox_scene      import SCENE_JS
+from  .tbox_dispatch   import DISPATCH_JS
 
 from pgkit.html_shell  import page
 from pgkit.js_check    import JsSyntaxError

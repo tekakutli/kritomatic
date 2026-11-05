@@ -30,7 +30,7 @@ bytes.
 import datetime
 from urllib.parse import unquote
 
-import board_krita
+from . import board_krita
 
 
 def _log(msg):

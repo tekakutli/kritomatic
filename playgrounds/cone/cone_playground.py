@@ -13,19 +13,49 @@ drive the cone from another tab — same shape as board/pair/text_board.
 `cone_server.py` is deleted; its only remaining job — the
 `/generate-kra` route — is now a single dict entry passed to
 `kit_serve(routes=...)`.
+
+sys.path setup
+==============
+Two directories must be importable:
+
+  _PLAYGROUNDS         playgrounds/
+                       → `from cone import cone_html, cone_kra`
+                         resolves here.  This file is a script
+                         (`python cone_playground.py`), so its
+                         `__name__` is `__main__` and relative
+                         imports would fail; the launcher therefore
+                         uses an absolute package import.
+
+  _SHARED_CABLE_ROOM   playgrounds/shared_cable_room/
+                       → `cone/pg_state.py` does
+                         `from playground_fonts import …`, and
+                         `playground_fonts.py` lives here.  Importing
+                         `cone_html` transitively imports `pg_state`,
+                         which fails if this directory is not on
+                         sys.path.
+
+`_HERE` (this directory) is *removed* from sys.path so a stray
+`import pg_base` cannot resolve to a sibling under a top-level name
+— that would collide with every other playground's `pg_base` when
+the shared-process launcher is used.
 """
 
 import os
 import sys
 
-_HERE   = os.path.dirname(os.path.abspath(__file__))
-_PARENT = os.path.dirname(_HERE)
-for _p in (_HERE, _PARENT):
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PLAYGROUNDS = os.path.dirname(_HERE)
+_SHARED_CABLE_ROOM = os.path.join(_PLAYGROUNDS, "shared_cable_room")
+
+try:
+    sys.path.remove(_HERE)
+except ValueError:
+    pass
+for _p in (_PLAYGROUNDS, _SHARED_CABLE_ROOM):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import cone_html
-import cone_kra
+from cone import cone_html, cone_kra
 
 from pgkit.server import serve as kit_serve
 

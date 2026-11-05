@@ -20,13 +20,16 @@ import os
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_PARENT = os.path.dirname(_HERE)
-for _p in (_HERE, _PARENT):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+_PLAYGROUNDS = os.path.dirname(_HERE)
 
-import segment_html
-import segment_server
+try:
+    sys.path.remove(_HERE)
+except ValueError:
+    pass
+if _PLAYGROUNDS not in sys.path:
+    sys.path.insert(0, _PLAYGROUNDS)
+
+from segment import segment_html, segment_server
 
 from pgkit.server import serve as kit_serve
 

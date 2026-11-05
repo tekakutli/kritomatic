@@ -12,31 +12,24 @@ The SAM-specific modules (`pg_region`, `pg_view_region`,
 not part of this manifest.  The inpaint-specific modules
 (`pg_inpaint`, `pg_view_inpaint`) are."""
 
-import os
 import sys
 
-_HERE   = os.path.dirname(os.path.abspath(__file__))
-_PARENT = os.path.dirname(_HERE)
-for _p in (_HERE, _PARENT):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from pg_base import PG_CSS, PG_PANEL_BODY
-from pg_tuning import TUNING_JS
-from pg_state import STATE_JS
-from pg_pixels import PIXELS_JS
-from pg_masks import MASKS_JS
-from pg_inpaint import INPAINT_JS
-from pg_view import VIEW_JS
-from pg_view_image import VIEW_IMAGE_JS
-from pg_view_inpaint import VIEW_INPAINT_JS
-from pg_dispatch import DISPATCH_JS
-from pg_comfy_client import COMFY_CLIENT_JS
-from pg_krita_client import KRITA_CLIENT_JS
-from pg_panel_fields import PANEL_FIELDS_JS
-from pg_panel_lists import PANEL_LISTS_JS
-from pg_panel_scrubs import PANEL_SCRUBS_JS
-from pg_panel_bindings import PANEL_BINDINGS_JS
+from  .pg_base import PG_CSS, PG_PANEL_BODY
+from  .pg_tuning import TUNING_JS
+from  .pg_state import STATE_JS
+from  .pg_pixels import PIXELS_JS
+from  .pg_masks import MASKS_JS
+from  .pg_inpaint import INPAINT_JS
+from  .pg_view import VIEW_JS
+from  .pg_view_image import VIEW_IMAGE_JS
+from  .pg_view_inpaint import VIEW_INPAINT_JS
+from  .pg_dispatch import DISPATCH_JS
+from  .pg_comfy_client import COMFY_CLIENT_JS
+from  .pg_krita_client import KRITA_CLIENT_JS
+from  .pg_panel_fields import PANEL_FIELDS_JS
+from  .pg_panel_lists import PANEL_LISTS_JS
+from  .pg_panel_scrubs import PANEL_SCRUBS_JS
+from  .pg_panel_bindings import PANEL_BINDINGS_JS
 
 from pgkit.html_shell import page
 from pgkit.js_check import JsSyntaxError

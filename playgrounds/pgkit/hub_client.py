@@ -13,10 +13,27 @@
     #     (see hub.py, _kill_playground), and are filtered out of the
     #     playground dropdown in remote_panel/rp_client.py.
 
+    conn = ensure_running("board", 8770,
+                          html_file="board_playground.html",
+                          group="core")
+    # ... same as the first form, but the registration carries the
+    #     group name.  Groups are metadata, not routing: proxying,
+    #     /__playgrounds, and target selection all treat each
+    #     registration independently.  The hub consults `group` only
+    #     when reporting a cooperative kill, so its message names the
+    #     whole group instead of only the one playground that was
+    #     signalled.  See pgkit/hub.py's GROUPS section.
+
 `html_file` is the playground's own `kit_serve(html_file=...)` value.
 It travels to the hub in the `hello` frame and to panels in every
 `playgrounds` event, so remote_panel can build an Open URL without a
 hardcoded filename map.
+
+`group` is optional and defaults to None.  Standalone launchers pass
+nothing; the shared-process launcher (`pgkit/launcher.py`) passes the
+group name so every playground it starts joins the same group.  A
+`None` group behaves exactly as before this field was added — every
+existing standalone invocation is unchanged.
 
 Detached hub spawn
 ==================
@@ -58,6 +75,7 @@ HUB_PORT = 8780
 def ensure_running(playground_name, playground_port, *,
                    role="playground",
                    html_file=None,
+                   group=None,
                    hub_port=HUB_PORT, connect_timeout=10.0):
     """Return a live HubConnection registered with the hub.
 
@@ -73,13 +91,21 @@ def ensure_running(playground_name, playground_port, *,
     are still registered; consumers fall back to
     `<name>_playground.html`.
 
+    `group` is optional metadata.  A `None` group means "standalone";
+    the hub records it as null and the kill path's message names only
+    this playground.  A non-None group joins this registration to any
+    others with the same value; the hub's kill path then reports the
+    whole group shutting down.  Routes, target selection, and the
+    /__playgrounds shape are unchanged by this field.
+
     Blocks up to `connect_timeout` seconds for the initial registration
     handshake. If it times out, the returned connection keeps retrying
     in the background but `conn.registered` will be clear — callers
     can decide to fall back to a direct URL.
     """
     conn = HubConnection(playground_name, playground_port,
-                         hub_port, role=role, html_file=html_file)
+                         hub_port, role=role, html_file=html_file,
+                         group=group)
     conn.start(timeout=connect_timeout)
     return conn
 
@@ -90,12 +116,13 @@ def ensure_running(playground_name, playground_port, *,
 
 class HubConnection:
     def __init__(self, name, port, hub_port, role="playground",
-                 html_file=None):
+                 html_file=None, group=None):
         self.name = name
         self.port = port
         self.hub_port = hub_port
         self.role = role
         self.html_file = html_file
+        self.group = group
         self.hub_url = f"http://{HUB_HOST}:{hub_port}/{name}/"
         self.stop = threading.Event()
         self.registered = threading.Event()
@@ -253,6 +280,8 @@ class HubConnection:
             }
             if self.html_file:
                 hello["html_file"] = self.html_file
+            if self.group:
+                hello["group"] = self.group
             _ws.write_text_frame(sock, json.dumps(hello))
 
             sock.settimeout(None)

@@ -1,43 +1,26 @@
 """
 pgkit.server — HTTP file server, WebSocket endpoint, module serving.
 
-`serve(...)` serves the current working directory, accepts WebSocket
-upgrades on `/remote`, dispatches JSON POST routes and raw-body POST
-routes, and additionally serves `/modules/<name>` for every entry in
-`module_sources` (the project's `_MODULE_SOURCES` dict).
+`make_handler(routes, raw_routes, module_sources)` builds a fresh
+`SimpleHTTPRequestHandler` subclass — one per playground, each with
+its own `pgkit.remote_hub.Hub` instance.  `serve()` calls it and then
+blocks; `serve_nonblocking()` calls it and returns the pieces so a
+launcher can own threading and shutdown.
 
 Module serving
 ==============
-`GET /modules/pgkit/remote_client.js` looks up
-`module_sources["pgkit/remote_client.js"]` and serves the string with
-`Content-Type: application/javascript` and `Cache-Control: no-store`.
-The no-store matters during development: a stale cached module
-combined with a fresh boot module produces load-order mismatches
-that are hard to spot.
-
-A missing module is a 404 with a short text body naming the missing
-key and listing the keys that *are* present — the browser will show
-it in the network tab and the console, so a typo in an `import`
-path is visible without server access.
+`GET /modules/<name>` looks up `module_sources[name]` and serves it
+with `Cache-Control: no-store`.  A missing module is a 404 with a
+short text body listing the present keys.
 
 Hub registration
 ================
-When `hub_name` is provided, the playground also registers with the
-pgkit hub (`pgkit.hub`) under that name. The hub is spawned detached
-if it is not already running. The browser is pointed at the hub URL
-if registration succeeded, and at the local URL otherwise. The
-fallback is silent and correct: a standalone playground is a valid
-deployment shape.
-
-`hub_role` selects the role the hub sees for this client. Defaults
-to `"playground"`; the remote panel passes `"panel"` so the hub
-treats it as unkillable and the panel's own UI filters it out of the
-target dropdown. See pgkit/hub_client.py's docstring.
-
-`html_file` (already a `serve()` parameter) is forwarded to the hub
-as part of the registration, so panels and the CLI can construct an
-Open URL from the registration entry alone. See
-pgkit/hub_client.py's docstring.
+Both serve paths register with the pgkit hub if `hub_name` is given.
+`serve_nonblocking` additionally accepts `group` (metadata; see
+`pgkit/hub.py`'s GROUPS section) and `html_render` (a zero-argument
+callable producing the HTML page, which `serve_nonblocking` writes
+to disk before serving).  Standalone `serve()` keeps its old
+behavior: it serves an HTML file the caller has already written.
 """
 
 import json
@@ -52,21 +35,15 @@ from . import ws as _ws
 from .remote_hub import Client, Hub, handle_message
 
 
-def serve(*, port=8766, open_browser=True,
-          html_file="playground.html",
-          routes=None, raw_routes=None,
-          module_sources=None, hub=None,
-          hub_name=None, hub_role="playground"):
-    """Start the HTTP + WebSocket server and block until Ctrl+C.
+def make_handler(routes=None, raw_routes=None, module_sources=None, hub=None):
+    """Create a fresh handler class for one playground.
 
-    When `hub_name` is provided, the playground also registers with
-    the pgkit hub (`pgkit.hub`) as this name and role. The hub is
-    spawned detached if absent. The browser opens the hub URL if
-    registration succeeded; otherwise it opens the local URL and the
-    playground runs standalone.
+    Each call produces a fresh closure and a fresh Hub (unless one is
+    supplied) so two playgrounds in the same process never share
+    routes, module tables, or WS peers.
     """
-    routes         = routes or {}
-    raw_routes     = raw_routes or {}
+    routes = routes or {}
+    raw_routes = raw_routes or {}
     module_sources = module_sources or {}
     if hub is None:
         hub = Hub()
@@ -111,10 +88,7 @@ def serve(*, port=8766, open_browser=True,
                 result = handler(payload)
             except Exception as e:
                 traceback.print_exc()
-                result = {
-                    "success": False,
-                    "message": "Server error: %s" % e,
-                }
+                result = {"success": False, "message": "Server error: %s" % e}
             self._send_json(200, result)
 
         def _handle_raw_post(self, handler):
@@ -131,10 +105,7 @@ def serve(*, port=8766, open_browser=True,
                 result = handler(dict(self.headers), body)
             except Exception as e:
                 traceback.print_exc()
-                result = {
-                    "success": False,
-                    "message": "Server error: %s" % e,
-                }
+                result = {"success": False, "message": "Server error: %s" % e}
             self._send_json(200, result)
 
         def _send_json(self, code, data):
@@ -149,10 +120,8 @@ def serve(*, port=8766, open_browser=True,
             source = module_sources.get(name)
             if source is None:
                 available = ", ".join(sorted(module_sources.keys())) or "(none)"
-                body = (
-                    f"Module not found: {name!r}\n"
-                    f"Available modules: {available}\n"
-                ).encode("utf-8")
+                body = (f"Module not found: {name!r}\n"
+                        f"Available modules: {available}\n").encode("utf-8")
                 self.send_response(404)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -162,7 +131,8 @@ def serve(*, port=8766, open_browser=True,
                 return
             body = source.encode("utf-8")
             self.send_response(200)
-            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Content-Type",
+                             "application/javascript; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -202,43 +172,92 @@ def serve(*, port=8766, open_browser=True,
                 except Exception:
                     pass
 
-    httpd = None
-    used_port = None
+    return Handler
+
+
+def _bind_server(port, handler_cls):
+    """Return (httpd, used_port) or (None, None)."""
     for p in range(port, port + 20):
         try:
-            httpd = ThreadingHTTPServer(("127.0.0.1", p), Handler)
-            used_port = p
-            break
+            return ThreadingHTTPServer(("127.0.0.1", p), handler_cls), p
         except OSError:
             continue
+    return None, None
+
+
+def _register_hub(hub_name, hub_role, used_port, html_file, group=None):
+    if not hub_name:
+        return None, False
+    try:
+        from .hub_client import ensure_running
+        conn = ensure_running(
+            hub_name, used_port,
+            role=hub_role,
+            html_file=html_file,
+            group=group,
+        )
+        return conn, conn.registered.is_set()
+    except Exception as e:
+        print(f"  hub registration failed: {e}", file=sys.stderr)
+        return None, False
+
+
+def _public_url(hub_conn, registered, used_port, html_file):
+    if registered:
+        return hub_conn.hub_url + html_file
+    return "http://127.0.0.1:%d/%s" % (used_port, html_file)
+
+
+def serve_nonblocking(*, port, html_file, html_render,
+                      routes=None, raw_routes=None, module_sources=None,
+                      hub_name=None, hub_role="playground", group=None,
+                      open_browser=False):
+    """Start a playground's HTTP+WS server without blocking.
+
+    Returns `(httpd, hub_conn, url)`.  The caller owns
+    `httpd.serve_forever()` (in a thread) and `httpd.shutdown()` on
+    teardown.  `hub_conn.stop_now()` closes the hub WS cleanly.
+    """
+    html = html_render()
+    with open(html_file, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    handler_cls = make_handler(routes, raw_routes, module_sources)
+    httpd, used_port = _bind_server(port, handler_cls)
+    if httpd is None:
+        raise RuntimeError(
+            "Could not find a free port in [%d, %d)." % (port, port + 20))
+
+    hub_conn, registered = _register_hub(
+        hub_name, hub_role, used_port, html_file, group=group)
+    url = _public_url(hub_conn, registered, used_port, html_file)
+
+    if open_browser:
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+
+    return httpd, hub_conn, url
+
+
+def serve(*, port=8766, open_browser=True,
+          html_file="playground.html",
+          routes=None, raw_routes=None,
+          module_sources=None, hub=None,
+          hub_name=None, hub_role="playground"):
+    """Standalone entry point.  Signature and behavior unchanged."""
+    handler_cls = make_handler(routes, raw_routes, module_sources, hub)
+    httpd, used_port = _bind_server(port, handler_cls)
     if httpd is None:
         print("Could not find a free port in [%d, %d)." % (port, port + 20))
         return
 
-    # Hub registration is best-effort: if it fails, the playground
-    # keeps running standalone at its local URL.
-    hub_conn = None
-    registered = False
-    if hub_name:
-        try:
-            from .hub_client import ensure_running
-            hub_conn = ensure_running(
-                hub_name, used_port,
-                role=hub_role,
-                html_file=html_file,
-            )
-            registered = hub_conn.registered.is_set()
-        except Exception as e:
-            print(f"  hub registration failed: {e}", file=sys.stderr)
-
-    if registered:
-        url = hub_conn.hub_url + html_file
-    else:
-        url = "http://127.0.0.1:%d/%s" % (used_port, html_file)
+    hub_conn, registered = _register_hub(
+        hub_name, hub_role, used_port, html_file)
+    url = _public_url(hub_conn, registered, used_port, html_file)
 
     print("Serving %s" % os.getcwd())
     print("  -> open  %s" % url)
-    print("  -> modules at /modules/ (%d file(s))" % len(module_sources))
+    print("  -> modules at /modules/ (%d file(s))"
+          % len(module_sources or {}))
     print("  -> remote ws at ws://127.0.0.1:%d/remote" % used_port)
     if registered:
         print("  -> registered as %r (role=%s) with pgkit hub (port %d)"

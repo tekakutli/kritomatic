@@ -60,36 +60,29 @@ DELETED
     cone_server.py        (replaced by kit_serve)
 """
 
-import os
 import sys
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_PARENT = os.path.dirname(_HERE)
-for _p in (_HERE, _PARENT):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+from .pg_base import CONE_CSS, CONE_PANEL_BODY
 
-from pg_base import CONE_CSS, CONE_PANEL_BODY
-
-from pg_state              import STATE_JS
-from pg_flat_math          import FLAT_MATH_JS
-from pg_view_squares_core  import SQUARES_CORE_JS
-from pg_view_squares_warp  import SQUARES_WARP_JS
-from pg_view_squares_proj  import SQUARES_PROJ_JS
-from pg_view_squares_edit  import SQUARES_EDIT_JS
-from pg_view_squares_flat  import SQUARES_FLAT_JS
-from pg_view_cone          import CONE_VIEW_JS
-from pg_view_flat          import FLAT_VIEW_JS
-from pg_dispatch           import DISPATCH_JS
-from pg_core               import CORE_JS
-from pg_panel_fields       import PANEL_FIELDS_JS
-from pg_panel_lists        import PANEL_LISTS_JS
-from pg_panel_help         import PANEL_HELP_JS
-from pg_panel_scrubs       import PANEL_SCRUBS_JS
-from pg_panel_bindings     import PANEL_BINDINGS_JS
-from pg_scene              import SCENE_JS
-from pg_export             import EXPORT_JS
-from pg_kra                import KRA_JS
+from .pg_state              import STATE_JS
+from .pg_flat_math          import FLAT_MATH_JS
+from .pg_view_squares_core  import SQUARES_CORE_JS
+from .pg_view_squares_warp  import SQUARES_WARP_JS
+from .pg_view_squares_proj  import SQUARES_PROJ_JS
+from .pg_view_squares_edit  import SQUARES_EDIT_JS
+from .pg_view_squares_flat  import SQUARES_FLAT_JS
+from .pg_view_cone          import CONE_VIEW_JS
+from .pg_view_flat          import FLAT_VIEW_JS
+from .pg_dispatch           import DISPATCH_JS
+from .pg_core               import CORE_JS
+from .pg_panel_fields       import PANEL_FIELDS_JS
+from .pg_panel_lists        import PANEL_LISTS_JS
+from .pg_panel_help         import PANEL_HELP_JS
+from .pg_panel_scrubs       import PANEL_SCRUBS_JS
+from .pg_panel_bindings     import PANEL_BINDINGS_JS
+from .pg_scene              import SCENE_JS
+from .pg_export             import EXPORT_JS
+from .pg_kra                import KRA_JS
 
 from pgkit.html_shell  import page
 from pgkit.js_check    import JsSyntaxError

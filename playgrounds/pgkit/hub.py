@@ -32,6 +32,21 @@ fire after the new connection has registered, without wiping it out.
 The hard-kill escalation path calls `deregister(name)` without a
 socket to force removal; that use case is authoritative, not a race.
 
+GROUPS
+======
+A registration may carry an optional `group` string (set by
+`pgkit.hub_client.ensure_running(group=...)`).  Groups are metadata,
+not routing: proxying, `/__playgrounds`, and target selection all
+treat each registration independently.  The group is consulted only
+by `_kill_playground`, which enriches the kill_result message to
+name the group and its member count.  Killing any member of a group
+that shares a Python process shuts down the process, and every
+registration it owned dies with it; the message reflects that.
+
+A `None` group (the default, and what every standalone launch uses)
+behaves exactly as before this field was added — the kill message
+names only the playground that was signalled.
+
 PANELS
 ======
 Two kinds of clients connect with `role="panel"`:
@@ -131,15 +146,22 @@ class Registration:
     talks back to it. `html_file` is the client's own
     `kit_serve(html_file=...)` value, forwarded so panels and the CLI
     can construct an Open URL without a hardcoded filename map.
+
+    `group` is optional metadata (see the module docstring's GROUPS
+    section).  Its only consumer is `_kill_playground`, which
+    enriches the kill_result message when the group has more than
+    one member.
     """
 
-    def __init__(self, name, port, role, pid, sock, html_file=None):
+    def __init__(self, name, port, role, pid, sock, html_file=None,
+                 group=None):
         self.name = name
         self.port = port
         self.role = role
         self.pid = pid
         self.sock = sock
         self.html_file = html_file
+        self.group = group
         self.connected_at = time.time()
         self.send_lock = threading.Lock()
 
@@ -155,6 +177,7 @@ class Registration:
             "role":         self.role,
             "pid":          self.pid,
             "html_file":    self.html_file,
+            "group":        self.group,
             "connected_at": self.connected_at,
         }
 
@@ -415,12 +438,13 @@ class Handler(BaseHTTPRequestHandler):
             port = int(hello.get("port") or 0)
             pid  = int(hello.get("pid") or 0)
             html_file = hello.get("html_file") or None
+            group     = hello.get("group") or None
 
             if role == "playground":
                 if not name or not port:
                     return
                 reg = Registration(name, port, role, pid, sock,
-                                   html_file=html_file)
+                                   html_file=html_file, group=group)
                 _HUB.register(reg)
                 registered_name = name
                 try:
@@ -440,7 +464,7 @@ class Handler(BaseHTTPRequestHandler):
                 # anonymous WS to receive those).
                 if name and port:
                     reg = Registration(name, port, role, pid, sock,
-                                       html_file=html_file)
+                                       html_file=html_file, group=group)
                     _HUB.register(reg)
                     registered_name = name
                     try:
@@ -709,6 +733,32 @@ def _kill_playground(name, hard):
                 "message": f"{name} is a panel; "
                            f"kill the PID from the shell if it hangs"}
 
+    # Group bookkeeping.  A None group is the default and behaves
+    # exactly as before this field existed: only the one playground
+    # that was signalled is named in the reply.  A non-None group
+    # means other registrations share it (the shared-process
+    # launcher case); the reply names the group and its member count
+    # so a user who killed "board" is not surprised when the other
+    # five playgrounds disappear too.  See the module docstring's
+    # GROUPS section.
+    group = reg.group
+    group_count = 0
+    group_msg = ""
+    if group is not None:
+        with _HUB.lock:
+            group_count = sum(
+                1 for r in _HUB.registrations.values()
+                if r.group == group
+            )
+        group_msg = f" (group '{group}', {group_count} playgrounds)"
+
+    def _ok(verb):
+        if group is not None:
+            return {"success": True,
+                    "message": f"{verb} group '{group}' "
+                               f"({group_count} playgrounds)"}
+        return {"success": True, "message": f"{name} {verb}"}
+
     try:
         reg.send({"type": "shutdown", "request_id": uuid.uuid4().hex})
     except OSError as e:
@@ -717,8 +767,7 @@ def _kill_playground(name, hard):
                 os.kill(reg.pid, signal.SIGTERM)
                 time.sleep(0.5)
                 _HUB.deregister(name)
-                return {"success": True,
-                        "message": f"{name} force-killed"}
+                return _ok("force-killed")
             except OSError as e2:
                 return {"success": False,
                         "message": f"send failed: {e}; hard failed: {e2}"}
@@ -727,7 +776,7 @@ def _kill_playground(name, hard):
     deadline = time.time() + 5.0
     while time.time() < deadline:
         if not _HUB.has(name):
-            return {"success": True, "message": f"{name} shut down"}
+            return _ok("shut down")
         time.sleep(0.1)
 
     if hard and reg.pid and _verify_pid(reg.pid, name):
@@ -736,12 +785,12 @@ def _kill_playground(name, hard):
             time.sleep(0.5)
             if _HUB.has(name):
                 _HUB.deregister(name)
-            return {"success": True, "message": f"{name} force-killed"}
+            return _ok("force-killed")
         except OSError as e:
             return {"success": False, "message": f"hard kill failed: {e}"}
 
     return {"success": False,
-            "message": f"{name} did not shut down within 5s "
+            "message": f"{name}{group_msg} did not shut down within 5s "
                        f"(use hard=1 to escalate)"}
 
 

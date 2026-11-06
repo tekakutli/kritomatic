@@ -1,0 +1,51 @@
+# =============================================================================
+# bindings.yaml — owned by YOU. Not merged with anything shipped.
+# =============================================================================
+# Copy this to ~/.config/kritomatic/bindings.yaml and edit. Every
+# installation is expected to have its own copy; nothing in the repo
+# overwrites it.
+#
+# Reference capabilities by name. Names come from capabilities.yaml
+# (shipped) plus your own user_capabilities: block below. To see what's
+# available: run `kritomatic-xremap validate` — it lists them on error.
+# =============================================================================
+
+# --- Devices ---------------------------------------------------------------
+devices:
+  # Every device xremap should listen to. These become `--device X` flags.
+  listen:
+    - kanata macropad
+    - kanata standard
+
+  # Which device blocks inherit if they omit their own `devices:` list.
+  default: kanata macropad
+
+
+# --- kritomatic CLI (optional) --------------------------------------------
+# Set this if `kritomatic` is not on PATH and auto-discovery from the
+# repo fails. Rarely needed; leave commented if you're not sure.
+#
+# kritomatic:
+#   cli: ["/usr/bin/env", "PYTHONPATH=/path/to/src", "python", "/path/to/src/kritomatic/main.py"]
+
+
+# --- Capabilities you define yourself -------------------------------------
+# Anything not in capabilities.yaml goes here. Same shape as capabilities.
+user_capabilities: {}
+
+# Example:
+#   user_capabilities:
+#     kitty_chat2api:
+#       command: ["kitty", "Chat2API"]
+#     my_script:
+#       command: ["/home/me/bin/my_script.sh"]
+
+
+# --- Your keymap ----------------------------------------------------------
+keymap: []
+# Example:
+#   keymap:
+#     - name: Global
+#       remap:
+#         n: clipboard2krita
+#         m: clipboard2caption

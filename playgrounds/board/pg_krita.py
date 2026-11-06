@@ -5,7 +5,8 @@ ES module.  Exports:
 
     reportError                POST /log, plus console.error
     refreshFromKrita           POST /krita/refresh, merge, redraw
-    retrieveOpenFromKrita      add every open Krita doc to the board
+    retrieveOpenFromKrita      add every open Krita doc to the board,
+                               then refresh so the new cards have state
     mergeIncoming              merge a refresh response into board.files
     openFileInKrita            POST /krita/open
     openAllMissing             open every closed file, sequentially
@@ -185,6 +186,15 @@ export async function retrieveOpenFromKrita() {
     statusEl.className = added > 0 ? "ok" : "";
     setTimeout(updateStatus, 1600);
   }
+
+  // The refresh above only returns results for the paths we sent,
+  // and every path added by this function was added *after* that
+  // request.  Newly added cards therefore have no state yet — no
+  // open/closed flag, no doc dimensions, no thumbnail.  A second
+  // refresh now that they are on the board fetches all of that, so
+  // the user does not have to press "Refresh from Krita" by hand
+  // after every "Retrieve open".
+  await refreshFromKrita();
 }
 
 export function mergeIncoming(payload) {

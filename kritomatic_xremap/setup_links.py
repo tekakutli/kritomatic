@@ -2,94 +2,56 @@
 """Setup/refresh script for the kritomatic xremap systemd service.
 
 Safe to run any number of times:
-  - REPODIR is updated to the current repo location.
-  - Any missing env keys are appended with safe defaults (empty).
-  - Existing user-set values are never modified, except with --reconfigure.
-  - systemd units are re-installed only if their contents (or repo path) changed.
+  - Seeds ~/.config/kritomatic/bindings.yaml from bindings.example.yaml
+    on first run. Never overwrites an existing bindings file.
+  - Reports retired Phase-0 files (the old env file and personal config)
+    as safely deletable; does not remove them automatically.
+  - Makes the launcher executable if it isn't.
+  - Validates the current bindings by delegating to
+    `kritomatic-xremap.py validate`; refuses to touch the service if
+    validation fails.
+  - Re-injects REPODIR into the installed systemd units and re-installs
+    them only if their contents or the repo path changed.
+  - Refreshes the running service and polls (up to 15s) for it to come up.
 """
 
 import argparse
 import hashlib
 import os
-import re
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+import yaml
+
 HOME = Path.home()
 REPO_DIR = Path(__file__).resolve().parent
-SYSTEMD_USER_DIR = HOME / ".config/systemd/user"
-ENV_DIR = HOME / ".config/xremap"
-ENV_FILE = ENV_DIR / "xremap_kritomatic.env"
-SERVICE_FILE = SYSTEMD_USER_DIR / "xremap-kritomatic.service"
-PATH_UNIT_FILE = SYSTEMD_USER_DIR / "xremap-kritomatic.path"
+
+# Systemd user unit directory
+SYSTEMD_USER_DIR  = HOME / ".config/systemd/user"
+SERVICE_FILE      = SYSTEMD_USER_DIR / "xremap-kritomatic.service"
+PATH_UNIT_FILE    = SYSTEMD_USER_DIR / "xremap-kritomatic.path"
 RESTART_UNIT_FILE = SYSTEMD_USER_DIR / "xremap-kritomatic-restart.service"
 
-PERSONAL_CONFIG_DEFAULT = str(HOME / "xremap_config.yaml")
+# User-facing files (Phase 1 surface)
+BINDINGS_DIR     = HOME / ".config" / "kritomatic"
+BINDINGS_FILE    = BINDINGS_DIR / "bindings.yaml"
+BINDINGS_EXAMPLE = REPO_DIR / "bindings.example.yaml"
 
-TEMPLATE = f"""# ==============================================================================
-# KRITOMATIC ENVIRONMENT CONFIGURATION
-# ==============================================================================
-# Re-run ./setup_links.py --reconfigure to change devices interactively.
+# Launcher script (referenced by the installed .service)
+LAUNCHER = REPO_DIR / "kritomatic-xremap.py"
 
-# 1. REPOSITORY PATH
-REPODIR="{REPO_DIR}"
-
-# 2. PERSONAL CONFIGURATION
-PERSONAL_CONFIG="{PERSONAL_CONFIG_DEFAULT}"
-
-# 3. TARGET DEVICE (default keyboard for kritomatic shortcuts)
-# xremap does EXACT string matching. Run `./setup_links.py --list-devices`
-# to see valid names. Suggested: TARGET_DEVICE="kanata ministeren"
-TARGET_DEVICE=""
-
-# 4. ADDITIONAL DEVICES (extra keyboards xremap should ALSO listen to)
-# Comma-separated. Leave empty to listen only on TARGET_DEVICE.
-# Suggested: PERSONAL_DEVICES="kanata standard"
-PERSONAL_DEVICES=""
-"""
-
-# (key, description) pairs. Missing keys are appended automatically.
-REQUIRED_KEYS = [
-    ("REPODIR",          "Repository path"),
-    ("PERSONAL_CONFIG",  "Path to personal xremap config"),
-    ("TARGET_DEVICE",    "Default keyboard for kritomatic shortcuts"),
-    ("PERSONAL_DEVICES", "Additional keyboards xremap should listen to"),
-]
+# Retired Phase-0 files: reported as deletable, never removed here
+LEGACY_ENV_FILE        = HOME / ".config" / "xremap" / "xremap_kritomatic.env"
+LEGACY_PERSONAL_CONFIG = HOME / "xremap_config.yaml"
 
 
 # ----------------------------------------------------------------- helpers
 
-def env_get(text: str, key: str) -> str:
-    m = re.search(rf'^{re.escape(key)}="(.*)"', text, re.MULTILINE)
-    return m.group(1) if m else ""
-
-
-def env_set_line(text: str, key: str, value: str) -> tuple[str, bool]:
-    """Set KEY="value" in text. Returns (new_text, changed)."""
-    pattern = re.compile(rf'^{re.escape(key)}=.*$', re.MULTILINE)
-    new_line = f'{key}="{value}"'
-    if pattern.search(text):
-        new_text = pattern.sub(new_line, text, count=1)
-        return new_text, new_text != text
-    sep = "" if text.endswith("\n") or not text else "\n"
-    return text + sep + new_line + "\n", True
-
-
-def ensure_keys(text: str) -> tuple[str, list[str]]:
-    """Append any missing REQUIRED_KEYS as KEY=\"\" with a comment."""
-    added = []
-    for key, desc in REQUIRED_KEYS:
-        if not re.search(rf'^{re.escape(key)}=', text, re.MULTILINE):
-            sep = "" if text.endswith("\n") or not text else "\n"
-            text += f'{sep}\n# {desc}\n{key}=""\n'
-            added.append(key)
-    return text, added
-
-
 def list_devices() -> list[str]:
+    """Return device names reported by `xremap --list-devices`."""
     try:
         out = subprocess.check_output(
             ["xremap", "--list-devices"], text=True, stderr=subprocess.DEVNULL
@@ -103,64 +65,34 @@ def list_devices() -> list[str]:
     return sorted(set(names))
 
 
-def prompt_devices(text: str) -> tuple[str, str]:
-    devices = list_devices()
-    print()
-    if devices:
-        print("Available input devices:")
-        for d in devices:
-            print(f"  {d}")
-    else:
-        print("(xremap --list-devices unavailable)")
-
-    cur_target = env_get(text, "TARGET_DEVICE")
-    cur_personal = env_get(text, "PERSONAL_DEVICES")
-
-    print()
-    print('Enter to keep current, "-" to clear, or type a new value.')
-    print('Leave PERSONAL_DEVICES empty to listen on only one device.')
-    print()
-
-    t = input(f'TARGET_DEVICE [{cur_target or "(empty)"}]: ').strip()
-    if t == "-":
-        cur_target = ""
-    elif t:
-        cur_target = t
-
-    p = input(f'PERSONAL_DEVICES [{cur_personal or "(empty)"}]: ').strip()
-    if p == "-":
-        cur_personal = ""
-    elif p:
-        cur_personal = p
-
-    return cur_target, cur_personal
+def seed_bindings() -> bool:
+    """Copy bindings.example.yaml -> ~/.config/kritomatic/bindings.yaml
+    if the destination does not exist. Returns True if newly created."""
+    if BINDINGS_FILE.exists():
+        return False
+    BINDINGS_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copy(BINDINGS_EXAMPLE, BINDINGS_FILE)
+    return True
 
 
-def warn_unreachable_bindings(personal_config: Path, listen: set[str]) -> None:
-    """Warn if personal YAML has device: {only: X} where X isn't listened to."""
-    if not personal_config.exists():
-        return
+def bindings_have_devices() -> bool:
+    """True if bindings.yaml parses and devices.listen is non-empty."""
     try:
-        import yaml
-    except ImportError:
-        return
-    try:
-        data = yaml.safe_load(personal_config.read_text())
+        data = yaml.safe_load(BINDINGS_FILE.read_text())
     except Exception:
-        return
-    if not data or "keymap" not in data:
-        return
+        return False
+    listen = ((data or {}).get("devices") or {}).get("listen") or []
+    return bool(listen)
 
-    for entry in data["keymap"]:
-        dev = entry.get("device", {})
-        if "only" not in dev:
-            continue
-        only = dev["only"] if isinstance(dev["only"], list) else [dev["only"]]
-        missing = [d for d in only if d not in listen]
-        if missing:
-            name = entry.get("name", "<unnamed binding>")
-            print(f'⚠️  Binding "{name}" requires device(s) {missing} '
-                  f'that xremap will not listen to. It will never fire.')
+
+def warn_legacy_files() -> None:
+    """Note the retired Phase-0 files as safely deletable if present."""
+    for path, role in (
+        (LEGACY_ENV_FILE,        "old env file"),
+        (LEGACY_PERSONAL_CONFIG, "old personal config"),
+    ):
+        if path.exists():
+            print(f"ℹ️  {path} ({role}) is no longer used. You can delete it.")
 
 
 def compute_state_hash() -> str:
@@ -204,18 +136,40 @@ def is_running() -> bool:
     return r.returncode == 0
 
 
+def validate_bindings() -> int:
+    """Run `kritomatic-xremap.py validate` and stream its output.
+
+    Returns the launcher's exit code (0 = OK, non-zero = problems).
+    If the launcher itself cannot be launched (missing interpreter,
+    timeout), prints a warning and returns 0 so the caller proceeds;
+    the ultimate is-running check will catch a real failure.
+    """
+    if not LAUNCHER.is_file():
+        print(f"⚠️  Launcher not found at {LAUNCHER}; skipping validation.")
+        return 0
+    try:
+        r = subprocess.run(
+            [sys.executable, str(LAUNCHER), "validate"],
+            check=False, capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"⚠️  Could not run validation ({e}); continuing without it.")
+        return 0
+    if r.stdout:
+        print(r.stdout, end="")
+    if r.stderr:
+        print(r.stderr, end="", file=sys.stderr)
+    return r.returncode
+
+
 # ----------------------------------------------------------------- main
 
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Install / refresh the kritomatic xremap systemd service.",
     )
-    ap.add_argument("--reconfigure", action="store_true",
-                    help="Interactively re-prompt TARGET_DEVICE and PERSONAL_DEVICES")
     ap.add_argument("--list-devices", action="store_true",
                     help="Print available input devices and exit")
-    ap.add_argument("--non-interactive", action="store_true",
-                    help="Do not prompt even with --reconfigure")
     args = ap.parse_args()
 
     if args.list_devices:
@@ -227,55 +181,38 @@ def main() -> int:
             print(d)
         return 0
 
-    print("🛠️  Kritomatic Xremap: Initializing Decoupled Setup...")
+    print("🛠️  Kritomatic Xremap: Setup")
 
-    # 1. env file: create or read
-    ENV_DIR.mkdir(parents=True, exist_ok=True)
-    first_install = not ENV_FILE.exists()
-    if first_install:
-        print(f"📄 Creating new .env file at {ENV_FILE}")
-        env_text = TEMPLATE
-    else:
-        env_text = ENV_FILE.read_text()
+    # 1. Seed bindings.yaml if missing.
+    if seed_bindings():
+        print(f"📄 Created {BINDINGS_FILE}")
+        print( "   Edit it to add your devices and bindings, then re-run this script.")
+        return 0
 
-    # 2. ensure all required keys exist
-    env_text, added = ensure_keys(env_text)
-    if added:
-        print(f"➕ Added missing keys: {', '.join(added)}")
+    # 2. Refuse to proceed without at least one listened device.
+    if not bindings_have_devices():
+        print(f"⚠️  {BINDINGS_FILE} has no devices.listen entries.")
+        print( "   Edit it and re-run this script.")
+        return 1
 
-    # 3. update REPODIR
-    env_text, repodir_changed = env_set_line(env_text, "REPODIR", str(REPO_DIR))
-    if repodir_changed:
-        print(f"🔄 REPODIR updated to {REPO_DIR}")
+    # 3. Notice retired files so the user can clean them up.
+    warn_legacy_files()
 
-    # 4. reconfigure prompt (only with --reconfigure)
-    if args.reconfigure and not args.non_interactive:
-        new_target, new_personal = prompt_devices(env_text)
-        env_text, t_changed = env_set_line(env_text, "TARGET_DEVICE", new_target)
-        env_text, p_changed = env_set_line(env_text, "PERSONAL_DEVICES", new_personal)
-        if t_changed:
-            print(f'✏️  TARGET_DEVICE = "{new_target}"')
-        if p_changed:
-            print(f'✏️  PERSONAL_DEVICES = "{new_personal}"')
+    # 4. Ensure the launcher is executable (convenience: user may run it
+    #    directly; the service always invokes it via `python <path>`, so
+    #    this is not strictly required for the service to work).
+    if LAUNCHER.is_file() and not os.access(LAUNCHER, os.X_OK):
+        os.chmod(LAUNCHER, 0o755)
+        print(f"🔧 chmod +x {LAUNCHER.name}")
 
-    # 5. write env back if changed
-    old_text = ENV_FILE.read_text() if ENV_FILE.exists() else ""
-    if env_text != old_text:
-        ENV_FILE.write_text(env_text)
+    # 5. Validate bindings. Delegated to the launcher so the semantics
+    #    live in exactly one place.
+    rc = validate_bindings()
+    if rc != 0:
+        print("⚠️  Validation failed; not touching the service.")
+        return rc
 
-    # 6. warn about device filters that can't fire
-    listen = {env_get(env_text, "TARGET_DEVICE")}
-    extra = env_get(env_text, "PERSONAL_DEVICES")
-    if extra:
-        listen.update(d.strip() for d in extra.split(",") if d.strip())
-    listen.discard("")
-    if not listen:
-        print("⚠️  TARGET_DEVICE and PERSONAL_DEVICES are both empty. "
-              "xremap will listen on ALL devices.")
-    personal_cfg = Path(env_get(env_text, "PERSONAL_CONFIG") or PERSONAL_CONFIG_DEFAULT)
-    warn_unreachable_bindings(personal_cfg, listen)
-
-    # 7. systemd units (hash-based)
+    # 6. Systemd units — hash-based reinstall.
     current_hash = compute_state_hash()
     installed_hash = read_installed_hash()
     if current_hash != installed_hash:
@@ -303,16 +240,22 @@ def main() -> int:
     else:
         print("⚡ Paths and unit files unchanged. Skipping re-injection.")
 
-    # 8. refresh
+    # 7. Refresh the running service.
     print("🔄 Refreshing merger...")
     refresh_services()
 
-    # 9. verify
-    time.sleep(0.3)
-    if is_running() or (time.sleep(0.3) or is_running()):
-        print("✅ Setup complete. Service is running.")
-        return 0
-    print("⚠️  Service not active. Check:")
+    # 8. Verify — poll, don't sleep-and-peek. The installed .service has
+    #    ExecStartPre=sleep 5 and the launcher itself may wait for devices,
+    #    so "active" can take several seconds after try-restart --no-block
+    #    returns. Poll up to 15s.
+    print("⏳ Verifying service state...")
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        if is_running():
+            print("✅ Setup complete. Service is running.")
+            return 0
+        time.sleep(0.5)
+    print("⚠️  Service not active after 15s. Check:")
     print("    systemctl --user status xremap-kritomatic.service")
     return 1
 

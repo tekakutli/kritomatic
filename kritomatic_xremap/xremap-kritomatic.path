@@ -1,9 +1,9 @@
 [Unit]
-Description=Watch Kritomatic Directory for Changes
+Description=Watch Kritomatic Config Files for Changes
 
 [Path]
-PathChanged=REPODIR_PLACEHOLDER/
-PathChanged=%h/xremap_config.yaml
+PathChanged=%h/.config/kritomatic/bindings.yaml
+PathChanged=REPODIR_PLACEHOLDER/capabilities.yaml
 Unit=xremap-kritomatic-restart.service
 
 [Install]

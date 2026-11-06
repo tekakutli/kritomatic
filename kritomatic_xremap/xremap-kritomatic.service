@@ -1,13 +1,11 @@
 [Unit]
-Description=Xremap Kritomatic Merger Service
-StartLimitIntervalSec=0
+Description=HuionPen Filter
 
 [Service]
-Type=simple
-ExecStartPre=/usr/bin/sleep 5
-ExecStart=/usr/bin/python REPODIR_PLACEHOLDER/merger.py
+ExecStart=/home/tekakutli/files/org/dotfiles/kanata/kanata-huionpen-filter/kanata-huion-filter-wrapper.sh
 Restart=always
-RestartSec=1
+RestartSec=2
+User=root
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

@@ -35,22 +35,22 @@ Board's action set:
     projectOverlaps     scope: selection  (level: files)
     newCrop             scope: global
     createCropFile      scope: global
+    gridToggle          scope: global     (per selected file)
+    gridAddV            scope: global     (per selected file)
+    gridAddH            scope: global     (per selected file)
+    createCellCrops     scope: global     (per selected file)
     openItem            scope: row        (level: files,
                                           appliesTo: !open && !missing)
     deleteItem          scope: row        (level: files)
 
 Board does not use the pair playground's `setAfterChange` hook.
 Each action calls `syncFileList()`, `draw()`, `pgkitNotifyAll()`
-in its own body, matching text_board's convention.  Cleaner for
-board's actions, none of which share a common mutation pattern.
+in its own body, matching text_board's convention.
 
 RETURN-YOUR-ASYNC-WORK
 ======================
-Six action wrappers in this file call an `async function` and
-discard its Promise unless they `return` it.  All are the same
-shape: the underlying helper does an `await fetch("/krita/...")`
-that is the whole point of the action, so without a `return` the
-`command_result` fires before the fetch is even sent:
+Action wrappers that call an `async function` `return` its Promise,
+so `command_result` fires after the underlying fetch settles:
 
     _addFilesAction        → pickFilesViaServer()
     _retrieveOpenAction    → retrieveOpenFromKrita()
@@ -58,26 +58,13 @@ that is the whole point of the action, so without a `return` the
     _loadBoardFromPayload  → loadBoardFromText(board_json)
     _projectOverlapsAction → projectSelectedOntoOverlaps()
     _createCropFileAction  → createCropFile()
+    _createCellCropsAction → createCellCrops()
 
-Each is now `return <helper>(...)`.  In the loadBoard and crop
-cases the helper also returns `true`/`false` (or resolves to it),
-so the boolean reaches `command_result.result` — the same
-reasoning as pair and cone.
-
-`_openItemByTarget` was already correct: both branches
-(`return activateFile(f)` and `return openFileInKrita(f).then(…)`)
-propagate the promise.  `_deleteItemByTarget` is fully
-synchronous.  The sync helpers (`_arrangeGridAction`, `_fitAction`,
-`_resetViewAction`, `_clearBoardAction`, `_saveSceneAction`,
-`_newCropAction`) do their work synchronously and correctly return
-`undefined`.
-
-WHY DYNAMIC IMPORTS ARE NOT NEEDED HERE
-=======================================
-Every handler calls `syncFileList`, `draw`, `pgkitNotifyAll`
-statically — no `import()` inside a handler.  There is no cycle
-from `pg_panel_bindings` back to `pg_dispatch`, so static imports
-of `draw` and `updateStatus` from `pg_dispatch` are safe.
+`_openItemByTarget` propagates its promise in both branches.
+`_deleteItemByTarget` is fully synchronous.  The sync helpers
+(arrange, fit, reset, clear, save, new-crop, grid-toggle,
+grid-add-v, grid-add-h) do their work synchronously and correctly
+return `undefined`.
 """
 
 PG_PANEL_BINDINGS_JS = r"""
@@ -100,18 +87,15 @@ import {
   createCropForSelectedFile, createCropFile, syncCropList,
 } from "./pg_crops.js";
 import {
+  toggleGridMode, addVLine, addHLine, createCellCrops, syncGridPanel,
+} from "./pg_grid.js";
+import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyAll, pgkitNotifyLocal,
 } from "./pgkit/remote_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
 
 // Wrappers below call an async helper and would otherwise discard
 // its Promise.  See the module docstring, RETURN-YOUR-ASYNC-WORK.
-// In each case the helper does an `await fetch(...)` that IS the
-// action — the fetch completes when the .kra has been opened / the
-// picker has been dispatched / the layout has been merged / the
-// transforms have been pasted / the crop file has been created — so
-// the wrapper must return the promise for `command_result` to fire
-// at the right moment.
 
 function _addFilesAction() {
   return pickFilesViaServer();
@@ -151,6 +135,7 @@ function _clearBoardAction() {
   board.selectedIdx = -1;
   syncFileList();
   syncCropList();
+  syncGridPanel();
   draw();
   flashStatus("board cleared", "ok");
   pgkitNotifyAll();
@@ -165,12 +150,6 @@ function _loadBoardFromPayload(payload) {
     promptLoadBoard();
     return;
   }
-  // loadBoardFromText is `async function` — it applies the layout,
-  // then awaits openAllMissing() so every closed file is opened in
-  // Krita before the refresh.  Return the promise so command_result
-  // fires when the whole load-and-open sequence has finished, and
-  // propagate the boolean so a CLI script can tell success from
-  // failure.
   return loadBoardFromText(payload.board_json);
 }
 
@@ -184,6 +163,22 @@ function _newCropAction() {
 
 function _createCropFileAction() {
   return createCropFile();
+}
+
+function _gridToggleAction() {
+  toggleGridMode();
+}
+
+function _gridAddVAction() {
+  addVLine();
+}
+
+function _gridAddHAction() {
+  addHLine();
+}
+
+function _createCellCropsAction() {
+  return createCellCrops();
 }
 
 function _openItemByTarget(payload) {
@@ -210,6 +205,7 @@ function _deleteItemByTarget(payload) {
   removeFile(idx);
   syncFileList();
   syncCropList();
+  syncGridPanel();
   draw();
   pgkitNotifyAll();
 }
@@ -277,6 +273,20 @@ export function installPanelBindings() {
       flashStatus("crop error: " + err.message, "bad");
     });
   });
+
+  const gridSplitBtn = document.getElementById("gridSplitBtn");
+  if (gridSplitBtn) gridSplitBtn.addEventListener("click", _gridToggleAction);
+  const gridAddVBtn = document.getElementById("gridAddVBtn");
+  if (gridAddVBtn) gridAddVBtn.addEventListener("click", _gridAddVAction);
+  const gridAddHBtn = document.getElementById("gridAddHBtn");
+  if (gridAddHBtn) gridAddHBtn.addEventListener("click", _gridAddHAction);
+  const gridCreateBtn = document.getElementById("gridCreateBtn");
+  if (gridCreateBtn) gridCreateBtn.addEventListener("click", () => {
+    _createCellCropsAction().catch((err) => {
+      console.error("[grid] create handler threw:", err);
+      flashStatus("grid crop error: " + err.message, "bad");
+    });
+  });
 }
 
 pgkitRegisterAction("action.refreshFromKrita", { label: "Refresh from Krita", scope: "global", run: refreshFromKrita, meta: { variant: "plain" } });
@@ -295,6 +305,10 @@ pgkitRegisterAction("action.loadBoard", {
 pgkitRegisterAction("action.projectOverlaps", { label: "Project overlaps", scope: "selection", level: "files", run: _projectOverlapsAction, meta: { variant: "primary" } });
 pgkitRegisterAction("action.newCrop", { label: "+ New crop", scope: "global", run: _newCropAction, meta: { variant: "plain" } });
 pgkitRegisterAction("action.createCropFile", { label: "Create crop file", scope: "global", run: _createCropFileAction, meta: { variant: "primary" } });
+pgkitRegisterAction("action.gridToggle", { label: "Grid split", scope: "global", run: _gridToggleAction, meta: { variant: "plain" } });
+pgkitRegisterAction("action.gridAddV", { label: "+ V line", scope: "global", run: _gridAddVAction, meta: { variant: "plain" } });
+pgkitRegisterAction("action.gridAddH", { label: "+ H line", scope: "global", run: _gridAddHAction, meta: { variant: "plain" } });
+pgkitRegisterAction("action.createCellCrops", { label: "Create cell crops", scope: "global", run: _createCellCropsAction, meta: { variant: "primary" } });
 pgkitRegisterAction("action.openItem", {
   label: "Open", scope: "row", level: "files",
   appliesTo: (item) => {
@@ -314,6 +328,7 @@ export function boardBootSync() {
   syncPanelSliders();
   syncFileList();
   syncCropList();
+  syncGridPanel();
   refreshFromKrita();
 }
 """

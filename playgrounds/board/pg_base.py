@@ -7,7 +7,9 @@ The shared shell (head, panel wrapper, status line, restore button,
 
     PG_CSS          board-specific CSS beyond pgkit's SHELL_CSS:
                     the file-row list, the coloured accent buttons,
-                    the drop overlay, the crop list and its groups.
+                    the drop overlay, the crop list and its groups,
+                    the grid cell list, and the small per-row
+                    focus (◎) buttons.
 
     PG_PANEL_BODY   the panel's field groups, lists, and buttons.
 
@@ -73,6 +75,34 @@ PG_CSS = r"""
     border-color: rgba(140, 225, 160, 1.00);
     background: rgba(140, 225, 160, 0.14);
     color: #e0ffe8;
+  }
+
+  #ui button#gridSplitBtn {
+    border-color: rgba(180, 155, 255, 0.72);
+    color: #cbbdf5;
+  }
+  #ui button#gridSplitBtn:hover {
+    border-color: rgba(180, 155, 255, 1.00);
+    background: rgba(180, 155, 255, 0.10);
+    color: #dcd0ff;
+  }
+  #ui button#gridSplitBtn.active {
+    border-color: #00e5ff;
+    color: #00e5ff;
+    background: rgba(0, 229, 255, 0.10);
+  }
+  #ui button#gridCreateBtn {
+    border-color: rgba(255, 200, 90, 0.72);
+    color: #ffd89b;
+  }
+  #ui button#gridCreateBtn:hover:not(:disabled) {
+    border-color: rgba(255, 200, 90, 1.00);
+    background: rgba(255, 200, 90, 0.10);
+    color: #ffe6b8;
+  }
+  #ui button:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
   }
 
   .fileList {
@@ -143,14 +173,14 @@ PG_CSS = r"""
     line-height:1.3 !important;
     letter-spacing:0.06em !important;
   }
-  .fileAct.open {
-    border-color: rgba(255, 200, 90, 0.55) !important;
-    color: #ffd89b !important;
+  .fileAct.focus {
+    border-color: rgba(0, 229, 255, 0.55) !important;
+    color: #00e5ff !important;
   }
-  .fileAct.open:hover {
-    background: rgba(255, 200, 90, 0.10) !important;
-    border-color: rgba(255, 200, 90, 0.95) !important;
-    color: #ffe6b8 !important;
+  .fileAct.focus:hover:not(:disabled) {
+    background: rgba(0, 229, 255, 0.10) !important;
+    border-color: rgba(0, 229, 255, 1.00) !important;
+    color: #b8ecff !important;
   }
   .fileDel {
     width:auto !important;
@@ -165,6 +195,22 @@ PG_CSS = r"""
     background:rgba(212,133,144,0.10) !important;
     border-color:#7a3e4a !important;
     color:#e8a0a8 !important;
+  }
+
+  /* Per-row focus button (crop rows + cell rows). */
+  .cropFocus {
+    width:auto !important;
+    padding:1px 6px !important;
+    font-size:11px !important;
+    line-height:1 !important;
+    border-color: rgba(0, 229, 255, 0.55) !important;
+    color: #00e5ff !important;
+    letter-spacing:0 !important;
+  }
+  .cropFocus:hover:not(:disabled) {
+    background: rgba(0, 229, 255, 0.10) !important;
+    border-color: rgba(0, 229, 255, 1.00) !important;
+    color: #b8ecff !important;
   }
 
   /* Crop list — grouped by source file.  A group header is a
@@ -236,6 +282,30 @@ PG_CSS = r"""
     flex:0 0 auto; font-size:10px;
     color:#5a6774;
     font-variant-numeric: tabular-nums;
+  }
+
+  /* Materialised grid-cell list.  Same visual rhythm as cropRow,
+     but without the click-to-select behaviour — cells aren't
+     selectable, they're just launch points for their Focus button. */
+  .gridCellRow {
+    display:flex; align-items:center; gap:7px;
+    padding:3px 6px;
+    margin-left:14px;
+    border:1px solid #223040;
+    border-radius:2px;
+    font-size:10px;
+    color:#a8b5c4;
+    letter-spacing:0.04em;
+    flex:0 0 auto;
+  }
+  .gridCellRow:hover {
+    border-color:#34445a; color:#dce6f2;
+    background:rgba(220,230,242,0.03);
+  }
+  .gridCellLabel {
+    flex:1 1 auto; font-weight:700;
+    font-variant-numeric: tabular-nums;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
   }
 
   #dropOverlay {
@@ -322,15 +392,38 @@ PG_PANEL_BODY = r"""
 
     <div class="row">
       <button id="newCropBtn"
-              title="Create a crop on the selected file (C)">
+              title="Create a free crop on the selected file (C)">
         + New crop
       </button>
       <button id="createCropFileBtn"
-              title="Create a new Krita file from the selected crop">
+              title="Create a new Krita file from the selected free crop">
         Create crop file
       </button>
     </div>
     <div id="cropList" class="fileList"></div>
+
+    <hr>
+
+    <div class="field" style="margin-bottom:2px;">
+      <label>Grid</label>
+    </div>
+    <div class="row">
+      <button id="gridSplitBtn"
+              title="Toggle grid-edit mode for the selected file. Creates a 2×2 grid if none.">
+        Grid split
+      </button>
+      <button id="gridCreateBtn" disabled
+              title="Create one Krita file per grid cell">
+        Create cell crops
+      </button>
+    </div>
+    <div class="row">
+      <button id="gridAddVBtn" disabled
+              title="Add a vertical line in the widest column">+ V line</button>
+      <button id="gridAddHBtn" disabled
+              title="Add a horizontal line in the tallest row">+ H line</button>
+    </div>
+    <div id="gridCellList" class="fileList"></div>
 
     <hr>
 

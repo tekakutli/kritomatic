@@ -88,6 +88,7 @@ from .pg_panel_bindings import PG_PANEL_BINDINGS_JS
 from .pg_scene       import SCENE_JS
 from .pg_dispatch    import DISPATCH_JS
 from .pg_crops       import CROPS_JS
+from .pg_grid        import GRID_JS
 
 from pgkit.html_shell  import page
 from pgkit.js_check    import JsSyntaxError
@@ -110,12 +111,10 @@ _BOOT_JS = r"""
 //
 // Import order: leaf modules first (pg_core, pg_panel_fields,
 // pg_panel_lists, pg_view_board, pg_scene), then pg_krita (which
-// cycles with pg_dispatch via pg_dispatch → pg_krita → pg_dispatch;
-// ES modules resolve this because both sides are `export function`,
-// which is hoisted), then pg_panel_scrubs (side effects), pg_crops
-// (which cycles with pg_dispatch — safe by the same hoisting rule),
-// pg_dispatch, pg_panel_bindings, and finally the three pgkit
-// modules.
+// cycles with pg_dispatch), then pg_panel_scrubs (side effects),
+// pg_crops (cycles with pg_dispatch and pg_panel_lists), pg_grid
+// (cycles with pg_dispatch, pg_crops, pg_view_board), pg_dispatch,
+// pg_panel_bindings, and finally the three pgkit modules.
 
 (async () => {
   const log  = (...a) => console.log("[boot]", ...a);
@@ -157,6 +156,7 @@ _BOOT_JS = r"""
       ["krita",    "./pg_krita.js"],
       ["scrubs",   "./pg_panel_scrubs.js"],    // side effects only
       ["crops",    "./pg_crops.js"],
+      ["grid",     "./pg_grid.js"],
       ["disp",     "./pg_dispatch.js"],
       ["bindings", "./pg_panel_bindings.js"],
       ["shell",    "./pgkit/shell.js"],
@@ -212,6 +212,7 @@ _MODULE_SOURCES = {
     "pg_scene.js":            SCENE_JS,
     "pg_dispatch.js":         DISPATCH_JS,
     "pg_crops.js":            CROPS_JS,
+    "pg_grid.js":             GRID_JS,
     "_boot.js":               _BOOT_JS,
 }
 

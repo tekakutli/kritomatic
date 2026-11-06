@@ -9,6 +9,31 @@ change, and every model-mutating action.  The DOM is rebuilt from
 scratch — the list is small and rebuilding is simpler than
 reconciling.
 
+FILE ROW ACTIONS
+================
+A file row carries a state dot, an optional per-row ◎ Focus
+button, and a × delete button:
+
+    ◎ Focus
+        activateFile(file) — bring the file to the front in Krita.
+        If the file is open, this POSTs /krita/activate with the
+        file's kritaName (or path).  If the file is closed, this
+        opens it first (open_document with add_view=True already
+        activates the new view), then refreshes.  Disabled for
+        missing files.
+
+    × Delete
+        Removes the card from the board.  Does not close the file
+        in Krita.
+
+The Focus button is always visible; the file's state (open,
+closed, missing) is reflected in its tooltip and its disabled
+state.  This replaced an earlier "Open" button that only appeared
+when the file was closed — the Open click already activated the
+new view (via add_view=True on open_document), so it was already
+half a Focus button.  Making it a permanent Focus button
+generalises the same action to already-open files.
+
 DEAD IMPORT REMOVED
 ===================
 The file used to import `_syncCardFields` from `./pg_panel_fields.js`
@@ -20,6 +45,17 @@ PG_PANEL_LISTS_JS = r"""
 import { board, _rgba, bringToTop, fileState } from "./pg_core.js";
 import { draw } from "./pg_dispatch.js";
 import { pgkitNotifyEntities, pgkitNotifyAll } from "./pgkit/remote_client.js";
+
+function _shortPath(p) {
+  if (!p) return "";
+  return String(p).split(/[\\\/]/).pop();
+}
+
+function _focusTitle(state, name) {
+  if (state === "missing") return "File is missing on disk";
+  if (state === "closed")  return "Open " + name + " in Krita and bring it to the front";
+  return "Bring " + name + " to the front in Krita";
+}
 
 export function syncFileList() {
   const list = document.getElementById("fileList");
@@ -67,18 +103,17 @@ export function syncFileList() {
       : (state === "closed" ? "not open in Krita" : "file missing on disk");
     row.appendChild(st);
 
-    if (state === "closed") {
-      const openBtn = document.createElement("button");
-      openBtn.className = "fileAct open";
-      openBtn.textContent = "Open";
-      openBtn.title = "Open this file in Krita";
-      openBtn.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        const m = await import("./pg_krita.js");
-        if (await m.openFileInKrita(f)) await m.refreshFromKrita();
-      });
-      row.appendChild(openBtn);
-    }
+    const focusBtn = document.createElement("button");
+    focusBtn.className = "fileAct focus";
+    focusBtn.textContent = "\u25CE";
+    focusBtn.title = _focusTitle(state, f.name);
+    focusBtn.disabled = state === "missing";
+    focusBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const m = await import("./pg_krita.js");
+      await m.activateFile(f);
+    });
+    row.appendChild(focusBtn);
 
     const del = document.createElement("button");
     del.className = "fileDel";

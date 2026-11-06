@@ -3,15 +3,17 @@ pg_view_board.py — draw the board.
 
 ES module.  Exports `drawBoardView`, which is called once per
 frame from `pg_dispatch.draw()`.  Reads `board.files`, `view`,
-the crop model, and the canvas; writes only to the canvas.
+the crop model, the grid model, and the canvas; writes only to the
+canvas.
 
 DRAW ORDER
 ==========
 Cards are drawn in `_zSortedIndices()` order, ascending, so a
 selected card sits above whatever it was overlapping.  Each card's
-crops are drawn immediately after the card, so a crop on card A
-sits above card A and below any later card.  Within a card, the
-active crop's handles are drawn on top of the scrim.
+crops and grid are drawn immediately after the card, so they sit
+above the card they belong to and below any later card.  Within a
+card, the active crop's handles and the hovered grid line are
+drawn on top.
 
 PERFORMANCE
 ===========
@@ -39,6 +41,7 @@ import {
   CORNER_SIGNS, CARD_HANDLE_R, ROTATE_HANDLE_R, ROTATE_HANDLE_OFFSET,
 } from "./pg_core.js";
 import { drawCropsForFile } from "./pg_crops.js";
+import { drawGridForFile } from "./pg_grid.js";
 
 function _drawBoardGrid() {
   const cw = window.innerWidth, ch = window.innerHeight;
@@ -230,6 +233,7 @@ export function drawBoardView() {
   const order = _zSortedIndices();
   for (const i of order) {
     _drawFileCard(board.files[i], i === board.selectedIdx);
+    drawGridForFile(board.files[i]);   // moved above crops
     drawCropsForFile(board.files[i]);
   }
   if (board.files.length === 0) {

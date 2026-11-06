@@ -19,7 +19,8 @@ supplies the routes dicts it dispatches through.  Two route tables:
     /krita/drop_file          raw body, filename in header  save a dropped file
     /krita/paste_transforms   { transforms: [...] }         transform-paste regions
     /krita/crop_to_file       { source_path, width, height,
-                                a..f }                      extract a crop as a new doc
+                                a..f }                      extract a free crop
+    /krita/crop_to_files      { source_path, cells: [...] } extract one crop per cell
 
 The drop_file endpoint receives the file's raw bytes.  The browser
 reads a dropped file via the File API (which hides the source path)
@@ -154,6 +155,25 @@ def handle_crop_to_file(payload):
     return result
 
 
+def handle_crop_to_files(payload):
+    source_path = payload.get("source_path", "")
+    if not source_path:
+        return {"success": False, "message": "no source_path"}
+    cells = payload.get("cells", [])
+    if not isinstance(cells, list) or not cells:
+        return {"success": False, "message": "no cells"}
+    _log(f"crop_to_files: {source_path!r} -> {len(cells)} cell(s)")
+
+    result = board_krita.crop_to_files(source_path, cells)
+    if not result.get("success"):
+        _log(f"crop_to_files FAILED: {result.get('message')}")
+    else:
+        _log(f"crop_to_files done: "
+             f"{result.get('successful',0)} ok, "
+             f"{result.get('failed',0)} failed")
+    return result
+
+
 # ----------------------------------------------------------------------------
 #  Raw-body handlers
 # ----------------------------------------------------------------------------
@@ -194,6 +214,7 @@ ROUTES = {
     "/krita/pick_files":       handle_pick_files,
     "/krita/paste_transforms": handle_paste_transforms,
     "/krita/crop_to_file":     handle_crop_to_file,
+    "/krita/crop_to_files":    handle_crop_to_files,
 }
 
 RAW_ROUTES = {

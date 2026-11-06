@@ -32,6 +32,30 @@ parameters.  The drop directory used to be stored in a local named
 did `float(d)` on a `PosixPath`.  The local is now `drop_dir`.  Any
 future local added to that function must not collide with the six
 parameter names.
+
+GRID CELLS
+==========
+`crop_to_files` is the grid tool's batch entry point.  It calls
+`crop_to_file` once per cell with the same source path and a different
+target dimension + affine, collecting a per-cell result.  It is
+strictly a loop over the existing single-cell function — the daemon
+sees N separate `create_document` (or fallback) + paste sequences,
+exactly as if the user had clicked "Create crop file" once per cell.
+
+CALLER-SIDE RESPONSE SHAPE
+==========================
+Several daemon commands (notably `activate_document`) return
+`{status: "success", message: ...}` with **no `data` key**.  The
+daemon's command dispatcher explicitly writes `data: None` in that
+case, and Python's `dict.get("data", {})` returns `None`, not `{}`,
+when the key is present with value `None`.
+
+Therefore every `_call(...)` caller that inspects `data` must treat
+`err` as the success indicator, not `data`.  `activate_document` was
+the last holdout — it checked `data is None`, which fired on the
+no-data success path and produced `"activate FAILED: unknown"` in
+the logs while Krita actually activated the document.  It now checks
+`err is not None` instead, matching the shape `_call` documents.
 """
 
 import json
@@ -76,6 +100,12 @@ def _norm(p):
 
 
 def _call(cmd_type, **kwargs):
+    """Return (data, None) on success and (None, message) on failure.
+
+    On success `data` may be `{}` *or* `None` — the daemon writes
+    `data: None` for commands that do not return a payload.  Callers
+    must test `err is not None` for failure, not `data is None`.
+    """
     client = KritaClient()
     if not client.connect():
         _log(f"{cmd_type}: daemon not reachable")
@@ -99,9 +129,10 @@ def status():
         data, err = _call("get_all_documents")
     except Exception as e:
         return {"success": False, "message": str(e)}
-    if data is None:
+    if err is not None:
         return {"success": False, "message": err or "unknown"}
-    return {"success": True, "documents_open": len(data.get("documents", []))}
+    return {"success": True,
+            "documents_open": len((data or {}).get("documents", []))}
 
 
 def refresh(paths, max_size=512):
@@ -111,12 +142,12 @@ def refresh(paths, max_size=512):
     except Exception as e:
         return {"success": False, "message": str(e)}
 
-    if data is None:
+    if err is not None or data is None:
         try:
             fallback, ferr = _call("get_all_documents")
         except Exception as e:
             return {"success": False, "message": str(e)}
-        if fallback is None:
+        if ferr is not None or fallback is None:
             return {"success": False, "message": err or ferr or "unknown"}
 
         incoming = []
@@ -195,21 +226,31 @@ def open_file(path, add_view=True):
                           file_path=path, add_view=add_view)
     except Exception as e:
         return {"success": False, "message": str(e)}
-    if data is None:
+    if err is not None:
         return {"success": False, "message": err or "unknown"}
     return {
         "success": True,
         "message": f"opened {path}",
-        "name":    data.get("name", ""),
+        "name":    (data or {}).get("name", ""),
     }
 
 
 def activate_document(name):
+    """Bring `name` (a document name or file path) to the front.
+
+    The daemon command returns `{status: "success", message: ...}`
+    with no `data` on success.  `_call` therefore yields
+    `(None, None)` here, which is success — the trigger to test is
+    `err is not None`, not `data is None`.  The previous
+    `data is None` check fired on every successful call and produced
+    a spurious `"activate FAILED: unknown"` log line while Krita
+    actually activated the document.
+    """
     try:
         data, err = _call("activate_document", name=name)
     except Exception as e:
         return {"success": False, "message": str(e)}
-    if data is None:
+    if err is not None:
         return {"success": False, "message": err or "unknown"}
     return {"success": True, "message": f"Activated {name}"}
 
@@ -422,16 +463,10 @@ def crop_to_file(source_path, width, height, a, b, c, d, e, f):
             "open_document",
             file_path=str(target_path), add_view=True,
         )
-        if open_resp is None:
+        if open_resp is None and open_err is not None:
             return {"success": False,
                     "message": f"could not open blank PNG: {open_err}"}
-        # The daemon's open_document response carries no `name` field.
-        # The identifier `paste_document_transform_as_layer` accepts is
-        # a file path — that is what the board's existing "project
-        # overlaps" feature passes as `target_document` — so when
-        # `name` is absent we fall back to the exact string we just
-        # handed to open_document.
-        target_name = open_resp.get("name") or str(target_path)
+        target_name = (open_resp or {}).get("name") or str(target_path)
         _log(f"crop_to_file: opened blank PNG; target_document = "
              f"{target_name!r}")
 
@@ -451,6 +486,80 @@ def crop_to_file(source_path, width, height, a, b, c, d, e, f):
     result = paste_transforms(transforms)
     result["target_document"] = target_name
     return result
+
+
+def crop_to_files(source_path, cells):
+    """Create one new Krita document per grid cell.
+
+    `cells` is a list of dicts, each shaped::
+
+        { width, height, a, b, c, d, e, f }
+
+    with the same affine convention as `crop_to_file`.  All cells share
+    `source_path`; each becomes a separate target document.
+
+    Returns::
+
+        { success: True, successful: N, failed: M, results: [...] }
+
+    where each result has ``index``, ``success`` (bool), ``message``,
+    and ``target_document``.
+
+    The loop is sequential and each iteration is a full
+    create-target / paste cycle, so N cells cost N of the existing
+    single-cell path.  That is intentional: it keeps the daemon
+    interaction identical to N individual "Create crop file" clicks,
+    which is what the current Krita daemon actually supports.
+    """
+    if not source_path:
+        return {"success": False, "message": "no source_path"}
+    if not isinstance(cells, list) or not cells:
+        return {"success": False, "message": "no cells"}
+
+    results = []
+    for i, cell in enumerate(cells):
+        try:
+            width  = int(cell.get("width", 0))
+            height = int(cell.get("height", 0))
+            a = float(cell.get("a", 1.0))
+            b = float(cell.get("b", 0.0))
+            c = float(cell.get("c", 0.0))
+            d = float(cell.get("d", 1.0))
+            e = float(cell.get("e", 0.0))
+            f = float(cell.get("f", 0.0))
+        except (TypeError, ValueError) as ex:
+            results.append({"index": i, "success": False,
+                            "message": f"bad params: {ex}",
+                            "target_document": ""})
+            continue
+
+        r = crop_to_file(source_path, width, height, a, b, c, d, e, f)
+        ok = bool(r.get("success")) and (r.get("successful", 0) > 0)
+        msg = ""
+        if not ok:
+            for rr in (r.get("results") or []):
+                if rr.get("status") == "error":
+                    msg = rr.get("message", "") or ""
+                    break
+            if not msg:
+                msg = r.get("message", "unknown")
+        results.append({
+            "index": i,
+            "success": ok,
+            "message": msg,
+            "target_document": r.get("target_document", ""),
+        })
+        _log(f"crop_to_files: cell[{i}] "
+             f"{'ok' if ok else 'FAIL: ' + msg}")
+
+    successful = sum(1 for r in results if r["success"])
+    failed = len(results) - successful
+    return {
+        "success": True,
+        "successful": successful,
+        "failed": failed,
+        "results": results,
+    }
 
 
 _picker_lock = threading.Lock()

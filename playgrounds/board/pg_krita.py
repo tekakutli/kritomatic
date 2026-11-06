@@ -424,4 +424,18 @@ export async function projectSelectedOntoOverlaps() {
     flashStatus("project: " + err.message, "bad");
   }
 }
+
+export async function activateDocument(name) {
+  if (!name) throw new Error("no target document");
+  const res = await fetch("/krita/activate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  const payload = await res.json();
+  if (!payload || !payload.success) {
+    throw new Error((payload && payload.message) || "unknown error");
+  }
+  return payload;
+}
 """

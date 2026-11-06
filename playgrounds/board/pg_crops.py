@@ -18,8 +18,9 @@ Exports:
     createCropForSelectedFile  "New crop"
     createCropFile             "Create crop file" (POSTs to server)
     deleteSelectedCrop         used by the Delete key
-    syncCropList               rebuilds the panel's crop list,
-                               grouped by source file
+    syncCropList               rebuilds the panel's crop list
+    tryFocusCropAt             returns the targetDoc of a materialised
+                               crop hit under the cursor, or null
 
 DEFAULT CROP
 ============
@@ -40,15 +41,19 @@ CROP LIST IS GROUPED BY SOURCE
 ==============================
 The panel's crop list renders one group per source file, in the
 same order as the Files list below, with the source's colour swatch
-and name as the group header.  This makes it possible to tell at a
-glance which file a crop belongs to.  The header of the currently-
-selected file is highlighted (same cyan as a selected row); clicking
-any header selects that file on the board.
+and name as the group header.
 
-A crop whose source file is no longer on the board is pruned at the
-top of `syncCropList` — there is no way to keep a crop that has no
-file to belong to, and leaving an orphan would produce a group
-header for a file that isn't in the Files list.
+MATERIALISED CROPS
+==================
+`createCropFile` records the Krita document returned by the server
+on `crop.targetDoc`.  A materialised crop renders with a subtle
+cyan tint under its border, and its row in the crop list grows a
+**◎ Focus** button that POSTs `/krita/activate` for that document.
+Un-exported crops show the button disabled.  The canvas exposes the
+same action through `tryFocusCropAt`: a clean click on a
+materialised crop's body focuses its document; the click detection
+and activation call live in `pg_dispatch.py`, so nothing here
+reaches for the network.
 
 AFFINE CONVENTION
 =================
@@ -58,31 +63,20 @@ convention as `pg_core.computeProjectionRegions`:
     tx = a*sx + c*sy + e
     ty = b*sx + d*sy + f
 
-For a crop at doc centre (cx, cy), dimensions (w, h), rotation θ,
-the straightened crop maps to a w × h target by rotating the whole
-source by -θ around the crop centre and translating to target
-centre:
+For a crop at doc centre (cx, cy), dimensions (w, h), rotation θ:
 
     a =  cos θ        b = -sin θ
     c =  sin θ        d =  cos θ
     e = -cos θ * cx - sin θ * cy + w/2
     f =  sin θ * cx - cos θ * cy + h/2
 
-The crop's local "up" edge midpoint lands at (w/2, 0) in the target
-(top-centre), and its local "right" edge midpoint lands at (w, h/2)
-(right-centre), for any θ.
-
 PASTE SUCCESS IS CHECKED EXPLICITLY
 ===================================
 `/krita/crop_to_file` returns `{success, successful, failed,
-results, target_document}` — the same shape as the batch-paste
-response, so `success` is the *transport* success, not the
+results, target_document}` — `success` is *transport* success, not
 *command* success.  `createCropFile` therefore checks
-`successful > 0` (there is exactly one transform in a crop), and
-surfaces the first per-command error message when it is 0.
-Without this, a failed paste would still show "created" on the
-status line, which is misleading given that the user just watched
-Krita open an empty document.
+`successful > 0` (there is exactly one transform in a crop) and
+surfaces the first per-command error when it is 0.
 """
 
 CROPS_JS = r"""
@@ -116,8 +110,13 @@ const CORNER_SIGNS = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
 const EDGE_SIGNS   = [[0, -1], [1, 0], [0, 1], [-1, 0]];
 
 // ============================================================================
-//  Lookups and transforms
+//  Helpers
 // ============================================================================
+
+function _shortPath(p) {
+  if (!p) return "";
+  return String(p).split(/[\\\/]/).pop();
+}
 
 function _fileByPath(path) {
   for (let i = 0; i < board.files.length; i++) {
@@ -270,6 +269,26 @@ export function cropCursorAt(sx, sy) {
 }
 
 // ============================================================================
+//  Focus helper (used by pg_dispatch's clean-click path)
+// ============================================================================
+
+export function tryFocusCropAt(file, sx, sy) {
+  if (!file || !file.docWidth || !file.docHeight) return null;
+  const [bx, by] = s2b(sx, sy);
+  const [dx, dy] = boardToDoc(file, bx, by);
+  for (let i = crops.length - 1; i >= 0; i--) {
+    const crop = crops[i];
+    if (crop.srcPath !== file.path) continue;
+    if (!crop.targetDoc) continue;
+    const [rx, ry] = _rotateOffset(dx - crop.cx, dy - crop.cy, -crop.rotation);
+    if (Math.abs(rx) <= crop.w / 2 && Math.abs(ry) <= crop.h / 2) {
+      return crop.targetDoc;
+    }
+  }
+  return null;
+}
+
+// ============================================================================
 //  Drawing
 // ============================================================================
 
@@ -313,6 +332,19 @@ function _drawCrop(file, crop, isActive) {
   ctx.fillStyle = "rgba(0, 0, 0, 0.55)";
   ctx.fill("evenodd");
   ctx.restore();
+
+  // Materialised tint: the crop's interior, shown when the crop has
+  // been exported to a Krita document (`targetDoc` set).
+  if (crop.targetDoc) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let c = 1; c < 4; c++) ctx.lineTo(pts[c][0], pts[c][1]);
+    ctx.closePath();
+    ctx.fillStyle = "rgba(0, 229, 255, 0.08)";
+    ctx.fill();
+    ctx.restore();
+  }
 
   // Crop border
   ctx.save();
@@ -548,6 +580,7 @@ export function createCropForSelectedFile() {
     w: file.docWidth * 0.5,
     h: file.docHeight * 0.5,
     rotation: 0,
+    targetDoc: null,
   });
   cropState.selectedIdx = crops.length - 1;
   syncCropList();
@@ -608,12 +641,6 @@ export async function createCropFile() {
     return;
   }
 
-  // `paste_transforms` returns success=True at the transport level even
-  // when the individual command failed.  There is exactly one transform
-  // in a crop, so a `successful === 0` here means the paste did not run
-  // — most commonly because the target document name we sent did not
-  // match anything on the daemon side.  Surface the daemon's own
-  // message instead of a misleading "created".
   const ok  = payload.successful || 0;
   const bad = payload.failed     || 0;
   if (ok === 0) {
@@ -629,6 +656,12 @@ export async function createCropFile() {
     return;
   }
 
+  // Record the created document on the crop so both the panel's
+  // Focus button and the canvas click-to-focus path can activate
+  // it later.
+  crop.targetDoc = payload.target_document || null;
+  syncCropList();
+  draw();
   flashStatus("created " + w + "×" + h + " crop", "ok");
 }
 
@@ -667,10 +700,7 @@ export function syncCropList() {
     return;
   }
 
-  // Group crops by source path.  Order groups by board.files order,
-  // so the crop list matches the Files list below.  Within a group,
-  // crops stay in creation order (their order in `crops`).
-  const groups = new Map();  // srcPath -> array of indices into crops
+  const groups = new Map();
   for (let ci = 0; ci < crops.length; ci++) {
     const sp = crops[ci].srcPath;
     if (!groups.has(sp)) groups.set(sp, []);
@@ -689,7 +719,7 @@ export function syncCropList() {
     const isSelFile = selFile && selFile.path === srcPath;
     const hue = file.color || board.palette[0];
 
-    // ---- Group header ------------------------------------------------
+    // Group header
     const header = document.createElement("div");
     header.className = "cropGroup" + (isSelFile ? " selected" : "");
     header.title = srcPath + " — click to select this file on the board";
@@ -727,7 +757,7 @@ export function syncCropList() {
 
     list.appendChild(header);
 
-    // ---- Crop rows under this header --------------------------------
+    // Crop rows under this header
     for (const ci of indices) {
       const crop = crops[ci];
       const isSel = ci === cropState.selectedIdx;
@@ -747,6 +777,28 @@ export function syncCropList() {
       if (Math.abs(deg) > 0.5) dimsText += "  " + Math.round(deg) + "°";
       dm.textContent = dimsText;
       row.appendChild(dm);
+
+      // Focus button: enabled only when the crop has been
+      // materialised into a Krita document.
+      const fbtn = document.createElement("button");
+      fbtn.className = "cropFocus";
+      fbtn.textContent = "\u25CE";
+      fbtn.disabled = !crop.targetDoc;
+      fbtn.title = crop.targetDoc
+        ? "Focus " + _shortPath(crop.targetDoc) + " in Krita"
+        : "Not exported yet — click Create crop file";
+      fbtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        if (!crop.targetDoc) return;
+        try {
+          const m = await import("./pg_krita.js");
+          await m.activateDocument(crop.targetDoc);
+          flashStatus("focused " + _shortPath(crop.targetDoc), "ok");
+        } catch (err) {
+          flashStatus("focus failed: " + err.message, "bad");
+        }
+      });
+      row.appendChild(fbtn);
 
       const del = document.createElement("button");
       del.className = "fileDel";

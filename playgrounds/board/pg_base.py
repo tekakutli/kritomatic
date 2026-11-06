@@ -7,7 +7,7 @@ The shared shell (head, panel wrapper, status line, restore button,
 
     PG_CSS          board-specific CSS beyond pgkit's SHELL_CSS:
                     the file-row list, the coloured accent buttons,
-                    the drop overlay.
+                    the drop overlay, the crop list and its groups.
 
     PG_PANEL_BODY   the panel's field groups, lists, and buttons.
 
@@ -55,6 +55,24 @@ PG_CSS = r"""
     border-color: rgba(255, 130, 210, 1.00);
     background: rgba(255, 130, 210, 0.10);
     color: #ffd0f0;
+  }
+  #ui button#newCropBtn {
+    border-color: rgba(140, 225, 160, 0.72);
+    color: #b8ecc8;
+  }
+  #ui button#newCropBtn:hover {
+    border-color: rgba(140, 225, 160, 1.00);
+    background: rgba(140, 225, 160, 0.10);
+    color: #d8ffe0;
+  }
+  #ui button#createCropFileBtn {
+    border-color: rgba(140, 225, 160, 0.85);
+    color: #c8f0d8;
+  }
+  #ui button#createCropFileBtn:hover {
+    border-color: rgba(140, 225, 160, 1.00);
+    background: rgba(140, 225, 160, 0.14);
+    color: #e0ffe8;
   }
 
   .fileList {
@@ -149,6 +167,77 @@ PG_CSS = r"""
     color:#e8a0a8 !important;
   }
 
+  /* Crop list — grouped by source file.  A group header is a
+     sub-heading (small caps, dim) with a colour swatch matching the
+     source card and a count badge.  Crop rows sit indented under
+     their header.  The header of the currently-selected file is
+     highlighted in the same cyan used for a selected fileRow. */
+  .cropGroup {
+    display:flex; align-items:center; gap:7px;
+    padding:5px 6px 3px;
+    margin-top:4px;
+    border-top:1px solid #1e2836;
+    cursor:pointer;
+    font-size:9px;
+    color:#7b8794;
+    letter-spacing:0.12em;
+    text-transform:uppercase;
+    font-weight:700;
+    flex:0 0 auto;
+  }
+  .cropGroup:first-child { margin-top:0; border-top:0; }
+  .cropGroup:hover { color:#dce6f2; }
+  .cropGroup.selected { color:#00e5ff; }
+  .cropGroupLabel {
+    flex:1 1 auto; font-weight:700;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .cropGroupCount {
+    flex:0 0 auto;
+    font-size:9px;
+    padding:0 5px;
+    border:1px solid #223040;
+    border-radius:2px;
+    color:#5a6774;
+    font-variant-numeric: tabular-nums;
+    letter-spacing:0;
+    text-transform:none;
+  }
+  .cropGroup.selected .cropGroupCount {
+    border-color:rgba(0,229,255,0.55);
+    color:#b8ecff;
+  }
+  .cropRow {
+    display:flex; align-items:center; gap:7px;
+    padding:3px 6px;
+    margin-left:14px;
+    border:1px solid #223040;
+    border-radius:2px;
+    cursor:pointer;
+    font-size:10px;
+    color:#a8b5c4;
+    letter-spacing:0.04em;
+    flex:0 0 auto;
+  }
+  .cropRow:hover {
+    border-color:#34445a; color:#dce6f2;
+    background:rgba(220,230,242,0.03);
+  }
+  .cropRow.selected {
+    border-color:rgba(0, 229, 255, 0.72);
+    color:#b8ecff;
+    background:rgba(0, 229, 255, 0.06);
+  }
+  .cropLabel {
+    flex:1 1 auto; font-weight:700;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .cropDims {
+    flex:0 0 auto; font-size:10px;
+    color:#5a6774;
+    font-variant-numeric: tabular-nums;
+  }
+
   #dropOverlay {
     position:fixed; inset:0; z-index:100;
     display:none;
@@ -228,6 +317,20 @@ PG_PANEL_BODY = r"""
              value="—" autocomplete="off" spellcheck="false" disabled
              title="Selected card's rotation in degrees.  Drag sideways to scrub; hold Shift to snap to 15°.">
     </div>
+
+    <hr>
+
+    <div class="row">
+      <button id="newCropBtn"
+              title="Create a crop on the selected file (C)">
+        + New crop
+      </button>
+      <button id="createCropFileBtn"
+              title="Create a new Krita file from the selected crop">
+        Create crop file
+      </button>
+    </div>
+    <div id="cropList" class="fileList"></div>
 
     <hr>
 

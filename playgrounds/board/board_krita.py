@@ -7,6 +7,31 @@ either side — a refused connection, a per-command error inside a
 batch — is printed with the daemon's own message intact, so the
 reason is visible where the board was launched and not only in the
 browser.
+
+CROP FALLBACK
+=============
+The daemon does not expose a `create_document` command.  `crop_to_file`
+therefore writes a transparent PNG of the target size to
+`board_drops/`, opens it via `open_document`, and pastes the
+transformed source on top of it as a new layer.  The blank pixels are
+fully covered by the pasted content, so the result is equivalent to
+what a native create-document command would produce.
+
+The daemon's `open_document` response carries no `name` field (this
+is the same reason `open_file`'s return has `"name": data.get("name", "")`
+with a `""` default).  The identifier `paste_document_transform_as_layer`
+actually wants — proven by the existing "project overlaps" feature —
+is a *file path*, so when `name` is missing we fall back to the exact
+string we passed to `open_document`.
+
+SHADOWING NOTE
+==============
+`crop_to_file` takes affine elements `a, b, c, d, e, f` as
+parameters.  The drop directory used to be stored in a local named
+`d`, which silently shadowed the `d` parameter; the paste step then
+did `float(d)` on a `PosixPath`.  The local is now `drop_dir`.  Any
+future local added to that function must not collide with the six
+parameter names.
 """
 
 import json
@@ -276,17 +301,17 @@ def save_dropped_file(name, data_bytes):
     safe = safe.strip() or "dropped_file"
 
     try:
-        d = _drop_dir()
+        drop_dir = _drop_dir()
     except Exception as e:
         _log(f"save_dropped_file: could not create drop dir: {e}")
         return {"success": False, "message": str(e)}
 
-    target = d / safe
+    target = drop_dir / safe
     if target.exists():
         stem, ext = os.path.splitext(safe)
         i = 1
         while True:
-            cand = d / f"{stem}_{i}{ext}"
+            cand = drop_dir / f"{stem}_{i}{ext}"
             if not cand.exists():
                 target = cand
                 break
@@ -302,6 +327,130 @@ def save_dropped_file(name, data_bytes):
     path = str(target.resolve())
     _log(f"save_dropped_file: wrote {path} ({len(data_bytes)} bytes)")
     return {"success": True, "path": path, "name": target.name}
+
+
+def _make_blank_png(width, height, rgba=(0, 0, 0, 0)):
+    """Encode a solid-color PNG.  Pure Python — no PIL needed.
+
+    Used by ``crop_to_file``'s fallback path when the daemon does
+    not expose a ``create_document`` command: write a transparent
+    PNG of the target size, open it in Krita, and paste the
+    transformed source on top of it.  The blank pixels are fully
+    covered by the pasted content, so the two paths produce
+    equivalent results.
+    """
+    import struct
+    import zlib
+
+    def chunk(typ, data):
+        return (struct.pack(">I", len(data)) + typ + data
+                + struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff))
+
+    signature = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)  # RGBA8
+    row = b"\x00" + bytes(rgba) * width
+    raw = row * height
+    compressed = zlib.compress(raw, 9)
+    return (signature
+            + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", compressed)
+            + chunk(b"IEND", b""))
+
+
+def crop_to_file(source_path, width, height, a, b, c, d, e, f):
+    """Create a new Krita document of size (width, height), and paste
+    the transformed source into it.
+
+    The affine (a..f) is the 2x3 matrix mapping source-document pixels
+    to target-document pixels in the codebase's convention::
+
+        tx = a*sx + c*sy + e
+        ty = b*sx + d*sy + f
+
+    The caller is expected to have computed it so the crop region in
+    the source maps to the full target canvas (see ``pg_crops.py``'s
+    AFFINE CONVENTION note).
+
+    Returns the same shape as ``paste_transforms`` plus a
+    ``target_document`` field naming the new document.
+
+    The six affine elements are parameters.  Do NOT introduce a local
+    named after any of them (a, b, c, d, e, f) — the drop directory
+    local used to be called `d`, which silently shadowed the `d`
+    parameter and produced a `float(PosixPath)` TypeError at the paste
+    step.  It is now `drop_dir`.
+    """
+    import time as _time
+
+    width  = int(width)
+    height = int(height)
+    if width <= 0 or height <= 0:
+        return {"success": False, "message": "invalid dimensions"}
+
+    # 1. Create (or open a blank PNG as) the target document.
+    create_resp = None
+    create_err  = None
+    try:
+        create_resp, create_err = _call(
+            "create_document",
+            width=width, height=height,
+            name=f"crop_{int(_time.time() * 1000)}.kra",
+            resolution=300.0,
+        )
+    except Exception as ex:
+        create_err = str(ex)
+
+    target_name = None
+    if create_resp is not None:
+        target_name = create_resp.get("name")
+
+    if not target_name:
+        _log(f"crop_to_file: create_document unavailable ({create_err}); "
+             f"using blank PNG fallback")
+        try:
+            png_bytes = _make_blank_png(width, height)
+            drop_dir = _drop_dir()
+        except Exception as ex:
+            return {"success": False, "message": f"prepare: {ex}"}
+        target_path = drop_dir / f"crop_{int(_time.time() * 1000)}_{width}x{height}.png"
+        try:
+            with open(target_path, "wb") as fh:
+                fh.write(png_bytes)
+        except Exception as ex:
+            return {"success": False, "message": f"write: {ex}"}
+        open_resp, open_err = _call(
+            "open_document",
+            file_path=str(target_path), add_view=True,
+        )
+        if open_resp is None:
+            return {"success": False,
+                    "message": f"could not open blank PNG: {open_err}"}
+        # The daemon's open_document response carries no `name` field.
+        # The identifier `paste_document_transform_as_layer` accepts is
+        # a file path — that is what the board's existing "project
+        # overlaps" feature passes as `target_document` — so when
+        # `name` is absent we fall back to the exact string we just
+        # handed to open_document.
+        target_name = open_resp.get("name") or str(target_path)
+        _log(f"crop_to_file: opened blank PNG; target_document = "
+             f"{target_name!r}")
+
+    if not target_name:
+        return {"success": False,
+                "message": "could not determine target document name"}
+
+    # 2. Paste source → target with the affine.
+    transforms = [{
+        "name":            f"crop_of_{os.path.basename(source_path)}",
+        "source_document": source_path,
+        "target_document": target_name,
+        "a": float(a), "b": float(b),
+        "c": float(c), "d": float(d),
+        "e": float(e), "f": float(f),
+    }]
+    result = paste_transforms(transforms)
+    result["target_document"] = target_name
+    return result
 
 
 _picker_lock = threading.Lock()

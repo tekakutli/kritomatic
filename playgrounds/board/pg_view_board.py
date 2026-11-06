@@ -3,12 +3,15 @@ pg_view_board.py — draw the board.
 
 ES module.  Exports `drawBoardView`, which is called once per
 frame from `pg_dispatch.draw()`.  Reads `board.files`, `view`,
-and the canvas; writes only to the canvas.
+the crop model, and the canvas; writes only to the canvas.
 
 DRAW ORDER
 ==========
 Cards are drawn in `_zSortedIndices()` order, ascending, so a
-selected card sits above whatever it was overlapping.
+selected card sits above whatever it was overlapping.  Each card's
+crops are drawn immediately after the card, so a crop on card A
+sits above card A and below any later card.  Within a card, the
+active crop's handles are drawn on top of the scrim.
 
 PERFORMANCE
 ===========
@@ -35,6 +38,7 @@ import {
   fileState, ensureThumbLoaded,
   CORNER_SIGNS, CARD_HANDLE_R, ROTATE_HANDLE_R, ROTATE_HANDLE_OFFSET,
 } from "./pg_core.js";
+import { drawCropsForFile } from "./pg_crops.js";
 
 function _drawBoardGrid() {
   const cw = window.innerWidth, ch = window.innerHeight;
@@ -224,7 +228,10 @@ export function drawBoardView() {
   ctx.fillRect(0, 0, cw, ch);
   _drawBoardGrid();
   const order = _zSortedIndices();
-  for (const i of order) _drawFileCard(board.files[i], i === board.selectedIdx);
+  for (const i of order) {
+    _drawFileCard(board.files[i], i === board.selectedIdx);
+    drawCropsForFile(board.files[i]);
+  }
   if (board.files.length === 0) {
     ctx.save();
     ctx.fillStyle = "#5a6774"; ctx.font = "700 12px 'JetBrains Mono', monospace";

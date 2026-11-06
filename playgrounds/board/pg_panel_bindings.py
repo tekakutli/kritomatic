@@ -33,6 +33,8 @@ Board's action set:
     saveBoard           scope: global
     loadBoard           scope: global     (requires: board_json file)
     projectOverlaps     scope: selection  (level: files)
+    newCrop             scope: global
+    createCropFile      scope: global
     openItem            scope: row        (level: files,
                                           appliesTo: !open && !missing)
     deleteItem          scope: row        (level: files)
@@ -40,33 +42,35 @@ Board's action set:
 Board does not use the pair playground's `setAfterChange` hook.
 Each action calls `syncFileList()`, `draw()`, `pgkitNotifyAll()`
 in its own body, matching text_board's convention.  Cleaner for
-board's eight actions, none of which share a common mutation
-pattern.
+board's actions, none of which share a common mutation pattern.
 
 RETURN-YOUR-ASYNC-WORK
 ======================
-Five action wrappers in this file call an `async function` and
-discard its Promise.  All five are the same shape: the underlying
-helper does an `await fetch("/krita/...")` that is the whole point
-of the action, so without a `return` the `command_result` fires
-before the fetch is even sent:
+Six action wrappers in this file call an `async function` and
+discard its Promise unless they `return` it.  All are the same
+shape: the underlying helper does an `await fetch("/krita/...")`
+that is the whole point of the action, so without a `return` the
+`command_result` fires before the fetch is even sent:
 
     _addFilesAction        → pickFilesViaServer()
     _retrieveOpenAction    → retrieveOpenFromKrita()
     _openAllAction         → openAllMissing()
     _loadBoardFromPayload  → loadBoardFromText(board_json)
     _projectOverlapsAction → projectSelectedOntoOverlaps()
+    _createCropFileAction  → createCropFile()
 
-Each is now `return <helper>(...)`.  In the loadBoard case the
-helper also returns `true`/`false`, so the boolean reaches
-`command_result.result` — the same reasoning as pair and cone.
+Each is now `return <helper>(...)`.  In the loadBoard and crop
+cases the helper also returns `true`/`false` (or resolves to it),
+so the boolean reaches `command_result.result` — the same
+reasoning as pair and cone.
 
 `_openItemByTarget` was already correct: both branches
 (`return activateFile(f)` and `return openFileInKrita(f).then(…)`)
 propagate the promise.  `_deleteItemByTarget` is fully
 synchronous.  The sync helpers (`_arrangeGridAction`, `_fitAction`,
-`_resetViewAction`, `_clearBoardAction`, `_saveSceneAction`) do
-their work synchronously and correctly return `undefined`.
+`_resetViewAction`, `_clearBoardAction`, `_saveSceneAction`,
+`_newCropAction`) do their work synchronously and correctly return
+`undefined`.
 
 WHY DYNAMIC IMPORTS ARE NOT NEEDED HERE
 =======================================
@@ -93,18 +97,21 @@ import {
   saveBoardJSON, promptLoadBoard, loadBoardFromText,
 } from "./pg_scene.js";
 import {
+  createCropForSelectedFile, createCropFile, syncCropList,
+} from "./pg_crops.js";
+import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyAll, pgkitNotifyLocal,
 } from "./pgkit/remote_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
 
-// Five wrappers below call an async helper and would otherwise
-// discard its Promise.  See the module docstring, RETURN-YOUR-
-// ASYNC-WORK.  In each case the helper does an `await fetch(...)`
-// that IS the action — the fetch completes when the .kra has been
-// opened / the picker has been dispatched / the layout has been
-// merged / the transforms have been pasted — so the wrapper must
-// return the promise for `command_result` to fire at the right
-// moment.
+// Wrappers below call an async helper and would otherwise discard
+// its Promise.  See the module docstring, RETURN-YOUR-ASYNC-WORK.
+// In each case the helper does an `await fetch(...)` that IS the
+// action — the fetch completes when the .kra has been opened / the
+// picker has been dispatched / the layout has been merged / the
+// transforms have been pasted / the crop file has been created — so
+// the wrapper must return the promise for `command_result` to fire
+// at the right moment.
 
 function _addFilesAction() {
   return pickFilesViaServer();
@@ -143,6 +150,7 @@ function _clearBoardAction() {
   board.files = [];
   board.selectedIdx = -1;
   syncFileList();
+  syncCropList();
   draw();
   flashStatus("board cleared", "ok");
   pgkitNotifyAll();
@@ -170,6 +178,14 @@ function _projectOverlapsAction() {
   return projectSelectedOntoOverlaps();
 }
 
+function _newCropAction() {
+  createCropForSelectedFile();
+}
+
+function _createCropFileAction() {
+  return createCropFile();
+}
+
 function _openItemByTarget(payload) {
   if (!payload || !payload.target) return;
   const name = payload.target.name || "";
@@ -193,6 +209,7 @@ function _deleteItemByTarget(payload) {
   if (!(idx >= 0 && idx < board.files.length)) return;
   removeFile(idx);
   syncFileList();
+  syncCropList();
   draw();
   pgkitNotifyAll();
 }
@@ -250,6 +267,16 @@ export function installPanelBindings() {
   if (els.clearBtn) els.clearBtn.addEventListener("click", _clearBoardAction);
   if (els.saveBtn)  els.saveBtn.addEventListener("click", _saveSceneAction);
   if (els.loadBtn)  els.loadBtn.addEventListener("click", () => promptLoadBoard());
+
+  const newCropBtn = document.getElementById("newCropBtn");
+  if (newCropBtn) newCropBtn.addEventListener("click", _newCropAction);
+  const createCropFileBtn = document.getElementById("createCropFileBtn");
+  if (createCropFileBtn) createCropFileBtn.addEventListener("click", () => {
+    _createCropFileAction().catch((err) => {
+      console.error("[crop] create handler threw:", err);
+      flashStatus("crop error: " + err.message, "bad");
+    });
+  });
 }
 
 pgkitRegisterAction("action.refreshFromKrita", { label: "Refresh from Krita", scope: "global", run: refreshFromKrita, meta: { variant: "plain" } });
@@ -266,6 +293,8 @@ pgkitRegisterAction("action.loadBoard", {
   meta: { variant: "plain", requires: [{ name: "board_json", kind: "file", label: "board JSON", accept: ".json,application/json" }] },
 });
 pgkitRegisterAction("action.projectOverlaps", { label: "Project overlaps", scope: "selection", level: "files", run: _projectOverlapsAction, meta: { variant: "primary" } });
+pgkitRegisterAction("action.newCrop", { label: "+ New crop", scope: "global", run: _newCropAction, meta: { variant: "plain" } });
+pgkitRegisterAction("action.createCropFile", { label: "Create crop file", scope: "global", run: _createCropFileAction, meta: { variant: "primary" } });
 pgkitRegisterAction("action.openItem", {
   label: "Open", scope: "row", level: "files",
   appliesTo: (item) => {
@@ -284,6 +313,7 @@ pgkitRegisterAction("action.deleteItem", { label: "\u00D7", scope: "row", level:
 export function boardBootSync() {
   syncPanelSliders();
   syncFileList();
+  syncCropList();
   refreshFromKrita();
 }
 """

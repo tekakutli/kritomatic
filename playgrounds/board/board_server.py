@@ -18,6 +18,8 @@ supplies the routes dicts it dispatches through.  Two route tables:
     /krita/pick_files         {}                            native file picker
     /krita/drop_file          raw body, filename in header  save a dropped file
     /krita/paste_transforms   { transforms: [...] }         transform-paste regions
+    /krita/crop_to_file       { source_path, width, height,
+                                a..f }                      extract a crop as a new doc
 
 The drop_file endpoint receives the file's raw bytes.  The browser
 reads a dropped file via the File API (which hides the source path)
@@ -124,6 +126,34 @@ def handle_paste_transforms(payload):
     return result
 
 
+def handle_crop_to_file(payload):
+    source_path = payload.get("source_path", "")
+    if not source_path:
+        return {"success": False, "message": "no source_path"}
+    try:
+        width  = int(payload.get("width", 0))
+        height = int(payload.get("height", 0))
+        a = float(payload.get("a", 1.0))
+        b = float(payload.get("b", 0.0))
+        c = float(payload.get("c", 0.0))
+        d = float(payload.get("d", 1.0))
+        e = float(payload.get("e", 0.0))
+        f = float(payload.get("f", 0.0))
+    except (TypeError, ValueError) as ex:
+        return {"success": False, "message": f"bad params: {ex}"}
+
+    _log(f"crop_to_file: {source_path!r} -> {width}x{height}")
+    _log(f"  affine: a={a:.6f} b={b:.6f} c={c:.6f} "
+         f"d={d:.6f} e={e:.3f} f={f:.3f}")
+    result = board_krita.crop_to_file(source_path, width, height,
+                                      a, b, c, d, e, f)
+    if not result.get("success"):
+        _log(f"crop_to_file FAILED: {result.get('message')}")
+    else:
+        _log(f"crop_to_file ok: {result.get('target_document')}")
+    return result
+
+
 # ----------------------------------------------------------------------------
 #  Raw-body handlers
 # ----------------------------------------------------------------------------
@@ -163,6 +193,7 @@ ROUTES = {
     "/krita/activate":         handle_activate,
     "/krita/pick_files":       handle_pick_files,
     "/krita/paste_transforms": handle_paste_transforms,
+    "/krita/crop_to_file":     handle_crop_to_file,
 }
 
 RAW_ROUTES = {

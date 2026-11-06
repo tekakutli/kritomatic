@@ -14,17 +14,28 @@ Four drag modes, mutually exclusive:
     dragFile     resize the card (drag on a corner; mode="resize")
     dragFile     rotate the card (drag on the rotate handle;
                  mode="rotate")
+    crop drag    one of four crop modes; handled by pg_crops
 
 MOUSEMOVE FAST PATH
 ===================
 `draw()` runs only when the canvas is actually going to change:
-during a card drag, during a canvas pan, on wheel zoom, on mouseup
-after a drag, and on every model mutation (through the panel).
+during a card drag, during a canvas pan, during a crop drag, on
+wheel zoom, on mouseup after a drag, and on every model mutation
+(through the panel).
 
 Pure hover — the mouse moving over the canvas with no button held —
 only updates the CSS cursor style.  `_hoverCursorAt` (in pg_core)
-is a single linear pass; `_setCursor` writes `style.cursor` only
-when the value actually differs.
+and `cropCursorAt` (in pg_crops) are single linear passes;
+`_setCursor` writes `style.cursor` only when the value actually
+differs.
+
+CROP EVENT PRIORITY
+===================
+Crop mouse handlers run *before* the card handlers.  If a crop
+consumes the event, the card handlers are skipped entirely.  This
+is what makes a click on a crop handle interact with the crop, not
+the card underneath.  If no crop is hit, the card handlers run as
+before.
 
 FIX HISTORY
 ===========
@@ -53,6 +64,11 @@ import {
   pgkitNotifyEntities, pgkitNotifyLocal, pgkitNotifyAll,
 } from "./pgkit/remote_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
+import {
+  cropCursorAt, handleCropMouseDown, handleCropMouseMove,
+  handleCropMouseUp, deleteSelectedCrop, cropState,
+  createCropForSelectedFile,
+} from "./pg_crops.js";
 
 let _statusTimer = null;
 
@@ -100,6 +116,8 @@ canvas.addEventListener("mousedown", (e) => {
   if (e.button !== 0) return;
   const rect = canvas.getBoundingClientRect();
   const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+
+  if (handleCropMouseDown(sx, sy, e)) return;
 
   if (rotateHandleHitTest(sx, sy)) {
     const f = board.files[board.selectedIdx];
@@ -158,6 +176,8 @@ window.addEventListener("mousemove", (e) => {
   state.mouse.inside = (sx >= 0 && sy >= 0 &&
                         sx < window.innerWidth && sy < window.innerHeight);
 
+  if (handleCropMouseMove(sx, sy, e)) return;
+
   if (state.dragFile) {
     const df = state.dragFile;
     const dx = sx - df.startSx, dy = sy - df.startSy;
@@ -191,10 +211,13 @@ window.addEventListener("mousemove", (e) => {
     draw(); return;
   }
 
+  const cropCursor = cropCursorAt(sx, sy);
+  if (cropCursor) { _setCursor(cropCursor); return; }
   _setCursor(_hoverCursorAt(sx, sy));
 });
 
 window.addEventListener("mouseup", () => {
+  handleCropMouseUp();
   const hadDrag = !!(state.dragFile || state.dragCanvas);
   state.dragFile = null; state.dragCanvas = null;
   _setCursor("default");
@@ -233,8 +256,17 @@ window.addEventListener("keydown", (e) => {
   else if (k === "f") { e.preventDefault(); fitAll(); }
   else if (k === "o") { e.preventDefault(); openAllMissing(); }
   else if (k === "p") { e.preventDefault(); projectSelectedOntoOverlaps(); }
+  else if (k === "c") { e.preventDefault(); createCropForSelectedFile(); }
   else if (k === "delete" || k === "backspace") {
-    if (board.selectedIdx >= 0) { e.preventDefault(); removeFile(board.selectedIdx); syncFileList(); draw(); }
+    if (cropState.selectedIdx >= 0) {
+      e.preventDefault();
+      deleteSelectedCrop();
+    } else if (board.selectedIdx >= 0) {
+      e.preventDefault();
+      removeFile(board.selectedIdx);
+      syncFileList();
+      draw();
+    }
   }
 });
 

@@ -11,7 +11,7 @@ own file:
     comfyui_bindings     comfy_bind_canvas, comfy_bind_selection
     comfyui_scratch      comfy_set_layer_pixels, scratch blob mgmt
     comfyui_config       comfy_apply_config
-    comfyui_generation   comfy_generate, cancel, wait, paste, history
+    comfyui_generation   comfy_generate, cancel, paste, history
     comfyui_status       comfy_status, comfy_batches, list_publishers
     comfyui_proxy        comfy_proxy_install / start / stop / status /
                          logs / health / test / uninstall

@@ -1,9 +1,17 @@
 """Panel-config consumption for the native v2 pipeline.
 
-`comfy_apply_config` takes the parsed `[resources]` / `[params]` /
-`[crop]` / `[paste]` sections from a panel config, validates them
-against the loaded workflow's slot tables, and stores the normalized
-result on the handler for `comfy_generate` to consume.
+Two commands:
+
+  * `comfy_apply_config` — takes the parsed `[resources]` / `[params]` /
+    `[crop]` / `[paste]` sections from a panel config, validates them
+    against the loaded workflow's slot tables, and stores the normalized
+    result on the handler for `comfy_generate` to consume.
+
+  * `comfy_prepare_only` — reads resources per the applied config,
+    uploads them to the comfy-api-proxy, substitutes `core/ASSET` refs
+    and param values into the graph, and returns the prepared graph
+    WITHOUT submitting. Diagnostic; Stage 5's `comfy_generate` consumes
+    the same `PreparedWorkflow` via `utils.comfy_apply.prepare_workflow`.
 
 Where the slots come from
 =========================
@@ -18,8 +26,8 @@ See `comfyui_inspect._extract_resource_slots` / `_extract_param_slots` /
 
 Validation rules
 ================
-The config is rejected if any of the following hold, each with a
-message naming the offending key so the user can fix the TOML:
+`comfy_apply_config` is rejected if any of the following hold, each
+with a message naming the offending key so the user can fix the TOML:
 
   * A `[resources]` key does not match a slot's `@`-name.
   * A `[resources]` entry has `source` outside `{active, global, layer}`.
@@ -32,7 +40,7 @@ message naming the offending key so the user can fix the TOML:
   * `crop.padding` is negative or non-int.
   * `paste.batch_mode` outside `{default, layers, animation}`.
 
-Unknown sections are ignored (forward-compat).
+Unknown top-level keys in the config are ignored (forward-compat).
 
 Storage
 =======
@@ -285,5 +293,96 @@ class ConfigCommands(AutoDispatchHandler):
                 ),
                 "crop": parent._active_config["crop"],
                 "paste": parent._active_config["paste"],
+            },
+        }
+
+    @command(
+        category="comfyui",
+        help_text="Read resources per the applied config, upload them to "
+                  "the proxy, substitute them into the graph (along "
+                  "with params and seed), and return the prepared graph "
+                  "WITHOUT submitting. The prepared graph is what "
+                  "comfy_generate submits (Stage 5); use this to inspect "
+                  "substitutions without running a job.",
+        args={
+            "--seed": {"type": "int", "required": False,
+                       "help": "Override the 'seed' param (if the "
+                               "workflow has a Primitive titled 'seed')."},
+        },
+    )
+    def comfy_prepare_only(self, params):
+        from krita import Krita
+
+        from ..utils.comfy_apply import prepare_workflow
+        from ..utils.comfyui_proxy_client import ProxyV2, ProxyUnreachable
+
+        parent = self.parent
+        if parent._active_workflow_graph is None:
+            return {"success": False,
+                    "message": "No workflow loaded; run comfy_load first"}
+        if parent._active_config is None:
+            return {"success": False,
+                    "message": "No panel config applied; run "
+                               "comfy_apply_config first"}
+
+        doc = Krita.instance().activeDocument()
+        if doc is None:
+            return {"success": False,
+                    "message": "No active document open in Krita"}
+
+        try:
+            client = ProxyV2.from_pid_file()
+        except (ProxyUnreachable, ImportError) as e:
+            return {"success": False,
+                    "message": f"proxy unavailable: {e}"}
+
+        seed_raw = params.get("seed")
+        seed = None
+        if seed_raw is not None:
+            try:
+                seed = int(seed_raw)
+            except (TypeError, ValueError):
+                return {"success": False,
+                        "message": f"--seed must be an integer, got "
+                                   f"{seed_raw!r}"}
+
+        try:
+            result = prepare_workflow(
+                doc,
+                parent._active_workflow_graph,
+                parent._active_workflow_resource_slots,
+                parent._active_workflow_param_slots,
+                parent._active_config,
+                client,
+                seed=seed,
+            )
+        except ValueError as e:
+            return {"success": False, "message": str(e)}
+
+        # Summarize without the blob bytes (they are megabytes) and
+        # without the full asset dicts (only id/hash matter to a human
+        # reading the response). The graph itself is small enough to
+        # include — it lets the operator eyeball the substitutions.
+        params_applied = set(parent._active_config["params"].keys())
+        if result.seed_applied is not None:
+            params_applied.add("seed")
+
+        return {
+            "success": True,
+            "message": (
+                f"prepared: {len(result.assets)} asset(s) uploaded, "
+                f"{len(result.graph)} node(s) in graph, "
+                f"crop={list(result.crop_bounds)}"
+            ),
+            "data": {
+                "crop_bounds": list(result.crop_bounds),
+                "assets": {
+                    name: {"id": a.get("id"), "hash": a.get("hash")}
+                    for name, a in result.assets.items()
+                },
+                "params_applied": sorted(params_applied),
+                "seed_applied": result.seed_applied,
+                "warnings": result.warnings,
+                "graph": result.graph,
             },
         }

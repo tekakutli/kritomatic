@@ -1,5 +1,6 @@
 """Unified command registry with JSON cache and parser caching"""
 
+import argparse
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional, List
@@ -29,6 +30,28 @@ def _escape_help_for_argparse(text):
     if not isinstance(text, str):
         return text
     return text.replace('%', '%%')
+
+
+def _coerce_bool_arg(value: str) -> bool:
+    """Parse a CLI bool value, rejecting anything not in a known true/false form.
+
+    Python's `bool("false")` is `True`, so argparse's `type=bool` makes
+    `--watch false` silently equivalent to `--watch true`. This helper
+    raises on unrecognized input, so a typo surfaces as an argparse
+    error rather than a silent wrong value.
+
+    Pairs with the `nargs='?'` + `const='true'` setup in `_build_parser`
+    so a bare flag (`--no_paste`) and an explicit value
+    (`--no_paste false`) both work.
+    """
+    v = value.strip().lower()
+    if v in ("true", "1", "yes", "on"):
+        return True
+    if v in ("false", "0", "no", "off"):
+        return False
+    raise argparse.ArgumentTypeError(
+        f"expected true/false/1/0/yes/no/on/off, got {value!r}"
+    )
 
 
 class CommandRegistry:
@@ -360,22 +383,35 @@ class CommandRegistry:
                 )
 
                 for arg_name, arg_info in cmd_info.get('args', {}).items():
-                    arg_type = arg_info.get('type', 'str')
+                    arg_type_str = arg_info.get('type', 'str')
                     required = arg_info.get('required', False)
                     default = arg_info.get('default')
                     choices = arg_info.get('choices')
                     help_text = _escape_help_for_argparse(arg_info.get('help', ''))
 
-                    if arg_type == 'int':
+                    # Type coercion. `bool` is special-cased: Python's
+                    # `bool("false")` is `True`, so a naive `type=bool`
+                    # would make `--flag false` silently mean `True`.
+                    # `_coerce_bool_arg` rejects anything not in a known
+                    # true/false form, and `nargs='?'` + `const='true'`
+                    # lets a bare flag (`--no_paste`) work without a
+                    # value — the way bool flags conventionally behave.
+                    if arg_type_str == 'int':
                         arg_type = int
-                    elif arg_type == 'float':
+                        kwargs = {'type': arg_type, 'help': help_text}
+                    elif arg_type_str == 'float':
                         arg_type = float
-                    elif arg_type == 'bool':
-                        arg_type = bool
+                        kwargs = {'type': arg_type, 'help': help_text}
+                    elif arg_type_str == 'bool':
+                        kwargs = {
+                            'type': _coerce_bool_arg,
+                            'nargs': '?',
+                            'const': 'true',
+                            'help': help_text,
+                        }
                     else:
                         arg_type = str
-
-                    kwargs = {'type': arg_type, 'help': help_text}
+                        kwargs = {'type': arg_type, 'help': help_text}
 
                     # The schema declares choices as strings.  Coerce
                     # them to match the argument's declared type, so
@@ -384,11 +420,11 @@ class CommandRegistry:
                     # an int-typed arg, and `5 in ['5','6']` would
                     # never match.  For str-typed args the choices go
                     # through unchanged.
-                    if choices is not None and arg_type is not bool:
+                    if choices is not None and arg_type_str != 'bool':
                         try:
-                            if arg_type is int:
+                            if arg_type_str == 'int':
                                 kwargs['choices'] = [int(c) for c in choices]
-                            elif arg_type is float:
+                            elif arg_type_str == 'float':
                                 kwargs['choices'] = [float(c) for c in choices]
                             else:
                                 kwargs['choices'] = list(choices)

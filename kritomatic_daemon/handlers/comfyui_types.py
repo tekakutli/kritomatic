@@ -3,7 +3,10 @@
 Data shapes and path constants used across the handler tree:
 
   * `_BatchRecord` — live state of one `comfy_generate` call.
-  * `_PendingJob` — live state of one `comfy_generate_async` job.
+  * `_PendingJob` — legacy async generation state. Unused by the
+    v2 pipeline (Stage 5 removed comfy_generate_async / comfy_wait);
+    kept here so `comfyui_types` stays importable while Stage 6
+    cleanup removes it.
   * Path constants (`_WORKFLOW_DIR`, `_HISTORY_DIR`, `_RECENT_ALIASES_PATH`).
   * Recent-alias persistence helpers — tiny, best-effort, swallowed.
 
@@ -40,12 +43,15 @@ _READ_ONLY_COMMANDS = frozenset({
     "comfy_list_recent_aliases",
     "comfy_list_scratch_blobs",
     "comfy_dump_scratch_blobs",
-    # Proxy status/logs are read-only: they must not trigger a state
-    # publish, which would re-probe the proxy on every poll.
+    # Proxy diagnostics: read-only, must not trigger a state publish
+    # (which would re-probe the proxy on every poll).
     "comfy_proxy_status",
     "comfy_proxy_logs",
     "comfy_proxy_health",
     "comfy_proxy_test",
+    # Preparation uploads to the proxy but does not mutate handler
+    # state; it is a diagnostic, not a state change.
+    "comfy_prepare_only",
 })
 
 
@@ -53,8 +59,8 @@ _READ_ONLY_COMMANDS = frozenset({
 #  Paths
 # ============================================================================
 
-_HANDLER_DIR = Path(__file__).resolve().parent.parent   # .../kritomatic/kritomatic_daemon
-_REPO_ROOT = _HANDLER_DIR.parent                        # .../kritomatic
+_HANDLER_DIR = Path(__file__).resolve().parent.parent
+_REPO_ROOT = _HANDLER_DIR.parent
 _PANEL_DIR = _REPO_ROOT / "data" / "comfy_panel"
 _WORKFLOW_DIR = _PANEL_DIR / "workflows"
 _HISTORY_DIR = _PANEL_DIR / "history"
@@ -106,6 +112,16 @@ class _BatchRecord:
 
     Held in `ComfyUIHandler._batches`, keyed by batch id, from the
     moment the batch starts until the moment it returns.
+
+    Fields added in Stage 5 (v2 pipeline):
+
+      * `job_ids` — proxy job ids, in submission order. Every entry
+        corresponds to a submitted run. Used by `comfy_cancel` (to
+        cancel each in-flight job) and echoed in the response so a
+        caller can reconcile against `GET /api/v2/jobs/{id}`.
+      * `_cancel_sent` — set of job ids for which `cancel_job` has
+        already been called. Prevents the poll loop from re-sending
+        cancel on every iteration after `cancel_event` is set.
     """
 
     def __init__(self, batch_id: str, workflow_name: str,
@@ -124,9 +140,18 @@ class _BatchRecord:
         self.current_run_index = 0
         self.run_records: list = []
 
+        # Stage 5: proxy job ids + cancellation tracking.
+        self.job_ids: list = []
+        self._cancel_sent: set = set()
+
 
 class _PendingJob:
-    """Live state of one `comfy_generate_async` job."""
+    """Legacy async generation state.
+
+    Retained so `comfyui_types` stays importable; nothing in the v2
+    pipeline uses it. Stage 6 removes it along with the rest of the
+    WebSocket path.
+    """
 
     def __init__(self, prompt_id: str, workflow_name: str,
                  params: dict, seed: int):

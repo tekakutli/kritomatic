@@ -1,6 +1,7 @@
 """Panel field wiring: the context-rectangle checkbox, the inpaint
-prompt textarea, the view-rotation scrub input, and the field
-registrations that expose these as pgkit fields.
+prompt textarea, the view-rotation scrub input, the interceptor
+routing checkbox and URL field, and the field registrations that
+expose these as pgkit fields.
 
 Very little code here compared to a full-featured playground: this
 playground drives exactly one operation (inpaint), and its inputs are
@@ -58,7 +59,22 @@ the user is currently typing.
 
 `status.running` is a read-only boolean registered at the bottom,
 same convention as sam3_segment: scripting clients (CLI,
-`remote_panel`) can wait on this name to sequence async actions."""
+`remote_panel`) can wait on this name to sequence async actions.
+
+INTERCEPTOR ROUTING
+===================
+A checkbox ("Route via interceptor") and a URL text input live in the
+Inpainting section.  When the checkbox is checked and the user clicks
+Inpaint, the payload is forwarded to the URL (default: the companion
+interceptor playground at port 8775) instead of running locally.  See
+`pg_comfy_client.py`'s `runInpaintViaInterceptor` for the flow.
+
+The URL field is hidden while the checkbox is off, via a `display`
+toggle driven from `_syncInterceptUrlVisibility`.  The field values
+themselves (`intercept.enabled`, `intercept.url`) are always
+registered, so a remote client can flip the checkbox whether or not
+the local DOM input happens to be visible.
+"""
 
 PANEL_SCRUBS_JS = r"""
 import { board, view, _applyRotation } from "./pg_state.js";
@@ -94,6 +110,42 @@ if (inpaintPromptEl) {
 }
 
 /* ============================================================
+   Interceptor routing
+   ============================================================ */
+
+const interceptEnabledEl = document.getElementById("interceptEnabled");
+const interceptUrlEl     = document.getElementById("interceptUrl");
+const interceptUrlRow    = document.getElementById("interceptUrlRow");
+
+function _syncInterceptUrlVisibility() {
+  if (!interceptUrlRow) return;
+  interceptUrlRow.style.display =
+    board.interceptEnabled ? "flex" : "none";
+}
+
+if (interceptEnabledEl) {
+  interceptEnabledEl.checked = !!board.interceptEnabled;
+  interceptEnabledEl.addEventListener("change", () => {
+    board.interceptEnabled = !!interceptEnabledEl.checked;
+    _syncInterceptUrlVisibility();
+    pgkitNotifyLocal("intercept.enabled");
+    import("./pg_panel_fields.js")
+      .then(m => m.syncPanelFields())
+      .catch(() => {});
+  });
+  _syncInterceptUrlVisibility();
+}
+
+if (interceptUrlEl) {
+  interceptUrlEl.value = board.interceptUrl
+    || "http://127.0.0.1:8775/intercept/intake";
+  interceptUrlEl.addEventListener("input", () => {
+    board.interceptUrl = interceptUrlEl.value;
+    pgkitNotifyLocal("intercept.url");
+  });
+}
+
+/* ============================================================
    Field registrations
    ============================================================ */
 
@@ -118,6 +170,34 @@ pgkitRegisterField("inpaint.prompt", {
     import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
   },
   meta: { kind: "text", label: "Inpaint prompt" },
+});
+
+pgkitRegisterField("intercept.enabled", {
+  get: () => !!board.interceptEnabled,
+  set: (v) => {
+    board.interceptEnabled = !!v;
+    const el = document.getElementById("interceptEnabled");
+    if (el && document.activeElement !== el) {
+      el.checked = board.interceptEnabled;
+    }
+    _syncInterceptUrlVisibility();
+    import("./pg_panel_fields.js")
+      .then(m => m.syncPanelFields())
+      .catch(() => {});
+  },
+  meta: { kind: "bool", label: "Route via interceptor" },
+});
+
+pgkitRegisterField("intercept.url", {
+  get: () => board.interceptUrl || "",
+  set: (v) => {
+    board.interceptUrl = String(v || "");
+    const el = document.getElementById("interceptUrl");
+    if (el && document.activeElement !== el) {
+      el.value = board.interceptUrl;
+    }
+  },
+  meta: { kind: "text", label: "Interceptor URL" },
 });
 
 pgkitRegisterField("masks.selectedIndex", {

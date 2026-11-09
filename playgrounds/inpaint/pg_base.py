@@ -290,6 +290,23 @@ PG_PANEL_BODY = r"""
                     placeholder="what should appear in the context region"
           ></textarea>
         </div>
+        <div class="field" style="align-items:flex-start;flex-direction:column;margin-top:8px;">
+          <label style="display:flex;gap:6px;align-items:center;cursor:pointer;flex:0 0 auto;">
+            <input type="checkbox" id="interceptEnabled"
+                   title="Send the payload to an interceptor playground instead of running inpaint locally.">
+            Route via interceptor
+          </label>
+        </div>
+        <div class="field" id="interceptUrlRow"
+             style="display:none;align-items:flex-start;flex-direction:column;margin-top:4px;">
+          <input type="text" id="interceptUrl"
+                 value="http://127.0.0.1:8775/intercept/intake"
+                 style="width:100%;background:#0d1219;color:#00e5ff;
+                        border:1px solid #223040;border-radius:2px;
+                        font-family:inherit;font-size:11px;
+                        padding:4px 6px;outline:none;"
+                 autocomplete="off" spellcheck="false">
+        </div>
         <div class="row" style="margin-top:8px;">
           <button id="inpaintBtn"
                   title="Run the inpaint workflow with the current canvas, selected mask, and context.">

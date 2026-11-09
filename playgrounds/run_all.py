@@ -2,11 +2,11 @@
 """
 run_all.py — launch playgrounds in one shared Python process.
 
-    python playgrounds/run_all.py                       # start all six
+    python playgrounds/run_all.py                       # start all seven
     python playgrounds/run_all.py --only board,cone     # start two
     python playgrounds/run_all.py --browser             # open tabs too
 
-    python playgrounds/run_all.py -i                    # all six, then REPL
+    python playgrounds/run_all.py -i                    # all seven, then REPL
     python playgrounds/run_all.py -i --only ""          # start nothing, REPL only
     python playgrounds/run_all.py -i --only board,cone  # two, then REPL
 
@@ -44,12 +44,13 @@ Two modes:
 
 Participants and ports
 ======================
-    board       8770
-    cone        8766
-    inpaint     8774
-    segment     8773
-    text_boxes  8771
-    text_wall   8767
+    board        8770
+    cone         8766
+    inpaint      8774
+    interceptor  8775
+    segment      8773
+    text_boxes   8771
+    text_wall    8767
 
 Each descriptor below supplies:
     name           hub registration name
@@ -66,16 +67,23 @@ Every panel's routes are the same ones the standalone launcher
 registers; the two entry points diverge only in how the HTTP server
 is started (blocking vs threaded).
 
+The interceptor playground is off by default (its `--only` default is
+unchanged); when the inpaint panel's "Route via interceptor" checkbox
+is on, its payload flows through interceptor at 8775.  The two are
+independent — inpaint works alone with the checkbox off, interceptor
+sits idle alone with no source feeding it.
+
 Standalone vs grouped
 =====================
-Each of the six remains independently runnable:
+Each of the seven remains independently runnable:
 
     python playgrounds/board/board_playground.py
+    python playgrounds/interceptor/interceptor_playground.py
 
 In that mode the playground registers with the hub under its own
 name, with `group=None`.  Killing it via the hub only shuts down
 that one process.  Grouped mode wires `group` so the hub knows
-killing one member takes down all six; the interactive panel warns
+killing one member takes down all seven; the interactive panel warns
 about that before the kill.
 
 sys.path setup
@@ -119,12 +127,13 @@ for _p in (_HERE, _SHARED_CABLE_ROOM):
 
 from pgkit.launcher import Launcher, serve_group
 
-from board      import board_html, board_server
-from cone       import cone_html, cone_kra
-from inpaint    import inpaint_html, inpaint_server
-from segment    import segment_html, segment_server
-from text_boxes import text_boxes_html, text_boxes_server
-from text_wall  import text_wall_html, text_wall_kra
+from board       import board_html, board_server
+from cone        import cone_html, cone_kra
+from inpaint     import inpaint_html, inpaint_server
+from interceptor import interceptor_html, interceptor_server
+from segment     import segment_html, segment_server
+from text_boxes  import text_boxes_html, text_boxes_server
+from text_wall   import text_wall_html, text_wall_kra
 
 
 GROUP_NAME = "core"
@@ -165,6 +174,16 @@ def _descriptors():
             "routes":         inpaint_server.ROUTES,
             "raw_routes":     inpaint_server.RAW_ROUTES,
             "module_sources": inpaint_html.module_sources(),
+        },
+        {
+            "name":           "interceptor",
+            "module":         "interceptor",
+            "port":           8775,
+            "html_file":      "interceptor.html",
+            "html_render":    interceptor_html.render,
+            "routes":         interceptor_server.ROUTES,
+            "raw_routes":     {},
+            "module_sources": interceptor_html.module_sources(),
         },
         {
             "name":           "segment",

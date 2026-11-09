@@ -277,6 +277,10 @@ export const board = {
     x: 0, y: 0, w: 0, h: 0,
     activeHandle: null,
   },
+
+  interceptEnabled:       false,
+  interceptUrl:           "http://127.0.0.1:8775/intercept/intake",
+  currentInterceptTaskId: null,
 };
 
 /* ============================================================

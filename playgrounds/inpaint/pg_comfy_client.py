@@ -6,6 +6,26 @@ This is the inpaint-only variant: `runInpaint` replaces the SAM3
 points, no SAM2/SAM3 model selection — the inpaint workflow does not
 use any of that.
 
+INTERCEPTOR BRANCH
+==================
+`runInpaintViaInterceptor` is the alternative path used when the
+panel's "Route via interceptor" checkbox is on.  It:
+
+    1. POSTs the payload to the local server's `/intercept_start`,
+       which forwards it to the configured interceptor playground.
+    2. Polls the local server's `/intercept_poll` for the result.
+    3. Returns the same shape as `runInpaint` — `{success, image_b64,
+       timing}` on success, `null` on error.
+
+`interruptInpaint` (the function `cancel` binds to) is updated to
+route through `/intercept_cancel` when a task is in flight on the
+interceptor, falling back to `/comfy/interrupt` otherwise.
+
+The interceptor side posts the result back to the source's
+`/intercept_callback` route; that callback writes to a server-side
+dict, which `/intercept_poll` reads.  See
+`inpaint_server.handle_intercept_*`.
+
 IMPORT SPLIT
 ============
 `board` comes from `pg_state.js` (leaf)."""
@@ -98,7 +118,126 @@ export async function runInpaint({ canvasB64, selectionB64, contextB64,
   }
 }
 
+/* ============================================================
+   Inpaint via interceptor
+   ============================================================
+   Same external contract as `runInpaint` — takes the same
+   arguments plus `interceptorUrl` and `callbackUrl`, returns
+   `{success, image_b64, timing}` or `null`.  The difference is
+   *where the work happens*: our Python server forwards the payload
+   to the interceptor playground, the interceptor runs
+   `handle_inpaint` (the same function the direct path uses), and
+   posts the result back to our server's `/intercept_callback`.
+   We poll for it.
+
+   `board.currentInterceptTaskId` is set for the duration so
+   `interruptInpaint` (which the Cancel button binds to) knows to
+   POST to `/intercept_cancel` rather than `/comfy/interrupt`, and
+   so `syncPanelFields` shows "waiting for interceptor…" instead of
+   "inpainting…". */
+
+export async function runInpaintViaInterceptor({
+  canvasB64, selectionB64, contextB64, prompt, outputRotation,
+  interceptorUrl, callbackUrl,
+}) {
+  if (_inFlightCount > 0) await interruptInpaint();
+
+  _inFlightCount += 1;
+  board.running = true;
+  pgkitNotifyAll();
+
+  try {
+    // 1. Ask our own server to forward the payload to the
+    //    interceptor.  Synchronous: a few hundred ms to localhost,
+    //    or an immediate error if the interceptor is unreachable.
+    let startResp;
+    try {
+      const res = await fetch("/intercept_start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          interceptor_url: interceptorUrl,
+          callback_url:    callbackUrl,
+          canvas_b64:      canvasB64,
+          selection_b64:   selectionB64,
+          context_b64:     contextB64,
+          prompt:          prompt,
+          output_rotation: outputRotation || 0,
+        }),
+      });
+      startResp = await res.json();
+    } catch (e) {
+      flashStatus("interceptor unreachable: " + e.message, "bad");
+      return null;
+    }
+    if (!startResp || !startResp.success) {
+      flashStatus("interceptor: "
+                  + ((startResp && startResp.message) || "unknown"),
+                  "bad");
+      return null;
+    }
+
+    const taskId = startResp.task_id;
+    board.currentInterceptTaskId = taskId;
+    pgkitNotifyAll();
+
+    // 2. Poll our own server for the result.
+    const deadline = performance.now() + 10 * 60 * 1000;
+    while (performance.now() < deadline) {
+      await new Promise(r => setTimeout(r, 750));
+      let poll;
+      try {
+        const res = await fetch("/intercept_poll", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ task_id: taskId }),
+        });
+        poll = await res.json();
+      } catch (e) {
+        continue;
+      }
+      if (!poll || !poll.status) continue;
+      if (poll.status === "pending") continue;
+      if (poll.status === "complete") {
+        board.lastTiming = poll.timing;
+        return {
+          success:   true,
+          image_b64: poll.image_b64,
+          timing:    poll.timing,
+        };
+      }
+      if (poll.status === "error") {
+        flashStatus("interceptor: " + (poll.message || "unknown"), "bad");
+        return null;
+      }
+    }
+    flashStatus("interceptor timed out", "bad");
+    return null;
+  } catch (e) {
+    console.error("[intercept] threw:", e);
+    flashStatus("interceptor: " + e.message, "bad");
+    return null;
+  } finally {
+    board.currentInterceptTaskId = null;
+    _inFlightCount -= 1;
+    if (_inFlightCount === 0) board.running = false;
+    pgkitNotifyAll();
+  }
+}
+
 export async function interruptInpaint() {
+  if (board.currentInterceptTaskId) {
+    try {
+      await fetch("/intercept_cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          task_id: board.currentInterceptTaskId,
+        }),
+      });
+    } catch (e) {}
+    return;
+  }
   try { await fetch("/comfy/interrupt", { method: "POST" }); }
   catch (e) {}
 }

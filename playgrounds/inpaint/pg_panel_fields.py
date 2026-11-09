@@ -1,6 +1,7 @@
 """Per-frame panel sync: image info, mask count, inpaint button
 enablement, cancel button enablement, mask-from-rect enablement,
-context-rectangle checkbox and hint visibility, status line.
+context-rectangle checkbox and hint visibility, interceptor routing
+enablement, status line.
 
 The function is called once per frame from `pg_dispatch.draw()`.
 Every DOM write is guarded against the current DOM value so a
@@ -65,7 +66,9 @@ export function syncPanelFields() {
 
   if (e.statusLine) {
     let text, cls = "";
-    if (board.running) {
+    if (board.running && board.currentInterceptTaskId) {
+      text = "waiting for interceptor\u2026"; cls = "warn";
+    } else if (board.running) {
       text = "inpainting\u2026"; cls = "ok";
     } else if (board.lastTiming != null) {
       text = "last: " + board.lastTiming.toFixed(2) + "s"; cls = "ok";
@@ -85,7 +88,10 @@ export function syncPanelFields() {
   const canInpaint = hasImage && maskReady && promptReady && !busy;
 
   if (e.inpaintBtn) {
-    e.inpaintBtn.textContent = busy ? "Inpainting\u2026" : "Inpaint";
+    e.inpaintBtn.textContent = busy
+      ? (board.currentInterceptTaskId ? "Waiting\u2026"
+                                      : "Inpainting\u2026")
+      : "Inpaint";
     e.inpaintBtn.classList.toggle("busy", busy);
     e.inpaintBtn.disabled = !canInpaint;
     if (!hasImage)              e.inpaintBtn.title = "Load an image first";
@@ -123,5 +129,9 @@ export function syncPanelFields() {
 
   if (e.inpaintEnabled) e.inpaintEnabled.disabled = busy;
   if (e.inpaintPrompt) e.inpaintPrompt.disabled = busy;
+  const interceptEnabledEl = document.getElementById("interceptEnabled");
+  if (interceptEnabledEl) interceptEnabledEl.disabled = busy;
+  const interceptUrlEl = document.getElementById("interceptUrl");
+  if (interceptUrlEl) interceptUrlEl.disabled = busy;
 }
 """

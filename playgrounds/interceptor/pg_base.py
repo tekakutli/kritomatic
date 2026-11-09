@@ -1,10 +1,17 @@
 """Interceptor's panel body and CSS.
 
-The prompt is not shown as a text field.  It is still registered as the
-`intercept.prompt` pgkit field (see `pg_panel_bindings.py`) so a
-scripting client can override it before triggering `action.run`.  When
-no override is set, the interceptor sends the payload's original prompt
-back to `handle_inpaint` unchanged.
+The prompt is not shown as a text field; it is still registered as
+the `intercept.prompt` pgkit field.
+
+CANVAS INTERACTION (hinted in the panel, implemented in
+`pg_dispatch.js`):
+
+    wheel            zoom at cursor
+    drag empty       pan
+    space + drag     pan
+    middle drag      pan
+    drag edge handle add surrounding context
+    Home / 0         reset view
 """
 
 PG_CSS = r"""
@@ -32,6 +39,38 @@ PG_CSS = r"""
   }
   #ui button#discardBtn:disabled {
     opacity: 0.4;
+    cursor: not-allowed;
+  }
+  #ui button#openKritaBtn,
+  #ui button#refreshKritaBtn {
+    border-color: rgba(140, 225, 160, 0.72);
+    color: #b8ecc8;
+  }
+  #ui button#openKritaBtn:hover:not(:disabled),
+  #ui button#refreshKritaBtn:hover:not(:disabled) {
+    border-color: rgba(160, 240, 180, 1.00);
+    background: rgba(140, 225, 160, 0.10);
+    color: #d8ffe0;
+  }
+  #ui button#openKritaBtn:disabled,
+  #ui button#refreshKritaBtn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  #ui button#resetExpansionBtn {
+    border-color: rgba(255, 200, 90, 0.55);
+    color: #ffd89b;
+    font-size: 9px;
+    padding: 2px 8px;
+    width: auto;
+  }
+  #ui button#resetExpansionBtn:hover:not(:disabled) {
+    border-color: rgba(255, 200, 90, 1.00);
+    background: rgba(255, 200, 90, 0.10);
+    color: #ffe6b8;
+  }
+  #ui button#resetExpansionBtn:disabled {
+    opacity: 0.35;
     cursor: not-allowed;
   }
 
@@ -102,6 +141,16 @@ PG_CSS = r"""
     white-space: pre-line;
     overflow-wrap: anywhere;
   }
+
+  #expansionInfo {
+    font-size:10px;
+    line-height:1.5;
+    margin-bottom:6px;
+    color:#7b8794;
+    white-space: pre-line;
+  }
+  #expansionInfo.active { color:#cbbdf5; }
+  #expansionInfo.warn   { color:#ffe600; }
 """
 
 PG_PANEL_BODY = r"""
@@ -122,6 +171,23 @@ PG_PANEL_BODY = r"""
         <div class="row" style="margin-top:8px;">
           <button id="runBtn" disabled>Inpaint</button>
           <button id="discardBtn" disabled>Discard</button>
+        </div>
+      </div>
+    </details>
+
+    <details class="section" open>
+      <summary>Canvas context</summary>
+      <div class="section-body">
+        <div id="expansionInfo">
+          wheel: zoom  ·  drag: pan  ·  space+drag: pan
+          drag boundary handles outward to add context
+        </div>
+        <div class="row">
+          <button id="openKritaBtn" disabled>Open in Krita</button>
+          <button id="refreshKritaBtn" disabled>Refresh from Krita</button>
+        </div>
+        <div class="row">
+          <button id="resetExpansionBtn" disabled>Reset expansion</button>
         </div>
       </div>
     </details>

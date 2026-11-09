@@ -3,9 +3,12 @@
 `client.py` and `tooling.py` are copied verbatim from
 kritomatic_daemon/utils/comfyui_client.py and comfyui_tooling.py.
 `image.py` is a playground-only simplification of comfyui_krita.py.
+`proxy_client.py` is a copy of kritomatic_daemon/utils/comfyui_proxy_client.py
+(Comfy API v2 client), used by the inpaint playground to talk to
+comfy-api-proxy directly.
 
-To update from upstream: copy the two files, verify the version at the
-top of each, run the smoke test in README.  Two things in this file are
+To update from upstream: copy the files, verify the version at the top
+of each, run the smoke test in README. Two things in this file are
 **playground extensions**, both documented below and both independent
 of the upstream copies:
 
@@ -51,6 +54,16 @@ No lock is needed: the cache read is a plain attribute access and the
 write is an atomic reference assignment under the GIL.  Two threads
 racing on a miss both fetch; last write wins; correctness is
 preserved.
+
+PROXY V2 CLIENT
+===============
+`proxy_client.py` is a byte-for-byte copy of the daemon's
+`ProxyV2` client (the HTTP surface for comfy-api-proxy on 8189). It
+is re-exported here for consistency with the other `pg_comfy` symbols.
+
+Live consumers: `inpaint_server.handle_inpaint` (from Stage 8
+onwards).  `segment` still uses `expand_custom` from `tooling.py` —
+its migration to the v2 proxy is out of scope for this stage.
 """
 
 from .client import (
@@ -70,6 +83,12 @@ from .tooling import (
     ExpansionError,
     expand_custom,
     scan_requirements,
+)
+from .proxy_client import (
+    ProxyV2,
+    ProxyError,
+    ProxyHTTPError,
+    ProxyUnreachable,
 )
 
 
@@ -123,4 +142,8 @@ __all__ = [
     "scan_requirements",
     "cached_object_info",
     "image",
+    "ProxyV2",
+    "ProxyError",
+    "ProxyHTTPError",
+    "ProxyUnreachable",
 ]

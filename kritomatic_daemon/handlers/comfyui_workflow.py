@@ -1,22 +1,21 @@
-"""Workflow loading, parameter values, and layer aliases.
+"""Workflow loading.
 
-This is where the user pushes new workflows into the daemon, tweaks
-their parameters, and maps declared layer names to actual document
-names. Actively worked on — new commands land here.
+`comfy_load` is the entry point: it reads a workflow JSON from disk,
+parses it, and sets it active. `_set_active_workflow` (in the container)
+then walks the graph for native-v2 slot tables.
+
+`comfy_set_param` and `comfy_bind_layer_alias` were removed in Stage 6
+along with the ETN_Parameter / layer-alias machinery they populated.
+The native pipeline takes values through `comfy_apply_config` instead.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
 
 from ..decorators import command, AutoDispatchHandler
-from .comfyui_types import (
-    _RECENT_ALIASES_CAP,
-    _WORKFLOW_DIR,
-    _save_recent_aliases,
-)
+from .comfyui_types import _WORKFLOW_DIR
 
 
 class WorkflowCommands(AutoDispatchHandler):
@@ -52,9 +51,9 @@ class WorkflowCommands(AutoDispatchHandler):
                        "help": "Workflow slug, or an absolute path to "
                                "a .json file."},
             "--exclusive": {"type": "bool", "default": False,
-                            "help": "If true, treat this file as the "
-                                    "exclusive source until the lock "
-                                    "is cleared."},
+                            "help": "Accepted for backward compatibility; "
+                                    "no-op after Stage 6 (the browser "
+                                    "watcher is gone)."},
         },
     )
     def comfy_load(self, params):
@@ -63,7 +62,6 @@ class WorkflowCommands(AutoDispatchHandler):
         if not name:
             return {"success": False, "message": "No workflow name given"}
 
-        exclusive = bool(params.get("exclusive", False))
         is_path = name.startswith("/") or name.startswith("~")
 
         if is_path:
@@ -113,17 +111,12 @@ class WorkflowCommands(AutoDispatchHandler):
                 ),
             }
 
-        parent._file_exclusive = exclusive
         parent._set_active_workflow(display_name, workflow, "file")
-        parent._params = {}
-        parent._layer_aliases = {}
 
         result_data: dict = {
             "name": display_name,
             "node_count": len(workflow),
             "source": "file",
-            "signature": parent._active_workflow_signature,
-            "exclusive": exclusive,
         }
         if is_path:
             result_data["path"] = str(path)
@@ -131,92 +124,17 @@ class WorkflowCommands(AutoDispatchHandler):
         return {
             "success": True,
             "message": f"Loaded workflow {display_name!r} "
-                       f"({len(workflow)} nodes)"
-                       + (", exclusive" if exclusive else ""),
+                       f"({len(workflow)} nodes)",
             "data": result_data,
         }
 
     @command(
         category="comfyui",
-        help_text="Set a value for an ETN_Parameter in the active "
-                  "workflow.",
-        args={
-            "--name": {"type": "str", "required": True,
-                       "help": "Parameter name (the node's `name` widget)"},
-            "--value": {"type": "str", "required": True,
-                        "help": "Value, as a string. Coerced later."},
-        },
-    )
-    def comfy_set_param(self, params):
-        parent = self.parent
-        if parent._active_workflow_graph is None:
-            return {"success": False,
-                    "message": "No workflow loaded; run comfy_load first, "
-                               "or publish a graph from ComfyUI's browser"}
-
-        name = params.get("name", "")
-        raw = params.get("value", "")
-        if not name:
-            return {"success": False, "message": "No parameter name given"}
-
-        if isinstance(raw, str):
-            low = raw.lower()
-            if low == "true":
-                value: Any = True
-            elif low == "false":
-                value = False
-            else:
-                value = raw
-        else:
-            value = raw
-
-        parent._params[name] = value
-        return {
-            "success": True,
-            "message": f"{name} = {value!r}",
-            "data": {"name": name, "value": value,
-                     "params": dict(parent._params)},
-        }
-
-    @command(
-        category="comfyui",
-        help_text="Map a layer name the workflow declares to a different "
-                  "layer in the document.",
-        args={
-            "--logical_name": {"type": "str", "required": True,
-                               "help": "The name the workflow declares"},
-            "--actual_name": {"type": "str", "required": True,
-                              "help": "The name to look up in the "
-                                      "document instead"},
-        },
-    )
-    def comfy_bind_layer_alias(self, params):
-        parent = self.parent
-        if parent._active_workflow_graph is None:
-            return {"success": False,
-                    "message": "No workflow loaded; run comfy_load first, "
-                               "or publish a graph from ComfyUI's browser"}
-
-        logical = params.get("logical_name", "")
-        actual = params.get("actual_name", "")
-        if not logical or not actual:
-            return {"success": False,
-                    "message": "Both --logical_name and --actual_name are "
-                               "required"}
-
-        parent._layer_aliases[logical] = actual
-        self._record_recent_alias(actual)
-        return {
-            "success": True,
-            "message": f"{logical} -> {actual}",
-            "data": {"logical_name": logical, "actual_name": actual,
-                     "layer_aliases": dict(parent._layer_aliases)},
-        }
-
-    @command(
-        category="comfyui",
         help_text="Return the most recently used layer alias targets, "
-                  "most recent first.",
+                  "most recent first. Kept for the docker's alias-"
+                  "dropdown refresh even after Stage 6 removed the "
+                  "binding commands; returns an empty list unless the "
+                  "aliases file has legacy entries.",
         args={},
     )
     def comfy_list_recent_aliases(self, params):
@@ -228,15 +146,3 @@ class WorkflowCommands(AutoDispatchHandler):
             "message": f"{len(snapshot)} recent alias(es)",
             "data": {"recent_aliases": snapshot},
         }
-
-    def _record_recent_alias(self, actual: str) -> None:
-        parent = self.parent
-        if not actual:
-            return
-        with parent._recent_aliases_lock:
-            updated = [actual] + [
-                a for a in parent._recent_aliases if a != actual
-            ]
-            del updated[_RECENT_ALIASES_CAP:]
-            parent._recent_aliases = updated
-            _save_recent_aliases(updated)

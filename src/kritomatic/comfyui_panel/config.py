@@ -2,28 +2,15 @@
 config.py — panel config file manipulation.
 
 Pure helpers: TOML rendering, workflow-interface extraction, config
-resolution, preset application, and — since Stage 3 — parsing of the
-new `[resources]` / `[params]` / `[crop]` / `[paste]` schema into a
-typed `PanelConfig`.
+resolution, preset application, and parsing of the `[resources]` /
+`[params]` / `[crop]` / `[paste]` schema into a typed `PanelConfig`.
 
 No daemon or network here; `cli.py` supplies the runtime around these
 functions.
 
-Two schema generations coexist
-==============================
-* `build_commands(cfg)` — the legacy path. Reads `[canvas]` /
-  `[selection]` / `[params]` (with `ETN_Parameter.name` keys) and
-  produces the batch the old generation pipeline consumes. Unchanged
-  by Stage 3.
-
-* `parse_panel_config(path)` + `build_batch(cfg, workflow_ref)` — the
-  native-v2 path. Reads `[resources]` / `[params]` / `[crop]` /
-  `[paste]` and produces `comfy_apply_config` + `comfy_generate`.
-  Added in Stage 3, wired into `cmd_run` in Stage 5.
-
-The CLI dispatches by inspecting the workflow: a graph with `ETN_*`
-nodes uses the legacy path; a native graph uses the v2 path. Stage 6
-migrates workflows and deletes the legacy path.
+Since Stage 7 all supported workflows are native-v2 (no ETN_* nodes).
+The legacy `build_commands` / `extract_workflow` helpers are gone; a
+config either parses as `PanelConfig` or it doesn't.
 """
 
 from __future__ import annotations
@@ -95,65 +82,19 @@ def _looks_like_path(s: str) -> bool:
 
 
 # ============================================================================
-#  Workflow interface extraction (used by legacy template rendering)
-# ============================================================================
-
-def extract_workflow(workflow: dict) -> dict:
-    params: dict = {}
-    has_canvas = False
-    selection = None
-    image_layers: list[str] = []
-    mask_layers: list[str] = []
-
-    for node in workflow.values():
-        cls = node.get("class_type", "")
-        ins = node.get("inputs", {}) or {}
-
-        if cls == "ETN_Parameter":
-            name = ins.get("name", "")
-            ptype = ins.get("type", "auto")
-            default = ins.get("default", "")
-            if name:
-                params[name] = (ptype, default)
-        elif cls == "ETN_KritaCanvas":
-            has_canvas = True
-        elif cls == "ETN_KritaSelection":
-            selection = (
-                ins.get("context", "entire_image"),
-                int(ins.get("padding", 0) or 0),
-            )
-        elif cls == "ETN_KritaImageLayer":
-            n = ins.get("name", "")
-            if n:
-                image_layers.append(str(n))
-        elif cls == "ETN_KritaMaskLayer":
-            n = ins.get("name", "")
-            if n:
-                mask_layers.append(str(n))
-
-    return {
-        "params": params,
-        "has_canvas": has_canvas,
-        "selection": selection,
-        "image_layers": sorted(set(image_layers)),
-        "mask_layers": sorted(set(mask_layers)),
-    }
-
-
-# ============================================================================
-#  Native-v2 interface extraction (used by template rendering)
+#  Workflow interface extraction
 # ============================================================================
 
 def extract_native_workflow(workflow: dict) -> dict:
     """Walk the graph for native slots: @-names, Primitive titles,
-    SaveImage nodes. Mirrors the daemon-side `_extract_*` functions in
+    SaveImage nodes. Mirrors the daemon-side extractors in
     comfyui_inspect.py, kept local so the CLI has no import dependency
     on the daemon package.
     """
     resource_names: list[str] = []
     resource_kinds: dict[str, str] = {}
     param_titles: dict[str, str] = {}
-    output_node_ids: list[str] = []
+    has_output_node = False
 
     _RESOURCE_CLASSES = {"LoadImage": "image", "LoadImageMask": "mask"}
     _PARAM_CLASSES = {
@@ -183,17 +124,13 @@ def extract_native_workflow(workflow: dict) -> dict:
             continue
 
         if cls == "SaveImage":
-            # Node id is a dict key in the API format; but we're
-            # iterating values here. Look up by class-specific default
-            # inputs for the template — we don't need node ids for
-            # rendering, just the fact that SaveImage exists.
-            output_node_ids.append(cls)
+            has_output_node = True
 
     return {
         "resource_names": sorted(set(resource_names)),
         "resource_kinds": resource_kinds,
         "param_titles": param_titles,
-        "has_output_node": "SaveImage" in output_node_ids,
+        "has_output_node": has_output_node,
     }
 
 
@@ -201,90 +138,8 @@ def extract_native_workflow(workflow: dict) -> dict:
 #  Template blocks
 # ============================================================================
 
-def _params_block(params: dict,
-                  heading: str = "ETN_Parameter values, keyed by each "
-                                 "node's `name` widget.") -> list[str]:
-    lines = [f"# {heading}", "[params]"]
-    if params:
-        for name, (ptype, default) in params.items():
-            suffix = f"   # {ptype}" if ptype and ptype != "auto" else ""
-            lines.append(f"{_toml_key(name)} = {_toml_value(default)}{suffix}")
-    else:
-        lines.append("# (no ETN_Parameter nodes in this workflow)")
-    return lines
-
-
-def _layer_aliases_block(image_layers: list[str],
-                         mask_layers: list[str]) -> list[str]:
-    lines = [
-        "# ---- Layer aliases ----------------------------------------",
-        "#",
-        "# Keys are the layer names the workflow declares. Values are the",
-        "# layers the daemon reads from your document. Change a value to",
-        "# use a document layer with a different name; the key stays as",
-        "# the workflow wrote it.",
-        "#",
-    ]
-    entries: list[tuple[str, str]] = []
-    for name in mask_layers:
-        entries.append((name, "ETN_KritaMaskLayer"))
-    for name in image_layers:
-        entries.append((name, "ETN_KritaImageLayer"))
-
-    if not entries:
-        lines.append("# This workflow does not reference named layers.")
-        return lines
-
-    lines.append("[layer_aliases]")
-    for name, kind in entries:
-        lines.append(
-            f"{_toml_key(name)} = {_toml_value(name)}   # {kind}"
-        )
-    return lines
-
-
-def _canvas_selection_block(info: dict) -> list[str]:
-    has_canvas = info.get("has_canvas", False)
-    has_selection = info.get("has_selection", False)
-    sel_context = info.get("selection_context") or "entire_image"
-    sel_padding = info.get("selection_padding", 0)
-
-    lines = ["# ---- Canvas and selection --------------------------------",
-             "#"]
-    if has_canvas:
-        lines.append("# This workflow uses ETN_KritaCanvas. The daemon "
-                     "reads the")
-        lines.append("# selected source below and ships it as the canvas "
-                     "image.")
-    else:
-        lines.append("# This workflow does not use ETN_KritaCanvas.")
-    if has_selection:
-        lines.append(f"# It also uses ETN_KritaSelection "
-                     f"(context=\"{sel_context}\", padding={sel_padding}).")
-    else:
-        lines.append("# It does not use ETN_KritaSelection.")
-    return lines
-
-
-def _batch_block() -> list[str]:
-    return [
-        "# ---- Batch generation -------------------------------------",
-        "#",
-        "# count > 1 runs the workflow that many times, one run per",
-        "# consecutive seed, and pastes each result. The workflow must",
-        "# declare an ETN_Parameter named exactly 'seed' wired to the",
-        "# sampler's seed input, or wire the ETN_KritaCanvas 'seed'",
-        "# output; otherwise the daemon clamps count to 1.",
-        "#",
-        "# seed is the base for a batch: run i uses seed+i. Blank means",
-        "# the daemon picks a random base. One history record is written",
-        "# per comfy_generate call, regardless of count.",
-    ]
-
-
 def _resources_block(resource_names: list[str],
                      resource_kinds: dict[str, str]) -> list[str]:
-    """The `[resources]` section for the native-v2 template."""
     lines = [
         "# ---- Resources -------------------------------------------",
         "#",
@@ -306,15 +161,12 @@ def _resources_block(resource_names: list[str],
     for name in resource_names:
         kind = resource_kinds.get(name, "image")
         if kind == "mask":
-            # Mask-shaped resource: almost always the selection.
             lines.append(
-                f'"{name}" = {{ source = "global" }}   '
-                f'# mask'
+                f'"{name}" = {{ source = "global" }}   # mask'
             )
         else:
             lines.append(
-                f'"{name}" = {{ source = "active" }}   '
-                f'# image'
+                f'"{name}" = {{ source = "active" }}   # image'
             )
     return lines
 
@@ -337,9 +189,7 @@ def _paste_block() -> list[str]:
     return [
         "# ---- Paste ----------------------------------------------",
         "#",
-        "# Where and how to paste SaveImage outputs. Matches the old",
-        "# ETN_KritaOutput widget values (x, y, name, batch_mode,",
-        "# resize_canvas).",
+        "# Where and how to paste SaveImage outputs.",
         "[paste]",
         "x = 0",
         "y = 0",
@@ -350,7 +200,6 @@ def _paste_block() -> list[str]:
 
 
 def _native_params_block(param_titles: dict[str, str]) -> list[str]:
-    """The `[params]` section for the native-v2 template."""
     lines = [
         "# ---- Parameters -----------------------------------------",
         "#",
@@ -366,13 +215,9 @@ def _native_params_block(param_titles: dict[str, str]) -> list[str]:
     lines.append("[params]")
     for title in sorted(param_titles):
         kind = param_titles[title]
-        default = _native_param_default(kind)
+        default = {"float": 0.0, "int": 0, "string": "", "boolean": False}[kind]
         lines.append(f"{_toml_key(title)} = {_toml_value(default)}   # {kind}")
     return lines
-
-
-def _native_param_default(kind: str) -> Any:
-    return {"float": 0.0, "int": 0, "string": "", "boolean": False}[kind]
 
 
 # ============================================================================
@@ -380,103 +225,22 @@ def _native_param_default(kind: str) -> Any:
 # ============================================================================
 
 def _render_file_template(workflow_ref: str, workflow: dict) -> str:
-    """Render a template for a file-sourced workflow.
+    """Render a template for a native-v2 workflow.
 
-    Detects the schema generation from the graph: a graph with no
-    `ETN_*` nodes is treated as native-v2 (renders `[resources]` /
-    `[crop]` / `[params]` / `[paste]`); otherwise legacy (renders
-    `[canvas]` / `[selection]` / `[layer_aliases]` / `[params]` with
-    `ETN_Parameter` keys).
+    A legacy ETN_* workflow would produce empty slot sections; since
+    Stage 7 the daemon refuses to load such graphs (no `expand_custom`),
+    so the template doesn't attempt to distinguish.
     """
-    has_etn = any(
-        str(node.get("class_type", "")).startswith("ETN_")
-        for node in workflow.values()
-    )
-
-    if not has_etn:
-        return _render_native_file_template(workflow_ref, workflow)
-
-    # Legacy template — unchanged from before Stage 3.
-    info = extract_workflow(workflow)
-
-    lines: list[str] = [
-        f'host = "127.0.0.1"',
-        f'port = 8188',
-        f'workflow = "{workflow_ref}"',
-        '# exclusive=true means the daemon loads this file and ignores',
-        '# any graph concurrently published by a ComfyUI browser tab.',
-        '# Without it, a browser republish between load and generate',
-        '# silently replaces the file\'s graph. Set to false to follow',
-        '# the browser instead.',
-        'exclusive = true',
-        'watch = true',
-        '',
-    ]
-    lines += _canvas_selection_block({
-        "has_canvas": info["has_canvas"],
-        "has_selection": info["selection"] is not None,
-        "selection_context": (info["selection"][0]
-                              if info["selection"] else "entire_image"),
-        "selection_padding": (info["selection"][1]
-                              if info["selection"] else 0),
-    })
-    lines.append('canvas = "active"    # active | ["layer", "Name"]')
-    if info["selection"]:
-        lines.append('# selection = "global"     # see notes above')
-        lines.append('# selection = ["layer", "areaToRMBG", '
-                     '"mask_bounds", 0]')
-    else:
-        lines.append('# selection = "global"     # workflow does not use '
-                     'ETN_KritaSelection')
-    lines.append('')
-    lines.append('timeout = 55.0')
-    lines.append('output_name = ""    # paste only this ETN_KritaOutput '
-                 'node; blank = all')
-    lines.append('')
-    lines += _batch_block()
-    lines.append('count = 1')
-    lines.append('seed = ""          # base seed for a batch; blank = auto')
-    lines.append('')
-    lines += _layer_aliases_block(info["image_layers"],
-                                  info["mask_layers"])
-    lines.append('')
-    lines += _params_block(info["params"])
-    lines.append('')
-    lines.append("# To bypass the settings above and write the full chain "
-                 "yourself,")
-    lines.append("# delete everything and use an array of inline tables:")
-    lines.append("#")
-    lines.append("# commands = [")
-    lines.append("#     { type = \"comfy_connect\", host = \"127.0.0.1\", "
-                 "port = 8188, check = true, watch = true },")
-    lines.append(f"#     {{ type = \"comfy_load\", name = "
-                 f"\"{workflow_ref}\", exclusive = true }},")
-    lines.append("#     { type = \"comfy_bind_layer_alias\", "
-                 "logical_name = \"areaToRMBG\", "
-                 "actual_name = \"face\" },")
-    lines.append("#     { type = \"comfy_bind_canvas\", source = "
-                 "\"active\" },")
-    lines.append("#     { type = \"comfy_set_param\", name = "
-                 "\"segmentFurther\", value = \"person\" },")
-    lines.append("#     { type = \"comfy_generate\", timeout = 55.0, "
-                 "count = 3 },")
-    lines.append("# ]")
-
-    return "\n".join(lines) + "\n"
-
-
-def _render_native_file_template(workflow_ref: str, workflow: dict) -> str:
-    """Render a template for a native-v2 workflow (no ETN_* nodes)."""
     info = extract_native_workflow(workflow)
 
     lines: list[str] = [
         f'host = "127.0.0.1"',
         f'port = 8188',
         f'workflow = "{workflow_ref}"',
-        '# exclusive=true means the daemon loads this file and ignores',
-        '# any graph concurrently published by a ComfyUI browser tab.',
+        '# exclusive=true keeps the graph pinned even though browser',
+        '# publishing no longer exists after Stage 6; kept for clarity.',
         'exclusive = true',
-        'watch = true',
+        'watch = false',
         '',
         '# ---- Batch generation -----------------------------------',
         'timeout = 55.0',
@@ -493,59 +257,6 @@ def _render_native_file_template(workflow_ref: str, workflow: dict) -> str:
     lines.append('')
     lines += _paste_block()
     return "\n".join(lines) + "\n"
-
-
-def _render_browser_template_body(status: dict,
-                                  signature: Optional[str]) -> list[str]:
-    params_list = status.get("workflow_parameters") or []
-    params: dict = {}
-    for entry in params_list:
-        name = entry.get("name")
-        if not name:
-            continue
-        params[str(name)] = (
-            str(entry.get("type", "auto")),
-            entry.get("default", ""),
-        )
-
-    layer_reqs = status.get("workflow_layer_requirements") or {}
-    image_layers = list(layer_reqs.get("image_layers") or [])
-    mask_layers = list(layer_reqs.get("mask_layers") or [])
-    canvas_info = status.get("workflow_canvas_info") or {}
-
-    lines: list[str] = []
-    if signature:
-        lines.append(f'signature = "{signature}"')
-    lines += [
-        'host = "127.0.0.1"',
-        'port = 8188',
-        "# Empty: the workflow is followed from ComfyUI's browser.",
-        'workflow = ""',
-        'watch = true',
-        '',
-    ]
-    lines += _canvas_selection_block(canvas_info)
-    lines.append('canvas = "active"    # active | ["layer", "Name"]')
-    if canvas_info.get("has_selection"):
-        lines.append('# selection = "global"     # see notes above')
-        lines.append('# selection = ["layer", "areaToRMBG", '
-                     '"mask_bounds", 0]')
-    else:
-        lines.append('# selection = "global"     # workflow does not use '
-                     'ETN_KritaSelection')
-    lines.append('')
-    lines.append('timeout = 55.0')
-    lines.append('output_name = ""    # paste only this ETN_KritaOutput '
-                 'node; blank = all')
-    lines.append('')
-    lines += _batch_block()
-    lines.append('count = 1')
-    lines.append('seed = ""          # base seed for a batch; blank = auto')
-    lines.append('')
-    lines += _layer_aliases_block(image_layers, mask_layers)
-    lines.append('')
-    lines += _params_block(params)
-    return lines
 
 
 def build_file_template(workflow_ref: str) -> Optional[str]:
@@ -589,19 +300,6 @@ def build_file_template(workflow_ref: str) -> Optional[str]:
     return _render_file_template(toml_ref, workflow)
 
 
-def build_browser_template(status: dict,
-                           signature: Optional[str]) -> str:
-    lines = _render_browser_template_body(status, signature)
-    lines.append('')
-    lines.append("# This config was generated from a graph published by")
-    lines.append("# ComfyUI's browser. It is keyed by the signature above, "
-                 "so")
-    lines.append("# reloading the same workflow in the browser will find "
-                 "this")
-    lines.append("# file again.")
-    return "\n".join(lines) + "\n"
-
-
 # ============================================================================
 #  File system helpers
 # ============================================================================
@@ -617,136 +315,8 @@ def existing_configs() -> list[Path]:
     return sorted(CONFIG_DIR.glob("*.toml"))
 
 
-def find_config_by_signature(sig: str) -> Optional[Path]:
-    if not sig or not CONFIG_DIR.is_dir():
-        return None
-    for p in sorted(CONFIG_DIR.glob("*.toml")):
-        try:
-            with p.open("rb") as f:
-                cfg = tomllib.load(f)
-        except Exception:
-            continue
-        if cfg.get("signature") == sig:
-            return p
-    return None
-
-
 # ============================================================================
-#  Legacy command building (unchanged)
-# ============================================================================
-
-def _stringify(v) -> str:
-    if v is True:
-        return "true"
-    if v is False:
-        return "false"
-    return str(v)
-
-
-def _canvas_cmd(canvas) -> dict:
-    if isinstance(canvas, str):
-        return {"type": "comfy_bind_canvas", "source": canvas}
-    if isinstance(canvas, list) and len(canvas) == 2:
-        return {"type": "comfy_bind_canvas",
-                "source": str(canvas[0]), "layer_name": str(canvas[1])}
-    raise ValueError(f"canvas must be a string, a 2-element list, or "
-                     f"None; got {canvas!r}")
-
-
-def _selection_cmd(selection) -> dict:
-    if isinstance(selection, str):
-        return {"type": "comfy_bind_selection", "source": selection}
-    if isinstance(selection, list) and len(selection) == 4:
-        return {"type": "comfy_bind_selection",
-                "source": str(selection[0]), "layer_name": str(selection[1]),
-                "context": str(selection[2]), "padding": int(selection[3])}
-    raise ValueError(
-        f"selection must be a string, a 4-element list, or None; "
-        f"got {selection!r}"
-    )
-
-
-def build_commands(cfg: dict) -> list:
-    """Legacy path: build the batch for an ETN_* workflow."""
-    if "commands" in cfg:
-        cmds = cfg["commands"]
-        if not isinstance(cmds, list):
-            raise ValueError("commands must be an array of tables")
-        for i, c in enumerate(cmds):
-            if not isinstance(c, dict) or "type" not in c:
-                raise ValueError(f"commands[{i}] must have a 'type' key")
-        return cmds
-
-    watch = bool(cfg.get("watch", True))
-
-    cmds: list = [
-        {"type": "comfy_connect",
-         "host": str(cfg.get("host", "127.0.0.1")),
-         "port": int(cfg.get("port", 8188)),
-         "check": True,
-         "watch": watch},
-    ]
-
-    workflow = cfg.get("workflow") or ""
-    if workflow:
-        load_cmd: dict = {"type": "comfy_load", "name": str(workflow)}
-        if bool(cfg.get("exclusive", True)):
-            load_cmd["exclusive"] = True
-        cmds.append(load_cmd)
-
-    for logical, actual in (cfg.get("layer_aliases") or {}).items():
-        cmds.append({
-            "type": "comfy_bind_layer_alias",
-            "logical_name": str(logical),
-            "actual_name": str(actual),
-        })
-
-    canvas = cfg.get("canvas", "active")
-    if canvas is not None:
-        cmds.append(_canvas_cmd(canvas))
-
-    selection = cfg.get("selection", None)
-    if selection is not None:
-        cmds.append(_selection_cmd(selection))
-
-    for name, value in (cfg.get("params") or {}).items():
-        cmds.append({
-            "type": "comfy_set_param",
-            "name": name,
-            "value": _stringify(value),
-        })
-
-    generate_cmd: dict = {
-        "type": "comfy_generate",
-        "timeout": float(cfg.get("timeout", 55.0)),
-    }
-    output_name = cfg.get("output_name") or ""
-    if output_name:
-        generate_cmd["output_name"] = str(output_name)
-
-    count_val = cfg.get("count", 1)
-    try:
-        count = int(count_val)
-    except (TypeError, ValueError):
-        count = 1
-    if count > 1:
-        generate_cmd["count"] = count
-
-    seed_val = cfg.get("seed", "")
-    if seed_val not in ("", None):
-        try:
-            generate_cmd["seed"] = int(seed_val)
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"seed must be an integer or blank, got {seed_val!r}"
-            )
-
-    cmds.append(generate_cmd)
-    return cmds
-
-
-# ============================================================================
-#  Native-v2: PanelConfig + parse_panel_config + build_batch (Stage 3)
+#  PanelConfig + parse_panel_config + build_batch
 # ============================================================================
 
 @dataclass
@@ -785,37 +355,25 @@ class PanelConfig:
     crop_context: str = "entire_image"
     crop_padding: int = 0
     paste: PasteSpec = field(default_factory=PasteSpec)
-    # Set when parsing a browser-sourced config; None for file-sourced.
-    signature: Optional[str] = None
 
 
 def parse_panel_config(path: Path) -> PanelConfig:
     """Read a TOML panel config and return a `PanelConfig`.
 
-    Structural validation only: raises ValueError on malformed sections
-    or invalid enum values. Graph-aware validation happens later, when
-    `comfy_apply_config` is called against a loaded workflow.
-
-    Old-style configs (no `[resources]` / `[crop]` / `[paste]`) parse
-    cleanly with empty `resources`/`params` — the config then validates
-    against a native workflow that has no slots. That is not what the
-    old-style config authors meant, but it is not this function's job
-    to guess: the CLI decides old-vs-new based on the workflow's node
-    classes (see `cmd_run`), and old workflows keep using
-    `build_commands`, never this function.
+    Structural validation only. Graph-aware validation happens later,
+    when `comfy_apply_config` is called against a loaded workflow.
     """
     try:
         cfg = load_config(path)
     except tomllib.TOMLDecodeError as e:
         raise ValueError(f"{path}: invalid TOML: {e}") from e
 
-    # -- core fields --
     try:
         host = str(cfg.get("host", "127.0.0.1"))
         port = int(cfg.get("port", 8188))
         workflow = str(cfg.get("workflow", ""))
         exclusive = bool(cfg.get("exclusive", True))
-        watch = bool(cfg.get("watch", True))
+        watch = bool(cfg.get("watch", False))
         timeout = float(cfg.get("timeout", 55.0))
         count = int(cfg.get("count", 1))
     except (TypeError, ValueError) as e:
@@ -837,11 +395,6 @@ def parse_panel_config(path: Path) -> PanelConfig:
                 f"{seed_raw!r}"
             )
 
-    signature = cfg.get("signature")
-    if signature is not None:
-        signature = str(signature)
-
-    # -- [resources] --
     resources: dict[str, ResourceSpec] = {}
     raw_resources = cfg.get("resources", {}) or {}
     if not isinstance(raw_resources, dict):
@@ -874,12 +427,10 @@ def parse_panel_config(path: Path) -> PanelConfig:
         resources[name] = ResourceSpec(source=source,
                                        layer_name=layer_name)
 
-    # -- [params] --
     params: dict[str, Any] = dict(cfg.get("params") or {})
     if not isinstance(params, dict):
         raise ValueError(f"{path}: [params] must be a table")
 
-    # -- [crop] --
     crop = cfg.get("crop", {}) or {}
     if not isinstance(crop, dict):
         raise ValueError(f"{path}: [crop] must be a table")
@@ -901,7 +452,6 @@ def parse_panel_config(path: Path) -> PanelConfig:
             f"{path}: [crop].padding must be >= 0, got {crop_padding}"
         )
 
-    # -- [paste] --
     paste_cfg = cfg.get("paste", {}) or {}
     if not isinstance(paste_cfg, dict):
         raise ValueError(f"{path}: [paste] must be a table")
@@ -936,26 +486,11 @@ def parse_panel_config(path: Path) -> PanelConfig:
         crop_context=crop_context,
         crop_padding=crop_padding,
         paste=paste,
-        signature=signature,
     )
 
 
 def build_batch(config: PanelConfig) -> dict:
-    """Build the batch the daemon consumes for a native-v2 workflow.
-
-    Produces:
-
-        comfy_connect       — establish connection, start proxy if needed
-        comfy_load          — load the workflow graph
-        comfy_apply_config  — validate + store resources/params/crop/paste
-        comfy_generate      — run the pipeline (Stage 5 consumes the config)
-
-    The `comfy_apply_config` args are JSON strings because the daemon's
-    dispatch hands strings to the handler (they are typed `str` in the
-    schema for argparse compatibility). The handler parses them and
-    rejects on any structural problem, so the daemon is still the
-    authority for graph-aware validation.
-    """
+    """Build the batch the daemon consumes for a native-v2 workflow."""
     resources_json = json.dumps({
         name: {
             "source": spec.source,
@@ -996,8 +531,7 @@ def build_batch(config: PanelConfig) -> dict:
             {"type": "comfy_connect",
              "host": config.host,
              "port": config.port,
-             "check": True,
-             "watch": config.watch},
+             "check": True},
             load_cmd,
             {"type": "comfy_apply_config",
              "resources": resources_json,
@@ -1049,10 +583,10 @@ def apply_preset(preset_path: Path, config_path: Path,
                  dry_run: bool = False) -> int:
     """Splice a preset's changes into a config file.
 
-    Extended in Stage 3 to also handle `[resources]` / `[crop]` /
-    `[paste]` sections. Same semantics as before: values spliced
-    section-by-section, unknown keys skipped, `[delete]` removes by
-    name, comments and ordering preserved via tomlkit.
+    Handles `[params]`, `[resources]`, `[crop]`, `[paste]`, and legacy
+    `[layer_aliases]` (harmless no-op now that the pipeline ignores it).
+    Same semantics: values spliced section-by-section, unknown keys
+    skipped, `[delete]` removes by name, comments preserved via tomlkit.
     """
     try:
         preset = tomlkit.parse(preset_path.read_text(encoding="utf-8"))

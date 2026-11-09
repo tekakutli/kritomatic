@@ -94,6 +94,18 @@ All five collapse into one debounced `layersChanged`, which routes to
 The one gap, named in layers_watcher.py, is a native-Krita layer add
 performed while no trigger fires and no other interaction happens;
 the next focus or popup open refreshes.
+
+Workflow hint text
+==================
+`_update_workflow_hint` renders a "No workflow loaded" hint when the
+panel description carries no `workflow` metadata section. The hint
+names the two CLI entry points that load a workflow:
+
+    kritomatic comfyui comfy_load --name <slug>
+    kritomatic comfyui panel run <slug>
+
+There is no browser-publish option; that transport died with the
+tooling-nodes package. The hint text was updated accordingly.
 """
 
 from __future__ import annotations
@@ -281,7 +293,8 @@ class KritomaticPanel(QDockWidget):
             self._hint.setText(
                 "No workflow loaded. Run "
                 "<code>kritomatic comfyui panel run &lt;name&gt;</code> "
-                "or publish from ComfyUI&rsquo;s browser."
+                "or <code>kritomatic comfyui comfy_load --name "
+                "&lt;name&gt;</code> from a terminal."
             )
             self._hint.show()
 

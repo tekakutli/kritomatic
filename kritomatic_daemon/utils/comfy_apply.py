@@ -29,9 +29,9 @@ Design notes
     shape — mixed sizes fail ComfyUI's validation.
 
   * The graph is deep-copied at the node level (fresh ``inputs`` dict
-    per node) before substitution, matching the two-level copy pattern
-    in ``comfyui_tooling._copy_for_pruning``. The caller's
-    ``_active_workflow_graph`` is never mutated.
+    per node) before substitution, so the caller's
+    ``_active_workflow_graph`` is never mutated by a single
+    substitution's failure.
 
   * A resource slot with no config entry is an error, not a warning:
     leaving a ``@``-prefixed literal in the graph means ComfyUI tries
@@ -59,7 +59,7 @@ from .comfyui_krita import (
     read_selection_bounds,
     read_selection_mask,
 )
-from .comfyui_tooling import EncodedImage
+from .comfyui_krita import EncodedImage
 
 
 Bounds = tuple[int, int, int, int]

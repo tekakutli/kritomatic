@@ -28,7 +28,9 @@ class ConnectionCommands(AutoDispatchHandler):
         category="comfyui",
         help_text="Connect to a ComfyUI server. Starts the workflow "
                   "watcher by default and blocks until the subscription "
-                  "is live.",
+                  "is live. Also ensures the comfy-api-proxy is running "
+                  "and pointed at the same ComfyUI (auto-starts it when "
+                  "not).",
         args={
             "--host": {"type": "str", "default": "127.0.0.1",
                        "help": "ComfyUI host"},
@@ -55,6 +57,21 @@ class ConnectionCommands(AutoDispatchHandler):
         watch = bool(params.get("watch", True))
         subscribe_timeout = float(params.get("subscribe_timeout", 5.0))
 
+        # ---- Proxy prelude ----
+        # Every generation path goes through /api/v2/* via the proxy;
+        # make sure it is running before we bother with ComfyUI. Auto-start
+        # is explicit here (not deferred) so the daemon's reported state
+        # accurately reflects the proxy's.
+        from ..proxy import manager as proxy_manager
+        proxy_state = proxy_manager.status()
+        if not proxy_state.get("running"):
+            proxy_start = proxy_manager.start(
+                comfyui=f"http://{host}:{port}",
+            )
+            proxy_state = proxy_manager.status()
+            if not proxy_start.get("success"):
+                proxy_state["start_error"] = proxy_start.get("message")
+
         parent._host = host
         parent._port = port
         parent._client = get_client(host, port)
@@ -71,14 +88,16 @@ class ConnectionCommands(AutoDispatchHandler):
                     )
                 except ComfyError as e:
                     return {"success": False,
-                            "message": f"Watcher unavailable: {e}"}
+                            "message": f"Watcher unavailable: {e}",
+                            "data": {"proxy": proxy_state}}
                 parent._release_to_browser()
             return {
                 "success": True,
                 "message": f"Connected to {host}:{port}",
                 "data": {"host": host, "port": port,
                          "watching": watch,
-                         "subscribed": subscribed},
+                         "subscribed": subscribed,
+                         "proxy": proxy_state},
             }
 
         try:
@@ -88,23 +107,16 @@ class ConnectionCommands(AutoDispatchHandler):
             parent._client = None
             return {"success": False,
                     "message": f"Could not reach ComfyUI at "
-                               f"{host}:{port}: {e}"}
+                               f"{host}:{port}: {e}",
+                    "data": {"proxy": proxy_state}}
 
         parent._object_info = info
 
+        # The tooling-nodes presence check is now advisory only: the
+        # native v2 path does not need them. Keep the field in `data`
+        # for panel-config authors who still want to know, but do not
+        # fail the connection when they are absent.
         has_tooling = "ETN_LoadImageCache" in info
-        if not has_tooling:
-            return {
-                "success": False,
-                "message": (
-                    f"Connected to {host}:{port}, but the "
-                    f"comfyui-tooling-nodes package is not installed. "
-                    f"Install it in ComfyUI/custom_nodes/ and restart "
-                    f"ComfyUI."
-                ),
-                "data": {"host": host, "port": port,
-                         "node_count": len(info)},
-            }
 
         subscribed = False
         if watch:
@@ -122,26 +134,32 @@ class ConnectionCommands(AutoDispatchHandler):
                                f"workflow watcher could not start: {e}",
                     "data": {"host": host, "port": port,
                              "node_count": len(info),
-                             "has_tooling_nodes": True,
-                             "watching": False},
+                             "has_tooling_nodes": has_tooling,
+                             "watching": False,
+                             "proxy": proxy_state},
                 }
             parent._release_to_browser()
 
-        msg = f"Connected to {host}:{port} " \
-              f"({len(info)} node classes registered)"
+        msg = (f"Connected to {host}:{port} "
+               f"({len(info)} node classes registered)")
         if watch and subscribed:
             msg += ", watching browser workflows"
         elif watch:
             msg += ", watcher started but not yet subscribed"
+        if proxy_state.get("running") and proxy_state.get("healthy"):
+            msg += ", proxy healthy"
+        elif proxy_state.get("start_error"):
+            msg += f", proxy unavailable ({proxy_state['start_error']})"
 
         return {
             "success": True,
             "message": msg,
             "data": {"host": host, "port": port,
                      "node_count": len(info),
-                     "has_tooling_nodes": True,
+                     "has_tooling_nodes": has_tooling,
                      "watching": watch,
-                     "subscribed": subscribed},
+                     "subscribed": subscribed,
+                     "proxy": proxy_state},
         }
 
     @command(

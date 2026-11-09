@@ -40,6 +40,12 @@ _READ_ONLY_COMMANDS = frozenset({
     "comfy_list_recent_aliases",
     "comfy_list_scratch_blobs",
     "comfy_dump_scratch_blobs",
+    # Proxy status/logs are read-only: they must not trigger a state
+    # publish, which would re-probe the proxy on every poll.
+    "comfy_proxy_status",
+    "comfy_proxy_logs",
+    "comfy_proxy_health",
+    "comfy_proxy_test",
 })
 
 

@@ -3,7 +3,7 @@ comfyui.py — the @command surface for driving ComfyUI from a bundle.
 
 The container. Owns the shared state (connection, active workflow,
 params, layer aliases, scratch blobs, batch tracking, publisher map)
-and dispatches to six sub-handlers, each in its own file:
+and dispatches to seven sub-handlers, each in its own file:
 
     comfyui_connection   comfy_connect, comfy_watch, publisher pinning
     comfyui_workflow     comfy_load, comfy_set_param, layer aliases
@@ -11,6 +11,8 @@ and dispatches to six sub-handlers, each in its own file:
     comfyui_scratch      comfy_set_layer_pixels, scratch blob mgmt
     comfyui_generation   comfy_generate, cancel, wait, paste, history
     comfyui_status       comfy_status, comfy_batches, list_publishers
+    comfyui_proxy        comfy_proxy_install / start / stop / status /
+                         logs / uninstall
 
 Supporting modules, split by stability:
 
@@ -31,9 +33,10 @@ Supporting modules, split by stability:
     comfyui_workflow     workflow loading, params, aliases
     comfyui_scratch      scratch-blob subsystem
     comfyui_generation   the whole generation pipeline
+    comfyui_proxy        supervisor for the comfy-api-proxy child process
 
 Every sub-handler holds `self.parent` back to this handler. The state
-lives here because all six sub-handlers touch overlapping pieces of
+lives here because all seven sub-handlers touch overlapping pieces of
 it. Sub-handlers are stateless apart from that back-reference.
 
 State publishing
@@ -74,6 +77,7 @@ from .comfyui_bindings import BindingsCommands
 from .comfyui_scratch import ScratchCommands
 from .comfyui_generation import GenerationCommands
 from .comfyui_status import StatusCommands
+from .comfyui_proxy import ProxyCommands
 
 
 class ComfyUIHandler(AutoDispatchHandler):
@@ -145,6 +149,7 @@ class ComfyUIHandler(AutoDispatchHandler):
         self._bindings_cmds = BindingsCommands(self)
         self._scratch_cmds = ScratchCommands(self)
         self._generation_cmds = GenerationCommands(self)
+        self._proxy_cmds = ProxyCommands(self)
 
         self._sub_handlers = [
             self._connection_cmds,
@@ -153,6 +158,7 @@ class ComfyUIHandler(AutoDispatchHandler):
             self._scratch_cmds,
             self._generation_cmds,
             self._status_cmds,
+            self._proxy_cmds,
         ]
 
         # Rebuild the dispatch map now that _sub_handlers exists.

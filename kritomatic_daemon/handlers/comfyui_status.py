@@ -20,14 +20,18 @@ class StatusCommands(AutoDispatchHandler):
     @command(
         category="comfyui",
         help_text="Return the handler's current workflow, parameters, "
-                  "layer aliases, bindings, and the active workflow's "
-                  "signature.",
+                  "layer aliases, bindings, proxy state, and the active "
+                  "workflow's signature.",
         args={},
     )
     def comfy_status(self, params):
         parent = self.parent
         with parent._batches_lock:
             active_batches = sorted(parent._batches.keys())
+
+        from ..proxy import manager as proxy_manager
+        proxy_state = proxy_manager.status()
+
         return {
             "success": True,
             "message": "ComfyUI handler state",
@@ -71,6 +75,7 @@ class StatusCommands(AutoDispatchHandler):
                     parent._active_workflow_publisher_key,
                 "published_publishers":
                     sorted(parent._published_publishers.keys()),
+                "proxy": proxy_state,
             },
         }
 

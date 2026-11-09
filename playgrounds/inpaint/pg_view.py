@@ -3,8 +3,14 @@
 Layers, in order:
 
   1. image + selected-mask tinted overlays     (pg_view_image)
-  2. inpaint context rectangle                 (pg_view_inpaint)
-  3. chrome text (top-left status line)
+  2. rotation clip-zone overlay                (pg_view_inpaint)
+  3. inpaint context rectangle                 (pg_view_inpaint)
+  4. chrome text (top-left status line)
+
+The clip-zone overlay sits between the image and the context rectangle
+so the context rectangle can be drawn over the tint without obscuring
+it. It is drawn only when the display rotation is non-zero; at 0° there
+is no clipping to show and the layer is skipped entirely.
 
 Adding a new layer means: write a new `pg_view_*.py`, add one call to
 `drawView()`, done — no other file is touched."""
@@ -13,7 +19,9 @@ VIEW_JS = r"""
 import { ctx, board, view, fittedImageRect } from "./pg_state.js";
 import { selectedMask } from "./pg_masks.js";
 import { drawImageLayer } from "./pg_view_image.js";
-import { drawInpaintContext } from "./pg_view_inpaint.js";
+import {
+  drawInpaintContext, drawRotationClipOverlay,
+} from "./pg_view_inpaint.js";
 
 /* ============================================================
    Header text — the one-line status bar at top-left
@@ -81,10 +89,13 @@ export function drawView() {
   /* ---- 1. image + mask overlays ---- */
   drawImageLayer(r);
 
-  /* ---- 2. inpaint context rect ---- */
+  /* ---- 2. rotation clip-zone overlay ---- */
+  drawRotationClipOverlay(r);
+
+  /* ---- 3. inpaint context rect ---- */
   drawInpaintContext(r);
 
-  /* ---- 3. chrome ---- */
+  /* ---- 4. chrome ---- */
   _drawChromeText(selectedMask());
 }
 """

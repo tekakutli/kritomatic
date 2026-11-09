@@ -14,7 +14,94 @@ Operations exposed by this playground:
 
 Not present (moved to sam3_segment or deferred to v2): Segment All,
 Refine, mask prompt, region painting, points, undo/redo, export to
-Krita."""
+Krita.
+
+ROTATED PAYLOAD (both modes)
+============================
+Both the "context rectangle enabled" and "no context rectangle" cases
+send a ROTATED payload whenever `view.rotation != 0`. The only
+difference between them is the context mask:
+
+  * context rectangle enabled → context = the user's rect, cropped
+    to `cropW × cropH` at the shifted position
+  * context rectangle disabled → context = full white (whole crop
+    frame is context, so the workflow crops to the selection bbox)
+
+At `view.rotation == 0`, both fall into a single un-rotated fast path
+that sends the original at `W × H` with `outputRotation: 0`.
+
+This makes Mode A behave like Mode B: the payload rotates, the crop
+expands if the mask extends into the clip zones, and the composite
+uses the same crop-aware keep mask. `projectCropDims` handles both
+modes (the `inpaintEnabled` parameter selects whether the context
+clips the mask or not).
+
+The trade-off — Mode A now sends rotated content when
+`view.rotation != 0` — is the same one Mode B has always made. If
+you need the model to see the un-rotated image in Mode A, keep
+`view.rotation` at 0 for those inpaints.
+
+RETURNED-IMAGE COMPOSITING
+==========================
+The inpaint result comes back with black corners whose shape is
+determined entirely by the display rotation that was active when the
+payload was built, AND by how much the crop was expanded to cover the
+selection mask. `_setOriginalFromB64` composites the result over the
+previous original, masked to the result's content region.
+
+Two facts make the mask computable from geometry alone, without
+inspecting the returned image's pixels:
+
+  · The client sent `rotate(original, θ)` cropped to (cropW × cropH),
+    so the sent image had transparent corners wherever the rotated
+    content extended past the crop.
+
+  · ComfyUI's LoadImage reads alpha as RGB, so those transparent
+    corners became black by the time SaveImage wrote the result. The
+    server's un-rotation cropped back to (cropW × cropH) the same way.
+
+So the "content region" of the returned image is exactly
+`rotate((cropW × cropH) rect, -θ) ∩ (cropW × cropH)`, and
+`_buildKeepMask` reproduces it with one `fillRect` under a rotation
+transform. No pixel scan, no heuristic on "what counts as black"
+(which would false-positive on images that legitimately have dark
+corners).
+
+Crop expansion
+==============
+`projectCropDims` (in `pg_inpaint.js`) computes the crop dims from
+the mask bbox intersected with the context rect (or unclipped when
+inpaint is disabled). Base case is (W × H) — the current behaviour,
+clipping at the rotated-frame corners. When the mask extends into
+those corners, the crop expands symmetrically until the effective
+selection is covered. The expansion is bounded by (W', H') — the
+bbox of the full rotated frame. Symmetric expansion around the
+frame's center means the server's `rotate(θ, expand=False)`
+un-rotation still puts the original content back at the (W × H)
+center of the returned image, so the client center-crops cleanly.
+
+The view's tint overlay (`drawRotationClipOverlay`) uses the same
+`projectCropDims` on every frame, so what the user sees as "still
+tinted" is exactly what would still be black in the payload.
+
+Rotation-capture timing
+=======================
+The rotation that determines the mask is the rotation the *server*
+un-rotated by. That is the rotation that was live in `view.rotation`
+at the moment `_buildInpaintPayload` was called, which is *not*
+necessarily `view.rotation` when the response arrives 20–60 s later.
+`_inpaintAction` captures it before the `await` and passes it to
+`_setOriginalFromB64`. A user who scrubs the rotation slider during
+the poll does not desync the mask from the returned image.
+
+Compositing at 0° / no mask overlaps
+====================================
+At rotation 0 the projection returns base dims, the mask is the
+classic diamond, the center-crop in `_setOriginalFromB64` is a
+no-op, and the composite is result-over-original — indistinguishable
+from replacing the original outright when the result is opaque
+everywhere. Nothing regresses.
+"""
 
 PANEL_BINDINGS_JS = r"""
 import { board, setImage, clearImage, _scheduleDraw,
@@ -24,7 +111,8 @@ import {
   selectedMask, selectedMaskIdx,
   replaceMaskSelection,
 } from "./pg_masks.js";
-import { buildMaskFromContextRectB64 } from "./pg_inpaint.js";
+import { buildMaskFromContextRectB64, projectCropDims } from "./pg_inpaint.js";
+import { computeMaskBBox } from "./pg_pixels.js";
 import { syncMaskList } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
 import { uploadImageFile, fetchStatus, runInpaint, interruptInpaint }
@@ -36,6 +124,30 @@ import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyAll,
 } from "./pgkit/remote_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
+
+/* ============================================================
+   Result-compositing tuning
+   ============================================================
+   Inset, in pixels, applied inward to the mask's rotated
+   rectangle when compositing the returned image over the
+   previous original. Discards the returned image's antialiased
+   edge transition band, which would otherwise show through as a
+   hairline seam at the diamond boundary.
+
+   Tune up (5, 7) if the seam persists — the transition width
+   depends on PIL's rotate quality on the server plus Canvas's
+   imageSmoothingQuality on the client, and can vary.
+
+   Tune down (2, 1) if a strip of un-inpainted original becomes
+   visible at the boundary — unlikely, since the inpaint region
+   is normally well inside the diamond and the inset lives in
+   the band between the inpaint and the diamond edge where the
+   original and returned are visually identical.
+
+   Not applied at rotation 0: no diamond edge, no antialiased
+   transition, no reason to trim. */
+
+const SEAM_INSET_PX = 3;
 
 /* ============================================================
    File picking / drop
@@ -179,69 +291,69 @@ function _maskFromRectAction() {
 }
 
 /* ============================================================
-   Inpaint payload builders
+   Inpaint payload builder
    ============================================================
-   Two modes, selected by `board.inpaintEnabled`.
+   Two states, selected by `view.rotation`:
 
-   Mode A — no context rectangle (inpaintEnabled === false)
-   -------------------------------------------------------
-   Send the original, un-rotated image, the full mask, and a
-   full-white context. The workflow inpaints the mask region of
-   the whole image. `outputRotation = 0` because nothing needs to
-   be un-rotated — the mask already lives in original-image
-   coords.
+   Un-rotated (theta = 0)
+   ----------------------
+   Send the original, un-rotated image at (W × H), the full mask
+   composited over black, and the context mask (full white when no
+   context rectangle is set; the user's rect when it is).
+   `outputRotation = 0`. This is the current Mode A behaviour, and
+   is what Mode B has always effectively done at rotation 0 (the
+   rotation math is an identity at theta = 0).
 
-   Mode B — context rectangle enabled
-   ----------------------------------
-   The rectangle is fixed in *screen* coords: it does not rotate
-   with the view, it stays where the user dragged it. The image
-   under it is the *rotated* image, so the content under the
-   rectangle is a diamond of image pixels (the un-rotated image
-   rotated by `view.rotation` around its center).
+   Rotated (theta != 0)
+   --------------------
+   Send a rotated payload. The crop region is derived from
+   `projectCropDims`: base (W × H) unless the mask (intersected
+   with the context rect, or unclipped when inpaint is disabled)
+   extends beyond the base crop, in which case it expands
+   symmetrically until the mask is covered.
 
-   To reproduce what the user sees on screen, we send:
+   Mode A (no context rect):
+     canvas    = rotated original, cropped to (cropW × cropH)
+     selection = rotated mask, cropped to (cropW × cropH)
+     context   = full white on (cropW × cropH)
+     outputRotation = -theta
 
-     thecanvas    = the rotated image, center-cropped to (W × H)
-     theselection = the rotated mask, center-cropped to (W × H),
-                    multiplied by a white rectangle at
-                    (c.x, c.y, c.w, c.h) on black
-     thecontext   = the same white rectangle at (c.x, c.y, c.w, c.h)
+   Mode B (context rect):
+     canvas    = same
+     selection = rotated mask, cropped, intersected with the
+                 context rect at its shifted position
+     context   = user's rect on (cropW × cropH) at its shifted
+                 position
+     outputRotation = -theta
 
-   The centered crop is what fits a (W' × H') rotated canvas into
-   the doc's (W × H) layer transport. The rect position in
-   rotated-canvas coords is (c.x − W/2 + W'/2, c.y − H/2 + H'/2);
-   subtracting the crop offset ((W' − W)/2, (H' − H)/2) gives back
-   (c.x, c.y) — so the rectangle lands at the same position in the
-   crop frame as it does in the un-rotated image. Only the content
-   behind it is rotated, which is exactly the mismatch the user
-   reported in the diagnostic: "the context should be rotated,
-   and the mask should be rotated mask ∩ rect."
+   Both modes end up with the same `outputRotation`; the difference
+   is only how the context mask is built and whether the selection
+   is clipped by the context rect before being sent.
+
+   The context rect position in the expanded crop frame is
+   (cropW - W)/2 + c.x for x, same for y. Derivation: base frame's
+   (c.x, c.y) is at (cropW - W)/2 + c.x in the expanded frame
+   because expansion shifts the frame's top-left by
+   ((cropW - W)/2, (cropH - H)/2) in the negative direction.
 
    `outputRotation = -view.rotation` tells the daemon to rotate the
-   result back before pasting, so the composite in the document is
-   back in original orientation with the inpaint applied to the
-   corresponding original-image region.
+   result back before pasting. The client center-crops the returned
+   (cropW × cropH) image back to (W × H) via `_setOriginalFromB64`
+   and applies `_buildKeepMask` on the (W × H) composite to mask
+   the non-content corners — same logic as before, just at the
+   expanded crop dims. */
 
-   Corner caveat: the (W × H) crop of the rotated canvas misses the
-   four corners of the original image (they extend beyond the
-   crop when rotated). After un-rotation the new layer has
-   transparent corners. Composite over the still-present original
-   layer looks correct (original shows through the transparency);
-   only the new layer alone is incomplete. This is fine for small
-   central rects and is the practical trade-off of fitting rotated
-   content through the (W × H) layer transport. */
-
-function _buildInpaintPayload(mask) {
+function _buildInpaintPayload(mask, maskBBoxOrig) {
   const W = board.imageWidth, H = board.imageHeight;
   const c = board.inpaintContext;
   const theta = view.rotation;
 
-  // ---- Mode A: no context rectangle ----
-  if (!board.inpaintEnabled) {
+  // ---- Un-rotated path: theta = 0 ----
+  // Same for both modes; only the context mask differs.
+  if (!theta || theta % 360 === 0) {
     const canvasB64 = board.imageDataUrl.replace(
       /^data:image\/png;base64,/, "");
 
-    // Selection = full mask, composited over black.
     const selCanvas = document.createElement("canvas");
     selCanvas.width = W; selCanvas.height = H;
     const scx = selCanvas.getContext("2d");
@@ -253,37 +365,60 @@ function _buildInpaintPayload(mask) {
     const selectionB64 = selCanvas.toDataURL("image/png").replace(
       /^data:image\/png;base64,/, "");
 
-    // Context = full white (no crop).
-    const ctxCanvas = document.createElement("canvas");
-    ctxCanvas.width = W; ctxCanvas.height = H;
-    const ccx = ctxCanvas.getContext("2d");
-    ccx.fillStyle = "#fff";
-    ccx.fillRect(0, 0, W, H);
-    const contextB64 = ctxCanvas.toDataURL("image/png").replace(
-      /^data:image\/png;base64,/, "");
+    let contextB64;
+    if (!board.inpaintEnabled) {
+      const ctxCanvas = document.createElement("canvas");
+      ctxCanvas.width = W; ctxCanvas.height = H;
+      const ccx = ctxCanvas.getContext("2d");
+      ccx.fillStyle = "#fff";
+      ccx.fillRect(0, 0, W, H);
+      contextB64 = ctxCanvas.toDataURL("image/png").replace(
+        /^data:image\/png;base64,/, "");
+    } else {
+      const ctxCanvas = document.createElement("canvas");
+      ctxCanvas.width = W; ctxCanvas.height = H;
+      const ccx = ctxCanvas.getContext("2d");
+      ccx.fillStyle = "#000";
+      ccx.fillRect(0, 0, W, H);
+      ccx.fillStyle = "#fff";
+      ccx.fillRect(c.x, c.y, c.w, c.h);
+      contextB64 = ctxCanvas.toDataURL("image/png").replace(
+        /^data:image\/png;base64,/, "");
+    }
 
-    return { canvasB64, selectionB64, contextB64, outputRotation: 0 };
+    return {
+      canvasB64, selectionB64, contextB64,
+      outputRotation: 0,
+      cropW: W, cropH: H,
+    };
   }
 
-  // ---- Mode B: context rectangle enabled ----
-  // Rotate the original image into a (W' × H') frame, then
-  // center-crop back to (W × H).
-  const rotImg = _rotateImage(board.originalImageEl, theta);
-  const cropXImg = Math.round((rotImg.width  - W) / 2);
-  const cropYImg = Math.round((rotImg.height - H) / 2);
+  // ---- Rotated path: theta != 0, both modes unified ----
+  const rad = (theta % 360) * Math.PI / 180;
+  const cosA = Math.abs(Math.cos(rad));
+  const sinA = Math.abs(Math.sin(rad));
+  const Wp = Math.max(1, Math.round(W * cosA + H * sinA));
+  const Hp = Math.max(1, Math.round(W * sinA + H * cosA));
 
+  const { cropW, cropH } = projectCropDims(
+    W, H, maskBBoxOrig, theta, c, board.inpaintEnabled,
+  );
+  const cropX = Math.round((Wp - cropW) / 2);
+  const cropY = Math.round((Hp - cropH) / 2);
+
+  // Canvas: rotate original to W' × H', crop to the (possibly
+  // expanded) region.
+  const rotImg = _rotateImage(board.originalImageEl, theta);
   const canvasCv = document.createElement("canvas");
-  canvasCv.width = W; canvasCv.height = H;
+  canvasCv.width = cropW; canvasCv.height = cropH;
   const canvasCtx = canvasCv.getContext("2d");
   canvasCtx.imageSmoothingEnabled = true;
   canvasCtx.imageSmoothingQuality = "high";
-  canvasCtx.drawImage(rotImg, -cropXImg, -cropYImg);
+  canvasCtx.drawImage(rotImg, -cropX, -cropY);
   const canvasB64 = canvasCv.toDataURL("image/png").replace(
     /^data:image\/png;base64,/, "");
 
-  // Mask: build at (W × H) first so mask.img is normalized to
-  // canvas dims even if it was imported at a different size.
-  // Then rotate → (W' × H') → center-crop to (W × H).
+  // Selection: rotated mask, cropped to the same expanded region.
   const maskBase = document.createElement("canvas");
   maskBase.width = W; maskBase.height = H;
   const mbx = maskBase.getContext("2d");
@@ -294,83 +429,238 @@ function _buildInpaintPayload(mask) {
   if (mask && mask.img) mbx.drawImage(mask.img, 0, 0, W, H);
 
   const rotMask = _rotateImage(maskBase, theta);
-  const cropXMask = Math.round((rotMask.width  - W) / 2);
-  const cropYMask = Math.round((rotMask.height - H) / 2);
-
   const maskCv = document.createElement("canvas");
-  maskCv.width = W; maskCv.height = H;
+  maskCv.width = cropW; maskCv.height = cropH;
   const maskCtx = maskCv.getContext("2d");
   maskCtx.imageSmoothingEnabled = true;
   maskCtx.imageSmoothingQuality = "high";
   maskCtx.fillStyle = "#000";
-  maskCtx.fillRect(0, 0, W, H);
-  maskCtx.drawImage(rotMask, -cropXMask, -cropYMask);
+  maskCtx.fillRect(0, 0, cropW, cropH);
+  maskCtx.drawImage(rotMask, -cropX, -cropY);
 
-  // Intersect with the fixed rect. The rect stays axis-aligned
-  // at (c.x, c.y) in the crop frame; only the mask content behind
-  // it is rotated. `multiply` keeps the rotated mask values
-  // inside the rect and zeros them outside — mask ∩ rect.
-  const rectMask = document.createElement("canvas");
-  rectMask.width = W; rectMask.height = H;
-  const rmx = rectMask.getContext("2d");
-  rmx.fillStyle = "#000";
-  rmx.fillRect(0, 0, W, H);
-  rmx.fillStyle = "#fff";
-  rmx.fillRect(c.x, c.y, c.w, c.h);
+  let contextB64;
+  if (board.inpaintEnabled) {
+    // Mode B: intersect with user's context rect at its position in
+    // the expanded crop frame.
+    const ctxInCropX = (cropW - W) / 2 + c.x;
+    const ctxInCropY = (cropH - H) / 2 + c.y;
 
-  maskCtx.globalCompositeOperation = "multiply";
-  maskCtx.drawImage(rectMask, 0, 0);
-  maskCtx.globalCompositeOperation = "source-over";
+    const rectMask = document.createElement("canvas");
+    rectMask.width = cropW; rectMask.height = cropH;
+    const rmx = rectMask.getContext("2d");
+    rmx.fillStyle = "#000";
+    rmx.fillRect(0, 0, cropW, cropH);
+    rmx.fillStyle = "#fff";
+    rmx.fillRect(ctxInCropX, ctxInCropY, c.w, c.h);
+
+    maskCtx.globalCompositeOperation = "multiply";
+    maskCtx.drawImage(rectMask, 0, 0);
+    maskCtx.globalCompositeOperation = "source-over";
+
+    const ctxCanvas = document.createElement("canvas");
+    ctxCanvas.width = cropW; ctxCanvas.height = cropH;
+    const ccx = ctxCanvas.getContext("2d");
+    ccx.fillStyle = "#000";
+    ccx.fillRect(0, 0, cropW, cropH);
+    ccx.fillStyle = "#fff";
+    ccx.fillRect(ctxInCropX, ctxInCropY, c.w, c.h);
+    contextB64 = ctxCanvas.toDataURL("image/png").replace(
+      /^data:image\/png;base64,/, "");
+  } else {
+    // Mode A: whole crop frame is context.
+    const ctxCanvas = document.createElement("canvas");
+    ctxCanvas.width = cropW; ctxCanvas.height = cropH;
+    const ccx = ctxCanvas.getContext("2d");
+    ccx.fillStyle = "#fff";
+    ccx.fillRect(0, 0, cropW, cropH);
+    contextB64 = ctxCanvas.toDataURL("image/png").replace(
+      /^data:image\/png;base64,/, "");
+  }
 
   const selectionB64 = maskCv.toDataURL("image/png").replace(
     /^data:image\/png;base64,/, "");
 
-  // Context: white rect at (c.x, c.y, c.w, c.h) on black.
-  const ctxCanvas = document.createElement("canvas");
-  ctxCanvas.width = W; ctxCanvas.height = H;
-  const ccx = ctxCanvas.getContext("2d");
-  ccx.fillStyle = "#000";
-  ccx.fillRect(0, 0, W, H);
-  ccx.fillStyle = "#fff";
-  ccx.fillRect(c.x, c.y, c.w, c.h);
-  const contextB64 = ctxCanvas.toDataURL("image/png").replace(
-    /^data:image\/png;base64,/, "");
-
   return {
-    canvasB64,
-    selectionB64,
-    contextB64,
-    outputRotation: theta ? -theta : 0,
+    canvasB64, selectionB64, contextB64,
+    outputRotation: -theta,
+    cropW, cropH,
   };
+}
+
+/* ============================================================
+   Result compositing — see the module docstring for the full
+   rationale. Two functions:
+
+     _buildKeepMask     geometry-only alpha mask of the returned
+                        image's content region (diamond at 45°,
+                        polygon for other angles, full frame at 0°),
+                        drawn at (cropW × cropH) dims so the expanded
+                        case produces a larger diamond, inset by
+                        SEAM_INSET_PX to discard the returned image's
+                        antialiased edge band.
+
+     _setOriginalFromB64 composites the returned image, masked to
+                        the keep region, over the previous original.
+                        Where the mask is transparent, the previous
+                        original shows through — recovering the
+                        corners that ComfyUI's LoadImage turned black.
+
+   `rotationDeg` is the display rotation that was live when the
+   payload was built. It is not `view.rotation` at the moment the
+   response arrives; see "Rotation-capture timing" in the module
+   docstring. */
+
+function _buildKeepMask(W, H, rotationDeg, cropW, cropH) {
+  // Reproduce, as an alpha mask, the region of the returned image
+  // that has real content. The returned image is the sent image
+  // un-rotated by the server; the sent image is the (cropW × cropH)
+  // crop of the rotated original. Composing the two transforms, the
+  // content region of the returned (center-cropped back to W × H) is
+  // the (cropW × cropH) rect rotated by -rotationDeg around the
+  // centre, intersected with the (W × H) frame itself.
+  //
+  // Base case (cropW=cropH=W): the classic diamond. Expanded case:
+  // a larger diamond that covers more of W × H, up to full white when
+  // the crop is big enough to include the whole rotated frame.
+  //
+  // Everything outside that region is black: ComfyUI's LoadImage reads
+  // the sent PNG's alpha as RGB, so the transparent corners the client
+  // produced are rendered black by the time SaveImage writes the
+  // result.
+  //
+  // `destination-in` uses the SOURCE'S ALPHA to multiply the
+  // destination's alpha. The mask therefore MUST be transparent
+  // outside the content region, not black — an opaque black
+  // background would be a no-op (alpha 1 × alpha 1 = alpha 1) and the
+  // returned image's black corners would paint over the original
+  // unchanged. The canvas is transparent by default; only the white
+  // rotated rect needs drawing.
+  //
+  // Seam inset: draw the white rect INSET by SEAM_INSET_PX on each
+  // side. That discards the returned image's antialiased transition
+  // band (a few pixels of dark mixture-of-content-and-black along the
+  // content boundary, produced by PIL's rotate on the server and by
+  // drawImage's smoothQuality on the client). Keeping those at full
+  // opacity in the composite produces a hairline seam. Discarding
+  // them lets the original show through instead — invisible, because
+  // inside the content region the original and the returned image
+  // are essentially identical.
+  //
+  // Rotation 0: the rect IS the frame, there is no diamond edge and
+  // no antialiased transition to discard. Any inset would just trim a
+  // strip of freshly-inpainted content from the canvas edges, so no
+  // inset is applied in that case.
+  const mask = document.createElement("canvas");
+  mask.width = W;
+  mask.height = H;
+  const mctx = mask.getContext("2d");
+  mctx.fillStyle = "#fff";
+  mctx.save();
+  mctx.translate(W / 2, H / 2);
+  mctx.rotate(-rotationDeg * Math.PI / 180);
+  mctx.translate(-W / 2, -H / 2);
+
+  const inset = (rotationDeg % 360 === 0) ? 0 : SEAM_INSET_PX;
+  mctx.fillRect(
+    W / 2 - cropW / 2 + inset,
+    H / 2 - cropH / 2 + inset,
+    cropW - 2 * inset,
+    cropH - 2 * inset,
+  );
+
+  mctx.restore();
+  return mask;
+}
+
+function _setOriginalFromB64(b64, rotationDeg) {
+  // `rotationDeg` is the display rotation that was active when this
+  // inpaint was submitted. It determines the diamond-shaped content
+  // region of the returned image (see _buildKeepMask). Passing it in
+  // rather than reading `view.rotation` here matters because the user
+  // can rotate the view during the 20–60 s wait for the server; the
+  // returned image was computed with the rotation that was live when
+  // the payload was sent, not whatever it is now.
+  const dataUrl = "data:image/png;base64," + b64;
+  const img = new Image();
+  img.onload = () => {
+    const W = board.originalWidth;
+    const H = board.originalHeight;
+    const srcW = img.naturalWidth;
+    const srcH = img.naturalHeight;
+
+    if (board.originalImageEl && W > 0 && H > 0
+        && srcW >= W && srcH >= H) {
+      // Unified path for both base (srcW === W) and expanded
+      // (srcW > W) inpaints:
+      //   1. draw original underneath
+      //   2. center-crop the returned image to (W × H) — for base
+      //      this is a no-op; for expanded this pulls out the
+      //      original content the wider crop captured
+      //   3. mask the center-crop to the content region implied by
+      //      the returned dims, then composite over the original
+      //
+      // Base case: center-crop is the whole returned image, mask is
+      // the base diamond, composite is exactly the previous
+      // behaviour. Expanded case: center-crop discards the black
+      // margins, mask is a larger diamond that covers more of the
+      // non-inpainted content, composite replaces more but is
+      // visually identical there.
+      const composite = document.createElement("canvas");
+      composite.width = W;
+      composite.height = H;
+      const cctx = composite.getContext("2d");
+      cctx.imageSmoothingEnabled = true;
+      cctx.imageSmoothingQuality = "high";
+
+      // 1. Original underneath.
+      cctx.drawImage(board.originalImageEl, 0, 0, W, H);
+
+      // 2. Masked returned, center-cropped to (W × H).
+      const cropX = Math.round((srcW - W) / 2);
+      const cropY = Math.round((srcH - H) / 2);
+
+      const masked = document.createElement("canvas");
+      masked.width = W;
+      masked.height = H;
+      const mctx = masked.getContext("2d");
+      mctx.imageSmoothingEnabled = true;
+      mctx.imageSmoothingQuality = "high";
+      // Draw the returned image at the negative offset so its W × H
+      // center lands at (0, 0) of `masked`.
+      mctx.drawImage(img, -cropX, -cropY, srcW, srcH);
+      mctx.globalCompositeOperation = "destination-in";
+      mctx.drawImage(_buildKeepMask(W, H, rotationDeg, srcW, srcH), 0, 0);
+      mctx.globalCompositeOperation = "source-over";
+
+      // 3. Masked result on top.
+      cctx.drawImage(masked, 0, 0);
+
+      board.originalImageEl  = composite;
+      board.originalDataUrl  = composite.toDataURL("image/png");
+      board.imageEl          = composite;
+      board.imageDataUrl     = board.originalDataUrl;
+    } else {
+      // Fallback: no prior original, or the returned dims are smaller
+      // than W × H (unexpected). Use the result as-is.
+      board.originalImageEl  = img;
+      board.originalWidth    = img.naturalWidth;
+      board.originalHeight   = img.naturalHeight;
+      board.originalDataUrl  = dataUrl;
+      board.imageEl          = img;
+      board.imageWidth       = img.naturalWidth;
+      board.imageHeight      = img.naturalHeight;
+      board.imageDataUrl     = dataUrl;
+    }
+
+    board.imageHash = "inpaint_" + Date.now();
+    _applyRotation(view.rotation);
+  };
+  img.src = dataUrl;
 }
 
 /* ============================================================
    Inpaint
    ============================================================ */
-
-function _setOriginalFromB64(b64) {
-  // The composite comes from Krita in its ORIGINAL orientation.
-  // It becomes the new source; the display transform re-rotates
-  // it for the user's current view. Because rotation is
-  // display-only, `board.imageEl` / `imageWidth` / `imageHeight`
-  // / `imageDataUrl` must be set directly here —
-  // `_applyRotation` no longer derives them.
-  const dataUrl = "data:image/png;base64," + b64;
-  const img = new Image();
-  img.onload = () => {
-    board.originalImageEl = img;
-    board.originalWidth   = img.naturalWidth;
-    board.originalHeight  = img.naturalHeight;
-    board.originalDataUrl = dataUrl;
-    board.imageEl         = img;
-    board.imageWidth      = img.naturalWidth;
-    board.imageHeight     = img.naturalHeight;
-    board.imageDataUrl    = dataUrl;
-    board.imageHash       = "inpaint_" + Date.now();
-    _applyRotation(view.rotation);
-  };
-  img.src = dataUrl;
-}
 
 async function _inpaintAction() {
   if (!board.imageHash) { flashStatus("Load an image first", "warn"); return; }
@@ -387,9 +677,19 @@ async function _inpaintAction() {
     flashStatus("Mask not loaded", "warn"); return;
   }
 
+  // Mask bbox in original-frame coords, used by `_buildInpaintPayload`
+  // to decide whether the crop needs to expand. Cached on the mask
+  // entry, so this is O(1) after the first call for a given mask.
+  const maskBBox = computeMaskBBox(idx);
+
   // Doc-sized payloads plus the matching un-rotation the daemon
   // needs before pasting — see _buildInpaintPayload above.
-  const payload = _buildInpaintPayload(mask);
+  const payload = _buildInpaintPayload(mask, maskBBox);
+  // Capture the rotation the payload was built with. The returned
+  // image is un-rotated by exactly `-payload.outputRotation`, so its
+  // black corners correspond to that rotation. A scrub during the
+  // 20–60 s poll must not desync the mask from the returned image.
+  const inpaintRotation = view.rotation;
 
   flashStatus("inpainting\u2026", "");
 
@@ -402,10 +702,10 @@ async function _inpaintAction() {
   });
   if (!result) return;
 
-  // The composite comes from Krita in its ORIGINAL orientation.
-  // Load it as the new original; the display transform re-rotates
-  // for display, so the user's view stays in the frame they chose.
-  _setOriginalFromB64(result.image_b64);
+  // Composite the result over the previous original, masked to the
+  // content region that rotation produced — see the module docstring
+  // and _setOriginalFromB64 for the full rationale.
+  _setOriginalFromB64(result.image_b64, inpaintRotation);
 
   const statusCls = (result.paste_ok === false) ? "warn" : "ok";
   const statusMsg = result.message

@@ -1,7 +1,7 @@
 """Inpaint playground's panel body and CSS.
 
-Three sections: Image, Masks, Inpainting.  Export-to-Krita is not
-wired here; mask editing and export live in `sam3_segment` or in
+Three sections: Image, View, Masks, Inpainting.  Export-to-Krita is
+not wired here; mask editing and export live in `sam3_segment` or in
 Krita itself.
 
 The context rectangle defaults to disabled: on page load the checkbox
@@ -248,13 +248,6 @@ PG_PANEL_BODY = r"""
                      value="0" autocomplete="off" spellcheck="false"
                      title="Rotation in degrees. Drag sideways to scrub; hold Shift to snap to 15&#176;. Click to type an exact value.">
             </div>
-            <div class="runHint" style="margin-top:4px;">
-              Rotates the displayed image, masks, and context rectangle
-              together. The inpaint result is un-rotated before being pasted
-              back into Krita, so Krita always ends up in its original
-              orientation. Drag the field sideways to scrub; hold Shift to
-              snap to 15&#176;. Click to type an exact value.
-            </div>
           </div>
         </details>
 
@@ -266,10 +259,6 @@ PG_PANEL_BODY = r"""
           <span id="maskCount" style="font-size:10px;color:#5a6774;">0 / 0</span>
         </div>
         <div id="maskList" class="maskList"></div>
-        <div class="runHint" style="margin-top:6px;">
-          Alt-click on the canvas selects a mask. Numbers 1–9 select by index.
-          Shift+click adds. Ctrl+click toggles.
-        </div>
       </div>
     </details>
 

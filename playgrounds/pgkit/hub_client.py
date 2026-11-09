@@ -51,7 +51,7 @@ the same WS.  Playgrounds never call it; the launcher uses it to push
 `launcher_state` (available names) and `launcher_result` (per-command
 replies).
 
-Detached hub spawn
+DETACHED HUB SPAWN
 ==================
 If no hub is listening on the configured port, this module spawns
 `python -m pgkit.hub` with `start_new_session=True` so killing the
@@ -59,7 +59,40 @@ playground's terminal does not kill the hub. Duplicate spawns are
 tolerated: whichever hub binds the port first wins; the other exits
 silently and its playground's WS client connects to the live one.
 
-Frames are unmasked
+STALE HUB DETECTION
+===================
+A hub process loaded from one version of `pgkit/hub.py` cannot pick
+up edits to that file without a restart — Python does not reload
+already-imported modules. Historically this left a footgun: a
+developer edits `hub.py`, starts a playground, the playground
+connects to the still-running old hub, and the mismatch surfaces much
+later as an obscure protocol error. The fix was always
+`pgkit.hub --shutdown`, but remembering to run it is exactly the kind
+of step that gets forgotten three times in a row.
+
+Before deciding a running hub is usable, `_spawn_hub_if_needed`
+probes `GET /__hash` and compares the hub's advertised source hash
+against this process's own. On a mismatch the client POSTs
+`/__shutdown?quiet=1` — quiet, so already-connected siblings are
+left to reconnect to the fresh hub rather than being killed — waits
+for the port to die, and falls through to the normal spawn path.
+The whole check runs under a module-level lock so that, in a
+launcher spawning six playgrounds at once, only the first thread
+pays the restart cost; the other five block on the lock and wake to
+find a fresh hub already running.
+
+Two upgrade caveats:
+
+  · A hub that predates `/__hash` returns 404. The client treats
+    that as "stale" and forces one restart. After that every hub
+    advertises the endpoint, so the 404 path fires exactly once.
+
+  · A hub that predates `/__shutdown?quiet=1` (but has `/__hash`,
+    if that combination somehow arises) ignores the query string and
+    performs the historical loud shutdown, killing its siblings on
+    the first auto-restart. From then on, quiet is honoured.
+
+FRAMES ARE UNMASKED
 ===================
 This is a private protocol between our own hub and our own
 playgrounds. `pgkit.ws.read_frame` accepts unmasked client frames, so
@@ -75,6 +108,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from . import ws as _ws
@@ -82,6 +117,12 @@ from . import ws as _ws
 
 HUB_HOST = "127.0.0.1"
 HUB_PORT = 8780
+
+
+# Serialises the freshness check and the restart it may trigger across
+# every HubConnection instance in this process. See "STALE HUB
+# DETECTION" in the module docstring.
+_restart_lock = threading.Lock()
 
 
 # ============================================================================
@@ -184,9 +225,72 @@ class HubConnection:
         except OSError:
             return False
 
+    def _hub_matches_local_source(self) -> bool:
+        """True iff the running hub was loaded from the same pgkit
+        source as this process. See "STALE HUB DETECTION" in the
+        module docstring.
+
+        Return values:
+          · True  — hashes match, or we could not reach the endpoint
+                    to ask (transient error, or 5xx — a healthy hub
+                    that happens to answer a probe badly should not
+                    be restarted).
+          · False — hashes differ, or the hub answered 404 (a hub
+                    predating `/__hash`, cannot prove freshness,
+                    treat as stale).
+        """
+        from ._source_hash import source_hash
+        local = source_hash()
+        try:
+            with urllib.request.urlopen(
+                f"http://{HUB_HOST}:{self.hub_port}/__hash", timeout=2
+            ) as r:
+                body = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return False
+            return True
+        except (urllib.error.URLError, OSError, ValueError):
+            return True
+        if not isinstance(body, dict):
+            return True
+        return body.get("source_hash") == local
+
+    def _restart_stale_hub(self) -> None:
+        """POST /__shutdown?quiet=1 and wait for the port to die.
+
+        On a hub that honours `quiet=1`, registered playgrounds are
+        left to reconnect. On a hub that predates the parameter (the
+        first auto-restart after upgrading to this client), the query
+        string is ignored, and existing siblings are killed. That is
+        a one-time cost of the transition, not an ongoing property.
+        """
+        from ._source_hash import short_hash
+        print(f"{self._log_prefix} hub at :{self.hub_port} is running "
+              f"stale code; restarting (local hash {short_hash()})",
+              file=sys.stderr)
+        try:
+            req = urllib.request.Request(
+                f"http://{HUB_HOST}:{self.hub_port}/__shutdown?quiet=1",
+                method="POST", data=b"{}",
+            )
+            urllib.request.urlopen(req, timeout=2).read()
+        except Exception:
+            pass
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not self._hub_reachable():
+                return
+            time.sleep(0.1)
+        print(f"{self._log_prefix} warning: hub at :{self.hub_port} "
+              f"did not shut down within 5s; still running stale code",
+              file=sys.stderr)
+
     def _spawn_hub_if_needed(self):
         if self._hub_reachable():
-            return
+            with _restart_lock:
+                if not self._hub_matches_local_source():
+                    self._restart_stale_hub()
         time.sleep(0.1)
         if self._hub_reachable():
             return

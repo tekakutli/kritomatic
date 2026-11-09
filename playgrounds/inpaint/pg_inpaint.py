@@ -23,6 +23,9 @@ grow.  This file contains:
       out of place relative to the visible context rect.
     - `resizeMaskB64ToCanvas` — canvas-sized output from an arbitrary
       input PNG
+    - `projectCropDims` — the payload's sent region, derived from the
+      mask ∩ context so the crop can expand when the mask would
+      otherwise land in the rotation clip zones
 
 The drag STATE (`_contextDrag = { active, handle, startIx, ... }`)
 stays in `pg_dispatch.js` because it is per-interaction, not
@@ -154,8 +157,8 @@ export function hitContextRect(r, sx, sy) {
    handles out-of-image rects gracefully:
 
      - `contextRectScreen` and `contextHandles` just project the
-       coords to screen; they do not need the rect to be inside
-       the image.
+       coords to screen; they do not need the rect to be inside the
+       image.
      - `hitContextRect` compares against `contextRectScreen`, so
        it works with any rect.
      - `buildContextMaskB64` paints into a `W×H` canvas with
@@ -369,5 +372,110 @@ export function resizeMaskB64ToCanvas(b64, img) {
   c.width = board.imageWidth; c.height = board.imageHeight;
   c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
   return c.toDataURL("image/png").replace(/^data:image\/png;base64,/, "");
+}
+
+/* ============================================================
+   Crop projection
+   ============================================================
+   The payload's sent region is (cropW × cropH), centered on the
+   rotated frame's center. The base case is (W × H): the crop clips
+   the four corners of the rotated content, and any mask pixel
+   landing there is lost.
+
+   When the mask (intersected with the context rect, or unclipped
+   when the context is the whole image) extends beyond the base
+   crop, expand symmetrically to include it. This keeps the
+   un-rotation math intact — the crop stays centered on the original
+   image's center — while giving the mask room.
+
+   `maskBBoxOrig` is the mask's bbox in the original frame (from
+   `computeMaskBBox`), or null if there's no mask. `inpaintEnabled`
+   decides how the context rect is interpreted:
+
+     · enabled  → the user's rect clips the mask (Mode B)
+     · disabled → the context is the whole image, so no clip (Mode A)
+
+   Either way, the returned `{cropW, cropH}` is at least (W, H) and
+   at most (W', H'). The projection is O(1) once the mask bbox is
+   available, so it's safe to call per frame from the view's tint
+   overlay as well as from the payload builder. */
+
+export function projectCropDims(W, H, maskBBoxOrig, theta, c, inpaintEnabled) {
+  const base = { cropW: W, cropH: H };
+  if (!maskBBoxOrig) return base;
+  if (!theta || theta % 360 === 0) return base;
+
+  const rad = (theta % 360) * Math.PI / 180;
+  const cosA = Math.abs(Math.cos(rad));
+  const sinA = Math.abs(Math.sin(rad));
+  const Wp = Math.max(1, Math.round(W * cosA + H * sinA));
+  const Hp = Math.max(1, Math.round(W * sinA + H * cosA));
+
+  const cosR = Math.cos(rad), sinR = Math.sin(rad);
+  const cx = W / 2, cy = H / 2;
+  const cxp = Wp / 2, cyp = Hp / 2;
+
+  const mcorners = [
+    [maskBBoxOrig.x, maskBBoxOrig.y],
+    [maskBBoxOrig.x + maskBBoxOrig.w, maskBBoxOrig.y],
+    [maskBBoxOrig.x + maskBBoxOrig.w, maskBBoxOrig.y + maskBBoxOrig.h],
+    [maskBBoxOrig.x, maskBBoxOrig.y + maskBBoxOrig.h],
+  ];
+  let rminX = Infinity, rminY = Infinity, rmaxX = -Infinity, rmaxY = -Infinity;
+  for (const [px, py] of mcorners) {
+    const dx = px - cx, dy = py - cy;
+    const rx = dx * cosR - dy * sinR;
+    const ry = dx * sinR + dy * cosR;
+    const wx = cxp + rx, wy = cyp + ry;
+    if (wx < rminX) rminX = wx;
+    if (wy < rminY) rminY = wy;
+    if (wx > rmaxX) rmaxX = wx;
+    if (wy > rmaxY) rmaxY = wy;
+  }
+
+  // Context rect in rotated-frame coords.
+  //
+  // Mode B: user's rect, clipped to the mask.
+  // Mode A: whole image, so no clip — use ±Infinity to make the
+  // intersection below a no-op. (This is what allows the crop to
+  // expand in Mode A when the mask extends into the base crop's
+  // corners.)
+  let ctxL, ctxT, ctxR, ctxB;
+  if (inpaintEnabled) {
+    ctxL = (Wp - W) / 2 + c.x;
+    ctxT = (Hp - H) / 2 + c.y;
+    ctxR = ctxL + c.w;
+    ctxB = ctxT + c.h;
+  } else {
+    ctxL = -Infinity;
+    ctxT = -Infinity;
+    ctxR = Infinity;
+    ctxB = Infinity;
+  }
+
+  // Effective selection region: mask bbox ∩ context rect.
+  const effL = Math.max(rminX, ctxL);
+  const effT = Math.max(rminY, ctxT);
+  const effR = Math.min(rmaxX, ctxR);
+  const effB = Math.min(rmaxY, ctxB);
+  if (effR <= effL || effB <= effT) return base;
+
+  // Base crop region in rotated-frame coords.
+  const baseL = (Wp - W) / 2;
+  const baseT = (Hp - H) / 2;
+  const baseR = baseL + W;
+  const baseB = baseT + H;
+  if (effL >= baseL && effT >= baseT && effR <= baseR && effB <= baseB) {
+    return base;
+  }
+
+  // Symmetrize around (Wp/2, Hp/2).
+  const halfW = Math.max(Wp / 2 - effL, effR - Wp / 2, W / 2);
+  const halfH = Math.max(Hp / 2 - effT, effB - Hp / 2, H / 2);
+
+  return {
+    cropW: Math.min(Wp, Math.ceil(halfW * 2)),
+    cropH: Math.min(Hp, Math.ceil(halfH * 2)),
+  };
 }
 """

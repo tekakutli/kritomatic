@@ -10,10 +10,46 @@ A single HTTP server (default 127.0.0.1:8780) that:
     · proxies  /<name>/*  to  localhost:<registered_port>/*  for both
       HTTP and WebSocket upgrades
     · accepts  GET /__playgrounds  for one-shot CLI listings
+    · accepts  GET /__hash  for a content fingerprint of its own
+      source; see "FRESHNESS" below
+    · accepts  POST /__shutdown  (optionally ?quiet=1) for cooperative
+      exit
     · exposes cooperative shutdown and (opt-in) hard kill over the
       management WebSocket, never over HTTP polling
     · broadcasts a `playgrounds` event to every connected panel
       whenever the registered set changes — no polling anywhere
+
+FRESHNESS
+=========
+`GET /__hash` returns `{"source_hash": "<sha256>"}`, computed by
+`pgkit._source_hash` over the four files that define the hub↔client
+contract. The client (`pgkit.hub_client`) probes this endpoint before
+deciding a running hub is usable. A mismatch — or a 404 from a hub
+that predates this endpoint — triggers an automatic restart. See
+`_source_hash.py` for the full design rationale.
+
+The hash is also printed in the startup banner, so a developer
+inspecting `~/.pgkit/hub.log` can compare it with what the current
+checkout produces.
+
+QUIET SHUTDOWN
+==============
+`POST /__shutdown?quiet=1` exits without sending `shutdown` to
+registered playgrounds. This is what the auto-restart uses: siblings
+that were connected to a stale hub survive the restart and reconnect
+to the fresh one via their own reconnect loops.
+
+Without `quiet`, `POST /__shutdown` is the historical behavior — it
+notifies every registration (which triggers `os._exit(0)` on those
+processes) and then exits. This is what `pgkit.hub --shutdown`
+invokes, because a user who types that command means "stop
+everything".
+
+One upgrade note: a hub that predates the `quiet` parameter ignores
+the query string and kills its siblings on the first auto-restart.
+Every hub spawned after this parameter was added honours it. So the
+sibling-kill is a one-time cost of the transition, not an ongoing
+property.
 
 REGISTRATION IDENTITY
 =====================
@@ -96,9 +132,10 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from . import ws as _ws
+from ._source_hash import source_hash, short_hash
 
 
 HUB_HOST = "127.0.0.1"
@@ -293,6 +330,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(_HUB._playgrounds_msg())
             return
 
+        if not is_ws and path == "/__hash":
+            self._send_json({"source_hash": source_hash()})
+            return
+
         if is_ws and path == "/__hub_ws":
             self._serve_hub_ws()
             return
@@ -304,10 +345,14 @@ class Handler(BaseHTTPRequestHandler):
         self._proxy_http(path)
 
     def do_POST(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/__shutdown":
-            self._send_json({"success": True})
-            threading.Timer(0.2, _shutdown_hub).start()
+            query = parse_qs(parsed.query)
+            quiet = (query.get("quiet", ["0"])[0]
+                     .lower() in ("1", "true", "yes"))
+            self._send_json({"success": True, "quiet": quiet})
+            threading.Timer(0.2, _shutdown_hub, args=(not quiet,)).start()
             return
         self._proxy_http(path)
 
@@ -583,6 +628,17 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        # The connect succeeded; that's the last thing a 10-second
+        # timeout is the right bound for. From here the hub is a
+        # pass-through: the playground's own handlers own the timeout
+        # (INPAINT_TIMEOUT = 180s in the inpaint playground, plus
+        # margins; other playgrounds define their own). Any finite
+        # hub-side timeout would either be too short and cut off a
+        # legitimate slow response (the bug this fixes) or too long
+        # and duplicate the playground's own deadline. Let the
+        # playground be the sole authority.
+        backend.settimeout(None)
+
         try:
             headers = dict(self.headers.items())
             headers["Host"] = f"{HUB_HOST}:{reg.port}"
@@ -763,21 +819,37 @@ def _kill_playground(name, hard):
                        f"(use hard=1 to escalate)"}
 
 
-def _shutdown_hub():
-    with _HUB.lock:
-        regs = list(_HUB.registrations.values())
-        panels = list(_HUB.panel_socks)
-    for reg in regs:
-        try:
-            reg.send({"type": "shutdown", "request_id": uuid.uuid4().hex})
-        except OSError:
-            pass
-    for sock in panels:
-        try:
-            sock.close()
-        except OSError:
-            pass
-    time.sleep(0.5)
+def _shutdown_hub(notify_registrations=True):
+    """Exit the hub process.
+
+    When `notify_registrations` is True (the default, and what
+    `pgkit.hub --shutdown` triggers), every registered playground
+    receives a `shutdown` message, which its client handler turns
+    into `os._exit(0)`. This is the historical behaviour, appropriate
+    for an explicit user-driven stop.
+
+    When False (`POST /__shutdown?quiet=1`, what the auto-restart
+    uses), registered playgrounds are left running. They lose their
+    WS connection to the hub, and their reconnect loops pick up the
+    freshly-spawned hub within a second or two. Siblings survive a
+    restart that was not addressed to them.
+    """
+    if notify_registrations:
+        with _HUB.lock:
+            regs = list(_HUB.registrations.values())
+            panels = list(_HUB.panel_socks)
+        for reg in regs:
+            try:
+                reg.send({"type": "shutdown",
+                          "request_id": uuid.uuid4().hex})
+            except OSError:
+                pass
+        for sock in panels:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        time.sleep(0.5)
     os._exit(0)
 
 
@@ -810,6 +882,7 @@ def main():
     print(f"pgkit hub listening on http://{args.host}:{args.port}")
     print(f"  registrations : ws://{args.host}:{args.port}/__hub_ws")
     print(f"  playgrounds   : http://{args.host}:{args.port}/__playgrounds")
+    print(f"  hash          : {short_hash()}")
     print(f"  proxied       : /<name>/* → localhost:<port>/*")
     sys.stdout.flush()
 

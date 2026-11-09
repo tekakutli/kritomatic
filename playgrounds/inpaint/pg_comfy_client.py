@@ -55,6 +55,7 @@ export async function runInpaint({ canvasB64, selectionB64, contextB64,
   board.running = true;
   pgkitNotifyAll();
 
+  const t0 = performance.now();
   try {
     const res = await fetch("/comfy/inpaint", {
       method: "POST",
@@ -67,7 +68,17 @@ export async function runInpaint({ canvasB64, selectionB64, contextB64,
         output_rotation: outputRotation || 0,
       }),
     });
+    const t1 = performance.now();
+    console.log("[inpaint] fetch resolved after",
+                (t1 - t0).toFixed(0), "ms; status", res.status,
+                "ok", res.ok);
+
     const payload = await res.json();
+    const t2 = performance.now();
+    console.log("[inpaint] json parsed after",
+                (t2 - t1).toFixed(0), "ms; success:", payload.success,
+                "b64 length:", (payload.image_b64 || "").length);
+
     if (!payload.success) {
       flashStatus("inpaint failed: " + (payload.message || "unknown"), "bad");
       return null;
@@ -75,6 +86,9 @@ export async function runInpaint({ canvasB64, selectionB64, contextB64,
     board.lastTiming = payload.timing;
     return payload;
   } catch (e) {
+    const tEnd = performance.now();
+    console.error("[inpaint] fetch threw after",
+                  (tEnd - t0).toFixed(0), "ms:", e);
     flashStatus("inpaint failed: " + e.message, "bad");
     return null;
   } finally {

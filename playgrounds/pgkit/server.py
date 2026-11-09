@@ -108,13 +108,33 @@ def make_handler(routes=None, raw_routes=None, module_sources=None, hub=None):
                 result = {"success": False, "message": "Server error: %s" % e}
             self._send_json(200, result)
 
-        def _send_json(self, code, data):
-            body = json.dumps(data).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        def _send_json(self, status, obj):
+            body = json.dumps(obj).encode("utf-8")
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                # Force connection close on every JSON response. The
+                # playground's SimpleHTTPRequestHandler-based server
+                # does not implement HTTP/1.1 keep-alive correctly for
+                # POST responses, and a keep-alive socket that has
+                # just spent tens of seconds idle waiting for a
+                # handler to finish is a common source of the browser
+                # or the pgkit hub giving up on the connection.
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError) as e:
+                # The client (browser, pgkit hub, curl) closed its
+                # end before receiving this response. Not a server
+                # bug: the pipeline ran, the response was serialised,
+                # and the peer left. Log one line and unwind cleanly
+                # rather than let socketserver dump a full traceback
+                # into the playground's stderr.
+                print(f"[server] client disconnected mid-response "
+                      f"({len(body):,} bytes): {type(e).__name__}",
+                      file=sys.stderr, flush=True)
+                self.close_connection = True
 
         def _serve_module(self, name):
             source = module_sources.get(name)

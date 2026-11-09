@@ -53,8 +53,8 @@ _READ_ONLY_COMMANDS = frozenset({
 #  Paths
 # ============================================================================
 
-_HANDLER_DIR = Path(__file__).resolve().parent.parent
-_REPO_ROOT = _HANDLER_DIR.parent.parent
+_HANDLER_DIR = Path(__file__).resolve().parent.parent   # .../kritomatic/kritomatic_daemon
+_REPO_ROOT = _HANDLER_DIR.parent                        # .../kritomatic
 _PANEL_DIR = _REPO_ROOT / "data" / "comfy_panel"
 _WORKFLOW_DIR = _PANEL_DIR / "workflows"
 _HISTORY_DIR = _PANEL_DIR / "history"

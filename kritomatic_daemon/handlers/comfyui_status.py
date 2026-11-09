@@ -20,7 +20,8 @@ class StatusCommands(AutoDispatchHandler):
     @command(
         category="comfyui",
         help_text="Return the handler's current workflow, parameters, "
-                  "layer aliases, bindings, proxy state, and the active "
+                  "layer aliases, bindings, proxy state, native slot "
+                  "tables, active panel config, and the active "
                   "workflow's signature.",
         args={},
     )
@@ -55,6 +56,21 @@ class StatusCommands(AutoDispatchHandler):
                     )
                 ),
                 "workflow_exclusive": parent._file_exclusive,
+
+                # Native-v2 slot tables (Stage 3). Empty when the
+                # workflow has no native inputs (e.g. legacy ETN_*
+                # graphs).
+                "workflow_resource_slots":
+                    dict(parent._active_workflow_resource_slots),
+                "workflow_param_slots":
+                    dict(parent._active_workflow_param_slots),
+                "workflow_output_nodes":
+                    dict(parent._active_workflow_output_nodes),
+                "config": (
+                    dict(parent._active_config)
+                    if parent._active_config is not None else None
+                ),
+
                 "active_batches": active_batches,
                 "watching": (
                     parent._client.is_watching()
@@ -89,7 +105,8 @@ class StatusCommands(AutoDispatchHandler):
         with parent._batches_lock:
             records = list(parent._batches.values())
 
-        now = time.time() if False else __import__("time").time()
+        import time as _time
+        now = _time.time()
         items = []
         for r in records:
             items.append({

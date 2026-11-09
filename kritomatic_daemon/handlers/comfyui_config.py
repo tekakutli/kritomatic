@@ -13,6 +13,12 @@ Two commands:
     WITHOUT submitting. Diagnostic; Stage 5's `comfy_generate` consumes
     the same `PreparedWorkflow` via `utils.comfy_apply.prepare_workflow`.
 
+  * `comfy_panel_run` — convenience wrapper: connect (auto-starts the
+    proxy), apply the supplied config, then generate. One command for
+    the docker's Run button, which collects the config from its widgets
+    at click time and cannot feasibly send three separate commands
+    without exposing the intermediate states to a race.
+
 Where the slots come from
 =========================
 `comfy_load` walks the loaded graph and populates:
@@ -52,6 +58,22 @@ Apply is idempotent: applying a new config replaces the previous one.
 Applying an empty config (`{}` for all four sections) is valid — it
 clears the config and leaves the graph as-is, useful to reset after a
 failed validation.
+
+`comfy_panel_run` and state publishing
+======================================
+`comfy_panel_run` calls `comfy_apply_config` and `comfy_generate` as
+methods on the sub-handler instances, not through the container's
+`execute`. That means the intermediate config-applied state does not
+publish on its own. It is still the `comfy_panel_run` command's own
+`execute` (in the container) that publishes the final state once
+`comfy_panel_run` returns — so the docker still sees the correct final
+state (`_active_config` set, batch records present or absent depending
+on timing).
+
+The generate call's internal `parent._publish_state_change()` calls
+(batch start, batch end) are unaffected — they happen on the daemon's
+container, not on this sub-handler, and are called explicitly by
+`comfy_generate`'s implementation.
 """
 
 from __future__ import annotations
@@ -359,10 +381,6 @@ class ConfigCommands(AutoDispatchHandler):
         except ValueError as e:
             return {"success": False, "message": str(e)}
 
-        # Summarize without the blob bytes (they are megabytes) and
-        # without the full asset dicts (only id/hash matter to a human
-        # reading the response). The graph itself is small enough to
-        # include — it lets the operator eyeball the substitutions.
         params_applied = set(parent._active_config["params"].keys())
         if result.seed_applied is not None:
             params_applied.add("seed")
@@ -386,3 +404,101 @@ class ConfigCommands(AutoDispatchHandler):
                 "graph": result.graph,
             },
         }
+
+    @command(
+        category="comfyui",
+        help_text="Connect (auto-starting the proxy), apply the supplied "
+                  "panel config, then generate. Convenience wrapper "
+                  "around comfy_connect + comfy_apply_config + "
+                  "comfy_generate. If connect or apply fails, generate "
+                  "is not attempted; the failure is returned in the "
+                  "same response shape as the underlying command.",
+        args={
+            "--resources": {
+                "type": "str", "default": "{}",
+                "help": "JSON object (same as comfy_apply_config).",
+            },
+            "--params": {
+                "type": "str", "default": "{}",
+                "help": "JSON object (same as comfy_apply_config).",
+            },
+            "--crop": {
+                "type": "str", "default": "{}",
+                "help": "JSON object (same as comfy_apply_config).",
+            },
+            "--paste": {
+                "type": "str", "default": "{}",
+                "help": "JSON object (same as comfy_apply_config).",
+            },
+            "--timeout": {
+                "type": "float", "default": 55.0,
+                "help": "Seconds per run (same as comfy_generate).",
+            },
+            "--count": {
+                "type": "int", "default": 1,
+                "help": "Number of runs (same as comfy_generate).",
+            },
+            "--seed": {
+                "type": "int", "required": False,
+                "help": "Base seed (same as comfy_generate).",
+            },
+            "--no_paste": {
+                "type": "bool", "default": False,
+                "help": "Skip pasting (same as comfy_generate).",
+            },
+            "--output_rotation": {
+                "type": "float", "default": 0.0,
+                "help": "Rotation degrees (same as comfy_generate).",
+            },
+        },
+    )
+    def comfy_panel_run(self, params):
+        parent = self.parent
+
+        # ---- connect (auto-starts proxy if needed) ----
+        # check=False so we do not spend a round trip on /object_info.
+        # comfy_generate itself does not need object_info; it uses the
+        # proxy directly. The _client is only used as a "connected?"
+        # flag by comfy_generate's precondition check.
+        conn = parent._connection_cmds.comfy_connect({
+            "host": parent._host,
+            "port": parent._port,
+            "check": False,
+        })
+        if not conn.get("success"):
+            return {
+                "success": False,
+                "message": (
+                    f"connect failed before apply/generate: "
+                    f"{conn.get('message', 'unknown error')}"
+                ),
+            }
+
+        # ---- apply config ----
+        apply_params = {
+            "resources": params.get("resources", "{}"),
+            "params": params.get("params", "{}"),
+            "crop": params.get("crop", "{}"),
+            "paste": params.get("paste", "{}"),
+        }
+        apply_result = self.comfy_apply_config(apply_params)
+        if not apply_result.get("success"):
+            return apply_result
+
+        # ---- generate ----
+        gen_params: dict = {
+            "timeout": params.get("timeout", 55.0),
+            "count": params.get("count", 1),
+            "no_paste": params.get("no_paste", False),
+            "output_rotation": params.get("output_rotation", 0.0),
+        }
+        if params.get("seed") is not None:
+            gen_params["seed"] = params.get("seed")
+        # Forward the outer batch id so the daemon's _BatchRecord is
+        # keyed by the docker's run-<timestamp>, not a fresh uuid. The
+        # docker's _running state and the daemon's cancel target both
+        # reference the same id.
+        if params.get("_batch_id"):
+            gen_params["_batch_id"] = params.get("_batch_id")
+
+        return parent._generation_cmds.comfy_generate(gen_params)

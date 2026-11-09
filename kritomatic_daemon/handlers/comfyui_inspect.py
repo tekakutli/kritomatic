@@ -11,7 +11,10 @@ v2 pipeline cares about:
   * `PrimitiveFloat` / `PrimitiveInt` / `PrimitiveString` /
     `PrimitiveBoolean` with a `_meta.title` become **param slots** —
     the daemon substitutes `[params][title]` into the node's `value`
-    input at generate time.
+    input at generate time. The extractor also records the node's
+    current `value` as `default`, so the panel can pre-populate its
+    widgets with the workflow's baked-in value rather than a generic
+    kind-based default.
 
   * `SaveImage` nodes become **output nodes** — the daemon pastes the
     committed bytes of every `SaveImage` entry that carries
@@ -93,11 +96,21 @@ def _extract_param_slots(graph: dict) -> dict:
     Returns::
 
         {
-          "denoise":    {"node_id": "10", "kind": "float"},
-          "prompt":     {"node_id": "11", "kind": "string"},
-          "Illustrous?":{"node_id": "12", "kind": "boolean"},
+          "denoise":    {"node_id": "10", "kind": "float",
+                         "default": 0.7},
+          "prompt":     {"node_id": "11", "kind": "string",
+                         "default": "a cat"},
+          "Illustrous?":{"node_id": "12", "kind": "boolean",
+                         "default": True},
           ...
         }
+
+    The `default` field is the node's current `value` input at extraction
+    time. It is what the workflow was authored to use — the daemon's
+    panel pre-populates its param widgets from it, so a user who does
+    not touch a param field still sees the workflow's own value, not a
+    generic kind default. `None` when the node has no `value` input
+    (malformed workflow; the panel falls back to a kind default).
 
     Nodes without `_meta.title` are ignored. Two nodes sharing a title is
     an authoring error; raises ValueError naming both.
@@ -118,7 +131,12 @@ def _extract_param_slots(graph: dict) -> dict:
                 f"node {out[title]['node_id']!r} and node {node_id!r}. "
                 f"Each _meta.title must be unique."
             )
-        out[title] = {"node_id": node_id, "kind": kind}
+        inputs = node.get("inputs", {}) or {}
+        out[title] = {
+            "node_id": node_id,
+            "kind": kind,
+            "default": inputs.get("value"),
+        }
     return out
 
 

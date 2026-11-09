@@ -2,7 +2,8 @@
 
 Data shapes and path constants used across the handler tree:
 
-  * `_BatchRecord` — live state of one `comfy_generate` call.
+  * `_BatchRecord` — live state of one `comfy_generate` call, or one
+    externally-registered proxy job (playground inpaint).
   * Path constants (`_WORKFLOW_DIR`, `_HISTORY_DIR`, `_RECENT_ALIASES_PATH`).
   * Recent-alias persistence helpers — tiny, best-effort, swallowed.
 
@@ -97,19 +98,35 @@ def _save_recent_aliases(aliases: list) -> None:
 # ============================================================================
 
 class _BatchRecord:
-    """Live state of one `comfy_generate` call.
+    """Live state of one batch.
 
     Held in `ComfyUIHandler._batches`, keyed by batch id, from the
     moment the batch starts until the moment it returns.
 
-    `job_ids` — proxy job ids, in submission order. Every entry
-    corresponds to a submitted run. Used by `comfy_cancel` (to cancel
-    each in-flight job) and echoed in the response so a caller can
-    reconcile against `GET /api/v2/jobs/{id}`.
+    Two kinds of batch are tracked:
+
+      * **Internal** — one `comfy_generate` call. `job_ids` is the list
+        of proxy job ids this call submitted. `cancel_event` is the
+        signal the poll loop watches; `comfy_cancel` sets it.
+
+      * **External** — one proxy job submitted directly by a client
+        (currently the inpaint playground), via
+        `comfy_register_external_job`. The daemon did not submit it and
+        is not polling it. `external_job_ids` holds the proxy job id(s)
+        the client registered; `comfy_cancel` cancels those via
+        `ProxyV2.cancel_job` instead of setting `cancel_event`
+        (the client owns its own poll loop and will see the proxy's
+        `canceled` status without any cooperation from the daemon).
+
+    A record is one kind or the other. `job_ids` being non-empty and
+    `external_job_ids` being non-empty never overlap in practice, but
+    the code checks `external_job_ids` first because that is the
+    stronger signal — a record with external ids was created by the
+    registration path and its `cancel_event` is unused.
 
     `_cancel_sent` — set of job ids for which `cancel_job` has already
-    been called. Prevents the poll loop from re-sending cancel on every
-    iteration after `cancel_event` is set.
+    been called from an internal batch's poll loop. Prevents re-sending
+    cancel on every iteration after `cancel_event` is set.
     """
 
     def __init__(self, batch_id: str, workflow_name: str,
@@ -130,3 +147,10 @@ class _BatchRecord:
 
         self.job_ids: list = []
         self._cancel_sent: set = set()
+
+        # Populated only by `comfy_register_external_job`. A record
+        # with a non-empty list was submitted by a client talking to
+        # the proxy directly; the daemon tracks it so `comfy_status`'s
+        # `active_batches` and `comfy_cancel` can see it, but does not
+        # own its lifecycle.
+        self.external_job_ids: list = []

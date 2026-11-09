@@ -9,6 +9,100 @@ loopback TCP, exactly like the browser panel and the Emacs client.
 The docker is on reload_daemon's keep-list. Do not move it under a
 module that reload drops.
 
+Config auto-apply
+=================
+Config fields (resources, params, crop, paste) are not auto-committed
+per-field — the daemon's `comfy_apply_config` validates a whole config
+at once, so a per-field command would either have to be a merge-into-
+active-config command the daemon doesn't have, or a re-send of the
+whole config on every keystroke. Instead:
+
+  * Every config field edit starts a 150 ms single-shot debounce timer
+    (`_pending_apply_timer`). Rapid edits across multiple fields
+    collapse into one apply.
+  * When the timer fires, `_apply_config_from_widgets` calls
+    `PanelRenderer.build_config_from_widgets()` to assemble the four
+    config sections from the current widget state and enqueues one
+    `comfy_apply_config` command. The daemon validates, stores the
+    result in `_active_config`, and re-publishes state.
+  * `_on_panel` also auto-applies when the panel's `structure_id`
+    changes and a workflow is loaded — this is what populates
+    `_active_config` with the workflow's baked-in defaults right after
+    `comfy_load`, so the playground (which reads `_active_config`)
+    sees them without the user having to touch a field or click Run.
+
+The effect: `_active_config` on the daemon is the canonical source of
+truth for panel values, kept current by whichever client last edited
+a config field. The docker's Run button still uses `comfy_panel_run`
+(apply-then-generate) as a belt-and-braces path, but on the happy
+path auto-apply has already pushed the same values, so the Run apply
+is a redundant no-op. The one case where it matters is a Run click
+inside the debounce window: the widget state is a hair ahead of
+`_active_config`, and `comfy_panel_run`'s own apply catches up.
+
+The alternative — no auto-apply, config only applied at Run — is what
+the previous design had. It broke the "set values once, have them
+respected everywhere" expectation: editing a field in the docker
+updated only the docker's local widget state, `_active_config` stayed
+at whatever the last Run applied (often the workflow defaults), and
+any other client reading `_active_config` (the inpaint playground,
+the CLI) saw stale values until the user clicked Run. Auto-apply
+fixes that by making edits propagate immediately, debounced so rapid
+typing doesn't flood the command queue with redundant applies.
+
+Why `no_sync` came off config fields
+====================================
+An earlier design marked config fields `no_sync: true` so a daemon
+re-publish could not stomp the user's in-progress edits. That design
+assumed the daemon's `_active_config` and the docker's widget state
+would only meet at Run time — a re-publish during editing had to be
+suppressed because the daemon's view was always one apply behind.
+
+With auto-apply, the daemon's view is at most one debounce window
+behind, and usually identical to the widget state. Sync-ing config
+fields from `_active_config` is safe (the renderer's focus-check
+protects the field the user is typing in) and useful: when another
+client (CLI `panel run`, a second docker, the playground's own
+`comfy_apply_config`) applies a config, the docker's widgets reflect
+it on the next re-publish instead of silently drifting. The previous
+"docker overwrites everyone else with its stale widget state" bug is
+gone — with sync restored, the docker's widgets and `_active_config`
+agree, so a docker Run is a re-apply of the current truth, not an
+overwrite of someone else's.
+
+Run button and the v2 config
+============================
+The Run action builds its payload from two sources:
+
+  * **Collected run-option fields** (timeout, count, seed) — via the
+    item's `collect` mapping.
+
+  * **The config widgets** — via `PanelRenderer.build_config_from_
+    widgets()`, which walks every field carrying a `config_path` and
+    assembles the four-section v2 config (resources, params, crop,
+    paste).
+
+The command the docker sends is `comfy_panel_run`, which the daemon
+handles by running `comfy_connect` (auto-starting the proxy), then
+`comfy_apply_config` (validating the assembled config against the
+loaded graph's slot tables), then `comfy_generate`. The whole thing is
+atomic: if connect or apply fails, generate is not attempted.
+
+Run button enablement
+=====================
+Run is disabled until a workflow is loaded. The docker tracks
+`_workflow_loaded` from the `state` event's `workflow` field. Clicking
+Run with no workflow loaded would fail at `comfy_apply_config` with
+"No workflow loaded; run comfy_load first", which is a clear message
+but a worse UX than just not offering the button.
+
+The workflow picker's dropdown (from `WorkflowPickerProvider`)
+commits `comfy_load --name <value>` on selection. Once the daemon
+publishes the post-load state, `_workflow_loaded` becomes True and Run
+enables. The docker also auto-applies config on the same event, so
+`_active_config` is populated with the workflow's baked-in defaults
+before the user can click Run.
+
 Cancel and the command queue
 ============================
 The command worker in DaemonConnection is single-threaded by design:
@@ -16,11 +110,12 @@ it serialises state-mutating commands so a field edit is committed
 before the next command reaches the daemon. That is what makes "edit
 a parameter then click Run" reliable.
 
-`comfy_generate` holds the worker for the entire duration of the run,
-though — its `batch_complete` message does not arrive until the run
-finishes. A queued follow-up (the cancel request) would sit behind it
-and reach the daemon only after the run completed, at which point the
-cancel has nothing to target.
+`comfy_generate` (and therefore `comfy_panel_run`, which wraps it)
+holds the worker for the entire duration of the run, though — its
+`batch_complete` message does not arrive until the run finishes. A
+queued follow-up (the cancel request) would sit behind it and reach
+the daemon only after the run completed, at which point the cancel
+has nothing to target.
 
 Cancel therefore uses `DaemonConnection.send_cancel_now`, which opens
 its own socket on a fresh thread and sends `comfy_cancel` directly.
@@ -29,8 +124,10 @@ batch's cancel flag, and the run winds itself down.
 
 The same path is used by the thin "ALL" companion next to Cancel,
 but with a `None` batch id, which the daemon interprets as
-"cancel every active batch". That is exactly the `panel cancel
---all` behaviour from the CLI, exposed here as a click.
+"cancel every active batch". That includes batches started from
+another client (the CLI, the inpaint playground's registered external
+jobs). That is exactly the `panel cancel --all` behaviour from the
+CLI, exposed here as a click.
 
 Cancel-All availability (cross-client, no polling)
 ==================================================
@@ -51,49 +148,23 @@ reads that field and stores its length in `_active_batches_count`.
 `_update_run_buttons` OR's it with `self._running` and calls
 `set_action_enabled("cancel_all", …)` accordingly.
 
+External jobs (the inpaint playground) are registered with the daemon
+via `comfy_register_external_job`, so they appear in `active_batches`
+and can be cancelled through the same Cancel-All button. See
+`handlers/comfyui_generation.comfy_cancel` for the forwarding to
+`ProxyV2.cancel_job`.
+
 No `comfy_batches` fetch, no timer, no interval. The state event
-stream is the sole source of truth. This matches the web panel's
-approach exactly: both clients derive the button's enabled state
-from the same channel the daemon already uses to publish workflow
-state.
-
-Ordering note: a local batch's `batch_complete` message (arriving on
-the command socket) and the end-of-batch `state` push (arriving on
-the event socket) are on two different sockets and may land in
-either order. Both orderings are safe:
-
-  * state first: `_on_state` sees `active_batches=[]`, but
-    `_running` is still true, so both Cancel and Cancel-All remain
-    enabled until `_on_command_completed` clears `_running`. No
-    flicker.
-
-  * completion first: `_on_command_completed` clears `_running`, so
-    Cancel disables. Cancel-All stays enabled on the stale count
-    from the previous state push until the new one arrives
-    (milliseconds later). If the user clicks in that window, the
-    daemon's `comfy_cancel` (no `batch_id`) returns
-    "Cancel requested (nothing was running)" — a harmless no-op.
+stream is the sole source of truth.
 
 Layer list freshness
 ====================
-The alias combos need a current layer list. Krita provides no signal
-for layer-tree changes (see layers_watcher.py for the full account),
-so `LayersWatcher` uses five event-driven triggers:
-
-  1. Notifier imageCreated/imageClosed (inside LayersWatcher).
-  2. Panel events — this file schedules a refresh from `_on_panel`.
-  3. Docker focusInEvent — this file schedules a refresh directly.
-  4. Combo showPopup — `PanelRenderer.layerRefreshRequested` routes
-     to `LayersWatcher.schedule`.
-  5. Event socket connected — this file schedules a refresh from
-     `_on_conn_state(True)`.
-
-All five collapse into one debounced `layersChanged`, which routes to
-`DaemonConnection.request_layers`. There is no polling.
-
-The one gap, named in layers_watcher.py, is a native-Krita layer add
-performed while no trigger fires and no other interaction happens;
-the next focus or popup open refreshes.
+`LayersWatcher` triggers `request_layers` on: notifier image events,
+panel events, docker focus, combo popup, and reconnect. All collapse
+into one debounced `layersChanged`. No polling. In the v2 panel no
+built-in provider emits `_LayerComboBox` fields, so the layer list
+mostly sits dormant, but the plumbing stays for any future provider
+that wants alias dropdowns.
 
 Workflow hint text
 ==================
@@ -104,15 +175,16 @@ names the two CLI entry points that load a workflow:
     kritomatic comfyui comfy_load --name <slug>
     kritomatic comfyui panel run <slug>
 
-There is no browser-publish option; that transport died with the
-tooling-nodes package. The hint text was updated accordingly.
+...and also mentions the workflow picker text field, which is the
+in-docker path.
 """
 
 from __future__ import annotations
 
+import json
 import time
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QScrollArea, QLabel,
     QPlainTextEdit, QFrame,
@@ -121,6 +193,15 @@ from PyQt6.QtWidgets import (
 from .connection import DaemonConnection
 from .layers_watcher import LayersWatcher
 from .renderer import PanelRenderer
+
+
+# Debounce interval for config auto-apply. Long enough to collapse a
+# burst of edits across multiple fields (the user tabbing through the
+# form, or a paste that fires several `editingFinished` events in
+# quick succession) into one `comfy_apply_config` command, short enough
+# that a single deliberate edit reaches the daemon well before the
+# user could plausibly reach for the Run button.
+_CONFIG_APPLY_DEBOUNCE_MS = 150
 
 
 class KritomaticPanel(QDockWidget):
@@ -136,6 +217,18 @@ class KritomaticPanel(QDockWidget):
         self._running = False
         self._active_run_request_id = None
         self._active_batches_count = 0
+        self._workflow_loaded = False
+
+        # Config auto-apply: see the module docstring. Every config
+        # field edit restarts this timer; when it fires, the docker
+        # assembles the current widget state and sends one
+        # `comfy_apply_config`. The timer is single-shot so a rapid
+        # series of edits produces exactly one apply.
+        self._pending_apply_timer = QTimer(self)
+        self._pending_apply_timer.setSingleShot(True)
+        self._pending_apply_timer.setInterval(_CONFIG_APPLY_DEBOUNCE_MS)
+        self._pending_apply_timer.timeout.connect(self._flush_pending_apply)
+        self._pending_apply_source = ""
 
         root = QWidget()
         root_layout = QVBoxLayout(root)
@@ -208,6 +301,10 @@ class KritomaticPanel(QDockWidget):
 
     def closeEvent(self, event):
         try:
+            self._pending_apply_timer.stop()
+        except Exception:
+            pass
+        try:
             self._layers_watcher.stop()
         except Exception:
             pass
@@ -235,38 +332,42 @@ class KritomaticPanel(QDockWidget):
                 pass
         else:
             self._status.setText("Waiting for daemon event stream…")
-            # No connection, no batches known to us. Resetting to 0
-            # disables Cancel-All honestly rather than leaving it lit
-            # against stale data. The event server re-sends a full
-            # `state` snapshot on reconnect, so `_on_state` restores
-            # the correct value automatically.
             self._active_batches_count = 0
+            self._workflow_loaded = False
         self._update_run_buttons()
 
     def _on_state(self, data: dict) -> None:
-        # `active_batches` is the daemon's live list of running
-        # batches, across all clients. The daemon publishes a state
-        # event at every batch boundary (see the module docstring's
-        # "Cancel-All availability" section), so this is always
-        # current — no polling, no fetch.
         try:
             batches = data.get("active_batches") or []
             self._active_batches_count = len(batches)
+            self._workflow_loaded = bool(data.get("workflow"))
         except Exception:
             pass
         self._update_run_buttons()
 
     def _on_panel(self, description: dict) -> None:
+        old_structure = self._renderer._structure_id
         try:
             self._renderer.render(description)
         except Exception as e:
             self._append_log("err", f"render error: {e}")
+        new_structure = self._renderer._structure_id
         self._update_workflow_hint(description)
         self._update_run_buttons()
         try:
             self._layers_watcher.schedule()
         except Exception:
             pass
+
+        # Structure change + workflow loaded → this is a fresh load
+        # (or the docker's first panel after booting with a workflow
+        # already in `_active_config`). Auto-apply so `_active_config`
+        # is populated with whatever defaults the freshly-built widgets
+        # show. This is what makes the playground see the workflow's
+        # baked-in param values without the user having to touch a
+        # field or click Run first.
+        if old_structure != new_structure and self._workflow_loaded:
+            self._apply_config_from_widgets("auto_load")
 
     def _on_layers_changed(self) -> None:
         self._conn.request_layers()
@@ -291,10 +392,11 @@ class KritomaticPanel(QDockWidget):
             self._hint.hide()
         else:
             self._hint.setText(
-                "No workflow loaded. Run "
-                "<code>kritomatic comfyui panel run &lt;name&gt;</code> "
-                "or <code>kritomatic comfyui comfy_load --name "
-                "&lt;name&gt;</code> from a terminal."
+                "No workflow loaded. Type a name in the Workflow field "
+                "above and press Enter, or run "
+                "<code>kritomatic comfyui comfy_load --name "
+                "&lt;name&gt;</code> / <code>kritomatic comfyui panel "
+                "run &lt;name&gt;</code> from a terminal."
             )
             self._hint.show()
 
@@ -318,12 +420,18 @@ class KritomaticPanel(QDockWidget):
                 self._append_log("warn", f"Cancel sent: {msg}")
             else:
                 self._append_log("err", f"Cancel failed: {msg}")
-            # No fetch here. If the cancel actually stopped a batch,
-            # the daemon's end-of-batch state push will update
-            # `_active_batches_count` when it fires. If it was a
-            # cancel-all against another client's batch, the same
-            # applies — the state push fires from `execute()`'s
-            # wrapper when that batch returns.
+            return
+
+        if request_id.startswith("apply-"):
+            # Auto-apply result. Success: silent (the widget state
+            # already reflects what was applied). Failure: log so the
+            # user knows their config edit was rejected (typically an
+            # intermediate invalid state, e.g. source=layer without a
+            # layer_name — the widget stays where they left it and the
+            # next valid edit re-applies).
+            if not ok:
+                msg = summary.get("message", "")
+                self._append_log("err", f"config rejected: {msg}")
             return
 
         if request_id != self._active_run_request_id:
@@ -357,7 +465,50 @@ class KritomaticPanel(QDockWidget):
     # ---- command submission ----
 
     def _on_field_commit(self, key: str, command: dict) -> None:
+        if command.get("type") == "comfy_apply_config_from_widgets":
+            # Config field edit: debounce, then apply the whole config.
+            # Rationale and debounce interval are documented in the
+            # module docstring, "Config auto-apply".
+            self._pending_apply_source = key
+            self._pending_apply_timer.start()
+            return
+
         request_id = f"field-{key}"
+        bundle = {"id": request_id, "commands": [command]}
+        self._conn.enqueue(request_id, bundle)
+
+    def _flush_pending_apply(self) -> None:
+        """Debounce timeout: one apply for the accumulated edit burst."""
+        source = self._pending_apply_source or "auto"
+        self._pending_apply_source = ""
+        self._apply_config_from_widgets(source)
+
+    def _apply_config_from_widgets(self, source_key: str) -> None:
+        """Assemble the current widget state and send comfy_apply_config.
+
+        Called from two places:
+          * `_flush_pending_apply`, after the debounce timer fires
+            following a config field edit.
+          * `_on_panel`, when the panel structure changes and a
+            workflow is loaded (this populates `_active_config` with
+            the workflow's baked-in defaults right after comfy_load).
+
+        Both paths send the same command shape: the four config
+        sections serialized as JSON, one command, one batch.
+        """
+        try:
+            cfg = self._renderer.build_config_from_widgets()
+        except Exception as e:
+            self._append_log("err", f"config build failed: {e}")
+            return
+        command = {
+            "type": "comfy_apply_config",
+            "resources": json.dumps(cfg["resources"]),
+            "params": json.dumps(cfg["params"]),
+            "crop": json.dumps(cfg["crop"]),
+            "paste": json.dumps(cfg["paste"]),
+        }
+        request_id = f"apply-{source_key}-{int(time.time() * 1000)}"
         bundle = {"id": request_id, "commands": [command]}
         self._conn.enqueue(request_id, bundle)
 
@@ -392,7 +543,28 @@ class KritomaticPanel(QDockWidget):
                     continue
                 command[argname] = v
 
+        # comfy_panel_run needs the four v2 config sections, which the
+        # docker assembles from its config widgets at click time. The
+        # module docstring, "Run button and the v2 config", explains
+        # why this is a redundant confirmation on the happy path and a
+        # necessary catch-up when Run is clicked inside the debounce
+        # window.
+        if command.get("type") == "comfy_panel_run":
+            cfg = self._renderer.build_config_from_widgets()
+            command["resources"] = json.dumps(cfg["resources"])
+            command["params"] = json.dumps(cfg["params"])
+            command["crop"] = json.dumps(cfg["crop"])
+            command["paste"] = json.dumps(cfg["paste"])
+
         if key == "run":
+            # Cancel any pending auto-apply so we don't double-send the
+            # same config just because the user typed and then clicked
+            # Run inside the debounce window. The Run command's own
+            # apply covers the widget state; the pending timer would
+            # have fired with identical values.
+            self._pending_apply_timer.stop()
+            self._pending_apply_source = ""
+
             request_id = f"run-{int(time.time() * 1000)}"
             self._active_run_request_id = request_id
             self._running = True
@@ -413,10 +585,6 @@ class KritomaticPanel(QDockWidget):
             )
 
         elif key == "cancel_all":
-            # Same out-of-band path as `cancel`, but with no batch id,
-            # so the daemon cancels every active batch — including
-            # ones launched from the CLI or another panel — and any
-            # async generates.
             request_id = f"cancel_all-{int(time.time() * 1000)}"
             self._conn.send_cancel_now(None, request_id)
 
@@ -427,13 +595,17 @@ class KritomaticPanel(QDockWidget):
             self._append_log("hdr", f"Action {key} sent.")
 
     def _update_run_buttons(self) -> None:
-        # Run: enabled when this docker is idle.
-        self._renderer.set_action_enabled("run", not self._running)
+        # Run: enabled only when this docker is idle AND a workflow is
+        # loaded. Clicking Run with no workflow loaded would fail at
+        # comfy_apply_config; disabling it is cleaner UX.
+        self._renderer.set_action_enabled(
+            "run", not self._running and self._workflow_loaded)
         # Cancel: targets this docker's own batch. Enabled strictly
         # when this docker has one in flight — it has nothing to do
         # otherwise.
         self._renderer.set_action_enabled("cancel", self._running)
-        # Cancel-All: targets every batch on the daemon. Enabled when
+        # Cancel-All: targets every batch on the daemon, including
+        # external jobs registered by the playground. Enabled when
         # either this docker has a local run (covers the brief window
         # before the first state push arrives) or the daemon reports
         # any active batch from any client.

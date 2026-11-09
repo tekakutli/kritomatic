@@ -25,14 +25,22 @@ this process:
        `Primitive*` param slots (_meta.title) from the graph.
     3. Upload canvas / selection / context as v2 assets via
        POST /api/v2/assets (blake3 dedup server-side).
-    4. Substitute core/ASSET refs and `prompt` / `seed` params into a
+    4. Fetch the daemon's active panel config so params set in the
+       docker (denoise, Illustrous?, Hyper?, etc.) carry over to the
+       inpaint. The `prompt` and `seed` are playground-owned and
+       override whatever the daemon has.
+    5. Substitute core/ASSET refs and the merged params into a
        two-level copy of the graph.
-    5. Submit via POST /api/v2/jobs, poll GET /api/v2/jobs/{id}.
-    6. Download each `type == "output"` entry via
+    6. Register the proxy job with the daemon
+       (comfy_register_external_job) so comfy_status's active_batches
+       and comfy_cancel can see it. Unregister in a finally block
+       around the poll + download.
+    7. Submit via POST /api/v2/jobs, poll GET /api/v2/jobs/{id}.
+    8. Download each `type == "output"` entry via
        GET /api/v2/assets/{id}/content.
-    7. Apply `-output_rotation` (the inverse of the client's display
+    9. Apply `-output_rotation` (the inverse of the client's display
        rotation) to the downloaded PNG.
-    8. Return the rotated PNG as base64.
+   10. Return the rotated PNG as base64.
 
 The rotation is applied server-side because the client sent the blobs
 in the *rotated* frame (`_buildInpaintPayload` rotates the canvas and
@@ -49,6 +57,34 @@ the full (rotated, W × H) canvas and lets the workflow crop internally.
 Corner caveat: when `output_rotation != 0`, the (W × H) result is
 rotated with `expand=False`, so the four corners of the rotated frame
 are lost. Same limitation the earlier v1 flow had.
+
+PARAM AND CANCEL SHARING WITH THE DOCKER
+========================================
+The playground drives generation itself, but it must not feel like a
+separate universe from the docker. Two wiring details ensure that:
+
+  · **Params.** Before substitution, `handle_inpaint` fetches
+    `comfy_status` from the daemon and copies `config.params` into the
+    playground's starting param map. `prompt` and `seed` are then
+    overwritten by the playground's own values. The effect: any param
+    the docker has applied (via `comfy_apply_config` from the Run
+    button, or from the CLI's `panel run`) carries over to the next
+    playground inpaint. Params the daemon has no opinion about fall
+    through to the workflow's baked-in defaults, same as before.
+
+  · **Cancel.** Every submitted proxy job is registered with the daemon
+    via `comfy_register_external_job` immediately after `submit_job`.
+    The daemon creates a `_BatchRecord` with the proxy job id under
+    `external_job_ids`, so `comfy_status.active_batches` reflects the
+    job and the docker's Cancel-All button enables. When the user
+    clicks Cancel-All (or the CLI runs `panel cancel --all`), the
+    daemon's `comfy_cancel` sees `external_job_ids` and routes to
+    `ProxyV2.cancel_job` on each id. The playground's own poll loop
+    then sees the proxy transition the job to `canceled` — no
+    cooperation needed from the daemon beyond the forward. A
+    `comfy_unregister_external_job` in a finally block cleans up on
+    every exit path (success, poll failure, download failure,
+    exception).
 """
 
 from __future__ import annotations
@@ -277,6 +313,52 @@ _RESOURCE_PAYLOAD_KEYS = (
 )
 
 
+def _fetch_daemon_params() -> dict:
+    """Return the daemon's current `_active_config["params"]` dict.
+
+    Falls back to `{}` on any failure: daemon unreachable, no config
+    applied, or the status response missing `config`. Non-fatal —
+    the inpaint still works, it just doesn't inherit the docker's
+    applied params. The caller overlays `prompt` and `seed` on top of
+    whatever this returns, so an empty result is safe.
+    """
+    try:
+        resp = krita_client.send({"type": "comfy_status"}, timeout=10.0)
+    except Exception:
+        return {}
+    if not isinstance(resp, dict) or resp.get("status") != "success":
+        return {}
+    cfg = (resp.get("data") or {}).get("config") or {}
+    params = cfg.get("params") if isinstance(cfg, dict) else None
+    return dict(params) if isinstance(params, dict) else {}
+
+
+def _register_external_job(batch_id: str, job_id: str, workflow: str) -> None:
+    """Tell the daemon to track this proxy job. Best-effort — a
+    registration failure only means the docker's Cancel-All won't see
+    this run; the inpaint itself is unaffected.
+    """
+    try:
+        krita_client.send({
+            "type": "comfy_register_external_job",
+            "batch_id": batch_id,
+            "job_id": job_id,
+            "workflow": workflow,
+        }, timeout=10.0)
+    except Exception:
+        pass
+
+
+def _unregister_external_job(batch_id: str) -> None:
+    try:
+        krita_client.send({
+            "type": "comfy_unregister_external_job",
+            "batch_id": batch_id,
+        }, timeout=5.0)
+    except Exception:
+        pass
+
+
 def handle_inpaint(payload: dict) -> dict:
     if not isinstance(payload, dict):
         return {"success": False, "message": "expected a JSON object"}
@@ -355,7 +437,7 @@ def handle_inpaint(payload: dict) -> dict:
                 "message": f"proxy unreachable: {e}"}
 
     asset_refs: dict = {}
-    for name, payload_key in _RESOURCE_PAYLOAD_KEYS:
+    for name, _payload_key in _RESOURCE_PAYLOAD_KEYS:
         img = images[name]
         buf = BytesIO()
         img.save(buf, "PNG")
@@ -369,14 +451,30 @@ def handle_inpaint(payload: dict) -> dict:
                     "message": f"upload of {name!r} failed: {e}"}
         asset_refs[name] = asset
 
-    # ---- 5. Build the prepared graph ----
+    # ---- 5. Build param map: docker's applied params, then override ----
+    #
+    # The daemon's `_active_config["params"]` is what the docker's Run
+    # button (or the CLI's `panel run`) last applied. Reading it here
+    # means any checkbox, slider, or numeric field the user set in the
+    # docker carries over to the playground's inpaint — without the
+    # playground having to know which params exist on which workflow.
+    #
+    # `prompt` and `seed` are playground-owned by design: the prompt is
+    # what the user typed in the playground's own textarea, and the
+    # seed must be fresh per run (the daemon's config never stores a
+    # seed — that's a top-level field, not a `[params]` key — so
+    # `daemon_params.get("seed")` is normally absent anyway; the
+    # override is for the rare case where a workflow has a Primitive
+    # titled "seed" whose default leaked into the config via a
+    # hand-edited TOML).
+    daemon_params = _fetch_daemon_params()
     seed = int(time.time() * 1000) & 0xFFFFFFFF
-    param_values = {
-        "prompt": prompt,
-        "seed": seed,
-    }
-    # Strip any params the workflow doesn't declare (harmless on the
-    # daemon side, but cleaner here since we can check ahead of time).
+    param_values = dict(daemon_params)
+    param_values["prompt"] = prompt
+    param_values["seed"] = seed
+    # Drop anything the loaded workflow doesn't actually expose as a
+    # param slot. Avoids passing unknown titles to _substitute_into_graph
+    # (which no-ops on them anyway, but the log line is clearer).
     param_values = {k: v for k, v in param_values.items() if k in param_slots}
 
     prepared = _substitute_into_graph(
@@ -384,7 +482,8 @@ def handle_inpaint(payload: dict) -> dict:
     )
 
     _log(f"inpaint: workflow={workflow!r} prompt={prompt[:40]!r} "
-         f"seed={seed} resources={list(asset_refs)}")
+         f"seed={seed} params={sorted(param_values)} "
+         f"resources={list(asset_refs)}")
 
     # ---- 6. Submit ----
     try:
@@ -396,40 +495,54 @@ def handle_inpaint(payload: dict) -> dict:
         return {"success": False, "message": f"submit failed: {e}"}
 
     job_id = job["id"]
+    batch_id = f"inpaint_{job_id}"
 
-    # ---- 7. Poll ----
-    deadline = time.monotonic() + timeout + 60.0
-    final = job
-    while time.monotonic() < deadline:
-        try:
-            final = proxy.get_job(job_id)
-        except ProxyUnreachable as e:
-            return {"success": False, "message": f"poll failed: {e}"}
-        status = final.get("status")
-        if status in ("succeeded", "failed", "canceled", "expired"):
-            break
-        time.sleep(0.25)
-
-    if final.get("status") != "succeeded":
-        err = (final.get("error") or {}).get("message") or final.get("status")
-        return {"success": False,
-                "message": f"job {final.get('status')}: {err}"}
-
-    # ---- 8. Download the first committed output ----
-    outputs = [
-        o for o in (final.get("outputs") or [])
-        if o.get("type") and o["type"] != "temp" and o.get("id")
-    ]
-    if not outputs:
-        return {"success": False,
-                "message": "job succeeded but produced no retrievable outputs"}
+    # ---- 7. Register with the daemon, poll, download, unregister ----
+    #
+    # Registration is what makes the docker's Cancel-All see this job.
+    # Unregistration in the finally block guarantees the daemon's
+    # `_batches` map is cleaned up on every exit path — success,
+    # cancellation, download failure, or an unexpected exception. The
+    # finally fires before the early returns propagate to the caller,
+    # so the docker's state event with the updated active_batches will
+    # already have been published by the time the user sees the
+    # playground's result.
+    _register_external_job(batch_id, job_id, workflow)
 
     try:
-        png_bytes = proxy.download_asset(outputs[0]["id"])
-    except (ProxyHTTPError, ProxyUnreachable) as e:
-        return {"success": False, "message": f"download failed: {e}"}
+        deadline = time.monotonic() + timeout + 60.0
+        final = job
+        while time.monotonic() < deadline:
+            try:
+                final = proxy.get_job(job_id)
+            except ProxyUnreachable as e:
+                return {"success": False, "message": f"poll failed: {e}"}
+            status = final.get("status")
+            if status in ("succeeded", "failed", "canceled", "expired"):
+                break
+            time.sleep(0.25)
 
-    # ---- 9. Un-rotate back to original orientation ----
+        if final.get("status") != "succeeded":
+            err = (final.get("error") or {}).get("message") or final.get("status")
+            return {"success": False,
+                    "message": f"job {final.get('status')}: {err}"}
+
+        outputs = [
+            o for o in (final.get("outputs") or [])
+            if o.get("type") and o["type"] != "temp" and o.get("id")
+        ]
+        if not outputs:
+            return {"success": False,
+                    "message": "job succeeded but produced no retrievable outputs"}
+
+        try:
+            png_bytes = proxy.download_asset(outputs[0]["id"])
+        except (ProxyHTTPError, ProxyUnreachable) as e:
+            return {"success": False, "message": f"download failed: {e}"}
+    finally:
+        _unregister_external_job(batch_id)
+
+    # ---- 8. Un-rotate back to original orientation ----
     if output_rotation:
         try:
             img = Image.open(BytesIO(png_bytes))

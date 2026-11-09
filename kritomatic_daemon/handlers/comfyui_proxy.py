@@ -22,12 +22,27 @@ or starting a separate Python process.
 comfy_connect auto-starts the proxy if it isn't running (see
 comfyui_connection.py). These explicit commands are for setup,
 inspection, and recovery.
+
+External-job registration
+=========================
+`comfy_register_external_job` / `comfy_unregister_external_job` let a
+client that submits jobs via ProxyV2 directly — currently the inpaint
+playground — announce the job to the daemon so:
+
+  * `comfy_status`'s `active_batches` reflects it, and
+  * `comfy_cancel` can reach it via `ProxyV2.cancel_job`.
+
+The daemon does not take over the job's lifecycle: it stores the
+proxy job id, and on cancel routes to the proxy, nothing more. The
+client keeps polling the proxy itself and sees the `canceled` status
+on its own next `get_job` call.
 """
 
 from __future__ import annotations
 
 from ..decorators import command, AutoDispatchHandler
 from ..proxy import manager
+from .comfyui_types import _BatchRecord
 
 
 class ProxyCommands(AutoDispatchHandler):
@@ -202,13 +217,6 @@ class ProxyCommands(AutoDispatchHandler):
                     "data": {"steps": steps,
                              "status": e.status, "code": e.code}}
 
-        # LoadImage → SaveImage: the minimal graph ComfyUI will accept.
-        # LoadImage on its own is not a terminal node; ComfyUI rejects a
-        # graph with no output node at /prompt time with
-        # "Prompt has no outputs" (422 invalid_workflow). SaveImage gives
-        # the graph a terminal, and exercises the full pipeline:
-        # upload → core/ASSET resolution → ComfyUI execution → output
-        # asset registration.
         workflow = {
             "1": {
                 "class_type": "LoadImage",
@@ -266,9 +274,6 @@ class ProxyCommands(AutoDispatchHandler):
                 "data": {"steps": steps, "final_status": status},
             }
         if status == "failed":
-            # Transport reached ComfyUI and execution started, but the
-            # graph crashed mid-run. Transport is fine; the test graph
-            # is what is broken. Surface the error for diagnosis.
             err = final.get("error") or {}
             return {
                 "success": True,
@@ -287,3 +292,90 @@ class ProxyCommands(AutoDispatchHandler):
             ),
             "data": {"steps": steps, "final_status": status},
         }
+
+    # ------------------------------------------------------------------
+    #  External-job registration
+    # ------------------------------------------------------------------
+    #
+    # A client that submits jobs via ProxyV2 directly (currently the
+    # inpaint playground, which moved off the daemon's comfy_generate
+    # in Stage 8) announces each job with `comfy_register_external_job`
+    # and removes it with `comfy_unregister_external_job`. The daemon
+    # creates a normal `_BatchRecord`, stores the proxy job id under
+    # `external_job_ids`, and does nothing else. `comfy_status` picks
+    # the record up automatically because `_batches` is what it walks.
+    # `comfy_cancel` sees `external_job_ids` and routes to
+    # `ProxyV2.cancel_job` instead of setting `cancel_event` (there is
+    # no local poll loop for the daemon to interrupt — the client has
+    # its own).
+
+    @command(
+        category="comfyui",
+        help_text="Register a proxy-submitted job with the daemon so "
+                  "comfy_status's active_batches reflects it and "
+                  "comfy_cancel can reach it. The daemon does not take "
+                  "over the job's lifecycle — it just records the id "
+                  "and forwards cancels. Callers must pair every "
+                  "register with a matching unregister when the job "
+                  "reaches a terminal state.",
+        args={
+            "--batch_id": {"type": "str", "required": True,
+                           "help": "Client-chosen batch id. Must be "
+                                   "unique among active batches."},
+            "--job_id":   {"type": "str", "required": True,
+                           "help": "Proxy job id (from submit_job)."},
+            "--workflow": {"type": "str", "required": False,
+                           "help": "Workflow name for display in "
+                                   "comfy_batches. Defaults to "
+                                   "'(external)'."},
+        },
+    )
+    def comfy_register_external_job(self, params):
+        parent = self.parent
+        batch_id = params.get("batch_id") or ""
+        job_id = params.get("job_id") or ""
+        if not batch_id or not job_id:
+            return {"success": False,
+                    "message": "batch_id and job_id are required"}
+
+        record = _BatchRecord(
+            batch_id=batch_id,
+            workflow_name=(params.get("workflow") or "(external)"),
+            requested_count=1,
+            total_runs=1,
+            base_seed=0,
+            output_name=None,
+        )
+        record.external_job_ids = [job_id]
+        record.current_phase = "running"
+
+        with parent._batches_lock:
+            parent._batches[batch_id] = record
+
+        return {
+            "success": True,
+            "message": f"registered external job {job_id} as {batch_id}",
+            "data": {"batch_id": batch_id, "job_id": job_id},
+        }
+
+    @command(
+        category="comfyui",
+        help_text="Remove an external job's registration. Safe to call "
+                  "whether or not the batch is still present.",
+        args={
+            "--batch_id": {"type": "str", "required": True,
+                           "help": "Batch id previously passed to "
+                                   "comfy_register_external_job."},
+        },
+    )
+    def comfy_unregister_external_job(self, params):
+        parent = self.parent
+        batch_id = params.get("batch_id") or ""
+        if not batch_id:
+            return {"success": False, "message": "batch_id is required"}
+
+        with parent._batches_lock:
+            parent._batches.pop(batch_id, None)
+
+        return {"success": True, "message": "unregistered",
+                "data": {"batch_id": batch_id}}

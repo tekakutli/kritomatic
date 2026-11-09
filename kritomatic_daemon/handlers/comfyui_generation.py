@@ -33,6 +33,35 @@ Cancellation
     `proxy.cancel_job(job_id)` once and continues polling. The job
     transitions to `canceling` then `canceled` within a step boundary.
 
+External batches (playground-submitted jobs)
+============================================
+A client that submits jobs via `ProxyV2` directly — currently the
+inpaint playground — registers each job with the daemon through
+`comfy_register_external_job` (see `comfyui_proxy.py`). The daemon
+creates a normal `_BatchRecord`, stores the proxy job id under
+`external_job_ids`, and stops there.
+
+`comfy_cancel` therefore handles two record shapes:
+
+  * **Internal** — `external_job_ids` empty. Behaviour unchanged:
+    `record.cancel_event.set()` and let the local poll loop do the
+    rest.
+
+  * **External** — `external_job_ids` non-empty. Setting
+    `cancel_event` would do nothing (the daemon never had a poll
+    loop for this job). Instead, `comfy_cancel` calls
+    `ProxyV2.cancel_job` on each registered job id, best-effort.
+    The client's own poll loop sees the proxy transition the job
+    to `canceled` on its next `get_job` call — no cooperation
+    needed from the daemon beyond the forward.
+
+The try/except around the external cancel is deliberately
+non-raising: a job that already reached a terminal state returns
+the terminal status without error; a proxy that has gone away since
+submission produces `ProxyUnreachable`. Neither should fail the
+cancel command when the user clicked Cancel-All on a batch that
+happens to already be finishing.
+
 `--no_paste`
 ============
 Returns PNG bytes as base64 in `data.images` instead of pasting into
@@ -650,7 +679,17 @@ class GenerationCommands(AutoDispatchHandler):
 
     @command(
         category="comfyui",
-        help_text="Cancel one or more running batches.",
+        help_text="Cancel one or more running batches. Internal "
+                  "batches (submitted via comfy_generate) are "
+                  "cancelled by setting their cancel_event, which "
+                  "the local poll loop turns into a "
+                  "ProxyV2.cancel_job call. External batches "
+                  "(registered by a client that submitted via "
+                  "ProxyV2 directly, e.g. the inpaint playground) are "
+                  "cancelled by calling ProxyV2.cancel_job on each "
+                  "registered job id — the client owns its own poll "
+                  "loop and sees the proxy's canceled status without "
+                  "any daemon cooperation beyond the forward.",
         args={
             "--batch_id": {"type": "str", "required": False,
                            "help": "The batch id to cancel. Omit to "
@@ -685,7 +724,40 @@ class GenerationCommands(AutoDispatchHandler):
                     "data": {"batches": []}}
 
         for r in records:
-            r.cancel_event.set()
+            external_ids = getattr(r, "external_job_ids", None) or []
+            if external_ids:
+                # External batch: the daemon never had a poll loop for
+                # this job, so setting cancel_event would do nothing.
+                # Route the cancel to the proxy directly. Both errors
+                # we swallow here are non-fatal:
+                #
+                #   * ProxyHTTPError — the job already reached a
+                #     terminal state (cancel on a terminal job is a
+                #     no-op that returns the terminal Job dict, but
+                #     a 404 for a job the proxy has since forgotten
+                #     is possible if the batch record outlives the
+                #     proxy's job retention window).
+                #
+                #   * ProxyUnreachable — the proxy has gone away
+                #     since submission. Nothing to cancel through it.
+                #
+                # Either way, the client's own poll loop is what
+                # ultimately decides the run's fate; the daemon's
+                # forward is best-effort.
+                try:
+                    proxy = ProxyV2.from_pid_file()
+                except (ProxyUnreachable, ImportError):
+                    continue
+                for jid in external_ids:
+                    try:
+                        proxy.cancel_job(jid)
+                    except (ProxyHTTPError, ProxyUnreachable):
+                        pass
+            else:
+                # Internal batch: unchanged behaviour. The poll loop
+                # in `_poll_job` watches `cancel_event` and sends
+                # `cancel_job` once per in-flight job id.
+                r.cancel_event.set()
 
         active_ids = sorted(r.batch_id for r in records)
         if batch_id:

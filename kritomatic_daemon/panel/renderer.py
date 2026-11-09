@@ -6,12 +6,15 @@ layout. On a new description:
 
   * If structure_id is unchanged, values are synced in place. Fields
     that currently have focus are skipped (their spec is still updated
-    so future syncs are consistent).
+    so future syncs are consistent). Fields marked `no_sync: true`
+    (the v2 config fields) are always skipped — the docker collects
+    them at Run time from the user's in-progress edits, and a daemon
+    re-publish must not overwrite those edits.
   * If structure_id changed, the tree is rebuilt.
 
 Edits are routed to a commit callback. Actions are routed to an action
 callback. The renderer knows nothing about comfyui; it knows field
-types and command names.
+types, command names, and config paths.
 
 Focus preservation across rebuilds
 ==================================
@@ -19,97 +22,61 @@ A structural change destroys and recreates every field widget. Without
 intervention that would steal focus from a field the user is typing
 into — visible on a Krita startup where the daemon publishes an empty
 panel (no workflow), the user clicks into a run-option field, and the
-auto-pull's subsequent state push arrives a beat later and rebuilds
-the tree.
+auto-pull's subsequent state push arrives a beat later and rebuilds the
+tree.
 
 `_rebuild` therefore captures the focused field's key and (for text
-inputs and editable combos) its cursor position before the teardown,
-and restores both after the rebuild if that field still exists in the
-new description.
+inputs) its cursor position before the teardown, and restores both
+after the rebuild if that field still exists in the new description.
+
+Two config models
+=================
+Command fields carry `set_command`; the renderer commits them on edit.
+Config fields carry `config_path` and `no_sync: true`; the renderer
+does not commit them, but includes them in `build_config_from_widgets`,
+which the docker calls at Run time to assemble the v2 config JSON.
 
 Layer alias combos
 ==================
-A text field whose spec carries `kind_hint: "image"` or `"mask"` is
-rendered as an editable `_LayerComboBox` with a contains-match,
-case-insensitive completer. The combo's current text is the alias
-value (the actual string the daemon will use); the dropdown is a
-hint. Typed text that does not match any item still commits, so
-free-form entry is preserved.
+The `_LayerComboBox` remains for image/mask-alias fields rendered by
+providers that carry `kind_hint`. In the v2 panel, none of the built-in
+providers emit such fields, but the class is kept for future use and
+for the playground's reuse. Behaviour is unchanged.
 
 Commit triggers
 ---------------
-The commit fires on `activated` (a dropdown pick) and on
-`lineEdit().editingFinished` (blur or Enter on the line edit).
-`currentTextChanged` is deliberately NOT connected: it fires on
-every keystroke, so an editable combo connected to it would send one
-`comfy_bind_layer_alias` per character — including the empty string
-after a backspace — and the daemon would reject each empty as
-"Both --logical_name and --actual_name are required."
-
-`_on_text_commit` updates the spec's cached `value` optimistically
-before sending, so a `activated` followed by an `editingFinished` on
-blur does not fire two commits of the same value. The next panel
-event overwrites the cached value with the authoritative one.
+Command fields commit on `activated` (dropdown pick), `editingFinished`
+(blur or Enter), or on the checkbox/radio `toggled` signal. Config
+fields do nothing on edit beyond updating their local widget state and
+re-evaluating `visible_when` for dependent fields.
 
 Layout
 ------
 A `QComboBox`'s default horizontal size policy is `Preferred`, while
 `QLineEdit`'s is `Expanding`. The form uses
-`QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow`, so line edits
-fill their row and combos do not. `_LayerComboBox` is given an
-`Expanding` policy at construction so it lines up with the other
-fields.
-
-Recent-alias prioritization
-===========================
-`set_layers` orders the item list so that layer names from the
-daemon's recent-alias history appear first, in recency order,
-followed by the rest in tree order. The recent list is flat
-(kind-agnostic); the intersection with the current bucket is what
-keeps a mask alias out of an image dropdown. See handlers/comfyui.py's
-"Layer aliases and the recent-aliases file" section for the daemon
-side.
+`QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow`, so line edits fill
+their row and combos do not. `_LayerComboBox` is given an `Expanding`
+policy at construction so it lines up with the other fields.
 
 Action-button fusion
 ====================
 An action item may carry `thin: true` and `attach_to: "<key>"`. The
-renderer draws it as a small companion button directly beside the
-item named by `attach_to`: their gap is negative (-2px), so the two
-buttons tuck tight against each other and read as one unit. The
-*visual style* of the companion is inherited from the same palette
-entry as its target (`style: "danger"` → the same `#c5221f`) — only
-the horizontal padding is narrowed and the width is fixed via
-`setFixedWidth`, which is a widget property, not a stylesheet
-declaration.
-
-Deliberately NOT touched on the companion:
-
-  * `border`, `border-left`, `border-*-radius` — any border or
-    radius declaration on a `QPushButton` forces Qt into
-    stylesheet-only rendering, which discards the theme's native
-    shading. The button then renders as a solid flat rectangle,
-    visibly different from its neighbour. This is why the fusion
-    is expressed through the -2px gap alone rather than by squaring
-    the companion's corners: the corners stay rounded (matching
-    Cancel), and the overlap does the fusing.
-  * `font-family`, `font-size`, `font-weight` — inherited, so the
-    letterforms match Cancel's.
+renderer draws it as a small companion button directly beside the item
+named by `attach_to`. See the current module docstring's full section
+for the QSS pairing rationale; behaviour is unchanged from the previous
+version.
 
 Disabled state
 ==============
 Every action button has its stylesheet written with a `QPushButton`
 rule for the enabled state and a `QPushButton:disabled` rule for the
-disabled state. Without the latter, a button whose stylesheet sets
-`background:` would render *identically* when disabled — Qt's default
-disabled palette is not applied once the widget owns a stylesheet
-background. The `:disabled` rule is what gives Cancel and Cancel-All
-their visible "grayed out" appearance when their respective
-preconditions are not met. `set_action_enabled(key, enabled)` on the
-renderer toggles `setEnabled()`; the visuals follow from the QSS
-pseudo-state, no per-toggle stylesheet juggling needed.
+disabled state. `set_action_enabled(key, enabled)` toggles
+`setEnabled()`; the visuals follow from the QSS pseudo-state.
 """
 
 from __future__ import annotations
+
+import json
 
 from PyQt6.QtCore import Qt, QObject, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -404,13 +371,11 @@ class PanelRenderer(QObject):
             if kind_hint in ("image", "mask"):
                 w = _LayerComboBox(kind_hint)
                 w.setCurrentText("" if value is None else str(value))
-                # Commit on dropdown pick.
                 w.activated.connect(
                     lambda _i, k=key, w=w: self._on_text_commit(
                         k, w.currentText()
                     )
                 )
-                # Commit on blur or Enter in the line edit.
                 le = w.lineEdit()
                 if le is not None:
                     le.editingFinished.connect(
@@ -530,10 +495,6 @@ class PanelRenderer(QObject):
         container = QWidget()
         h = QHBoxLayout(container)
         h.setContentsMargins(0, 0, 0, 0)
-        # Inter-button gap is inserted manually below: a thin
-        # companion wants -2px (it tucks tight against the previous
-        # button), the rest want the standard +6px. QBoxLayout's
-        # setSpacing is global per-layout, not per-pair.
         h.setSpacing(0)
 
         items = section.get("items", []) or []
@@ -545,11 +506,6 @@ class PanelRenderer(QObject):
             attaches = is_thin and bool(item.get("attach_to"))
 
             if added_any:
-                # -2 tucks the companion tight against the previous
-                # button; positive 6 is the standard gap. This is the
-                # ONLY mechanism used to fuse the pair — no border or
-                # corner-radius overrides on either button. See the
-                # module docstring's "Action-button fusion" section.
                 h.addSpacing(-2 if attaches else 6)
 
             btn = QPushButton(item.get("label") or key)
@@ -559,20 +515,6 @@ class PanelRenderer(QObject):
                 btn.setStyleSheet(_qss_primary("6px 14px"))
             elif style == "danger":
                 if is_thin:
-                    # Same QSS pairing as Cancel, in the same exact
-                    # syntax — same background, same text colour,
-                    # same disabled-state rule. Only the horizontal
-                    # padding is narrowed so the short "ALL" label
-                    # does not leave the button looking starved.
-                    # Width is pinned via setFixedWidth (a widget
-                    # property, not a QSS declaration), which does
-                    # not alter rendering.
-                    #
-                    # No border-*-radius, no border, no border-left.
-                    # Any of those would flip this button into
-                    # stylesheet-only rendering and drop its
-                    # disabled-state pairing — the exact failure mode
-                    # documented in the module docstring.
                     btn.setFixedWidth(40)
                     btn.setStyleSheet(_qss_danger("6px 4px"))
                 else:
@@ -592,16 +534,7 @@ class PanelRenderer(QObject):
     # ---- commits ----
 
     def _on_text_commit(self, key: str, new_value: str) -> None:
-        """Route a text-widget edit to the field's commit command.
-
-        Called from `activated` (dropdown pick), `editingFinished`
-        (blur or Enter on a line edit), and the text-area's
-        focus-out signal. The spec's cached `value` is updated
-        optimistically so an `activated` immediately followed by an
-        `editingFinished` on the same widget does not fire two
-        commits of the same value; the next panel event overwrites
-        the cached value with the authoritative one.
-        """
+        """Route a text-widget edit to the field's commit command."""
         spec = self._field_specs.get(key)
         if spec is None:
             return
@@ -612,6 +545,17 @@ class PanelRenderer(QObject):
         self._on_field_commit(key, new_value)
 
     def _on_field_commit(self, key: str, value) -> None:
+        # Config fields (config_path, no set_command) do not need a
+        # per-field command — the docker assembles the whole config
+        # from its widgets and sends `comfy_apply_config`. The commit
+        # callback receives a marker and decides what to do (the
+        # docker's implementation debounces the apply). Fields with
+        # `visible_when` dependencies get their visibility re-checked
+        # here regardless of whether they triggered a commit, because
+        # a resource's source change is what makes its layer_name
+        # field become visible.
+        self._reevaluate_visibility()
+
         spec = self._field_specs.get(key)
         if spec is None:
             return
@@ -637,6 +581,14 @@ class PanelRenderer(QObject):
             command = dict(spec["set_command"])
             command[arg_key] = value
             self._commit(key, command)
+            return
+
+        if spec.get("config_path"):
+            # Marker command: the docker turns this into a full
+            # `comfy_apply_config` built from `build_config_from_
+            # widgets()`, debounced across rapid edits. The daemon
+            # never sees this literal command type.
+            self._commit(key, {"type": "comfy_apply_config_from_widgets"})
 
     def _read_widget_value(self, spec: dict, widget):
         ftype = spec.get("type", "text")
@@ -680,6 +632,49 @@ class PanelRenderer(QObject):
                     return section
         return None
 
+    # ---- v2 config collection ----
+
+    def build_config_from_widgets(self) -> dict:
+        """Assemble the v2 panel config from the current widget state.
+
+        Every field that carries a `config_path` contributes one value
+        to the config dict at that path. Fields without a `config_path`
+        are ignored. Returns the standard four-section shape
+        `{"resources": {}, "params": {}, "crop": {}, "paste": {}}`,
+        matching what `comfy_apply_config` expects.
+
+        Called by the docker at Run time, immediately before dispatching
+        `comfy_panel_run`. The result is JSON-serialised into the
+        command's `resources` / `params` / `crop` / `paste` args.
+        """
+        cfg: dict = {
+            "resources": {},
+            "params": {},
+            "crop": {},
+            "paste": {},
+        }
+        for key, spec in self._field_specs.items():
+            path = spec.get("config_path")
+            if not path:
+                continue
+            widget = self._field_widgets.get(key)
+            if widget is None:
+                continue
+            value = self._read_widget_value(spec, widget)
+            self._set_path(cfg, path, value)
+        return cfg
+
+    @staticmethod
+    def _set_path(cfg: dict, path, value) -> None:
+        """Set `cfg[path[0]][path[1]]...[path[-1]] = value`, creating
+        intermediate dicts as needed."""
+        d = cfg
+        for key in path[:-1]:
+            if key not in d:
+                d[key] = {}
+            d = d[key]
+        d[path[-1]] = value
+
     # ---- sync ----
 
     def _sync_values(self, description: dict) -> None:
@@ -692,6 +687,18 @@ class PanelRenderer(QObject):
         for key, spec in new_specs.items():
             widget = self._field_widgets.get(key)
             if widget is None:
+                continue
+            if spec.get("no_sync"):
+                # Config fields used to set this to prevent panel
+                # re-publishes from stomping their in-progress edits.
+                # With auto-apply, the user's edit is pushed to the
+                # daemon within a debounce window and reflected back
+                # via the next re-publish; the focus check below
+                # protects the actively-edited field. The `no_sync`
+                # branch stays for any future provider that wants a
+                # field the daemon cannot override, but no built-in
+                # provider uses it.
+                self._field_specs[key] = spec
                 continue
             if self._is_focused(widget):
                 self._field_specs[key] = spec
@@ -811,25 +818,10 @@ class PanelRenderer(QObject):
         """Update every live layer-alias combo's item list.
 
         `layers` is {"image": [...], "mask": [...], "recent": [...]}
-        as emitted by `DaemonConnection.request_layers`. Every combo
-        whose spec has a matching `kind_hint` gets its items replaced;
-        the current text is preserved so an in-progress edit (or a
-        value that does not appear in the list) survives the swap.
-
-        Item ordering: recent aliases first (in recency order,
-        intersected with the current bucket), then the rest in tree
-        order. The intersection is what keeps a mask alias out of an
-        image dropdown; the recent list is flat and kind-agnostic.
-
-        Combos whose popup is currently open are skipped: refreshing
-        their items mid-view would disrupt the user's filter and
-        selection. The next popup open schedules a new fetch, so the
-        view on that next open is fresh.
-
-        Signals are blocked around the swap so any connection on
-        `currentTextChanged`, `activated`, or the line edit's
-        `editingFinished` does not fire a spurious commit while the
-        model is being repopulated.
+        as emitted by `DaemonConnection.request_layers`. Behaviour is
+        unchanged from the previous version; in the v2 panel no built-
+        in providers emit `_LayerComboBox` fields, but the class remains
+        available for the playground and for future providers.
         """
         image_list = layers.get("image") or []
         mask_list = layers.get("mask") or []

@@ -1,72 +1,55 @@
-"""Vendored ComfyUI client + tooling for the browser playgrounds.
+"""Shared ComfyUI client + tooling for the browser playgrounds.
 
-`client.py` and `tooling.py` are copied verbatim from
-kritomatic_daemon/utils/comfyui_client.py and comfyui_tooling.py.
-`image.py` is a playground-only simplification of comfyui_krita.py.
-`proxy_client.py` is a copy of kritomatic_daemon/utils/comfyui_proxy_client.py
-(Comfy API v2 client), used by the inpaint playground to talk to
-comfy-api-proxy directly.
+Three modules now live in `kritomatic_shared`, under `<repo>/src/`, so
+the daemon and the playgrounds share one copy of each:
 
-To update from upstream: copy the files, verify the version at the top
-of each, run the smoke test in README. Two things in this file are
-**playground extensions**, both documented below and both independent
-of the upstream copies:
+    comfyui_client.py        HTTP + WebSocket client  (setup.py dep:
+                             websockets>=12, needed by generate*)
+    comfyui_proxy_client.py  Comfy API v2 client       (pure stdlib)
+    comfyui_tooling.py       ETN_* rewrite, expand_custom  (pure stdlib)
 
-    LAZY `image`              defers PIL until first use
-    cached_object_info(...)   30 s TTL cache around client.object_info()
+This package's `client.py`, `proxy_client.py`, and `tooling.py` are
+now backwards-compatibility shims that re-export from shared.
 
-LAZY `image`
-============
-`pg_comfy.image` imports PIL (`from PIL import Image`), which is
-~30 MB of RSS and ~500 ms of import time.  Playgrounds that never
-touch image encoding — `board`, `cone`, `text_wall` — should not pay
-that cost just because `pg_comfy` is somewhere on the import graph.
-`image` is therefore not imported eagerly; `__getattr__` below
-resolves it on first attribute access.  Direct submodule imports
-(`from pg_comfy.image import ...`) continue to work through Python's
-normal submodule import machinery.
+`image.py` is a playground-only simplification of the daemon's
+`comfyui_krita.py` — PIL-based instead of Qt-based. Not shared, not
+duplicated content.
 
-The playgrounds that do need image encoding — `inpaint` and
-`segment` — import `make_encoded_image` inside the specific request
-handlers that use it, so the cost is deferred to the first
-upload/import/segment/refine request rather than paid at module
-load.  In grouped mode (`run_all.py`) a session that only uses
-`board` and `text_wall` never loads PIL at all.
-
-OBJECT_INFO CACHE
-=================
-ComfyUI's `/object_info` endpoint returns a ~200 KB JSON document
-listing every installed custom node and its schema.  It changes only
-when ComfyUI restarts or a custom node is installed.  `segment_server`
-calls it twice per Segment All or Refine cycle (once to validate node
-existence, once inside `_run_workflow` to expand the graph), and once
-per status check.
-
-`cached_object_info(client, ttl=30.0)` returns
-`client.object_info()`, cached on the client instance for `ttl`
-seconds.  The cache lives on the client, not in a module-global:
-`get_client()` returns a process-wide singleton per (host, port), so
-the effect is process-wide, but `reset_client()` drops the client
-(and the cache with it), so a ComfyUI restart — which always produces
-a fresh client on the next request — cannot hit a stale cache.
-
-No lock is needed: the cache read is a plain attribute access and the
-write is an atomic reference assignment under the GIL.  Two threads
-racing on a miss both fetch; last write wins; correctness is
-preserved.
-
-PROXY V2 CLIENT
-===============
-`proxy_client.py` is a byte-for-byte copy of the daemon's
-`ProxyV2` client (the HTTP surface for comfy-api-proxy on 8189). It
-is re-exported here for consistency with the other `pg_comfy` symbols.
-
-Live consumers: `inpaint_server.handle_inpaint` (from Stage 8
-onwards).  `segment` still uses `expand_custom` from `tooling.py` —
-its migration to the v2 proxy is out of scope for this stage.
+Shared-client bootstrap
+=======================
+`kritomatic_shared` is at `<repo>/src/kritomatic_shared/`. The
+playgrounds are launched from `playgrounds/` and are not installed
+into any venv, so this package has to reach into the repo to find
+`shared`. `_find_repo_src()` walks up from `__file__` looking for
+`<candidate>/src/kritomatic`, the same pattern
+`playgrounds/board/board_krita.py` uses.
 """
 
-from .client import (
+from pathlib import Path
+import sys
+
+
+def _find_repo_src() -> Path:
+    p = Path(__file__).resolve().parent
+    for _ in range(10):
+        cand = p / "src"
+        if (cand / "kritomatic").is_dir():
+            return cand
+        if p == p.parent:
+            break
+        p = p.parent
+    raise RuntimeError(
+        "Could not locate src/kritomatic from "
+        + str(Path(__file__).resolve())
+    )
+
+
+_SRC = _find_repo_src()
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+
+from kritomatic_shared.comfyui_client import (  # noqa: E402
     ComfyClient,
     ComfyError,
     ComfyTimeout,
@@ -75,7 +58,13 @@ from .client import (
     get_client,
     reset_client,
 )
-from .tooling import (
+from kritomatic_shared.comfyui_proxy_client import (  # noqa: E402
+    ProxyV2,
+    ProxyError,
+    ProxyHTTPError,
+    ProxyUnreachable,
+)
+from kritomatic_shared.comfyui_tooling import (  # noqa: E402
     EncodedImage,
     KritaResources,
     WorkflowRequirements,
@@ -83,12 +72,6 @@ from .tooling import (
     ExpansionError,
     expand_custom,
     scan_requirements,
-)
-from .proxy_client import (
-    ProxyV2,
-    ProxyError,
-    ProxyHTTPError,
-    ProxyUnreachable,
 )
 
 
@@ -104,10 +87,12 @@ _OBJECT_INFO_DEFAULT_TTL = 30.0
 def cached_object_info(client, ttl=_OBJECT_INFO_DEFAULT_TTL):
     """Return `client.object_info()`, cached on the client for `ttl` s.
 
-    See the module docstring's OBJECT_INFO CACHE note.  The client is
-    the natural cache holder: `get_client()` returns a process-wide
-    singleton, and `reset_client()` drops it, so a ComfyUI restart
-    always forces a refetch.
+    ComfyUI's `/object_info` endpoint returns a ~200 KB JSON document
+    listing every installed custom node and its schema. It changes only
+    when ComfyUI restarts or a custom node is installed, so caching it
+    on the client (which is process-wide via `get_client()`) removes
+    most of the cost without any staleness risk: `reset_client()` drops
+    the client and the cache together.
     """
     cached = getattr(client, "_object_info_cache", None)
     now = _time.monotonic()

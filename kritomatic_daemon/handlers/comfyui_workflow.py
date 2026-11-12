@@ -4,6 +4,15 @@
 parses it, and sets it active. `_set_active_workflow` (in the container)
 then walks the graph for native-v2 slot tables.
 
+UI-format sources are auto-converted to API format before the graph
+is loaded. The conversion algorithm lives in
+`kritomatic_shared.comfy_convert`; this module reaches it through
+`kritomatic_daemon/utils/comfy_convert.py`, whose `sys.path` bootstrap
+makes the shared package importable from Krita's Python. Result: a
+source at `data/comfy_panel/workflows/foo.json` in UI format loads
+exactly the same way as `data/convert/foo.json` in API format, with
+the converted file landing at `data/convert/foo.json` in both cases.
+
 `comfy_set_param` and `comfy_bind_layer_alias` were removed in Stage 6
 along with the ETN_Parameter / layer-alias machinery they populated.
 The native pipeline takes values through `comfy_apply_config` instead.
@@ -45,7 +54,9 @@ class WorkflowCommands(AutoDispatchHandler):
     @command(
         category="comfyui",
         help_text="Load a workflow by slug from the panel's workflows "
-                  "directory, or by absolute filesystem path.",
+                  "directory, or by absolute filesystem path. UI-format "
+                  "sources are auto-converted to API format before "
+                  "loading.",
         args={
             "--name": {"type": "str", "required": True,
                        "help": "Workflow slug, or an absolute path to "
@@ -99,17 +110,44 @@ class WorkflowCommands(AutoDispatchHandler):
                     "message": f"Workflow {display_name!r} is empty or "
                                f"not an object"}
 
+        # ---- Auto-convert UI format to API format ----
+        #
+        # The conversion algorithm lives in `kritomatic_shared.comfy_
+        # convert`. The daemon reaches it through the bootstrap in
+        # `kritomatic_daemon/utils/comfy_convert.py`, which prepends
+        # `<repo>/src/` to sys.path. Import is lazy — inside this
+        # branch — so a broken `kritomatic_shared` install cannot break
+        # API-format loads. The cost of the import (already in
+        # sys.modules after the first UI-format load) is effectively
+        # zero.
+        converted = False
+        converted_path: Path | None = None
         if "nodes" in workflow or "links" in workflow:
-            return {
-                "success": False,
-                "message": (
-                    f"Workflow {display_name!r} appears to be in "
-                    f"ComfyUI's UI format. Export it via "
-                    f"'Save (API Format)' in the ComfyUI menu, or run "
-                    f"`kritomatic comfyui convert` on the file, which "
-                    f"produces the prompt format this handler requires."
-                ),
-            }
+            from ..utils.comfy_convert import (
+                convert_if_ui, ConversionError,
+            )
+            try:
+                converted_path, _records, was = convert_if_ui(path, annotate=False)
+            except ConversionError as e:
+                return {
+                    "success": False,
+                    "message": (
+                        f"Workflow {display_name!r} is in ComfyUI's UI "
+                        f"format and auto-conversion failed: {e}\n"
+                        f"Convert manually with "
+                        f"`kritomatic comfyui convert {path}`."
+                    ),
+                }
+            if was:
+                # Re-read from the converted file. The output is API
+                # format, so the second json.loads sees a well-formed
+                # graph. If somehow `was` is False (shouldn't happen
+                # in this branch — we already detected UI format), we
+                # keep the original `workflow` in memory.
+                workflow = json.loads(
+                    converted_path.read_text(encoding="utf-8")
+                )
+                converted = True
 
         parent._set_active_workflow(display_name, workflow, "file")
 
@@ -120,11 +158,19 @@ class WorkflowCommands(AutoDispatchHandler):
         }
         if is_path:
             result_data["path"] = str(path)
+        if converted and converted_path is not None:
+            result_data["converted"] = True
+            result_data["converted_from"] = str(path)
+            result_data["converted_path"] = str(converted_path)
+
+        msg = (f"Loaded workflow {display_name!r} "
+               f"({len(workflow)} nodes)")
+        if converted:
+            msg += " \u2014 auto-converted from UI format"
 
         return {
             "success": True,
-            "message": f"Loaded workflow {display_name!r} "
-                       f"({len(workflow)} nodes)",
+            "message": msg,
             "data": result_data,
         }
 

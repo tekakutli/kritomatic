@@ -36,6 +36,19 @@ When `comfy_load` could not extract slots (duplicate @-name or
 broken — the graph is loaded.  `WorkflowMetadataProvider` renders a
 red "Slot error" line so the user sees *why* the form is empty
 instead of a silently blank panel.
+
+Composite (row) fields
+======================
+A field with `type: "row"` is a composite: one row containing N
+sub-widgets laid out horizontally. Each sub-widget carries its own
+`key`, `config_path`, and (optionally) `visible_when` / `stretch`.
+Both renderers register the sub-widgets as ordinary leaf fields keyed
+by their own key; the composite key itself is only the row's label.
+
+Used by ResourcesProvider so each resource renders as
+    @thecanvas    [ global/active/layer ▼ ]   [ thecanvas________ ]
+on one line, with the layer-name input shown only when the dropdown
+is "layer".
 """
 
 from __future__ import annotations
@@ -71,6 +84,27 @@ _STRUCTURE_FIELD_KEYS = (
     "config_path", "no_sync",
 )
 
+# Sub-fields contribute to the structure hash only by their *shape*
+# (key, type, options, config_path, visibility rule, stretch) — never
+# by their current value. Otherwise a value change would produce a
+# new structure_id and defeat the sync-in-place optimization in both
+# renderers.
+_STRUCTURE_SUBFIELD_KEYS = (
+    "key", "type", "options", "visible_when",
+    "config_path", "kind_hint", "stretch",
+)
+
+
+def _field_structure(f: dict) -> dict:
+    out = {k: f.get(k) for k in _STRUCTURE_FIELD_KEYS}
+    subs = f.get("sub_fields")
+    if isinstance(subs, list):
+        out["sub_fields"] = [
+            {k: sf.get(k) for k in _STRUCTURE_SUBFIELD_KEYS}
+            for sf in subs if isinstance(sf, dict)
+        ]
+    return out
+
 
 def _finalize_description(sections: list) -> dict:
     structure_src = []
@@ -81,7 +115,7 @@ def _finalize_description(sections: list) -> dict:
             "title": s.get("title"),
             "commit": s.get("commit"),
             "fields": [
-                {k: f.get(k) for k in _STRUCTURE_FIELD_KEYS}
+                _field_structure(f)
                 for f in (s.get("fields") or [])
             ],
             "items": s.get("items"),
@@ -209,9 +243,22 @@ class WorkflowMetadataProvider:
 
 
 class ResourcesProvider:
-    """Per-@-name: a source select and a conditional layer_name text
-    field. Both carry `config_path`; the docker auto-applies on every
-    edit.
+    """Per-@-name: a single composite row with the source dropdown and
+    a conditional layer_name text field.
+
+    The composite's `key` is only the row's label. Its sub-widgets
+    carry the real `config_path`s and are wired independently — the
+    docker auto-applies on every edit to either sub-widget.
+
+    The layer_name input carries `visible_when` pointing at its
+    sibling `source` sub-widget, so it collapses when the dropdown is
+    `active` or `global` and reappears on `layer`. Because both
+    renderers register the sub-widgets as ordinary leaf fields keyed
+    by their own key, all the per-field plumbing
+    (read_widget_value, apply_value, sync_values, build_config_from_widgets,
+    focus tracking, in-flight tracking) works unchanged. The only
+    places that needed new branches are the two `_build_form` /
+    `buildFieldHtml` paths that turn the field list into widgets.
     """
 
     def contribute(self, builder, ctx):
@@ -229,20 +276,29 @@ class ResourcesProvider:
                 res_cfg.get("layer_name") or name.lstrip("@")
             )
             fields.append({
-                "key": f"cfg-resource.{name}.source",
-                "label": f"{name} source",
-                "type": "select",
-                "options": ["active", "global", "layer"],
-                "value": current_source,
-                "config_path": ["resources", name, "source"],
-            })
-            fields.append({
-                "key": f"cfg-resource.{name}.layer_name",
-                "label": f"{name} layer",
-                "type": "text",
-                "value": current_layer,
-                "config_path": ["resources", name, "layer_name"],
-                "visible_when": {f"cfg-resource.{name}.source": "layer"},
+                "key": f"cfg-resource.{name}",
+                "label": name,
+                "type": "row",
+                "sub_fields": [
+                    {
+                        "key": f"cfg-resource.{name}.source",
+                        "type": "select",
+                        "options": ["active", "global", "layer"],
+                        "value": current_source,
+                        "config_path": ["resources", name, "source"],
+                        "stretch": 0,
+                    },
+                    {
+                        "key": f"cfg-resource.{name}.layer_name",
+                        "type": "text",
+                        "value": current_layer,
+                        "config_path": ["resources", name, "layer_name"],
+                        "visible_when": {
+                            f"cfg-resource.{name}.source": "layer",
+                        },
+                        "stretch": 1,
+                    },
+                ],
             })
         builder.add_section({
             "id": "resources",

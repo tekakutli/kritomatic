@@ -36,6 +36,25 @@ The debounce is 150 ms, matching the docker's timer exactly. It is
 flushed synchronously before any generic action (Save config, Load)
 and before Run, so an edit-then-click-within-150 ms sequence still
 runs with the panel's values, not the daemon's stale ones.
+
+COMPOSITE (ROW) FIELDS
+======================
+A field with `type: "row"` renders as one flex row containing one
+sub-widget per `sub_fields` entry. Each sub-widget carries its own
+`data-field`, so the existing per-field plumbing (`readWidgetValue`,
+`readAllValues`, `syncValues`, `evaluateVisibility`,
+`buildConfigFromWidgets`, `commitField` via `onFormChange`, focus and
+in-flight tracking) works unchanged — sub-widgets are registered as
+ordinary leaf fields keyed by their own key.
+
+Used by the ResourcesProvider so each resource is rendered as
+    @thecanvas    [ global/active/layer ▼ ]   [ thecanvas________ ]
+on one line, with the layer-name input collapsed to zero width when
+the dropdown is "active" or "global" and reappearing on "layer".
+
+The two places that needed a new branch are `buildFieldHtml` (row
+arm) and the flattening steps in `rebuildPanel` / `syncValues` (walk
+`sub_fields` in addition to the top level).
 """
 
 import json
@@ -647,6 +666,41 @@ HTML_PAGE = r"""<!DOCTYPE html>
     outline: 2px solid #1a73e8; outline-offset: -1px;
     border-color: transparent;
   }
+  .field.field-row {
+    align-items: center;
+  }
+  .row-container {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+    min-width: 0;
+  }
+  .sub-field {
+    min-width: 0;
+    box-sizing: border-box;
+  }
+  .sub-field select,
+  .sub-field input[type=text],
+  .sub-field input[type=number] {
+    width: 100%;
+    box-sizing: border-box;
+    font: inherit;
+    font-size: 0.85rem;
+    padding: 0.3rem 0.5rem;
+    border: 1px solid #ccc;
+    border-radius: 3px;
+    background: white;
+  }
+  .sub-field select:focus,
+  .sub-field input[type=text]:focus,
+  .sub-field input[type=number]:focus {
+    outline: 2px solid #1a73e8;
+    outline-offset: -1px;
+    border-color: transparent;
+  }
+  .sub-field input[type=checkbox] {
+    margin: 0;
+  }
   .field.in-flight input, .field.in-flight select,
   .field.in-flight textarea { opacity: 0.6; }
   .field.overridden > label { color: #1a73e8; }
@@ -863,6 +917,33 @@ function buildSectionHtml(section) {
   return "";
 }
 
+function buildSubFieldHtml(f) {
+  const key = f.key;
+  if (!key) return "";
+  const t = f.type;
+  let inner = "";
+  if (t === "select") {
+    const opts = (f.options || []).map(o =>
+      `<option value="${escAttr(o)}"${String(o) === String(f.value) ? " selected" : ""}>${esc(o)}</option>`
+    ).join("");
+    inner = `<select data-field="${escAttr(key)}">${opts}</select>`;
+  } else if (t === "textarea") {
+    inner = `<textarea data-field="${escAttr(key)}" rows="2">${esc(f.value ?? "")}</textarea>`;
+  } else if (t === "integer" || t === "number") {
+    const step = t === "integer" ? "1" : "any";
+    inner = `<input type="number" step="${step}" data-field="${escAttr(key)}" value="${escAttr(f.value ?? 0)}">`;
+  } else if (t === "toggle") {
+    inner = `<input type="checkbox" data-field="${escAttr(key)}" ${f.value ? "checked" : ""}>`;
+  } else {
+    inner = `<input type="text" data-field="${escAttr(key)}" value="${escAttr(f.value ?? "")}">`;
+  }
+  const stretch = f.stretch != null ? Number(f.stretch) : 0;
+  const flexStyle = stretch > 0
+    ? `flex: ${stretch} 1 0;`
+    : `flex: 0 0 auto;`;
+  return `<div class="sub-field" data-field-container="${escAttr(key)}" style="${flexStyle}">${inner}</div>`;
+}
+
 function buildFieldHtml(f) {
   const key = f.key;
   if (!key) return "";
@@ -870,6 +951,13 @@ function buildFieldHtml(f) {
   const labelHtml = esc(f.label || key);
   let inner = "";
   const t = f.type;
+  if (t === "row") {
+    const subs = (f.sub_fields || []).map(buildSubFieldHtml).join("");
+    return `<div class="field field-row" data-row-key="${escAttr(key)}">
+    <label>${esc(f.label || "")}</label>
+    <div class="row-container">${subs}</div>
+  </div>`;
+  }
   if (t === "text") {
     inner = `<input type="text" data-field="${escAttr(key)}" value="${escAttr(f.value ?? "")}">`;
   } else if (t === "textarea") {
@@ -923,7 +1011,14 @@ function rebuildPanel(description) {
   });
   for (const s of app.sectionSpecs) {
     for (const f of (s.fields || [])) {
-      if (f.key) {
+      if (f.type === "row" && Array.isArray(f.sub_fields)) {
+        for (const sub of f.sub_fields) {
+          if (sub && sub.key) {
+            app.specs.set(sub.key, sub);
+            app.sections.set(sub.key, s);
+          }
+        }
+      } else if (f.key) {
         app.specs.set(f.key, f);
         app.sections.set(f.key, s);
       }
@@ -936,7 +1031,13 @@ function rebuildPanel(description) {
 
   for (const s of app.sectionSpecs) {
     for (const f of (s.fields || [])) {
-      if (f.key && f.visible_when) evaluateVisibility(f.key);
+      if (f.type === "row" && Array.isArray(f.sub_fields)) {
+        for (const sub of f.sub_fields) {
+          if (sub && sub.key && sub.visible_when) evaluateVisibility(sub.key);
+        }
+      } else if (f.key && f.visible_when) {
+        evaluateVisibility(f.key);
+      }
     }
   }
 
@@ -947,7 +1048,13 @@ function syncValues(description) {
   const newSpecs = new Map();
   for (const s of description.sections || []) {
     for (const f of (s.fields || [])) {
-      if (f.key) newSpecs.set(f.key, f);
+      if (f.type === "row" && Array.isArray(f.sub_fields)) {
+        for (const sub of f.sub_fields) {
+          if (sub && sub.key) newSpecs.set(sub.key, sub);
+        }
+      } else if (f.key) {
+        newSpecs.set(f.key, f);
+      }
     }
   }
   for (const [key, spec] of newSpecs.entries()) {
@@ -976,7 +1083,13 @@ function syncValues(description) {
   }
   for (const s of app.sectionSpecs) {
     for (const f of (s.fields || [])) {
-      if (f.key && f.visible_when) evaluateVisibility(f.key);
+      if (f.type === "row" && Array.isArray(f.sub_fields)) {
+        for (const sub of f.sub_fields) {
+          if (sub && sub.key && sub.visible_when) evaluateVisibility(sub.key);
+        }
+      } else if (f.key && f.visible_when) {
+        evaluateVisibility(f.key);
+      }
     }
   }
   setRunning(app.running);

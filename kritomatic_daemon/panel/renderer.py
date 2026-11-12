@@ -17,6 +17,19 @@ On a new description:
 
 Edits are routed to a commit callback. Actions are routed to an action
 callback.
+
+Composite (row) fields
+======================
+A field with `type: "row"` is built by `_build_row_field` into a
+QWidget with an HBoxLayout, one sub-widget per `sub_fields` entry.
+The composite itself is *not* registered in `_field_widgets` — its
+`key` is only the row's label. Its sub-widgets are registered as
+ordinary leaf fields under their own `key`s, so every method that
+iterates `_field_widgets` (read / apply / sync / focus / in-flight /
+build_config_from_widgets / set_layers) works unchanged. The only
+places that needed a new branch were `_build_form`, `_sync_values`,
+and `_find_section`; each gained a small flattening step that walks
+`sub_fields` in addition to the top level.
 """
 
 from __future__ import annotations
@@ -268,6 +281,15 @@ class PanelRenderer(QObject):
             key = f.get("key")
             if not key:
                 continue
+
+            if f.get("type") == "row":
+                widget = self._build_row_field(f)
+                if widget is None:
+                    continue
+                label = f.get("label") or key
+                form.addRow(label, widget)
+                continue
+
             widget = self._build_field_widget(f)
             if widget is None:
                 continue
@@ -279,6 +301,62 @@ class PanelRenderer(QObject):
             form.addRow(label, widget)
         self._reevaluate_visibility()
         return group
+
+    def _build_row_field(self, f: dict):
+        """Build one composite row: N sub-widgets laid out horizontally.
+
+        The sub-widgets are registered in `_field_widgets` /
+        `_field_specs` under their own `key`s. The returned container
+        is what the form adds to its row, but the container itself is
+        *not* registered — it has no `config_path` of its own, only
+        its children do.
+
+        `stretch` on each sub-field maps to QHBoxLayout.addWidget's
+        stretch argument: 0 sizes the widget to its natural width,
+        positive values fill the remaining space proportionally. This
+        is what keeps the `global/active/layer` dropdown at its
+        natural width while the layer-name text input fills the rest
+        of the row.
+
+        The sub-widgets' `visible_when` rules are honored as usual by
+        `_reevaluate_visibility` — it iterates `_field_specs`, which
+        includes these sub-widgets. Hiding one collapses its layout
+        cell (Qt removes it from the row), so the visible sub-widget
+        stays in its own cell and the row reflows.
+        """
+        subs = f.get("sub_fields")
+        if not isinstance(subs, list):
+            return None
+
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        any_added = False
+        for sub in subs:
+            if not isinstance(sub, dict):
+                continue
+            sub_key = sub.get("key")
+            if not sub_key:
+                continue
+            sub_widget = self._build_field_widget(sub)
+            if sub_widget is None:
+                continue
+            self._field_widgets[sub_key] = sub_widget
+            self._field_specs[sub_key] = sub
+
+            try:
+                stretch = int(sub.get("stretch", 0))
+            except (TypeError, ValueError):
+                stretch = 0
+            if stretch < 0:
+                stretch = 0
+
+            layout.addWidget(sub_widget, stretch)
+            any_added = True
+
+        return container if any_added else None
 
     def _build_workflow_bar(self, section: dict):
         """Picker on the left (expanding), action buttons on the right.
@@ -582,6 +660,10 @@ class PanelRenderer(QObject):
             for f in section.get("fields", []) or []:
                 if f.get("key") == key:
                     return section
+                if f.get("type") == "row":
+                    for sub in f.get("sub_fields", []) or []:
+                        if isinstance(sub, dict) and sub.get("key") == key:
+                            return section
         return None
 
     # ---- v2 config collection ----
@@ -620,8 +702,15 @@ class PanelRenderer(QObject):
         new_specs = {}
         for section in description.get("sections", []) or []:
             for f in section.get("fields", []) or []:
-                if f.get("key"):
-                    new_specs[f["key"]] = f
+                key = f.get("key")
+                if not key:
+                    continue
+                if f.get("type") == "row":
+                    for sub in f.get("sub_fields", []) or []:
+                        if isinstance(sub, dict) and sub.get("key"):
+                            new_specs[sub["key"]] = sub
+                else:
+                    new_specs[key] = f
 
         for key, spec in new_specs.items():
             widget = self._field_widgets.get(key)

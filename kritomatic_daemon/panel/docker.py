@@ -72,6 +72,31 @@ not.
 whenever `structure_id` changed, forcing the next `request_layers`
 to emit. The watcher (already scheduled on every panel push) then
 fires, the fetch emits, and `set_layers` repopulates the new combos.
+
+Client-side Parameters filter
+=============================
+The Parameters section's filter prefix is a *client-local* display
+preference.  The renderer emits a `local_handler: "param_prefix_filter"`
+field at the top of the Parameters section, and the docker registers
+a handler for that name in `__init__`:
+
+  - On commit, the handler stores the new prefix in `QSettings`
+    under `param_prefix/<workflow>`, keyed by the current workflow
+    name, so each workflow remembers its own prefix.
+  - The handler then calls `renderer.set_param_prefix(prefix)`,
+    which re-filters the last panel description and rebuilds the
+    tree, hiding every `cfg-param.*` field whose title does not
+    start with the prefix.
+
+`_on_state` watches for workflow changes and, on transition,
+restores `QSettings`'s saved prefix for the new workflow, calling
+`renderer.set_param_prefix` before the next panel description
+arrives so the very first render for the new workflow is filtered
+correctly.
+
+The daemon never sees the prefix.  The web panel's localStorage-
+backed filter is independent of this docker's; the two clients can
+filter by different prefixes at the same time without interfering.
 """
 
 from __future__ import annotations
@@ -79,7 +104,7 @@ from __future__ import annotations
 import json
 import time
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QSettings, QTimer
 from PyQt6.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QScrollArea, QLabel,
     QPlainTextEdit, QFrame,
@@ -107,6 +132,13 @@ class KritomaticPanel(QDockWidget):
         self._active_run_request_id = None
         self._active_batches_count = 0
         self._workflow_loaded = False
+
+        # Client-side Parameters filter.  Persisted per workflow in
+        # `_settings`; restored by `_on_state` when the workflow
+        # changes.  The daemon never sees this.
+        self._param_prefix_filter: str = ""
+        self._current_workflow: str = ""
+        self._settings = QSettings("kritomatic", "panel")
 
         self._pending_apply_timer = QTimer(self)
         self._pending_apply_timer.setSingleShot(True)
@@ -177,6 +209,13 @@ class KritomaticPanel(QDockWidget):
             self._on_action,
             actions_layout=self._actions_layout,
         )
+        # Register the client-local handler for the Parameters filter
+        # prefix field.  See the module docstring, "Client-side
+        # Parameters filter".
+        self._renderer.set_local_handler(
+            "param_prefix_filter",
+            self._on_param_prefix_committed,
+        )
 
         self._conn = DaemonConnection()
         self._conn.stateReceived.connect(self._on_state)
@@ -233,10 +272,60 @@ class KritomaticPanel(QDockWidget):
         try:
             batches = data.get("active_batches") or []
             self._active_batches_count = len(batches)
-            self._workflow_loaded = bool(data.get("workflow"))
+            new_workflow = data.get("workflow") or ""
+            old_workflow = self._current_workflow
+            self._workflow_loaded = bool(new_workflow)
+            self._current_workflow = new_workflow
+            if new_workflow != old_workflow:
+                self._restore_param_filter_for_workflow(new_workflow)
         except Exception:
             pass
         self._update_run_buttons()
+
+    def _restore_param_filter_for_workflow(self, workflow: str) -> None:
+        """Restore this client's saved prefix for `workflow` (or clear
+        it when the workflow name is empty).  Called from `_on_state`
+        on every workflow transition so the very first panel render
+        for a newly-loaded workflow is already filtered."""
+        if not workflow:
+            self._param_prefix_filter = ""
+            try:
+                self._renderer.set_param_prefix("")
+            except Exception:
+                pass
+            return
+        try:
+            saved = self._settings.value(
+                f"param_prefix/{workflow}", "", type=str,
+            )
+        except Exception:
+            saved = ""
+        self._param_prefix_filter = saved or ""
+        try:
+            self._renderer.set_param_prefix(self._param_prefix_filter)
+        except Exception:
+            pass
+
+    def _on_param_prefix_committed(self, prefix: str) -> None:
+        """Local handler for the Parameters filter prefix field.
+
+        Persists the prefix under the current workflow's name in
+        `QSettings`, then tells the renderer to re-filter.  The daemon
+        never sees this value.
+        """
+        self._param_prefix_filter = str(prefix or "")
+        if self._current_workflow:
+            try:
+                self._settings.setValue(
+                    f"param_prefix/{self._current_workflow}",
+                    self._param_prefix_filter,
+                )
+            except Exception:
+                pass
+        try:
+            self._renderer.set_param_prefix(self._param_prefix_filter)
+        except Exception:
+            pass
 
     def _on_panel(self, description: dict) -> None:
         old_structure = self._renderer._structure_id

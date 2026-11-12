@@ -1,60 +1,120 @@
 #!/usr/bin/env python3
 """
-web_panel/server.py — standalone live view of the daemon's state.
+comfy2krita_web.py — standalone browser view of the daemon's state.
 
-A pure client of the daemon. Reads the same event stream the Krita
+A pure HTTP client of the daemon. Reads the same event stream the Krita
 docker reads, renders the same panel description the docker renders,
-and posts the same commands to the same command socket.
+and posts the same commands to the same daemon command socket. The
+web panel is "a browser tab you can open next to Krita" — nothing more.
 
-See the current docker.py docstring for the architecture. This file
-only adds:
+One process, no external state
+==============================
+This file is self-contained: no imports from `kritomatic_shared`,
+`kritomatic_daemon`, or any playground. It only imports `KritaClient`
+from `kritomatic.client`, and that one import is what makes it
+addressable as a proper package module (the REPO_ROOT/src bootstrap at
+the top of the file does that).
 
-  * SSE forwarding of state + panel events to browser tabs.
-  * A minimal in-browser renderer (`buildSectionHtml` and friends)
-    that supports section kinds: metadata, form, workflow-bar,
-    actions.
-  * A `comfy_save_config` path parallel to `comfy_panel_run`: the
-    docker-side enrichment (four config sections) is not done in JS
-    here — the daemon falls back to `_active_config` when the sections
-    are not supplied. Save still works; the values are just whatever
-    the daemon last had in `_active_config`, not the in-progress
-    widget state. That is fine for the web panel's use case (a viewer
-    / controller, not an editor).
+The server, the SSE forwarding, the in-browser renderer, and the
+comfy_panel_run / comfy_save_config enrichment all live in this one
+file. That is deliberate: the web panel is meant to be copy-pasteable
+into a fresh machine and runnable with `python comfy2krita_web.py`,
+without a plugin install, without a daemon module tree, without the
+`kritomatic_shared` bootstrap. The only external dependency is the
+Krita plugin's socket server already running on the machine.
 
-CONFIG AUTO-APPLY (added)
-=========================
-The web panel now mirrors the Krita docker's config-field model:
-every edit to a config field (params, resources, crop, paste) fires
-one debounced `comfy_apply_config` with the four sections assembled
-from current widget state. That is what makes web-panel edits
-propagate to the daemon's `_active_config`, which is where
-`comfy_panel_run` (via `comfy_panel_run`'s fallback) and
-`comfy_save_config` read from on the daemon side, and which the
-docker's `syncValues` then picks up from the subsequent panel event.
+Routes
+======
+    GET  /              HTML shell + inline CSS + inline JS
+    GET  /api/state     Current daemon state snapshot (one shot)
+    GET  /api/batches   Current comfy_batches response (one shot)
+    GET  /api/events    SSE stream: state, panel, run events
+    POST /api/command   One daemon command, one response
+    POST /api/run       Start a long-running generation, returns run_id
+    POST /api/cancel    Cancel the current run or all runs
 
-The debounce is 150 ms, matching the docker's timer exactly. It is
-flushed synchronously before any generic action (Save config, Load)
-and before Run, so an edit-then-click-within-150 ms sequence still
-runs with the panel's values, not the daemon's stale ones.
+The distinction between /api/command and /api/run is the daemon's
+command worker. State-mutating commands are short and block the worker
+only for their own duration. `comfy_generate` blocks the worker for the
+entire run (tens of seconds). /api/run spawns the generate on its own
+thread with its own socket, so the worker stays available for cancel
+requests, state reads, and other panel edits that would otherwise be
+stuck in the queue behind the long run. This is the same reason the
+docker uses `send_cancel_now` out-of-band for its Cancel button.
 
-COMPOSITE (ROW) FIELDS
+Config auto-apply
+=================
+Config fields (resources, params, crop, paste) carry `config_path` and
+neither `set_command` nor a section-level `commit`. Every edit to one
+of them starts a 150 ms single-shot debounce; when it fires,
+`flushApply` assembles the four config sections from current widget
+state and POSTs one `comfy_apply_config`, matching the docker's
+`_apply_config_from_widgets` on the same timer.
+
+`comfy_panel_run` and `comfy_save_config` receive the four sections
+assembled from widget state at click time; the daemon's fallback to
+`_active_config` only fires when the caller omits the sections
+entirely (a CLI invocation without them), never on the web panel's
+click path.
+
+Composite (row) fields
 ======================
 A field with `type: "row"` renders as one flex row containing one
-sub-widget per `sub_fields` entry. Each sub-widget carries its own
-`data-field`, so the existing per-field plumbing (`readWidgetValue`,
-`readAllValues`, `syncValues`, `evaluateVisibility`,
-`buildConfigFromWidgets`, `commitField` via `onFormChange`, focus and
-in-flight tracking) works unchanged — sub-widgets are registered as
-ordinary leaf fields keyed by their own key.
-
-Used by the ResourcesProvider so each resource is rendered as
-    @thecanvas    [ global/active/layer ▼ ]   [ thecanvas________ ]
+sub-widget per `sub_fields` entry. Sub-widgets carry their own
+`data-field`, so the existing per-field plumbing works unchanged.
+Used by the daemon's `ResourcesProvider` so each resource renders as
+    @thecanvas    [ global/active/layer ▼ ]   [ thecanvas_______ ]
 on one line, with the layer-name input collapsed to zero width when
-the dropdown is "active" or "global" and reappearing on "layer".
+the dropdown is "active" or "global".
 
-The two places that needed a new branch are `buildFieldHtml` (row
-arm) and the flattening steps in `rebuildPanel` / `syncValues` (walk
-`sub_fields` in addition to the top level).
+Hidden fields (`visible: false`)
+================================
+A field carrying `visible: false` is created and registered exactly
+like any other leaf field, but its `data-field-container` div gets
+`style="display: none;"`. This preserves the per-field plumbing:
+`readConfigWidgetValue` and `buildConfigFromWidgets` still find the
+element, so the field is still submitted to `comfy_apply_config`.
+Only the user-visible row is hidden.
+
+`evaluateVisibility` treats `visible: false` as a hard-hide that
+`visible_when` cannot override.
+
+Local handlers (`local_handler`)
+================================
+A field carrying `local_handler: "name"` is a client-side widget whose
+edits are not sent to the daemon.  `commitField` checks the spec for
+`local_handler` and, if present, dispatches to the handler registered
+in `app.localHandlers` under that name instead of scheduling a daemon
+command.  The daemon's panel description carries such fields so their
+label and position are consistent with the rest of the layout, and so
+the client's structure-id hash matches the daemon's — the client-side
+value of the field is not part of the hash, so a client-local edit
+never causes a structural rebuild.
+
+Parameters filter prefix (client-side)
+======================================
+The Parameters section carries a "Filter prefix" text field at the
+top with `local_handler: "param_prefix_filter"`.  This client registers
+a handler for that name which:
+
+  - writes the new prefix to `app.paramPrefixByWorkflow`, keyed by
+    the current workflow name;
+  - persists that map to `localStorage`;
+  - triggers a `rebuildPanel` against the latest description, so the
+    filter takes effect immediately.
+
+`_filteredDescription` runs before every `rebuildPanel` and
+`syncValues` and marks each `cfg-param.*` field whose title does not
+start with the current workflow's prefix as `visible: false`.  The
+daemon never sees the prefix — it emits every param unconditionally.
+
+`_onState` watches for workflow changes and, on transition, triggers
+a `rebuildPanel` so the newly-loaded workflow's saved prefix is
+applied immediately, before any other panel push.
+
+The docker persists its own prefix in `QSettings`.  The web panel's
+`localStorage` is independent of the docker's `QSettings`; the two
+clients can filter by different prefixes at the same time.
 """
 
 import json
@@ -789,7 +849,53 @@ const app = {
   activeBatchesCount: 0,
   eventsConnected: false,
   firstPanelReceived: false,
+  // Per-client Parameters filter state:
+  //   currentWorkflow          — last workflow name seen in a state push
+  //   paramPrefixByWorkflow    — Map<workflow, prefix>, persisted to localStorage
+  //   localHandlers            — Map<name, fn> for `local_handler` fields
+  currentWorkflow: "",
+  paramPrefixByWorkflow: new Map(),
+  localHandlers: new Map(),
 };
+
+// ---- localStorage load ----
+(function restoreParamPrefixMap() {
+  try {
+    const raw = localStorage.getItem("kritomatic_param_prefix_by_workflow");
+    if (!raw) return;
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== "object") return;
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof k === "string" && typeof v === "string") {
+        app.paramPrefixByWorkflow.set(k, v);
+      }
+    }
+  } catch (_) {}
+})();
+
+function persistParamPrefixMap() {
+  try {
+    const obj = {};
+    for (const [k, v] of app.paramPrefixByWorkflow.entries()) {
+      obj[k] = v;
+    }
+    localStorage.setItem(
+      "kritomatic_param_prefix_by_workflow", JSON.stringify(obj),
+    );
+  } catch (_) {}
+}
+
+// ---- local handler: Parameters filter prefix ----
+app.localHandlers.set("param_prefix_filter", function (prefix) {
+  const wf = app.currentWorkflow;
+  if (wf) {
+    app.paramPrefixByWorkflow.set(wf, String(prefix || ""));
+    persistParamPrefixMap();
+  }
+  if (app.latestPanel) {
+    rebuildPanel(app.latestPanel);
+  }
+});
 
 function esc(s) {
   return String(s).replace(/&/g, "&amp;")
@@ -849,6 +955,32 @@ function renderStatus(s) {
   }
   el.innerHTML = lines.map(l => "<div>" + l + "</div>").join("")
     || '<div class="empty">(no state)</div>';
+}
+
+// ---- filter the incoming description with the current workflow's prefix ----
+//
+// Returns a deep copy with `cfg-param.*` fields whose title does not
+// start with the current workflow's prefix marked `visible: false`.
+// The description the server sent is left untouched so `app.latestPanel`
+// stays as the pristine daemon view; re-filtering with a different
+// prefix works by re-calling `rebuildPanel(app.latestPanel)`.
+function _filteredDescription(description) {
+  if (!description) return description;
+  const prefix = app.paramPrefixByWorkflow.get(app.currentWorkflow) || "";
+  if (!prefix) return description;
+  const copy = JSON.parse(JSON.stringify(description));
+  for (const s of copy.sections || []) {
+    for (const f of s.fields || []) {
+      const key = f.key || "";
+      if (key.startsWith("cfg-param.")) {
+        const title = key.substring("cfg-param.".length);
+        if (!title.startsWith(prefix)) {
+          f.visible = false;
+        }
+      }
+    }
+  }
+  return copy;
 }
 
 function buildWorkflowBarHtml(section) {
@@ -949,17 +1081,32 @@ function buildFieldHtml(f) {
   if (!key) return "";
   const overridden = f.overridden ? " overridden" : "";
   const labelHtml = esc(f.label || key);
+  // `visible: false` hides the row but keeps its <input> in the DOM,
+  // so buildConfigFromWidgets / syncValues still see the value.
+  const hiddenStyle = f.visible === false ? ' style="display:none;"' : "";
   let inner = "";
   const t = f.type;
   if (t === "row") {
     const subs = (f.sub_fields || []).map(buildSubFieldHtml).join("");
-    return `<div class="field field-row" data-row-key="${escAttr(key)}">
+    return `<div class="field field-row" data-row-key="${escAttr(key)}"${hiddenStyle}>
     <label>${esc(f.label || "")}</label>
     <div class="row-container">${subs}</div>
   </div>`;
   }
   if (t === "text") {
-    inner = `<input type="text" data-field="${escAttr(key)}" value="${escAttr(f.value ?? "")}">`;
+    // Prefix-filter fields (or any `local_handler` field) can be
+    // identified by the extra attribute; `commitField` uses the spec,
+    // not the attribute, so this is informational.
+    const lhAttr = f.local_handler
+      ? ` data-local-handler="${escAttr(f.local_handler)}"` : "";
+    // Seed the input's value from the current client-side state so a
+    // rebuild (e.g. after a workflow change) shows the restored
+    // prefix.  The daemon's spec carries `value: ""` for this field.
+    let value = f.value ?? "";
+    if (f.local_handler === "param_prefix_filter") {
+      value = app.paramPrefixByWorkflow.get(app.currentWorkflow) || "";
+    }
+    inner = `<input type="text" data-field="${escAttr(key)}"${lhAttr} value="${escAttr(value)}">`;
   } else if (t === "textarea") {
     inner = `<textarea data-field="${escAttr(key)}" rows="3">${esc(f.value ?? "")}</textarea>`;
   } else if (t === "integer") {
@@ -986,7 +1133,7 @@ function buildFieldHtml(f) {
   } else {
     inner = `<input type="text" data-field="${escAttr(key)}" value="${escAttr(f.value ?? "")}">`;
   }
-  return `<div class="field${overridden}" data-field-container="${escAttr(key)}">
+  return `<div class="field${overridden}" data-field-container="${escAttr(key)}"${hiddenStyle}>
     <label>${labelHtml}</label>
     ${inner}
     <div class="field-error" data-error-for="${escAttr(key)}"></div>
@@ -994,11 +1141,17 @@ function buildFieldHtml(f) {
 }
 
 function rebuildPanel(description) {
+  // Apply the current workflow's client-side prefix filter before
+  // laying out.  Deep copy inside `_filteredDescription` keeps the
+  // original pristine; `app.latestPanel` stays the daemon's view so
+  // switching prefixes and re-calling `rebuildPanel(app.latestPanel)`
+  // works.
+  const filtered = _filteredDescription(description);
   const form = document.getElementById("config-form");
   app.fields = new Map();
   app.specs = new Map();
   app.sections = new Map();
-  app.sectionSpecs = description.sections || [];
+  app.sectionSpecs = (filtered && filtered.sections) || [];
 
   let html = "";
   for (const s of app.sectionSpecs) html += buildSectionHtml(s);
@@ -1045,8 +1198,9 @@ function rebuildPanel(description) {
 }
 
 function syncValues(description) {
+  const filtered = _filteredDescription(description);
   const newSpecs = new Map();
-  for (const s of description.sections || []) {
+  for (const s of (filtered && filtered.sections) || []) {
     for (const f of (s.fields || [])) {
       if (f.type === "row" && Array.isArray(f.sub_fields)) {
         for (const sub of f.sub_fields) {
@@ -1072,6 +1226,10 @@ function syncValues(description) {
       } else if (el.type === "radio") {
         el.checked = String(spec.value) === String(el.value);
       } else {
+        // `local_handler` fields: the value lives in client state,
+        // not the daemon's spec.  Skip overwrite so the user's typed
+        // prefix isn't clobbered by the empty daemon value.
+        if (spec.local_handler) continue;
         const target = String(spec.value ?? "");
         if (el.value !== target) el.value = target;
       }
@@ -1097,7 +1255,17 @@ function syncValues(description) {
 
 function evaluateVisibility(key) {
   const spec = app.specs.get(key);
-  if (!spec || !spec.visible_when) return;
+  if (!spec) return;
+  // Hard-hidden fields (`visible: false`) stay hidden regardless of
+  // `visible_when`. Used by the param-prefix filter, whose excluded
+  // params have no visible_when of their own.
+  if (spec.visible === false) {
+    const container = document.querySelector(
+      `[data-field-container="${cssEsc(key)}"]`);
+    if (container) container.style.display = "none";
+    return;
+  }
+  if (!spec.visible_when) return;
   let visible = true;
   for (const [otherKey, expected] of Object.entries(spec.visible_when)) {
     const otherSpec = app.specs.get(otherKey);
@@ -1279,6 +1447,18 @@ function commitField(key) {
   const spec = app.specs.get(key);
   const section = app.sections.get(key);
   if (!spec || !section) return;
+
+  // Client-side `local_handler`: dispatch to the registered JS
+  // handler instead of sending a command to the daemon.  Used by the
+  // Parameters prefix filter; see the module docstring.
+  if (spec.local_handler) {
+    const handler = app.localHandlers.get(spec.local_handler);
+    if (!handler) return;
+    const els = app.fields.get(key) || [];
+    const value = els.length > 0 ? readWidgetValue(els[0], spec) : "";
+    handler(value);
+    return;
+  }
 
   // v2 config fields: debounce a whole-config re-apply, matching the
   // Krita docker's model.  See the "v2 config auto-apply" comment
@@ -1561,6 +1741,16 @@ function connectEvents() {
     try {
       const s = JSON.parse(e.data);
       app.latestState = s;
+      const wf = (s && s.daemon && s.daemon.workflow) || "";
+      const wfChanged = wf !== app.currentWorkflow;
+      app.currentWorkflow = wf;
+      if (wfChanged && app.latestPanel) {
+        // Workflow changed: re-render using the new workflow's saved
+        // prefix.  Done before the panel push that accompanies the
+        // workflow change so the params appear correctly filtered on
+        // that first render.
+        rebuildPanel(app.latestPanel);
+      }
       const batches = (s && s.daemon
                        && Array.isArray(s.daemon.active_batches))
         ? s.daemon.active_batches.length : 0;

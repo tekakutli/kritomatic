@@ -61,6 +61,37 @@ sub-field, which tells the docker to render an editable
 vs transparency/selection masks) and ordered by the recent-alias
 list. Fields without `kind_hint` continue to render as plain
 `QLineEdit`s.
+
+Hidden fields (`visible: false`)
+================================
+A field carrying `visible: false` is created by both renderers but
+not shown to the user. Its widget still exists (and its current
+value is still read by `build_config_from_widgets`), so the field is
+still submitted to `comfy_apply_config`. Only the UI row is hidden.
+
+This capability is not used by any daemon-side provider today.  It
+exists so that a *client* (the docker or the web panel) can mark
+fields as hidden when it applies a local display filter — the
+Parameters prefix filter being the one such filter today.  Each
+client filters its own copy of the description before passing it to
+the renderer, so the daemon emits all fields unconditionally.
+
+Param prefix filter (client-side)
+=================================
+The Parameters section carries a "Filter prefix" text field at the
+top with `local_handler: "param_prefix_filter"`.  That field has no
+`set_command` — it is not routed through the daemon.  Each client
+(docker, web panel) registers a local handler for that name, stores
+the current prefix in its own settings (QSettings on the docker
+side, localStorage on the web side, keyed by workflow name), and
+applies the filter to its local copy of the description before
+rendering.  The daemon never sees the prefix, which means docker and
+web panel can filter independently without interfering.
+
+When a workflow changes, each client restores its saved prefix for
+that workflow.  The config file does not carry the prefix — a
+display preference in a shared, daemon-owned file would let one
+client's choice leak into another client's UI.
 """
 
 from __future__ import annotations
@@ -91,26 +122,27 @@ class PanelDescriptionBuilder:
 
 
 _STRUCTURE_FIELD_KEYS = (
-    "key", "type", "options", "visible_when",
-    "set_command", "arg_key", "kind_hint",
+    "key", "type", "options", "visible_when", "visible",
+    "set_command", "arg_key", "kind_hint", "local_handler",
     "config_path", "no_sync",
 )
 
 # Sub-fields contribute to the structure hash only by their *shape*
 # (key, type, options, config_path, visibility rule, stretch,
-# kind_hint) — never by their current value. Otherwise a value change
-# would produce a new structure_id and defeat the sync-in-place
-# optimization in both renderers.
+# kind_hint, local_handler) — never by their current value. Otherwise
+# a value change would produce a new structure_id and defeat the
+# sync-in-place optimization in both renderers.
 #
-# `kind_hint` is *shape*, not value: whether a text field is rendered
-# as a plain QLineEdit or as a _LayerComboBox is decided at rebuild
-# time from this hint, and switching a field between the two at
-# runtime requires the tree to be rebuilt (a plain QLineEdit cannot
-# become an editable combo in place). So a `kind_hint` change must
+# `kind_hint`, `visible`, and `local_handler` are *shape*, not value:
+# whether a text field renders as a plain QLineEdit or as a
+# _LayerComboBox, whether it is hidden behind a `visible: false`, and
+# whether a commit routes through the daemon or a client-local
+# handler, are all decided at rebuild time. Switching any at runtime
+# requires the tree to be rebuilt. So a change to any of them must
 # change structure_id.
 _STRUCTURE_SUBFIELD_KEYS = (
-    "key", "type", "options", "visible_when",
-    "config_path", "kind_hint", "stretch",
+    "key", "type", "options", "visible_when", "visible",
+    "config_path", "kind_hint", "stretch", "local_handler",
 )
 
 
@@ -356,6 +388,20 @@ def _param_widget_and_default(kind: str):
 class ParamsProvider:
     """Per-title: a typed input matching the slot kind. The docker
     auto-applies on every edit.
+
+    Emits one form section with a `local_handler` text field at the
+    top — the prefix filter — followed by one field per param.  The
+    prefix field is not routed through the daemon; each client
+    registers a handler named `param_prefix_filter` and stores the
+    prefix in its own settings.  See the module docstring, "Param
+    prefix filter (client-side)".
+
+    The daemon emits *all* params unconditionally, with their current
+    `_active_config` values.  A client that has an active prefix
+    filters its local copy of the description before rendering; the
+    params it hides keep their `config_path` and value, so
+    `build_config_from_widgets` still re-applies them through
+    `comfy_apply_config` on every subsequent edit.
     """
 
     def contribute(self, builder, ctx):
@@ -365,7 +411,24 @@ class ParamsProvider:
             return
         config = status.get("config") or {}
         cfg_params = config.get("params") or {}
+
         fields = []
+
+        # Prefix filter field first. It sits inside the Parameters
+        # section — not a separate "Filter" section — because it's
+        # the control that decides which of the fields below are
+        # shown.  `local_handler` means "the client invokes its own
+        # handler for this field; do not send a command".  The
+        # daemon does not know, and must not know, what prefix the
+        # client is filtering by.
+        fields.append({
+            "key": "param-prefix",
+            "label": "Filter prefix",
+            "type": "text",
+            "value": "",
+            "local_handler": "param_prefix_filter",
+        })
+
         for title in sorted(slots.keys()):
             slot = slots[title]
             kind = slot.get("kind", "string")
@@ -381,6 +444,7 @@ class ParamsProvider:
                 "value": current,
                 "config_path": ["params", title],
             })
+
         builder.add_section({
             "id": "params",
             "kind": "form",

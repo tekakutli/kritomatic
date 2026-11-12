@@ -53,6 +53,66 @@ built widget regardless of location), and the layout's bookkeeping is
 cleared via `takeAt(0)` so the layout does not hold dangling
 references. Double-calling `deleteLater()` on a widget already
 scheduled for deletion is safe.
+
+Hidden fields (`visible: false`)
+================================
+A field carrying `visible: false` is created and registered exactly
+like any other leaf field, but it is not added to the QFormLayout
+row. Instead, it is parented to the containing QGroupBox and hidden
+via `setVisible(False)`.
+
+QFormLayout has no per-row visibility primitive in Qt6, so the
+"parent to group, skip addRow" arrangement is the only one where
+the field's widget takes zero space in the form while still existing
+as a live QObject parented to the section.
+
+The registration in `_field_widgets` is what makes
+`build_config_from_widgets` still pick up the hidden field's value —
+which is the entire point of `visible: false` versus dropping the
+field from the description. A param hidden by a client-side filter
+keeps its last-applied value through every subsequent
+`comfy_apply_config` that the docker sends, exactly as if it were
+still on screen.
+
+`_reevaluate_visibility` treats `visible: false` as a hard-hide that
+`visible_when` cannot override.
+
+Client-side filters (`set_param_prefix`)
+========================================
+The docker maintains a Parameters-section filter prefix that is a
+*client-local display preference* — not a daemon-side setting. When
+the prefix changes, the docker calls `set_param_prefix()`, which
+forces a rebuild of the tree against the last received description
+with `cfg-param.*` fields whose title does not start with the prefix
+marked `visible: false`. This is how the docker and the web panel
+can maintain independent filters: the daemon never sees the prefix
+at all.
+
+`_filtered_description` is also where the current prefix is
+*injected back into* every `local_handler: "param_prefix_filter"`
+field's `value`. The daemon always sends `value: ""` for such fields
+(it has no reason to carry a value the client owns), so without this
+injection a rebuild or sync from the daemon would silently clear the
+prefix field's widget while leaving the params filtered — the very
+bug the injection prevents.
+
+Local handlers (`local_handler`)
+================================
+A field carrying `local_handler: "name"` is a client-side widget
+whose edits are not sent to the daemon. When the widget's commit
+signal fires, the renderer invokes the handler registered under
+`name` via `set_local_handler`, passing the new value. The daemon's
+panel description carries such fields for two reasons: (a) so their
+row label and position are consistent with the rest of the panel
+layout, and (b) so the client's structure-id hash matches the
+daemon's (so updates sync in place rather than rebuilding on every
+panel push). The daemon's `_STRUCTURE_FIELD_KEYS` includes
+`local_handler` for the same reason.
+
+Because the daemon has no value for such fields, the renderer's
+`_filtered_description` is where the client's current value is
+written back into the description before `_rebuild` and
+`_sync_values` consume it. See "Client-side filters" above.
 """
 
 from __future__ import annotations
@@ -152,18 +212,123 @@ class PanelRenderer(QObject):
         # the module docstring.
         self._actions_layout = actions_layout
         self._structure_id = None
+        self._last_description = None
         self._section_widgets = []
         self._section_specs = []
         self._field_widgets = {}
         self._field_specs = {}
         self._action_buttons = {}
+        # Client-side Parameters filter prefix.  Empty string means "no
+        # filter".  Set via `set_param_prefix`, which forces a rebuild
+        # against `_last_description`.  See "Client-side filters" in
+        # the module docstring.
+        self._param_prefix_filter = ""
+        # Handlers registered via `set_local_handler`; keyed by the
+        # `local_handler` string a field spec carries.  See "Local
+        # handlers" in the module docstring.
+        self._local_handlers = {}
+
+    def set_local_handler(self, name: str, fn) -> None:
+        """Register a client-side handler for fields with
+        `local_handler: name`.  Replaces any prior registration under
+        the same name."""
+        self._local_handlers[name] = fn
+
+    def set_param_prefix(self, prefix: str) -> None:
+        """Set the client-side Parameters filter prefix.
+
+        If `prefix` differs from the current one, rebuild the tree
+        against `_last_description` (re-applying the filter via
+        `_filtered_description`).  `_structure_id` is cleared during
+        the rebuild so the next `render()` call from the daemon takes
+        the rebuild path with the same `struct_id` the daemon sends —
+        this keeps the client's view of "last seen daemon structure"
+        in sync.
+
+        A no-op if `prefix` matches the current value.
+        """
+        if prefix == self._param_prefix_filter:
+            return
+        self._param_prefix_filter = prefix
+        if self._last_description is not None:
+            self._structure_id = None
+            self.render(self._last_description)
+
+    def get_param_prefix(self) -> str:
+        """Return the current client-side Parameters filter prefix."""
+        return self._param_prefix_filter
+
+    def _filtered_description(self, description: dict) -> dict:
+        """Return a copy of `description` with client-side filters and
+        local-handler values applied.
+
+        Two transformations:
+
+          1. **Local-handler value injection.**  For each field carrying
+             `local_handler: "param_prefix_filter"`, the field's `value`
+             is replaced with the renderer's current prefix.  The daemon
+             never carries a real value for client-local fields — its
+             spec always says `value: ""` — so without this injection a
+             rebuild or sync from the daemon would silently clear the
+             field's widget.  (Rebuild creates it empty; sync calls
+             `_apply_value("")` on the existing widget.)
+
+          2. **Client-side filter.**  Each `cfg-param.*` field whose title
+             does not start with `_param_prefix_filter` is marked
+             `visible: false`.  The field is still emitted, still has its
+             `config_path` and value, and is still read by
+             `build_config_from_widgets` — only the visible row is
+             hidden.  Empty prefix means "no filter" (no visibility
+             changes).
+
+        Returns `description` unchanged (identity) when neither
+        transformation would touch anything, so the caller's `is` check
+        on the return value still means "nothing changed".
+        """
+        prefix = self._param_prefix_filter
+        sections = description.get("sections") or []
+        new_sections = []
+        any_change = False
+        for s in sections:
+            old_fields = s.get("fields") or []
+            new_fields = []
+            section_changed = False
+            for f in old_fields:
+                key = f.get("key") or ""
+                f_mod = f
+                if f.get("local_handler") == "param_prefix_filter":
+                    if f.get("value") != prefix:
+                        f_mod = dict(f)
+                        f_mod["value"] = prefix
+                        section_changed = True
+                elif prefix and key.startswith("cfg-param."):
+                    title = key[len("cfg-param."):]
+                    if not title.startswith(prefix):
+                        f_mod = dict(f)
+                        f_mod["visible"] = False
+                        section_changed = True
+                new_fields.append(f_mod)
+            if section_changed:
+                new_s = dict(s)
+                new_s["fields"] = new_fields
+                new_sections.append(new_s)
+                any_change = True
+            else:
+                new_sections.append(s)
+        if not any_change:
+            return description
+        new_desc = dict(description)
+        new_desc["sections"] = new_sections
+        return new_desc
 
     def render(self, description: dict) -> None:
-        struct_id = description.get("structure_id", "")
+        self._last_description = description
+        filtered = self._filtered_description(description)
+        struct_id = filtered.get("structure_id", "")
         if struct_id == self._structure_id:
-            self._sync_values(description)
+            self._sync_values(filtered)
             return
-        self._rebuild(description)
+        self._rebuild(filtered)
         self._structure_id = struct_id
 
     # ---- rebuild ----
@@ -356,6 +521,16 @@ class PanelRenderer(QObject):
                 continue
             self._field_widgets[key] = widget
             self._field_specs[key] = f
+
+            if f.get("visible") is False:
+                # Invisible but live.  See the module docstring,
+                # "Hidden fields (`visible: false`)", for why the
+                # widget is parented to the group without a form row
+                # rather than added-and-hidden.
+                widget.setParent(group)
+                widget.setVisible(False)
+                continue
+
             label = f.get("label") or key
             if f.get("overridden"):
                 label = f"{label} ●"
@@ -489,9 +664,23 @@ class PanelRenderer(QObject):
 
             w = QLineEdit()
             w.setText("" if value is None else str(value))
-            w.editingFinished.connect(
-                lambda k=key, w=w: self._on_text_commit(k, w.text())
-            )
+            local_handler = f.get("local_handler")
+            if local_handler:
+                # Route commit through the client-local handler
+                # instead of the daemon.  The spec's `value` is kept
+                # up to date by `_filtered_description`, so subsequent
+                # syncs from the daemon (which carry the daemon's
+                # empty-string view of a local-handler field) don't
+                # clobber what the client set.
+                w.editingFinished.connect(
+                    lambda k=key, lh=local_handler, w=w: (
+                        self._on_local_handler_commit(k, lh, w.text())
+                    )
+                )
+            else:
+                w.editingFinished.connect(
+                    lambda k=key, w=w: self._on_text_commit(k, w.text())
+                )
             return w
 
         if ftype == "textarea":
@@ -641,6 +830,37 @@ class PanelRenderer(QObject):
             return
         spec["value"] = new_value
         self._on_field_commit(key, new_value)
+
+    def _on_local_handler_commit(
+        self, key: str, handler_name: str, new_value: str,
+    ) -> None:
+        """Commit a `local_handler` field.
+
+        Updates the spec's `value` so subsequent daemon-pushed syncs
+        (which carry the daemon's view of the value — empty string for
+        fields the daemon never set) don't clobber the widget, then
+        invokes the registered client-local handler if any.  No
+        daemon command is dispatched.
+        """
+        spec = self._field_specs.get(key)
+        if spec is not None:
+            old_value = spec.get("value")
+            if str(new_value) == str(
+                    old_value if old_value is not None else ""):
+                # No change; still invoke the handler so callers can
+                # observe "commit" events even without value drift
+                # (e.g. persistence on blur, which just re-saves the
+                # current value).
+                pass
+            else:
+                spec["value"] = new_value
+        handler = self._local_handlers.get(handler_name)
+        if handler is None:
+            return
+        try:
+            handler(new_value)
+        except Exception:
+            pass
 
     def _on_field_commit(self, key: str, value) -> None:
         self._reevaluate_visibility()
@@ -864,6 +1084,14 @@ class PanelRenderer(QObject):
         for key, spec in self._field_specs.items():
             widget = self._field_widgets.get(key)
             if widget is None:
+                continue
+            # Fields hidden by `visible: false` never receive a form row
+            # and stay hidden regardless of `visible_when`.  A change in
+            # `visible` triggers a full rebuild (structure hash covers
+            # it), not an in-place visibility flip; so the only job here
+            # is to make sure nothing else un-hides them.
+            if spec.get("visible") is False:
+                widget.setVisible(False)
                 continue
             rule = spec.get("visible_when")
             if not rule:

@@ -63,6 +63,33 @@ Corner caveat: when `output_rotation != 0`, the (W × H) result is
 rotated with `expand=False`, so the four corners of the rotated frame
 are lost.  Same limitation the earlier v1 flow had.
 
+PROXY AUTO-START
+================
+The daemon only spawns comfy-api-proxy from `comfy_connect` — the one
+place in the whole codebase that calls `proxy_manager.start()`.  The
+docker's Run button and the CLI's `panel run` both go through
+`comfy_connect` first, so they get the proxy for free.  This
+playground bypasses the daemon's command surface for generation
+(Stage 8), which means it also bypasses the one place that would
+have started the proxy on the way in.
+
+To close that gap without broadening the auto-start to every code
+path that touches the daemon, `handle_inpaint` treats a missing
+proxy as recoverable: `ProxyV2.from_pid_file()` is attempted first;
+on `ProxyUnreachable` it sends one `comfy_connect` over the daemon
+(which triggers `proxy_manager.start()` server-side, waits for
+`/api/v2/health`, and writes the pid file), then retries
+`from_pid_file()` once.  The recovery is bounded (one retry, no
+loop), silent on failure (the caller still gets a clean
+`proxy unavailable: ...` message), and zero-cost on the happy path
+(proxy running → first attempt succeeds → no recovery sent).
+
+`check=False` on the recovery `comfy_connect`: the `check` flag
+makes the daemon run `parent._client.object_info()` against ComfyUI
+8188, which is slow (~200 KB JSON) and irrelevant here — the proxy
+spawn happens regardless of `check`, and this route's only interest
+in `comfy_connect` is the side effect.
+
 PARAM AND CANCEL SHARING WITH THE DOCKER
 ========================================
 The playground drives generation itself, but it must not feel like a
@@ -213,6 +240,60 @@ def _cache_image(hash_hex, raw, width, height, filename):
             "raw": raw, "width": width, "height": height,
             "filename": filename,
         }
+
+
+# ---------------------------------------------------------------------------
+#  Proxy reachability with a single automatic recovery
+# ---------------------------------------------------------------------------
+
+def _ensure_proxy() -> "ProxyV2":
+    """Return a ProxyV2 pointed at a running proxy, starting it if needed.
+
+    First attempt: `ProxyV2.from_pid_file()`.  Succeeds in the common
+    case (proxy already running, or already auto-started by an earlier
+    `comfy_connect`).  Raises `ProxyUnreachable` if the pid file is
+    missing or the process is dead.
+
+    Recovery attempt: one `comfy_connect` over the daemon.  That is
+    the only command in the whole daemon that calls
+    `proxy_manager.start()`, so it is the one action that can spawn
+    the proxy.  `check=False` because the reply we care about is the
+    side effect (proxy spawned), not the object_info round trip
+    against ComfyUI 8188.
+
+    Retry: one more `ProxyV2.from_pid_file()`.  If it still raises,
+    the exception propagates to the caller as-is; the caller's normal
+    `except ProxyUnreachable` path returns a `proxy unavailable`
+    message that names the underlying reason (pid file absent,
+    process dead, install state).
+
+    The whole thing is bounded: one recovery send, one retry, no
+    loop.  A proxy that is broken for a non-transient reason (not
+    installed, venv corrupt, health probe always fails) surfaces its
+    error on the first attempt every time, with the same message the
+    old code produced — no extra latency beyond the failed
+    `comfy_connect`.
+    """
+    try:
+        return ProxyV2.from_pid_file()
+    except ProxyUnreachable:
+        pass
+
+    # Proxy is not running (or not installed yet).  Ask the daemon to
+    # bring it up.  Any error here is swallowed: whatever reason
+    # comfy_connect itself has for failing is not more informative to
+    # the browser than the ProxyUnreachable message the retry will
+    # produce, and swallowing keeps the failure mode a single clean
+    # return rather than a compound exception.
+    try:
+        krita_client.send(
+            {"type": "comfy_connect", "check": False},
+            timeout=30.0,
+        )
+    except Exception:
+        pass
+
+    return ProxyV2.from_pid_file()
 
 
 # ---------------------------------------------------------------------------
@@ -439,8 +520,13 @@ def handle_inpaint(payload: dict) -> dict:
         }
 
     # ---- 4. Upload each blob as a v2 asset ----
+    #
+    # `_ensure_proxy()` handles the "proxy not running" case by asking
+    # the daemon to start it (via comfy_connect, the only command in
+    # the codebase that calls proxy_manager.start()) and retrying once.
+    # See the module docstring, "PROXY AUTO-START".
     try:
-        proxy = ProxyV2.from_pid_file()
+        proxy = _ensure_proxy()
     except ProxyUnreachable as e:
         return {"success": False,
                 "message": f"proxy unreachable: {e}"}

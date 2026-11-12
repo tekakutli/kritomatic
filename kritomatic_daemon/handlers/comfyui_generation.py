@@ -62,6 +62,22 @@ submission produces `ProxyUnreachable`. Neither should fail the
 cancel command when the user clicked Cancel-All on a batch that
 happens to already be finishing.
 
+Recent layer aliases
+====================
+After a batch in which at least one `prepare_workflow` succeeded,
+`_comfy_generate_impl` walks `_active_config["resources"]` and hands
+every `source == "layer"` entry's `layer_name` to
+`WorkflowCommands._record_recent_alias`. That's the "used these
+layers" signal for the docker's layer-alias dropdowns. Recording is
+per-batch, once, after the loop — the config is fixed for the whole
+batch, so the layer names are the same on every iteration; recording
+inside the loop would just be redundant work. Cancelled batches and
+batches in which every prepare failed record nothing.
+
+The hook is deliberately *not* on `comfy_prepare_only`: that command
+is a diagnostic that reads resources without submitting, and it
+should not pollute the MRU list.
+
 `--no_paste`
 ============
 Returns PNG bytes as base64 in `data.images` instead of pasting into
@@ -270,6 +286,14 @@ class GenerationCommands(AutoDispatchHandler):
             # ---- phase 1: prepare + submit ----
             record.current_phase = "preparing"
             submitted: list = []
+            # Track whether *any* prepare succeeded in this batch.
+            # Used at the end of the try block to decide whether the
+            # layer names from `_active_config["resources"]` were
+            # actually used and should therefore be recorded into the
+            # recent-alias MRU. A batch where every prepare failed
+            # (bad layer, colour-mode problem, unreadable pixels)
+            # records nothing — nothing was used.
+            any_prepare_succeeded = False
 
             for i in range(count):
                 if record.cancel_event.is_set():
@@ -298,6 +322,7 @@ class GenerationCommands(AutoDispatchHandler):
                         proxy,
                         seed=seed_i,
                     )
+                    any_prepare_succeeded = True
                 except ValueError as e:
                     record.run_records.append({
                         "seed": seed_i, "prompt_id": None,
@@ -492,6 +517,19 @@ class GenerationCommands(AutoDispatchHandler):
                 warnings=warnings,
                 duration_s=time.time() - batch_started,
             )
+
+            # ---- record recent layer aliases ----
+            #
+            # Option B (see module docstring, "Recent layer aliases"):
+            # if at least one prepare succeeded, every `source ==
+            # "layer"` entry in the config was actually read from the
+            # document this batch and should be promoted to the front
+            # of the MRU. `_active_config` is fixed for the whole
+            # batch, so we can iterate it once here rather than
+            # recording per-iteration. Cancelled batches and batches
+            # where every prepare failed record nothing.
+            if any_prepare_succeeded:
+                self._record_used_layers(parent._active_config)
 
             successful = sum(1 for r in record.run_records
                              if r["status"] == "success")
@@ -1030,3 +1068,47 @@ class GenerationCommands(AutoDispatchHandler):
                             encoding="utf-8")
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    #  Recent layer aliases (Option B)
+    # ------------------------------------------------------------------
+
+    def _record_used_layers(self, config: Optional[dict]) -> None:
+        """Promote every `source == "layer"` resource's layer_name into
+        the recent-alias MRU, once per successful batch.
+
+        Called from `_comfy_generate_impl` after the batch loop, gated
+        on `any_prepare_succeeded`. Nothing else calls this method.
+
+        Reaches into `WorkflowCommands._record_recent_alias` for the
+        actual prepend-dedupe-cap-persist logic, keeping a single
+        write path: the CLI `comfy_record_recent_alias` command and
+        this internal hook both land in the same helper, so the two
+        cannot drift.
+
+        No-ops on `config is None` or an empty `resources` dict — the
+        batch would have bailed at the `_active_config is None`
+        precondition long before reaching finalize, so this is purely
+        defensive.
+
+        Malformed entries (non-dict spec, missing name, empty
+        layer_name) are skipped rather than raising; the layer was
+        already used successfully at prepare time by the time we get
+        here, so a broken record at this layer of the stack is a
+        data-shape problem, not a reason to fail the batch.
+        """
+        if not config:
+            return
+        resources = config.get("resources") or {}
+        if not isinstance(resources, dict):
+            return
+        workflow_cmds = self.parent._workflow_cmds
+        for _name, spec in resources.items():
+            if not isinstance(spec, dict):
+                continue
+            if spec.get("source") != "layer":
+                continue
+            layer_name = spec.get("layer_name")
+            if not layer_name:
+                continue
+            workflow_cmds._record_recent_alias(str(layer_name))

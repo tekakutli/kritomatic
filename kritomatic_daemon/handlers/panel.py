@@ -41,14 +41,26 @@ Composite (row) fields
 ======================
 A field with `type: "row"` is a composite: one row containing N
 sub-widgets laid out horizontally. Each sub-widget carries its own
-`key`, `config_path`, and (optionally) `visible_when` / `stretch`.
-Both renderers register the sub-widgets as ordinary leaf fields keyed
-by their own key; the composite key itself is only the row's label.
+`key`, `config_path`, and (optionally) `visible_when` / `stretch` /
+`kind_hint`. Both renderers register the sub-widgets as ordinary
+leaf fields keyed by their own key; the composite key itself is only
+the row's label.
 
 Used by ResourcesProvider so each resource renders as
     @thecanvas    [ global/active/layer ▼ ]   [ thecanvas________ ]
 on one line, with the layer-name input shown only when the dropdown
 is "layer".
+
+Layer alias kind hints
+======================
+Each resource slot has a `kind` from `comfyui_inspect`'s resource
+extractor: `"image"` for `LoadImage`, `"mask"` for `LoadImageMask`.
+`ResourcesProvider` propagates that as `kind_hint` on the layer-name
+sub-field, which tells the docker to render an editable
+`_LayerComboBox` populated with layers of that kind (image-bearing
+vs transparency/selection masks) and ordered by the recent-alias
+list. Fields without `kind_hint` continue to render as plain
+`QLineEdit`s.
 """
 
 from __future__ import annotations
@@ -85,10 +97,17 @@ _STRUCTURE_FIELD_KEYS = (
 )
 
 # Sub-fields contribute to the structure hash only by their *shape*
-# (key, type, options, config_path, visibility rule, stretch) — never
-# by their current value. Otherwise a value change would produce a
-# new structure_id and defeat the sync-in-place optimization in both
-# renderers.
+# (key, type, options, config_path, visibility rule, stretch,
+# kind_hint) — never by their current value. Otherwise a value change
+# would produce a new structure_id and defeat the sync-in-place
+# optimization in both renderers.
+#
+# `kind_hint` is *shape*, not value: whether a text field is rendered
+# as a plain QLineEdit or as a _LayerComboBox is decided at rebuild
+# time from this hint, and switching a field between the two at
+# runtime requires the tree to be rebuilt (a plain QLineEdit cannot
+# become an editable combo in place). So a `kind_hint` change must
+# change structure_id.
 _STRUCTURE_SUBFIELD_KEYS = (
     "key", "type", "options", "visible_when",
     "config_path", "kind_hint", "stretch",
@@ -244,21 +263,28 @@ class WorkflowMetadataProvider:
 
 class ResourcesProvider:
     """Per-@-name: a single composite row with the source dropdown and
-    a conditional layer_name text field.
+    a conditional layer_name field.
 
     The composite's `key` is only the row's label. Its sub-widgets
     carry the real `config_path`s and are wired independently — the
     docker auto-applies on every edit to either sub-widget.
 
-    The layer_name input carries `visible_when` pointing at its
-    sibling `source` sub-widget, so it collapses when the dropdown is
-    `active` or `global` and reappears on `layer`. Because both
-    renderers register the sub-widgets as ordinary leaf fields keyed
-    by their own key, all the per-field plumbing
-    (read_widget_value, apply_value, sync_values, build_config_from_widgets,
-    focus tracking, in-flight tracking) works unchanged. The only
-    places that needed new branches are the two `_build_form` /
-    `buildFieldHtml` paths that turn the field list into widgets.
+    The layer_name sub-field carries two hints that matter to the
+    docker:
+
+      * `kind_hint` — copied from the workflow slot's `kind`. Value is
+        "image" (LoadImage) or "mask" (LoadImageMask). The docker
+        uses this to decide whether the field renders as a plain
+        `QLineEdit` or as an editable `_LayerComboBox` populated
+        with layers of the matching kind.
+
+      * `visible_when` — points at the sibling `source` sub-widget,
+        so the field collapses when the dropdown is `active` or
+        `global` and reappears on `layer`. Both renderers register
+        sub-widgets as ordinary leaf fields keyed by their own key,
+        so all per-field plumbing (read_widget_value, apply_value,
+        sync_values, build_config_from_widgets, focus and in-flight
+        tracking, set_layers) works unchanged.
     """
 
     def contribute(self, builder, ctx):
@@ -270,6 +296,14 @@ class ResourcesProvider:
         cfg_resources = config.get("resources") or {}
         fields = []
         for name in sorted(slots.keys()):
+            slot = slots.get(name) or {}
+            # The extractor records `kind` as "image" or "mask"
+            # depending on whether the node was LoadImage or
+            # LoadImageMask. That's exactly what the docker's
+            # _LayerComboBox needs to pick the right bucket. Default
+            # to "image" if the slot dict is somehow missing the
+            # field — a plain text input is the safe fallback.
+            slot_kind = slot.get("kind") or "image"
             res_cfg = cfg_resources.get(name) or {}
             current_source = res_cfg.get("source") or "layer"
             current_layer = (
@@ -296,6 +330,7 @@ class ResourcesProvider:
                         "visible_when": {
                             f"cfg-resource.{name}.source": "layer",
                         },
+                        "kind_hint": slot_kind,
                         "stretch": 1,
                     },
                 ],

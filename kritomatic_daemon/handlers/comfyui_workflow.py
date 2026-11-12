@@ -26,6 +26,29 @@ extractor's message in the response and skips the config autoload —
 the saved config would fail validation against empty slot tables,
 producing a redundant "config autoload rejected" warning on top of
 the real error.
+
+Recent layer aliases
+====================
+`comfy_list_recent_aliases` reads the MRU list the daemon keeps in
+`_RECENT_ALIASES_PATH`; the docker's `_LayerComboBox` fields put
+those names at the front of their dropdowns, per kind bucket. The
+list is populated by `_record_recent_alias`, which is invoked:
+
+  * internally, from `comfyui_generation._comfy_generate_impl` after
+    a batch in which at least one `prepare_workflow` succeeded —
+    every `source == "layer"` resource in `_active_config` is
+    recorded (see Option B in the design notes);
+  * externally, through `comfy_record_recent_alias`, for CLI use and
+    manual testing.
+
+Both paths land in `WorkflowCommands._record_recent_alias`, which
+dedupes (a re-recorded name moves to the front), caps at
+`_RECENT_ALIASES_CAP`, and best-effort persists to disk. The
+in-memory list on `ComfyUIHandler` (`_recent_aliases`, guarded by
+`_recent_aliases_lock`) is authoritative for the session; the disk
+file is loaded once at handler construction and rewritten by
+`_record_recent_alias`. The daemon does not watch the file for
+external edits.
 """
 
 from __future__ import annotations
@@ -34,7 +57,11 @@ import json
 from pathlib import Path
 
 from ..decorators import command, AutoDispatchHandler
-from .comfyui_types import _WORKFLOW_DIR
+from .comfyui_types import (
+    _RECENT_ALIASES_CAP,
+    _WORKFLOW_DIR,
+    _save_recent_aliases,
+)
 
 
 class WorkflowCommands(AutoDispatchHandler):
@@ -239,10 +266,8 @@ class WorkflowCommands(AutoDispatchHandler):
     @command(
         category="comfyui",
         help_text="Return the most recently used layer alias targets, "
-                  "most recent first. Kept for the docker's alias-"
-                  "dropdown refresh even after Stage 6 removed the "
-                  "binding commands; returns an empty list unless the "
-                  "aliases file has legacy entries.",
+                  "most recent first. Used by the docker's alias "
+                  "dropdowns to order their items.",
         args={},
     )
     def comfy_list_recent_aliases(self, params):
@@ -254,3 +279,56 @@ class WorkflowCommands(AutoDispatchHandler):
             "message": f"{len(snapshot)} recent alias(es)",
             "data": {"recent_aliases": snapshot},
         }
+
+    @command(
+        category="comfyui",
+        help_text="Record a layer name as recently used. Moves it to "
+                  "the front of the MRU list (deduping any prior entry) "
+                  "and persists. The docker's layer-alias dropdowns "
+                  "read this list to order their items. "
+                  "comfy_generate invokes the same code path after a "
+                  "successful batch; this command exists for CLI use "
+                  "and manual testing.",
+        args={
+            "--actual_name": {"type": "str", "required": True,
+                              "help": "The layer name to record"},
+        },
+    )
+    def comfy_record_recent_alias(self, params):
+        actual = params.get("actual_name", "")
+        if not actual:
+            return {"success": False,
+                    "message": "--actual_name is required"}
+        self._record_recent_alias(actual)
+        with self.parent._recent_aliases_lock:
+            snapshot = list(self.parent._recent_aliases)
+        return {
+            "success": True,
+            "message": f"recorded {actual!r}",
+            "data": {"recorded": actual,
+                     "recent_aliases": snapshot},
+        }
+
+    def _record_recent_alias(self, actual: str) -> None:
+        """Prepend `actual` to the recent-alias list, dedupe, cap, save.
+
+        Under `_recent_aliases_lock` so a concurrent
+        `comfy_list_recent_aliases` read sees a consistent snapshot.
+        The disk write is best-effort and swallowed inside
+        `_save_recent_aliases`; the in-memory list remains
+        authoritative for this session even if the write fails.
+
+        Called from `comfy_record_recent_alias` (external CLI path) and
+        from `comfyui_generation._comfy_generate_impl` (internal,
+        post-prepare path). Both routes land here.
+        """
+        if not actual:
+            return
+        parent = self.parent
+        with parent._recent_aliases_lock:
+            updated = [actual] + [
+                a for a in parent._recent_aliases if a != actual
+            ]
+            del updated[_RECENT_ALIASES_CAP:]
+            parent._recent_aliases = updated
+            _save_recent_aliases(updated)

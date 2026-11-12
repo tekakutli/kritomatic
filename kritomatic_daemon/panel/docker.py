@@ -25,6 +25,23 @@ handled by the renderer as a single row. The docker's action handler
 enriches `comfy_save_config` with config sections, same as
 `comfy_panel_run`.
 
+Pinned action row
+=================
+The panel's `run-actions` section (Run / Cancel / Cancel-All) is a
+`kind: "actions"` section.  The docker places such sections in a
+dedicated layout that sits between the scrollable form area and the
+Log section, both of which are non-scrolling children of the dock's
+root layout.  The effect: the run controls stay visible at all times,
+regardless of how far the user has scrolled the Resources /
+Parameters / Crop / Paste fields.
+
+Mechanism: the renderer accepts an optional `actions_layout` and
+routes `kind == "actions"` sections to it instead of into the
+scrollable form.  The docker builds that layout (`_actions_layout`),
+places it in the root layout, and passes it to the renderer.  See
+"Pinned actions" in `renderer.py`'s module docstring for the full
+contract.
+
 Cancel semantics
 ================
 Cancel targets this docker's own batch via `send_cancel_now`.
@@ -35,6 +52,26 @@ Workflow hint text
 ==================
 `_update_workflow_hint` renders a "No workflow loaded" hint when the
 panel description carries no `workflow` metadata section.
+
+Layer cache invalidation on structure change
+============================================
+When a panel description push carries a different `structure_id`
+from the previous one, the renderer tears down its widget tree and
+rebuilds it. Every `_LayerComboBox` in the new tree is created
+empty — its text is set from the spec, but its item list is not
+populated until `set_layers` runs with a fresh `layersFetched`.
+
+`request_layers` deduplicates by layer signature (see
+`connection.py`'s module docstring, "Layer cache invalidation").
+Without intervention, a rebuild that lands between fetches would
+leave the new combos empty until the daemon's layer set happened to
+change — which, for the common case of workflow loading, it does
+not.
+
+`_on_panel` therefore calls `DaemonConnection.invalidate_layers_cache`
+whenever `structure_id` changed, forcing the next `request_layers`
+to emit. The watcher (already scheduled on every panel push) then
+fires, the fetch emits, and `set_layers` repopulates the new combos.
 """
 
 from __future__ import annotations
@@ -108,6 +145,18 @@ class KritomaticPanel(QDockWidget):
         self._scroll.setWidget(self._form_container)
         root_layout.addWidget(self._scroll, 1)
 
+        # Pinned action row container.  The renderer routes
+        # `kind == "actions"` sections here instead of into the
+        # scrollable form layout, so Run / Cancel / Cancel-All stay
+        # visible at all times (see the module docstring, "Pinned
+        # action row").  When the layout is empty, the container has
+        # zero natural height and simply does not take space.
+        self._actions_container = QWidget()
+        self._actions_layout = QVBoxLayout(self._actions_container)
+        self._actions_layout.setContentsMargins(0, 0, 0, 0)
+        self._actions_layout.setSpacing(0)
+        root_layout.addWidget(self._actions_container)
+
         log_label = QLabel("Log")
         log_label.setStyleSheet(
             "color:#888;font-size:0.72rem;"
@@ -126,6 +175,7 @@ class KritomaticPanel(QDockWidget):
             self._form_layout,
             self._on_field_commit,
             self._on_action,
+            actions_layout=self._actions_layout,
         )
 
         self._conn = DaemonConnection()
@@ -195,14 +245,34 @@ class KritomaticPanel(QDockWidget):
         except Exception as e:
             self._append_log("err", f"render error: {e}")
         new_structure = self._renderer._structure_id
+        structure_changed = old_structure != new_structure
+
         self._update_workflow_hint(description)
         self._update_run_buttons()
+
+        if structure_changed:
+            # The renderer just tore down and rebuilt its widget tree.
+            # Every _LayerComboBox in the new tree was constructed
+            # empty — its *text* was set from the spec, but the item
+            # list is only populated by set_layers, which only runs on
+            # a layersFetched emit. If the daemon's layer set is
+            # unchanged since the last emit, request_layers's
+            # signature dedup would skip the emit and leave the new
+            # combos empty. Invalidating forces the next fetch to
+            # emit regardless of signature, so set_layers repopulates
+            # them. See this module's docstring, "Layer cache
+            # invalidation on structure change".
+            try:
+                self._conn.invalidate_layers_cache()
+            except Exception:
+                pass
+
         try:
             self._layers_watcher.schedule()
         except Exception:
             pass
 
-        if old_structure != new_structure and self._workflow_loaded:
+        if structure_changed and self._workflow_loaded:
             self._apply_config_from_widgets("auto_load")
 
     def _on_layers_changed(self) -> None:

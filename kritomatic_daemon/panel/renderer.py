@@ -30,6 +30,29 @@ build_config_from_widgets / set_layers) works unchanged. The only
 places that needed a new branch were `_build_form`, `_sync_values`,
 and `_find_section`; each gained a small flattening step that walks
 `sub_fields` in addition to the top level.
+
+Pinned actions
+==============
+A section with `kind == "actions"` contains a row of buttons (Run /
+Cancel / Cancel-All on the docker's run-actions section). If the host
+passed an `actions_layout` to the constructor, actions sections are
+routed there instead of into the scrollable form layout. The host is
+expected to place that layout at a fixed position outside any scroll
+area — the docker puts it right above the Log section, so those
+buttons stay visible regardless of how far the user has scrolled the
+form.
+
+When no `actions_layout` is provided (e.g. the web panel does its own
+rendering and never uses this class), actions sections fall through
+to the scrollable form, same as before this change.
+
+The renderer's contract: it always clears `actions_layout` on rebuild
+before repopulating it. Widgets from the previous render are detached
+and scheduled for deletion via `_section_widgets` (which holds every
+built widget regardless of location), and the layout's bookkeeping is
+cleared via `takeAt(0)` so the layout does not hold dangling
+references. Double-calling `deleteLater()` on a widget already
+scheduled for deletion is safe.
 """
 
 from __future__ import annotations
@@ -115,11 +138,19 @@ class PanelRenderer(QObject):
 
     layerRefreshRequested = pyqtSignal()
 
-    def __init__(self, container_layout, commit_callback, action_callback):
+    def __init__(self, container_layout, commit_callback, action_callback,
+                 actions_layout=None):
         super().__init__()
         self._layout = container_layout
         self._commit = commit_callback
         self._action = action_callback
+        # Optional host-supplied layout for `kind == "actions"` sections.
+        # When None, actions sections go into the scrollable form (the
+        # browser panel's arrangement).  When a QVBoxLayout, actions
+        # sections go there instead, and the docker owns that layout's
+        # placement in its non-scrolling area.  See "Pinned actions" in
+        # the module docstring.
+        self._actions_layout = actions_layout
         self._structure_id = None
         self._section_widgets = []
         self._section_specs = []
@@ -140,6 +171,9 @@ class PanelRenderer(QObject):
     def _rebuild(self, description: dict) -> None:
         focused_key, focused_cursor = self._capture_focus()
 
+        # Detach and schedule deletion of every widget built by the
+        # previous render.  Widgets living in `actions_layout` are in
+        # `_section_widgets` too, so this loop clears both placements.
         for w in self._section_widgets:
             w.setParent(None)
             w.deleteLater()
@@ -149,18 +183,45 @@ class PanelRenderer(QObject):
         self._action_buttons = {}
         self._section_specs = description.get("sections", []) or []
 
+        # Clear the pinned-actions layout's bookkeeping.  The widgets
+        # it held were already detached and deleted by the loop above;
+        # this just tells the layout to forget them so it does not
+        # hold dangling references across the rebuild.
+        if self._actions_layout is not None:
+            while self._actions_layout.count() > 0:
+                item = self._actions_layout.takeAt(0)
+                if item is None:
+                    break
+                w = item.widget()
+                if w is not None:
+                    # Defensive: also delete here, in case a future
+                    # code path adds to actions_layout without going
+                    # through _section_widgets.  deleteLater is
+                    # idempotent, so double-scheduling is harmless.
+                    w.setParent(None)
+                    w.deleteLater()
+
         for section in self._section_specs:
             widget = self._build_section(section)
             if widget is None:
                 continue
-            count = self._layout.count()
-            insert_at = count
-            for i in range(count):
-                item = self._layout.itemAt(i)
-                if item and item.spacerItem():
-                    insert_at = i
-                    break
-            self._layout.insertWidget(insert_at, widget)
+
+            if (section.get("kind") == "actions"
+                    and self._actions_layout is not None):
+                # Pinned: outside the scroll area, above the Log.
+                self._actions_layout.addWidget(widget)
+            else:
+                # Scrollable: insert before the trailing stretch so
+                # the form fields stay top-aligned.
+                count = self._layout.count()
+                insert_at = count
+                for i in range(count):
+                    item = self._layout.itemAt(i)
+                    if item and item.spacerItem():
+                        insert_at = i
+                        break
+                self._layout.insertWidget(insert_at, widget)
+
             self._section_widgets.append(widget)
 
         self._restore_focus(focused_key, focused_cursor)
@@ -317,12 +378,6 @@ class PanelRenderer(QObject):
         is what keeps the `global/active/layer` dropdown at its
         natural width while the layer-name text input fills the rest
         of the row.
-
-        The sub-widgets' `visible_when` rules are honored as usual by
-        `_reevaluate_visibility` — it iterates `_field_specs`, which
-        includes these sub-widgets. Hiding one collapses its layout
-        cell (Qt removes it from the row), so the visible sub-widget
-        stays in its own cell and the row reflows.
         """
         subs = f.get("sub_fields")
         if not isinstance(subs, list):

@@ -48,6 +48,30 @@ when `comfy_generate` returns). The `active_batches` field in those
 state events is the sole source of truth for "is anything running
 anywhere", and the docker's `_on_state` handler reads it directly.
 No fetch, no timer.
+
+Layer cache invalidation
+========================
+`request_layers` deduplicates fetches: if the layer signature
+(`image` tuple, `mask` tuple, `recent` tuple) matches `_last_layers`,
+it returns without emitting `layersFetched`. That suppresses noisy
+re-emits when the watcher fires spuriously.
+
+The dedup has one blind spot: when the panel's widget tree is
+rebuilt (a description push whose `structure_id` changed), every
+`_LayerComboBox` is destroyed and recreated with no items — the
+combo's *text* is set from the spec, but the dropdown has nothing
+to offer. If the daemon's layer set happens to be unchanged since
+the last emit (the common case: rebuilds are triggered by workflow
+loads, not by layer edits), `request_layers` skips the emit and
+`set_layers` never runs against the new combos — they stay empty
+until the layer set actually changes.
+
+`invalidate_layers_cache` fixes that: it resets `_last_layers` to
+its sentinel initial value (the empty tuple), which can never equal
+a real signature, so the next fetch always emits. The docker calls
+it from `_on_panel` whenever `structure_id` changes, right before
+scheduling the watcher, so the next fetch is guaranteed to
+repopulate the new combos.
 """
 
 from __future__ import annotations
@@ -101,6 +125,11 @@ class DaemonConnection(QObject):
         self._command_thread = None
         self._shutting_down = False
 
+        # Deduplication state for request_layers. The empty tuple is
+        # the sentinel initial value; any real signature is a 3-tuple
+        # of tuples, which never compares equal to the bare empty
+        # tuple. `invalidate_layers_cache` resets to this sentinel to
+        # force the next fetch to emit.
         self._last_layers: tuple = ()
 
     # -- lifecycle --
@@ -199,6 +228,29 @@ class DaemonConnection(QObject):
             daemon=True,
         ).start()
 
+    def invalidate_layers_cache(self) -> None:
+        """Force the next `request_layers` to emit even if the daemon's
+        layer set matches the last successful fetch.
+
+        Called by the docker when the panel's widget tree is rebuilt
+        (a description push whose `structure_id` changed). The rebuild
+        destroys every `_LayerComboBox` and recreates them empty; if
+        the daemon's layer set hasn't changed since the last emit,
+        `request_layers`'s signature dedup would skip the emit and
+        `set_layers` would never repopulate the new combos. Resetting
+        `_last_layers` to its sentinel initial value (the empty tuple)
+        forces the next fetch to emit.
+
+        Thread-safe: `_last_layers` is written by `request_layers`
+        on its own background thread and read here from the GUI
+        thread. The comparison is against a fresh tuple from the
+        next fetch, so a transient torn read (Python doesn't have
+        them, but consider the abstract hazard) can only cause one
+        spurious re-emit, never a missed population. The failure
+        mode of a wrong read is "one extra fetch" — benign.
+        """
+        self._last_layers = ()
+
     def request_layers(self) -> None:
         """Fetch the layer list and recent aliases, classify, emit
         `layersFetched({"image": [...], "mask": [...], "recent": [...]})`.
@@ -214,6 +266,12 @@ class DaemonConnection(QObject):
         mask or a transparency mask is a child of a paint layer, not
         of a group. Without `all=True` the mask bucket is always empty
         and mask alias combos have no items.
+
+        Emits are also forced when `_last_layers` was reset by
+        `invalidate_layers_cache` — the comparison against the
+        sentinel empty tuple always fails, so the fetch emits
+        unconditionally. See the module docstring, "Layer cache
+        invalidation".
         """
         def _run():
             layers_resp = self._fetch_one(

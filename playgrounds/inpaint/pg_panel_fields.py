@@ -27,7 +27,6 @@ function _get() {
     pickImageBtn:    document.getElementById("pickImageBtn"),
     clearImageBtn:   document.getElementById("clearImageBtn"),
     pickMaskBtn:     document.getElementById("pickMaskBtn"),
-    kritaImportBtn:  document.getElementById("kritaImportBtn"),
     kritaImportMasksBtn: document.getElementById("kritaImportMasksBtn"),
     maskFromRectBtn: document.getElementById("maskFromRectBtn"),
   };
@@ -124,7 +123,6 @@ export function syncPanelFields() {
   if (e.pickImageBtn) e.pickImageBtn.disabled = busy;
   if (e.clearImageBtn) e.clearImageBtn.disabled = busy;
   if (e.pickMaskBtn) e.pickMaskBtn.disabled = busy;
-  if (e.kritaImportBtn) e.kritaImportBtn.disabled = busy;
   if (e.kritaImportMasksBtn) e.kritaImportMasksBtn.disabled = busy;
 
   if (e.inpaintEnabled) e.inpaintEnabled.disabled = busy;

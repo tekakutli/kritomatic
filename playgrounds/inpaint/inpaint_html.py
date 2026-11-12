@@ -30,6 +30,7 @@ from  .pg_panel_fields import PANEL_FIELDS_JS
 from  .pg_panel_lists import PANEL_LISTS_JS
 from  .pg_panel_scrubs import PANEL_SCRUBS_JS
 from  .pg_panel_bindings import PANEL_BINDINGS_JS
+from  .pg_autosync import AUTOSYNC_JS
 
 from pgkit.html_shell import page
 from pgkit.js_check import JsSyntaxError
@@ -51,6 +52,7 @@ import { draw }                             from "./pg_dispatch.js";
 import { board, resize, _setDraw }          from "./pg_state.js";
 import { syncMaskList }                     from "./pg_panel_lists.js";
 import { syncPanelFields }                  from "./pg_panel_fields.js";
+import { startAutosync }                    from "./pg_autosync.js";
 
 console.log("[boot] modules loaded");
 
@@ -68,6 +70,7 @@ try {
   installShellControls();     console.log("[boot] installShellControls");
   installPanelBindings();     console.log("[boot] installPanelBindings");
   inpaintBootSync();          console.log("[boot] inpaintBootSync");
+  startAutosync();            console.log("[boot] startAutosync");
   resize();                   console.log("[boot] BOOT COMPLETE");
 } catch (e) {
   console.error("[boot] FAILED:", e);
@@ -93,6 +96,7 @@ _MODULE_SOURCES = {
     "pg_panel_lists.js":      PANEL_LISTS_JS,
     "pg_panel_scrubs.js":     PANEL_SCRUBS_JS,
     "pg_panel_bindings.js":   PANEL_BINDINGS_JS,
+    "pg_autosync.js":         AUTOSYNC_JS,
     "_boot.js":               _BOOT_JS,
 }
 

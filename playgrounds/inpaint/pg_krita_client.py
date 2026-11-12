@@ -24,7 +24,6 @@ export async function applyToKrita(opts) {
   if (opts.contractPixels)        body.contract_pixels = opts.contractPixels;
   if (opts.smoothIterations)      body.smooth_iterations = opts.smoothIterations;
   if (opts.featherRadius)         body.feather_radius = opts.featherRadius;
-  // export_layer mode only
   if (opts.name)                  body.name = opts.name;
   if (opts.aboveLayer)            body.above_layer = opts.aboveLayer;
 
@@ -41,10 +40,6 @@ export async function applyToKrita(opts) {
 }
 
 export async function extractMaskToLayer(opts) {
-  // Same endpoint as applyToKrita; the daemon server composes the
-  // extract + blend + opacity + group chain. Any of blendMode,
-  // opacity, and groupName may be empty, in which case the
-  // corresponding post-apply step is skipped.
   const body = {
     mask_b64: opts.maskB64,
     mode:     opts.mode,
@@ -75,13 +70,6 @@ export async function extractMaskToLayer(opts) {
 }
 
 export async function exportMaskAsLayer(opts) {
-  // Thin wrapper over applyToKrita for the export_layer mode. Kept as
-  // its own function so callers read naturally: "I have a mask, I want
-  // it as a layer, at this position".
-  //
-  // aboveLayer accepts "", "@active", or an explicit layer name. The
-  // daemon resolves "@active" itself (single round trip) rather than
-  // the client having to look up the active layer's name first.
   return applyToKrita({
     maskB64: opts.maskB64,
     mode: "export_layer",
@@ -112,17 +100,6 @@ export async function importFromKrita(opts) {
 }
 
 export async function importKritaMasks(opts) {
-  // Ask the daemon to read the currently-selected layer(s) in Krita as
-  // base64 masks. When `layerNames` is provided (array or string), those
-  // specific layers are read instead of the selection. Response shape:
-  //
-  //   { success, masks: [{name, type, source, width, height, mask_b64}],
-  //     skipped: [{name, reason}], selection_path, message }
-  //
-  // `selection_path` reports which multi-selection accessor succeeded
-  // ("view.selectedNodes", "doc.selectedNodes", "node.isSelected",
-  // or "active_only") so the caller can tell the user whether multiple
-  // selected layers were imported or just the active one.
   const body = {};
   if (opts) {
     if (opts.layerNames) {
@@ -141,6 +118,43 @@ export async function importKritaMasks(opts) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    return await res.json();
+  } catch (e) {
+    return { success: false, message: e.message };
+  }
+}
+
+/* ------------------------------------------------------------------
+   @thecanvas auto-sync helpers
+   ------------------------------------------------------------------
+   `fetchActiveState` returns the daemon's `comfy_status` data so the
+   autosync poller can read `config.resources["@thecanvas"]`.
+
+   `fetchResourceImage` resolves that spec to a PNG data URL via
+   `/krita/resource_image`. */
+
+export async function fetchActiveState() {
+  try {
+    const res = await fetch("/comfy/active_state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    if (!res.ok) return { success: false, message: "HTTP " + res.status };
+    return await res.json();
+  } catch (e) {
+    return { success: false, message: e.message };
+  }
+}
+
+export async function fetchResourceImage(spec) {
+  try {
+    const res = await fetch("/krita/resource_image", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(spec),
+    });
+    if (!res.ok) return { success: false, message: "HTTP " + res.status };
     return await res.json();
   } catch (e) {
     return { success: false, message: e.message };

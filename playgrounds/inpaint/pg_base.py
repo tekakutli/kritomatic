@@ -59,15 +59,6 @@ PG_CSS = r"""
     background: rgba(140, 225, 160, 0.10);
     color: #d8ffe0;
   }
-  #ui button#kritaImportBtn {
-    border-color: rgba(140, 225, 160, 0.72);
-    color: #b8ecff;
-  }
-  #ui button#kritaImportBtn:hover:not(:disabled) {
-    border-color: rgba(160, 240, 180, 1.00);
-    background: rgba(140, 225, 160, 0.10);
-    color: #d8ffe0;
-  }
   #ui button#kritaImportMasksBtn {
     border-color: rgba(180, 155, 255, 0.72);
     color: #d5c8ff;
@@ -212,12 +203,6 @@ PG_PANEL_BODY = r"""
         <div class="row">
           <button id="pickImageBtn" title="Pick an image file">+ Pick image…</button>
           <button id="clearImageBtn" title="Clear the current image">Clear</button>
-        </div>
-        <div class="row">
-          <button id="kritaImportBtn"
-                  title="Import the active document's composite from Krita as the playground image">
-            + Import image from Krita
-          </button>
         </div>
         <div class="row">
           <button id="kritaImportMasksBtn"

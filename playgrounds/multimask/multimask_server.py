@@ -5,52 +5,49 @@
   POST /mask                fetch a mask by hash
   POST /export_graph        build the API-format JSON the node would emit
   POST /fetch_history       fetch the last ComfyUI run from native /history
-  POST /generation_started  hint from MultiAreaConditioning; opens polling window
-  POST /image_status        cheap poll; fetches composite only during active window
-  POST /cached_image        return current composite (cache-first)
   POST /import_image        fetch active document composite from Krita
   POST /import_masks        fetch selected mask or paint layer(s) as base64 masks
   POST /krita_status        daemon reachable?
   POST /upload_image        raw body (image file), returns dims + data_url
+  POST /active_state        daemon comfy_status (workflow + config)
+  POST /resource_image      resolve a `{source, layer_name}` spec to a PNG data URL
+
+@thecanvas auto-sync
+====================
+The playground's displayed image tracks the daemon's
+`config.resources["@thecanvas"]` spec.  The browser-side poller in
+`pg_autosync.py` queries `/active_state` every 3 s; on any change to
+`config.resources["@thecanvas"]` it calls `/resource_image` with the
+new spec and swaps in the returned pixels via `applyCanvasImage`
+(preserving the area list).  No generation-triggered refresh.
+
+`/resource_image` dispatches:
+  source == "active"  → GET_DOCUMENT_COMPOSITE_B64
+  source == "layer"   → GET_LAYER_PIXELS_B64
+
+`source == "global"` is a mask and is not displayed here.
 
 STATE OWNERSHIP
 ===============
 The browser is the source of truth.  It POSTs `{op: "set", state, masks}`
 after every change; the server keeps the last-pushed state in memory
-and serves it.  If the playground process restarts, the state is
-lost and the browser re-pushes it on its next change (or on boot).
-
-The node fetches `/state` on every execution.  `/version` is cheap
-enough for `IS_CHANGED` on every queue.
+and serves it.
 
 MASK STORAGE
 ============
 Masks are content-addressed by a hash the browser computes.  The
 `/state` POST includes `{hash → b64}` for every mask referenced in
-the state, and the server merges them into a growing dict.  Old
-masks are not evicted; the dict is bounded by the number of distinct
-masks the user has ever imported in the current process.
+the state, and the server merges them into a growing dict.
 
 GRAPH EXPORT
 ============
 `/export_graph` returns the API-format graph the node would build
-from the current state.  It mirrors the node's expansion logic; the
-two implementations must stay in sync when either side changes.
-The export runs entirely in the playground, so it works with
-ComfyUI closed.
-
-Bbox crop — the export cannot show the actual crop coordinates.
-The node computes them at execute time from the wired context_mask
-and selection_mask.  The export emits `RUNTIME_CROP_X` etc. as
-placeholders and a note explaining that.
+from the current state.
 
 HISTORY FETCH
 =============
 `/fetch_history` asks ComfyUI's *native* `/history` endpoint (port
-8188) for the most recent run and returns it with a diagnostic
-summary.  The native endpoint is the right source: expansion happens
-at ComfyUI's execution time, not through comfy-api-proxy's
-`/api/v2/jobs` API, so the proxy would never see these runs."""
+8188) for the most recent run."""
 
 import base64
 import hashlib
@@ -74,33 +71,6 @@ _masks     = {}
 _version   = ""
 
 COMFY_URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188").rstrip("/")
-
-
-# ---------------------------------------------------------------------------
-#  Composite cache + generation-active window
-# ---------------------------------------------------------------------------
-#
-# `/generation_started` (called by MultiAreaConditioning.execute before
-# fetching state) opens a 120 s window during which `/image_status`
-# fetches Krita's active-document composite and hashes it.  The browser
-# polls `/image_status` every 3 s (1.5 s while active); on a hash
-# mismatch it calls `/cached_image` to fetch the actual data.
-#
-# Outside the window, `/image_status` returns `{active: false}` without
-# touching Krita.  Idle cost is one round trip on the playground's
-# own HTTP server.
-
-_generation_active_until = 0.0
-_generation_lock         = threading.Lock()
-
-_composite_cache = {
-    "hash":     None,
-    "data_url": None,
-    "width":    0,
-    "height":   0,
-    "at":       0.0,
-}
-_composite_lock = threading.Lock()
 
 
 def _log(msg):
@@ -136,6 +106,17 @@ def _public_state():
     if _state is None:
         return {"globals": _default_globals(), "areas": []}
     return _state
+
+
+def _fetch_active_state():
+    """Return the daemon's `comfy_status` data payload, or {} on failure."""
+    try:
+        resp = krita_client.send({"type": "comfy_status"}, timeout=10.0)
+    except Exception:
+        return {}
+    if not isinstance(resp, dict) or resp.get("status") != "success":
+        return {}
+    return resp.get("data") or {}
 
 
 # ---------------------------------------------------------------------------
@@ -191,122 +172,14 @@ def handle_mask(payload):
     return {"success": True, "hash": h, "b64": b64}
 
 
-# ---------------------------------------------------------------------------
-#  /generation_started, /image_status, /cached_image
-# ---------------------------------------------------------------------------
-
-def handle_generation_started(_payload):
-    """Called by MultiAreaConditioning.execute() before fetching state.
-
-    Opens a window during which /image_status will actively poll
-    Krita's composite.  ComfyUI's SaveImage fires *after* the node's
-    execute(), the daemon's paste-to-Krita fires shortly after that,
-    and the composite becomes visible on the next /image_status poll.
-
-    120 s is generous — most runs complete in under 60 s; if the user
-    queues back-to-back generations, each /generation_started refreshes
-    the window.
-    """
-    global _generation_active_until
-    import time as _time
-    with _generation_lock:
-        _generation_active_until = _time.monotonic() + 120.0
-    _log("generation_started; polling Krita composite for 120s")
-    return {"success": True}
-
-
-def _fetch_composite():
-    """Fetch the active Krita document's composite and cache it."""
-    import time as _time
-    resp = krita_client.send(
-        {"type": "get_document_composite_b64"}, timeout=15.0,
-    )
-    if not isinstance(resp, dict) or resp.get("status") != "success":
-        return None
-    data_url = (resp.get("data") or {}).get("data_url")
-    if not data_url or not data_url.startswith("data:image/png;base64,"):
-        return None
-    try:
-        png_bytes = base64.b64decode(data_url.split(",", 1)[1])
-        img = Image.open(BytesIO(png_bytes))
-        w, h = img.size
-    except Exception:
-        return None
-    hash_hex = hashlib.sha256(png_bytes).hexdigest()[:16]
-    with _composite_lock:
-        _composite_cache["hash"]     = hash_hex
-        _composite_cache["data_url"] = data_url
-        _composite_cache["width"]    = w
-        _composite_cache["height"]   = h
-        _composite_cache["at"]       = _time.monotonic()
-    return {
-        "hash": hash_hex, "data_url": data_url,
-        "width": w, "height": h,
-    }
-
-
-def handle_image_status(_payload):
-    """Cheap check the browser polls every few seconds.
-
-    Idle: `{active: false}`, no Krita call.
-    Active: fetch the composite, return its hash.  Browser compares
-    against `board.imageHash`; on mismatch it calls `/cached_image`.
-    """
-    import time as _time
-    with _generation_lock:
-        active = _time.monotonic() < _generation_active_until
-    if not active:
-        return {"success": True, "active": False}
-    result = _fetch_composite()
-    if result is None:
-        return {"success": False, "active": True,
-                "message": "could not fetch composite from Krita"}
-    return {"success": True, "active": True, "hash": result["hash"]}
-
-
-def handle_cached_image(payload):
-    """Return the current composite's data.  Prefers the cache.
-
-    `payload.hash` is optional: when provided and matching a fresh
-    cache entry, the response is served from cache (no Krita fetch).
-    On cache miss or stale hash, refetches from Krita.
-    """
-    import time as _time
-    want = (payload or {}).get("hash") if isinstance(payload, dict) else None
-
-    with _composite_lock:
-        cached = dict(_composite_cache)
-    age = (_time.monotonic() - cached["at"]) if cached["at"] else 1e9
-
-    if (cached["hash"] and age < 5.0
-            and (want is None or want == cached["hash"])):
-        return {
-            "success":  True,
-            "hash":     cached["hash"],
-            "data_url": cached["data_url"],
-            "width":    cached["width"],
-            "height":   cached["height"],
-        }
-
-    result = _fetch_composite()
-    if result is None:
-        return {"success": False, "message": "could not fetch composite"}
-    return {"success": True, **result}
+def handle_active_state(_payload):
+    data = _fetch_active_state()
+    return {"success": True, "data": data}
 
 
 # ---------------------------------------------------------------------------
-#  Graph export — mirrors kritomatic_nodes/__init__.py's expansion
+#  Graph export
 # ---------------------------------------------------------------------------
-#
-# The playground keeps a copy of the expansion logic so it can serve
-# /export_graph without ComfyUI being present.  The two implementations
-# must stay in sync; when you change one, change the other.  The
-# duplication is bounded (one function, one dict shape) and the payoff
-# is that the panel can export the graph while ComfyUI is closed.
-#
-# External inputs (clip, base_positive, context_mask, image) are
-# emitted as placeholder stubs with reconnectable PLACEHOLDER__ strings,
-# matching what the node's old subgraph_json output produced.
 
 _STUB_NODES = {
     "clip": {
@@ -354,13 +227,6 @@ def _safe_id(s):
 
 
 def _build_expansion_json(state, area_filter=""):
-    """Return (graph, final_conditioning, notes).
-
-    `graph` is {node_id: {class_type, inputs}} in ComfyUI API format.
-    `final_conditioning` is the [node_id, slot] of the last combine,
-    or ["__base_positive__", 0] if no areas ran.
-    `notes` is a list of human-readable caveats about the export.
-    """
     globs = dict(state.get("globals") or {})
     areas = list(state.get("areas") or [])
     want = {n.strip() for n in (area_filter or "").split(",") if n.strip()}
@@ -411,9 +277,6 @@ def _build_expansion_json(state, area_filter=""):
         }
         current = ["base_setarea", 0]
 
-    # If any area needs the bbox crop, note it.  The actual crop
-    # rect is computed at execute time from the wired context_mask
-    # and selection_mask — the playground cannot know those values.
     needs_bbox = False
     for a in areas:
         eff_bbox = a.get("bbox")
@@ -644,7 +507,7 @@ def handle_export_graph(payload):
 
 
 # ---------------------------------------------------------------------------
-#  /fetch_history — last ComfyUI run from native /history
+#  /fetch_history
 # ---------------------------------------------------------------------------
 
 def _comfy_get(path, timeout=10.0):
@@ -655,19 +518,6 @@ def _comfy_get(path, timeout=10.0):
 
 
 def handle_fetch_history(payload):
-    """Fetch the last ComfyUI run from the native /history endpoint.
-
-    Uses ComfyUI native (default port 8188), not comfy-api-proxy.
-    MultiAreaConditioning nodes are queued through ComfyUI's browser
-    UI, which goes through the native `/prompt` endpoint; comfy-api-
-    proxy's `/api/v2/jobs` never sees them.
-
-    Note: `/history` returns the SUBMITTED graph, not the EXPANDED
-    graph.  The submitted graph contains MultiAreaConditioning and
-    the base CLIPTextEncode (base_positive), but not the per-area
-    CLIPTextEncode nodes that expansion creates.  The `diagnostic`
-    field in the response explains this so the result is not misread.
-    """
     try:
         try:
             history = _comfy_get("/history?max_items=1")
@@ -710,8 +560,6 @@ def handle_fetch_history(payload):
 
 
 def _diagnose_history(details):
-    """Summarise one /history entry without claiming to show the
-    expanded graph."""
     prompt = details.get("prompt") or []
     graph = {}
     if isinstance(prompt, list) and len(prompt) >= 3:
@@ -752,16 +600,13 @@ def _diagnose_history(details):
         "note": (
             "ComfyUI's /history returns the SUBMITTED graph, not the "
             "EXPANDED one.  Per-area CLIPTextEncode nodes created by "
-            "expansion will not appear in `prompt`.  The single "
-            "CLIPTextEncode in the submitted graph is the base_positive "
-            "input.  To see the expanded graph, start ComfyUI with "
-            "--verbose, or add the _dump_finalized helper to the node."
+            "expansion will not appear in `prompt`."
         ),
     }
 
 
 # ---------------------------------------------------------------------------
-#  /krita_status, /import_image, /import_masks
+#  /krita_status, /import_image, /import_masks, /resource_image
 # ---------------------------------------------------------------------------
 
 def handle_krita_status(_payload):
@@ -828,6 +673,49 @@ def handle_import_masks(payload):
     }
 
 
+def handle_resource_image(payload):
+    """Resolve a `{source, layer_name}` spec to a PNG data URL."""
+    if not isinstance(payload, dict):
+        return {"success": False, "message": "expected a JSON object"}
+
+    source = payload.get("source", "active")
+    layer_name = payload.get("layer_name")
+
+    if source == "active":
+        return handle_import_image({})
+    if source == "layer":
+        if not layer_name:
+            return {"success": False,
+                    "message": "layer_name is required when source=layer"}
+        response = krita_client.send(
+            {"type": "get_layer_pixels_b64", "name": str(layer_name)},
+            timeout=30.0,
+        )
+        if response.get("status") != "success":
+            return {"success": False,
+                    "message": response.get("message") or "daemon rejected"}
+        data = response.get("data") or {}
+        data_url = data.get("data_url")
+        if not data_url:
+            return {"success": False,
+                    "message": "daemon returned no data_url for layer"}
+        return {
+            "success": True,
+            "hash": "layer_" + str(layer_name),
+            "width": data.get("width"),
+            "height": data.get("height"),
+            "data_url": data_url,
+            "filename": str(layer_name),
+        }
+    return {
+        "success": False,
+        "message": (
+            f"source={source!r} cannot be displayed as an image "
+            f"(@thecanvas expects 'active' or 'layer')."
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 #  /upload_image (raw body)
 # ---------------------------------------------------------------------------
@@ -873,12 +761,11 @@ ROUTES = {
     "/mask":               handle_mask,
     "/export_graph":       handle_export_graph,
     "/fetch_history":      handle_fetch_history,
-    "/generation_started": handle_generation_started,
-    "/image_status":       handle_image_status,
-    "/cached_image":       handle_cached_image,
     "/import_image":       handle_import_image,
     "/import_masks":       handle_import_masks,
     "/krita_status":       handle_krita_status,
+    "/active_state":       handle_active_state,
+    "/resource_image":     handle_resource_image,
 }
 
 RAW_ROUTES = {

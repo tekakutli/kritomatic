@@ -14,6 +14,7 @@ from .pg_client         import CLIENT_JS
 from .pg_panel_fields   import PANEL_FIELDS_JS
 from .pg_panel_lists    import PANEL_LISTS_JS
 from .pg_panel_bindings import PANEL_BINDINGS_JS
+from .pg_autosync       import AUTOSYNC_JS
 
 from pgkit.html_shell import page
 from pgkit.js_check   import JsSyntaxError
@@ -34,6 +35,7 @@ import { resize, _setDraw } from "./pg_state.js";
 import { syncAreaList } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
 import { selectArea } from "./pg_areas.js";
+import { startAutosync } from "./pg_autosync.js";
 
 (async () => {
   console.log("[boot] modules loaded");
@@ -51,6 +53,7 @@ import { selectArea } from "./pg_areas.js";
     installShellControls();
     installPanelBindings();
     await multimaskBootSync();
+    startAutosync();
     resize();
     console.log("[boot] BOOT COMPLETE");
   } catch (e) {
@@ -74,6 +77,7 @@ _MODULE_SOURCES = {
     "pg_panel_fields.js":   PANEL_FIELDS_JS,
     "pg_panel_lists.js":    PANEL_LISTS_JS,
     "pg_panel_bindings.js": PANEL_BINDINGS_JS,
+    "pg_autosync.js":       AUTOSYNC_JS,
     "_boot.js":             _BOOT_JS,
 }
 

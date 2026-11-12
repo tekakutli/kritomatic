@@ -1,6 +1,4 @@
-"""HTTP bridge to the multimask server.  Every action is a fetch to
-the Python server; the server fans out to the kritomatic daemon for
-the Krita import paths."""
+"""HTTP bridge to the multimask server."""
 
 CLIENT_JS = r"""
 export async function uploadImageFile(file) {
@@ -70,27 +68,31 @@ export async function checkKritaStatus() {
   }
 }
 
-export async function checkImageStatus() {
+/* ------------------------------------------------------------------
+   @thecanvas auto-sync helpers */
+
+export async function fetchActiveState() {
   try {
-    const res = await fetch("/image_status", {
+    const res = await fetch("/active_state", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
     });
+    if (!res.ok) return { success: false, message: "HTTP " + res.status };
     return await res.json();
   } catch (e) {
-    return { success: false, active: false, message: e.message };
+    return { success: false, message: e.message };
   }
 }
 
-export async function fetchCachedImage(wantHash) {
-  const body = wantHash ? { hash: wantHash } : {};
+export async function fetchResourceImage(spec) {
   try {
-    const res = await fetch("/cached_image", {
+    const res = await fetch("/resource_image", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify(spec),
     });
+    if (!res.ok) return { success: false, message: "HTTP " + res.status };
     return await res.json();
   } catch (e) {
     return { success: false, message: e.message };

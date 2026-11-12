@@ -2,7 +2,7 @@
 boot-sync routine.
 
 Operations exposed by this playground:
-  - Load image (file, drop, import from Krita)
+  - Load image (file, drop; autosync from @thecanvas)
   - Load masks (import from Krita, pick a PNG file)
   - Select / delete masks
   - Rotate the playground view (single scrub input: click-to-type,
@@ -13,54 +13,11 @@ Operations exposed by this playground:
   - Cancel (local interrupt, or interceptor cancellation)
   - ComfyUI / Krita status checks
 
-Not present (moved to sam3_segment or deferred to v2): Segment All,
-Refine, mask prompt, region painting, points, undo/redo, export to
-Krita.
-
-INTERCEPTOR ROUTING
-===================
-`_inpaintAction` reads `board.interceptEnabled` and dispatches to
-`runInpaintViaInterceptor` or `runInpaint`.  The two paths share the
-payload builder (`_buildInpaintPayload`) and the result-compositing
-step (`_setOriginalFromB64`); only the middle differs.
-
-`_cancelAction` is unchanged — it calls `interruptInpaint`, whose
-implementation (in `pg_comfy_client.py`) already knows whether a
-task is in flight on the interceptor or on the local ComfyUI.
-
-ROTATED PAYLOAD (both modes)
-============================
-Both the "context rectangle enabled" and "no context rectangle" cases
-send a ROTATED payload whenever `view.rotation != 0`.  The only
-difference between them is the context mask:
-
-  * context rectangle enabled → context = the user's rect, cropped
-    to `cropW × cropH` at the shifted position
-  * context rectangle disabled → context = full white (whole crop
-    frame is context, so the workflow crops to the selection bbox)
-
-At `view.rotation == 0`, both fall into a single un-rotated fast path
-that sends the original at `W × H` with `outputRotation: 0`.
-
-RETURNED-IMAGE COMPOSITING
-==========================
-The inpaint result comes back with black corners whose shape is
-determined entirely by the display rotation that was active when the
-payload was built, AND by how much the crop was expanded to cover the
-selection mask.  `_setOriginalFromB64` composites the result over the
-previous original, masked to the result's content region.
-
-See the inline comments in `_buildKeepMask` and `_setOriginalFromB64`
-for the full geometry.  The rotation passed to `_setOriginalFromB64`
-is captured before the `await` and is not re-read after; a user who
-scrubs the rotation during the 20–60 s wait does not desync the mask
-from the returned image.
-
-Interception preserves that contract: `runInpaintViaInterceptor`
-receives the same `inpaintRotation` the payload was built with (the
-caller captures it before the await and passes it to
-`_setOriginalFromB64` on return, unchanged from the direct path).
-"""
+Not present: Segment All, Refine, mask prompt, region painting,
+points, undo/redo, export to Krita.  Also: the old "Import image from
+Krita" button is gone — `pg_autosync.js` pulls the current
+`@thecanvas` in automatically when the daemon's config points at
+one."""
 
 PANEL_BINDINGS_JS = r"""
 import { board, setImage, clearImage, _scheduleDraw,
@@ -77,7 +34,7 @@ import { syncPanelFields } from "./pg_panel_fields.js";
 import { uploadImageFile, fetchStatus, runInpaint, runInpaintViaInterceptor,
          interruptInpaint } from "./pg_comfy_client.js";
 import {
-  checkKritaStatus, importFromKrita, importKritaMasks,
+  checkKritaStatus, importKritaMasks,
 } from "./pg_krita_client.js";
 import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyAll,
@@ -734,34 +691,8 @@ async function _kritaStatusRefresh() {
 }
 
 /* ============================================================
-   Import from Krita
+   Import masks from Krita
    ============================================================ */
-
-async function _kritaImportAction() {
-  flashStatus("importing from Krita\u2026", "");
-  try {
-    const res = await importFromKrita({});
-    if (!res.success) {
-      flashStatus("import failed: " + (res.message || "unknown"), "bad");
-      if (/unreachable|connect|refused|timeout/i.test(res.message || "")) {
-        _kritaMarkUnreachable(res.message);
-      }
-      return;
-    }
-    setImage(res.hash, res.data_url, res.width, res.height);
-    flashStatus(
-      "imported from Krita: " + (res.filename || "") +
-      " (" + res.width + "\u00d7" + res.height + ")", "ok",
-    );
-    _kritaMarkReachable();
-    syncPanelFields();
-    syncMaskList();
-    pgkitNotifyAll();
-    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-  } catch (e) {
-    flashStatus("import failed: " + e.message, "bad");
-  }
-}
 
 async function _kritaImportMasksAction() {
   flashStatus("importing masks from Krita\u2026", "");
@@ -837,7 +768,7 @@ export function installPanelBindings() {
   const ids = [
     "inpaintBtn", "cancelBtn",
     "pickImageBtn", "clearImageBtn", "pickMaskBtn",
-    "kritaImportBtn", "kritaImportMasksBtn",
+    "kritaImportMasksBtn",
     "kritaCheckBtn",
     "maskFromRectBtn",
   ];
@@ -848,7 +779,6 @@ export function installPanelBindings() {
   if (el.pickImageBtn) el.pickImageBtn.addEventListener("click", _pickImageAction);
   if (el.clearImageBtn) el.clearImageBtn.addEventListener("click", _clearImageAction);
   if (el.pickMaskBtn)  el.pickMaskBtn.addEventListener("click", _pickMaskAction);
-  if (el.kritaImportBtn) el.kritaImportBtn.addEventListener("click", _kritaImportAction);
   if (el.kritaImportMasksBtn) el.kritaImportMasksBtn.addEventListener("click", _kritaImportMasksAction);
   if (el.kritaCheckBtn) el.kritaCheckBtn.addEventListener("click", _kritaStatusRefresh);
   if (el.maskFromRectBtn) el.maskFromRectBtn.addEventListener("click", _maskFromRectAction);
@@ -905,10 +835,6 @@ pgkitRegisterAction("action.checkStatus", {
 });
 pgkitRegisterAction("action.kritaCheck", {
   label: "Check Krita", scope: "global", run: _kritaStatusRefresh,
-  meta: { variant: "plain" },
-});
-pgkitRegisterAction("action.kritaImport", {
-  label: "Import from Krita", scope: "global", run: _kritaImportAction,
   meta: { variant: "plain" },
 });
 pgkitRegisterAction("action.kritaImportMasks", {

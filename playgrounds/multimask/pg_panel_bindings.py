@@ -10,11 +10,15 @@ build from the current state (works with ComfyUI closed).
 
 `Fetch last run` asks the server to GET ComfyUI's native `/history`
 for the most recent run.  The returned JSON is the *submitted*
-graph, not the expanded one; the diagnostic summary explains this."""
+graph, not the expanded one; the diagnostic summary explains this.
+
+The displayed image is whatever the user picked or imported — no
+auto-refresh after generation.  Use `+ From Krita` to pull the
+current composite into the canvas."""
 
 PANEL_BINDINGS_JS = r"""
 import {
-  board, setImage, clearImage, refreshImageKeepAreas,
+  board, setImage, clearImage,
 } from "./pg_state.js";
 import {
   addAreaFromB64, removeArea, selectArea, areaById,
@@ -23,7 +27,7 @@ import { syncAreaList, setStateChangeHook } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
 import {
   importFromKrita, importKritaMasks, uploadImageFile,
-  checkKritaStatus, checkImageStatus, fetchCachedImage,
+  checkKritaStatus,
 } from "./pg_client.js";
 import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitRegisterField,
@@ -676,20 +680,12 @@ export function pgkitHandleSelect(level, name) {
 }
 
 /* ============================================================
-   Boot-time state restore + ongoing image poll
+   Boot-time state restore
    ============================================================
-   `multimaskBootSync` used to unconditionally POST `_scheduleStateSync`
-   on page load, which pushed an empty-areas payload and wiped the
-   previous session's state.  Replaced with: pull server state first,
-   only push if the server's empty.
-
-   The image poller runs continuously but is cheap when idle — the
-   server's `/image_status` returns `{active: false}` without touching
-   Krita unless a generation is in flight.  When ComfyUI's
-   MultiAreaConditioning node runs, it POSTs `/generation_started`
-   which opens a window; the browser then polls faster and picks up
-   the fresh composite after the daemon pushes the generation result
-   into Krita. */
+   `multimaskBootSync` pulls the server's saved state on page load
+   and rehydrates the area list.  The image is NOT auto-fetched from
+   Krita — the user picks or imports one explicitly with the panel
+   buttons.  There is no image poller. */
 
 async function _applyServerState(payload) {
   if (payload.globals && typeof payload.globals === "object") {
@@ -732,38 +728,6 @@ async function _applyServerState(payload) {
   }
 }
 
-let _imagePollerTimer   = null;
-let _imagePollerRunning = false;
-
-async function _pollImageStatus() {
-  _imagePollerTimer = null;
-  let nextDelay = 3000;
-  try {
-    const status = await checkImageStatus();
-    if (status && status.success && status.active) {
-      nextDelay = 1500;
-      if (status.hash && status.hash !== board.imageHash) {
-        const img = await fetchCachedImage(status.hash);
-        if (img && img.success && img.hash !== board.imageHash) {
-          refreshImageKeepAreas(img.hash, img.data_url, img.width, img.height);
-          syncPanelFields();
-          _scheduleStateSync();
-          import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-        }
-      }
-    }
-  } catch (e) {
-    console.warn("[multimask] image_status poll failed:", e);
-  }
-  _imagePollerTimer = setTimeout(_pollImageStatus, nextDelay);
-}
-
-function _startImagePoller() {
-  if (_imagePollerRunning) return;
-  _imagePollerRunning = true;
-  _pollImageStatus();
-}
-
 export async function multimaskBootSync() {
   syncPanelFields();
   syncAreaList();
@@ -789,19 +753,6 @@ export async function multimaskBootSync() {
     _scheduleStateSync();
   }
 
-  // If we have areas from the server but no image on this page yet
-  // (fresh tab, previous session), seed the image from Krita so the
-  // masks have something to align against.
-  if (board.areas.length > 0 && !board.imageHash) {
-    try {
-      const img = await fetchCachedImage(null);
-      if (img && img.success) {
-        refreshImageKeepAreas(img.hash, img.data_url, img.width, img.height);
-      }
-    } catch (e) {}
-  }
-
-  _startImagePoller();
   _kritaStatusAction();
 }
 """

@@ -277,19 +277,6 @@ class MultiAreaConditioning(io.ComfyNode):
         area_filter = area_filter or ""
         crop_padding = max(0, _int(crop_padding, _DEFAULT_CROP_PADDING))
 
-        # Signal the playground that a generation is starting so it
-        # can poll Krita's composite and refresh its displayed image
-        # once ComfyUI's SaveImage fires and the daemon pushes the
-        # result back into Krita.  Best-effort — if the playground is
-        # unreachable, the graph still runs, it just won't auto-refresh.
-        try:
-            _post_json(
-                playground_url.rstrip("/") + "/generation_started",
-                {}, timeout=2.0,
-            )
-        except Exception:
-            pass
-
         try:
             state = _fetch_state(playground_url)
         except Exception as e:

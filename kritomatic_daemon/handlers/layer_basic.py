@@ -1,7 +1,10 @@
 from krita import Krita
+import base64
+
 from ..decorators import command, AutoDispatchHandler
 from ..utils.refresh import refresh
 from ..utils.layer_resolve import resolve as resolve_node, register as register_node
+from ..utils.comfyui_krita import read_layer_pixels
 
 
 class LayerBasicHandler(AutoDispatchHandler):
@@ -363,5 +366,47 @@ class LayerBasicHandler(AutoDispatchHandler):
                 'group_name': group_name,
                 'position': position
             })
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    @command(
+        category='layer',
+        help_text='Get a layer\'s rendered pixels as a base64 PNG data '
+                  'URL, at the full document extent (transparent '
+                  'outside the layer\'s own bounds).  Used by the '
+                  'inpaint and multimask playgrounds to display '
+                  'whatever `@thecanvas` currently points at.',
+        args={
+            '--name': {'type': 'str', 'required': True,
+                       'help': 'Layer name'},
+        }
+    )
+    def get_layer_pixels_b64(self, params):
+        try:
+            doc = Krita.instance().activeDocument()
+            if not doc:
+                return {'success': False, 'message': 'No active document'}
+            name = (params or {}).get('name', '')
+            if not name:
+                return {'success': False, 'message': 'Layer name is required'}
+
+            try:
+                bounds = (0, 0, int(doc.width()), int(doc.height()))
+                enc = read_layer_pixels(doc, name, bounds)
+            except ValueError as e:
+                return {'success': False, 'message': str(e)}
+
+            data_url = ('data:image/png;base64,'
+                        + base64.b64encode(enc.data).decode('ascii'))
+            return {
+                'success': True,
+                'message': f'Layer {name!r} pixels fetched',
+                'data': {
+                    'name':     name,
+                    'width':    enc.width,
+                    'height':   enc.height,
+                    'data_url': data_url,
+                },
+            }
         except Exception as e:
             return {'success': False, 'message': str(e)}

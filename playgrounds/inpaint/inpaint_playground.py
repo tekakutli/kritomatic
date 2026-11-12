@@ -5,12 +5,14 @@
 Writes inpaint.html, serves it at http://127.0.0.1:8774/, and serves
 /modules/* from the module manifest.
 
-The inpaint workflow is `NEWTekakutli45`, expected at
-`<repo>/data/comfy_panel/workflows/NEWTekakutli45.json`.  Krita must
-be running with the Kritomatic daemon enabled, and the daemon must be
-linked to a running ComfyUI (the playground sends a `comfy_connect` as
-part of every inpaint batch, so an already-connected daemon is fine
-but a disconnected one gets auto-connected on first run).
+The inpaint workflow is whatever the daemon currently has loaded — the
+one the docker's Workflow picker shows, set via `comfy_load`.  The
+playground does NOT hardcode a workflow name; see `inpaint_server.py`'s
+module docstring for the resolution rules.  Krita must be running with
+the Kritomatic daemon enabled, with a workflow already loaded, and the
+daemon must be linked to a running ComfyUI (the playground sends a
+`comfy_connect` as part of every inpaint batch, so an already-connected
+daemon is fine but a disconnected one gets auto-connected on first run).
 """
 
 import os
@@ -42,7 +44,7 @@ def main():
         f.write(html)
     print(f"Wrote {HTML_FILE}")
     print(f"  comfyui  : http://{inpaint_server.COMFY_HOST}:{inpaint_server.COMFY_PORT}")
-    print(f"  workflow : {inpaint_server.DEFAULT_WORKFLOW}")
+    print(f"  workflow : dynamic \u2014 uses whatever the daemon has loaded")
     print(f"  routes   : {', '.join(sorted(list(inpaint_server.ROUTES) + list(inpaint_server.RAW_ROUTES)))}")
 
     kit_serve(

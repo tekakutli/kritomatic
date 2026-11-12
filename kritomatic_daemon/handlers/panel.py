@@ -4,137 +4,30 @@ Panel description handler.
 Owns the panel's *content*: the machine-readable description that every
 frontend (the Krita docker, the browser panel, the Emacs client)
 renders. The description is a list of sections; each section is a
-metadata strip, a form, or a set of action buttons. Each editable field
-carries the daemon command that sets it, OR a `config_path` into the
-v2 panel config (resources/params/crop/paste) — the docker collects the
-config at Run time from its widgets and sends it atomically.
-
-The description is composed from providers. A provider is a small
-object with one method, `contribute(builder, ctx)`. Adding a new panel
-feature that is not comfyui-related (document stats, batch history,
-palette management) means writing a provider and appending it to the
-list below. Every frontend picks it up on the next description push.
+metadata strip, a form, a workflow-bar, or a set of action buttons.
 
 Two config models
 =================
-The panel carries two kinds of fields:
+  * **Command fields** — carry a `set_command`; the docker sends the
+    command on edit. Used for state the daemon owns (run options,
+    workflow picker).
 
-  * **Command fields** — carry a `set_command` that the docker sends
-    on edit. Used for state that the daemon owns (run options, workflow
-    picker). The daemon validates, applies, re-publishes.
+  * **Config fields** — carry a `config_path` into the v2 config dict
+    (resources/params/crop/paste). The docker watches these for edits
+    and pushes a full `comfy_apply_config` on a 150 ms debounce.
 
-  * **Config fields** — carry a `config_path` into the v2 config dict.
-    The docker watches these for edits and, when one fires, builds the
-    full config from all current widget values and sends it as a
-    single `comfy_apply_config`. The daemon validates, stores the
-    result in `_active_config`, and re-publishes. Every field edit
-    therefore propagates to the daemon within one debounce window
-    (~150 ms), and any other client reading `_active_config` — CLI's
-    `panel run`, the inpaint playground, a second docker instance —
-    sees the same values.
-
-    This is the "set the values somewhere, have them respected
-    everywhere" model. Config edits are not entangled with generation:
-    editing `Hyper?` in the docker updates the daemon's canonical
-    config immediately, and the next generation from ANY client uses
-    the new value. The docker's Run button still sends
-    `comfy_panel_run` (which re-applies the current widget state before
-    generating), but that apply is now a redundant no-op on the happy
-    path — auto-apply already pushed the same values — and a useful
-    safety net if the user clicked Run within the debounce window
-    before the apply had fired.
-
-Config fields do NOT carry `no_sync`. Widgets sync from `_active_config`
-on every panel re-publish, with the renderer's focus-check skipping
-the field the user is actively editing. This is what makes external
-changes (a CLI `comfy_apply_config`, an inpaint from another tab) show
-up in the docker's widgets instead of silently drifting. An earlier
-design used `no_sync: True` to prevent daemon re-publishes from
-stomping local edits, but that design relied on "apply config only at
-Run time" — which is exactly the model this change replaces.
-
-Config defaults
-===============
-A config field's initial value has three sources, in precedence order:
-
-  1. `_active_config` (set by `comfy_apply_config`) — the values last
-     applied by any client.
-  2. The workflow's own baked-in default:
-     * resources: `{source: "layer", layer_name: <name minus @>}` —
-       matches the CLI's `.toml` convention for the workspace-layer
-       naming pattern.
-     * params: the Primitive node's current `value`, recorded by
-       `_extract_param_slots` as `default`.
-  3. A kind-based fallback (only when the slot has no value at all —
-     malformed workflow).
-
-The point of (2) is that loading a workflow and immediately clicking
-Run without touching any config field produces the same behaviour as
-the CLI's `panel run <slug>`, which reads its values from
-`[resources]` and `[params]` in the `.toml`. The previous
-implementation defaulted every param to a kind-based value
-(0, 0.0, False, "") and every resource to "active". That silently
-substituted wrong values into every Primitive and every resource slot
-on load, causing the crash observed on the first run of
-NEWTekakutli45: `"normal, sketch, +grays"` defaulted to 0, node 240's
-`ImpactSwitch(select=0)` (1-based indices) returned None,
-`InpaintCropImproved` got None for image and raised.
-
-The workflow picker
-===================
-The picker is a `<select>` dropdown populated from the on-disk
-workflows directory (`data/comfy_panel/workflows/*.json`). Selecting a
-value fires `currentTextChanged`, which the renderer commits as
-`comfy_load --name <value>`. The daemon loads the graph, populates the
-three slot tables, clears `_active_config`, and re-publishes state. The
-docker rebuilds the panel from the new slot tables — resources and
-params sections appear. Because the docker's `_on_panel` auto-applies
-config on structure change (see `panel/docker.py`), the new widget
-defaults are pushed to `_active_config` before the user ever sees
-them, so the playground and any other reader get the workflow's
-baked-in defaults rather than `None`.
-
-The dropdown handles "pick a workflow and load it" as one gesture. No
-typing. No separate Load button required for the normal case.
-
-An explicit **Load** button sits in the actions row. It commits
-`comfy_load --name <currently-selected-value>` again. This covers the
-one case the dropdown cannot: selecting the *same* workflow to reload
-it after you've edited the JSON on disk (a dropdown re-select of the
-current value emits no signal, so no commit fires).
-
-The daemon can only load **API-format** JSON. Files that are UI format
-are rejected by `comfy_load` with a clear message. The CLI's
-`panel run` converts UI→API on the fly via `comfy-cli`; the daemon has
-no subprocess path to that tool and does not convert. If the workflows
-directory contains a UI-format file, the flow is: run
-`kritomatic comfyui panel run <slug>` once from the CLI (which
-converts to `data/convert/<slug>.json` and applies that), after which
-the daemon's `workflow` field points at the converted path and every
-subsequent dropdown selection works because the workflows directory
-now contains that converted file too (or the user is selecting a slug
-that already points at an API-format source).
-
-There is no "Apply config" button separate from Run. `comfy_panel_run`
-(the Run action) does apply-and-generate atomically, and auto-apply
-also fires on every field edit — so the applied config is always what
-the docker's widgets show. The Run button's apply step is a redundant
-confirmation of what auto-apply already did.
-
-State source
+Workflow bar
 ============
-The handler holds the last comfyui status it has seen. Two things
-update it:
+The `workflow-bar` section kind renders the workflow picker and the
+Load / Save-config buttons on one row. Kept as its own section kind
+rather than a form+actions pair so the renderer can layout them
+together (picker stretches, buttons hug the right edge).
 
-  * Bus events. `ComfyUIHandler` publishes a `state` event after every
-    successful state-mutating command. The handler subscribes on
-    `__init__`, so during a session it stays current.
-
-  * An on-demand puller. The `CommandHandler` injects a callable that
-    returns the current comfyui status directly. `panel_description`
-    calls it before building, so a fresh client asking for the panel
-    on a freshly-launched Krita gets a description built from live
-    state, not from an empty cache.
+Autoload on comfy_load
+======================
+`comfy_load` autoloads `panel_configs/<slug>.json` if it exists. The
+providers here read `_active_config` to populate field values, so
+autoloaded values appear in the panel with no extra work on this side.
 """
 
 from __future__ import annotations
@@ -164,15 +57,6 @@ class PanelDescriptionBuilder:
         self.sections.append(section)
 
 
-# Fields whose presence affects the structure hash. `config_path` and
-# `no_sync` are included: a field that gains or loses a config path is
-# structurally different from one that does not, and the frontend needs
-# a rebuild (not an in-place value sync) in that case. No built-in
-# provider sets `no_sync` any more — config fields sync from
-# `_active_config` on every re-publish, with focus-based skipping
-# handled by the renderer. The key stays here so a future provider can
-# still mark a field as "don't sync from daemon" without a hash-schema
-# change.
 _STRUCTURE_FIELD_KEYS = (
     "key", "type", "options", "visible_when",
     "set_command", "arg_key", "kind_hint",
@@ -210,16 +94,12 @@ def _finalize_description(sections: list) -> dict:
 # ============================================================================
 
 class WorkflowPickerProvider:
-    """A `<select>` dropdown populated from the on-disk workflows
-    directory. Selecting a value fires `comfy_load --name <value>`.
+    """The workflow picker + Load + Save-config buttons, on one row.
 
-    The available list is read directly off the filesystem by the
-    provider (it runs in the daemon and has access to
-    `_WORKFLOW_DIR`). The current selection is the daemon's
-    `_active_workflow_name` if it appears in the list, otherwise the
-    first item. If the directory is empty, the dropdown degrades to a
-    single text field so the section still renders (and the docker's
-    workflow-loaded flag remains False so Run stays disabled).
+    Replaces the previous form section that only carried the picker.
+    Load and Save-config moved here from `run-actions` because they
+    operate on the current workflow's config file, not on execution
+    state.
     """
 
     def contribute(self, builder, ctx):
@@ -232,38 +112,42 @@ class WorkflowPickerProvider:
             slugs = []
 
         if not slugs:
-            builder.add_section({
-                "id": "workflow-picker",
-                "kind": "form",
-                "title": "Workflow",
-                "fields": [
-                    {
-                        "key": "workflow-name",
-                        "label": "Name",
-                        "type": "text",
-                        "value": "",
-                        "set_command": {"type": "comfy_load"},
-                        "arg_key": "name",
-                    },
-                ],
-            })
-            return
-
-        selected = current if current in slugs else slugs[0]
+            picker_field = {
+                "key": "workflow-name",
+                "label": "Name",
+                "type": "text",
+                "value": "",
+                "set_command": {"type": "comfy_load"},
+                "arg_key": "name",
+            }
+        else:
+            selected = current if current in slugs else slugs[0]
+            picker_field = {
+                "key": "workflow-name",
+                "label": "Name",
+                "type": "select",
+                "options": slugs,
+                "value": selected,
+                "set_command": {"type": "comfy_load"},
+                "arg_key": "name",
+            }
 
         builder.add_section({
             "id": "workflow-picker",
-            "kind": "form",
+            "kind": "workflow-bar",
             "title": "Workflow",
-            "fields": [
+            "fields": [picker_field],
+            "items": [
                 {
-                    "key": "workflow-name",
-                    "label": "Name",
-                    "type": "select",
-                    "options": slugs,
-                    "value": selected,
-                    "set_command": {"type": "comfy_load"},
-                    "arg_key": "name",
+                    "key": "load",
+                    "label": "Load",
+                    "command": {"type": "comfy_load"},
+                    "collect": {"workflow-name": "name"},
+                },
+                {
+                    "key": "save_config",
+                    "label": "Save config",
+                    "command": {"type": "comfy_save_config"},
                 },
             ],
         })
@@ -314,14 +198,6 @@ class ResourcesProvider:
     """Per-@-name: a source select and a conditional layer_name text
     field. Both carry `config_path`; the docker auto-applies on every
     edit.
-
-    Defaults for a slot with no `_active_config["resources"]` entry:
-    `{source: "layer", layer_name: <name minus leading @>}`. This
-    matches the "workspace layer named after the @-ref" convention
-    used by the CLI's `.toml` files, so a user who loads a workflow
-    and immediately clicks Run gets the same behaviour as
-    `kritomatic comfyui panel run <slug>` would produce. Changing the
-    dropdown to "active" or "global" overrides it.
     """
 
     def contribute(self, builder, ctx):
@@ -375,19 +251,6 @@ def _param_widget_and_default(kind: str):
 class ParamsProvider:
     """Per-title: a typed input matching the slot kind. The docker
     auto-applies on every edit.
-
-    Default for a slot with no `_active_config["params"]` entry: the
-    workflow node's current `value` (recorded by `_extract_param_slots`
-    as `default`), falling back to a kind-based default only when the
-    node had no `value` input at load time. This is what keeps the
-    docker's widgets in sync with the workflow: a user who loads
-    `NEWTekakutli45` and clicks Run without touching anything sends the
-    same param values the CLI would send from the `.toml`. The old
-    behaviour — defaulting to `0` / `0.0` / `False` regardless of the
-    workflow — silently substituted wrong values into every Primitive,
-    which is what caused the `ImpactSwitch: invalid select index` crash
-    (select defaulted to 0, ImpactSwitch uses 1-based indices, returned
-    None, InpaintCropImproved got None for image).
     """
 
     def contribute(self, builder, ctx):
@@ -422,10 +285,7 @@ class ParamsProvider:
 
 
 class CropProvider:
-    """Context and padding. Only relevant when a resource has
-    source='global', but always rendered when any resource slot exists
-    so the config shape is complete and `comfy_panel_run`'s crop arg
-    is always well-formed."""
+    """Context and padding."""
 
     def contribute(self, builder, ctx):
         status = ctx.get("comfy_status") or {}
@@ -460,8 +320,7 @@ class CropProvider:
 
 
 class PasteProvider:
-    """Where and how to paste SaveImage outputs. Only rendered when
-    the workflow has at least one output node."""
+    """Where and how to paste SaveImage outputs."""
 
     def contribute(self, builder, ctx):
         status = ctx.get("comfy_status") or {}
@@ -516,11 +375,7 @@ class PasteProvider:
 
 
 class RunOptionsProvider:
-    """Timeout, count, seed. These auto-commit to the panel handler's
-    `_run_options` state via `panel_set_run_options`; the docker reads
-    them at Run time too and injects them into `comfy_panel_run`'s
-    args, so either path is authoritative. The set_command exists to
-    persist across panel rebuilds."""
+    """Timeout, count, seed. Auto-commit via `panel_set_run_options`."""
 
     def contribute(self, builder, ctx):
         opts = (ctx.get("panel_state") or {}).get("run_options") or {}
@@ -578,22 +433,10 @@ class RunOptionsProvider:
 
 
 class RunActionsProvider:
-    """Load / Run / Cancel / Cancel All.
+    """Run / Cancel / Cancel-All.
 
-    Load: re-issues `comfy_load --name <current dropdown value>`.
-    Covers the case the dropdown cannot: selecting the same workflow
-    again to reload after on-disk edits (no signal fires on re-select
-    of the current value).
-
-    Run: sends `comfy_panel_run` with the config the docker assembles
-    from its config fields. Because config fields auto-apply on every
-    edit, the assembled config matches `_active_config` on the happy
-    path; the apply is a redundant confirmation. It becomes useful if
-    the user clicks Run within the auto-apply debounce window, where
-    the widget state may be a hair ahead of `_active_config`.
-
-    Cancel and Cancel All bypass the command queue via the docker's
-    `send_cancel_now` path.
+    Load moved to `WorkflowPickerProvider`'s `workflow-bar` section
+    (it operates on the config file, not on execution state).
     """
 
     def contribute(self, builder, ctx):
@@ -602,12 +445,6 @@ class RunActionsProvider:
             "kind": "actions",
             "title": None,
             "items": [
-                {
-                    "key": "load",
-                    "label": "Load",
-                    "command": {"type": "comfy_load"},
-                    "collect": {"workflow-name": "name"},
-                },
                 {
                     "key": "run",
                     "label": "Run",
@@ -668,20 +505,10 @@ class PanelHandler(AutoDispatchHandler):
         ]
         self._register_listener()
 
-    # -- state wiring --
-
     def set_comfy_status_puller(self, puller: Callable[[], dict]) -> None:
-        """Inject a callable that returns the current comfyui status.
-
-        Called by CommandHandler after constructing the handler tree.
-        The puller is used by `panel_description` to guarantee that a
-        cold-start client gets a description built from live state, not
-        from an empty bus-event cache.
-        """
         self._comfy_status_puller = puller
 
     def _pull_current_comfy_status(self) -> Optional[dict]:
-        """Ask the injected puller for the current status, or None."""
         if self._comfy_status_puller is None:
             return None
         try:
@@ -712,10 +539,7 @@ class PanelHandler(AutoDispatchHandler):
         except Exception:
             pass
 
-    # -- description building --
-
     def _build_description_from_state(self) -> dict:
-        """Build a description from the current `_last_comfy_status`."""
         builder = PanelDescriptionBuilder()
         with self._lock:
             comfy_status = dict(self._last_comfy_status)
@@ -750,13 +574,9 @@ class PanelHandler(AutoDispatchHandler):
         except Exception:
             pass
 
-    # -- commands --
-
     @command(
         category='panel',
-        help_text='Return the current panel description (sections, '
-                  'fields, actions). Pulls current comfyui state on '
-                  'demand if the bus has not delivered any yet.',
+        help_text='Return the current panel description.',
         args={},
     )
     def panel_description(self, params):
@@ -790,8 +610,7 @@ class PanelHandler(AutoDispatchHandler):
 
     @command(
         category='panel',
-        help_text='Set a panel run option. Valid names: timeout, count, '
-                  'seed, output_name.',
+        help_text='Set a panel run option.',
         args={
             '--name': {
                 'type': 'str', 'required': True,
@@ -838,8 +657,7 @@ class PanelHandler(AutoDispatchHandler):
 
     @command(
         category='panel',
-        help_text='Rebuild and republish the panel description with a '
-                  'fresh structure id.',
+        help_text='Rebuild and republish the panel description.',
         args={},
     )
     def panel_rebuild(self, params):

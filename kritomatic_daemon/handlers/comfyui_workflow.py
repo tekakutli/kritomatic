@@ -8,14 +8,15 @@ UI-format sources are auto-converted to API format before the graph
 is loaded. The conversion algorithm lives in
 `kritomatic_shared.comfy_convert`; this module reaches it through
 `kritomatic_daemon/utils/comfy_convert.py`, whose `sys.path` bootstrap
-makes the shared package importable from Krita's Python. Result: a
-source at `data/comfy_panel/workflows/foo.json` in UI format loads
-exactly the same way as `data/convert/foo.json` in API format, with
-the converted file landing at `data/convert/foo.json` in both cases.
+makes the shared package importable from Krita's Python. The
+converted file is written to `data/convert/<source>.json` and
+substituted for the source for the rest of this command's execution.
 
-`comfy_set_param` and `comfy_bind_layer_alias` were removed in Stage 6
-along with the ETN_Parameter / layer-alias machinery they populated.
-The native pipeline takes values through `comfy_apply_config` instead.
+If a saved panel config exists at
+`data/comfy_panel/panel_configs/<slug>.json` (JSON, since the TOML
+migration), it is applied via `comfy_apply_config` automatically
+after the workflow loads. Structural problems are logged as warnings
+in the response; they do not fail the load.
 """
 
 from __future__ import annotations
@@ -56,7 +57,8 @@ class WorkflowCommands(AutoDispatchHandler):
         help_text="Load a workflow by slug from the panel's workflows "
                   "directory, or by absolute filesystem path. UI-format "
                   "sources are auto-converted to API format before "
-                  "loading.",
+                  "loading. If a saved panel config exists for the "
+                  "slug, it is applied to _active_config automatically.",
         args={
             "--name": {"type": "str", "required": True,
                        "help": "Workflow slug, or an absolute path to "
@@ -110,16 +112,6 @@ class WorkflowCommands(AutoDispatchHandler):
                     "message": f"Workflow {display_name!r} is empty or "
                                f"not an object"}
 
-        # ---- Auto-convert UI format to API format ----
-        #
-        # The conversion algorithm lives in `kritomatic_shared.comfy_
-        # convert`. The daemon reaches it through the bootstrap in
-        # `kritomatic_daemon/utils/comfy_convert.py`, which prepends
-        # `<repo>/src/` to sys.path. Import is lazy — inside this
-        # branch — so a broken `kritomatic_shared` install cannot break
-        # API-format loads. The cost of the import (already in
-        # sys.modules after the first UI-format load) is effectively
-        # zero.
         converted = False
         converted_path: Path | None = None
         if "nodes" in workflow or "links" in workflow:
@@ -127,7 +119,9 @@ class WorkflowCommands(AutoDispatchHandler):
                 convert_if_ui, ConversionError,
             )
             try:
-                converted_path, _records, was = convert_if_ui(path, annotate=False)
+                converted_path, _records, was = convert_if_ui(
+                    path, annotate=False,
+                )
             except ConversionError as e:
                 return {
                     "success": False,
@@ -139,11 +133,6 @@ class WorkflowCommands(AutoDispatchHandler):
                     ),
                 }
             if was:
-                # Re-read from the converted file. The output is API
-                # format, so the second json.loads sees a well-formed
-                # graph. If somehow `was` is False (shouldn't happen
-                # in this branch — we already detected UI format), we
-                # keep the original `workflow` in memory.
                 workflow = json.loads(
                     converted_path.read_text(encoding="utf-8")
                 )
@@ -163,10 +152,52 @@ class WorkflowCommands(AutoDispatchHandler):
             result_data["converted_from"] = str(path)
             result_data["converted_path"] = str(converted_path)
 
+        # ---- Autoload saved panel config ----
+        autoload_warnings: list[str] = []
+        autoloaded = False
+        try:
+            from ..utils.panel_config import CONFIG_DIR, read_config_file
+            cfg_path = CONFIG_DIR / f"{display_name}.json"
+            if cfg_path.is_file():
+                cfg_data = read_config_file(cfg_path)
+                apply_args = {
+                    "resources": json.dumps(
+                        cfg_data.get("resources", {}) or {}
+                    ),
+                    "params": json.dumps(
+                        cfg_data.get("params", {}) or {}
+                    ),
+                    "crop": json.dumps(cfg_data.get("crop", {}) or {}),
+                    "paste": json.dumps(cfg_data.get("paste", {}) or {}),
+                }
+                apply_result = parent._config_cmds.comfy_apply_config(
+                    apply_args
+                )
+                if apply_result.get("success"):
+                    autoloaded = True
+                else:
+                    autoload_warnings.append(
+                        f"config autoload rejected: "
+                        f"{apply_result.get('message', '')}"
+                    )
+        except ValueError as e:
+            autoload_warnings.append(f"config autoload failed: {e}")
+        except Exception as e:  # noqa: BLE001 — never fail the load
+            autoload_warnings.append(f"config autoload failed: {e}")
+
+        if autoloaded:
+            result_data["autoloaded_config"] = True
+        if autoload_warnings:
+            result_data["autoload_warnings"] = autoload_warnings
+
         msg = (f"Loaded workflow {display_name!r} "
                f"({len(workflow)} nodes)")
         if converted:
             msg += " \u2014 auto-converted from UI format"
+        if autoloaded:
+            msg += " \u2014 config autoloaded"
+        if autoload_warnings:
+            msg += f" ({len(autoload_warnings)} autoload warning(s))"
 
         return {
             "success": True,

@@ -6,91 +6,20 @@ A pure client of the daemon. Reads the same event stream the Krita
 docker reads, renders the same panel description the docker renders,
 and posts the same commands to the same command socket.
 
-Two responsibilities:
+See the current docker.py docstring for the architecture. This file
+only adds:
 
-  * Maintain a small in-process cache of the latest state and panel
-    events received from the daemon, and forward both to any open
-    browser tabs over SSE.
-
-  * Forward single commands and run requests from the browser back to
-    the daemon, streaming run progress over SSE.
-
-Everything the browser needs to draw comes from the panel description
-the daemon publishes. There is no comfyui-specific logic in this file.
-
-Run it
-------
-    python web_server/server.py
-    # or
-    WEB_PANEL_PORT=8289 python web_server/server.py
-
-Then open http://127.0.0.1:8189/.
-
-Cancel-All's precondition, and why there is no polling
-======================================================
-The button is enabled when *any* client has a batch in flight on the
-daemon (this browser, the Krita docker, the CLI). The daemon's
-`comfy_status` payload carries `active_batches: [...]` — the live
-list of running batches from all clients.
-
-The browser derives `activeBatchesCount` directly from the SSE
-`state` events the daemon pushes. For that to be complete, the
-daemon has to publish a state event at *batch start*: `execute()`
-only publishes after each state-mutating command returns, and
-`comfy_generate` blocks until the run finishes. That's why
-`handlers/comfyui.py` calls `self._publish_state_change()` at batch
-registration — it is what makes the batch visible in the SSE stream
-while it is running. The end-of-batch publish already happens via
-`execute()`'s wrapper when `comfy_generate` returns (unconditionally,
-including on cancellation or failure; see that method's docstring).
-
-Given both ends of that lifecycle are pushed, the browser needs no
-fetch of its own: every state event carries the current
-`active_batches`, and every change to that list triggers a fresh
-state event. There is therefore no timer, no interval, no manual
-`/api/batches` fetch in the JS below.
-
-Button refresh is unconditional on both event types
-===================================================
-Docker's `_on_state` and `_on_panel` both call `_update_run_buttons()`
-on every event, with no early-out. That is what makes the docker's
-button state always consistent with the daemon's view: even if
-`active_batches` hasn't changed, the button is re-evaluated.
-
-The web panel used to have `if (batches !== app.activeBatchesCount)
-setRunning(...)`, which was an optimization that turned into a bug
-in one specific class of failure: if `activeBatchesCount` ever
-drifted out of sync with the daemon's real batch list (a dropped
-state event during SSE reconnect, a transient race between batch
-start and a fresh subscription), the `!==` guard would skip the
-`setRunning` call on every subsequent event whose count matched the
-stale one — leaving the button permanently out of sync with
-reality. `syncValues` had the same issue: it ran on every
-value-only panel event but never refreshed button enabled state,
-so a panel event could arrive without any button update if the
-state event that would have updated buttons had been missed.
-
-Both are fixed: the `state` handler unconditionally calls
-`setRunning`, and `syncValues` calls it at the end. This mirrors the
-docker exactly and eliminates the entire class of stale-count bugs.
-
-Why `cancelRun` does not set `running = true`
-=============================================
-`app.running` is "this browser started a batch that has not yet
-finished". It is set by `startRun()` and cleared by the terminal
-run events (`"done"`, `"cancelled"`, `"error"`). It is NOT touched
-by `cancelRun` on a successful cancel, because:
-
-  * Local run: `running` is already true; sending the cancel changes
-    nothing about who started it. The run is still in flight on the
-    daemon until it winds itself down, at which point `"cancelled"`
-    or `"done"` fires and clears `running`.
-
-  * Other-client run (Cancel All when this browser did not start a
-    batch): `running` was never true, and nothing in this browser
-    will ever fire a terminal run event for that batch. Setting
-    `running = true` here would leave it stuck forever, permanently
-    enabling Cancel and Cancel All.
+  * SSE forwarding of state + panel events to browser tabs.
+  * A minimal in-browser renderer (`buildSectionHtml` and friends)
+    that supports section kinds: metadata, form, workflow-bar,
+    actions.
+  * A `comfy_save_config` path parallel to `comfy_panel_run`: the
+    docker-side enrichment (four config sections) is not done in JS
+    here — the daemon falls back to `_active_config` when the sections
+    are not supplied. Save still works; the values are just whatever
+    the daemon last had in `_active_config`, not the in-progress
+    widget state. That is fine for the web panel's use case (a viewer
+    / controller, not an editor).
 """
 
 import json
@@ -106,10 +35,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-# ----------------------------------------------------------------------
-#  Make the kritomatic package importable
-# ----------------------------------------------------------------------
-
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SRC = _REPO_ROOT / "src"
 if str(_SRC) not in sys.path:
@@ -117,10 +42,6 @@ if str(_SRC) not in sys.path:
 
 from kritomatic.client import KritaClient
 
-
-# ----------------------------------------------------------------------
-#  Configuration
-# ----------------------------------------------------------------------
 
 HOST = os.environ.get("WEB_PANEL_HOST", "127.0.0.1")
 PORT = int(os.environ.get("WEB_PANEL_PORT", "8189"))
@@ -136,10 +57,6 @@ SUBSCRIBER_QUEUE_SIZE = 256
 RUN_READ_TIMEOUT_MARGIN = 60.0
 
 
-# ----------------------------------------------------------------------
-#  State cache
-# ----------------------------------------------------------------------
-
 _state = {
     "daemon": None,
     "panel": None,
@@ -150,10 +67,6 @@ _state = {
 }
 _state_lock = threading.Lock()
 
-
-# ----------------------------------------------------------------------
-#  SSE subscribers
-# ----------------------------------------------------------------------
 
 class LatestValueQueue:
     def __init__(self, maxsize: int = SUBSCRIBER_QUEUE_SIZE):
@@ -196,10 +109,6 @@ def _broadcast_state() -> None:
         payload = dict(_state)
     _broadcast("state", payload)
 
-
-# ----------------------------------------------------------------------
-#  Daemon event stream client
-# ----------------------------------------------------------------------
 
 def _daemon_event_client() -> None:
     while True:
@@ -269,12 +178,7 @@ def _handle_daemon_event(event: dict) -> None:
         _broadcast("panel", data)
 
 
-# ----------------------------------------------------------------------
-#  Daemon command helpers
-# ----------------------------------------------------------------------
-
 def _daemon_call(command: dict) -> tuple:
-    """Send one command on a fresh connection. Returns (ok, message, data)."""
     client = KritaClient(host=DAEMON_HOST, port=DAEMON_PORT)
     if not client.connect():
         return False, "could not connect to daemon", {}
@@ -292,10 +196,6 @@ def _daemon_call(command: dict) -> tuple:
         return False, resp.get("message", "daemon refused the command"), {}
     return True, resp.get("message", ""), resp.get("data") or {}
 
-
-# ----------------------------------------------------------------------
-#  Run bookkeeping
-# ----------------------------------------------------------------------
 
 _runs: dict = {}
 _runs_lock = threading.Lock()
@@ -356,10 +256,6 @@ def _do_run(run_id: str, command: dict) -> None:
         succ = summary.get("successful", 0)
         fail = summary.get("failed", 0)
 
-        # A cancelled batch reports success=False and carries a
-        # "cancelled" mention in the failure message. When nothing
-        # succeeded and every error is a cancellation, the honest
-        # terminal event is "cancelled", not "done with N failures".
         results = summary.get("results", []) or []
         cancelled_count = sum(
             1 for r in results
@@ -405,13 +301,6 @@ def _send_daemon_cancel(batch_id) -> tuple:
 
 
 def _fetch_batches() -> list:
-    """Query `comfy_batches` for the live batch list.
-
-    Kept for the `/api/batches` endpoint as an escape hatch for
-    debugging and scripted use. The browser does *not* use it — the
-    JS below reads `active_batches` from the SSE `state` stream, which
-    the daemon publishes at batch boundaries.
-    """
     client = KritaClient(host=DAEMON_HOST, port=DAEMON_PORT)
     if not client.connect():
         return []
@@ -427,13 +316,9 @@ def _fetch_batches() -> list:
     return list(data.get("batches") or [])
 
 
-# ----------------------------------------------------------------------
-#  HTTP handler
-# ----------------------------------------------------------------------
-
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "KritomaticWebPanel/2.2"
+    server_version = "KritomaticWebPanel/2.3"
 
     def log_message(self, fmt, *args):
         pass
@@ -476,8 +361,6 @@ class Handler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError):
             return None
 
-    # ---- GET ----
-
     def do_GET(self):
         try:
             if self.path in ("/", "/index.html"):
@@ -487,9 +370,6 @@ class Handler(BaseHTTPRequestHandler):
                 with _state_lock:
                     self._send_json(dict(_state))
             elif self.path == "/api/batches":
-                # Live batch list. The browser does not use this
-                # (see the module docstring); it is kept for scripts
-                # and manual debugging.
                 self._send_json({"batches": _fetch_batches()})
             elif self.path == "/api/events":
                 self._handle_events()
@@ -545,8 +425,6 @@ class Handler(BaseHTTPRequestHandler):
         msg = f"event: {event_type}\ndata: {data}\n\n"
         self.wfile.write(msg.encode("utf-8"))
         self.wfile.flush()
-
-    # ---- POST ----
 
     def do_POST(self):
         try:
@@ -622,11 +500,6 @@ class Handler(BaseHTTPRequestHandler):
         scope = body.get("scope", "current")
 
         if scope == "all":
-            # Cancel every batch the daemon knows about — including
-            # ones launched from the CLI or another panel — plus any
-            # async generates. Mark our own run as cancelling so the
-            # UI status flips, then send the cancel-all command with
-            # no batch id.
             with _runs_lock:
                 run_id = None
                 for rid, r in _runs.items():
@@ -649,7 +522,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"status": "cancelling_all", "message": msg})
             return
 
-        # scope == "current" — the original behaviour.
         with _runs_lock:
             run_id = None
             for rid, r in _runs.items():
@@ -669,23 +541,12 @@ class Handler(BaseHTTPRequestHandler):
         _broadcast("run", {"run_id": run_id, "status": "cancelling"})
         print(f"[web_panel] cancel requested for run {run_id}")
 
-        # `_do_run` sends the bundle with `id=run_id`, and
-        # `handlers/base.py` propagates that id to each command as
-        # `_batch_id`; `comfy_generate` uses `_batch_id` as its
-        # registered batch id. So `run_id` here is the same value the
-        # daemon has registered as the active batch's id. Cancel is
-        # issued on a fresh connection (`_send_daemon_cancel`), which
-        # is safe to do while the run's own socket is mid-read.
         ok, msg = _send_daemon_cancel(run_id)
         if not ok:
             print(f"[web_panel] cancel for {run_id} failed: {msg}")
 
         self._send_json({"run_id": run_id, "status": "cancelling"})
 
-
-# ----------------------------------------------------------------------
-#  HTML page — generic description renderer
-# ----------------------------------------------------------------------
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html>
@@ -785,6 +646,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     cursor: pointer;
   }
   .empty { color: #888; font-style: italic; font-size: 0.85rem; }
+
+  .workflow-bar {
+    display: flex; gap: 6px; align-items: center;
+  }
+  .workflow-bar select,
+  .workflow-bar input[type=text] {
+    flex: 1;
+    font: inherit; font-size: 0.85rem;
+    padding: 0.3rem 0.5rem;
+    border: 1px solid #ccc; border-radius: 3px;
+    background: white;
+  }
+  .workflow-bar button { flex: 0 0 auto; }
 
   .actions-section { display: flex; gap: 0.5rem; }
   button {
@@ -887,7 +761,7 @@ function renderStatus(s) {
   } else if (!s.daemon || !s.daemon.workflow) {
     el.classList.add("warn");
     lines.push("Connected to the daemon; no active workflow.");
-    lines.push('<span class="dim">Publish a graph from ComfyUI&rsquo;s browser, or load a file.</span>');
+    lines.push('<span class="dim">Select a workflow in the Workflow bar above, or use the CLI.</span>');
   } else {
     el.classList.add("ok");
     const d = s.daemon;
@@ -896,18 +770,39 @@ function renderStatus(s) {
     } else {
       lines.push("Connected to the daemon.");
     }
-    if (d.workflow_exclusive) {
-      lines.push('<span class="dim">File lock: on</span>');
-    }
-    if (d.pinned_publisher) {
-      lines.push('<span class="dim">Pinned publisher: ' + esc(d.pinned_publisher) + '</span>');
-    }
   }
   if (s && s.last_event) {
     lines.push('<span class="dim">Last event: ' + esc(s.last_event) + '</span>');
   }
   el.innerHTML = lines.map(l => "<div>" + l + "</div>").join("")
     || '<div class="empty">(no state)</div>';
+}
+
+function buildWorkflowBarHtml(section) {
+  let html = `<div class="config-section">`;
+  if (section.title) html += `<h3>${esc(section.title)}</h3>`;
+  html += `<div class="workflow-bar">`;
+  for (const f of (section.fields || [])) {
+    const key = f.key;
+    const value = f.value ?? "";
+    if (f.type === "select") {
+      const opts = (f.options || []).map(o =>
+        `<option value="${escAttr(o)}"${String(o) === String(value) ? " selected" : ""}>${esc(o)}</option>`
+      ).join("");
+      html += `<select data-field="${escAttr(key)}">${opts}</select>`;
+    } else {
+      html += `<input type="text" data-field="${escAttr(key)}" value="${escAttr(value)}">`;
+    }
+  }
+  for (const item of (section.items || [])) {
+    let cls = "";
+    if (item.style === "danger") cls = "danger";
+    else if (item.style === "primary") cls = "primary";
+    let label = item.label || item.key;
+    html += `<button class="${cls}" data-action-key="${escAttr(item.key)}">${esc(label)}</button>`;
+  }
+  html += `</div></div>`;
+  return html;
 }
 
 function buildSectionHtml(section) {
@@ -930,17 +825,15 @@ function buildSectionHtml(section) {
     html += `</div>`;
     return html;
   }
+  if (kind === "workflow-bar") {
+    return buildWorkflowBarHtml(section);
+  }
   if (kind === "actions") {
     let html = `<div class="config-section actions-section">`;
     for (const item of (section.items || [])) {
       let cls = "";
       if (item.style === "danger") cls = "danger";
       else if (item.style === "primary") cls = "primary";
-      // Every action renders as a normal button. The docker is where
-      // "ALL" reads naturally as a compact companion next to Cancel;
-      // in the web panel there is room, and a label of "ALL" alone
-      // does not say what it cancels. `cancel_all` therefore gets the
-      // full "Cancel All" label here.
       let label = item.label || item.key;
       if (item.cancel_all) label = "Cancel All";
       html += `<button class="${cls}" data-action-key="${escAttr(item.key)}">${esc(label)}</button>`;
@@ -1067,11 +960,6 @@ function syncValues(description) {
       if (f.key && f.visible_when) evaluateVisibility(f.key);
     }
   }
-  // Refresh button enabled state from the current
-  // `activeBatchesCount`, matching docker's `_on_panel` (which
-  // unconditionally calls `_update_run_buttons()`). `rebuildPanel`
-  // already does this on structure changes; this closes the same
-  // gap on value-only panel events.
   setRunning(app.running);
 }
 
@@ -1228,7 +1116,8 @@ function revertFields(keys) {
 
 async function runAction(key) {
   const section = app.sectionSpecs.find(
-    s => s.kind === "actions" && (s.items || []).some(i => i.key === key));
+    s => (s.kind === "actions" || s.kind === "workflow-bar")
+      && (s.items || []).some(i => i.key === key));
   if (!section) return;
   const item = section.items.find(i => i.key === key);
   if (!item) return;
@@ -1258,6 +1147,10 @@ async function runAction(key) {
   } else if (key === "cancel" || cancelAll) {
     await cancelRun(command, cancelAll ? "all" : "current");
   } else {
+    // Load, Save config, and any other generic action go through
+    // /api/command. The daemon fills in config sections for
+    // comfy_save_config from _active_config if not supplied; for
+    // comfy_load the picker value was collected above.
     const requestId = "action:" + key;
     await sendCommand(requestId, command, []);
   }
@@ -1274,7 +1167,7 @@ function setRunning(running) {
   app.running = running;
   const anyBatch = running || (app.activeBatchesCount > 0);
   for (const s of app.sectionSpecs) {
-    if (s.kind !== "actions") continue;
+    if (s.kind !== "actions" && s.kind !== "workflow-bar") continue;
     for (const item of (s.items || [])) {
       const btn = document.querySelector(
         `[data-action-key="${cssEsc(item.key)}"]`);
@@ -1282,14 +1175,14 @@ function setRunning(running) {
       if (item.key === "run") {
         btn.disabled = running;
       } else if (item.key === "cancel") {
-        // Cancel targets *this* client's run. Enabled strictly when
-        // this client has one in flight.
         btn.disabled = !running;
       } else if (isCancelAllItem(item)) {
-        // Cancel-All targets every batch on the daemon, from any
-        // client. Enabled whenever there is anything anywhere to
-        // cancel, whether or not this client started it.
         btn.disabled = !anyBatch;
+      } else if (item.key === "load") {
+        btn.disabled = running;
+      } else if (item.key === "save_config") {
+        btn.disabled = running || !app.latestState
+          || !(app.latestState.daemon && app.latestState.daemon.workflow);
       }
     }
   }
@@ -1331,12 +1224,6 @@ async function startRun(command) {
 
 async function cancelRun(command, scope) {
   const log = document.getElementById("progress");
-  // This function sends a cancel request; it does not mutate
-  // `app.running`. For a local run, `running` is already true and
-  // will be cleared by the terminal run event. For another client's
-  // run (Cancel All with no local run), setting `running = true`
-  // here would leave it stuck forever — nothing in this browser
-  // fires a terminal event for that batch.
   let resp;
   try {
     resp = await fetch("/api/cancel", {
@@ -1353,8 +1240,6 @@ async function cancelRun(command, scope) {
     try { const b = await resp.json(); if (b && b.error) msg = b.error; } catch (_) {}
     log.appendChild(rowDiv("err", "Cannot cancel: " + msg));
     if (resp.status === 409) {
-      // Server says there is no run in progress. If `running` was
-      // stuck true, reset it — nothing else will unstick it.
       app.running = false;
       setRunning(false);
     }
@@ -1402,24 +1287,6 @@ function connectEvents() {
     try {
       const s = JSON.parse(e.data);
       app.latestState = s;
-      // Full sync of `activeBatchesCount` from the daemon's state
-      // payload. The daemon publishes a `state` event at every
-      // batch boundary (see handlers/comfyui.py — `_publish_state_change`
-      // is called at batch registration and again by `execute()`'s
-      // wrapper when `comfy_generate` returns, unconditionally,
-      // including on cancellation or failure).
-      //
-      // `setRunning` is called unconditionally, not only when the
-      // count changes. Docker's `_on_state` does the same (it calls
-      // `_update_run_buttons()` unconditionally), and that is what
-      // makes its button state always consistent with the daemon's
-      // view. The `!==` guard this used to have was an optimization
-      // that could leave the button stale if `activeBatchesCount`
-      // had ever drifted out of sync (a missed state event during
-      // SSE reconnect, a transient race between batch start and a
-      // fresh subscription) — because then a "same count" check
-      // would short-circuit the only thing that would have repaired
-      // it.
       const batches = (s && s.daemon
                        && Array.isArray(s.daemon.active_batches))
         ? s.daemon.active_batches.length : 0;
@@ -1451,9 +1318,7 @@ function connectEvents() {
   es.addEventListener("run", handleRunEvent);
 
   es.onerror = function () {
-    // EventSource reconnects automatically. On reconnect the server
-    // sends a full `state` snapshot via `_handle_events`'s initial
-    // write, so `activeBatchesCount` re-syncs without any polling.
+    // EventSource reconnects automatically.
   };
 
   setTimeout(function () {
@@ -1486,10 +1351,6 @@ connectEvents();
 </html>
 """
 
-
-# ----------------------------------------------------------------------
-#  Main
-# ----------------------------------------------------------------------
 
 def main() -> int:
     threading.Thread(target=_daemon_event_client,

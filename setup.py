@@ -20,7 +20,6 @@ setup(
         'pyyaml',
         'PyQt5>=5.15.11',
         'websockets>=12',
-        'tomlkit',
         'comfy-cli',
     ],
 )

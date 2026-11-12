@@ -9,32 +9,15 @@ cli.py — command-line interface for the panel.
     kritomatic comfyui panel queue
     kritomatic comfyui panel cancel [<batch_id>] [--all]
 
-Since Stage 7 the daemon has no browser-watch surface, so the
-`publishers` / `pin` / `unpin` subcommands are gone. Every workflow is
-loaded from disk by `comfy_load`; the config either names a slug or a
-filesystem path.
+Config files are JSON (`.json`). The daemon autoloads them on
+`comfy_load` and saves them via `comfy_save_config`. TOML is no
+longer read or written anywhere.
 
 If the source file is in ComfyUI UI format, it is automatically
 converted to API format before the daemon reads it, via the same
 mechanism as `kritomatic comfyui convert`. The converted file lands
 under `<repo>/data/convert/<source_name>` and is what the panel config
 references; the source JSON is not modified or copied.
-
-Converted-path override in cmd_run
-==================================
-`_prepare_workflow_ref` converts a UI-format source on every
-invocation and returns the freshly-converted path. The config file's
-`workflow` field is what the batch would otherwise use, but that field
-is frozen at template-generation time and therefore goes stale as
-soon as the source is re-saved. `cmd_run` overrides `cfg.workflow`
-with the freshly-resolved path whenever `_prepare_workflow_ref`
-produced one, so a `panel run` on a config whose TOML still says
-`workflow = "NEWTekakutli45"` picks up the fresh conversion instead of
-loading the stale original.
-
-The override is skipped when the caller named no workflow
-(`_prepare_workflow_ref` was never called). That path — "run the only
-config on disk" — relies on the file's own `workflow` field.
 """
 
 from __future__ import annotations
@@ -186,6 +169,7 @@ def _prepare_workflow_ref(
     try:
         converted, records, was_converted = convert_if_ui(
             source, url=comfy_url or "http://127.0.0.1:8188",
+            annotate=False,
         )
     except ConversionError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -210,16 +194,9 @@ def _resolve_config_path(
     workflow_slug: Optional[str],
     json_path: Optional[Path] = None,
 ) -> tuple[Path, str]:
-    """Return (config_path, label).
-
-    Explicit slug or path → the config file lives at
-    ``<panel_configs>/<slug>.toml``.
-
-    No argument → fall back to the single config on disk if there is
-    exactly one, otherwise fail with a menu.
-    """
+    """Return (config_path, label). Config files are `<slug>.json`."""
     if workflow_slug:
-        config_path = CONFIG_DIR / f"{workflow_slug}.toml"
+        config_path = CONFIG_DIR / f"{workflow_slug}.json"
         if json_path is not None:
             label = f"file {json_path}"
         else:
@@ -314,9 +291,6 @@ def cmd_run(args) -> int:
             print(f"Error in {path}: {e}", file=sys.stderr)
             return 1
 
-        # Use the freshly-resolved workflow path from _prepare_workflow_ref
-        # rather than the config file's frozen `workflow` field. See the
-        # module docstring, "Converted-path override in cmd_run".
         if workflow_ref is not None:
             cfg.workflow = workflow_ref
 
@@ -395,7 +369,7 @@ def cmd_preset_apply(args) -> int:
 
     if args.workflow:
         slug, _ = _normalize_workflow_arg(args.workflow)
-        config_path = CONFIG_DIR / f"{slug}.toml"
+        config_path = CONFIG_DIR / f"{slug}.json"
     else:
         try:
             config_path, _label = _resolve_config_path(None)
@@ -565,7 +539,7 @@ def populate_panel_subcommands(sub) -> None:
     run_p.add_argument(
         'workflow', nargs='?', default=None,
         help='Workflow name, or a path to a workflow .json file. With a '
-             'name, uses panel_configs/<name>.toml and '
+             'name, uses panel_configs/<name>.json and '
              'workflows/<name>.json. With a path, reads the JSON from '
              'where it is. UI-format sources are auto-converted to API '
              'format. Defaults to the only config on disk if there is '
@@ -615,7 +589,7 @@ def populate_panel_subcommands(sub) -> None:
     )
     apply_p.add_argument(
         'name',
-        help='Preset name (bare filename in presets/, .toml optional).',
+        help='Preset name (bare filename in presets/, .json optional).',
     )
     apply_p.add_argument(
         'workflow', nargs='?', default=None,

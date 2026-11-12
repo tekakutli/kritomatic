@@ -51,6 +51,7 @@ Participants and ports
     segment      8773
     text_boxes   8771
     text_wall    8767
+    multimask    8776
 
 Each descriptor below supplies:
     name           hub registration name
@@ -134,6 +135,7 @@ from interceptor import interceptor_html, interceptor_server
 from segment     import segment_html, segment_server
 from text_boxes  import text_boxes_html, text_boxes_server
 from text_wall   import text_wall_html, text_wall_kra
+from multimask   import multimask_html, multimask_server
 
 
 GROUP_NAME = "core"
@@ -214,6 +216,16 @@ def _descriptors():
             "routes":         {"/generate-kra": text_wall_kra.generate},
             "raw_routes":     {},
             "module_sources": text_wall_html.module_sources(),
+        },
+        {
+            "name":           "multimask",
+            "module":         "multimask",
+            "port":           8776,
+            "html_file":      "multimask.html",
+            "html_render":    multimask_html.render,
+            "routes":         multimask_server.ROUTES,
+            "raw_routes":     multimask_server.RAW_ROUTES,
+            "module_sources": multimask_html.module_sources(),
         },
     ]
 

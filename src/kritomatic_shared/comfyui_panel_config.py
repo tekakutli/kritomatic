@@ -151,12 +151,44 @@ def read_config_file(path: Path) -> dict:
 
 
 def write_config_file(path: Path, data: dict) -> None:
-    """Write a JSON panel config file, creating parent dirs as needed."""
+    """Write a JSON panel config file atomically, creating parent dirs.
+
+    Writes to a sibling temp file, fsyncs, then os.replace()s onto the
+    target.  os.replace is atomic on POSIX (guaranteed same filesystem
+    by the sibling temp file) and on Windows.  A crash, full disk, or
+    Ctrl-C mid-write leaves the original file intact — never a
+    half-written JSON that fails to parse on the next comfy_load
+    autoload.
+
+    The original implementation used path.write_text, which truncates
+    the target first and writes second; a crash between those two steps
+    could leave the user's saved config at zero bytes.  This is the
+    standard write-to-temp-then-rename pattern.
+    """
+    import os
+    import tempfile
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+    text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=path.name + ".",
+        suffix=".tmp",
     )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # ============================================================================
@@ -341,50 +373,39 @@ def serialize_config(cfg: PanelConfig) -> dict:
 
 def extract_native_workflow(workflow: dict) -> dict:
     """Walk the graph for native slots: @-names, Primitive titles,
-    SaveImage nodes. Mirrors the daemon-side extractors in
-    comfyui_inspect.py, kept local so the CLI has no import dependency
-    on the daemon package.
+    SaveImage nodes.
+
+    Delegates to the three shared extractors in
+    `kritomatic_shared.comfyui_inspect` — the same functions the
+    daemon's `comfy_load` and the playground's `handle_inpaint` use.
+    Keeping the flat-name projection here (rather than the shared
+    module) lets the CLI template render without importing node ids,
+    which a human-edited template cannot use anyway.
+
+    Raises `ValueError` on a duplicate `@`-name or `_meta.title`,
+    matching the daemon's behaviour: a graph the CLI cannot render a
+    coherent template for is a graph the daemon will refuse to drive
+    via the native pipeline.
     """
-    resource_names: list[str] = []
-    resource_kinds: dict[str, str] = {}
-    param_titles: dict[str, str] = {}
-    has_output_node = False
+    from .comfyui_inspect import (
+        extract_output_nodes,
+        extract_param_slots,
+        extract_resource_slots,
+    )
 
-    _RESOURCE_CLASSES = {"LoadImage": "image", "LoadImageMask": "mask"}
-    _PARAM_CLASSES = {
-        "PrimitiveFloat": "float",
-        "PrimitiveInt": "int",
-        "PrimitiveString": "string",
-        "PrimitiveBoolean": "boolean",
-    }
-
-    for node in workflow.values():
-        cls = node.get("class_type", "")
-        ins = node.get("inputs", {}) or {}
-
-        kind = _RESOURCE_CLASSES.get(cls)
-        if kind:
-            val = ins.get("image")
-            if isinstance(val, str) and val.startswith("@"):
-                resource_names.append(val)
-                resource_kinds[val] = kind
-            continue
-
-        pkind = _PARAM_CLASSES.get(cls)
-        if pkind:
-            title = (node.get("_meta") or {}).get("title", "")
-            if isinstance(title, str) and title.strip():
-                param_titles[title] = pkind
-            continue
-
-        if cls == "SaveImage":
-            has_output_node = True
+    resources = extract_resource_slots(workflow)
+    params = extract_param_slots(workflow)
+    outputs = extract_output_nodes(workflow)
 
     return {
-        "resource_names": sorted(set(resource_names)),
-        "resource_kinds": resource_kinds,
-        "param_titles": param_titles,
-        "has_output_node": has_output_node,
+        "resource_names": sorted(resources.keys()),
+        "resource_kinds": {
+            name: slot["kind"] for name, slot in resources.items()
+        },
+        "param_titles": {
+            title: slot["kind"] for title, slot in params.items()
+        },
+        "has_output_node": bool(outputs),
     }
 
 
@@ -499,7 +520,11 @@ def build_file_template(workflow_ref: str) -> Optional[str]:
         )
         return None
 
-    return render_template_string(json_ref, workflow)
+    try:
+        return render_template_string(json_ref, workflow)
+    except ValueError as e:
+        print(f"Error: {path}: {e}", file=sys.stderr)
+        return None
 
 
 # ============================================================================

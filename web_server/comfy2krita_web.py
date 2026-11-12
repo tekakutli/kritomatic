@@ -20,6 +20,22 @@ only adds:
     the daemon last had in `_active_config`, not the in-progress
     widget state. That is fine for the web panel's use case (a viewer
     / controller, not an editor).
+
+CONFIG AUTO-APPLY (added)
+=========================
+The web panel now mirrors the Krita docker's config-field model:
+every edit to a config field (params, resources, crop, paste) fires
+one debounced `comfy_apply_config` with the four sections assembled
+from current widget state. That is what makes web-panel edits
+propagate to the daemon's `_active_config`, which is where
+`comfy_panel_run` (via `comfy_panel_run`'s fallback) and
+`comfy_save_config` read from on the daemon side, and which the
+docker's `syncValues` then picks up from the subsequent panel event.
+
+The debounce is 150 ms, matching the docker's timer exactly. It is
+flushed synchronously before any generic action (Save config, Load)
+and before Run, so an edit-then-click-within-150 ms sequence still
+runs with the panel's values, not the daemon's stale ones.
 """
 
 import json
@@ -44,7 +60,8 @@ from kritomatic.client import KritaClient
 
 
 HOST = os.environ.get("WEB_PANEL_HOST", "127.0.0.1")
-PORT = int(os.environ.get("WEB_PANEL_PORT", "8189"))
+# 8189 is comfy-api-proxy's port. Do not share it.
+PORT = int(os.environ.get("WEB_PANEL_PORT", "8190"))
 
 DAEMON_HOST = "localhost"
 DAEMON_PORT = 12346
@@ -466,9 +483,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         command = body.get("command")
         if not isinstance(command, dict) \
-                or command.get("type") != "comfy_generate":
+                or command.get("type") not in ("comfy_generate",
+                                               "comfy_panel_run"):
             self._send_error_json(
-                "'command' must be a comfy_generate command", status=400)
+                "'command' must be a comfy_generate or comfy_panel_run "
+                "command", status=400)
             return
 
         with _runs_lock:
@@ -1034,10 +1053,127 @@ function readAllValues() {
   return out;
 }
 
+/* ---- v2 config auto-apply (parity with the Krita docker) ----
+ *
+ * Config fields carry `config_path` and neither `set_command` nor a
+ * section-level `commit`, so the earlier branches of commitField
+ * never fire for them: edits sat in widget state and never reached
+ * the daemon's `_active_config`.  The Run button — whose daemon-side
+ * comfy_panel_run falls back to `_active_config` for omitted sections
+ * — therefore ran with whatever the Krita docker last applied, not
+ * what the web panel showed.
+ *
+ * Model: every config edit re-assembles the four sections from current
+ * widget state and POSTs one comfy_apply_config, debounced exactly like
+ * the docker's 150 ms timer.  The daemon validates the whole config at
+ * once against the loaded workflow's slot tables; per-field pushes
+ * would defeat that.
+ */
+const APPLY_DEBOUNCE_MS = 150;
+let _applyTimer = null;
+let _applyChain = Promise.resolve();
+
+function readConfigWidgetValue(el, spec) {
+  const t = spec.type;
+  if (t === "integer") {
+    const n = parseInt(el.value, 10);
+    return Number.isFinite(n) ? n : 0;
+  }
+  if (t === "number") {
+    const n = parseFloat(el.value);
+    return Number.isFinite(n) ? n : 0.0;
+  }
+  if (t === "toggle") return !!el.checked;
+  return el.value;
+}
+
+function buildConfigFromWidgets() {
+  const cfg = { resources: {}, params: {}, crop: {}, paste: {} };
+  for (const [key, spec] of app.specs.entries()) {
+    const path = spec.config_path;
+    if (!Array.isArray(path) || path.length === 0) continue;
+    const els = app.fields.get(key) || [];
+    if (els.length === 0) continue;
+    const value = readConfigWidgetValue(els[0], spec);
+    let d = cfg;
+    for (let i = 0; i < path.length - 1; i++) {
+      const step = path[i];
+      if (!(step in d) || typeof d[step] !== "object" || d[step] === null) {
+        d[step] = {};
+      }
+      d = d[step];
+    }
+    d[path[path.length - 1]] = value;
+  }
+  return cfg;
+}
+
+function _configFieldKeys() {
+  const keys = [];
+  for (const [key, spec] of app.specs.entries()) {
+    if (Array.isArray(spec.config_path) && spec.config_path.length) {
+      keys.push(key);
+    }
+  }
+  return keys;
+}
+
+function scheduleApply() {
+  if (_applyTimer !== null) clearTimeout(_applyTimer);
+  _applyTimer = setTimeout(() => {
+    _applyTimer = null;
+    _applyChain = _applyChain.then(flushApply, flushApply);
+  }, APPLY_DEBOUNCE_MS);
+}
+
+async function flushApply() {
+  const cfg = buildConfigFromWidgets();
+  const command = {
+    type: "comfy_apply_config",
+    resources: JSON.stringify(cfg.resources),
+    params:    JSON.stringify(cfg.params),
+    crop:      JSON.stringify(cfg.crop),
+    paste:     JSON.stringify(cfg.paste),
+  };
+  // [] for affectedKeys → a whole-config rejection does not paint every
+  // config field's error slot.  _configFieldKeys() for in-flight keys →
+  // syncValues will not overwrite mid-edit during the fetch.
+  return sendCommand("apply", command, [], _configFieldKeys());
+}
+
+async function flushPendingApply() {
+  // Drain any in-flight apply, then fire any pending timer, loop
+  // until both are clear.  Correctness: a config edit that lands
+  // during the await schedules a new timer; the loop's next iteration
+  // catches it.  A config edit that lands before flushPendingApply
+  // was called is either a pending timer (cancelled and re-fired with
+  // current widget state) or an in-flight apply (awaited).
+  while (true) {
+    if (_applyTimer !== null) {
+      clearTimeout(_applyTimer);
+      _applyTimer = null;
+      _applyChain = _applyChain.then(flushApply, flushApply);
+      continue;
+    }
+    if (_applyChain === null) return;
+    const p = _applyChain;
+    _applyChain = null;
+    try { await p; } catch (_) {}
+  }
+}
+
 function commitField(key) {
   const spec = app.specs.get(key);
   const section = app.sections.get(key);
   if (!spec || !section) return;
+
+  // v2 config fields: debounce a whole-config re-apply, matching the
+  // Krita docker's model.  See the "v2 config auto-apply" comment
+  // above for why this is a whole-config push, not per-field.
+  if (Array.isArray(spec.config_path) && spec.config_path.length) {
+    scheduleApply();
+    return;
+  }
 
   const sectionCommit = section.commit;
   let command = null;
@@ -1062,8 +1198,16 @@ function commitField(key) {
   app.commitQueue = app.commitQueue.then(doIt, doIt);
 }
 
-async function sendCommand(requestId, command, affectedKeys) {
-  for (const k of affectedKeys) {
+async function sendCommand(requestId, command, affectedKeys, inFlightKeys) {
+  // inFlightKeys controls what syncValues skips while the request is
+  // outstanding.  affectedKeys controls which fields get the error
+  // painted on failure.  They differ for the whole-config apply: every
+  // config field must be held in-flight during the fetch (so an
+  // arriving panel event from the daemon does not overwrite a value
+  // the user just typed), but the rejection message is generic and
+  // should not be copied onto every field's error slot.
+  const track = inFlightKeys !== undefined ? inFlightKeys : affectedKeys;
+  for (const k of track) {
     app.inFlight.add(k);
     const c = document.querySelector(`[data-field-container="${cssEsc(k)}"]`);
     if (c) c.classList.add("in-flight");
@@ -1078,17 +1222,17 @@ async function sendCommand(requestId, command, affectedKeys) {
       let msg = "HTTP " + resp.status;
       try { const b = await resp.json(); if (b && b.error) msg = b.error; } catch (_) {}
       for (const k of affectedKeys) setFieldError(k, msg);
-      revertFields(affectedKeys);
+      revertFields(track);
       return false;
     }
     for (const k of affectedKeys) setFieldError(k, "");
     return true;
   } catch (e) {
     for (const k of affectedKeys) setFieldError(k, "network error: " + e.message);
-    revertFields(affectedKeys);
+    revertFields(track);
     return false;
   } finally {
-    for (const k of affectedKeys) {
+    for (const k of track) {
       app.inFlight.delete(k);
       const c = document.querySelector(`[data-field-container="${cssEsc(k)}"]`);
       if (c) c.classList.remove("in-flight");
@@ -1143,14 +1287,26 @@ async function runAction(key) {
   const cancelAll = isCancelAllItem(item);
 
   if (key === "run") {
+    // Enrich the comfy_panel_run command with the current config
+    // sections assembled from widget state, matching what the Docker's
+    // _on_action handler does.  Without this, the daemon's
+    // comfy_panel_run falls back to _active_config, which is only as
+    // fresh as the last comfy_apply_config call.  If the web panel's
+    // debounce hadn't fired yet, that's stale — the daemon uses the
+    // Docker's values instead of the web panel's.
+    const cfg = buildConfigFromWidgets();
+    command.resources = JSON.stringify(cfg.resources);
+    command.params    = JSON.stringify(cfg.params);
+    command.crop      = JSON.stringify(cfg.crop);
+    command.paste     = JSON.stringify(cfg.paste);
+
     await startRun(command);
   } else if (key === "cancel" || cancelAll) {
     await cancelRun(command, cancelAll ? "all" : "current");
   } else {
-    // Load, Save config, and any other generic action go through
-    // /api/command. The daemon fills in config sections for
-    // comfy_save_config from _active_config if not supplied; for
-    // comfy_load the picker value was collected above.
+    // Save config (and any future generic action) reads _active_config
+    // on the daemon side.  Push pending edits first.
+    await flushPendingApply();
     const requestId = "action:" + key;
     await sendCommand(requestId, command, []);
   }
@@ -1194,6 +1350,11 @@ async function startRun(command) {
   setRunning(true);
   log.appendChild(rowDiv("hdr", "Starting run\u2026"));
 
+  // If the user edited a param and clicked Run within 150 ms, the
+  // debounce has not fired yet.  Fire it now and wait, so the daemon's
+  // _active_config reflects what the panel shows before comfy_panel_run
+  // reads it.
+  await flushPendingApply();
   try { await app.commitQueue; } catch (_) {}
 
   let resp;

@@ -656,6 +656,149 @@ def default_output_dir() -> Path:
 
 
 # ============================================================================
+#  Cache (sidecar + stat validation)
+# ============================================================================
+#
+# Re-converting on every comfy_load is wasteful: comfy-cli takes about a
+# second, and the workflow only changes when the user edits it. The
+# cache lives in convert_if_ui (the "convert if needed" entry point).
+# convert_workflow (the "convert now" worker) is unconditional, because
+# `kritomatic comfyui convert` is an explicit request to convert and
+# should never serve a cache.
+#
+# Validation is by sidecar, not by mtime alone. A sidecar of the form
+#   data/convert/foo.json.meta.json
+# records enough to prove the cached output was produced from *this*
+# source under *this* contract:
+#
+#   - converter_version: hand-bumped integer. Bump when the parsing
+#     contract in `_parse_api_graph_from_stdout` changes shape (e.g. a
+#     comfy-cli release that emits a different stdout wrapper). One
+#     integer bump invalidates every cache entry at once, which is the
+#     alternative to hunting down every stale output on disk.
+#   - source_path: absolute. /a/foo.json and /b/foo.json share a
+#     basename but must not share a cache slot, or one gets served the
+#     other's graph.
+#   - source_mtime, source_size: the source's identity at conversion
+#     time. Recording both and requiring both to match is strictly
+#     stronger than "output mtime > source mtime" — some editors
+#     preserve mtime across saves, and the mtime heuristic cannot
+#     catch that.
+#   - annotate, id_scheme: the two flags that change the *content* of
+#     the converted file. A caller asking for a different mode than
+#     the cache holds must re-convert.
+#   - records: handle records, so a cache hit can return them without
+#     re-running annotate_handles.
+#
+# A missing, unreadable, or mismatched sidecar counts as a miss and
+# triggers a re-convert. That is the safe default: pre-cache
+# deployments have no sidecar, so their first comfy_load after an
+# upgrade re-converts once, writes the sidecar, and from then on hits
+# the cache.
+
+CONVERTER_VERSION = 1
+
+
+def _cache_sidecar_path(out_path: Path) -> Path:
+    """Sidecar path: data/convert/foo.json → data/convert/foo.json.meta.json.
+
+    Suffixing rather than replacing the extension keeps the sidecar
+    visually paired with the file it describes, which matters for a
+    directory the user might inspect by hand.
+    """
+    return out_path.with_name(out_path.name + ".meta.json")
+
+
+def _read_cache_sidecar(out_path: Path,
+                        source_path: Path,
+                        id_scheme: str,
+                        annotate: bool,
+                        ) -> Optional[dict]:
+    """Return the sidecar dict if the cache is valid, else None.
+
+    Validity requires all of:
+
+      * the converted file exists,
+      * the sidecar exists and parses as a JSON object,
+      * its converter_version matches CONVERTER_VERSION,
+      * its annotate and id_scheme match what the caller asked for,
+      * its source_path matches the resolved source,
+      * its source_mtime and source_size match the source's current
+        stat.
+
+    Any failure returns None; the caller re-converts. An output file
+    in data/convert/ with no sidecar is treated as a miss — it is a
+    leftover from a pre-cache conversion (or a hand-placed file), not
+    a trusted entry.
+    """
+    if not out_path.is_file():
+        return None
+    sidecar_path = _cache_sidecar_path(out_path)
+    if not sidecar_path.is_file():
+        return None
+    try:
+        meta = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+
+    if meta.get("converter_version") != CONVERTER_VERSION:
+        return None
+    if meta.get("annotate") is not annotate:
+        return None
+    if meta.get("id_scheme") != id_scheme:
+        return None
+    if meta.get("source_path") != str(source_path):
+        return None
+
+    try:
+        src_stat = source_path.stat()
+    except OSError:
+        return None
+    if meta.get("source_mtime") != src_stat.st_mtime:
+        return None
+    if meta.get("source_size") != src_stat.st_size:
+        return None
+
+    return meta
+
+
+def _write_cache_sidecar(out_path: Path,
+                         source_path: Path,
+                         id_scheme: str,
+                         annotate: bool,
+                         records: list,
+                         ) -> None:
+    """Write the sidecar next to a freshly written converted file.
+
+    Best-effort: a failure to write the sidecar does not fail the
+    conversion. The next call will treat the cache as a miss (no
+    sidecar) and re-convert, which is exactly the pre-cache behaviour.
+    """
+    try:
+        src_stat = source_path.stat()
+    except OSError:
+        return
+    payload = {
+        "converter_version": CONVERTER_VERSION,
+        "annotate": annotate,
+        "id_scheme": id_scheme,
+        "source_path": str(source_path),
+        "source_mtime": src_stat.st_mtime,
+        "source_size": src_stat.st_size,
+        "records": list(records),
+    }
+    try:
+        _cache_sidecar_path(out_path).write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+# ============================================================================
 #  High-level entry point
 # ============================================================================
 
@@ -670,18 +813,27 @@ def convert_if_ui(source_path: Path,
     Behaviour:
 
       * If `source_path` is already API format, returns it unchanged:
-        ``(source_path, [], False)``. No subprocess is spawned.
+        ``(source_path, [], False)``. No subprocess is spawned, no
+        cache is consulted.
 
-      * If it is UI format, the workflow is converted and the result
-        is written to ``<repo>/data/convert/<source_name>``. The file
-        is overwritten on each call, so a source edited between runs
-        produces a fresh conversion. Returns
-        ``(converted_path, records, True)``.
+      * If it is UI format, the workflow is converted (once) and the
+        result is written to ``<repo>/data/convert/<source_name>``,
+        with a sidecar at ``<source_name>.meta.json``. A subsequent
+        call with the same source, same annotate/id_scheme flags, and
+        an unchanged source file returns the cached result without
+        spawning a subprocess. Both the fresh and the cached case
+        return ``(converted_path, records, True)``.
 
     `annotate` propagates to `convert_workflow`: `True` (the CLI
     default) injects `{{handle_id}}` tokens; `False` (the daemon's
     auto-conversion path) leaves `@`-prefixed resources and hardcoded
-    filenames verbatim.
+    filenames verbatim. `annotate` and `id_scheme` are part of the
+    cache key — an entry written under one mode is never served to a
+    caller asking for the other.
+
+    `convert_workflow` (the lower-level worker) is deliberately
+    uncached: `kritomatic comfyui convert` calls it directly, and an
+    explicit convert request should always convert.
 
     Raises ConversionError when the file cannot be read or the
     conversion fails. The caller decides whether that is fatal. Both
@@ -702,8 +854,19 @@ def convert_if_ui(source_path: Path,
         return source_path, [], False
 
     out_path = default_output_dir() / source_path.name
+
+    meta = _read_cache_sidecar(out_path, source_path, id_scheme, annotate)
+    if meta is not None:
+        records = meta.get("records")
+        if not isinstance(records, list):
+            records = []
+        return out_path, records, True
+
     converted, records = convert_workflow(
         source_path, out_path,
         url=url, id_scheme=id_scheme, annotate=annotate,
+    )
+    _write_cache_sidecar(
+        converted, source_path, id_scheme, annotate, records,
     )
     return converted, records, True

@@ -28,6 +28,14 @@ Autoload on comfy_load
 `comfy_load` autoloads `panel_configs/<slug>.json` if it exists. The
 providers here read `_active_config` to populate field values, so
 autoloaded values appear in the panel with no extra work on this side.
+
+Slot extraction failure
+=======================
+When `comfy_load` could not extract slots (duplicate @-name or
+`_meta.title`), the panel has no fields to render, but it is not
+broken — the graph is loaded.  `WorkflowMetadataProvider` renders a
+red "Slot error" line so the user sees *why* the form is empty
+instead of a silently blank panel.
 """
 
 from __future__ import annotations
@@ -154,8 +162,8 @@ class WorkflowPickerProvider:
 
 
 class WorkflowMetadataProvider:
-    """Workflow identity, source, output-node count, active-batch
-    count. Rendered only when a workflow is loaded."""
+    """Workflow identity, source, output-node count, slot error,
+    active-batch count. Rendered only when a workflow is loaded."""
 
     def contribute(self, builder, ctx):
         status = ctx.get("comfy_status") or {}
@@ -178,6 +186,12 @@ class WorkflowMetadataProvider:
                 "label": "Output nodes",
                 "value": str(len(output_nodes)),
                 "emphasis": "dim",
+            })
+        if status.get("workflow_slot_error"):
+            fields.append({
+                "label": "Slot error",
+                "value": status["workflow_slot_error"],
+                "emphasis": "danger",
             })
         active_batches = status.get("active_batches") or []
         if active_batches:

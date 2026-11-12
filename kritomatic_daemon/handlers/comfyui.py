@@ -65,6 +65,16 @@ consumes `_active_config` for the native v2 pipeline.
 Both `_active_config` and the three slot tables are cleared on any
 workflow change (via `_set_active_workflow`) so a stale config can
 never accidentally apply to the wrong workflow.
+
+Slot extraction failures
+========================
+When `comfy_load` cannot extract slots (duplicate `@`-name or
+`_meta.title`), the workflow still loads — the graph is valid for
+ComfyUI — but the three slot tables stay empty and the native
+pipeline cannot drive the graph.  `_active_workflow_slot_error`
+carries the extractor's message so `comfy_status` (and, through it,
+the panel description) can show *why* the panel is empty instead of
+silently rendering a form with no fields.
 """
 
 from __future__ import annotations
@@ -78,9 +88,9 @@ from .comfyui_types import (
     _load_recent_aliases,
 )
 from .comfyui_inspect import (
-    _extract_output_nodes,
-    _extract_param_slots,
-    _extract_resource_slots,
+    extract_output_nodes,
+    extract_param_slots,
+    extract_resource_slots,
 )
 from .comfyui_connection import ConnectionCommands
 from .comfyui_workflow import WorkflowCommands
@@ -115,6 +125,13 @@ class ComfyUIHandler(AutoDispatchHandler):
         self._active_workflow_resource_slots: dict = {}
         self._active_workflow_param_slots: dict = {}
         self._active_workflow_output_nodes: dict = {}
+        # Set when comfy_load's slot extraction raised (duplicate
+        # @-name or _meta.title).  The workflow still loads — the panel
+        # just has no configurable slots — but the message is surfaced
+        # in comfy_status and in the panel description, so the user
+        # sees *why* the panel is empty instead of a silently blank
+        # form.
+        self._active_workflow_slot_error: Optional[str] = None
         # Normalized panel config. Populated by comfy_apply_config,
         # consumed by comfy_generate. None = not configured.
         self._active_config: Optional[dict] = None
@@ -173,9 +190,9 @@ class ComfyUIHandler(AutoDispatchHandler):
         (comfy_load) surfaces as a load error — an ambiguous graph is
         not loadable via the native pipeline.
         """
-        self._active_workflow_resource_slots = _extract_resource_slots(graph)
-        self._active_workflow_param_slots = _extract_param_slots(graph)
-        self._active_workflow_output_nodes = _extract_output_nodes(graph)
+        self._active_workflow_resource_slots = extract_resource_slots(graph)
+        self._active_workflow_param_slots = extract_param_slots(graph)
+        self._active_workflow_output_nodes = extract_output_nodes(graph)
 
     def _clear_native_slots(self) -> None:
         self._active_workflow_resource_slots = {}
@@ -191,9 +208,12 @@ class ComfyUIHandler(AutoDispatchHandler):
         # Native slots + config are per-workflow. Best-effort
         # extraction: a duplicate-title graph still loads, but the
         # native slots stay empty and comfy_apply_config will reject
-        # everything.
+        # everything.  The extractor's message is kept so comfy_status
+        # and the panel description can surface it.
+        self._active_workflow_slot_error = None
         try:
             self._populate_native_slots(graph)
-        except ValueError:
+        except ValueError as e:
+            self._active_workflow_slot_error = str(e)
             self._clear_native_slots()
         self._active_config = None

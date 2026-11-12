@@ -140,6 +140,9 @@ from pg_comfy import (
     ComfyClient, ComfyError,
     get_client, reset_client, cached_object_info,
     ProxyV2, ProxyHTTPError, ProxyUnreachable,
+    extract_resource_slots,
+    extract_param_slots,
+    substitute_into_graph,
 )
 from pg_comfy.image import make_encoded_image
 
@@ -252,95 +255,6 @@ def _gc_intercepts():
                  and e["status"] != "pending"]
         for tid in stale:
             del _intercepts[tid]
-
-
-# ---------------------------------------------------------------------------
-#  Graph slot extraction
-# ---------------------------------------------------------------------------
-#
-# Mirrors the daemon's comfyui_inspect extractors.  Kept as a local
-# duplicate because the playground cannot import kritomatic_daemon
-# (that package imports krita at import time).
-
-_RESOURCE_NODE_FIELDS = {
-    "LoadImage": "image",
-    "LoadImageMask": "image",
-}
-
-_PARAM_NODE_CLASSES = {
-    "PrimitiveFloat": "float",
-    "PrimitiveInt": "int",
-    "PrimitiveString": "string",
-    "PrimitiveBoolean": "boolean",
-}
-
-
-def _extract_resource_slots(graph: dict) -> dict:
-    out: dict = {}
-    for node_id, node in graph.items():
-        cls = node.get("class_type", "")
-        field = _RESOURCE_NODE_FIELDS.get(cls)
-        if field is None:
-            continue
-        inputs = node.get("inputs", {}) or {}
-        value = inputs.get(field)
-        if not isinstance(value, str) or not value.startswith("@"):
-            continue
-        out[value] = {
-            "node_id": node_id,
-            "input_field": field,
-            "kind": "mask" if cls == "LoadImageMask" else "image",
-        }
-    return out
-
-
-def _extract_param_slots(graph: dict) -> dict:
-    out: dict = {}
-    for node_id, node in graph.items():
-        cls = node.get("class_type", "")
-        kind = _PARAM_NODE_CLASSES.get(cls)
-        if kind is None:
-            continue
-        title = (node.get("_meta") or {}).get("title", "")
-        if not isinstance(title, str) or not title.strip():
-            continue
-        out[title] = {"node_id": node_id, "kind": kind}
-    return out
-
-
-def _substitute_into_graph(graph: dict,
-                           resource_slots: dict,
-                           param_slots: dict,
-                           asset_refs: dict,
-                           param_values: dict) -> dict:
-    """Two-level copy + substitutions.  Same rules as the daemon's
-    comfy_apply._substitute_into_graph, minus seed handling (the
-    playground wants per-run random seeds, which it passes in via
-    `param_values["seed"]`)."""
-    prepared = {
-        node_id: {
-            **node,
-            "inputs": dict(node.get("inputs") or {}),
-        }
-        for node_id, node in graph.items()
-    }
-
-    for title, value in param_values.items():
-        slot = param_slots.get(title)
-        if slot is None:
-            continue
-        prepared[slot["node_id"]]["inputs"]["value"] = value
-
-    for name, asset in asset_refs.items():
-        slot = resource_slots.get(name)
-        if slot is None:
-            continue
-        prepared[slot["node_id"]]["inputs"][slot["input_field"]] = {
-            "__type": "core/ASSET",
-            "info": {"id": asset["id"]},
-        }
-
-    return prepared
 
 
 # ---------------------------------------------------------------------------
@@ -503,8 +417,8 @@ def handle_inpaint(payload: dict) -> dict:
 
     # ---- 3. Extract slots ----
     try:
-        resource_slots = _extract_resource_slots(graph)
-        param_slots = _extract_param_slots(graph)
+        resource_slots = extract_resource_slots(graph)
+        param_slots = extract_param_slots(graph)
     except ValueError as e:
         return {"success": False,
                 "message": f"workflow slot extraction failed: {e}"}
@@ -554,27 +468,30 @@ def handle_inpaint(payload: dict) -> dict:
     # docker carries over to the playground's inpaint — without the
     # playground having to know which params exist on which workflow.
     #
-    # `prompt` and `seed` are playground-owned by design: the prompt is
-    # what the user typed in the playground's own textarea, and the
-    # seed must be fresh per run (the daemon's config never stores a
-    # seed — that's a top-level field, not a `[params]` key — so
-    # `daemon_params.get("seed")` is normally absent anyway; the
-    # override is for the rare case where a workflow has a Primitive
-    # titled "seed" whose default leaked into the config via a
-    # hand-edited TOML).
+    # `prompt` is playground-owned by design: it is what the user typed
+    # in the playground's own textarea.  `seed` is passed via the
+    # `seed=` keyword on `substitute_into_graph` rather than merged
+    # into `param_values`, so the shared function applies its usual
+    # "only override seed if the workflow declares a seed slot" rule
+    # without the playground re-implementing it.
     daemon_params = _fetch_daemon_params()
     seed = int(time.time() * 1000) & 0xFFFFFFFF
     param_values = dict(daemon_params)
     param_values["prompt"] = prompt
-    param_values["seed"] = seed
     # Drop anything the loaded workflow doesn't actually expose as a
-    # param slot.  Avoids passing unknown titles to _substitute_into_graph
-    # (which no-ops on them anyway, but the log line is clearer).
+    # param slot.  `substitute_into_graph` would no-op on unknown titles
+    # anyway, but the pre-filter keeps the `_log` line below honest
+    # about which params are actually being substituted.
     param_values = {k: v for k, v in param_values.items() if k in param_slots}
 
-    prepared = _substitute_into_graph(
-        graph, resource_slots, param_slots, asset_refs, param_values,
-    )
+    try:
+        prepared = substitute_into_graph(
+            graph, resource_slots, param_slots, asset_refs, param_values,
+            seed=seed,
+        )
+    except ValueError as e:
+        return {"success": False,
+                "message": f"workflow substitution failed: {e}"}
 
     _log(f"inpaint: workflow={workflow!r} prompt={prompt[:40]!r} "
          f"seed={seed} params={sorted(param_values)} "

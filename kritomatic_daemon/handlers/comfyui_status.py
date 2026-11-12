@@ -42,13 +42,21 @@ class StatusCommands(AutoDispatchHandler):
                 "workflow_source": parent._active_workflow_source,
 
                 # Native-v2 slot tables. Empty when the workflow has no
-                # native inputs (e.g. legacy ETN_* graphs).
+                # native inputs (e.g. legacy ETN_* graphs) or when
+                # extraction failed on duplicate names/titles.
                 "workflow_resource_slots":
                     dict(parent._active_workflow_resource_slots),
                 "workflow_param_slots":
                     dict(parent._active_workflow_param_slots),
                 "workflow_output_nodes":
                     dict(parent._active_workflow_output_nodes),
+                # Set when comfy_load's slot extraction raised.  The
+                # workflow is loaded and valid for ComfyUI, but the
+                # native pipeline has no slots to drive.  The panel
+                # renders this as a red "Slot error" line so the empty
+                # form has an explanation.
+                "workflow_slot_error":
+                    parent._active_workflow_slot_error,
                 "config": (
                     dict(parent._active_config)
                     if parent._active_config is not None else None

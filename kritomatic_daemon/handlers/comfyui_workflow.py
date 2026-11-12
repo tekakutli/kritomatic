@@ -17,6 +17,15 @@ If a saved panel config exists at
 migration), it is applied via `comfy_apply_config` automatically
 after the workflow loads. Structural problems are logged as warnings
 in the response; they do not fail the load.
+
+Slot extraction failures
+========================
+If the graph is loaded successfully but slot extraction fails
+(duplicate @-name or _meta.title), `comfy_load` surfaces the
+extractor's message in the response and skips the config autoload —
+the saved config would fail validation against empty slot tables,
+producing a redundant "config autoload rejected" warning on top of
+the real error.
 """
 
 from __future__ import annotations
@@ -151,6 +160,28 @@ class WorkflowCommands(AutoDispatchHandler):
             result_data["converted"] = True
             result_data["converted_from"] = str(path)
             result_data["converted_path"] = str(converted_path)
+
+        # ---- Slot extraction failure ----
+        #
+        # The graph loaded (ComfyUI will accept it), but the native-v2
+        # slot tables are empty because two nodes share an @-name or
+        # a _meta.title.  Surface that here and skip the autoload
+        # below — comfy_apply_config would reject every saved entry
+        # against empty slot tables, producing a redundant error on
+        # top of the real one.
+        if parent._active_workflow_slot_error:
+            result_data["slot_error"] = parent._active_workflow_slot_error
+            msg = (
+                f"Loaded workflow {display_name!r} "
+                f"({len(workflow)} nodes) \u2014 "
+                f"slot extraction failed: "
+                f"{parent._active_workflow_slot_error}"
+            )
+            return {
+                "success": True,
+                "message": msg,
+                "data": result_data,
+            }
 
         # ---- Autoload saved panel config ----
         autoload_warnings: list[str] = []

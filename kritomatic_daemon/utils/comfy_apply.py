@@ -31,7 +31,8 @@ Design notes
   * The graph is deep-copied at the node level (fresh ``inputs`` dict
     per node) before substitution, so the caller's
     ``_active_workflow_graph`` is never mutated by a single
-    substitution's failure.
+    substitution's failure.  (The copy lives in the shared
+    `substitute_into_graph` function; this module does not touch it.)
 
   * A resource slot with no config entry is an error, not a warning:
     leaving a ``@``-prefixed literal in the graph means ComfyUI tries
@@ -60,6 +61,7 @@ from .comfyui_krita import (
     read_selection_mask,
 )
 from .comfyui_krita import EncodedImage
+from .comfyui_substitute import substitute_into_graph
 
 
 Bounds = tuple[int, int, int, int]
@@ -125,9 +127,9 @@ def prepare_workflow(doc,
     )
     asset_refs = _upload_resource_blobs(blobs, proxy_client)
 
-    prepared_graph = _substitute_into_graph(
+    prepared_graph = substitute_into_graph(
         graph, resource_slots, param_slots,
-        asset_refs, config["params"], seed,
+        asset_refs, config["params"], seed=seed,
     )
 
     return PreparedWorkflow(
@@ -264,51 +266,3 @@ def _upload_resource_blobs(blobs: dict[str, EncodedImage],
             ) from e
         refs[name] = asset
     return refs
-
-
-def _substitute_into_graph(graph: dict,
-                           resource_slots: dict,
-                           param_slots: dict,
-                           asset_refs: dict[str, dict],
-                           param_values: dict,
-                           seed: Optional[int]) -> dict:
-    """Return a node-level deep copy of `graph` with substitutions.
-
-    Param substitutions come first (cheap; may be skipped if the title
-    is not in the config). Seed overrides the ``seed`` param if the
-    slot exists. Resource substitutions inject ``core/ASSET`` refs.
-    """
-    prepared = {
-        node_id: {
-            **node,
-            "inputs": dict(node.get("inputs") or {}),
-        }
-        for node_id, node in graph.items()
-    }
-
-    effective_params = dict(param_values)
-    if seed is not None and "seed" in param_slots:
-        effective_params["seed"] = seed
-
-    for title, slot in param_slots.items():
-        if title not in effective_params:
-            continue
-        node = prepared[slot["node_id"]]
-        node["inputs"]["value"] = effective_params[title]
-
-    for name, slot in resource_slots.items():
-        asset = asset_refs.get(name)
-        if asset is None:
-            # Should be unreachable — _read_resource_blobs already
-            # rejects a slot with no config entry. Defensive.
-            raise ValueError(
-                f"resource {name!r} has a slot but no uploaded asset"
-            )
-        node = prepared[slot["node_id"]]
-        field = slot["input_field"]
-        node["inputs"][field] = {
-            "__type": "core/ASSET",
-            "info": {"id": asset["id"]},
-        }
-
-    return prepared

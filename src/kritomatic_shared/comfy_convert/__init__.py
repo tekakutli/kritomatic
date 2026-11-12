@@ -14,6 +14,9 @@ Re-exported symbols:
     convert_workflow   the lower-level worker: unconditionally convert
                        a UI-format source; raises if source is API
     is_ui_format       detect UI format without parsing deeper
+    default_output_dir returns (and creates) <repo>/data/convert/, the
+                       directory `convert_if_ui` writes converted files
+                       to by default
 """
 
 from .convert import (
@@ -21,6 +24,7 @@ from .convert import (
     DEFAULT_COMFY_URL,
     convert_if_ui,
     convert_workflow,
+    default_output_dir,
     is_ui_format,
 )
 
@@ -29,5 +33,6 @@ __all__ = [
     "DEFAULT_COMFY_URL",
     "convert_if_ui",
     "convert_workflow",
+    "default_output_dir",
     "is_ui_format",
 ]

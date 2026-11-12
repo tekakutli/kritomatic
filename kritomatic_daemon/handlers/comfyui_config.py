@@ -328,12 +328,20 @@ class ConfigCommands(AutoDispatchHandler):
     @command(
         category="comfyui",
         help_text="Connect (auto-starting the proxy), apply the supplied "
-                  "panel config, then generate.",
+                  "panel config, then generate.  Sections omitted from "
+                  "the call fall back to the daemon's current "
+                  "_active_config, and the response notes which sections "
+                  "used the fallback.",
         args={
-            "--resources": {"type": "str", "default": "{}"},
-            "--params": {"type": "str", "default": "{}"},
-            "--crop": {"type": "str", "default": "{}"},
-            "--paste": {"type": "str", "default": "{}"},
+            "--resources": {"type": "str", "required": False,
+                            "help": "JSON object. Omit to use "
+                                    "_active_config's current value."},
+            "--params": {"type": "str", "required": False,
+                         "help": "JSON object. Omit to use current."},
+            "--crop": {"type": "str", "required": False,
+                       "help": "JSON object. Omit to use current."},
+            "--paste": {"type": "str", "required": False,
+                        "help": "JSON object. Omit to use current."},
             "--timeout": {"type": "float", "default": 55.0},
             "--count": {"type": "int", "default": 1},
             "--seed": {"type": "int", "required": False},
@@ -349,6 +357,11 @@ class ConfigCommands(AutoDispatchHandler):
             "port": parent._port,
             "check": False,
         })
+        if not isinstance(conn, dict):
+            return {
+                "success": False,
+                "message": f"comfy_connect returned non-dict: {conn!r}",
+            }
         if not conn.get("success"):
             return {
                 "success": False,
@@ -358,13 +371,40 @@ class ConfigCommands(AutoDispatchHandler):
                 ),
             }
 
-        apply_params = {
-            "resources": params.get("resources", "{}"),
-            "params": params.get("params", "{}"),
-            "crop": params.get("crop", "{}"),
-            "paste": params.get("paste", "{}"),
-        }
+        # Presence check ("is this key in params?") rather than
+        # value check ("is it empty?"), because a caller that
+        # explicitly sends `"resources": "{}"` means "apply empty
+        # resources" — it cleared them on purpose.  A caller that
+        # omits the key entirely means "I don't care, use what
+        # _active_config already has".  The web panel's Run button
+        # and the Docker's Run button both always supply all four
+        # sections (assembled from current widget state); only the
+        # schema-based CLI path `kritomatic comfyui comfy_panel_run`
+        # can omit them.  That CLI path is what the args schema
+        # above enables: with no `default: "{}"`, an unsupplied
+        # section is truly absent from `params`, so the fallback
+        # fires.
+        active = parent._active_config or {}
+        apply_params = {}
+        fallback_keys: list[str] = []
+        for key in ("resources", "params", "crop", "paste"):
+            if key in params:
+                apply_params[key] = params[key]
+            else:
+                value = active.get(key) or {}
+                if isinstance(value, str):
+                    apply_params[key] = value
+                else:
+                    apply_params[key] = json.dumps(value)
+                fallback_keys.append(key)
+
         apply_result = self.comfy_apply_config(apply_params)
+        if not isinstance(apply_result, dict):
+            return {
+                "success": False,
+                "message": f"comfy_apply_config returned non-dict: "
+                           f"{apply_result!r}",
+            }
         if not apply_result.get("success"):
             return apply_result
 
@@ -379,7 +419,19 @@ class ConfigCommands(AutoDispatchHandler):
         if params.get("_batch_id"):
             gen_params["_batch_id"] = params.get("_batch_id")
 
-        return parent._generation_cmds.comfy_generate(gen_params)
+        gen_result = parent._generation_cmds.comfy_generate(gen_params)
+
+        if fallback_keys and isinstance(gen_result, dict):
+            note = (f" (used _active_config for "
+                    f"{', '.join(fallback_keys)})")
+            gen_result["message"] = (
+                (gen_result.get("message") or "") + note
+            )
+            data = gen_result.get("data")
+            if isinstance(data, dict):
+                data["fallback_sections"] = list(fallback_keys)
+
+        return gen_result
 
     # ------------------------------------------------------------------
     #  comfy_save_config
@@ -439,7 +491,9 @@ class ConfigCommands(AutoDispatchHandler):
 
         # Lazy import — sys.path bootstrap only runs when this command
         # is actually used, not at handler construction.
-        from ..utils.panel_config import CONFIG_DIR, read_config_file
+        from ..utils.panel_config import (
+            CONFIG_DIR, read_config_file, write_config_file,
+        )
 
         workflow_name = parent._active_workflow_name
         path = CONFIG_DIR / f"{workflow_name}.json"
@@ -470,11 +524,7 @@ class ConfigCommands(AutoDispatchHandler):
             file_data["_notes"] = existing["_notes"]
 
         try:
-            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(file_data, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
+            write_config_file(path, file_data)
         except OSError as e:
             return {"success": False,
                     "message": f"could not write {path}: {e}"}

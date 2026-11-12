@@ -1,12 +1,14 @@
 """Shared ComfyUI client + tooling for the browser playgrounds.
 
-Three modules now live in `kritomatic_shared`, under `<repo>/src/`, so
+Four modules now live in `kritomatic_shared`, under `<repo>/src/`, so
 the daemon and the playgrounds share one copy of each:
 
     comfyui_client.py        HTTP + WebSocket client  (setup.py dep:
                              websockets>=12, needed by generate*)
     comfyui_proxy_client.py  Comfy API v2 client       (pure stdlib)
     comfyui_tooling.py       ETN_* rewrite, expand_custom  (pure stdlib)
+    comfyui_inspect.py       native-v2 slot extractors (pure stdlib)
+    comfyui_substitute.py    resource + param substitution (pure stdlib)
 
 This package's `client.py`, `proxy_client.py`, and `tooling.py` are
 now backwards-compatibility shims that re-export from shared.
@@ -73,6 +75,15 @@ from kritomatic_shared.comfyui_tooling import (  # noqa: E402
     expand_custom,
     scan_requirements,
 )
+from kritomatic_shared.comfyui_inspect import (  # noqa: E402
+    extract_resource_slots,
+    extract_param_slots,
+    extract_output_nodes,
+    extract_all_slots,
+)
+from kritomatic_shared.comfyui_substitute import (  # noqa: E402
+    substitute_into_graph,
+)
 
 
 # ============================================================================
@@ -125,6 +136,11 @@ __all__ = [
     "ExpansionError",
     "expand_custom",
     "scan_requirements",
+    "extract_resource_slots",
+    "extract_param_slots",
+    "extract_output_nodes",
+    "extract_all_slots",
+    "substitute_into_graph",
     "cached_object_info",
     "image",
     "ProxyV2",

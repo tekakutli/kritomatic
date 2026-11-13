@@ -7,6 +7,8 @@ Routes:
   POST /comfy/interrupt        forward POST /interrupt to ComfyUI
   GET  /comfy/status           preflight (ComfyUI reachability)
   POST /comfy/active_state     daemon comfy_status (workflow + config)
+  POST /comfy/current_prompt   read `_active_config["params"]["prompt"]`
+                               (the docker / web panel's shared prompt)
   POST /krita/resource_image   resolve a `{source, layer_name}` spec to
                                a PNG data URL (used by the @thecanvas
                                auto-sync poller)
@@ -28,6 +30,31 @@ queries `comfy_status` to learn the current name, then:
     to it.
   * Otherwise (explicit name matches current, or no explicit name),
     no reload happens.
+
+PROMPT RESOLUTION
+=================
+The inpaint prompt is a *participant* in the daemon's shared state
+(`_active_config["params"]["prompt"]`), the same slot the docker and
+web panel edit via `comfy_apply_config`.  Three cases:
+
+  · Non-empty playground prompt
+        `comfy_set_param name="prompt"` overwrites the shared state for
+        this run and subsequent runs.
+
+  · Empty playground prompt
+        `comfy_set_param` is omitted entirely, so the workflow uses
+        whatever the docker / web panel last set — or the workflow's
+        own `Primitive*` default if neither has set one.
+
+  · Empty playground + empty shared state
+        The workflow's default `PrimitiveString` value is used.
+
+The `/comfy/current_prompt` route lets the playground panel *read* the
+shared prompt on boot, so the user sees the same prompt the docker and
+web panel are using without having to retype it.  The prompt field on
+the playground is initialised from that read, but a non-empty value
+already present wins (so a typed prompt, a remote-client patch, or a
+prior session's value is never silently replaced by hydration).
 
 @thecanvas auto-sync
 ====================
@@ -139,16 +166,8 @@ def _fetch_active_state() -> dict:
     return resp.get("data") or {}
 
 
-def _fetch_active_workflow() -> tuple[Optional[str], str]:
-    data = _fetch_active_state()
-    name = data.get("workflow")
-    if not isinstance(name, str) or not name:
-        return None, "no workflow loaded"
-    return name, ""
-
-
 # ---------------------------------------------------------------------------
-#  /comfy/status, /comfy/active_state
+#  /comfy/status, /comfy/active_state, /comfy/current_prompt
 # ---------------------------------------------------------------------------
 
 def handle_status(_payload) -> dict:
@@ -175,6 +194,38 @@ def handle_status(_payload) -> dict:
 def handle_active_state(_payload) -> dict:
     data = _fetch_active_state()
     return {"success": True, "data": data}
+
+
+def handle_current_prompt(_payload) -> dict:
+    """Return the prompt currently stored in the daemon's _active_config.
+
+    Used by the playground on boot: if the user has not written a
+    prompt of their own, the panel shows the shared-state prompt so
+    they can see / edit what the docker and the web panel are working
+    with.  A non-empty playground prompt on submit overrides the
+    shared state via `comfy_set_param` (see `handle_inpaint`); an
+    empty one leaves the shared state alone.
+
+    The prompt lives in `_active_config["params"]["prompt"]`, which is
+    populated by `comfy_apply_config` (the docker's per-config push
+    and the web panel's debounced push).  If neither has fired for the
+    current workflow — a fresh `comfy_load` with no saved config, or
+    the CLI path without --params — `_active_config` is None, and
+    this returns an empty string.  ComfyUI then uses the workflow's
+    own `Primitive*` node value, which is the right default.
+    """
+    data = _fetch_active_state()
+    cfg = data.get("config")
+    if not isinstance(cfg, dict):
+        return {"success": True, "prompt": ""}
+    params = cfg.get("params")
+    if not isinstance(params, dict):
+        return {"success": True, "prompt": ""}
+    value = params.get("prompt")
+    return {
+        "success": True,
+        "prompt": value if isinstance(value, str) else "",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -215,26 +266,7 @@ def handle_inpaint(payload: dict) -> dict:
     selection_b64 = payload.get("selection_b64")
     context_b64   = payload.get("context_b64")
     prompt        = payload.get("prompt", "") or ""
-
-    explicit = payload.get("workflow")
-    current, workflow_err = _fetch_active_workflow()
-
-    if explicit:
-        workflow = explicit
-        need_load = (explicit != current)
-    elif current:
-        workflow = current
-        need_load = False
-    else:
-        return {
-            "success": False,
-            "message": (
-                f"Cannot determine active workflow ({workflow_err}).  "
-                f"Load one first: in the docker's Workflow picker, or "
-                f"via `kritomatic comfyui comfy_load --name <name>`.  "
-                f"Or pass an explicit `workflow` in the request body."
-            ),
-        }
+    workflow      = payload.get("workflow") or DEFAULT_WORKFLOW
 
     try:
         timeout = float(payload.get("timeout", INPAINT_TIMEOUT))
@@ -250,6 +282,7 @@ def handle_inpaint(payload: dict) -> dict:
         return {"success": False,
                 "message": "canvas_b64, selection_b64, context_b64 are required"}
 
+    # --- crop canvas + selection to the context rectangle ---
     try:
         bbox = _context_bbox(context_b64)
         canvas_b64    = _crop_b64_png(canvas_b64, bbox)
@@ -275,36 +308,44 @@ def handle_inpaint(payload: dict) -> dict:
         if images:
             captured["image_b64"] = images[0]
 
-    generate_cmd = {
-        "type": "comfy_generate",
-        "timeout": 55.0,
-        "output_rotation": output_rotation,
-        "output_offset_x": bbox[0],
-        "output_offset_y": bbox[1],
-    }
-
+    # --- batch construction ---
+    #
+    # The prompt is treated as an *override* on the daemon's shared
+    # state.  `comfy_set_param name="prompt"` writes into
+    # `_active_config["params"]["prompt"]`, the same slot the docker
+    # and the web panel edit via `comfy_apply_config`.  A non-empty
+    # playground prompt overwrites it for this run and for subsequent
+    # runs; an empty playground prompt omits `comfy_set_param`
+    # entirely, so the workflow uses whatever the docker / web panel
+    # last set (or the workflow default if neither has set one).
+    # Sending `comfy_set_param` with an empty value would CLEAR the
+    # shared prompt, which is not what "the playground has no prompt"
+    # should mean.
     commands = [
-        {"type": "comfy_connect", "check": False},
-    ]
-    if need_load:
-        commands.append(
-            {"type": "comfy_load", "name": workflow, "exclusive": True}
-        )
-    commands.extend([
+        {"type": "comfy_load", "name": workflow, "exclusive": True},
         {"type": "comfy_set_layer_pixels", "name": "thecanvas",
          "image_b64": canvas_b64, "is_mask": False},
         {"type": "comfy_set_layer_pixels", "name": "theselection",
          "image_b64": selection_b64, "is_mask": True},
         {"type": "comfy_set_layer_pixels", "name": "thecontext",
          "image_b64": context_b64, "is_mask": True},
-        {"type": "comfy_set_param", "name": "prompt", "value": prompt},
-        generate_cmd,
-    ])
+    ]
+    if prompt and prompt.strip():
+        commands.append(
+            {"type": "comfy_set_param", "name": "prompt", "value": prompt}
+        )
+    else:
+        _log("inpaint: no playground prompt; using shared-state prompt "
+             "(docker / web panel), or the workflow default if unset")
+    commands.append({
+        "type": "comfy_generate", "timeout": 55.0,
+        "output_rotation": output_rotation,
+        "no_paste": True,
+    })
     batch = {"id": batch_id, "commands": commands}
 
-    _log(f"inpaint batch {batch_id}: workflow={workflow!r} "
-         f"reload={need_load} prompt={prompt[:40]!r} "
-         f"timeout={timeout}s")
+    _log(f"inpaint batch {batch_id}: workflow={workflow} "
+         f"prompt={prompt[:40]!r} timeout={timeout}s")
 
     t0 = time.monotonic()
     summary = krita_client.send_batch(
@@ -499,6 +540,7 @@ def handle_resource_image(payload: dict) -> dict:
 ROUTES = {
     "/comfy/status":         handle_status,
     "/comfy/active_state":   handle_active_state,
+    "/comfy/current_prompt": handle_current_prompt,
     "/comfy/inpaint":        handle_inpaint,
     "/comfy/interrupt":      handle_interrupt,
     "/krita/status":         handle_krita_status,

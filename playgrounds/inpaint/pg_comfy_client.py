@@ -74,6 +74,26 @@ export async function fetchStatus() {
   }
 }
 
+/* Read the daemon's shared-state prompt (i.e. `_active_config
+   ["params"]["prompt"]`).  Used on boot to populate the playground
+   prompt field when it is empty — see `_hydrateSharedPrompt` in
+   `pg_panel_bindings.js`. */
+export async function fetchCurrentPrompt() {
+  try {
+    const res = await fetch("/comfy/current_prompt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    if (!res.ok) {
+      return { success: false, prompt: "", message: "HTTP " + res.status };
+    }
+    return await res.json();
+  } catch (e) {
+    return { success: false, prompt: "", message: e.message };
+  }
+}
+
 /* ============================================================
    Inpaint — the single operation this playground performs
    ============================================================ */

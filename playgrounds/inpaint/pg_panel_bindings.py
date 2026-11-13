@@ -35,6 +35,29 @@ panel reading; the terminal write is the durable record.  This is the
 only place in this file that bypasses `flashStatus` for an error,
 because it is the only place with a persistent DOM element designed
 to hold that error text.
+
+SHARED-PROMPT HYDRATION
+=======================
+`_hydrateSharedPrompt` pulls the daemon's shared-state prompt
+(`_active_config["params"]["prompt"]`, the same value the docker and
+web panel edit) into the playground's prompt field on boot, but only
+when the playground's own prompt is empty.  A non-empty prompt (typed
+value, remote-client patch, or prior session) wins.  See
+`inpaint_server.py`'s PROMPT RESOLUTION section for the full model.
+
+SHARED-SELECTION HYDRATION
+==========================
+`_hydrateSharedSelection` pulls the mask the daemon's config points
+at via `@theselection` into the playground's mask stack on boot, but
+only when the stack is empty.  Currently handles the `source: "layer"`
+shape — the one the daemon's panel configs use (see
+`data/comfy_panel/panel_configs/*.json`).  `source: "global"` would
+mean the live document selection, which no route in this playground
+exposes; `source: "active"` is not a natural source for `@theselection`
+and is treated the same.  Both cases are silently skipped.  One-shot:
+no retries, no polling, no overwriting of pre-existing masks.  See
+`inpaint_server.py`'s PROMPT RESOLUTION section for the analogous
+model on the prompt side.
 """
 
 PANEL_BINDINGS_JS = r"""
@@ -49,10 +72,12 @@ import { buildMaskFromContextRectB64, projectCropDims } from "./pg_inpaint.js";
 import { computeMaskBBox } from "./pg_pixels.js";
 import { syncMaskList } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
-import { uploadImageFile, fetchStatus, runInpaint, runInpaintViaInterceptor,
-         interruptInpaint } from "./pg_comfy_client.js";
 import {
-  checkKritaStatus, importKritaMasks,
+  uploadImageFile, fetchStatus, runInpaint, runInpaintViaInterceptor,
+  interruptInpaint, fetchCurrentPrompt,
+} from "./pg_comfy_client.js";
+import {
+  checkKritaStatus, importKritaMasks, fetchActiveState,
 } from "./pg_krita_client.js";
 import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyAll,
@@ -450,8 +475,8 @@ function _buildKeepMask(W, H, rotationDeg, cropW, cropH) {
   // un-rotated by the server; the sent image is the (cropW × cropH)
   // crop of the rotated original.  Composing the two transforms, the
   // content region of the returned (center-cropped back to W × H) is
-  // the (cropW × cropH) rect rotated by -rotationDeg around the
-  // centre, intersected with the (W × H) frame itself.
+  // the (cropW × cropH) rect rotated by -rotationDeg around the centre,
+  // intersected with the (W × H) frame itself.
   //
   // Base case (cropW=cropH=W): the classic diamond.  Expanded case:
   // a larger diamond that covers more of W × H, up to full white when
@@ -593,6 +618,109 @@ function _setOriginalFromB64(b64, rotationDeg) {
 }
 
 /* ============================================================
+   Shared-prompt hydration
+   ============================================================
+   On boot, pull the daemon's shared-state prompt into the panel
+   if the playground has no prompt of its own.
+
+   This is a one-shot read, not a subscription.  The playground
+   prompt is a view of the shared-state prompt that the user can
+   override on a per-run basis; subscribing to changes would
+   silently clobber whatever the user is typing.  A user who
+   wants a fresh view can reload the page.
+
+   Two emptiness checks bracket the async fetch: one before, so
+   a prompt typed just before boot is not overwritten; one after,
+   so a prompt typed while the fetch is in flight is not
+   overwritten.  Both would otherwise be race conditions. */
+
+async function _hydrateSharedPrompt() {
+  if (board.inpaintPrompt && board.inpaintPrompt.trim()) return;
+  const r = await fetchCurrentPrompt();
+  if (!r || !r.success) return;
+  const shared = (r.prompt || "").trim();
+  if (!shared) return;
+  if (board.inpaintPrompt && board.inpaintPrompt.trim()) return;
+  board.inpaintPrompt = shared;
+  const el = document.getElementById("inpaintPrompt");
+  if (el && document.activeElement !== el) el.value = shared;
+  syncPanelFields();
+  pgkitNotifyAll();
+  flashStatus("prompt hydrated from shared state", "");
+}
+
+/* ============================================================
+   Shared-selection hydration
+   ============================================================
+   On boot, pull the mask the daemon's config points at via
+   `@theselection` into the playground's mask stack, but only
+   when the stack is empty.
+
+   Only fires when all of:
+     · board.masks is empty (never overwrite user work)
+     · config.resources["@theselection"] exists
+     · its source is "layer" — the only spec shape that maps
+       cleanly onto an importable layer mask.  "global" would
+       mean the live document selection, which no route in this
+       playground exposes; "active" is not a natural source for
+       @theselection and is treated the same (skip).
+
+   One-shot: no retries, no polling.  A failure (daemon down,
+   layer missing, no route) is silent — first boot hydration is
+   a "nice to have", not a hard requirement. */
+
+async function _hydrateSharedSelection() {
+  if (board.masks.length > 0) return;
+
+  let state;
+  try {
+    state = await fetchActiveState();
+  } catch (_) {
+    return;
+  }
+  if (!state || !state.success) return;
+  const data = state.data || {};
+  const cfg = data.config;
+  if (!cfg || typeof cfg !== "object") return;
+  const resources = cfg.resources || {};
+  const spec = resources["@theselection"];
+  if (!spec || typeof spec !== "object") return;
+  if (spec.source !== "layer") return;
+  const layerName = spec.layer_name;
+  if (!layerName) return;
+
+  let res;
+  try {
+    res = await importKritaMasks({ layerNames: [layerName] });
+  } catch (_) {
+    return;
+  }
+  if (!res || !res.success) return;
+  const masks = res.masks || [];
+  if (masks.length === 0) return;
+
+  const addedIndices = [];
+  for (const m of masks) {
+    if (m && m.mask_b64) addedIndices.push(addMaskFromB64(m.mask_b64));
+  }
+  if (addedIndices.length === 0) return;
+
+  // Select the first imported mask so the "Select a mask to inpaint"
+  // gate is satisfied without a manual click.
+  board.selectedMaskIndices = [addedIndices[0]];
+
+  syncMaskList();
+  syncPanelFields();
+  pgkitNotifyAll();
+  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  flashStatus(
+    "mask hydrated from @theselection ("
+      + addedIndices.length + " layer(s))",
+    ""
+  );
+}
+
+/* ============================================================
    Inpaint
    ============================================================ */
 
@@ -602,9 +730,10 @@ async function _inpaintAction() {
 
   const idx = selectedMaskIdx();
   if (idx < 0) { flashStatus("Select a mask to inpaint", "warn"); return; }
-  if (!board.inpaintPrompt.trim()) {
-    flashStatus("Enter an inpaint prompt", "warn"); return;
-  }
+  // Empty prompt is allowed: the server falls back to whatever the
+  // docker / web panel last set in the shared state, or to the
+  // workflow's default if neither has set one.  See
+  // `handle_inpaint`'s batch construction in `inpaint_server.py`.
 
   const mask = board.masks[idx];
   if (!mask || !mask.loaded) {
@@ -965,5 +1094,11 @@ export function inpaintBootSync() {
   pgkitNotifyAll();
   _checkStatusAction();
   _kritaStatusRefresh();
+  // First-boot hydration: both are one-shot, no polling.  Serialized
+  // so their flashStatus() messages do not collide on a fresh load.
+  (async () => {
+    await _hydrateSharedPrompt();
+    await _hydrateSharedSelection();
+  })();
 }
 """

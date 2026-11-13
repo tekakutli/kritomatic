@@ -7,7 +7,14 @@ Krita itself.
 The context rectangle defaults to disabled: on page load the checkbox
 is unchecked, the rectangle is not drawn, and the inpaint workflow
 uses the full canvas as context.  Checking the box restricts
-inpainting to the rectangle drawn on the canvas."""
+inpainting to the rectangle drawn on the canvas.
+
+The Inpaint prompt textarea is an *override* on the daemon's
+shared-state prompt (the docker / web panel's
+`comfy_apply_config` params).  Left blank, the workflow uses whatever
+the docker or web panel has set, with the workflow's own
+`PrimitiveString` default as the last resort.  See
+`inpaint_server.py`'s PROMPT RESOLUTION section."""
 
 PG_CSS = r"""
   #ui button#inpaintBtn {
@@ -272,7 +279,7 @@ PG_PANEL_BODY = r"""
             Inpaint prompt
           </label>
           <textarea id="inpaintPrompt" rows="2" spellcheck="false"
-                    placeholder="what should appear in the context region"
+                    placeholder="what should appear (blank = use docker / web panel prompt)"
           ></textarea>
         </div>
         <div class="field" style="align-items:flex-start;flex-direction:column;margin-top:8px;">

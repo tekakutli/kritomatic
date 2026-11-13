@@ -5,7 +5,13 @@ enablement, status line.
 
 The function is called once per frame from `pg_dispatch.draw()`.
 Every DOM write is guarded against the current DOM value so a
-steady-state frame touches nothing."""
+steady-state frame touches nothing.
+
+The prompt field is *not* part of the inpaint button's enablement
+gate: an empty playground prompt is served from the daemon's shared
+state (the docker / web panel's `comfy_apply_config` params), with the
+workflow's own `Primitive*` default as the last resort.  See
+`inpaint_server.py`'s PROMPT RESOLUTION section."""
 
 PANEL_FIELDS_JS = r"""
 import { board } from "./pg_state.js";
@@ -83,8 +89,11 @@ export function syncPanelFields() {
   const selCount = board.selectedMaskIndices.length;
   const m = selectedMaskIdx() >= 0 ? board.masks[selectedMaskIdx()] : null;
   const maskReady = selCount === 1 && m && m.loaded;
-  const promptReady = !!board.inpaintPrompt.trim();
-  const canInpaint = hasImage && maskReady && promptReady && !busy;
+  // Prompt is optional: an empty playground prompt is served from the
+  // daemon's shared state (docker / web panel), with the workflow's
+  // own Primitive* default as the last resort.  Only image + a single
+  // loaded mask are required to enable Run.
+  const canInpaint = hasImage && maskReady && !busy;
 
   if (e.inpaintBtn) {
     e.inpaintBtn.textContent = busy
@@ -93,10 +102,10 @@ export function syncPanelFields() {
       : "Inpaint";
     e.inpaintBtn.classList.toggle("busy", busy);
     e.inpaintBtn.disabled = !canInpaint;
-    if (!hasImage)              e.inpaintBtn.title = "Load an image first";
-    else if (!maskReady)        e.inpaintBtn.title = "Select a single mask to inpaint";
-    else if (!promptReady)      e.inpaintBtn.title = "Enter an inpaint prompt";
-    else                        e.inpaintBtn.title = "Run the inpaint workflow";
+    if (!hasImage)         e.inpaintBtn.title = "Load an image first";
+    else if (!maskReady)   e.inpaintBtn.title = "Select a single mask to inpaint";
+    else                   e.inpaintBtn.title =
+      "Run the inpaint workflow (blank prompt = use docker / web panel prompt)";
   }
   if (e.cancelBtn) e.cancelBtn.disabled = !busy;
 

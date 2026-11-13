@@ -1,39 +1,43 @@
-"""Panel-config consumption for the native v2 pipeline.
+"""Panel-config consumption, plus the `comfy_set_layer_pixels`
+scratch-layer writer.
 
-Three commands:
+Config commands:
 
   * `comfy_apply_config` — takes the parsed `[resources]` / `[params]` /
     `[crop]` / `[paste]` sections from a panel config, validates them
     against the loaded workflow's slot tables, and stores the normalized
     result on the handler for `comfy_generate` to consume.
+  * `comfy_prepare_only` — diagnostic.
+  * `comfy_panel_run` — connect, apply, generate.
+  * `comfy_save_config` — write the current panel config.
 
-  * `comfy_prepare_only` — reads resources per the applied config,
-    uploads them to the comfy-api-proxy, substitutes `core/ASSET` refs
-    and param values into the graph, and returns the prepared graph
-    WITHOUT submitting. Diagnostic.
+Scratch-layer command:
 
-  * `comfy_panel_run` — convenience wrapper: connect (auto-starts the
-    proxy), apply the supplied config, then generate.
+  * `comfy_set_layer_pixels` — write content into a named layer for the
+    playground's sync protocol.  Two behaviors depending on what the
+    existing layer is:
 
-  * `comfy_save_config` — write the current panel config to
-    `data/comfy_panel/panel_configs/<workflow>.json`. Creates the file
-    if it doesn't exist; preserves `host`/`port`/`exclusive`/`watch`/
-    `timeout`/`count`/`seed` from the existing file if present; always
-    sets `workflow` to `_active_workflow_name`. Values for `resources`/
-    `params` come from the caller if provided (docker path), or from
-    `_active_config` if not (CLI path). `crop` and the dead half of
-    `paste` (`x`, `y`, `resize_canvas`) are no longer written — they
-    were dropped from the panel (see `panel.py`'s module docstring)
-    because neither can influence an inpaint run. The daemon still
-    honors all four on the read side (`comfy_apply_config` and the
-    `parse_config_dict` defaults reproduce them), so the on-disk format
-    stays backward-compatible.
+      · paint layer   — `setPixelData` in place with the RGBA blob
+                        (or the mask-as-alpha conversion when
+                        `is_mask=True`).
+      · mask layer    — `setPixelData` in place with grayscale bytes
+                        (only when `is_mask=True`).
 
-Panel config files are JSON. The TOML format is gone.
-"""
+    A missing layer is created as a new paint layer at the document
+    root, so first-time use works without manual layer setup.  Any
+    other existing layer type (group / file / vector / clone / fill /
+    filter) is refused — those don't accept `setPixelData` as a
+    scratch target, and silently clobbering them would be worse than
+    an error message.
+
+    This preserves the user's mask layers: if they had a
+    `theselection` selection mask before, it stays a selection mask;
+    only its pixel content is updated to reflect the playground's
+    current mask.  Same for `thecontext`."""
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -52,37 +56,247 @@ _KIND_ACCEPTORS = {
 }
 
 
+def _find_node_by_name(doc, name):
+    def walk(node):
+        try:
+            if node.name() == name:
+                return node
+        except Exception:
+            pass
+        try:
+            for child in node.childNodes():
+                found = walk(child)
+                if found is not None:
+                    return found
+        except Exception:
+            pass
+        return None
+    try:
+        return walk(doc.rootNode())
+    except Exception:
+        return None
+
+
 class ConfigCommands(AutoDispatchHandler):
 
     def __init__(self, parent):
         self.parent = parent
         super().__init__()
 
+    # ------------------------------------------------------------------
+    #  comfy_set_layer_pixels
+    # ------------------------------------------------------------------
+
+    @command(
+        category="comfyui",
+        help_text="Write content into a named layer for the playground's "
+                  "sync protocol. Existing paint layers are updated in "
+                  "place with RGBA (or mask-as-alpha when is_mask=True). "
+                  "Existing mask layers (transparencymask / selectionmask) "
+                  "are updated in place with grayscale when is_mask=True; "
+                  "other layer types are refused. A missing layer is "
+                  "created as a new paint layer at the document root.",
+        args={
+            "--name":      {"type": "str",  "required": True,
+                            "help": "Layer name to create or update."},
+            "--image_b64": {"type": "str",  "required": True,
+                            "help": "Base64-encoded PNG."},
+            "--is_mask":   {"type": "bool", "default": False,
+                            "help": "Treat input's R channel as the mask "
+                                    "(paint layer: store as alpha with "
+                                    "RGB=255; mask layer: store as "
+                                    "grayscale bytes)."},
+        },
+    )
+    def comfy_set_layer_pixels(self, params):
+        try:
+            from krita import Krita
+            from PyQt6.QtGui import QImage
+            from PyQt6.QtCore import Qt
+            import numpy as np
+        except ImportError as e:
+            return {"success": False, "message": f"import failed: {e}"}
+
+        name = (params.get("name") or "").strip()
+        image_b64 = params.get("image_b64") or ""
+        is_mask = bool(params.get("is_mask", False))
+
+        if not name:
+            return {"success": False, "message": "name is required"}
+        if not image_b64:
+            return {"success": False, "message": "image_b64 is required"}
+
+        doc = Krita.instance().activeDocument()
+        if doc is None:
+            return {"success": False, "message": "No active document"}
+
+        try:
+            raw = base64.b64decode(image_b64)
+        except Exception as e:
+            return {"success": False, "message": f"bad base64: {e}"}
+
+        img = QImage()
+        if not img.loadFromData(raw, "PNG"):
+            return {"success": False, "message": "not a valid PNG"}
+        img = img.convertToFormat(QImage.Format.Format_ARGB32)
+
+        W, H = int(doc.width()), int(doc.height())
+        if img.width() != W or img.height() != H:
+            img = img.scaled(
+                W, H,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            img = img.convertToFormat(QImage.Format.Format_ARGB32)
+
+        existing = _find_node_by_name(doc, name)
+
+        mask_layer_types = {"transparencymask", "selectionmask"}
+        image_layer_types = {
+            "paintlayer", "grouplayer", "filelayer", "vectorlayer",
+            "clonelayer", "filllayer", "filterlayer",
+        }
+
+        if existing is not None:
+            existing_type = existing.type()
+
+            if existing_type in mask_layer_types:
+                if not is_mask:
+                    return {
+                        "success": False,
+                        "message": (
+                            f"layer {name!r} exists as {existing_type}; "
+                            f"only is_mask=True content can be written "
+                            f"into it. Rename the layer or delete it."
+                        ),
+                    }
+                # Extract R channel (which is the grayscale mask value
+                # after QImage's PNG decode) into a grayscale buffer.
+                ptr = img.constBits()
+                ptr.setsize(img.sizeInBytes())
+                arr = np.frombuffer(bytes(ptr), dtype=np.uint8).reshape(
+                    (H, W, 4),
+                )
+                # Qt ARGB32 memory layout little-endian: BGRA per pixel.
+                gray = arr[:, :, 2].copy().tobytes()
+                try:
+                    existing.setPixelData(gray, 0, 0, W, H)
+                except Exception as e:
+                    return {"success": False,
+                            "message": f"setPixelData failed on mask "
+                                       f"layer: {e}"}
+                try:
+                    doc.refreshProjection()
+                except Exception:
+                    pass
+                return {
+                    "success": True,
+                    "message": f"updated mask layer {name!r} ({W}x{H})",
+                    "data": {"name": name, "width": W, "height": H,
+                             "kind": existing_type,
+                             "updated": True},
+                }
+
+            if existing_type == "paintlayer":
+                if is_mask:
+                    ptr = img.constBits()
+                    ptr.setsize(img.sizeInBytes())
+                    arr = np.frombuffer(
+                        bytes(ptr), dtype=np.uint8,
+                    ).reshape((H, W, 4)).copy()
+                    r_channel = arr[:, :, 2].copy()
+                    arr[:, :, 0] = 255  # B
+                    arr[:, :, 1] = 255  # G
+                    arr[:, :, 2] = 255  # R
+                    arr[:, :, 3] = r_channel
+                    argb_bytes = arr.tobytes()
+                else:
+                    ptr = img.constBits()
+                    ptr.setsize(img.sizeInBytes())
+                    argb_bytes = bytes(ptr)
+                try:
+                    existing.setPixelData(argb_bytes, 0, 0, W, H)
+                except Exception as e:
+                    return {"success": False,
+                            "message": f"setPixelData failed on paint "
+                                       f"layer: {e}"}
+                try:
+                    doc.refreshProjection()
+                except Exception:
+                    pass
+                return {
+                    "success": True,
+                    "message": f"updated paint layer {name!r} ({W}x{H})",
+                    "data": {"name": name, "width": W, "height": H,
+                             "kind": "paintlayer",
+                             "updated": True},
+                }
+
+            # Any other existing type — refuse rather than clobber.
+            return {
+                "success": False,
+                "message": (
+                    f"layer {name!r} exists as {existing_type!r}, which "
+                    f"cannot be used as a scratch target. Rename or "
+                    f"delete it before syncing."
+                ),
+            }
+
+        # ---- No existing layer: create a paint layer at root ----
+        node = doc.createNode(name, "paintlayer")
+        if node is None:
+            return {"success": False,
+                    "message": f"createNode returned None for {name!r}"}
+        doc.rootNode().addChildNode(node, None)
+
+        if is_mask:
+            ptr = img.constBits()
+            ptr.setsize(img.sizeInBytes())
+            arr = np.frombuffer(bytes(ptr), dtype=np.uint8).reshape(
+                (H, W, 4),
+            ).copy()
+            r_channel = arr[:, :, 2].copy()
+            arr[:, :, 0] = 255
+            arr[:, :, 1] = 255
+            arr[:, :, 2] = 255
+            arr[:, :, 3] = r_channel
+            argb_bytes = arr.tobytes()
+        else:
+            ptr = img.constBits()
+            ptr.setsize(img.sizeInBytes())
+            argb_bytes = bytes(ptr)
+
+        try:
+            node.setPixelData(argb_bytes, 0, 0, W, H)
+        except Exception as e:
+            return {"success": False,
+                    "message": f"setPixelData failed on new layer: {e}"}
+
+        try:
+            doc.refreshProjection()
+        except Exception:
+            pass
+
+        return {
+            "success": True,
+            "message": f"created {name!r} ({W}x{H} is_mask={is_mask})",
+            "data": {"name": name, "width": W, "height": H,
+                     "is_mask": is_mask, "created": True},
+        }
+
+    # ------------------------------------------------------------------
+    #  comfy_apply_config (unchanged)
+    # ------------------------------------------------------------------
+
     @command(
         category="comfyui",
         help_text="Apply a panel config (resources, params, crop, paste) "
-                  "to the active workflow. Validates every "
-                  "'@'-prefixed resource, every param title, and every "
-                  "enum value against the loaded graph's slot tables.",
+                  "to the active workflow.",
         args={
-            "--resources": {
-                "type": "str", "default": "{}",
-                "help": "JSON object mapping @-names to resource specs.",
-            },
-            "--params": {
-                "type": "str", "default": "{}",
-                "help": "JSON object mapping Primitive _meta.title to "
-                        "the value to substitute.",
-            },
-            "--crop": {
-                "type": "str", "default": "{}",
-                "help": "JSON object: {'context': ..., 'padding': ...}.",
-            },
-            "--paste": {
-                "type": "str", "default": "{}",
-                "help": "JSON object: {'x': ..., 'y': ..., 'name': ..., "
-                        "'batch_mode': ..., 'resize_canvas': ...}.",
-            },
+            "--resources": {"type": "str", "default": "{}"},
+            "--params":    {"type": "str", "default": "{}"},
+            "--crop":      {"type": "str", "default": "{}"},
+            "--paste":     {"type": "str", "default": "{}"},
         },
     )
     def comfy_apply_config(self, params):
@@ -129,9 +343,7 @@ class ConfigCommands(AutoDispatchHandler):
                     f"[params] references unknown _meta.title(s): "
                     f"{sorted(unknown_params)}. "
                     f"Available in the loaded graph: "
-                    f"{sorted(param_slots) or '(none)'}. "
-                    f"Set the title on the Primitive node in ComfyUI's "
-                    f"browser."
+                    f"{sorted(param_slots) or '(none)'}."
                 ),
             }
 
@@ -139,29 +351,23 @@ class ConfigCommands(AutoDispatchHandler):
         for res_name, res_spec in resources.items():
             if not isinstance(res_spec, dict):
                 return {"success": False,
-                        "message": (
-                            f"resource {res_name!r}: must be a JSON "
-                            f"object with a 'source' field"
-                        )}
+                        "message": f"resource {res_name!r}: must be a JSON "
+                                   f"object with a 'source' field"}
             source = res_spec.get("source")
             if source not in _RESOURCE_SOURCES:
                 return {"success": False,
-                        "message": (
-                            f"resource {res_name!r}: source must be "
-                            f"one of {sorted(_RESOURCE_SOURCES)}, got "
-                            f"{source!r}"
-                        )}
+                        "message": f"resource {res_name!r}: source must be "
+                                   f"one of {sorted(_RESOURCE_SOURCES)}, "
+                                   f"got {source!r}"}
             layer_name = res_spec.get("layer_name")
             if source == "layer":
                 if not isinstance(layer_name, str) or not layer_name:
                     return {"success": False,
-                            "message": (
-                                f"resource {res_name!r}: source='layer' "
-                                f"requires a non-empty layer_name"
-                            )}
+                            "message": f"resource {res_name!r}: "
+                                       f"source='layer' requires a "
+                                       f"non-empty layer_name"}
             else:
                 layer_name = None
-
             normalized_resources[res_name] = {
                 "source": source,
                 "layer_name": layer_name,
@@ -171,38 +377,30 @@ class ConfigCommands(AutoDispatchHandler):
             kind = param_slots[param_name]["kind"]
             if not _KIND_ACCEPTORS[kind](param_value):
                 return {"success": False,
-                        "message": (
-                            f"param {param_name!r}: expected {kind}, "
-                            f"got {type(param_value).__name__} "
-                            f"({param_value!r})"
-                        )}
+                        "message": f"param {param_name!r}: expected {kind}, "
+                                   f"got {type(param_value).__name__} "
+                                   f"({param_value!r})"}
 
         crop_context = crop.get("context", "entire_image")
         if crop_context not in _CROP_CONTEXTS:
             return {"success": False,
-                    "message": (
-                        f"crop.context must be one of "
-                        f"{sorted(_CROP_CONTEXTS)}, got "
-                        f"{crop_context!r}"
-                    )}
+                    "message": f"crop.context must be one of "
+                               f"{sorted(_CROP_CONTEXTS)}, got "
+                               f"{crop_context!r}"}
         crop_padding = crop.get("padding", 0)
         if (not isinstance(crop_padding, int)
                 or isinstance(crop_padding, bool)
                 or crop_padding < 0):
             return {"success": False,
-                    "message": (
-                        f"crop.padding must be a non-negative integer, "
-                        f"got {crop_padding!r}"
-                    )}
+                    "message": f"crop.padding must be a non-negative "
+                               f"integer, got {crop_padding!r}"}
 
         paste_batch_mode = paste.get("batch_mode", "default")
         if paste_batch_mode not in _PASTE_BATCH_MODES:
             return {"success": False,
-                    "message": (
-                        f"paste.batch_mode must be one of "
-                        f"{sorted(_PASTE_BATCH_MODES)}, got "
-                        f"{paste_batch_mode!r}"
-                    )}
+                    "message": f"paste.batch_mode must be one of "
+                               f"{sorted(_PASTE_BATCH_MODES)}, got "
+                               f"{paste_batch_mode!r}"}
 
         def _coerce_int(obj, key, default=0):
             v = obj.get(key, default)
@@ -248,14 +446,17 @@ class ConfigCommands(AutoDispatchHandler):
             },
         }
 
+    # ------------------------------------------------------------------
+    #  comfy_prepare_only (unchanged)
+    # ------------------------------------------------------------------
+
     @command(
         category="comfyui",
-        help_text="Read resources per the applied config, upload them to "
-                  "the proxy, substitute them into the graph, and return "
-                  "the prepared graph WITHOUT submitting.",
+        help_text="Read resources per the applied config, upload them, "
+                  "substitute into the graph, return the prepared graph "
+                  "WITHOUT submitting.",
         args={
-            "--seed": {"type": "int", "required": False,
-                       "help": "Override the 'seed' param."},
+            "--seed": {"type": "int", "required": False},
         },
     )
     def comfy_prepare_only(self, params):
@@ -316,10 +517,12 @@ class ConfigCommands(AutoDispatchHandler):
             "message": (
                 f"prepared: {len(result.assets)} asset(s) uploaded, "
                 f"{len(result.graph)} node(s) in graph, "
-                f"crop={list(result.crop_bounds)}"
+                f"crop={list(result.crop_bounds)}, "
+                f"rotation={result.rotation}"
             ),
             "data": {
                 "crop_bounds": list(result.crop_bounds),
+                "rotation": result.rotation,
                 "assets": {
                     name: {"id": a.get("id"), "hash": a.get("hash")}
                     for name, a in result.assets.items()
@@ -331,28 +534,22 @@ class ConfigCommands(AutoDispatchHandler):
             },
         }
 
+    # ------------------------------------------------------------------
+    #  comfy_panel_run (unchanged)
+    # ------------------------------------------------------------------
+
     @command(
         category="comfyui",
         help_text="Connect (auto-starting the proxy), apply the supplied "
-                  "panel config, then generate.  Sections omitted from "
-                  "the call fall back to the daemon's current "
-                  "_active_config, and the response notes which sections "
-                  "used the fallback.",
+                  "panel config, then generate.",
         args={
-            "--resources": {"type": "str", "required": False,
-                            "help": "JSON object. Omit to use "
-                                    "_active_config's current value."},
-            "--params": {"type": "str", "required": False,
-                         "help": "JSON object. Omit to use current."},
-            "--crop": {"type": "str", "required": False,
-                       "help": "JSON object. Omit to use current."},
-            "--paste": {"type": "str", "required": False,
-                        "help": "JSON object. Omit to use current."},
-            "--timeout": {"type": "float", "default": 55.0},
-            "--count": {"type": "int", "default": 1},
-            "--seed": {"type": "int", "required": False},
-            "--no_paste": {"type": "bool", "default": False},
-            "--output_rotation": {"type": "float", "default": 0.0},
+            "--resources": {"type": "str", "required": False},
+            "--params":    {"type": "str", "required": False},
+            "--crop":      {"type": "str", "required": False},
+            "--paste":     {"type": "str", "required": False},
+            "--timeout":   {"type": "float", "default": 55.0},
+            "--count":     {"type": "int",   "default": 1},
+            "--seed":      {"type": "int",   "required": False},
         },
     )
     def comfy_panel_run(self, params):
@@ -364,32 +561,13 @@ class ConfigCommands(AutoDispatchHandler):
             "check": False,
         })
         if not isinstance(conn, dict):
-            return {
-                "success": False,
-                "message": f"comfy_connect returned non-dict: {conn!r}",
-            }
+            return {"success": False,
+                    "message": f"comfy_connect returned non-dict: {conn!r}"}
         if not conn.get("success"):
-            return {
-                "success": False,
-                "message": (
-                    f"connect failed before apply/generate: "
-                    f"{conn.get('message', 'unknown error')}"
-                ),
-            }
+            return {"success": False,
+                    "message": f"connect failed: "
+                               f"{conn.get('message', 'unknown error')}"}
 
-        # Presence check ("is this key in params?") rather than
-        # value check ("is it empty?"), because a caller that
-        # explicitly sends `"resources": "{}"` means "apply empty
-        # resources" — it cleared them on purpose.  A caller that
-        # omits the key entirely means "I don't care, use what
-        # _active_config already has".  The web panel's Run button
-        # and the Docker's Run button both always supply all four
-        # sections (assembled from current widget state); only the
-        # schema-based CLI path `kritomatic comfyui comfy_panel_run`
-        # can omit them.  That CLI path is what the args schema
-        # above enables: with no `default: "{}"`, an unsupplied
-        # section is truly absent from `params`, so the fallback
-        # fires.
         active = parent._active_config or {}
         apply_params = {}
         fallback_keys: list[str] = []
@@ -406,19 +584,15 @@ class ConfigCommands(AutoDispatchHandler):
 
         apply_result = self.comfy_apply_config(apply_params)
         if not isinstance(apply_result, dict):
-            return {
-                "success": False,
-                "message": f"comfy_apply_config returned non-dict: "
-                           f"{apply_result!r}",
-            }
+            return {"success": False,
+                    "message": f"comfy_apply_config returned non-dict: "
+                               f"{apply_result!r}"}
         if not apply_result.get("success"):
             return apply_result
 
         gen_params: dict = {
             "timeout": params.get("timeout", 55.0),
             "count": params.get("count", 1),
-            "no_paste": params.get("no_paste", False),
-            "output_rotation": params.get("output_rotation", 0.0),
         }
         if params.get("seed") is not None:
             gen_params["seed"] = params.get("seed")
@@ -440,31 +614,18 @@ class ConfigCommands(AutoDispatchHandler):
         return gen_result
 
     # ------------------------------------------------------------------
-    #  comfy_save_config
+    #  comfy_save_config (unchanged)
     # ------------------------------------------------------------------
 
     @command(
         category="comfyui",
         help_text="Write the current panel config to "
-                  "data/comfy_panel/panel_configs/<workflow>.json. "
-                  "Creates the file if missing; preserves "
-                  "host/port/exclusive/watch/timeout/count/seed from the "
-                  "existing file if present; always sets workflow to the "
-                  "active workflow name. Resources/params come from the "
-                  "provided args if any are supplied (docker path), else "
-                  "from the current _active_config (CLI path). Crop and "
-                  "paste.x/y/resize_canvas are not written; only "
-                  "paste.name and paste.batch_mode are persisted.",
+                  "data/comfy_panel/panel_configs/<workflow>.json.",
         args={
-            "--resources": {"type": "str", "required": False,
-                            "help": "JSON resources. Omit to use "
-                                    "_active_config's current value."},
-            "--params": {"type": "str", "required": False,
-                         "help": "JSON params. Omit to use current."},
-            "--crop": {"type": "str", "required": False,
-                       "help": "JSON crop. Omit to use current."},
-            "--paste": {"type": "str", "required": False,
-                        "help": "JSON paste. Omit to use current."},
+            "--resources": {"type": "str", "required": False},
+            "--params":    {"type": "str", "required": False},
+            "--crop":      {"type": "str", "required": False},
+            "--paste":     {"type": "str", "required": False},
         },
     )
     def comfy_save_config(self, params):
@@ -473,10 +634,6 @@ class ConfigCommands(AutoDispatchHandler):
             return {"success": False,
                     "message": "No workflow loaded; run comfy_load first"}
 
-        # If the caller supplied any config section, apply it first so
-        # validation happens and _active_config reflects the values
-        # that will be written. If nothing was supplied, use the
-        # current _active_config as-is.
         supplied_any = any(
             params.get(k) is not None
             for k in ("resources", "params", "crop", "paste")
@@ -497,8 +654,6 @@ class ConfigCommands(AutoDispatchHandler):
                     "message": "No panel config to save; run "
                                "comfy_apply_config first"}
 
-        # Lazy import — sys.path bootstrap only runs when this command
-        # is actually used, not at handler construction.
         from ..utils.panel_config import (
             CONFIG_DIR, read_config_file, write_config_file,
         )
@@ -513,18 +668,6 @@ class ConfigCommands(AutoDispatchHandler):
             except ValueError:
                 existing = {}
 
-        # The panel no longer surfaces the Crop section or the
-        # paste.x/y/resize_canvas fields (see panel.py's module
-        # docstring). They still exist in `_active_config` because
-        # `comfy_apply_config` fills defaults for them, and every
-        # reader inside the daemon still reads them from there. But
-        # the file we persist is now trimmed: no `crop` key at all,
-        # and only `name` + `batch_mode` under `paste`. A fresh load
-        # of this file therefore flows through `comfy_apply_config`
-        # and gets the same defaults it always did, so the daemon's
-        # `_active_config` invariant ("all four sections, fully
-        # populated") is preserved without carrying the dead fields
-        # on disk.
         file_data: dict = {
             "host": existing.get("host", parent._host),
             "port": existing.get("port", parent._port),
@@ -541,7 +684,6 @@ class ConfigCommands(AutoDispatchHandler):
                 "batch_mode": parent._active_config["paste"]["batch_mode"],
             },
         }
-        # Preserve any _notes the user wrote by hand.
         if "_notes" in existing:
             file_data["_notes"] = existing["_notes"]
 

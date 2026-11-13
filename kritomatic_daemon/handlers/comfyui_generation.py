@@ -1,108 +1,34 @@
 """comfyui_generation.py — submit workflows via the v2 proxy, poll,
 download outputs, paste into Krita.
 
-Rewritten in Stage 5 to use comfy-api-proxy's `/api/v2/*` endpoints
-instead of the old WebSocket + tooling-nodes pipeline. The graph the
-daemon submits is fully native — no `ETN_*` nodes — because
-`prepare_workflow` (Stage 4) has already substituted the resource
-blobs and param values into the graph.
+ROTATION
+========
+The paste stage reads `prepared.rotation` (set by `prepare_workflow`).
 
-Pipeline shape
-==============
-    prepare_workflow(doc, graph, ..., proxy) → PreparedWorkflow
-    proxy.submit_job(prepared.graph)         → job with id
-    proxy.get_job(id)                        → poll until terminal
-    proxy.download_asset(out.id)             → raw PNG bytes per output
-    _paste_result(...)                       → layers in Krita
+  · rotation == 0: unchanged — paste at
+    `(crop_bounds[0]+x, crop_bounds[1]+y)`.
 
-Batch semantics (`--count N`):
-  * N runs are prepared sequentially; each run's graph has the seed
-    substituted at prepare time (base_seed + i).
-  * N jobs are submitted. `record.job_ids` tracks them.
-  * Each job is polled to terminal. Success → download + paste;
-    failure → recorded; cancellation → recorded.
-  * `comfy_cancel` sets `record.cancel_event`; the poll loop sends
-    `cancel_job` once per in-flight job (`record._cancel_sent` tracks).
+  · rotation != 0: the workflow ran on pre-rotated content at
+    `(0, 0, cropW, cropH)` where `cropW × cropH` is centered on the
+    rotated frame `W' × H'`.  `InpaintStitchImproved` returns
+    `cropW × cropH`.  **Before un-rotating**, the output is padded
+    back to `W' × H'` at `((W' - cropW) // 2, (H' - cropH) // 2)` so
+    the un-rotation recovers the full un-rotated canvas (no clipped
+    corners — see `comfyui_krita.pad_png`).  Then `paste_image`
+    rotates the padded image by `-rotation`, center-crops to doc dims,
+    and pastes at `(paste_config.x, paste_config.y)` (default 0, 0).
 
-Cancellation
-============
-  * During prepare: `record.cancel_event.is_set()` breaks the loop,
-    remaining runs marked cancelled, already-submitted jobs still
-    polled (they'll wind down via the cancel requests sent below).
-  * During poll: on `cancel_event` set, the loop calls
-    `proxy.cancel_job(job_id)` once and continues polling. The job
-    transitions to `canceling` then `canceled` within a step boundary.
-
-External batches (playground-submitted jobs)
-============================================
-A client that submits jobs via `ProxyV2` directly — currently the
-inpaint playground — registers each job with the daemon through
-`comfy_register_external_job` (see `comfyui_proxy.py`). The daemon
-creates a normal `_BatchRecord`, stores the proxy job id under
-`external_job_ids`, and stops there.
-
-`comfy_cancel` therefore handles two record shapes:
-
-  * **Internal** — `external_job_ids` empty. Behaviour unchanged:
-    `record.cancel_event.set()` and let the local poll loop do the
-    rest.
-
-  * **External** — `external_job_ids` non-empty. Setting
-    `cancel_event` would do nothing (the daemon never had a poll
-    loop for this job). Instead, `comfy_cancel` calls
-    `ProxyV2.cancel_job` on each registered job id, best-effort.
-    The client's own poll loop sees the proxy transition the job
-    to `canceled` on its next `get_job` call — no cooperation
-    needed from the daemon beyond the forward.
-
-The try/except around the external cancel is deliberately
-non-raising: a job that already reached a terminal state returns
-the terminal status without error; a proxy that has gone away since
-submission produces `ProxyUnreachable`. Neither should fail the
-cancel command when the user clicked Cancel-All on a batch that
-happens to already be finishing.
-
-Recent layer aliases
-====================
-After a batch in which at least one `prepare_workflow` succeeded,
-`_comfy_generate_impl` walks `_active_config["resources"]` and hands
-every `source == "layer"` entry's `layer_name` to
-`WorkflowCommands._record_recent_alias`. That's the "used these
-layers" signal for the docker's layer-alias dropdowns. Recording is
-per-batch, once, after the loop — the config is fixed for the whole
-batch, so the layer names are the same on every iteration; recording
-inside the loop would just be redundant work. Cancelled batches and
-batches in which every prepare failed record nothing.
-
-The hook is deliberately *not* on `comfy_prepare_only`: that command
-is a diagnostic that reads resources without submitting, and it
-should not pollute the MRU list.
-
-`--no_paste`
-============
-Returns PNG bytes as base64 in `data.images` instead of pasting into
-Krita. Used by the inpaint playground, which pastes client-side. Also
-skips `_paste_result` entirely. Sets `_last_result` so a subsequent
-`comfy_paste_last` still works.
-
-`--output_rotation`
-===================
-Applied per-image at paste time via `paste_image(rotation=...)`. Same
-semantics as before. Stored in `_last_result` so `comfy_paste_last`
-preserves it.
-
-`--output_name`
-===============
-Deprecated: it filtered ETN_KritaOutput nodes by `name`. In v2, output
-names are SaveImage filenames. Accepted for CLI compatibility but
-ignored — v2 pastes every SaveImage output that carries
-`type: "output"`.
-"""
+FILES
+=====
+`_paste_result` gains the padding branch and uses `prepared.rotation`
+(no per-call `--output_rotation`).  Everything else (submit, poll,
+download, batch semantics, cancel, history) is unchanged."""
 
 from __future__ import annotations
 
 import base64
 import json
+import math
 import time
 import uuid
 from datetime import datetime, timezone
@@ -114,6 +40,7 @@ from krita import Krita
 from ..decorators import command, AutoDispatchHandler
 from ..utils.comfy_apply import prepare_workflow
 from ..utils.comfyui_krita import (
+    pad_png,
     paste_animation,
     paste_batch_as_layers,
     paste_image,
@@ -133,9 +60,6 @@ from .comfyui_document import (
 )
 
 
-# Time allowance per run. The old pipeline's default of 55s matches;
-# poll adds a 60s margin so the total wall clock budget is
-# timeout + 60 per job.
 _POLL_MARGIN_S = 60.0
 _POLL_INTERVAL_S = 0.25
 
@@ -153,33 +77,12 @@ class GenerationCommands(AutoDispatchHandler):
     @command(
         category="comfyui",
         help_text="Run the active workflow via the v2 proxy. Requires "
-                  "comfy_apply_config to have been called (that's what "
-                  "tells the daemon which resources to read and which "
-                  "params to substitute). With --count N, run the "
-                  "workflow N times with consecutive seeds; requires a "
-                  "Primitive titled 'seed' in the graph.",
+                  "comfy_apply_config to have been called.",
         args={
-            "--timeout": {"type": "float", "default": 55.0,
-                          "help": "Seconds to wait per run for the job "
-                                  "to reach a terminal state."},
-            "--count": {"type": "int", "default": 1,
-                        "help": "Number of generations to run."},
-            "--seed": {"type": "int", "required": False,
-                       "help": "Base seed. Run i uses base+i. Omit for "
-                               "a random base. Ignored unless the "
-                               "workflow has a Primitive titled 'seed'."},
-            "--no_paste": {"type": "bool", "default": False,
-                           "help": "Skip pasting; return generated PNGs "
-                                   "as base64 in data.images. Used by "
-                                   "the inpaint playground."},
-            "--output_rotation": {"type": "float", "default": 0.0,
-                                  "help": "Degrees to rotate each "
-                                          "generation output before "
-                                          "pasting."},
-            "--output_name": {"type": "str", "required": False,
-                              "help": "Deprecated. Ignored in the v2 "
-                                      "pipeline; retained for CLI "
-                                      "compatibility."},
+            "--timeout": {"type": "float", "default": 55.0},
+            "--count":   {"type": "int",   "default": 1},
+            "--seed":    {"type": "int",   "required": False},
+            "--no_paste": {"type": "bool", "default": False},
         },
     )
     def comfy_generate(self, params):
@@ -198,17 +101,13 @@ class GenerationCommands(AutoDispatchHandler):
     def _comfy_generate_impl(self, params):
         parent = self.parent
 
-        # ---- preconditions ----
         if parent._active_workflow_graph is None:
             return {"success": False,
-                    "message": "No workflow loaded. Run comfy_load or "
-                               "publish a graph from ComfyUI's browser."}
+                    "message": "No workflow loaded. Run comfy_load first."}
         if parent._active_config is None:
             return {"success": False,
                     "message": "No panel config applied. Run "
-                               "comfy_apply_config first (or load a "
-                               "panel config that sets [resources], "
-                               "[params], [crop], [paste])."}
+                               "comfy_apply_config first."}
         if parent._client is None:
             return {"success": False,
                     "message": "Not connected; run comfy_connect first"}
@@ -227,7 +126,6 @@ class GenerationCommands(AutoDispatchHandler):
             return {"success": False,
                     "message": f"proxy unavailable: {e}"}
 
-        # ---- parse args ----
         requested_count = max(1, int(params.get("count", 1)))
         count = requested_count
         try:
@@ -235,10 +133,6 @@ class GenerationCommands(AutoDispatchHandler):
         except (TypeError, ValueError):
             timeout = 55.0
         no_paste = bool(params.get("no_paste", False))
-        try:
-            output_rotation = float(params.get("output_rotation") or 0.0)
-        except (TypeError, ValueError):
-            output_rotation = 0.0
 
         raw_seed = params.get("seed")
         if raw_seed in (None, ""):
@@ -252,14 +146,13 @@ class GenerationCommands(AutoDispatchHandler):
         batch_id = params.get("_batch_id") or str(uuid.uuid4())
         workflow_name = parent._active_workflow_name or "(unnamed)"
 
-        # ---- register batch ----
         record = _BatchRecord(
             batch_id=batch_id,
             workflow_name=workflow_name,
             requested_count=requested_count,
             total_runs=requested_count,
             base_seed=base_seed,
-            output_name=params.get("output_name") or None,
+            output_name=None,
         )
         with parent._batches_lock:
             parent._batches[batch_id] = record
@@ -268,14 +161,11 @@ class GenerationCommands(AutoDispatchHandler):
         try:
             warnings: list = []
 
-            # ---- batch feasibility ----
             has_seed_slot = "seed" in parent._active_workflow_param_slots
             if count > 1 and not has_seed_slot:
                 warnings.append(
                     f"count={requested_count} clamped to 1: the workflow "
-                    f"has no Primitive titled 'seed'. Wire a PrimitiveInt "
-                    f"titled 'seed' to the sampler's seed input to enable "
-                    f"batch generation."
+                    f"has no Primitive titled 'seed'."
                 )
                 count = 1
                 record.total_runs = 1
@@ -283,16 +173,8 @@ class GenerationCommands(AutoDispatchHandler):
             paste_config = dict(parent._active_config["paste"])
             batch_started = time.time()
 
-            # ---- phase 1: prepare + submit ----
             record.current_phase = "preparing"
             submitted: list = []
-            # Track whether *any* prepare succeeded in this batch.
-            # Used at the end of the try block to decide whether the
-            # layer names from `_active_config["resources"]` were
-            # actually used and should therefore be recorded into the
-            # recent-alias MRU. A batch where every prepare failed
-            # (bad layer, colour-mode problem, unreadable pixels)
-            # records nothing — nothing was used.
             any_prepare_succeeded = False
 
             for i in range(count):
@@ -337,8 +219,7 @@ class GenerationCommands(AutoDispatchHandler):
                     record.run_records.append({
                         "seed": seed_i, "prompt_id": None,
                         "status": "error",
-                        "error": f"submit: {e} "
-                                 f"(code={e.code}, status={e.status})",
+                        "error": f"submit: {e}",
                     })
                     continue
                 except ProxyUnreachable as e:
@@ -357,22 +238,19 @@ class GenerationCommands(AutoDispatchHandler):
                     "prepared": prepared,
                     "job_id": job_id,
                 })
-                print(f"[comfyui] batch {i + 1}/{count}: submitted job "
-                      f"{job_id}", flush=True)
 
-            # ---- phase 2: poll each job ----
             record.current_phase = "running"
 
             for entry in submitted:
                 job_id = entry["job_id"]
                 seed_i = entry["seed"]
+                prepared = entry["prepared"]
                 record.current_run_index = entry["index"]
 
                 terminal = self._poll_job(
                     proxy, job_id, record,
                     timeout=timeout + _POLL_MARGIN_S,
                 )
-
                 if terminal is None:
                     record.run_records.append({
                         "seed": seed_i, "prompt_id": job_id,
@@ -382,7 +260,6 @@ class GenerationCommands(AutoDispatchHandler):
                     continue
 
                 status = terminal.get("status")
-
                 if status == "canceled":
                     record.run_records.append({
                         "seed": seed_i, "prompt_id": job_id,
@@ -390,7 +267,6 @@ class GenerationCommands(AutoDispatchHandler):
                         "error": "cancelled",
                     })
                     continue
-
                 if status == "expired":
                     record.run_records.append({
                         "seed": seed_i, "prompt_id": job_id,
@@ -398,7 +274,6 @@ class GenerationCommands(AutoDispatchHandler):
                         "error": "job expired upstream",
                     })
                     continue
-
                 if status == "failed":
                     err = terminal.get("error") or {}
                     record.run_records.append({
@@ -408,7 +283,6 @@ class GenerationCommands(AutoDispatchHandler):
                                   or "execution failed"),
                     })
                     continue
-
                 if status != "succeeded":
                     record.run_records.append({
                         "seed": seed_i, "prompt_id": job_id,
@@ -417,7 +291,6 @@ class GenerationCommands(AutoDispatchHandler):
                     })
                     continue
 
-                # ---- download outputs ----
                 downloaded = self._download_outputs(proxy, terminal)
                 if not downloaded:
                     record.run_records.append({
@@ -428,7 +301,6 @@ class GenerationCommands(AutoDispatchHandler):
                     })
                     continue
 
-                # ---- no_paste path ----
                 if no_paste:
                     record.run_records.append({
                         "seed": seed_i, "prompt_id": job_id,
@@ -441,31 +313,26 @@ class GenerationCommands(AutoDispatchHandler):
                     parent._last_result = {
                         "outputs": downloaded,
                         "job_id": job_id,
-                        "crop_bounds": entry["prepared"].crop_bounds,
+                        "crop_bounds": prepared.crop_bounds,
                         "paste_config": paste_config,
-                        "output_rotation": output_rotation,
+                        "output_rotation": prepared.rotation,
                     }
                     parent._last_document = doc
-                    print(f"[comfyui] batch {entry['index'] + 1}/{count}: "
-                          f"downloaded {len(downloaded)} image(s) "
-                          f"(no_paste)", flush=True)
                     continue
 
-                # ---- paste ----
                 try:
                     paste_result = self._paste_result(
                         doc,
                         downloaded,
-                        crop_bounds=entry["prepared"].crop_bounds,
+                        crop_bounds=prepared.crop_bounds,
                         paste_config=paste_config,
                         job_id=job_id,
                         seed_suffix=seed_i if count > 1 else None,
-                        output_rotation=output_rotation,
+                        output_rotation=prepared.rotation,
                     )
                 except Exception as e:
                     import traceback
-                    print(f"[comfyui] batch {entry['index'] + 1}/{count}: "
-                          f"paste raised:", flush=True)
+                    print(f"[comfyui] paste raised:", flush=True)
                     traceback.print_exc()
                     record.run_records.append({
                         "seed": seed_i, "prompt_id": job_id,
@@ -481,9 +348,6 @@ class GenerationCommands(AutoDispatchHandler):
                         "error": paste_result.get(
                             "message", "paste failed"),
                     })
-                    print(f"[comfyui] batch {entry['index'] + 1}/{count}: "
-                          f"paste failed: "
-                          f"{paste_result.get('message')}", flush=True)
                     continue
 
                 pdata = paste_result.get("data") or {}
@@ -497,16 +361,12 @@ class GenerationCommands(AutoDispatchHandler):
                 parent._last_result = {
                     "outputs": downloaded,
                     "job_id": job_id,
-                    "crop_bounds": entry["prepared"].crop_bounds,
+                    "crop_bounds": prepared.crop_bounds,
                     "paste_config": paste_config,
-                    "output_rotation": output_rotation,
+                    "output_rotation": prepared.rotation,
                 }
                 parent._last_document = doc
-                print(f"[comfyui] batch {entry['index'] + 1}/{count}: "
-                      f"pasted {len(pdata.get('layer_names', []))} "
-                      f"layer(s)", flush=True)
 
-            # ---- finalize ----
             record.current_phase = "finalizing"
 
             self._write_history_record(
@@ -518,16 +378,6 @@ class GenerationCommands(AutoDispatchHandler):
                 duration_s=time.time() - batch_started,
             )
 
-            # ---- record recent layer aliases ----
-            #
-            # Option B (see module docstring, "Recent layer aliases"):
-            # if at least one prepare succeeded, every `source ==
-            # "layer"` entry in the config was actually read from the
-            # document this batch and should be promoted to the front
-            # of the MRU. `_active_config` is fixed for the whole
-            # batch, so we can iterate it once here rather than
-            # recording per-iteration. Cancelled batches and batches
-            # where every prepare failed record nothing.
             if any_prepare_succeeded:
                 self._record_used_layers(parent._active_config)
 
@@ -558,8 +408,6 @@ class GenerationCommands(AutoDispatchHandler):
                 "runs": [_public_run_record(r) for r in record.run_records],
             }
 
-            # no_paste: include base64 PNG bytes so the caller can use
-            # them without a second round trip.
             if no_paste:
                 images = []
                 for r in record.run_records:
@@ -573,10 +421,7 @@ class GenerationCommands(AutoDispatchHandler):
             if warnings:
                 response_data["warnings"] = warnings
 
-            # ---- success/failure verdict ----
             if successful == 0:
-                # In no_paste mode, "successful" counts downloaded runs
-                # even without pasting — same counter applies.
                 if cancelled == len(record.run_records) and cancelled > 0:
                     msg = (f"Batch cancelled "
                            f"({cancelled} run(s) not completed)")
@@ -618,18 +463,12 @@ class GenerationCommands(AutoDispatchHandler):
             parent._publish_state_change()
 
     # ------------------------------------------------------------------
-    #  Poll helpers
+    #  Poll
     # ------------------------------------------------------------------
 
     def _poll_job(self, proxy: ProxyV2, job_id: str,
                   record: _BatchRecord, *,
                   timeout: float) -> Optional[dict]:
-        """Poll one job until terminal, sending cancel once on cancel_event.
-
-        Returns the terminal Job dict, or None on transport failure
-        or timeout. A returned `status` of "canceled" means the job
-        wound down cleanly.
-        """
         deadline = time.monotonic() + timeout
         last_error: Optional[str] = None
 
@@ -649,8 +488,6 @@ class GenerationCommands(AutoDispatchHandler):
                 time.sleep(_POLL_INTERVAL_S)
                 continue
             except ProxyHTTPError as e:
-                # 404 means the proxy has no record — treat as expired.
-                # Any other error is transient; keep polling.
                 if e.status == 404:
                     return {
                         "id": job_id,
@@ -674,14 +511,7 @@ class GenerationCommands(AutoDispatchHandler):
                   f"{last_error}", flush=True)
         return None
 
-    def _download_outputs(self, proxy: ProxyV2,
-                          job: dict) -> list:
-        """Download every committed output of a succeeded job.
-
-        Skips entries with `type: "temp"` — those are `PreviewImage`
-        snapshots written to temp/ and are not user-visible results.
-        Returns a list of ``{"png_bytes", "name", "node_id", "type"}``.
-        """
+    def _download_outputs(self, proxy: ProxyV2, job: dict) -> list:
         real_outputs = [
             o for o in (job.get("outputs") or [])
             if o.get("type") and o["type"] != "temp" and o.get("id")
@@ -692,16 +522,9 @@ class GenerationCommands(AutoDispatchHandler):
                 png = proxy.download_asset(out["id"])
             except ProxyHTTPError as e:
                 if e.status == 404 and e.code == "output_unavailable":
-                    # Bytes gone; skip without failing the run.
-                    print(f"[comfyui] output {out.get('name')} bytes "
-                          f"unavailable; skipping", flush=True)
                     continue
-                print(f"[comfyui] download {out.get('name')} failed: "
-                      f"{e}", flush=True)
                 continue
-            except ProxyUnreachable as e:
-                print(f"[comfyui] download {out.get('name')} failed: "
-                      f"{e}", flush=True)
+            except ProxyUnreachable:
                 continue
             downloaded.append({
                 "png_bytes": png,
@@ -717,21 +540,9 @@ class GenerationCommands(AutoDispatchHandler):
 
     @command(
         category="comfyui",
-        help_text="Cancel one or more running batches. Internal "
-                  "batches (submitted via comfy_generate) are "
-                  "cancelled by setting their cancel_event, which "
-                  "the local poll loop turns into a "
-                  "ProxyV2.cancel_job call. External batches "
-                  "(registered by a client that submitted via "
-                  "ProxyV2 directly, e.g. the inpaint playground) are "
-                  "cancelled by calling ProxyV2.cancel_job on each "
-                  "registered job id — the client owns its own poll "
-                  "loop and sees the proxy's canceled status without "
-                  "any daemon cooperation beyond the forward.",
+        help_text="Cancel one or more running batches.",
         args={
-            "--batch_id": {"type": "str", "required": False,
-                           "help": "The batch id to cancel. Omit to "
-                                   "cancel all active batches."},
+            "--batch_id": {"type": "str", "required": False},
         },
     )
     def comfy_cancel(self, params):
@@ -764,24 +575,6 @@ class GenerationCommands(AutoDispatchHandler):
         for r in records:
             external_ids = getattr(r, "external_job_ids", None) or []
             if external_ids:
-                # External batch: the daemon never had a poll loop for
-                # this job, so setting cancel_event would do nothing.
-                # Route the cancel to the proxy directly. Both errors
-                # we swallow here are non-fatal:
-                #
-                #   * ProxyHTTPError — the job already reached a
-                #     terminal state (cancel on a terminal job is a
-                #     no-op that returns the terminal Job dict, but
-                #     a 404 for a job the proxy has since forgotten
-                #     is possible if the batch record outlives the
-                #     proxy's job retention window).
-                #
-                #   * ProxyUnreachable — the proxy has gone away
-                #     since submission. Nothing to cancel through it.
-                #
-                # Either way, the client's own poll loop is what
-                # ultimately decides the run's fate; the daemon's
-                # forward is best-effort.
                 try:
                     proxy = ProxyV2.from_pid_file()
                 except (ProxyUnreachable, ImportError):
@@ -792,9 +585,6 @@ class GenerationCommands(AutoDispatchHandler):
                     except (ProxyHTTPError, ProxyUnreachable):
                         pass
             else:
-                # Internal batch: unchanged behaviour. The poll loop
-                # in `_poll_job` watches `cancel_event` and sends
-                # `cancel_job` once per in-flight job id.
                 r.cancel_event.set()
 
         active_ids = sorted(r.batch_id for r in records)
@@ -817,10 +607,8 @@ class GenerationCommands(AutoDispatchHandler):
         help_text="Re-paste the most recent generation's result as new "
                   "layers.",
         args={
-            "--name": {"type": "str", "required": False,
-                       "help": "Override the layer name"},
-            "--blend_mode": {"type": "str", "required": False,
-                             "help": "Krita blend mode; default normal"},
+            "--name": {"type": "str", "required": False},
+            "--blend_mode": {"type": "str", "required": False},
         },
     )
     def comfy_paste_last(self, params):
@@ -855,17 +643,14 @@ class GenerationCommands(AutoDispatchHandler):
             blend_mode=blend_mode,
         )
 
+    # ------------------------------------------------------------------
+    #  comfy_paste_image_b64
+    # ------------------------------------------------------------------
+
     @command(
         category="comfyui",
-        help_text="Paste a base64-encoded PNG into the active document as "
-                  "a new paint layer.  When --rotation is nonzero, the "
-                  "image is rotated about its center via "
-                  "QTransform().rotate(rotation) and center-cropped to "
-                  "the document's dimensions before being written.  This "
-                  "is the paste step for external submissions (e.g. the "
-                  "inpaint playground's option-2 pipeline), which bypass "
-                  "the daemon's own comfy_generate and so need a "
-                  "standalone way to get their result into Krita.",
+        help_text="Paste a base64-encoded PNG into the active document "
+                  "as a new paint layer.",
         args={
             "--name":       {"type": "str",   "default": ""},
             "--image_b64":  {"type": "str",   "required": True},
@@ -879,7 +664,7 @@ class GenerationCommands(AutoDispatchHandler):
         import base64 as _b64
         import time as _time
         from krita import Krita
-        from ..utils.comfyui_krita import paste_image
+        from ..utils.comfyui_krita import paste_image as _paste_image
 
         name = (params.get("name") or "").strip()
         image_b64 = params.get("image_b64") or ""
@@ -908,7 +693,7 @@ class GenerationCommands(AutoDispatchHandler):
             name = f"[Inpaint] {int(_time.time()) & 0xFFFFFF:06x}"
 
         try:
-            node = paste_image(
+            node = _paste_image(
                 doc, png, x, y, name,
                 blend_mode=blend_mode,
                 make_active=True,
@@ -929,11 +714,9 @@ class GenerationCommands(AutoDispatchHandler):
 
     @command(
         category="comfyui",
-        help_text="Return the last N generation records from the panel's "
-                  "history directory.",
+        help_text="Return the last N generation records.",
         args={
-            "--limit": {"type": "int", "default": 10,
-                        "help": "How many entries to return"},
+            "--limit": {"type": "int", "default": 10},
         },
     )
     def comfy_history(self, params):
@@ -958,6 +741,13 @@ class GenerationCommands(AutoDispatchHandler):
     # ------------------------------------------------------------------
     #  Paste
     # ------------------------------------------------------------------
+    #
+    # Rotation branch:
+    #   · rotation == 0 → paste at (crop_bounds[0]+x, crop_bounds[1]+y)
+    #   · rotation != 0 → pad workflow output back to rotated frame
+    #                     dims, pass rotation=-rotation to paste_image
+    #                     (un-rotate + center-crop to doc dims),
+    #                     paste at (x, y)
 
     def _paste_result(self, doc, outputs: list, *,
                       crop_bounds: tuple,
@@ -966,40 +756,22 @@ class GenerationCommands(AutoDispatchHandler):
                       seed_suffix: Optional[int] = None,
                       output_rotation: float = 0.0,
                       blend_mode: str = "normal") -> dict:
-        """Paste downloaded outputs as Krita layers.
-
-        `outputs` is the list produced by `_download_outputs`:
-        ``[{"png_bytes", "name", "node_id", "type"}, ...]``.
-
-        Groups by `node_id` (one group per SaveImage node). For each
-        group:
-          * `batch_mode="layers"` and multiple images → multiple layers
-            via `paste_batch_as_layers`.
-          * `batch_mode="animation"` and multiple images → import as an
-            animation.
-          * otherwise → one layer per image, name-suffixed if >1.
-
-        `crop_bounds` is the crop origin the workflow ran against. Final
-        paste position is ``crop_bounds[0] + paste_config["x"]`` (and
-        same for y). A workflow run against a sub-region of the canvas
-        pastes its output back at the crop origin, not at the top-left
-        of the document.
-
-        `job_id` is used to derive a default layer name when
-        `paste_config["name"]` is empty.
-        """
         if not outputs:
             return {"success": True,
                     "message": "No outputs to paste",
                     "data": {"layer_names": [],
                              "output_count": 0, "frame_count": 0}}
 
-        # Group by SaveImage node.
+        print(f"[_paste_result] output_rotation={output_rotation} "
+              f"crop_bounds={crop_bounds} "
+              f"paste_config.x={paste_config.get('x', 0)} "
+              f"y={paste_config.get('y', 0)} "
+              f"outputs={len(outputs)}", flush=True)
+
         groups: dict[str, list] = {}
         for o in outputs:
             groups.setdefault(o["node_id"], []).append(o)
 
-        # resize_canvas from the first output (if configured).
         resize_canvas_flag = bool(paste_config.get("resize_canvas", False))
         if resize_canvas_flag:
             w, h = _png_dimensions(outputs[0]["png_bytes"])
@@ -1010,9 +782,50 @@ class GenerationCommands(AutoDispatchHandler):
                     return {"success": False,
                             "message": f"resize_canvas failed: {e}"}
 
-        # Final paste origin = crop origin + configured offset.
-        paste_x = int(crop_bounds[0]) + int(paste_config.get("x", 0))
-        paste_y = int(crop_bounds[1]) + int(paste_config.get("y", 0))
+        configured_x = int(paste_config.get("x", 0))
+        configured_y = int(paste_config.get("y", 0))
+
+        if output_rotation != 0:
+            # Pad workflow output back to rotated frame dims so un-rotation
+            # recovers the full un-rotated canvas (no clipped corners).
+            try:
+                W_doc = int(doc.width())
+                H_doc = int(doc.height())
+                rad = math.radians(abs(float(output_rotation)))
+                cos_a = abs(math.cos(rad))
+                sin_a = abs(math.sin(rad))
+                Wp = max(1, int(round(W_doc * cos_a + H_doc * sin_a)))
+                Hp = max(1, int(round(W_doc * sin_a + H_doc * cos_a)))
+                cropW = int(crop_bounds[2])
+                cropH = int(crop_bounds[3])
+                pad_x = max(0, (Wp - cropW) // 2)
+                pad_y = max(0, (Hp - cropH) // 2)
+                print(f"[_paste_result] rotated prepare: "
+                      f"theta={output_rotation} doc={W_doc}x{H_doc} "
+                      f"frame={Wp}x{Hp} crop={cropW}x{cropH} "
+                      f"pad_at=({pad_x},{pad_y})", flush=True)
+                new_outputs = []
+                for o in outputs:
+                    padded_bytes = pad_png(o["png_bytes"],
+                                           pad_x, pad_y, Wp, Hp)
+                    o2 = dict(o)
+                    o2["png_bytes"] = padded_bytes
+                    new_outputs.append(o2)
+                outputs = new_outputs
+            except Exception as e:
+                import traceback
+                print(f"[_paste_result] padding failed "
+                      f"(continuing unpadded): {e}", flush=True)
+                traceback.print_exc()
+
+            paste_x = configured_x
+            paste_y = configured_y
+            effective_rotation = -output_rotation
+        else:
+            paste_x = int(crop_bounds[0]) + configured_x
+            paste_y = int(crop_bounds[1]) + configured_y
+            effective_rotation = 0.0
+
         batch_mode = paste_config.get("batch_mode", "default")
         configured_name = paste_config.get("name") or ""
 
@@ -1023,7 +836,6 @@ class GenerationCommands(AutoDispatchHandler):
         for node_id, group in groups.items():
             images = [o["png_bytes"] for o in group]
 
-            # Layer name.
             if configured_name and len(groups) == 1:
                 base_name = configured_name
             elif configured_name:
@@ -1042,18 +854,17 @@ class GenerationCommands(AutoDispatchHandler):
                         pasted_frames += len(images)
                         pasted_layers.append(f"[Animation] {base_name}")
                         continue
-                    # Fallback to single paste if animation import failed.
                     node = paste_image(
                         doc, images[0], paste_x, paste_y, base_name,
                         blend_mode=blend_mode,
-                        rotation=output_rotation,
+                        rotation=effective_rotation,
                     )
                     pasted_layers.append(node.name())
                 elif batch_mode == "layers" and len(images) > 1:
                     nodes = paste_batch_as_layers(
                         doc, images, paste_x, paste_y, base_name,
                         blend_mode=blend_mode,
-                        rotation=output_rotation,
+                        rotation=effective_rotation,
                     )
                     pasted_layers.extend(n.name() for n in nodes)
                 else:
@@ -1065,7 +876,7 @@ class GenerationCommands(AutoDispatchHandler):
                         node = paste_image(
                             doc, png, paste_x, paste_y, sub_name,
                             blend_mode=blend_mode,
-                            rotation=output_rotation,
+                            rotation=effective_rotation,
                         )
                         pasted_layers.append(node.name())
             except ValueError as e:
@@ -1138,33 +949,10 @@ class GenerationCommands(AutoDispatchHandler):
             pass
 
     # ------------------------------------------------------------------
-    #  Recent layer aliases (Option B)
+    #  Recent layer aliases
     # ------------------------------------------------------------------
 
     def _record_used_layers(self, config: Optional[dict]) -> None:
-        """Promote every `source == "layer"` resource's layer_name into
-        the recent-alias MRU, once per successful batch.
-
-        Called from `_comfy_generate_impl` after the batch loop, gated
-        on `any_prepare_succeeded`. Nothing else calls this method.
-
-        Reaches into `WorkflowCommands._record_recent_alias` for the
-        actual prepend-dedupe-cap-persist logic, keeping a single
-        write path: the CLI `comfy_record_recent_alias` command and
-        this internal hook both land in the same helper, so the two
-        cannot drift.
-
-        No-ops on `config is None` or an empty `resources` dict — the
-        batch would have bailed at the `_active_config is None`
-        precondition long before reaching finalize, so this is purely
-        defensive.
-
-        Malformed entries (non-dict spec, missing name, empty
-        layer_name) are skipped rather than raising; the layer was
-        already used successfully at prepare time by the time we get
-        here, so a broken record at this layer of the stack is a
-        data-shape problem, not a reason to fail the batch.
-        """
         if not config:
             return
         resources = config.get("resources") or {}

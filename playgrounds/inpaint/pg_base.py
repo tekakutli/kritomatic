@@ -1,56 +1,24 @@
 """Inpaint playground's panel body and CSS.
 
-Three sections: Image, View, Masks, Inpainting.  Export-to-Krita is
-not wired here; mask editing and export live in `sam3_segment` or in
-Krita itself.
+Sections: Image, View, Masks, Context.  Export-to-Krita is not wired
+here; mask editing and export live in `sam3_segment` or in Krita
+itself.
 
-The context rectangle defaults to disabled: on page load the checkbox
-is unchecked, the rectangle is not drawn, and the inpaint workflow
-uses the full canvas as context.  Checking the box restricts
-inpainting to the rectangle drawn on the canvas.
+The Inpaint button, Cancel button, prompt textarea, and interceptor
+routing are all gone.  This playground no longer submits generation —
+the docker's Run button does.  This playground's job is to push state
+into Krita scratch layers so the docker's run finds the right canvas,
+mask, and context rectangle.  See `pg_sync.js`.
 
-The Inpaint prompt textarea is an *override* on the daemon's
-shared-state prompt (the docker / web panel's
-`comfy_apply_config` params).  Left blank, the workflow uses whatever
-the docker or web panel has set, with the workflow's own
-`PrimitiveString` default as the last resort.  See
-`inpaint_server.py`'s PROMPT RESOLUTION section.
+The `#inpaintEnabled` checkbox ("Context rectangle") stays: it decides
+whether `thecontext` is pushed with a white rectangle or left alone.
+When off, the daemon falls back to the `@thecontext` layer's own tight
+bbox (if any) or the whole canvas.
 
-The Refresh button re-fetches the current `@thecanvas` from the
-daemon on demand.  The `@thecanvas` spec normally tracks layer
-edits through `pg_autosync.js`, but that poller only reacts to spec
-*changes* (`active` -> `layer X`, `layer X` -> `layer Y`).  A spec
-that stays constant while the underlying pixels change (e.g. a
-paint layer whose content was edited in Krita) does not trigger a
-refresh.  The button is the manual escape hatch."""
+The `#statusLine` element is repurposed as the sync status: `Synced
+14:22:08 · rotation 15.0° · mask 3/5 · context on`."""
 
 PG_CSS = r"""
-  #ui button#inpaintBtn {
-    border-color: rgba(180, 155, 255, 0.72);
-    color: #d5c8ff;
-  }
-  #ui button#inpaintBtn:hover:not(:disabled) {
-    border-color: rgba(200, 180, 255, 1.00);
-    background: rgba(180, 155, 255, 0.10);
-    color: #e8e0ff;
-  }
-  #ui button#inpaintBtn.busy {
-    border-color: rgba(255, 200, 90, 0.72);
-    color: #ffd89b;
-  }
-  #ui button#inpaintBtn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
-  #ui button#cancelBtn {
-    border-color: rgba(255, 105, 125, 0.55);
-    color: #ffb0bc;
-  }
-  #ui button#cancelBtn:hover:not(:disabled) {
-    border-color: rgba(255, 130, 150, 1.00);
-    background: rgba(220, 90, 110, 0.10);
-    color: #ffd0d8;
-  }
   #ui button#pickImageBtn,
   #ui button#pickMaskBtn,
   #ui button#refreshCanvasBtn {
@@ -101,6 +69,18 @@ PG_CSS = r"""
     opacity: 0.35;
     cursor: not-allowed;
   }
+  #ui button#syncNowBtn {
+    border-color: rgba(120, 220, 255, 0.72);
+    color: #b8ecff;
+    font-size: 9px;
+    padding: 2px 8px;
+    width: auto;
+  }
+  #ui button#syncNowBtn:hover:not(:disabled) {
+    border-color: rgba(140, 225, 255, 1.00);
+    background: rgba(120, 220, 255, 0.10);
+    color: #d8f4ff;
+  }
   #kritaStatus {
     font-size: 10px;
     color: #5a6774;
@@ -109,16 +89,6 @@ PG_CSS = r"""
   #kritaStatus.ok   { color: #00e5ff; }
   #kritaStatus.bad  { color: #d48590; }
   #kritaStatus.warn { color: #ffe600; }
-
-  #inpaintPrompt {
-    width:100%;background:#0d1219;color:#00e5ff;
-    border:1px solid #223040;border-radius:2px;
-    font-family:inherit;font-size:12px;
-    padding:4px 6px;outline:none;resize:vertical;
-  }
-  #inpaintPrompt:disabled {
-    opacity: 0.5;
-  }
 
   .maskList {
     display:flex; flex-direction:column;
@@ -223,19 +193,19 @@ PG_PANEL_BODY = r"""
         </div>
         <div class="row">
           <button id="kritaImportMasksBtn"
-                  title="Import the selected mask or paint layer(s) from Krita into the playground's mask stack. If multiple layers are selected in Krita, all are imported. Paint layers contribute their alpha channel; mask layers contribute their grayscale pixels.">
+                  title="Import the selected mask or paint layer(s) from Krita into the playground's mask stack.">
             + Import masks from Krita
           </button>
         </div>
         <div class="row">
           <button id="pickMaskBtn"
-                  title="Pick a PNG from disk as a mask. White = selected, black = not selected. Resized to the canvas if needed.">
+                  title="Pick a PNG from disk as a mask.">
             + Pick mask file…
           </button>
         </div>
         <div class="row">
           <button id="refreshCanvasBtn"
-                  title="Re-fetch the current @thecanvas from Krita. Use when the canvas image changed in Krita but the autosync poller didn't pick it up — the poller only fires when the @thecanvas *spec* changes (active ↔ layer X ↔ layer Y), not when the pixels behind a constant spec change.">
+                  title="Re-fetch the current @thecanvas from Krita.">
             ↻ Refresh @thecanvas
           </button>
         </div>
@@ -248,16 +218,16 @@ PG_PANEL_BODY = r"""
     </details>
 
     <details class="section" open>
-          <summary>View</summary>
-          <div class="section-body">
-            <div class="field">
-              <label>Rotation</label>
-              <input type="text" id="viewRotation" class="scrubInput"
-                     value="0" autocomplete="off" spellcheck="false"
-                     title="Rotation in degrees. Drag sideways to scrub; hold Shift to snap to 15&#176;. Click to type an exact value.">
-            </div>
-          </div>
-        </details>
+      <summary>View</summary>
+      <div class="section-body">
+        <div class="field">
+          <label>Rotation</label>
+          <input type="text" id="viewRotation" class="scrubInput"
+                 value="0" autocomplete="off" spellcheck="false"
+                 title="Rotation in degrees. Drag sideways to scrub; hold Shift to snap to 15°. Click to type an exact value.">
+        </div>
+      </div>
+    </details>
 
     <details class="section" open>
       <summary>Masks</summary>
@@ -271,56 +241,29 @@ PG_PANEL_BODY = r"""
     </details>
 
     <details class="section" open>
-      <summary>Inpainting</summary>
+      <summary>Context</summary>
       <div class="section-body">
         <div class="field">
           <label>Context rectangle</label>
           <span style="display:flex;gap:6px;align-items:center;">
             <input type="checkbox" id="inpaintEnabled"
-                   title="When checked, inpainting is restricted to the rectangle drawn on the canvas. When unchecked, the whole canvas is the context and the rectangle is hidden.">
+                   title="When checked, pushes a white rectangle at the current context rect into @thecontext. When unchecked, @thecontext is left alone — the daemon falls back to that layer's own bbox or the whole canvas.">
             <button id="maskFromRectBtn"
-                    title="Create a new mask from the current context rectangle (white = inside, black = outside). The new mask is placed at the top of the mask stack and selected."
+                    title="Create a new mask from the current context rectangle."
                     disabled>+ As mask</button>
           </span>
         </div>
         <div id="inpaintRectHint" class="runHint"
              style="margin-top:4px;display:none;">
-          Drag anywhere on the context rectangle's border or interior
-          to move it. Drag a handle (four corners, four edge midpoints)
-          to resize. Hold Shift while dragging a handle to resize
-          symmetrically around the center.
-        </div>
-        <div class="field" style="align-items:flex-start;flex-direction:column;margin-top:6px;">
-          <label style="text-align:left;flex:0 0 auto;margin-bottom:4px;">
-            Inpaint prompt
-          </label>
-          <textarea id="inpaintPrompt" rows="2" spellcheck="false"
-                    placeholder="what should appear (blank = use docker / web panel prompt)"
-          ></textarea>
-        </div>
-        <div class="field" style="align-items:flex-start;flex-direction:column;margin-top:8px;">
-          <label style="display:flex;gap:6px;align-items:center;cursor:pointer;flex:0 0 auto;">
-            <input type="checkbox" id="interceptEnabled"
-                   title="Send the payload to an interceptor playground instead of running inpaint locally.">
-            Route via interceptor
-          </label>
-        </div>
-        <div class="field" id="interceptUrlRow"
-             style="display:none;align-items:flex-start;flex-direction:column;margin-top:4px;">
-          <input type="text" id="interceptUrl"
-                 value="http://127.0.0.1:8775/intercept/intake"
-                 style="width:100%;background:#0d1219;color:#00e5ff;
-                        border:1px solid #223040;border-radius:2px;
-                        font-family:inherit;font-size:11px;
-                        padding:4px 6px;outline:none;"
-                 autocomplete="off" spellcheck="false">
+          Drag anywhere on the context rectangle's border or interior to move it.
+          Drag a handle (four corners, four edge midpoints) to resize.
+          Hold Shift while dragging a handle to resize symmetrically around the center.
         </div>
         <div class="row" style="margin-top:8px;">
-          <button id="inpaintBtn"
-                  title="Run the inpaint workflow with the current canvas, selected mask, and context.">
-            Inpaint
+          <button id="syncNowBtn"
+                  title="Re-push the current state into Krita scratch layers.">
+            Sync now
           </button>
-          <button id="cancelBtn">Cancel</button>
         </div>
         <div id="statusLine">idle</div>
       </div>

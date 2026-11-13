@@ -5,96 +5,44 @@ Operations exposed by this playground:
   - Load image (file, drop; autosync from @thecanvas)
   - Load masks (import from Krita, pick a PNG file)
   - Select / delete masks
-  - Rotate the playground view (single scrub input: click-to-type,
-    drag-to-scrub, Shift-snap)
+  - Rotate the playground view (single scrub input)
   - Materialise the context rectangle as a mask
-  - Inpaint (local, or routed via the interceptor playground when
-    the "Route via interceptor" checkbox is on)
-  - Cancel (local interrupt, or interceptor cancellation)
-  - Manually re-fetch @thecanvas from Krita (Refresh button)
+  - Manual "Sync now" (re-push state)
   - ComfyUI / Krita status checks
 
-Not present: Segment All, Refine, mask prompt, region painting,
-points, undo/redo, export to Krita.  Also: the old "Import image from
-Krita" button is gone — `pg_autosync.js` pulls the current
-`@thecanvas` in automatically when the daemon's config points at
-one.
+Not present: Inpaint button, Cancel button, prompt field, interceptor
+routing.  Generation is triggered by the docker's Run button; the
+playground's job is to push state into Krita scratch layers so that
+run finds the right canvas / mask / context rectangle.
 
-MANUAL REFRESH
-==============
-`_refreshCanvasAction` re-fetches `@thecanvas` on demand.  The
-autosync poller only reacts to *spec* changes, so a paint layer
-whose content was edited in Krita keeps showing the old pixels
-until something else triggers a poll.  The button bypasses the
-spec-change detection: read the current spec, fetch the pixels
-that spec resolves to, `applyCanvasImage`.  Masks and the context
-rect survive if the new image has matching dimensions — same
-semantics as the autosync path — so the manual refresh is safe to
-invoke at any point in a session.
+SYNC TRIGGERS
+=============
+Every user-facing state mutation below calls `scheduleSync()` after
+updating the model.  Image loads and mask imports go through the
+debounced path; rotation changes bypass the debounce (handled in
+`pg_panel_scrubs.js`).  Autosync from @thecanvas does NOT schedule a
+push — pushing back what was just pulled would be wasteful.
 
-PASTE ≠ PLAYGROUND UPDATE
+MANUAL @thecanvas REFRESH
 =========================
-After `/comfy/inpaint` succeeds, the server has already pasted the
-result into Krita (via `comfy_paste_image_b64`, un-rotated by
-`output_rotation`).  The inpaint playground does NOT pull that
-result back into its own canvas.  The playground's displayed image
-is whatever `@thecanvas` resolves to at any moment; that is the
-whole point of the autosync poller in `pg_autosync.js`.  Injecting
-the inpaint output would make the canvas show something `@thecanvas`
-does not point at.
-
-So `_inpaintAction`, after the server returns, only flashes a
-status line.  It never writes `board.originalImageEl`,
-`board.imageEl`, or `board.imageDataUrl`.  If the user wants to see
-the pasted result in the playground, they set `@thecanvas` to a
-spec that resolves to it (e.g. `source: "active"`); autosync then
-refreshes the canvas on the next spec change, exactly as for any
-other `@thecanvas` update.
-
-KRITA STATUS MIRRORING
-======================
-`#kritaStatus` is a PERSISTENT panel element: a small "✓ reachable"
-/ "✗ not reachable" label next to the Check-Krita button.  Unlike
-`flashStatus`, it does not auto-clear — the last-known state stays
-visible until the next refresh.
-
-`_kritaMarkReachable()` writes the ✓ form; `_kritaMarkUnreachable(
-reason)` writes the ✗ form.  Because the ✗ state is exactly what a
-developer watching the terminal would want to see, `_kritaMarkUnreachable`
-ALSO mirrors `reason` to `console.error`, which pgkit/panel_core.js
-routes to `POST ./__log`.  The persistent DOM write is for at-a-glance
-panel reading; the terminal write is the durable record.
-
-SHARED-PROMPT HYDRATION
-=======================
-`_hydrateSharedPrompt` pulls the daemon's shared-state prompt
-(`_active_config["params"]["prompt"]`, the same value the docker and
-web panel edit) into the playground's prompt field on boot, but only
-when the playground's own prompt is empty.
-
-SHARED-SELECTION HYDRATION
-==========================
-`_hydrateSharedSelection` pulls the mask the daemon's config points
-at via `@theselection` into the playground's mask stack on boot, but
-only when the stack is empty.
-"""
+`_refreshCanvasAction` uses `applyCanvasImage`, which preserves the
+mask stack and the context rectangle when the new image's dims
+match.  (A full-dims mismatch clears the context rect, since its
+coords referred to the old dims, but masks keep their pixel data.)"""
 
 PANEL_BINDINGS_JS = r"""
-import { board, setImage, clearImage, _scheduleDraw,
-         view, _rotateImage, applyCanvasImage } from "./pg_state.js";
+import { board, setImage, clearImage, applyCanvasImage,
+         _scheduleDraw, view, _applyRotation } from "./pg_state.js";
 import {
   setMasks, addMaskFromB64,
   selectedMask, selectedMaskIdx,
   replaceMaskSelection,
 } from "./pg_masks.js";
-import { buildMaskFromContextRectB64, projectCropDims } from "./pg_inpaint.js";
-import { computeMaskBBox } from "./pg_pixels.js";
+import { buildMaskFromContextRectB64 } from "./pg_inpaint.js";
 import { syncMaskList } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
-import {
-  uploadImageFile, fetchStatus, runInpaint, runInpaintViaInterceptor,
-  interruptInpaint, fetchCurrentPrompt,
-} from "./pg_comfy_client.js";
+import { scheduleSync, syncNow } from "./pg_sync.js";
+import { uploadImageFile, fetchStatus } from "./pg_comfy_client.js";
 import {
   checkKritaStatus, importKritaMasks, fetchActiveState,
   fetchResourceImage,
@@ -131,6 +79,7 @@ async function _handleDroppedFile(file) {
     syncPanelFields();
     syncMaskList();
     pgkitNotifyAll();
+    scheduleSync();
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   } catch (e) {
     flashStatus("upload failed: " + e.message, "bad");
@@ -173,6 +122,7 @@ function _pickMaskAction() {
       syncMaskList();
       syncPanelFields();
       pgkitNotifyAll();
+      scheduleSync();
       import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
     };
     reader.onerror = () => flashStatus("could not read mask file", "bad");
@@ -183,37 +133,18 @@ function _pickMaskAction() {
 
 function _clearImageAction() {
   clearImage();
-  // clearImage resets view.rotation to 0; sync the widget so the
-  // user does not see a stale angle on a cleared canvas.
   const rotEl = document.getElementById("viewRotation");
   if (rotEl) rotEl.value = "0";
   syncPanelFields();
   syncMaskList();
   pgkitNotifyAll();
+  scheduleSync();
   import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
 }
 
 /* ============================================================
    Manual @thecanvas refresh
-   ============================================================
-   The autosync poller in `pg_autosync.js` reacts only to changes
-   in the @thecanvas *spec* — `active` → `layer X`, `layer X` →
-   `layer Y`, etc.  A paint layer whose content was edited in
-   Krita keeps the same spec, so the poller does not fire and the
-   playground keeps showing the old pixels.  This button is the
-   manual escape hatch.
-
-   Shape of the operation is identical to the poller's
-   `_fetchAndSet`: read the current spec, resolve it to pixels via
-   `/krita/resource_image`, applyCanvasImage.  The difference is
-   that we do it unconditionally, not gated on a spec change.
-
-   `applyCanvasImage` preserves masks and the inpaint context rect
-   when the new image has the same dimensions, so invoking this mid-
-   session does not nuke the user's mask stack.  If dimensions
-   changed, the context rect is cleared (it pointed at the old
-   dims), masks keep their pixel data and will be re-tinted on the
-   next draw. */
+   ============================================================ */
 
 async function _refreshCanvasAction() {
   flashStatus("refreshing @thecanvas\u2026", "");
@@ -270,6 +201,7 @@ async function _refreshCanvasAction() {
     img.width,
     img.height,
   );
+
   const label = normalized.source === "layer"
     ? normalized.layer_name
     : normalized.source;
@@ -283,16 +215,7 @@ async function _refreshCanvasAction() {
 
 /* ============================================================
    Mask from context rectangle
-   ============================================================
-   Materialises the current context rectangle as a new mask
-   entry in the stack.
-
-   The mask is built via `buildMaskFromContextRectB64`, which
-   stores the rect *inverse-rotated* by `view.rotation` around
-   the image centre.  Every mask is drawn under the view's
-   rotation transform, so the inverse rotation cancels on
-   display and the mask lands on screen exactly where the
-   axis-aligned context rectangle appears. */
+   ============================================================ */
 
 function _maskFromRectAction() {
   if (!board.imageHash) {
@@ -322,190 +245,8 @@ function _maskFromRectAction() {
   syncMaskList();
   syncPanelFields();
   pgkitNotifyAll();
+  scheduleSync();
   import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-}
-
-/* ============================================================
-   Inpaint payload builder
-   ============================================================
-   Two states, selected by `view.rotation`:
-
-   Un-rotated (theta = 0)
-   ----------------------
-   Send the original, un-rotated image at (W × H), the full mask
-   composited over black, and the context mask (full white when no
-   context rectangle is set; the user's rect when it is).
-   `outputRotation = 0`.
-
-   Rotated (theta != 0)
-   --------------------
-   Send a rotated payload.  The crop region is derived from
-   `projectCropDims`: base (W × H) unless the mask (intersected
-   with the context rect, or unclipped when inpaint is disabled)
-   extends beyond the base crop, in which case it expands
-   symmetrically until the mask is covered.
-
-   `outputRotation = -view.rotation` tells the daemon to rotate the
-   result back before pasting.  The server passes that value
-   through to `comfy_paste_image_b64`, which runs
-   `QTransform().rotate(output_rotation)` to un-rotate, then
-   center-crops to the document's dims.  Result: the region lands
-   at the right position in Krita, un-rotated. */
-
-function _buildInpaintPayload(mask, maskBBoxOrig) {
-  const W = board.imageWidth, H = board.imageHeight;
-  const c = board.inpaintContext;
-  const theta = view.rotation;
-
-  // ---- Un-rotated path: theta = 0 ----
-  if (!theta || theta % 360 === 0) {
-    const canvasB64 = board.imageDataUrl.replace(
-      /^data:image\/png;base64,/, "");
-
-    const selCanvas = document.createElement("canvas");
-    selCanvas.width = W; selCanvas.height = H;
-    const scx = selCanvas.getContext("2d");
-    scx.imageSmoothingEnabled = true;
-    scx.imageSmoothingQuality = "high";
-    scx.fillStyle = "#000";
-    scx.fillRect(0, 0, W, H);
-    if (mask && mask.img) scx.drawImage(mask.img, 0, 0, W, H);
-    const selectionB64 = selCanvas.toDataURL("image/png").replace(
-      /^data:image\/png;base64,/, "");
-
-    let contextB64;
-    if (!board.inpaintEnabled) {
-      const ctxCanvas = document.createElement("canvas");
-      ctxCanvas.width = W; ctxCanvas.height = H;
-      const ccx = ctxCanvas.getContext("2d");
-      ccx.fillStyle = "#fff";
-      ccx.fillRect(0, 0, W, H);
-      contextB64 = ctxCanvas.toDataURL("image/png").replace(
-        /^data:image\/png;base64,/, "");
-    } else {
-      const ctxCanvas = document.createElement("canvas");
-      ctxCanvas.width = W; ctxCanvas.height = H;
-      const ccx = ctxCanvas.getContext("2d");
-      ccx.fillStyle = "#000";
-      ccx.fillRect(0, 0, W, H);
-      ccx.fillStyle = "#fff";
-      ccx.fillRect(c.x, c.y, c.w, c.h);
-      contextB64 = ctxCanvas.toDataURL("image/png").replace(
-        /^data:image\/png;base64,/, "");
-    }
-
-    return {
-      canvasB64, selectionB64, contextB64,
-      outputRotation: 0,
-      cropW: W, cropH: H,
-    };
-  }
-
-  // ---- Rotated path: theta != 0, both modes unified ----
-  const rad = (theta % 360) * Math.PI / 180;
-  const cosA = Math.abs(Math.cos(rad));
-  const sinA = Math.abs(Math.sin(rad));
-  const Wp = Math.max(1, Math.round(W * cosA + H * sinA));
-  const Hp = Math.max(1, Math.round(W * sinA + H * cosA));
-
-  const { cropW, cropH } = projectCropDims(
-    W, H, maskBBoxOrig, theta, c, board.inpaintEnabled,
-  );
-  const cropX = Math.round((Wp - cropW) / 2);
-  const cropY = Math.round((Hp - cropH) / 2);
-
-  const rotImg = _rotateImage(board.originalImageEl, theta);
-  const canvasCv = document.createElement("canvas");
-  canvasCv.width = cropW; canvasCv.height = cropH;
-  const canvasCtx = canvasCv.getContext("2d");
-  canvasCtx.imageSmoothingEnabled = true;
-  canvasCtx.imageSmoothingQuality = "high";
-  canvasCtx.drawImage(rotImg, -cropX, -cropY);
-  const canvasB64 = canvasCv.toDataURL("image/png").replace(
-    /^data:image\/png;base64,/, "");
-
-  const maskBase = document.createElement("canvas");
-  maskBase.width = W; maskBase.height = H;
-  const mbx = maskBase.getContext("2d");
-  mbx.imageSmoothingEnabled = true;
-  mbx.imageSmoothingQuality = "high";
-  mbx.fillStyle = "#000";
-  mbx.fillRect(0, 0, W, H);
-  if (mask && mask.img) mbx.drawImage(mask.img, 0, 0, W, H);
-
-  const rotMask = _rotateImage(maskBase, theta);
-  const maskCv = document.createElement("canvas");
-  maskCv.width = cropW; maskCv.height = cropH;
-  const maskCtx = maskCv.getContext("2d");
-  maskCtx.imageSmoothingEnabled = true;
-  maskCtx.imageSmoothingQuality = "high";
-  maskCtx.fillStyle = "#000";
-  maskCtx.fillRect(0, 0, cropW, cropH);
-  maskCtx.drawImage(rotMask, -cropX, -cropY);
-
-  let contextB64;
-  if (board.inpaintEnabled) {
-    const ctxInCropX = (cropW - W) / 2 + c.x;
-    const ctxInCropY = (cropH - H) / 2 + c.y;
-
-    const rectMask = document.createElement("canvas");
-    rectMask.width = cropW; rectMask.height = cropH;
-    const rmx = rectMask.getContext("2d");
-    rmx.fillStyle = "#000";
-    rmx.fillRect(0, 0, cropW, cropH);
-    rmx.fillStyle = "#fff";
-    rmx.fillRect(ctxInCropX, ctxInCropY, c.w, c.h);
-
-    maskCtx.globalCompositeOperation = "multiply";
-    maskCtx.drawImage(rectMask, 0, 0);
-    maskCtx.globalCompositeOperation = "source-over";
-
-    const ctxCanvas = document.createElement("canvas");
-    ctxCanvas.width = cropW; ctxCanvas.height = cropH;
-    const ccx = ctxCanvas.getContext("2d");
-    ccx.fillStyle = "#000";
-    ccx.fillRect(0, 0, cropW, cropH);
-    ccx.fillStyle = "#fff";
-    ccx.fillRect(ctxInCropX, ctxInCropY, c.w, c.h);
-    contextB64 = ctxCanvas.toDataURL("image/png").replace(
-      /^data:image\/png;base64,/, "");
-  } else {
-    const ctxCanvas = document.createElement("canvas");
-    ctxCanvas.width = cropW; ctxCanvas.height = cropH;
-    const ccx = ctxCanvas.getContext("2d");
-    ccx.fillStyle = "#fff";
-    ccx.fillRect(0, 0, cropW, cropH);
-    contextB64 = ctxCanvas.toDataURL("image/png").replace(
-      /^data:image\/png;base64,/, "");
-  }
-
-  const selectionB64 = maskCv.toDataURL("image/png").replace(
-    /^data:image\/png;base64,/, "");
-
-  return {
-    canvasB64, selectionB64, contextB64,
-    outputRotation: -theta,
-    cropW, cropH,
-  };
-}
-
-/* ============================================================
-   Shared-prompt hydration
-   ============================================================ */
-
-async function _hydrateSharedPrompt() {
-  if (board.inpaintPrompt && board.inpaintPrompt.trim()) return;
-  const r = await fetchCurrentPrompt();
-  if (!r || !r.success) return;
-  const shared = (r.prompt || "").trim();
-  if (!shared) return;
-  if (board.inpaintPrompt && board.inpaintPrompt.trim()) return;
-  board.inpaintPrompt = shared;
-  const el = document.getElementById("inpaintPrompt");
-  if (el && document.activeElement !== el) el.value = shared;
-  syncPanelFields();
-  pgkitNotifyAll();
-  flashStatus("prompt hydrated from shared state", "");
 }
 
 /* ============================================================
@@ -562,81 +303,6 @@ async function _hydrateSharedSelection() {
 }
 
 /* ============================================================
-   Inpaint
-   ============================================================ */
-
-async function _inpaintAction() {
-  if (!board.imageHash) { flashStatus("Load an image first", "warn"); return; }
-  if (board.running) return;
-
-  const idx = selectedMaskIdx();
-  if (idx < 0) { flashStatus("Select a mask to inpaint", "warn"); return; }
-
-  const mask = board.masks[idx];
-  if (!mask || !mask.loaded) {
-    flashStatus("Mask not loaded", "warn"); return;
-  }
-
-  const maskBBox = computeMaskBBox(idx);
-  const payload = _buildInpaintPayload(mask, maskBBox);
-
-  flashStatus("inpainting\u2026", "");
-
-  let result;
-  if (board.interceptEnabled) {
-    const callbackUrl = new URL(
-      "intercept_callback", window.location.href
-    ).href;
-    result = await runInpaintViaInterceptor({
-      canvasB64:      payload.canvasB64,
-      selectionB64:   payload.selectionB64,
-      contextB64:     payload.contextB64,
-      prompt:         board.inpaintPrompt,
-      outputRotation: payload.outputRotation,
-      interceptorUrl: board.interceptUrl,
-      callbackUrl:    callbackUrl,
-    });
-  } else {
-    result = await runInpaint({
-      canvasB64:      payload.canvasB64,
-      selectionB64:   payload.selectionB64,
-      contextB64:     payload.contextB64,
-      prompt:         board.inpaintPrompt,
-      outputRotation: payload.outputRotation,
-    });
-  }
-  if (!result) return;
-
-  // The server already pasted the result into Krita, un-rotated.
-  // Do NOT touch the playground canvas here: what the canvas shows
-  // is whatever `@thecanvas` resolves to, and `pg_autosync.js`
-  // refreshes it on `@thecanvas` spec changes.  Injecting the
-  // inpaint output would make the canvas show something `@thecanvas`
-  // does not point at.  The inpaint result is visible in Krita; the
-  // playground just reports what happened.
-  flashStatus(
-    result.paste_ok
-      ? ("inpainted + pasted to Krita: "
-         + (result.paste_layer_name || "new layer")
-         + " in " + result.timing.toFixed(2) + "s")
-      : ("inpainted in " + result.timing.toFixed(2) + "s, "
-         + "but Krita paste failed: "
-         + (result.paste_message || "unknown")),
-    result.paste_ok ? "ok" : "warn"
-  );
-
-  syncPanelFields();
-  pgkitNotifyAll();
-  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-}
-
-async function _cancelAction() {
-  if (!board.running) return;
-  await interruptInpaint();
-  flashStatus("cancel requested", "warn");
-}
-
-/* ============================================================
    Status checks
    ============================================================ */
 
@@ -663,10 +329,6 @@ function _kritaMarkUnreachable(reason) {
   el.textContent = "\u2717 " + (reason || "not reachable");
   el.className = "bad";
   el.title = "Start Krita with the Kritomatic Daemon plugin enabled";
-  // Mirror to the terminal.  The persistent #kritaStatus element is
-  // the panel's at-a-glance indicator; the terminal entry is the
-  // durable record.  console.error is captured by
-  // pgkit/panel_core.js's override and routed to POST ./__log.
   try {
     console.error("[inpaint] krita:", reason || "not reachable");
   } catch (_) {}
@@ -741,6 +403,7 @@ async function _kritaImportMasksAction() {
     syncMaskList();
     syncPanelFields();
     pgkitNotifyAll();
+    scheduleSync();
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   } catch (e) {
     flashStatus("import failed: " + e.message, "bad");
@@ -754,24 +417,23 @@ async function _kritaImportMasksAction() {
 export function installPanelBindings() {
   const el = {};
   const ids = [
-    "inpaintBtn", "cancelBtn",
     "pickImageBtn", "clearImageBtn", "pickMaskBtn",
     "kritaImportMasksBtn",
     "kritaCheckBtn",
     "maskFromRectBtn",
     "refreshCanvasBtn",
+    "syncNowBtn",
   ];
   for (const id of ids) el[id] = document.getElementById(id);
 
-  if (el.inpaintBtn)   el.inpaintBtn.addEventListener("click", _inpaintAction);
-  if (el.cancelBtn)    el.cancelBtn.addEventListener("click", _cancelAction);
-  if (el.pickImageBtn) el.pickImageBtn.addEventListener("click", _pickImageAction);
-  if (el.clearImageBtn) el.clearImageBtn.addEventListener("click", _clearImageAction);
-  if (el.pickMaskBtn)  el.pickMaskBtn.addEventListener("click", _pickMaskAction);
+  if (el.pickImageBtn)   el.pickImageBtn.addEventListener("click", _pickImageAction);
+  if (el.clearImageBtn)  el.clearImageBtn.addEventListener("click", _clearImageAction);
+  if (el.pickMaskBtn)    el.pickMaskBtn.addEventListener("click", _pickMaskAction);
   if (el.kritaImportMasksBtn) el.kritaImportMasksBtn.addEventListener("click", _kritaImportMasksAction);
-  if (el.kritaCheckBtn) el.kritaCheckBtn.addEventListener("click", _kritaStatusRefresh);
+  if (el.kritaCheckBtn)  el.kritaCheckBtn.addEventListener("click", _kritaStatusRefresh);
   if (el.maskFromRectBtn) el.maskFromRectBtn.addEventListener("click", _maskFromRectAction);
   if (el.refreshCanvasBtn) el.refreshCanvasBtn.addEventListener("click", _refreshCanvasAction);
+  if (el.syncNowBtn) el.syncNowBtn.addEventListener("click", syncNow);
 
   const statusEl = document.getElementById("statusLine");
   if (statusEl) {
@@ -805,16 +467,6 @@ export function installPanelBindings() {
    Actions
    ============================================================ */
 
-pgkitRegisterAction("action.inpaint", {
-  label: "Inpaint", scope: "global", run: _inpaintAction,
-  meta: { variant: "primary",
-          description: "Run the inpaint workflow with the current " +
-                       "canvas, selected mask, and context rectangle." },
-});
-pgkitRegisterAction("action.cancel", {
-  label: "Cancel", scope: "global", run: _cancelAction,
-  meta: { variant: "danger" },
-});
 pgkitRegisterAction("action.clearImage", {
   label: "Clear image", scope: "global", run: _clearImageAction,
   meta: { variant: "plain" },
@@ -822,9 +474,12 @@ pgkitRegisterAction("action.clearImage", {
 pgkitRegisterAction("action.refreshCanvas", {
   label: "Refresh @thecanvas", scope: "global", run: _refreshCanvasAction,
   meta: { variant: "plain",
-          description: "Re-fetch the current @thecanvas from Krita. " +
-                       "Use when the canvas image changed in Krita but " +
-                       "autosync did not pick it up." },
+          description: "Re-fetch the current @thecanvas from Krita." },
+});
+pgkitRegisterAction("action.syncNow", {
+  label: "Sync now", scope: "global", run: syncNow,
+  meta: { variant: "plain",
+          description: "Re-push the current state into Krita scratch layers." },
 });
 pgkitRegisterAction("action.checkStatus", {
   label: "Check connection", scope: "global", run: _checkStatusAction,
@@ -872,6 +527,7 @@ pgkitRegisterAction("action.selectMask", {
     if (!(idx >= 0 && idx < board.masks.length)) return;
     replaceMaskSelection(idx);
     syncMaskList();
+    scheduleSync();
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   },
   meta: { variant: "primary" },
@@ -896,6 +552,7 @@ pgkitRegisterAction("action.deleteMask", {
     else if (board.hoveredMaskIdx > idx) board.hoveredMaskIdx -= 1;
     syncMaskList();
     pgkitNotifyAll();
+    scheduleSync();
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   },
   meta: { variant: "danger" },
@@ -913,6 +570,7 @@ export function pgkitHandleSelect(level, name) {
     if (!(idx >= 0 && idx < board.masks.length)) return false;
     replaceMaskSelection(idx);
     syncMaskList();
+    scheduleSync();
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
     return true;
   }
@@ -926,8 +584,8 @@ export function inpaintBootSync() {
   _checkStatusAction();
   _kritaStatusRefresh();
   (async () => {
-    await _hydrateSharedPrompt();
     await _hydrateSharedSelection();
+    if (board.imageHash) syncNow();
   })();
 }
 """

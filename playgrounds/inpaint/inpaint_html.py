@@ -7,10 +7,8 @@ shared shell.  Every other module is a Python-side string constant
 (the `_JS` suffix) imported from its own Python file; the file name
 in `_MODULE_SOURCES` is the `.js` name the browser sees.
 
-The SAM-specific modules (`pg_region`, `pg_view_region`,
-`pg_view_brush`, `pg_view_points`, `pg_composite`, `pg_oplog`) are
-not part of this manifest.  The inpaint-specific modules
-(`pg_inpaint`, `pg_view_inpaint`) are."""
+The inpaint playground has no interceptor, no rotation math, and no
+generation payload.  `pg_sync.js` is the sole outbound-state module."""
 
 import sys
 
@@ -24,6 +22,7 @@ from  .pg_view import VIEW_JS
 from  .pg_view_image import VIEW_IMAGE_JS
 from  .pg_view_inpaint import VIEW_INPAINT_JS
 from  .pg_dispatch import DISPATCH_JS
+from  .pg_sync import SYNC_JS
 from  .pg_comfy_client import COMFY_CLIENT_JS
 from  .pg_krita_client import KRITA_CLIENT_JS
 from  .pg_panel_fields import PANEL_FIELDS_JS
@@ -90,6 +89,7 @@ _MODULE_SOURCES = {
     "pg_view_image.js":       VIEW_IMAGE_JS,
     "pg_view_inpaint.js":     VIEW_INPAINT_JS,
     "pg_dispatch.js":         DISPATCH_JS,
+    "pg_sync.js":             SYNC_JS,
     "pg_comfy_client.js":     COMFY_CLIENT_JS,
     "pg_krita_client.js":     KRITA_CLIENT_JS,
     "pg_panel_fields.js":     PANEL_FIELDS_JS,
@@ -116,7 +116,7 @@ def render():
             module_sources = _MODULE_SOURCES,
             boot_module    = BOOT_MODULE,
             extra_css      = PG_CSS,
-            status_text    = "drop an image to begin",
+            status_text    = "idle",
         )
     except JsSyntaxError as err:
         print(file=sys.stderr)

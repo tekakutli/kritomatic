@@ -7,7 +7,10 @@ magnitudes that more than one feature reads belong here.
 
 The op-log cap and the view-zoom bounds are the two the entire
 codebase already agreed on; the bbox paddings are read by
-`pg_pixels.py` and by `pg_comfy_client.py` through `computeEffectiveBBox`."""
+`pg_pixels.py` and by `pg_comfy_client.py` through `computeEffectiveBBox`.
+SYNC_DEBOUNCE_MS is the debounce window for pushes of playground state
+into Krita scratch layers — small enough to feel immediate when the
+user edits, large enough to collapse a burst of edits into one push."""
 
 TUNING_JS = r"""
 /* ============================================================
@@ -26,14 +29,18 @@ export const VIEW_PAN_MARGIN = 40;
 
 /* ============================================================
    Bbox
-   ============================================================
-   BBOX_PAD / BBOX_MIN_SIZE are applied to a mask's actual pixel
-   bounds when `pg_pixels.computeMaskBBox` snaps them to the image
-   coordinate space.  POINT_BBOX_PAD is the extra halo added around
-   each positive point when `computeEffectiveBBox` widens a bbox to
-   include a fresh click that has no mask yet. */
+   ============================================================ */
 
 export const BBOX_PAD       = 4;
 export const BBOX_MIN_SIZE  = 8;
 export const POINT_BBOX_PAD = 50;
+
+/* ============================================================
+   Sync
+   ============================================================
+   Debounce for state pushes.  Rotation changes bypass this — the
+   rotation slider calls syncNow() directly so a rotate-then-Run
+   sequence has no measurable stale window. */
+
+export const SYNC_DEBOUNCE_MS = 250;
 """

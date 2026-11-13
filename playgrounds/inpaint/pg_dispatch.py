@@ -1,43 +1,32 @@
 """The draw orchestrator and the canvas event listeners.
 
-`draw()` is the panel-wide redraw entry point: it calls `drawView()`,
-then syncs the panel fields, then syncs the mask list.  The canvas
-event listeners own the input lifecycle — mousedown, mousemove,
-mouseup, wheel, contextmenu, keydown, keyup.
+`draw()` is the panel-wide redraw entry point: `drawView()`, then
+`syncPanelFields()`, then `syncMaskList()`.  `drawView()` is the
+canvas-only redraw, used wherever the state that changed is visible
+only on the canvas.
 
-`drawView()` is the canvas-only redraw.  It is used wherever the
-state that changed is visible only on the canvas — pan, zoom,
-inpaint-context drag, hover highlight — and none of the panel
-fields or the mask list need to be re-synced.  Hover in particular
-runs on every mouse-move that crosses a mask boundary; using
-`draw()` there would rebuild the mask DOM and re-sync every panel
-field on every crossing, which was the largest per-frame cost after
-`syncMaskList`'s own rebuild.
+COORDINATE SYSTEMS
+==================
+Two projections to image coords exist:
 
-Input modes:
-  - pan (space+drag, middle mouse)
-  - zoom (wheel at cursor)
-  - alt-click mask selection
-  - inpaint context rectangle drag (move / resize handles), only
-    active when `board.inpaintEnabled` is true
+  · `screenToImage`         applies the rotation inverse.  Used for
+                            mask hit-testing and hover — mask pixel
+                            data is stored un-rotated, so the cursor
+                            must be mapped back through the inverse
+                            rotation.
 
-The inpaint drag STATE (`_contextDrag = { active, handle, startIx, ... }`)
-stays here because it is per-interaction, not per-document.  The pure
-math lives in `pg_inpaint.js` so a second inpaint mode could carry
-its own drag state without touching this module.
-
-Screen-coordinate mapping is split into two flavours:
-
-  - `screenToImage`         applies the rotation inverse.  Used when
-                            the caller needs the actual image pixel
-                            under the cursor (mask hit-test, hover).
-  - `screenToImageUnrotated` skips the rotation.  Used for the inpaint
+  · `screenToImageUnrotated` skips the rotation.  Used for the inpaint
                             context rectangle, which is anchored to
                             the un-rotated fit rect and stays visually
-                            fixed while the image rotates under it.
+                            fixed on screen while the image rotates
+                            underneath.  Using `screenToImage` here
+                            would make drags at θ≠0 jump because the
+                            rect's stored coords are un-rotated but the
+                            delta would be in rotated space.
 
-`overImage` is decided in rotated image coords (via `screenToImage`),
-so alt-click mask selection works on the actual rotated extent."""
+The `overImage` decision is made in ROTATED image coords (via
+`screenToImage`), so alt-click mask selection works on the actual
+rotated extent."""
 
 DISPATCH_JS = r"""
 import {
@@ -57,6 +46,7 @@ import {
 import { drawView } from "./pg_view.js";
 import { syncMaskList } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
+import { scheduleSync } from "./pg_sync.js";
 import { pgkitNotifyAll } from "./pgkit/remote_client.js";
 
 export function draw() {
@@ -69,7 +59,6 @@ export function draw() {
    Module-scope interaction state
    ============================================================ */
 
-// Pan state. Middle mouse button, or space+left drag.
 let _panActive = false;
 let _panStartScreenX = 0;
 let _panStartScreenY = 0;
@@ -77,11 +66,6 @@ let _panStartPanX = 0;
 let _panStartPanY = 0;
 let _spaceDown = false;
 
-// Inpaint context drag state. `handle` is one of 'nw','ne','sw','se',
-// 'n','s','e','w', or 'move'. startIx/startIy are in UN-ROTATED image
-// coords (the rectangle is anchored to the un-rotated fit rect);
-// startRect is the rect captured at mousedown so each mousemove can
-// recompute from the original anchor rather than accumulating error.
 let _contextDrag = {
   active: false,
   handle: null,
@@ -95,7 +79,6 @@ let _contextDrag = {
    ============================================================ */
 
 canvas.addEventListener("mousedown", (e) => {
-  // Blur any focused input so keyboard shortcuts work again.
   const active = document.activeElement;
   if (active && active !== canvas
       && (active.tagName === "INPUT"
@@ -104,7 +87,6 @@ canvas.addEventListener("mousedown", (e) => {
     active.blur();
   }
 
-  // Pan: middle mouse button, or space + left button.
   if ((e.button === 1 || (e.button === 0 && _spaceDown))
       && !_contextDrag.active) {
     e.preventDefault();
@@ -122,15 +104,11 @@ canvas.addEventListener("mousedown", (e) => {
   const r = fittedImageRect();
   if (!r) return;
 
-  // Rotated inverse — the actual pixel under the cursor.
   const [ix, iy] = screenToImage(sx, sy);
-  // Un-rotated — what the context rectangle's coords live in.
   const [uix, uiy] = screenToImageUnrotated(sx, sy);
-
   const overImage = ix >= 0 && ix <= board.imageWidth
                  && iy >= 0 && iy <= board.imageHeight;
 
-  // Alt+click selects a mask.
   if (e.altKey && e.button === 0) {
     if (overImage) {
       const idx = hitTestMaskAtPoint(ix, iy);
@@ -139,16 +117,13 @@ canvas.addEventListener("mousedown", (e) => {
         else if (e.ctrlKey || e.metaKey) toggleMaskSelection(idx);
         else                             replaceMaskSelection(idx);
         pgkitNotifyAll();
+        scheduleSync();
         draw();
       }
     }
     return;
   }
 
-  // Inpaint context rectangle:
-  //   - a click on one of the 8 handles starts a resize
-  //   - a click on the border band OR anywhere inside the rect
-  //     starts a move
   if (e.button === 0 && board.inpaintEnabled) {
     ensureDefaultContext();
     const hit = hitContextRect(r, sx, sy);
@@ -202,7 +177,6 @@ canvas.addEventListener("mousemove", (e) => {
     board.mouse.inside = overImage;
   }
 
-  // Pan takes priority over everything else.
   if (_panActive) {
     view.panX = _panStartPanX + (e.clientX - _panStartScreenX);
     view.panY = _panStartPanY + (e.clientY - _panStartScreenY);
@@ -212,15 +186,12 @@ canvas.addEventListener("mousemove", (e) => {
     return;
   }
 
-  // Space held: show grab cursor, no other interaction.
   if (_spaceDown) {
     canvas.style.cursor = "grab";
     drawView();
     return;
   }
 
-  // Inpaint context drag in progress — uses un-rotated image coords
-  // because the rectangle itself isn't rotated.
   if (_contextDrag.active && r) {
     const newRect = applyContextDrag(
       _contextDrag.startRect,
@@ -239,7 +210,6 @@ canvas.addEventListener("mousemove", (e) => {
     return;
   }
 
-  // Inpaint context hover cursor.
   if (board.inpaintEnabled && r && !_contextDrag.active) {
     const hit = hitContextRect(r, sx, sy);
     if (hit) {
@@ -252,15 +222,6 @@ canvas.addEventListener("mousemove", (e) => {
     }
   }
 
-  // Hover state for mask overlay highlight.
-  //
-  // Hover affects only the canvas — drawImageLayer reads
-  // `board.hoveredMaskIdx` to vary globalAlpha.  It does NOT affect
-  // any panel field or the mask list DOM, so a canvas-only redraw
-  // is enough.  Using draw() here (which additionally runs
-  // syncPanelFields and syncMaskList) is what made hover across a
-  // mask boundary the largest per-frame cost after syncMaskList's
-  // own rebuild.
   let hoveredMask = -1;
   if (overImage) {
     hoveredMask = hitTestMaskAtPoint(ix, iy);
@@ -268,7 +229,7 @@ canvas.addEventListener("mousemove", (e) => {
 
   if (hoveredMask !== board.hoveredMaskIdx) {
     board.hoveredMaskIdx = hoveredMask;
-    drawView();
+    draw();
   }
 
   if (hoveredMask >= 0) canvas.style.cursor = "pointer";
@@ -315,6 +276,7 @@ window.addEventListener("mouseup", () => {
     board.inpaintContext.activeHandle = null;
     canvas.style.cursor = "crosshair";
     pgkitNotifyAll();
+    scheduleSync();
     drawView();
   }
 });
@@ -374,6 +336,7 @@ window.addEventListener("keydown", (e) => {
     e.preventDefault();
     selectAllMasks();
     pgkitNotifyAll();
+    scheduleSync();
     draw();
     return;
   }
@@ -386,6 +349,7 @@ window.addEventListener("keydown", (e) => {
     if (e.shiftKey) addMaskToSelection(n - 1);
     else            replaceMaskSelection(n - 1);
     pgkitNotifyAll();
+    scheduleSync();
     draw();
     return;
   }
@@ -394,6 +358,7 @@ window.addEventListener("keydown", (e) => {
     e.preventDefault();
     clearMaskSelection();
     pgkitNotifyAll();
+    scheduleSync();
     draw();
   }
 });

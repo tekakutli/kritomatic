@@ -10,7 +10,8 @@ The document adapter for the `comfyui` handler. The v2 pipeline (Stage
   * ``compute_context_bounds`` to derive a crop rect from the selection
     and the ``[crop]`` config;
   * ``paste_image`` / ``paste_batch_as_layers`` / ``paste_animation`` /
-    ``resize_canvas`` to write downloaded outputs back into the document.
+    ``resize_canvas`` to write downloaded outputs back into the document;
+  * ``pad_png`` to expand a pasted PNG's frame before un-rotation.
 
 It knows nothing about ComfyUI, nothing about graph rewriting, nothing
 about the wire protocol.
@@ -59,11 +60,6 @@ Bounds = tuple[int, int, int, int]
 # ============================================================================
 #  EncodedImage
 # ============================================================================
-#
-# One PNG-encoded image plus its pixel extent. Moved here from
-# comfyui_tooling.py in Stage 6 (that module's expansion logic is gone;
-# this dataclass is what survives and what the reads return and the
-# uploads consume).
 
 @dataclass
 class EncodedImage:
@@ -79,13 +75,7 @@ class EncodedImage:
 
     @property
     def content_hash(self) -> str:
-        """8-character lowercase hex CRC32 of the PNG bytes.
-
-        Kept for compatibility with callers that used it as a cache key
-        under the old tooling-nodes path. The proxy hashes uploaded
-        bytes server-side (blake3), so the daemon no longer needs a
-        client-side hash — this property is informational.
-        """
+        """8-character lowercase hex CRC32 of the PNG bytes."""
         return f"{zlib.crc32(self.data) & 0xFFFFFFFF:08x}"
 
 
@@ -115,9 +105,7 @@ def read_selection_mask(doc, bounds: Bounds) -> Optional[EncodedImage]:
     """Read the active selection, cropped to `bounds`.
 
     Returns None when the document has no selection, or has a selection
-    that covers the entire document (Krita creates one of those when the
-    user runs Edit > Select All, and downstream nodes should treat it
-    the same as "no selection").
+    that covers the entire document.
     """
     selection = doc.selection()
     if selection is None:
@@ -225,13 +213,7 @@ def compute_context_bounds(canvas_extent: tuple[int, int],
                            padding: int) -> Bounds:
     """Compute the crop region to read for a workflow.
 
-    Mirrors krita-ai-diffusion's `CustomWorkspace.prepare_mask`:
-
-        "entire_image"  the whole canvas
-        "automatic"     the selection's bounds, padded by `padding`
-        "mask_bounds"   the selection's bounds, padded, rounded to 1px
-
-    When there is no selection, everything reduces to the whole canvas.
+    Mirrors krita-ai-diffusion's `CustomWorkspace.prepare_mask`.
     """
     w, h = canvas_extent
     canvas_bounds: Bounds = (0, 0, w, h)
@@ -252,6 +234,46 @@ def compute_context_bounds(canvas_extent: tuple[int, int],
 
     padded = _pad_bounds((mx, my, mw, mh), pad, multiple=multiple)
     return _clamp_bounds(padded, canvas_bounds)
+
+
+# ============================================================================
+#  Padding (un-rotation fix)
+# ============================================================================
+
+def pad_png(png_bytes: bytes, pad_x: int, pad_y: int,
+            new_w: int, new_h: int) -> bytes:
+    """Decode PNG, place at (pad_x, pad_y) in a new_w × new_h canvas,
+    re-encode as PNG.
+
+    Used by the paste path when un-rotating a rotated workflow output.
+    The workflow was prepared by rotating the canvas by θ (giving a
+    W' × H' frame), then cropping the central (cropW × cropH).  When
+    the workflow returns the same cropW × cropH output, un-rotating it
+    directly clips the four tips of the rotated diamond, leaving
+    transparent corners in the final content.  Padding back to W' × H'
+    at ((W' - cropW) / 2, (H' - cropH) / 2) reconstructs the full
+    rotated frame, so un-rotation recovers the full un-rotated canvas
+    (edge-to-edge, no clipping).
+    """
+    from PyQt6.QtGui import QPainter
+
+    img = QImage()
+    if not img.loadFromData(png_bytes, "PNG"):
+        raise ValueError("could not decode PNG for padding")
+    img = img.convertToFormat(QImage.Format.Format_ARGB32)
+
+    padded = QImage(new_w, new_h, QImage.Format.Format_ARGB32)
+    padded.fill(0)
+    painter = QPainter(padded)
+    painter.drawImage(pad_x, pad_y, img)
+    painter.end()
+
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    padded.save(buf, "PNG")
+    out = bytes(buf.data())
+    buf.close()
+    return out
 
 
 # ============================================================================
@@ -277,8 +299,7 @@ def paste_image(doc,
     suppress the widget-level repaint that would normally make a fresh
     layer appear. Three direct steps nudge Krita into repainting:
     recompute the composite, toggle the new layer's visibility off and
-    on, then set the blending mode back to itself (a no-op Krita treats
-    as a layer modification).
+    on, then set the blending mode back to itself.
     """
     img = _decode_png(image_png)
 

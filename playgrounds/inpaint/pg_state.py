@@ -15,17 +15,49 @@ array, inpaint context rectangle) rather than importing
 `applyCanvasImage` is the autosync target: updates the displayed
 image without clearing masks or the inpaint context rect (unless
 image dimensions changed).  Used by `pg_autosync.js` when the
-daemon's `@thecanvas` spec changes."""
+daemon's `@thecanvas` spec changes, and by the manual refresh action.
+
+The `lastSync`, `syncing`, and `syncError` fields are set by
+`pg_sync.js` — they drive the panel's status line and nothing else."""
 
 STATE_JS = r"""
 import {
   VIEW_ZOOM_MIN, VIEW_ZOOM_MAX, VIEW_PAN_MARGIN,
 } from "./pg_tuning.js";
 
+/* ============================================================
+   Canvas and 2D context
+   ============================================================ */
+
 export const canvas = document.getElementById("c");
 export const ctx    = canvas.getContext("2d");
 
 let _dpr = window.devicePixelRatio || 1;
+
+/* ============================================================
+   View (zoom + pan + rotation)
+   ============================================================
+   `view.rotation` is a *display-only* angle.  `board.imageWidth`,
+   `board.imageHeight`, `board.imageDataUrl`, and `board.imageEl`
+   are always the ORIGINAL un-rotated source.  Rotation is applied
+   as a 2D canvas transform at draw time (in `pg_view_image.js`
+   and `pg_view_inpaint.js`), not by pre-rendering a rotated copy.
+
+   The inpaint workflow's rotated behavior is produced daemon-side:
+   `pg_sync.js` pushes the un-rotated state into Krita scratch layers
+   and separately pushes the rotation value; the daemon queries the
+   rotation value on demand and, when θ≠0, rotates the canvas and
+   selection and defines the context mask as a translated axis-aligned
+   rect before submitting to ComfyUI.
+
+   `board.inpaintContext` lives in original-image pixel coords.
+   Because the image never moves in that frame, the user's rect
+   stays over the same pixels no matter what the rotation is.
+   Rotating the view visually rotates the rect (it is drawn under
+   the same transform), but its `x/y/w/h` never change except
+   when the user drags a handle in `pg_dispatch.js`.
+   `_applyRotation` is no longer allowed to touch it.
+   ============================================================ */
 
 export const view = {
   zoom: 1,
@@ -49,6 +81,8 @@ export function clampPan() {
   const baseS = Math.min(sx, sy);
   const s = baseS * view.zoom;
 
+  // Pan clamp uses the ROTATED bounding box, so at non-cardinal
+  // angles the user can still pan far enough to see the corners.
   const rad = view.rotation * Math.PI / 180;
   const cos = Math.abs(Math.cos(rad));
   const sin = Math.abs(Math.sin(rad));
@@ -67,6 +101,9 @@ export function clampPan() {
   view.panY = Math.max(minPanY, Math.min(maxPanY, view.panY));
 }
 
+/* Zoom around the cursor, rotation-safe.  We remember the image
+   point under the cursor, change the zoom, then adjust pan so
+   the same image point returns to the same screen point. */
 export function zoomAt(screenX, screenY, newZoom) {
   const [ix0, iy0] = screenToImage(screenX, screenY);
   view.zoom = Math.max(VIEW_ZOOM_MIN, Math.min(VIEW_ZOOM_MAX, newZoom));
@@ -75,6 +112,21 @@ export function zoomAt(screenX, screenY, newZoom) {
   view.panY += screenY - sy1;
   clampPan();
 }
+
+/* ============================================================
+   Rotation
+   ============================================================
+   `_applyRotation` only sets the display angle.  It does not
+   re-render the image, does not touch `board.imageWidth/Height`,
+   does not touch `board.inpaintContext`, and does not re-rotate
+   mask pixel caches.
+
+   `_rotateImage` is retained as a helper for `pg_view_image.js`'s
+   draw path (used via the ctx.rotate transform, not by
+   pre-rendering) and for tests.  `_rotateMask` invalidates only the
+   stale rotated-canvas cache; mask pixel data always lives in the
+   original image frame.
+   ============================================================ */
 
 export function _applyRotation(angle) {
   view.rotation = ((Number(angle) || 0) % 360 + 360) % 360;
@@ -107,10 +159,16 @@ export function _rotateImage(img, angleDeg) {
 }
 
 export function _rotateMask(entry, angle) {
+  // Invalidate the rotated-canvas cache.  Mask pixel data always
+  // reads `mask.img` in the original image frame.
   entry.rotatedCanvas = null;
   entry.rotatedW = entry.w || 0;
   entry.rotatedH = entry.h || 0;
 }
+
+/* ============================================================
+   Image loading / clearing
+   ============================================================ */
 
 export function setImage(hash, dataUrl, width, height) {
   board.imageHash     = hash;
@@ -152,19 +210,19 @@ export function setImage(hash, dataUrl, width, height) {
 }
 
 /* ============================================================
-   applyCanvasImage — autosync target
+   applyCanvasImage — autosync / manual-refresh target
    ============================================================
    Swap the displayed image in response to a `@thecanvas` resource
-   spec change.  Unlike `setImage`, this:
+   spec change or a manual refresh.  Unlike `setImage`, this:
 
      * keeps the mask stack (invalidating only their pixel caches so
        the tinted overlays rebuild);
      * keeps the inpaint context rectangle IF the new image has the
-       same dimensions, else clears it (its coords referred to the
-       old dims);
+       same dimensions, else clears it;
      * keeps view.rotation, view.zoom, view.panX/Y.
 
-   Used by `pg_autosync.js`, not by generation. */
+   Used by `pg_autosync.js` and by the panel's "Refresh @thecanvas"
+   button in `pg_panel_bindings.js`. */
 export function applyCanvasImage(hash, dataUrl, width, height) {
   const oldW = board.imageWidth;
   const oldH = board.imageHeight;
@@ -229,6 +287,10 @@ export function clearImage() {
   _scheduleDraw();
 }
 
+/* ============================================================
+   Mask palette
+   ============================================================ */
+
 export const MASK_COLORS = [
   { r: 255, g:  90, b: 105 },
   { r: 120, g: 220, b: 255 },
@@ -244,6 +306,10 @@ export function maskColor(idx) {
   return MASK_COLORS[((idx % MASK_COLORS.length)
                       + MASK_COLORS.length) % MASK_COLORS.length];
 }
+
+/* ============================================================
+   The board
+   ============================================================ */
 
 export const board = {
   imageHash:     null,
@@ -263,16 +329,23 @@ export const board = {
   selectedMaskIndices: [],
   hoveredMaskIdx:      -1,
 
-  running:       false,
-  lastTiming:    null,
+  // Sync state, set by pg_sync.js.  Purely panel-facing.
+  lastSync:  null,
+  syncing:   false,
+  syncError: null,
 
   inpaintEnabled: false,
-  inpaintPrompt:  "",
   inpaintContext: {
     x: 0, y: 0, w: 0, h: 0,
     activeHandle: null,
   },
 };
+
+/* ============================================================
+   Image-fit rect — the axis-aligned screen rect the ORIGINAL,
+   un-rotated image occupies.  Rotation is applied on top of this
+   by the draw layer; the rect itself never changes with rotation.
+   ============================================================ */
 
 export function fittedImageRect() {
   const cw = window.innerWidth, ch = window.innerHeight;
@@ -289,6 +362,8 @@ export function fittedImageRect() {
   return { x0, y0, w, h, s };
 }
 
+/* Image → screen.  Rotation is around the image center.  Positive
+   angle follows `ctx.rotate` — clockwise in screen (y-down) coords. */
 export function imageToScreen(x, y) {
   const r = fittedImageRect();
   if (!r) return [x, y];
@@ -304,6 +379,7 @@ export function imageToScreen(x, y) {
   return [cx + rx, cy + ry];
 }
 
+/* Screen → image.  Inverse of `imageToScreen`. */
 export function screenToImage(sx, sy) {
   const r = fittedImageRect();
   if (!r) return [0, 0];
@@ -321,14 +397,18 @@ export function screenToImage(sx, sy) {
 }
 
 /* Screen -> image, WITHOUT rotation.  Use this for anything anchored
-   to the un-rotated fit rect — notably the inpaint context
-   rectangle, whose position is fixed on screen even while the image
-   rotates underneath it. */
+   to the un-rotated fit rect — notably the inpaint context rectangle,
+   whose position is fixed on screen even while the image rotates
+   underneath it. */
 export function screenToImageUnrotated(sx, sy) {
   const r = fittedImageRect();
   if (!r) return [0, 0];
   return [(sx - r.x0) / r.s, (sy - r.y0) / r.s];
 }
+
+/* ============================================================
+   Draw scheduling
+   ============================================================ */
 
 let _drawScheduled = false;
 let _drawFn = null;
@@ -350,6 +430,10 @@ export function _scheduleDraw() {
     }, 16);
   }
 }
+
+/* ============================================================
+   Resize
+   ============================================================ */
 
 export function resize() {
   _dpr = window.devicePixelRatio || 1;

@@ -2,52 +2,36 @@
 
   POST /state               set (from browser) or get (from node)
   POST /version             version only (for IS_CHANGED)
-  POST /mask                fetch a mask by hash
-  POST /export_graph        build the API-format JSON the node would emit
-  POST /fetch_history       fetch the last ComfyUI run from native /history
+  POST /mask                fetch a mask by hash; transformed by
+                            inpaint's crop frame if available
+  POST /export_graph        build the API-format JSON
+  POST /fetch_history       fetch the last ComfyUI run
   POST /import_image        fetch active document composite from Krita
-  POST /import_masks        fetch selected mask or paint layer(s) as base64 masks
+  POST /import_masks        fetch selected mask or paint layer(s)
   POST /krita_status        daemon reachable?
-  POST /upload_image        raw body (image file), returns dims + data_url
-  POST /active_state        daemon comfy_status (workflow + config)
-  POST /resource_image      resolve a `{source, layer_name}` spec to a PNG data URL
+  POST /upload_image        raw body (image file)
+  POST /active_state        daemon comfy_status
+  POST /resource_image      resolve a spec to a PNG data URL
 
-@thecanvas auto-sync
-====================
-The playground's displayed image tracks the daemon's
-`config.resources["@thecanvas"]` spec.  The browser-side poller in
-`pg_autosync.py` queries `/active_state` every 3 s; on any change to
-`config.resources["@thecanvas"]` it calls `/resource_image` with the
-new spec and swaps in the returned pixels via `applyCanvasImage`
-(preserving the area list).  No generation-triggered refresh.
+MASK TRANSFORM
+==============
+When inpaint's playground is running, the daemon rotates and crops
+`@thecanvas`, `@theselection`, and `@thecontext` before submitting to
+ComfyUI.  To stay in the same coordinate frame, the area masks that
+`MultiAreaConditioning` receives must undergo the same rotate+crop.
+That transformation happens HERE, not in the browser (which must keep
+un-rotated state for display) and not in the node (which is
+playground-agnostic).
 
-`/resource_image` dispatches:
-  source == "active"  → GET_DOCUMENT_COMPOSITE_B64
-  source == "layer"   → GET_LAYER_PIXELS_B64
+Mechanism: `/mask` queries inpaint's `/crop_frame` (cached for 1 s),
+then applies `rotate(-theta) + crop(cropX, cropY, cropW, cropH)` via
+PIL.  Cache key is `(hash, theta, cropX, cropY, cropW, cropH)` so a
+given mask at a given frame isn't re-transformed.
 
-`source == "global"` is a mask and is not displayed here.
-
-STATE OWNERSHIP
-===============
-The browser is the source of truth.  It POSTs `{op: "set", state, masks}`
-after every change; the server keeps the last-pushed state in memory
-and serves it.
-
-MASK STORAGE
-============
-Masks are content-addressed by a hash the browser computes.  The
-`/state` POST includes `{hash → b64}` for every mask referenced in
-the state, and the server merges them into a growing dict.
-
-GRAPH EXPORT
-============
-`/export_graph` returns the API-format graph the node would build
-from the current state.
-
-HISTORY FETCH
-=============
-`/fetch_history` asks ComfyUI's *native* `/history` endpoint (port
-8188) for the most recent run."""
+When inpaint is down (or `/crop_frame` returns null), no transform
+happens — the mask is served as stored.  Matches the daemon's
+behavior, which also falls back to un-rotated when inpaint is
+unreachable."""
 
 import base64
 import hashlib
@@ -55,6 +39,7 @@ import json
 import os
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 from io import BytesIO
@@ -71,6 +56,25 @@ _masks     = {}
 _version   = ""
 
 COMFY_URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188").rstrip("/")
+
+INPAINT_URL = os.environ.get(
+    "MULTIMASK_INPAINT_URL", "http://127.0.0.1:8774",
+).rstrip("/")
+
+
+# Crop-frame cache — one query per second at most.  `MultiAreaConditioning`
+# calls `/mask` per-area in quick succession during one execute; caching
+# collapses N fetches into one.
+_crop_frame_lock = threading.Lock()
+_crop_frame_cache = {"frame": None, "at": 0.0}
+CROP_FRAME_TTL = 1.0
+
+
+# Mask transform cache — keyed by (hash, frame signature).  Bounded by
+# `_MASK_TRANSFORM_CACHE_MAX`; oldest evicted on overflow.
+_mask_transform_lock = threading.Lock()
+_mask_transform_cache: dict = {}
+_MASK_TRANSFORM_CACHE_MAX = 64
 
 
 def _log(msg):
@@ -109,7 +113,6 @@ def _public_state():
 
 
 def _fetch_active_state():
-    """Return the daemon's `comfy_status` data payload, or {} on failure."""
     try:
         resp = krita_client.send({"type": "comfy_status"}, timeout=10.0)
     except Exception:
@@ -120,7 +123,7 @@ def _fetch_active_state():
 
 
 # ---------------------------------------------------------------------------
-#  /state, /version, /mask
+#  /state, /version
 # ---------------------------------------------------------------------------
 
 def handle_state(payload):
@@ -163,13 +166,132 @@ def handle_version(_payload):
         return {"success": True, "version": _version}
 
 
+# ---------------------------------------------------------------------------
+#  Crop-frame + mask transform
+# ---------------------------------------------------------------------------
+
+def _fetch_crop_frame_uncached():
+    try:
+        req = urllib.request.Request(
+            INPAINT_URL + "/crop_frame",
+            data=b"{}", method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=0.5) as r:
+            data = json.loads(r.read())
+        if not isinstance(data, dict) or not data.get("success"):
+            return None
+        return data.get("frame")
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def _fetch_crop_frame_cached():
+    with _crop_frame_lock:
+        now = time.monotonic()
+        if now - _crop_frame_cache["at"] < CROP_FRAME_TTL:
+            return _crop_frame_cache["frame"]
+    frame = _fetch_crop_frame_uncached()
+    with _crop_frame_lock:
+        _crop_frame_cache["frame"] = frame
+        _crop_frame_cache["at"] = time.monotonic()
+    return frame
+
+
+def _frame_signature(frame):
+    if frame is None:
+        return None
+    return (
+        round(float(frame.get("theta", 0.0)) % 360.0, 3),
+        int(frame.get("cropX", 0)),
+        int(frame.get("cropY", 0)),
+        int(frame.get("cropW", 0)),
+        int(frame.get("cropH", 0)),
+    )
+
+
+def _transform_mask_b64(b64: str, frame) -> str:
+    """Rotate + crop the mask to align with the daemon's prepared frame.
+
+    Assumes the incoming mask is at W×H (the same coordinate frame as
+    `@thecanvas` and `@theselection` before prepare).  Applies the same
+    transform the daemon applies to those:
+
+      · theta ≠ 0  →  rotate by theta (CW) about the canvas center,
+                      producing a W'×H' image
+      · always     →  crop to (cropX, cropY, cropW, cropH)
+    """
+    if frame is None:
+        return b64
+
+    theta = float(frame.get("theta", 0.0)) % 360.0
+    W = int(frame.get("W", 0))
+    H = int(frame.get("H", 0))
+    cropX = int(frame.get("cropX", 0))
+    cropY = int(frame.get("cropY", 0))
+    cropW = int(frame.get("cropW", 0))
+    cropH = int(frame.get("cropH", 0))
+
+    if cropW <= 0 or cropH <= 0:
+        return b64
+
+    try:
+        raw = base64.b64decode(b64)
+        img = Image.open(BytesIO(raw)).convert("L")
+    except Exception as e:
+        _log(f"mask decode failed: {e}")
+        return b64
+
+    # Ensure native W×H before rotating.
+    if W > 0 and H > 0 and img.size != (W, H):
+        img = img.resize((W, H), Image.LANCZOS)
+
+    if theta != 0:
+        # PIL rotates CCW for positive angles; the playground and
+        # QTransform (daemon) rotate CW on screen.  Negate theta.
+        img = img.rotate(
+            -theta, expand=True,
+            resample=Image.BICUBIC, fillcolor=0,
+        )
+
+    img = img.crop((cropX, cropY, cropX + cropW, cropY + cropH))
+
+    buf = BytesIO()
+    img.save(buf, "PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _transform_mask_cached(h: str, b64: str) -> str:
+    frame = _fetch_crop_frame_cached()
+    sig = _frame_signature(frame)
+    if sig is None:
+        return b64
+
+    key = (h, sig)
+    with _mask_transform_lock:
+        cached = _mask_transform_cache.get(key)
+        if cached is not None:
+            return cached
+
+    transformed = _transform_mask_b64(b64, frame)
+
+    with _mask_transform_lock:
+        if len(_mask_transform_cache) >= _MASK_TRANSFORM_CACHE_MAX:
+            oldest = next(iter(_mask_transform_cache))
+            _mask_transform_cache.pop(oldest, None)
+        _mask_transform_cache[key] = transformed
+
+    return transformed
+
+
 def handle_mask(payload):
     h = (payload or {}).get("hash", "")
     with _state_lock:
         b64 = _masks.get(h)
     if b64 is None:
         return {"success": False, "message": f"unknown mask hash {h!r}"}
-    return {"success": True, "hash": h, "b64": b64}
+
+    transformed = _transform_mask_cached(h, b64)
+    return {"success": True, "hash": h, "b64": transformed}
 
 
 def handle_active_state(_payload):
@@ -289,11 +411,7 @@ def _build_expansion_json(state, area_filter=""):
     if needs_bbox:
         notes.append(
             "The node crops each area's mask to the runtime bbox of "
-            "(context_mask \u222a selection_mask) + crop_padding, clamped "
-            "to the mask canvas.  This export shows the structure with "
-            "placeholder coordinates; the actual values are computed "
-            "by the node at execute time from the wired context_mask "
-            "and selection_mask."
+            "(context_mask \u222a selection_mask) + crop_padding."
         )
 
     any_tagger = False
@@ -478,8 +596,7 @@ def _build_expansion_json(state, area_filter=""):
 
     if any_tagger:
         notes.append(
-            "Tagger chains use WD14Tagger|pysssss + ImageCropToMask(image). "
-            "They only execute in the node if the `image` input is wired."
+            "Tagger chains use WD14Tagger|pysssss + ImageCropToMask(image)."
         )
 
     return graph, current, notes
@@ -548,8 +665,7 @@ def handle_fetch_history(payload):
         }
     except urllib.error.HTTPError as e:
         return {"success": False,
-                "message": f"ComfyUI returned HTTP {e.code} "
-                           f"from {COMFY_URL}{e.url}"}
+                "message": f"ComfyUI returned HTTP {e.code}"}
     except urllib.error.URLError as e:
         return {"success": False,
                 "message": f"could not reach ComfyUI at {COMFY_URL}: "
@@ -599,8 +715,7 @@ def _diagnose_history(details):
         "status_messages":      status_messages,
         "note": (
             "ComfyUI's /history returns the SUBMITTED graph, not the "
-            "EXPANDED one.  Per-area CLIPTextEncode nodes created by "
-            "expansion will not appear in `prompt`."
+            "EXPANDED one."
         ),
     }
 
@@ -674,7 +789,6 @@ def handle_import_masks(payload):
 
 
 def handle_resource_image(payload):
-    """Resolve a `{source, layer_name}` spec to a PNG data URL."""
     if not isinstance(payload, dict):
         return {"success": False, "message": "expected a JSON object"}
 
@@ -710,14 +824,13 @@ def handle_resource_image(payload):
     return {
         "success": False,
         "message": (
-            f"source={source!r} cannot be displayed as an image "
-            f"(@thecanvas expects 'active' or 'layer')."
+            f"source={source!r} cannot be displayed as an image."
         ),
     }
 
 
 # ---------------------------------------------------------------------------
-#  /upload_image (raw body)
+#  /upload_image
 # ---------------------------------------------------------------------------
 
 def handle_upload_image(headers, body):

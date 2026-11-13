@@ -4,12 +4,15 @@ Polls the daemon's `comfy_status` every 500 ms while the tab is
 visible and, whenever the `@thecanvas` resource spec in
 `config.resources` changes — the user picked a new source or layer in
 the docker's Resources section, or in the web panel at
-comfy2krita_web.py — re-fetches the corresponding pixels and swaps in
-the returned image via `applyCanvasImage`.
+comfy2krita_web.py, or loaded a different workflow — re-fetches the
+corresponding pixels and swaps in the returned image via
+`applyCanvasImage`.
 
 The trigger is a spec change (`active` → `layer X`, `layer X` →
 `layer Y`, etc.), not a composite change.  Generation does NOT trigger
-a refresh; only an explicit `@thecanvas` re-selection does.
+a refresh; only an explicit `@thecanvas` re-selection does.  (The
+inpaint playground no longer generates; the docker does.  This poller
+is purely about the *displayed* canvas, which tracks `@thecanvas`.)
 
 Pause on tab-hide: `document.visibilityState` is checked before every
 reschedule.  A hidden tab does not poll at all.  On visibility-change
@@ -19,11 +22,25 @@ waiting for the next tick.
 
 Boot-time behavior: on the first poll, if `@thecanvas` is non-null and
 the playground has no image loaded yet, fetch and display it.  If the
-user already picked or imported an image, leave it alone — the poller
-only overwrites on subsequent spec changes.
+user already picked or imported an image, leave it alone.
 
-Absent `@thecanvas` (legacy workflows without native-v2 slots) is a
-no-op: the poller sees `null`, matches its own `null`, and stops."""
+Absent `@thecanvas` (no workflow loaded yet, or a workflow whose
+config does not declare `@thecanvas`) is a no-op: the poller sees
+`null`, matches its own `null`, and stops.  To make this less silent,
+the first poll flashes a "load a workflow" warning when the spec is
+null and no image is loaded; subsequent polls stay quiet until the
+state changes, so the warning is a one-shot nudge, not a per-tick
+spam.
+
+Failure handling: the poller calls `fetchActiveState()`, which can
+fail (`/comfy/active_state` unreachable, daemon down).  A single
+failure is a transient hiccup; a repeated failure across consecutive
+polls means the daemon is down or the backend routes are broken.
+`_warnedBackendDown` tracks the transition: the first failure flashes
+a warning, subsequent failures stay silent, and a success clears the
+flag so the next failure flashes again.  This gives the operator one
+line in the terminal when something is wrong, rather than either zero
+lines (silent) or one line per 500 ms (useless)."""
 
 AUTOSYNC_JS = r"""
 import { board, applyCanvasImage } from "./pg_state.js";
@@ -43,6 +60,8 @@ let _lastSpec = null;
 let _bootstrapped = false;
 let _running = false;
 let _timer = null;
+let _warnedNoWorkflow = false;
+let _warnedBackendDown = false;
 
 function _specOf(cfg) {
   const res = (cfg && cfg.resources) || {};
@@ -91,7 +110,27 @@ async function _poll() {
   _running = true;
   try {
     const resp = await fetchActiveState();
-    if (!resp || !resp.success) return;
+
+    // ---- backend reachability ----
+    //
+    // `fetchActiveState` returns `{success: false, message: ...}` when
+    // `/comfy/active_state` is missing, unreachable, or the daemon
+    // behind it failed.  A single failure is transient; a persistent
+    // one means the daemon is down or the server route is broken.  See
+    // the module docstring, "Failure handling".
+    if (!resp || !resp.success) {
+      if (!_warnedBackendDown) {
+        _warnedBackendDown = true;
+        flashStatus(
+          "autosync: cannot reach daemon state ("
+            + ((resp && resp.message) || "no response") + ")",
+          "warn",
+        );
+      }
+      return;
+    }
+    _warnedBackendDown = false;
+
     const cfg = (resp.data && resp.data.config) || null;
     const spec = _specOf(cfg);
     const specHash = _hashSpec(spec);
@@ -99,8 +138,21 @@ async function _poll() {
     if (!_bootstrapped) {
       _bootstrapped = true;
       _lastSpec = specHash;
+
       if (spec !== null && !board.imageHash) {
         await _fetchAndSet(spec);
+      } else if (spec === null && !board.imageHash && !_warnedNoWorkflow) {
+        // No workflow loaded (or the workflow does not declare
+        // @thecanvas).  Without one, `@thecanvas` has no layer to
+        // resolve to, so the canvas stays empty until the docker (or
+        // CLI) loads a workflow.  Flash once; the next poll after a
+        // workflow load will fire _fetchAndSet normally.
+        _warnedNoWorkflow = true;
+        flashStatus(
+          "autosync: no workflow loaded \u2014 load one in the docker "
+            + "to pull @thecanvas",
+          "warn",
+        );
       }
       return;
     }

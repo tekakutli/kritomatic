@@ -692,12 +692,24 @@ async function _kritaStatusRefresh() {
 
 /* ============================================================
    Import masks from Krita
-   ============================================================ */
+   ============================================================
+   The `preferSelectionMaskChildren: true` flag tells the daemon:
+   for every image-bearing layer in the selection, do NOT read
+   its alpha channel; instead, expand it to its first
+   `selectionmask` child.  Image layers with no selectionmask
+   child are skipped entirely (no mask emitted for them).
+
+   Explicitly-selected mask layers (transparencymask,
+   selectionmask) still pass through unchanged, so selecting a
+   mask directly keeps working.
+
+   Multimask's identically-named button does not pass this flag,
+   so its behaviour (read image layers via alpha) is unchanged. */
 
 async function _kritaImportMasksAction() {
   flashStatus("importing masks from Krita\u2026", "");
   try {
-    const res = await importKritaMasks({});
+    const res = await importKritaMasks({ preferSelectionMaskChildren: true });
     if (!res.success) {
       flashStatus("import failed: " + (res.message || "unknown"), "bad");
       if (/unreachable|connect|refused|timeout/i.test(res.message || "")) {

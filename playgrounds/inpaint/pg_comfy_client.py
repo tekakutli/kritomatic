@@ -56,7 +56,12 @@ export async function uploadImageFile(file) {
 
 export async function fetchStatus() {
   try {
-    const res = await fetch("/comfy/status");
+    const res = await fetch("/comfy/status", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    if (!res.ok) return { success: false, reachable: false, message: "HTTP " + res.status };
     return await res.json();
   } catch (e) {
     return { success: false, reachable: false, message: e.message };

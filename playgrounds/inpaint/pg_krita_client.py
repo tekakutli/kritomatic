@@ -110,6 +110,10 @@ export async function importKritaMasks(opts) {
     if (typeof opts.includePaintAlpha === "boolean") {
       body.include_paint_alpha = opts.includePaintAlpha;
     }
+    if (typeof opts.preferSelectionMaskChildren === "boolean") {
+      body.prefer_selection_mask_children =
+        opts.preferSelectionMaskChildren;
+    }
   }
 
   try {

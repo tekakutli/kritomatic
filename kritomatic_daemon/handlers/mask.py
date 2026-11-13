@@ -7,6 +7,7 @@ from PyQt6.QtCore import QByteArray, QBuffer, QIODevice, Qt
 from krita import *
 from ..decorators import command, AutoDispatchHandler
 from ..utils.layer_resolve import resolve as resolve_node, register as register_node
+from ..utils.layer_types import IMAGE_LAYER_TYPES, MASK_LAYER_TYPES
 
 
 class MaskHandler(AutoDispatchHandler):
@@ -680,6 +681,18 @@ class MaskHandler(AutoDispatchHandler):
     # different size, the JS side scales masks at use time (the same
     # way masks from Segment All do), so this is safe but the caller
     # should warn about mismatches.
+    #
+    # `prefer_selection_mask_children`:
+    #   When True, an image-bearing layer in the selection is not read
+    #   via its alpha channel. Instead, its first `selectionmask` child
+    #   is read instead; image layers with no selectionmask child are
+    #   skipped entirely (no mask emitted for them). Explicitly-
+    #   selected mask layers (transparency / selection) are still read
+    #   directly. This is used by the inpaint playground's "Import
+    #   masks from Krita" button, so selecting a paint layer imports
+    #   its attached selection mask rather than the paint layer itself.
+    #   When False (default), the pre-existing behaviour — image layers
+    #   read via alpha channel — is preserved unchanged.
 
     @command(
         category='mask',
@@ -699,6 +712,18 @@ class MaskHandler(AutoDispatchHandler):
                                               'mask. Set false to import '
                                               'only actual mask layers '
                                               '(transparency / selection).'},
+            '--prefer_selection_mask_children': {
+                'type': 'bool', 'default': False,
+                'help': 'When True, image-bearing layers in the selection '
+                        'are not read via their alpha channel. Instead, '
+                        'each image layer is replaced by its first '
+                        'selection-mask child; image layers without a '
+                        'selection-mask child are skipped entirely. '
+                        'Explicitly-selected mask layers (transparency / '
+                        'selection) are still read directly. Used by the '
+                        'inpaint playground so selecting a paint layer '
+                        'imports its attached selection mask rather than '
+                        'the paint layer itself.'},
         },
     )
     def import_krita_masks_b64(self, params):
@@ -710,6 +735,9 @@ class MaskHandler(AutoDispatchHandler):
             names_raw = params.get('layer_names', '') or ''
             names = [p.strip() for p in str(names_raw).split(',') if p.strip()]
             include_paint_alpha = bool(params.get('include_paint_alpha', True))
+            prefer_selection_mask_children = bool(
+                params.get('prefer_selection_mask_children', False)
+            )
 
             # Pick which nodes to read
             selection_path = 'layer_names'
@@ -737,8 +765,44 @@ class MaskHandler(AutoDispatchHandler):
             masks = []
             skipped = []
 
-            for node in nodes:
-                name = node.name() or '(unnamed)'
+            # When prefer_selection_mask_children is set, expand image
+            # layers into their first selection-mask child; skip image
+            # layers that have none. Explicitly-selected mask layers
+            # (transparency / selection) pass through unchanged.
+            if prefer_selection_mask_children:
+                work_items = []
+                for node in nodes:
+                    ntype = node.type() or ''
+                    display_name = node.name() or '(unnamed)'
+                    if ntype in MASK_LAYER_TYPES:
+                        work_items.append((display_name, node))
+                    elif ntype in IMAGE_LAYER_TYPES:
+                        sel_child = None
+                        try:
+                            for child in node.childNodes():
+                                if child.type() == 'selectionmask':
+                                    sel_child = child
+                                    break
+                        except Exception:
+                            pass
+                        if sel_child is not None:
+                            work_items.append((display_name, sel_child))
+                        else:
+                            skipped.append({
+                                'name': display_name,
+                                'reason': 'no selection mask child',
+                            })
+                    else:
+                        skipped.append({
+                            'name': display_name,
+                            'reason': f'layer type {ntype!r} cannot be '
+                                      f'expanded into a selection mask',
+                        })
+            else:
+                work_items = [(node.name() or '(unnamed)', node)
+                              for node in nodes]
+
+            for name, node in work_items:
                 ntype = node.type() or ''
                 try:
                     result = self._read_node_as_mask(
@@ -762,7 +826,7 @@ class MaskHandler(AutoDispatchHandler):
                 masks.append({
                     'name': name,
                     'type': ntype,
-                    'source': kind,   # 'mask' for mask layers, 'alpha' for image layers
+                    'source': kind,
                     'width': doc_w,
                     'height': doc_h,
                     'mask_b64': mask_b64,

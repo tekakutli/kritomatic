@@ -33,7 +33,7 @@ queries `comfy_status` to learn the current name, then:
 ====================
 The playground's displayed image tracks the daemon's
 `config.resources["@thecanvas"]` spec.  The browser-side poller in
-`pg_autosync.py` queries `/comfy/active_state` every 3 s; on any
+`pg_autosync.py` queries `/comfy/active_state` every 500 ms; on any
 change to `config.resources["@thecanvas"]` it calls
 `/krita/resource_image` with the new spec and swaps in the returned
 pixels via `applyCanvasImage`.  There is no generation-triggered
@@ -422,6 +422,10 @@ def handle_krita_import_masks(payload: dict) -> dict:
             command["layer_names"] = str(payload["layer_names"])
         if "include_paint_alpha" in payload:
             command["include_paint_alpha"] = bool(payload["include_paint_alpha"])
+        if "prefer_selection_mask_children" in payload:
+            command["prefer_selection_mask_children"] = bool(
+                payload["prefer_selection_mask_children"]
+            )
 
     response = krita_client.send(command, timeout=60.0)
     if response.get("status") != "success":

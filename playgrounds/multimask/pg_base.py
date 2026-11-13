@@ -19,6 +19,15 @@ PG_CSS = r"""
     background: rgba(140, 225, 160, 0.10);
     color: #d8ffe0;
   }
+  #ui button#clearAreasBtn {
+    border-color: rgba(255, 105, 125, 0.55);
+    color: #ffb0bc;
+  }
+  #ui button#clearAreasBtn:hover:not(:disabled) {
+    border-color: rgba(255, 130, 150, 1.00);
+    background: rgba(220, 90, 110, 0.10);
+    color: #ffd0d8;
+  }
   #ui button#importImageBtn,
   #ui button#pickImageBtn,
   #ui button#clearImageBtn {
@@ -230,6 +239,12 @@ PG_PANEL_BODY = r"""
           <button id="blankAreaBtn"
                   title="Add a fully-white mask at image dimensions">
             + Blank
+          </button>
+        </div>
+        <div class="row">
+          <button id="clearAreasBtn"
+                  title="Remove every area (mask + prompt) from the list. The image is left untouched.">
+            Clear all areas
           </button>
         </div>
         <div id="areaList" class="areaList"></div>

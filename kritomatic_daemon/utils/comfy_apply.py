@@ -151,15 +151,79 @@ def _determine_crop_bounds(doc, resource_slots: dict,
                            config: dict, warnings: list) -> Bounds:
     """Decide the read window for every resource.
 
-    Full canvas unless a ``source = "global"`` slot forces a crop. The
-    crop is derived from the selection bounds and the ``[crop]`` config;
-    see ``compute_context_bounds``. Falls back to full canvas (with a
-    warning) when no selection exists, matching the old "no selection =
-    everything selected" behavior.
+    Resolution order:
+
+      1. Mask-kind, source="layer" resources.  The first one whose
+         layer has any non-zero pixels defines the crop: its
+         non-zero bbox, padded by [crop].padding and clamped to the
+         canvas.  Conventionally @thecontext.  This is the rule the
+         multimask playground relies on: it sets @thecontext to a
+         layer whose painted rectangle is the region of interest,
+         and expects the workflow to see only what is inside that
+         rectangle, with any @theselection spill clipped to it.
+
+      2. source="global" resources: crop derived from the live
+         Krita selection bounds and [crop] config.  Falls back to
+         full canvas (with a warning) when no selection exists,
+         matching the old "no selection = everything selected"
+         behaviour.
+
+      3. Otherwise: full canvas.
+
+    Every resource is then read at the resulting crop, so the canvas,
+    every mask, and every named layer share one dimension — required
+    because LoadImage / LoadImageMask feed each other with a shared
+    latent shape.
     """
     canvas_w, canvas_h = int(doc.width()), int(doc.height())
     full: Bounds = (0, 0, canvas_w, canvas_h)
 
+    try:
+        padding = int(config["crop"].get("padding", 0))
+    except (TypeError, ValueError):
+        padding = 0
+
+    # ---- Rule 1: a mask-kind, source="layer" resource defines the crop. ----
+    #
+    # Conventionally @thecontext. The layer's non-zero bbox — the tight
+    # rectangle around its painted / alpha-bearing content — is the
+    # region the workflow should see. Everything else (canvas,
+    # selection, other masks) gets read at that same crop, so a
+    # selection that spills outside @thecontext is clipped before it
+    # ever reaches ComfyUI.
+    for name, slot in resource_slots.items():
+        if name == "@theselection":
+            continue
+        if slot.get("kind") != "mask":
+            continue
+        spec = config["resources"].get(name) or {}
+        if spec.get("source") != "layer":
+            continue
+        layer_name = spec.get("layer_name")
+        if not layer_name:
+            continue
+
+        bbox = _read_layer_bbox(doc, layer_name, canvas_w, canvas_h)
+        if bbox is None:
+            warnings.append(
+                f"crop boundary {name!r} (layer {layer_name!r}) has no "
+                f"non-zero pixels; falling through to other crop rules"
+            )
+            continue
+
+        x0, y0, w, h = bbox
+        cx0 = max(0, x0 - padding)
+        cy0 = max(0, y0 - padding)
+        cx1 = min(canvas_w, x0 + w + padding)
+        cy1 = min(canvas_h, y0 + h + padding)
+        clamped = (cx0, cy0, cx1 - cx0, cy1 - cy0)
+        warnings.append(
+            f"crop boundary from {name!r} (layer {layer_name!r}): "
+            f"bbox={bbox} padded={padding} -> {clamped}"
+        )
+        return clamped
+
+    # ---- Rule 2: source="global" resources use live selection bounds. ----
     has_global = any(
         config["resources"].get(name, {}).get("source") == "global"
         for name in resource_slots
@@ -179,8 +243,110 @@ def _determine_crop_bounds(doc, resource_slots: dict,
         canvas_extent=(canvas_w, canvas_h),
         mask_bounds=sel,
         context=config["crop"]["context"],
-        padding=config["crop"]["padding"],
+        padding=padding,
     )
+
+
+def _read_layer_bbox(doc, layer_name: str,
+                     canvas_w: int, canvas_h: int) -> Optional[Bounds]:
+    """Non-zero bbox of a layer's mask rendering, or None if empty.
+
+    Reads the whole canvas once and computes the tight rectangle around
+    every non-zero mask pixel.  The shape of the mask depends on the
+    layer type:
+
+      * mask layers (transparencymask, selectionmask): pixelData is
+        8-bit grayscale; bbox is the tight rect around every pixel
+        with value > 0.
+
+      * image-bearing layers (paintlayer, grouplayer, filelayer,
+        vectorlayer, clonelayer, filllayer, filterlayer): the alpha
+        channel of projectionPixelData; bbox is the tight rect around
+        every pixel with alpha > 0.  This matches what read_layer_mask
+        encodes (alpha -> grayscale) so the bbox the daemon uses for
+        cropping is the same bbox the workflow will see on the mask
+        the daemon uploaded.
+
+    Returns None for an empty layer (no pixels above 0) and for layer
+    types that cannot be read as masks.  The caller treats None as
+    "this layer cannot define a crop" and tries the next rule.
+
+    numpy is used when available (it is in any Krita that ships the
+    kritomatic daemon, because handlers/mask.py already imports it).
+    If it is missing, falls back to a pure-Python scan — slower, but
+    same answer.
+    """
+    from .layer_resolve import resolve as resolve_node
+    from .layer_types import IMAGE_LAYER_TYPES, MASK_LAYER_TYPES
+
+    node = resolve_node(doc, layer_name)
+    if node is None:
+        return None
+
+    if canvas_w <= 0 or canvas_h <= 0:
+        return None
+
+    node_type = node.type()
+
+    if node_type in MASK_LAYER_TYPES:
+        raw = bytes(node.pixelData(0, 0, canvas_w, canvas_h))
+        if len(raw) != canvas_w * canvas_h:
+            return None
+        return _grayscale_bbox(raw, canvas_w, canvas_h)
+
+    if node_type in IMAGE_LAYER_TYPES:
+        raw = bytes(node.projectionPixelData(0, 0, canvas_w, canvas_h))
+        if len(raw) != canvas_w * canvas_h * 4:
+            return None
+        try:
+            import numpy as np
+        except ImportError:
+            return None
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape(
+            (canvas_h, canvas_w, 4),
+        )
+        return _grayscale_bbox_arr(arr[:, :, 3], canvas_w, canvas_h)
+
+    return None
+
+
+def _grayscale_bbox(raw: bytes, W: int, H: int) -> Optional[Bounds]:
+    try:
+        import numpy as np
+    except ImportError:
+        return _grayscale_bbox_pure(raw, W, H)
+    arr = np.frombuffer(raw, dtype=np.uint8).reshape((H, W))
+    return _grayscale_bbox_arr(arr, W, H)
+
+
+def _grayscale_bbox_arr(arr, W: int, H: int) -> Optional[Bounds]:
+    import numpy as np
+    if arr.size == 0:
+        return None
+    rows = np.any(arr != 0, axis=1)
+    cols = np.any(arr != 0, axis=0)
+    if not rows.any() or not cols.any():
+        return None
+    y0 = int(np.argmax(rows))
+    y1 = int(H - 1 - np.argmax(rows[::-1]))
+    x0 = int(np.argmax(cols))
+    x1 = int(W - 1 - np.argmax(cols[::-1]))
+    return (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+
+
+def _grayscale_bbox_pure(raw: bytes, W: int, H: int) -> Optional[Bounds]:
+    min_x, min_y, max_x, max_y = W, H, -1, -1
+    for y in range(H):
+        base = y * W
+        for x in range(W):
+            if raw[base + x]:
+                if x < min_x: min_x = x
+                if x > max_x: max_x = x
+                if y < min_y: min_y = y
+                if y > max_y: max_y = y
+    if max_x < min_x:
+        return None
+    return (min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
 
 
 def _read_resource_blobs(doc, resource_slots: dict, config: dict,

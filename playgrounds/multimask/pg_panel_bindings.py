@@ -16,6 +16,13 @@ The displayed image is whatever the user picked or imported — no
 auto-refresh after generation.  Use `+ From Krita` to pull the
 current composite into the canvas.
 
+`Clear all areas` empties the area list (masks + prompts) without
+touching the loaded image.  This is the counterpart of `Clear image`
+which resets both.  The action flows through the same debounced
+state sync as every other area mutation, so the daemon's saved
+`/state` becomes empty and the `MultiAreaConditioning` node passes
+`base_positive` through unchanged on the next execute.
+
 KRITA STATUS MIRRORING
 ======================
 `#kritaStatus` is a persistent panel element like inpaint's:
@@ -261,6 +268,33 @@ function _addBlankAreaAction() {
   syncAreaList();
   _scheduleStateSync();
   flashStatus("added blank area", "ok");
+  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+}
+
+/* Empty the area list (masks + prompts) without touching the image.
+ * Counterpart to `Clear image`, which resets both.  Kept as its own
+ * action so a user who only wants to start over on masks can keep
+ * the imported composite in place and re-import masks against it.
+ *
+ * Every mutation goes through the same debounced state sync the
+ * other area operations use, so the daemon's saved state becomes
+ * empty and the next `MultiAreaConditioning` execute passes
+ * `base_positive` through — matching a running playground with zero
+ * areas. */
+function _clearAreasAction() {
+  const n = board.areas.length;
+  if (n === 0) {
+    flashStatus("no areas to clear", "warn");
+    return;
+  }
+  board.areas          = [];
+  board.selectedAreaId = null;
+  board.hoveredAreaId  = null;
+  board.nextAreaNum    = 1;
+  syncPanelFields();
+  syncAreaList();
+  _scheduleStateSync();
+  flashStatus("cleared " + n + " area(s)", "ok");
   import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
 }
 
@@ -534,7 +568,7 @@ export function installPanelBindings() {
   const el = {};
   for (const id of [
     "pickImageBtn", "clearImageBtn", "importImageBtn",
-    "importMasksBtn", "blankAreaBtn", "kritaCheckBtn",
+    "importMasksBtn", "blankAreaBtn", "clearAreasBtn", "kritaCheckBtn",
     "saveStateBtn", "loadStateBtn", "exportGraphBtn",
     "fetchHistoryBtn",
   ]) {
@@ -545,6 +579,7 @@ export function installPanelBindings() {
   if (el.importImageBtn)  el.importImageBtn.addEventListener("click", _importImageFromKritaAction);
   if (el.importMasksBtn)  el.importMasksBtn.addEventListener("click", _importMasksFromKritaAction);
   if (el.blankAreaBtn)    el.blankAreaBtn.addEventListener("click", _addBlankAreaAction);
+  if (el.clearAreasBtn)   el.clearAreasBtn.addEventListener("click", _clearAreasAction);
   if (el.kritaCheckBtn)   el.kritaCheckBtn.addEventListener("click", _kritaStatusAction);
   if (el.saveStateBtn)    el.saveStateBtn.addEventListener("click", _saveStateAction);
   if (el.loadStateBtn)    el.loadStateBtn.addEventListener("click", _loadStateAction);
@@ -654,6 +689,10 @@ pgkitRegisterAction("action.importMasks", {
 pgkitRegisterAction("action.blankArea", {
   label: "+ Blank area", scope: "global",
   run: _addBlankAreaAction, meta: { variant: "plain" },
+});
+pgkitRegisterAction("action.clearAreas", {
+  label: "Clear all areas", scope: "global",
+  run: _clearAreasAction, meta: { variant: "danger" },
 });
 pgkitRegisterAction("action.clearImage", {
   label: "Clear image", scope: "global",

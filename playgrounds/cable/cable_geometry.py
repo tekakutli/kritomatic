@@ -67,6 +67,7 @@ ordering helpers below.
 
 import json
 import os
+import sys
 from math import hypot
 
 from quiet import quiet
@@ -100,7 +101,8 @@ def _poly_to_face(points):
         pts = [(float(p[0]), float(p[1])) for p in points]
         return make_face(Polyline(*pts, close=True))
     except Exception as e:
-        print(f"  (could not build face from {len(points)} points: {e})")
+        print(f"[cable] could not build face from {len(points)} points: {e}",
+              file=sys.stderr, flush=True)
         return None
 
 
@@ -306,7 +308,8 @@ def _compute_step_faces(data, plan_faces):
             if result:
                 return result
         except Exception as e:
-            print(f"  (step/wall subtraction failed: {e})")
+            print(f"[cable] step/wall subtraction failed: {e}",
+                  file=sys.stderr, flush=True)
 
     # Fallback: plain step outlines.  Same shape the pre-refactor
     # reader produced when the boolean step failed; the visual and

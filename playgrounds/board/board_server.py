@@ -28,17 +28,27 @@ and streams it to the server; the server saves it under board_drops/
 and returns the saved path.  The filename comes in the X-Filename
 header, URL-encoded, because header values cannot contain arbitrary
 bytes.
+
+LOG FORMAT
+==========
+`_log(msg)` prints `[board] msg` with no timestamp.  Same shape as
+`[inpaint] ...`, `[multimask] ...`, `[interceptor] ...`, and the
+`pgkit/server.py::_handle_log` output for `/__log` messages — one
+tagged-prefix convention across every playground, so a terminal
+running several of them side by side stays readable without a
+per-playground timestamp parser.  (`datetime` was previously used
+here for a `[HH:MM:SS]` prefix; it is now gone.)  Timestamps are
+still available if needed by piping output through `ts` or a similar
+wrapper at the shell.
 """
 
-import datetime
 from urllib.parse import unquote
 
 from . import board_krita
 
 
 def _log(msg):
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] board: {msg}", flush=True)
+    print(f"[board] {msg}", flush=True)
 
 
 # ----------------------------------------------------------------------------
@@ -48,8 +58,7 @@ def _log(msg):
 def handle_log(payload):
     tag = payload.get("tag", "js")
     msg = payload.get("message", "")
-    ts  = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] js/{tag}: {msg}", flush=True)
+    print(f"[board] js/{tag}: {msg}", flush=True)
     return {"success": True}
 
 

@@ -24,16 +24,26 @@ BOOT MODULE — DEFENSIVE BY DESIGN
 dependency, and wraps each import and each wiring step in its own
 try/catch.  Same shape as board/pair/text_board/cone.  Consequences:
 
-    · A module failing to load produces exactly one console line
+    · A module failing to load produces exactly one error line
       `[boot] FAIL import <key> → <error>` before the boot aborts.
+      Failure lines go through console.error, which
+      pgkit/panel_core.js mirrors to the server terminal.
 
     · Each wiring step is logged on its own line.
 
-    · Everything logs with `console.log` so DevTools filters cannot
-      hide a failure.
+    · Success messages log via console.log; failure messages via
+      console.error.  Both are filter-resistant in DevTools AND
+      the failures reach the server terminal.
 
     · The boot logs `[boot] BOOT COMPLETE` on success; its absence
       is the fastest failure signal.
+
+IMPORT ORDER
+============
+`panel_core` is imported FIRST so its console.error / console.warn
+overrides install before any other module loads.  A failure in any
+subsequent import reaches the terminal via the mirror installed by
+that very import.
 
 WIRING CALLBACKS
 ================
@@ -92,19 +102,26 @@ _BOOT_JS = r"""
 //
 // Every dependency is loaded with `await import(path)` inside an
 // async IIFE.  Each import and each wiring step logs on its own
-// console line.  All logs use console.log so no DevTools filter can
-// hide them.  A module failure produces exactly one line:
+// console line.  Success lines use console.log; failure lines use
+// console.error, which pgkit/panel_core.js mirrors to the server
+// terminal through its console override.  A module failure produces
+// exactly one error line:
 //
 //     [boot] FAIL import <key> -> <error>
 //     [boot] BOOT ABORTED: <error>
 //
 // and no wiring steps run.  See boxes_html.py's module docstring for
 // the full map of which bug class is caught by which check.
+//
+// panel_core is imported FIRST so its console override installs
+// before any subsequent import can fail.
 
 (async () => {
   const log  = (...a) => console.log("[boot]", ...a);
-  const fail = (label, e) => log("FAIL", label, "\u2192",
-                                 (e && e.message) || e);
+  const fail = (label, e) => {
+    console.error("[boot]", "FAIL", label, "\u2192",
+                  (e && e.message) || e);
+  };
 
   log("starting");
 
@@ -133,6 +150,7 @@ _BOOT_JS = r"""
 
   try {
     const m = await importAll([
+      ["pc",       "./pgkit/panel_core.js"],
       ["geom",     "./bx_geometry.js"],
       ["i18n",     "./bx_i18n.js"],
       ["base",     "./bx_base.js"],
@@ -147,7 +165,6 @@ _BOOT_JS = r"""
       ["disp",     "./bx_dispatch.js"],
       ["shell",    "./pgkit/shell.js"],
       ["rc",       "./pgkit/remote_client.js"],
-      ["pc",       "./pgkit/panel_core.js"],
     ]);
 
     // Wire bx_core's draw hook.
@@ -187,9 +204,11 @@ _BOOT_JS = r"""
 
     log("BOOT COMPLETE");
   } catch (e) {
-    log("BOOT ABORTED:", (e && e.message) || e);
+    console.error("[boot]", "BOOT ABORTED:",
+                  (e && e.message) || e);
     if (e && e.stack) {
-      log("STACK:", e.stack.split("\n").slice(0, 4).join(" | "));
+      console.error("[boot]", "STACK:",
+                    e.stack.split("\n").slice(0, 4).join(" | "));
     }
   }
 })();

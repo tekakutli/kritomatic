@@ -34,7 +34,13 @@ WHAT'S LEFT
     • keyboard listeners — installKeyboard
     • grid adders — addFloorNsGrid, addFloorEwGrid, addWallVGrid,
       addWallHGrid
-    • UI feedback — flashStatus, updateSnapPill, updateDrawButton
+    • UI feedback — updateSnapPill, updateDrawButton
+
+`flashStatus` is no longer defined here: it is re-exported from
+`pgkit/panel_core.js`, which mirrors "bad" and "warn" statuses to
+the server's terminal.  Callers that import `flashStatus` from
+`./pg_core.js` continue to work unchanged — the re-export keeps the
+existing import surface.
 
 CROSS-MODULE CALLS
 ==================
@@ -683,21 +689,23 @@ export async function doSave() {
 }
 
 /* ==========================================================================
-   STATUS FLASH + SNAP PILL + DRAW BUTTON
-   ========================================================================== */
+   STATUS FLASH — re-exported from pgkit/panel_core.js
+   ==========================================================================
+   The previous local copy had no terminal mirror: a `flashStatus(msg,
+   "bad")` wrote the DOM status line and nothing else.  Every other
+   playground routes those through `pgkit/panel_core.js`'s
+   mirror-aware `flashStatus`, which POSTs "bad" and (subject to the
+   opt-out URL params) "warn" messages to `./__log` so the server's
+   stdout shows them.  Cable now does the same, by re-exporting the
+   kit's implementation instead of defining its own.  Every importer
+   of `./pg_core.js` that already names `flashStatus` (pg_panel.js,
+   pg_navigation.js, pg_edit.js) gets the mirror for free. */
 
-let _statusTimer = null;
-const _statusEl = document.getElementById("status");
-export function flashStatus(msg, cls) {
-  if (!_statusEl) return;
-  _statusEl.textContent = msg;
-  _statusEl.className   = cls || "";
-  if (_statusTimer) clearTimeout(_statusTimer);
-  _statusTimer = setTimeout(() => {
-    _statusTimer = null;
-    callDraw();
-  }, 1400);
-}
+export { flashStatus } from "./pgkit/panel_core.js";
+
+/* ==========================================================================
+   SNAP PILL + DRAW BUTTON
+   ========================================================================== */
 
 export function updateSnapPill() {
   const el = document.getElementById("snapPill");

@@ -564,6 +564,12 @@ function _kritaMarkUnreachable(reason) {
   el.textContent = "\u2717 " + (reason || "not reachable");
   el.className = "bad";
   el.title = "Start Krita with the Kritomatic Daemon plugin enabled";
+  // Mirror to the terminal.  The persistent #kritaStatus element is
+  // the panel's at-a-glance indicator; console.error is captured by
+  // pgkit/panel_core.js's override and routed to POST ./__log.
+  try {
+    console.error("[segment] krita:", reason || "not reachable");
+  } catch (_) {}
 }
 
 async function _kritaStatusRefresh() {

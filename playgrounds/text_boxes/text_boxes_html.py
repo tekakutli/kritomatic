@@ -32,10 +32,18 @@ right order.  Its imports:
     · board, resize, _setDraw         from tbox_core
     · syncItemList                    from tbox_panel_lists
 
-Then it wires the injected callbacks (`_setDraw`, `setPanelDraw`,
-`setRemoteDraw`, `setRemoteSelect`, `setRemoteDeselect`) and calls
-the boot sequence (`installShellControls`, `installEditorBindings`,
-`installPanelBindings`, `pgkitBootSync`, `resize`).
+BOOT MODULE — UNIFIED WITH OTHER PLAYGROUNDS
+=============================================
+This boot wraps its wiring in a `try`/`catch` and emits
+`console.log("[boot] ...")` for each successful step and
+`console.error("[boot] FAILED:", e)` for the catch.  That matches
+the pattern every other playground uses; pgkit's `panel_core.js`
+mirrors both — success as class `boot-ok`, failure as class
+`boot-error` — to the server's terminal via `POST ./__log`.  A
+headless run therefore sees per-step confirmation of a healthy
+boot (which it previously got only from browser DevTools) and a
+single, classed error line on failure (which it previously got as
+`js-error` from `window.onerror`, without the per-step context).
 
 WHY A MANIFEST
 ==============
@@ -94,23 +102,29 @@ import { draw }                             from "./tbox_dispatch.js";
 import { board, resize, _setDraw }          from "./tbox_core.js";
 import { syncItemList }                     from "./tbox_panel_lists.js";
 
-// Wire kit's injectable slots.
-_setDraw(draw);
-setPanelDraw(draw);
-setRemoteDraw(draw);
-setRemoteSelect(pgkitHandleSelect);
-setRemoteDeselect(() => {
-  board.selectedIdx = -1;
-  syncItemList();
-  _syncEditor();
-});
+console.log("[boot] modules loaded");
 
-// Boot.
-installShellControls();
-installEditorBindings();
-installPanelBindings();
-pgkitBootSync();
-resize();
+try {
+  // Wire kit's injectable slots.
+  _setDraw(draw);                     console.log("[boot] _setDraw");
+  setPanelDraw(draw);                 console.log("[boot] setPanelDraw");
+  setRemoteDraw(draw);                console.log("[boot] setRemoteDraw");
+  setRemoteSelect(pgkitHandleSelect); console.log("[boot] setRemoteSelect");
+  setRemoteDeselect(() => {
+    board.selectedIdx = -1;
+    syncItemList();
+    _syncEditor();
+  });                                 console.log("[boot] setRemoteDeselect");
+
+  // Boot.
+  installShellControls();             console.log("[boot] installShellControls");
+  installEditorBindings();            console.log("[boot] installEditorBindings");
+  installPanelBindings();             console.log("[boot] installPanelBindings");
+  pgkitBootSync();                    console.log("[boot] pgkitBootSync");
+  resize();                           console.log("[boot] BOOT COMPLETE");
+} catch (e) {
+  console.error("[boot] FAILED:", e);
+}
 """
 
 

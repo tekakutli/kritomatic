@@ -13,6 +13,19 @@ Module serving
 with `Cache-Control: no-store`.  A missing module is a 404 with a
 short text body listing the present keys.
 
+Built-in routes
+===============
+`POST /__log` is installed unconditionally by `make_handler` on every
+playground, ahead of the per-playground `routes` lookup.  The browser
+client (see `pgkit/panel_core.py::_postLog`) uses it to mirror panel
+errors and uncaught JS exceptions to the playground server's stdout,
+so a developer watching the terminal sees the same errors the browser
+shows in the panel's status line.  Route name is `__log` to mark it
+as an internal pgkit endpoint; the client must POST to `./__log`
+(relative to the page), not `/__log`, so that under the pgkit hub the
+request lands on `/<name>/__log` and the hub proxies it back to the
+playground, rather than on the hub root where nothing handles it.
+
 Hub registration
 ================
 Both serve paths register with the pgkit hub if `hub_name` is given.
@@ -67,6 +80,11 @@ def make_handler(routes=None, raw_routes=None, module_sources=None, hub=None):
             super().do_GET()
 
         def do_POST(self):
+            # Built-in route, ahead of per-playground routes so that no
+            # playground needs to know about it.
+            if self.path == "/__log":
+                self._handle_log()
+                return
             if self.path in raw_routes:
                 self._handle_raw_post(raw_routes[self.path])
                 return
@@ -90,6 +108,70 @@ def make_handler(routes=None, raw_routes=None, module_sources=None, hub=None):
                 traceback.print_exc()
                 result = {"success": False, "message": "Server error: %s" % e}
             self._send_json(200, result)
+
+        def _handle_log(self):
+            """Print a browser-side panel error to the server's stdout.
+
+            Called by `pgkit/panel_core.py`'s `_postLog` for two kinds
+            of message:
+
+              * flashStatus(..., "bad") — panel errors that the user
+                sees in the status line and that the server's terminal
+                should show too.  `class` is "bad" and the message is
+                exactly what the panel showed.
+
+              * Uncaught JS exceptions and unhandled promise
+                rejections — window.onerror and
+                window.onunhandledrejection listeners in
+                panel_core.py.  `class` is "js-error" or
+                "js-rejection"; the message is err.stack when
+                available.
+
+            `prefix` is the playground's name derived from
+            document.title (e.g. "inpaint", "multimask").  The output
+            matches the `[inpaint] ...` / `[multimask] ...` prefix
+            that each playground's own server-side `_log()` helpers
+            use, so a terminal running several playgrounds under the
+            hub stays readable.
+
+            Multi-line messages (JS stack traces) are printed with the
+            first line prefixed and subsequent lines indented by four
+            spaces, matching the convention `traceback.print_exc`
+            would use for its own frames.
+
+            Response is a bare {"success": true} so the client's
+            fire-and-forget fetch resolves without inspecting the
+            body.
+            """
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                body = self.rfile.read(length) if length else b""
+            except Exception as e:
+                self._send_json(400, {"success": False,
+                                      "message": str(e)})
+                return
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                self._send_json(400, {"success": False,
+                                      "message": str(e)})
+                return
+            if not isinstance(payload, dict):
+                self._send_json(400, {"success": False,
+                                      "message": "expected an object"})
+                return
+            msg    = str(payload.get("message") or "")
+            cls    = str(payload.get("class") or "")
+            prefix = str(payload.get("prefix") or "panel")
+            if msg:
+                lines = msg.splitlines() or [msg]
+                tag = f"[{prefix}]"
+                if cls:
+                    tag += f" {cls}:"
+                print(f"{tag} {lines[0]}", flush=True)
+                for line in lines[1:]:
+                    print(f"    {line}", flush=True)
+            self._send_json(200, {"success": True})
 
         def _handle_raw_post(self, handler):
             try:

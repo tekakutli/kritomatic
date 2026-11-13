@@ -46,7 +46,23 @@ Selection and context masks are both expanded to W'×H':
     distinction here would make Mode B expansion a silent no-op
     (the model would never see the drawn margins), so both modes
     collapse to full white on expansion.
-"""
+
+POLL FAILURE SURFACING
+======================
+The poll loop fires `/intercept/list` every 2000 ms.  A single
+failure is a transient hiccup and is swallowed silently — flashing
+on every one would produce terminal noise for a socket that
+reconnected between ticks.  But a *persistent* failure (target
+moved, port changed, daemon down) leaves the panel looking frozen
+with no user-visible signal.
+
+`_refreshList` tracks consecutive failures.  When the streak reaches
+3 — 6 s of unbroken failure at the poll cadence — the panel flashes a
+`"warn"`, which `flashStatus` mirrors to the terminal via
+`pgkit/panel_core.js`.  After that the streak continues to grow and
+re-flashes every 10 failures (20 s), so a long outage produces a
+readable reminder without per-tick spam.  A success at any point
+resets the streak to zero."""
 
 PANEL_BINDINGS_JS = r"""
 import {
@@ -66,13 +82,33 @@ import {
 
 const POLL_MS = 2000;
 
+/* Consecutive-failure tracking for the poll loop.  See the module
+   docstring, POLL FAILURE SURFACING. */
+let _consecutivePollFailures = 0;
+
 /* ============================================================
    Poll loop / task refresh
    ============================================================ */
 
 async function _refreshList() {
   const res = await interceptList();
-  if (!res.success) return;
+  if (!res.success) {
+    _consecutivePollFailures += 1;
+    /* Flash on the 3rd consecutive failure — 6 s of unbroken failure
+       at the poll cadence — and every 10th after that (so 3, 13, 23,
+       …).  A single transient failure produces no flash. */
+    if (_consecutivePollFailures === 3 ||
+        (_consecutivePollFailures > 3 &&
+         (_consecutivePollFailures - 3) % 10 === 0)) {
+      flashStatus(
+        "interceptor: can't reach the intercept server ("
+          + (res.message || "unknown") + ")",
+        "warn"
+      );
+    }
+    return;
+  }
+  _consecutivePollFailures = 0;
 
   const prevStatus = {};
   for (const [tid, t] of Object.entries(board.tasks)) {

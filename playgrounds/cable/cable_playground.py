@@ -92,6 +92,10 @@ RUST_BIN = (
 RUST_TIMEOUT_SEC = 60
 
 
+def _log(msg: str) -> None:
+    print(f"[cable] {msg}", flush=True)
+
+
 def _save_route(payload):
     """Persist room_layout.json from the browser's /save POST."""
     try:
@@ -101,10 +105,10 @@ def _save_route(payload):
              len(payload.get("wallGrids", [])) +
              len(payload.get("floorCables", [])) +
              len(payload.get("wallCables", [])))
-        print(f"  saved {n} item(s) to {STATE_FILE}", flush=True)
+        _log(f"saved {n} item(s) to {STATE_FILE}")
         return {"success": True}
     except Exception as e:
-        print(f"  save FAILED: {e}", flush=True)
+        _log(f"save FAILED: {e}")
         return {"success": False, "message": str(e)}
 
 

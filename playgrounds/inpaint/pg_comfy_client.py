@@ -54,6 +54,12 @@ export async function uploadImageFile(file) {
   return payload;
 }
 
+/* POST, not GET.  /comfy/status is registered in inpaint_server.py's
+   ROUTES and dispatched via pgkit/server.py::do_POST.  A GET falls
+   through to SimpleHTTPRequestHandler.do_GET which serves files and
+   returns 404 HTML — res.json() then throws "Unexpected token '<'",
+   which _checkStatusAction flashes as "ComfyUI unreachable:
+   Unexpected token <".  Same fix segment's fetchStatus needed. */
 export async function fetchStatus() {
   try {
     const res = await fetch("/comfy/status", {

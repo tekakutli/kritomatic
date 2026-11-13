@@ -3,7 +3,7 @@ pg_krita.py — fetch glue for the /krita endpoints.
 
 ES module.  Exports:
 
-    reportError                POST /log, plus console.error
+    reportError                mirror an error message to the terminal
     refreshFromKrita           POST /krita/refresh, merge, redraw
     retrieveOpenFromKrita      add every open Krita doc to the board,
                                then refresh so the new cards have state
@@ -40,6 +40,39 @@ DROP PAYLOAD — RAW BYTES
 travels in the `X-Filename` header, URL-encoded.  pgkit's
 `server.serve()` gained `raw_routes` support precisely so board
 could keep this wire format.
+
+REPORTERROR — WHY IT IS A THIN WRAPPER NOW
+==========================================
+This module used to carry two error channels:
+
+    1. a POST to /log, which board_server.py::handle_log printed
+       as `[HH:MM:SS] js/{tag}: {message}`; and
+    2. a direct console.error line, which the pgkit console
+       override (in pgkit/panel_core.js) mirrors to the terminal
+       via POST ./__log as `[board] console-error: [{tag}] {message}`.
+
+Two channels for one message meant the terminal saw each board
+error twice, in two different formats, under two different prefixes
+that a reader had to learn separately.
+
+`reportError` is now a single-channel wrapper over `console.error`.
+The mirror does the rest.  The `/log` route in board_server.py is
+kept in place — any external caller posting there still gets a
+print — but nothing in this file reaches for it.  Future callers
+that want a bespoke class ("board-error" instead of "console-error")
+should import `reportPanelError` from `./pgkit/panel_core.js` and
+call it directly; `reportError` stays for the common case of "just
+log this".
+
+The window-level hooks (`error` and `unhandledrejection`) that used
+to live here are removed.  `pgkit/panel_core.js` installs one pair
+of hooks for the whole page.  Doubling them meant every uncaught
+error landed in the terminal twice — once as `js-error` from
+panel_core, once as `console-error` from board's own hook that
+called `reportError` which called `console.error`.  Uncaught errors
+now go through panel_core's hooks alone; handled errors (the
+try/catch blocks in this file and in pg_panel_bindings.js) go
+through `reportError`, which mirrors as `console-error`.
 """
 
 KRITA_JS = r"""
@@ -54,26 +87,31 @@ import {
 } from "./pgkit/remote_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
 
+/* ==========================================================================
+   ERROR REPORTING
+   ==========================================================================
+   Thin wrapper over console.error.  pgkit/panel_core.js's console
+   override mirrors every console.error call to POST ./__log, which
+   the playground's server prints to its stdout.  This is the ONE
+   channel for board's handled errors (try/catch failures).  See the
+   module docstring, REPORTERROR — WHY IT IS A THIN WRAPPER NOW.
+
+   The tag becomes a bracketed prefix inside the message: a caller
+   that passes tag="open" and message="file not found" produces a
+   terminal line reading
+       [board] console-error: [open] file not found
+   where `[board]` is the document.title-derived playground prefix and
+   `console-error` is the class set by panel_core's override. */
+
 export function reportError(tag, message) {
   try {
-    fetch("/log", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tag, message: String(message) }),
-    }).catch(() => {});
+    console.error("[" + tag + "] " + message);
   } catch (_) {}
-  try { console.error("[" + tag + "] " + message); } catch (_) {}
 }
 
-window.addEventListener("error", (e) => {
-  const loc = (e.filename || "") + ":" + (e.lineno || "") + ":" + (e.colno || "");
-  reportError("uncaught", (e.message || "unknown error") + " @ " + loc);
-});
-window.addEventListener("unhandledrejection", (e) => {
-  let reason = e.reason;
-  if (reason && reason.message) reason = reason.message;
-  reportError("unhandled-rejection", reason || "no reason given");
-});
+/* ==========================================================================
+   DROP OVERLAY
+   ========================================================================== */
 
 (function installDropOverlay() {
   if (document.getElementById("dropOverlay")) return;

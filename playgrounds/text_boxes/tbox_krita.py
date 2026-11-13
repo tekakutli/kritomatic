@@ -3,12 +3,14 @@ tbox_krita.py — fetch glue for the /krita endpoints.
 
 ES module.  Exports the async fetch wrappers, error reporters, and
 open/refresh helpers.  All POSTs return JSON with a `success` flag;
-a non-success response has its `message` mirrored to `/log` on the
-local server, so failures also appear on the terminal.
+a non-success response is mirrored to the server's terminal via
+`console.error`, which pgkit/panel_core.js's console override routes
+to `POST ./__log`.
 
 EXPORTS
 =======
-    reportError(tag, message)     POST /log, plus console.error
+    reportError(tag, message)     console.error only (mirrored by
+                                  pgkit/panel_core.js's override)
     refreshFromKrita()            POST /krita/dump_text, merge the
                                   result into the board, then
                                   refresh the panel and canvas
@@ -21,6 +23,34 @@ EXPORTS
 
 The single-flight `_refreshInFlight` guard prevents two concurrent
 `dump_text` requests from clobbering each other's responses.
+
+REPORTERROR — WHY IT IS A THIN WRAPPER
+======================================
+Earlier this file carried two error channels:
+
+    1. a POST to /log, which text_boxes_server.py printed to the
+       terminal; and
+    2. a `console.error` call.
+
+With `pgkit/panel_core.js`'s console override in place, the second
+channel already mirrors to the server's terminal (`POST ./__log`
+→ `pgkit/server.py::_handle_log`).  The first channel is therefore
+redundant — each error was landing in the terminal twice, once as
+`[text_boxes] js/{tag}: ...` from /log and once as
+`[text_boxes] console-error: [{tag}] ...` from ./__log.
+
+`reportError` is now a single-channel wrapper over `console.error`.
+The `/log` route is kept in `text_boxes_server.py` (harmless dead
+endpoint) so any external caller posting there still gets a print,
+but nothing in this file reaches for it.
+
+The window-level hooks (`error` and `unhandledrejection`) that used
+to live here are also removed.  `pgkit/panel_core.js` installs one
+pair of hooks for the whole page; doubling them meant every uncaught
+error and unhandled rejection landed in the terminal twice — once as
+`js-error` / `js-rejection` from panel_core, once as `console-error`
+from this file's own hook that called `reportError` which called
+`console.error`.
 """
 
 KRITA_JS = r"""
@@ -34,28 +64,26 @@ import { flashStatus }       from "./pgkit/panel_core.js";
 
 /* ==========================================================================
    ERROR REPORTING
-   ========================================================================== */
+   ==========================================================================
+   Thin wrapper over console.error.  pgkit/panel_core.js's console
+   override mirrors every console.error call to POST ./__log, which
+   the playground server prints to its stdout.  This is the one
+   channel for text_boxes's handled errors (try/catch failures).  See
+   the module docstring, REPORTERROR — WHY IT IS A THIN WRAPPER.
+
+   The tag becomes a bracketed prefix inside the message: a caller
+   that passes tag="refresh" and message="file not found" produces a
+   terminal line reading
+       [text_boxes] console-error: [refresh] file not found
+   where `[text_boxes]` is the document.title-derived playground
+   prefix and `console-error` is the class set by panel_core's
+   override. */
 
 export function reportError(tag, message) {
   try {
-    fetch("/log", {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ tag: tag, message: String(message) }),
-    }).catch(() => {});
+    console.error("[" + tag + "] " + message);
   } catch (_) {}
-  try { console.error("[" + tag + "] " + message); } catch (_) {}
 }
-
-window.addEventListener("error", (e) => {
-  const loc = (e.filename || "") + ":" + (e.lineno || "") + ":" + (e.colno || "");
-  reportError("uncaught", (e.message || "unknown error") + " @ " + loc);
-});
-window.addEventListener("unhandledrejection", (e) => {
-  let reason = e.reason;
-  if (reason && reason.message) reason = reason.message;
-  reportError("unhandled-rejection", reason || "no reason given");
-});
 
 /* ==========================================================================
    REFRESH
@@ -85,7 +113,6 @@ export async function refreshFromKrita() {
     payload = await res.json();
   } catch (err) {
     console.error("[refresh] fetch or parse failed:", err);
-    reportError("refresh", err.message);
     if (statusEl) {
       statusEl.textContent = "Request failed: " + err.message;
       statusEl.className   = "bad";
@@ -100,7 +127,6 @@ export async function refreshFromKrita() {
   if (!payload || !payload.success) {
     const msg = (payload && payload.message) ? payload.message : "unknown error";
     console.error("[refresh] daemon reported error:", msg);
-    reportError("refresh", msg);
     if (statusEl) {
       statusEl.textContent = "Krita: " + msg;
       statusEl.className   = "bad";

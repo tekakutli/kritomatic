@@ -9,6 +9,12 @@ fetches that state on every execution, stages each area's mask PNG
 into ComfyUI's input directory, and expands them into
 ConditioningSetMask branches.
 
+When the multimask playground is not running, the node logs the
+failure and passes `base_positive` through unchanged — same
+behaviour as a running playground with an empty area list.  A missing
+playground is not an error: workflows that wire this node must still
+execute when the area editor is closed.
+
 CONTEXT MASK AND CROP ALIGNMENT
 ===============================
 When `context_mask` (and optionally `selection_mask`) is wired and
@@ -280,12 +286,19 @@ class MultiAreaConditioning(io.ComfyNode):
         try:
             state = _fetch_state(playground_url)
         except Exception as e:
-            raise RuntimeError(
-                f"Kritomatic multimask playground unreachable at "
-                f"{playground_url!r}: {e}\n"
-                f"Start it with: "
-                f"python playgrounds/multimask/multimask_playground.py"
+            # A closed multimask playground is not a workflow error.  The
+            # node exists so that workflows remain runnable whether or not
+            # the area editor is open.  Pass base_positive through, which
+            # is the same result a running playground with zero areas
+            # produces — inpaint workflows that wire this node keep
+            # working with no multimask areas defined.
+            print(
+                f"[MultiAreaConditioning] multimask playground "
+                f"unreachable at {playground_url!r}: {e}; passing "
+                f"base_positive through (behaving as if no multimask "
+                f"areas were defined)."
             )
+            return io.NodeOutput(base_positive, expand={})
 
         state_version = state.get("version") or ""
         globs = dict(state.get("globals") or {})

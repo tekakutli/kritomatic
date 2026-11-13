@@ -69,6 +69,20 @@ other files add `GEOMETRY.cutZ`, `GEOMETRY.stepFaces`) needs
 GEOMETRY in its own module scope — the concatenation model relied
 on a page-level `const`, which the ES-module model does not have.
 The import below is what puts it here.
+
+FLASHSTATUS — RE-EXPORTED FROM pgkit
+====================================
+Earlier revisions of this file carried their own local `flashStatus`
+with a different timeout (1400 ms instead of pgkit's 1800 ms) and an
+on-timeout `callDraw()`.  Nothing in the current tree uses it — every
+caller imports from `./pgkit/panel_core.js` directly — but the local
+copy was a latent trap: a new caller that reached for `bx_core`'s
+`flashStatus` would get the version WITHOUT the error-mirroring hook
+that `pgkit/panel_core.js` installs.  The re-export below routes any
+such caller through the mirror-aware version automatically.  The
+alternate timeout and the on-timeout draw are not needed: flashStatus
+is display-only, and the caller's own `draw()` call already covers
+the repaint.
 """
 
 CORE_JS = r"""
@@ -78,6 +92,11 @@ import {
 } from "./bx_base.js";
 import { GEOMETRY } from "./bx_geometry.js";
 import { pgkitNotifyAll } from "./pgkit/remote_client.js";
+
+/* Re-export pgkit's mirror-aware flashStatus so any caller of
+   bx_core.flashStatus gets the terminal mirror for free.  See the
+   module docstring, FLASHSTATUS — RE-EXPORTED FROM pgkit. */
+export { flashStatus } from "./pgkit/panel_core.js";
 
 /* ==========================================================================
    VIEW
@@ -589,25 +608,4 @@ export function setSelected(b) {
 let _drawRef = null;
 export function _setDraw(fn) { _drawRef = fn; }
 export function callDraw() { if (_drawRef) _drawRef(); }
-
-/* ==========================================================================
-   STATUS — flashStatus
-   ==========================================================================
-   A local, self-contained flash-status function.  The pgkit panel
-   has its own (pgkit/panel_core.js) but this one is used by
-   internal helpers that run before the kit has been wired.
-   The class names match the pgkit CSS exactly ("ok"/"warn"/"bad"). */
-
-let statusTimer = null;
-export function flashStatus(msg, cls) {
-  const el = document.getElementById("status");
-  if (!el) return;
-  el.textContent = msg;
-  el.className = cls || "";
-  if (statusTimer) clearTimeout(statusTimer);
-  statusTimer = setTimeout(() => {
-    statusTimer = null;
-    callDraw();
-  }, 1400);
-}
 """

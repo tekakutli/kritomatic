@@ -44,6 +44,30 @@ HUB SHUTDOWN FLOW
 =================
 Unchanged.  `rpShutdownHub()` promises a `shutdown_ack`; see the
 previous version's docstring for the full lifecycle.
+
+RPLOG — MIRRORING ERRORS AND WARNINGS TO THE TERMINAL
+====================================================
+`rpLog` is the panel's own log writer.  It records to `_rp.log`,
+renders to the panel's log DOM, and — for kinds "error" and "warn"
+— also calls console.error / console.warn.  The console calls are
+what reach the terminal: the inline script in
+remote_panel_html.py installs the same console override that
+pgkit/panel_core.js installs, and routes every console.error /
+console.warn through POST ./__log.  The panel's own server
+(port 8772) has the standard pgkit built-in `_handle_log` handler,
+so those messages appear on the panel's stdout alongside the
+playground processes' output.
+
+Why "error" and "warn" and nothing else: those two kinds represent
+failures and warnings the operator needs to see; "info" and "cmd"
+are progress narration and would flood the terminal.  See
+`rpLog`'s own comment for the full reasoning.
+
+The `if (typeof flashStatus === "function")` guards elsewhere in
+this file are defensive no-ops — remote_panel doesn't load
+pgkit/panel_core.js as a module, so `flashStatus` is never a global
+on this page.  The mirror is now the primary channel; flashStatus
+would be a secondary panel-local echo if it were ever wired up.
 """
 
 RP_CLIENT_JS = r"""
@@ -92,13 +116,58 @@ const RP_REBUILD_DEBOUNCE_MS = 50;
 
 /* ==========================================================================
    LOG
-   ========================================================================== */
+   ==========================================================================
+   Panel-local logging that ALSO mirrors errors and warnings to the
+   terminal.
+
+   The panel's log array and its log DOM are the primary display —
+   every kind lands there.  For the two kinds that represent
+   failures ("error") or warnings ("warn"), the entry additionally
+   goes through console.error / console.warn, which the inline
+   script in remote_panel_html.py's <head> has overridden to
+   forward to POST ./__log.  The panel's own server prints those
+   to its stdout.
+
+   Kinds and their mirroring:
+
+     "error"    failures: kill send failed, launcher refused, hub
+                acknowledgment timeout, WebSocket send error, etc.
+                MIRRORED via console.error.
+
+     "warn"     warnings: state-stale conditions, transient
+                network hiccups.  MIRRORED via console.warn.
+
+     "info"     progress narration: connect, disconnect, presence
+                changes, hub registration list updates.  NOT
+                mirrored — would flood the terminal.
+
+     "cmd"      command traffic: every command sent, every
+                command_result received.  NOT mirrored — the
+                successful case is expected chatter, the failure
+                case follows up with an explicit rpLog("error", …)
+                that mirrors independently.
+
+     "state"    state dump notifications.  NOT mirrored.
+     "schema"   schema dump notifications.  NOT mirrored.
+     "entities" entity-list updates.  NOT mirrored.
+     "patch"    field patches.  NOT mirrored.
+
+   The `try/catch` around console.error / console.warn is
+   defensive: those methods never throw, but if a caller in a
+   subclass or a test harness replaces them, a bad replacement
+   should not break `rpLog` itself. */
 
 function rpLog(kind, text) {
   const ts = new Date().toLocaleTimeString();
   _rp.log.push({ ts, kind, text });
   if (_rp.log.length > RP_MAX_LOG) _rp.log.shift();
   rpRenderLog();
+
+  if (kind === "error") {
+    try { console.error("[rp]", text); } catch (_) {}
+  } else if (kind === "warn") {
+    try { console.warn("[rp]", text); } catch (_) {}
+  }
 }
 
 /* ==========================================================================

@@ -14,7 +14,16 @@ graph, not the expanded one; the diagnostic summary explains this.
 
 The displayed image is whatever the user picked or imported — no
 auto-refresh after generation.  Use `+ From Krita` to pull the
-current composite into the canvas."""
+current composite into the canvas.
+
+KRITA STATUS MIRRORING
+======================
+`#kritaStatus` is a persistent panel element like inpaint's:
+"✓ reachable" / "✗ not reachable".  The ✗ branch mirrors its reason
+to `console.error`, which pgkit/panel_core.js routes to POST
+./__log.  The persistent DOM write stays visible on the panel; the
+terminal write is the durable record.
+"""
 
 PANEL_BINDINGS_JS = r"""
 import {
@@ -112,6 +121,10 @@ async function _doStateSync() {
       st.textContent = "sync failed: " + e.message;
       st.className = "bad";
     }
+    // Mirror the failure to the terminal — the persistent
+    // #statusLine write above shows it in the panel; console.error
+    // routes it through pgkit/panel_core.js's mirror.
+    try { console.error("[multimask] state sync:", e.message); } catch (_) {}
   }
 }
 
@@ -278,6 +291,12 @@ async function _kritaStatusAction() {
     el.textContent = "\u2717 not reachable";
     el.className = "bad";
     el.title = "Start Krita with the Kritomatic Daemon plugin enabled";
+    // Mirror the reason to the terminal.  #kritaStatus is the
+    // panel's persistent indicator; console.error routes through
+    // pgkit/panel_core.js's mirror to the terminal.
+    try {
+      console.error("[multimask] krita:", res.message || "not reachable");
+    } catch (_) {}
   }
 }
 

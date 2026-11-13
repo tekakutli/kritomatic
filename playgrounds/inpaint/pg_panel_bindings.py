@@ -17,7 +17,25 @@ Not present: Segment All, Refine, mask prompt, region painting,
 points, undo/redo, export to Krita.  Also: the old "Import image from
 Krita" button is gone — `pg_autosync.js` pulls the current
 `@thecanvas` in automatically when the daemon's config points at
-one."""
+one.
+
+KRITA STATUS MIRRORING
+======================
+`#kritaStatus` is a PERSISTENT panel element: a small "✓ reachable"
+/ "✗ not reachable" label next to the Check-Krita button.  Unlike
+`flashStatus`, it does not auto-clear — the last-known state stays
+visible until the next refresh.
+
+`_kritaMarkReachable()` writes the ✓ form; `_kritaMarkUnreachable(
+reason)` writes the ✗ form.  Because the ✗ state is exactly what a
+developer watching the terminal would want to see, `_kritaMarkUnreachable`
+ALSO mirrors `reason` to `console.error`, which pgkit/panel_core.js
+routes to `POST ./__log`.  The persistent DOM write is for at-a-glance
+panel reading; the terminal write is the durable record.  This is the
+only place in this file that bypasses `flashStatus` for an error,
+because it is the only place with a persistent DOM element designed
+to hold that error text.
+"""
 
 PANEL_BINDINGS_JS = r"""
 import { board, setImage, clearImage, _scheduleDraw,
@@ -682,6 +700,13 @@ function _kritaMarkUnreachable(reason) {
   el.textContent = "\u2717 " + (reason || "not reachable");
   el.className = "bad";
   el.title = "Start Krita with the Kritomatic Daemon plugin enabled";
+  // Mirror to the terminal.  The persistent #kritaStatus element is
+  // the panel's at-a-glance indicator; the terminal entry is the
+  // durable record.  console.error is captured by
+  // pgkit/panel_core.js's override and routed to POST ./__log.
+  try {
+    console.error("[inpaint] krita:", reason || "not reachable");
+  } catch (_) {}
 }
 
 async function _kritaStatusRefresh() {

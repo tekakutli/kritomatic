@@ -60,9 +60,30 @@ waiting — a rapid double-click, a script author writing against
 carry their originating `id`, so the recipient matches them
 correctly.  Introducing a queue would break `cancel`, which is
 exactly the action a user fires *while* another action is running.
+
+LOG MIRRORING FOR REMOTE COMMANDS
+=================================
+`pgkitRemoteHandleCommand`'s catch does not currently surface its
+failure anywhere the playground server can see.  A remote-driven
+action that throws browser-side produces a `command_result {ok:
+false}`, which the caller (`remote_cli` or `remote_panel`) sees as
+its own error; the playground's terminal shows nothing.  The catch
+therefore calls `reportPanelError` from `pgkit/panel_core.js`
+before building the failure reply, so a browser-side action failure
+that came in over `/remote` is visible in the terminal just like a
+locally-triggered failure is.
+
+The import is static: `pgkit/panel_core.js` is a leaf module (no
+imports of its own), so there is no cycle.  Its console-override
+side effects install before this module's boot IIFE opens the
+WebSocket, which is exactly the order we want — every subsequent
+`console.error` from anywhere in the page already reaches the
+server terminal.
 """
 
 REMOTE_CLIENT_JS = r"""
+import { reportPanelError } from "./panel_core.js";
+
 /* ==========================================================================
    REMOTE CLIENT — STATE
    ========================================================================== */
@@ -494,7 +515,15 @@ function pgkitRemoteApplyPatch(values) {
    `resetView` is not a global in any ES-module playground, so the
    guard was never true.  A playground that wants a reset action
    registers one via `pgkitRegisterAction`, and it is dispatched
-   through the registry like any other action. */
+   through the registry like any other action.
+
+   A failure inside the handler — thrown synchronously by a sync
+   action, or a rejected promise from an async one — is mirrored to
+   the server terminal via `reportPanelError` before the failure
+   reply is built.  Without this mirror, remote-driven action
+   failures (remote_cli, remote_panel, any other WS client) are
+   visible only to the client that fired them; the server's stdout
+   stays silent. */
 
 async function pgkitRemoteHandleCommand(msg) {
   let ok = true;
@@ -507,16 +536,36 @@ async function pgkitRemoteHandleCommand(msg) {
 
     if (entry && entry.isAction) {
       try { result = await entry.run(msg.payload || {}); }
-      catch (e) { ok = false; error = String(e); }
+      catch (e) {
+        ok = false;
+        error = String(e);
+        reportPanelError(
+          "remote command " + kind + ": " + error,
+          "js-remote-error",
+        );
+      }
     } else if (kind === "select") {
       const payload = msg.payload || {};
       if (_selectFn) {
         const selOk = await _selectFn(payload.level, payload.name);
-        if (!selOk) { ok = false; error = "select failed"; }
-        else { pgkitNotifyAll(); }
+        if (!selOk) {
+          ok = false;
+          error = "select failed";
+          reportPanelError(
+            "remote command select " + payload.level + "/" + payload.name
+              + ": handler returned false",
+            "js-remote-error",
+          );
+        } else {
+          pgkitNotifyAll();
+        }
       } else {
         ok = false;
         error = "no select handler";
+        reportPanelError(
+          "remote command select: no handler installed",
+          "js-remote-error",
+        );
       }
     } else if (kind === "deselect") {
       if (_deselectFn) await _deselectFn();
@@ -524,14 +573,29 @@ async function pgkitRemoteHandleCommand(msg) {
       pgkitNotifyAll();
     } else if (_extraCommandFn) {
       const handled = await _extraCommandFn(kind, msg.payload || {});
-      if (!handled) { ok = false; error = "unknown command"; }
+      if (!handled) {
+        ok = false;
+        error = "unknown command";
+        reportPanelError(
+          "remote command " + kind + ": unknown kind",
+          "js-remote-error",
+        );
+      }
     } else {
       ok = false;
       error = "unknown command";
+      reportPanelError(
+        "remote command " + kind + ": unknown kind",
+        "js-remote-error",
+      );
     }
   } catch (e) {
     ok = false;
     error = String(e);
+    reportPanelError(
+      "remote command handler threw: " + error,
+      "js-remote-error",
+    );
   }
 
   const reply = {

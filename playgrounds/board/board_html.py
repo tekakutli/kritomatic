@@ -12,7 +12,7 @@ BOOT MODULE — DEFENSIVE BY DESIGN
 dependency, and wraps each import and each wiring step in its own
 try/catch.  Consequences:
 
-    · A module failing to load produces exactly one console line —
+    · A module failing to load produces exactly one line
       `[boot] FAIL import <key> → <error>` — followed by
       `[boot] BOOT ABORTED: …`.  Without this, a failed static
       import aborts the whole module graph silently and the page
@@ -22,12 +22,35 @@ try/catch.  Consequences:
       `installPanelBindings()` (say) doesn't prevent `resize()`
       from running, and the console names the step.
 
-    · Everything logs with `console.log`, not `console.error`, so
-      no DevTools filter can hide the failure.
+    · Success messages log via `console.log`; FAILURES log via
+      `console.error`.  The distinction matters: `pgkit/panel_core.js`
+      overrides `console.error` to mirror every call to the server
+      terminal via `POST ./__log`, so a boot failure now reaches BOTH
+      DevTools AND the terminal process running the playground.
+      Success messages stay in DevTools only — no terminal noise.
 
     · The boot logs `[boot] BOOT COMPLETE` at the end; the absence
       of that line after reload is the fastest way to know the
       boot did not run to completion.
+
+IMPORT ORDER — panel_core FIRST
+===============================
+`pgkit/panel_core.js` is imported FIRST, before `core`, `fields`,
+`lists`, `view`, `scene`, `krita`, `scrubs`, `crops`, `grid`.
+That ordering is what installs the console override before any
+other module can throw during import.  Without it, a failure in
+`core` or `view` would fire before `panel_core` loaded, and the
+`console.error` inside `fail()` would go to DevTools only — the
+terminal would stay silent.
+
+`panel_core.js` is a leaf module (imports nothing of its own), so
+evaluating it first adds no load-order risk to anything else.
+
+If `panel_core` itself fails to import, the failure IS visible via
+the browser's native console (no override installed yet), via the
+`[boot] BOOT ABORTED` line that follows, and via the absence of
+`[boot] BOOT COMPLETE`.  Only the terminal mirror is lost in that
+specific case — an unavoidable limitation.
 
 BOOT WIRING
 ===========
@@ -100,8 +123,10 @@ _BOOT_JS = r"""
 //
 // Every dependency is loaded with `await import(path)` inside an
 // async IIFE.  Each import and each wiring step logs on its own
-// console line.  All logs use console.log so no DevTools filter can
-// hide them.  A module failure produces exactly one line:
+// console line.  Success messages use console.log; failures use
+// console.error, which pgkit/panel_core.js mirrors to the server
+// terminal through its console override.  A module failure produces
+// exactly one error line:
 //
 //     [boot] FAIL import <key> -> <error>
 //     [boot] BOOT ABORTED: <error>
@@ -109,17 +134,17 @@ _BOOT_JS = r"""
 // and no wiring steps run.  See board_html.py's module docstring for
 // the full map of which bug class is caught by which check.
 //
-// Import order: leaf modules first (pg_core, pg_panel_fields,
-// pg_panel_lists, pg_view_board, pg_scene), then pg_krita (which
-// cycles with pg_dispatch), then pg_panel_scrubs (side effects),
-// pg_crops (cycles with pg_dispatch and pg_panel_lists), pg_grid
-// (cycles with pg_dispatch, pg_crops, pg_view_board), pg_dispatch,
-// pg_panel_bindings, and finally the three pgkit modules.
+// Import order: panel_core FIRST so its console override installs
+// before any subsequent import can fail.  If a module below pc
+// throws during import, console.error inside fail() reaches the
+// server terminal via the override pc installed.
 
 (async () => {
   const log  = (...a) => console.log("[boot]", ...a);
-  const fail = (label, e) => log("FAIL", label, "\u2192",
-                                 (e && e.message) || e);
+  const fail = (label, e) => {
+    console.error("[boot]", "FAIL", label, "\u2192",
+                  (e && e.message) || e);
+  };
 
   log("starting");
 
@@ -148,6 +173,7 @@ _BOOT_JS = r"""
 
   try {
     const m = await importAll([
+      ["pc",       "./pgkit/panel_core.js"],   // FIRST: installs mirror
       ["core",     "./pg_core.js"],
       ["fields",   "./pg_panel_fields.js"],
       ["lists",    "./pg_panel_lists.js"],
@@ -161,7 +187,6 @@ _BOOT_JS = r"""
       ["bindings", "./pg_panel_bindings.js"],
       ["shell",    "./pgkit/shell.js"],
       ["rc",       "./pgkit/remote_client.js"],
-      ["pc",       "./pgkit/panel_core.js"],
     ]);
 
     // Wire kit's injectable slots.
@@ -191,9 +216,10 @@ _BOOT_JS = r"""
 
     log("BOOT COMPLETE");
   } catch (e) {
-    log("BOOT ABORTED:", (e && e.message) || e);
+    console.error("[boot]", "BOOT ABORTED:", (e && e.message) || e);
     if (e && e.stack) {
-      log("STACK:", e.stack.split("\n").slice(0, 4).join(" | "));
+      console.error("[boot]", "STACK:",
+                    e.stack.split("\n").slice(0, 4).join(" | "));
     }
   }
 })();

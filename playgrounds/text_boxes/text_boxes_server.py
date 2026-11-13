@@ -11,9 +11,29 @@ the routes dict it dispatches through.
     /krita/activate      { name }
     /krita/pick_files    {}                              native file picker
     /krita/open          { path, add_view }              open a .kra in Krita
+
+LOG FORMAT
+==========
+`_log(msg)` prints `[text_boxes] msg` with no timestamp.  Same shape
+as `[inpaint] ...`, `[multimask] ...`, `[segment] ...`,
+`[interceptor] ...`, `[board] ...`, and the
+`pgkit/server.py::_handle_log` output for `/__log` messages — one
+tagged-prefix convention across every playground, so a terminal
+running several side by side stays readable without a per-playground
+timestamp parser.  (`datetime` was previously used here for an
+`[HH:MM:SS]` prefix; it is now gone.)
+
+THE /log ROUTE
+==============
+Browser-side `reportError` in tbox_krita.py no longer posts here —
+it calls `console.error` and lets pgkit/panel_core.js's override
+route the message through `POST ./__log` (handled by
+`pgkit/server.py::_handle_log`).  This route is kept as a
+compatibility endpoint: any external caller that still POSTs `{tag,
+message}` gets a print in the standard `[text_boxes] js/{tag}: ...`
+format.  Nothing in the current tree reaches it.
 """
 
-import datetime
 import os
 import socket
 
@@ -21,8 +41,7 @@ from . import text_boxes_krita
 
 
 def _log(msg):
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] text_boxes: {msg}", flush=True)
+    print(f"[text_boxes] {msg}", flush=True)
 
 
 # ----------------------------------------------------------------------------
@@ -33,8 +52,7 @@ def _log(msg):
 def handle_log(payload):
     tag = payload.get("tag", "js")
     msg = payload.get("message", "")
-    ts  = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] js/{tag}: {msg}", flush=True)
+    print(f"[text_boxes] js/{tag}: {msg}", flush=True)
     return {"success": True}
 
 

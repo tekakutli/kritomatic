@@ -18,7 +18,7 @@ PANEL TITLE
 `_PANEL_TITLE` is the h3 content emitted by `page()`.  It carries:
 
     · the panel title text, wrapped in a `<span data-i18n="appTitleShort">`
-      so `installVerticalMenu`'s translation pass can set it from T()
+      so `installVerticalMenu`'s translation pass can set it from `T()`
     · the snap pill (`#snapPill`, its state text set by `updateSnapPill`)
     · the help button (`#helpBtn`), whose click handler is attached by
       `installInstructionsPopover`
@@ -32,9 +32,13 @@ BOOT MODULE — DEFENSIVE BY DESIGN
 dependency, and wraps each import and each wiring step in its own
 try/catch.  Same shape as board/pair/text_board/cone/boxes.
 
-The boot logs `[boot] BOOT COMPLETE` at the end; its absence is the
-fastest failure signal.  All logs go to `console.log`, not
-`console.error`, so DevTools filters cannot hide a failure.
+Success lines go to `console.log("[boot]", ...)`, mirrored by
+`pgkit/panel_core.js` as class "boot-ok".  Failures go to
+`console.error("[boot]", ...)`, mirrored as "boot-error".  The
+console override is installed by `pgkit/panel_core.js`, which is
+why `["pc", "./pgkit/panel_core.js"]` is the FIRST entry in
+`importAll` — before any other import whose failure we would
+otherwise have to see in DevTools only.
 
 FOUC IS FIXED AT THE SOURCE
 ===========================
@@ -140,8 +144,10 @@ _BOOT_JS = r"""
 //
 // Every dependency is loaded with `await import(path)` inside an
 // async IIFE.  Each import and each wiring step logs on its own
-// console line.  All logs use console.log so no DevTools filter can
-// hide them.  A module failure produces exactly one line:
+// console line.  Success lines go to console.log (mirrored by
+// pgkit/panel_core.js as "boot-ok"); failures go to console.error
+// (mirrored as "boot-error").  A module failure produces exactly one
+// line:
 //
 //     [boot] FAIL import <key> -> <error>
 //     [boot] BOOT ABORTED: <error>
@@ -149,10 +155,16 @@ _BOOT_JS = r"""
 // and no wiring steps run.  The panel's CSS and markup are baked in
 // pg_base; nothing is "reshaped" at boot, so there is no flash-of-
 // unstyled-content — the served page is the final page.
+//
+// ["pc", "./pgkit/panel_core.js"] is FIRST so the console override is
+// installed before any other import can fail — otherwise an early
+// import failure would fall through to DevTools only, with no
+// matching line in the server's stdout.
 
 (async () => {
   const log  = (...a) => console.log("[boot]", ...a);
-  const fail = (label, e) => log("FAIL", label, "\u2192",
+  const err  = (...a) => console.error("[boot]", ...a);
+  const fail = (label, e) => err("FAIL", label, "\u2192",
                                  (e && e.message) || e);
 
   log("starting");
@@ -182,6 +194,7 @@ _BOOT_JS = r"""
 
   try {
     const m = await importAll([
+      ["pc",             "./pgkit/panel_core.js"],
       ["i18n",           "./pg_i18n.js"],
       ["geom",           "./pg_geometry.js"],
       ["state",          "./pg_state.js"],
@@ -225,7 +238,6 @@ _BOOT_JS = r"""
       ["dispatch",       "./pg_dispatch.js"],
       ["shell",          "./pgkit/shell.js"],
       ["rc",             "./pgkit/remote_client.js"],
-      ["pc",             "./pgkit/panel_core.js"],
     ]);
 
     /* ---- translate the baked panel markup into the active language.
@@ -281,9 +293,9 @@ _BOOT_JS = r"""
         log("BOOT COMPLETE");
       });
   } catch (e) {
-    log("BOOT ABORTED:", (e && e.message) || e);
+    err("BOOT ABORTED:", (e && e.message) || e);
     if (e && e.stack) {
-      log("STACK:", e.stack.split("\n").slice(0, 4).join(" | "));
+      err("STACK:", e.stack.split("\n").slice(0, 4).join(" | "));
     }
   }
 })();

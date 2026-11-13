@@ -44,7 +44,27 @@ carries `visible: false`.  `rpRebuildFields` skips that null.
 
 HUB SHUTDOWN FLOW
 =================
-Unchanged; see `rpShutdownHub()` in `rp_client.py`.
+Unchanged from the previous revision.  The two failure paths in the
+"Shut down hub" button handler — hub not connected, and shutdown
+result not ok — route through `_mgmtStatusBad()`, which is defined
+below and mirrors each message to the terminal via console.error.
+
+_mgmtStatusBad — MIRRORING MODAL ERRORS TO THE TERMINAL
+======================================================
+The `#rpMgmtStatus` modal footer shows a one-line state of the
+shutdown flow: "waiting for hub acknowledgment…", "hub is shutting
+down…", and — for the two error paths — "hub not connected" and
+`result.error || "shutdown failed"`.  Because the footer is a
+persistent panel display (it does not auto-clear), the console
+mirror is the only durable record for a user watching the terminal.
+
+`_mgmtStatusBad(text)` does BOTH: writes to the footer as
+`rp-modal-status bad`, AND mirrors `text` via `console.error` so
+the inline script in remote_panel_html.py's `<head>` routes it to
+`POST ./__log`.  Every error path in the shutdown button uses it;
+non-error transitions ("waiting…", "hub is shutting down…") keep
+their inline writes because they are progress narration, not
+failures.
 """
 
 RP_UI_JS = r"""
@@ -361,7 +381,34 @@ function rpDownloadState() {
    When a group has no launcher (all standalone), the Stop button is
    omitted and no "Available to start" section is rendered for that
    group.  Kill and Force still work; they will only kill the one
-   standalone playground, since its group has exactly one member. */
+   standalone playground, since its group has exactly one member.
+
+   _mgmtStatusBad — MODAL ERROR MIRRORING
+   ======================================
+   `#rpMgmtStatus` is a persistent one-line footer in the modal.  It
+   does NOT auto-clear; the last state (warn, ok, or bad) stays until
+   the next transition.  Because persistence means the message is
+   also the durable record a terminal-watching user wants, the two
+   error transitions inside the shutdown-button handler route
+   through `_mgmtStatusBad()`: it writes the footer text and class
+   AND mirrors the message to `console.error`, which the inline
+   script in `remote_panel_html.py`'s `<head>` forwards to `POST
+   ./__log`.
+
+   The "waiting…" and "hub is shutting down…" transitions are
+   progress narration, not failures, and keep their inline writes.
+   This is deliberate — a failed shutdown, a lost hub connection, a
+   timeout — those are what should survive in the terminal; the
+   intermediate states are what the user reads in the modal. */
+
+function _mgmtStatusBad(text) {
+  const el = document.getElementById("rpMgmtStatus");
+  if (el) {
+    el.textContent = text;
+    el.className = "rp-modal-status bad";
+  }
+  try { console.error("[rp-mgmt]", text); } catch (_) {}
+}
 
 function rpOpenManagement() {
   const modal = document.getElementById("rpMgmtModal");
@@ -733,10 +780,7 @@ function rpRebuildManagementList() {
   if (mgmtShutdown) {
     mgmtShutdown.addEventListener("click", async () => {
       if (!_rp.hubConnected) {
-        if (mgmtStatus) {
-          mgmtStatus.textContent = "hub not connected";
-          mgmtStatus.className = "rp-modal-status bad";
-        }
+        _mgmtStatusBad("hub not connected");
         return;
       }
       if (!confirm(
@@ -765,10 +809,7 @@ function rpRebuildManagementList() {
           if (m) m.hidden = true;
         }, 1500);
       } else {
-        if (mgmtStatus) {
-          mgmtStatus.textContent = result.error || "shutdown failed";
-          mgmtStatus.className = "rp-modal-status bad";
-        }
+        _mgmtStatusBad(result.error || "shutdown failed");
         mgmtShutdown.disabled = false;
         mgmtShutdown.textContent = "Shut down hub";
       }

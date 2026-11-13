@@ -19,6 +19,25 @@ Krita" button is gone — `pg_autosync.js` pulls the current
 `@thecanvas` in automatically when the daemon's config points at
 one.
 
+PASTE ≠ PLAYGROUND UPDATE
+=========================
+After `/comfy/inpaint` succeeds, the server has already pasted the
+result into Krita (via `comfy_paste_image_b64`, un-rotated by
+`output_rotation`).  The inpaint playground does NOT pull that
+result back into its own canvas.  The playground's displayed image
+is whatever `@thecanvas` resolves to at any moment; that is the
+whole point of the autosync poller in `pg_autosync.js`.  Injecting
+the inpaint output would make the canvas show something `@thecanvas`
+does not point at.
+
+So `_inpaintAction`, after the server returns, only flashes a
+status line.  It never writes `board.originalImageEl`,
+`board.imageEl`, or `board.imageDataUrl`.  If the user wants to see
+the pasted result in the playground, they set `@thecanvas` to a
+spec that resolves to it (e.g. `source: "active"`); autosync then
+refreshes the canvas on the next spec change, exactly as for any
+other `@thecanvas` update.
+
 KRITA STATUS MIRRORING
 ======================
 `#kritaStatus` is a PERSISTENT panel element: a small "✓ reachable"
@@ -31,38 +50,25 @@ reason)` writes the ✗ form.  Because the ✗ state is exactly what a
 developer watching the terminal would want to see, `_kritaMarkUnreachable`
 ALSO mirrors `reason` to `console.error`, which pgkit/panel_core.js
 routes to `POST ./__log`.  The persistent DOM write is for at-a-glance
-panel reading; the terminal write is the durable record.  This is the
-only place in this file that bypasses `flashStatus` for an error,
-because it is the only place with a persistent DOM element designed
-to hold that error text.
+panel reading; the terminal write is the durable record.
 
 SHARED-PROMPT HYDRATION
 =======================
 `_hydrateSharedPrompt` pulls the daemon's shared-state prompt
 (`_active_config["params"]["prompt"]`, the same value the docker and
 web panel edit) into the playground's prompt field on boot, but only
-when the playground's own prompt is empty.  A non-empty prompt (typed
-value, remote-client patch, or prior session) wins.  See
-`inpaint_server.py`'s PROMPT RESOLUTION section for the full model.
+when the playground's own prompt is empty.
 
 SHARED-SELECTION HYDRATION
 ==========================
 `_hydrateSharedSelection` pulls the mask the daemon's config points
 at via `@theselection` into the playground's mask stack on boot, but
-only when the stack is empty.  Currently handles the `source: "layer"`
-shape — the one the daemon's panel configs use (see
-`data/comfy_panel/panel_configs/*.json`).  `source: "global"` would
-mean the live document selection, which no route in this playground
-exposes; `source: "active"` is not a natural source for `@theselection`
-and is treated the same.  Both cases are silently skipped.  One-shot:
-no retries, no polling, no overwriting of pre-existing masks.  See
-`inpaint_server.py`'s PROMPT RESOLUTION section for the analogous
-model on the prompt side.
+only when the stack is empty.
 """
 
 PANEL_BINDINGS_JS = r"""
 import { board, setImage, clearImage, _scheduleDraw,
-         view, _applyRotation, _rotateImage } from "./pg_state.js";
+         view, _rotateImage } from "./pg_state.js";
 import {
   setMasks, addMaskFromB64,
   selectedMask, selectedMaskIdx,
@@ -83,30 +89,6 @@ import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyAll,
 } from "./pgkit/remote_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
-
-/* ============================================================
-   Result-compositing tuning
-   ============================================================
-   Inset, in pixels, applied inward to the mask's rotated
-   rectangle when compositing the returned image over the
-   previous original.  Discards the returned image's antialiased
-   edge transition band, which would otherwise show through as a
-   hairline seam at the diamond boundary.
-
-   Tune up (5, 7) if the seam persists — the transition width
-   depends on PIL's rotate quality on the server plus Canvas's
-   imageSmoothingQuality on the client, and can vary.
-
-   Tune down (2, 1) if a strip of un-inpainted original becomes
-   visible at the boundary — unlikely, since the inpaint region
-   is normally well inside the diamond and the inset lives in
-   the band between the inpaint and the diamond edge where the
-   original and returned are visually identical.
-
-   Not applied at rotation 0: no diamond edge, no antialiased
-   transition, no reason to trim. */
-
-const SEAM_INSET_PX = 3;
 
 /* ============================================================
    File picking / drop
@@ -208,15 +190,7 @@ function _clearImageAction() {
    the image centre.  Every mask is drawn under the view's
    rotation transform, so the inverse rotation cancels on
    display and the mask lands on screen exactly where the
-   axis-aligned context rectangle appears.  Storing the plain
-   axis-aligned rect (as `buildContextMaskB64` does) would make
-   the mask appear rotated on screen, off-position relative to
-   the visible context rect.
-
-   Only meaningful when the rectangle is enabled: when
-   `inpaintEnabled === false`, there is no rectangle to convert.
-   The button is disabled in that state; the check below is the
-   belt-and-braces version. */
+   axis-aligned context rectangle appears. */
 
 function _maskFromRectAction() {
   if (!board.imageHash) {
@@ -259,9 +233,7 @@ function _maskFromRectAction() {
    Send the original, un-rotated image at (W × H), the full mask
    composited over black, and the context mask (full white when no
    context rectangle is set; the user's rect when it is).
-   `outputRotation = 0`.  This is the current Mode A behaviour, and
-   is what Mode B has always effectively done at rotation 0 (the
-   rotation math is an identity at theta = 0).
+   `outputRotation = 0`.
 
    Rotated (theta != 0)
    --------------------
@@ -271,36 +243,12 @@ function _maskFromRectAction() {
    extends beyond the base crop, in which case it expands
    symmetrically until the mask is covered.
 
-   Mode A (no context rect):
-     canvas    = rotated original, cropped to (cropW × cropH)
-     selection = rotated mask, cropped to (cropW × cropH)
-     context   = full white on (cropW × cropH)
-     outputRotation = -theta
-
-   Mode B (context rect):
-     canvas    = same
-     selection = rotated mask, cropped, intersected with the
-                 context rect at its shifted position
-     context   = user's rect on (cropW × cropH) at its shifted
-                 position
-     outputRotation = -theta
-
-   Both modes end up with the same `outputRotation`; the difference
-   is only how the context mask is built and whether the selection
-   is clipped by the context rect before being sent.
-
-   The context rect position in the expanded crop frame is
-   (cropW - W)/2 + c.x for x, same for y.  Derivation: base frame's
-   (c.x, c.y) is at (cropW - W)/2 + c.x in the expanded frame
-   because expansion shifts the frame's top-left by
-   ((cropW - W)/2, (cropH - H)/2) in the negative direction.
-
    `outputRotation = -view.rotation` tells the daemon to rotate the
-   result back before pasting.  The client center-crops the returned
-   (cropW × cropH) image back to (W × H) via `_setOriginalFromB64`
-   and applies `_buildKeepMask` on the (W × H) composite to mask
-   the non-content corners — same logic as before, just at the
-   expanded crop dims. */
+   result back before pasting.  The server passes that value
+   through to `comfy_paste_image_b64`, which runs
+   `QTransform().rotate(output_rotation)` to un-rotate, then
+   center-crops to the document's dims.  Result: the region lands
+   at the right position in Krita, un-rotated. */
 
 function _buildInpaintPayload(mask, maskBBoxOrig) {
   const W = board.imageWidth, H = board.imageHeight;
@@ -308,7 +256,6 @@ function _buildInpaintPayload(mask, maskBBoxOrig) {
   const theta = view.rotation;
 
   // ---- Un-rotated path: theta = 0 ----
-  // Same for both modes; only the context mask differs.
   if (!theta || theta % 360 === 0) {
     const canvasB64 = board.imageDataUrl.replace(
       /^data:image\/png;base64,/, "");
@@ -365,8 +312,6 @@ function _buildInpaintPayload(mask, maskBBoxOrig) {
   const cropX = Math.round((Wp - cropW) / 2);
   const cropY = Math.round((Hp - cropH) / 2);
 
-  // Canvas: rotate original to W' × H', crop to the (possibly
-  // expanded) region.
   const rotImg = _rotateImage(board.originalImageEl, theta);
   const canvasCv = document.createElement("canvas");
   canvasCv.width = cropW; canvasCv.height = cropH;
@@ -377,7 +322,6 @@ function _buildInpaintPayload(mask, maskBBoxOrig) {
   const canvasB64 = canvasCv.toDataURL("image/png").replace(
     /^data:image\/png;base64,/, "");
 
-  // Selection: rotated mask, cropped to the same expanded region.
   const maskBase = document.createElement("canvas");
   maskBase.width = W; maskBase.height = H;
   const mbx = maskBase.getContext("2d");
@@ -399,8 +343,6 @@ function _buildInpaintPayload(mask, maskBBoxOrig) {
 
   let contextB64;
   if (board.inpaintEnabled) {
-    // Mode B: intersect with user's context rect at its position in
-    // the expanded crop frame.
     const ctxInCropX = (cropW - W) / 2 + c.x;
     const ctxInCropY = (cropH - H) / 2 + c.y;
 
@@ -426,7 +368,6 @@ function _buildInpaintPayload(mask, maskBBoxOrig) {
     contextB64 = ctxCanvas.toDataURL("image/png").replace(
       /^data:image\/png;base64,/, "");
   } else {
-    // Mode A: whole crop frame is context.
     const ctxCanvas = document.createElement("canvas");
     ctxCanvas.width = cropW; ctxCanvas.height = cropH;
     const ccx = ctxCanvas.getContext("2d");
@@ -447,192 +388,8 @@ function _buildInpaintPayload(mask, maskBBoxOrig) {
 }
 
 /* ============================================================
-   Result compositing — see the module docstring for the full
-   rationale.  Two functions:
-
-     _buildKeepMask     geometry-only alpha mask of the returned
-                        image's content region (diamond at 45°,
-                        polygon for other angles, full frame at 0°),
-                        drawn at (cropW × cropH) dims so the expanded
-                        case produces a larger diamond, inset by
-                        SEAM_INSET_PX to discard the returned image's
-                        antialiased edge band.
-
-     _setOriginalFromB64 composites the returned image, masked to
-                        the keep region, over the previous original.
-                        Where the mask is transparent, the previous
-                        original shows through — recovering the
-                        corners that ComfyUI's LoadImage turned black.
-
-   `rotationDeg` is the display rotation that was live when the
-   payload was built.  It is not `view.rotation` at the moment the
-   response arrives; see "Rotation-capture timing" in the module
-   docstring. */
-
-function _buildKeepMask(W, H, rotationDeg, cropW, cropH) {
-  // Reproduce, as an alpha mask, the region of the returned image
-  // that has real content.  The returned image is the sent image
-  // un-rotated by the server; the sent image is the (cropW × cropH)
-  // crop of the rotated original.  Composing the two transforms, the
-  // content region of the returned (center-cropped back to W × H) is
-  // the (cropW × cropH) rect rotated by -rotationDeg around the centre,
-  // intersected with the (W × H) frame itself.
-  //
-  // Base case (cropW=cropH=W): the classic diamond.  Expanded case:
-  // a larger diamond that covers more of W × H, up to full white when
-  // the crop is big enough to include the whole rotated frame.
-  //
-  // Everything outside that region is black: ComfyUI's LoadImage reads
-  // the sent PNG's alpha as RGB, so the transparent corners the client
-  // produced are rendered black by the time SaveImage writes the
-  // result.
-  //
-  // `destination-in` uses the SOURCE'S ALPHA to multiply the
-  // destination's alpha.  The mask therefore MUST be transparent
-  // outside the content region, not black — an opaque black
-  // background would be a no-op (alpha 1 × alpha 1 = alpha 1) and the
-  // returned image's black corners would paint over the original
-  // unchanged.  The canvas is transparent by default; only the white
-  // rotated rect needs drawing.
-  //
-  // Seam inset: draw the white rect INSET by SEAM_INSET_PX on each
-  // side.  That discards the returned image's antialiased transition
-  // band (a few pixels of dark mixture-of-content-and-black along the
-  // content boundary, produced by PIL's rotate on the server and by
-  // drawImage's smoothQuality on the client).  Keeping those at full
-  // opacity in the composite produces a hairline seam.  Discarding
-  // them lets the original show through instead — invisible, because
-  // inside the content region the original and the returned image
-  // are essentially identical.
-  //
-  // Rotation 0: the rect IS the frame, there is no diamond edge and
-  // no antialiased transition to discard.  Any inset would just trim a
-  // strip of freshly-inpainted content from the canvas edges, so no
-  // inset is applied in that case.
-  const mask = document.createElement("canvas");
-  mask.width = W;
-  mask.height = H;
-  const mctx = mask.getContext("2d");
-  mctx.fillStyle = "#fff";
-  mctx.save();
-  mctx.translate(W / 2, H / 2);
-  mctx.rotate(-rotationDeg * Math.PI / 180);
-  mctx.translate(-W / 2, -H / 2);
-
-  const inset = (rotationDeg % 360 === 0) ? 0 : SEAM_INSET_PX;
-  mctx.fillRect(
-    W / 2 - cropW / 2 + inset,
-    H / 2 - cropH / 2 + inset,
-    cropW - 2 * inset,
-    cropH - 2 * inset,
-  );
-
-  mctx.restore();
-  return mask;
-}
-
-function _setOriginalFromB64(b64, rotationDeg) {
-  // `rotationDeg` is the display rotation that was active when this
-  // inpaint was submitted.  It determines the diamond-shaped content
-  // region of the returned image (see _buildKeepMask).  Passing it in
-  // rather than reading `view.rotation` here matters because the user
-  // can rotate the view during the 20–60 s wait for the server; the
-  // returned image was computed with the rotation that was live when
-  // the payload was sent, not whatever it is now.
-  const dataUrl = "data:image/png;base64," + b64;
-  const img = new Image();
-  img.onload = () => {
-    const W = board.originalWidth;
-    const H = board.originalHeight;
-    const srcW = img.naturalWidth;
-    const srcH = img.naturalHeight;
-
-    if (board.originalImageEl && W > 0 && H > 0
-        && srcW >= W && srcH >= H) {
-      // Unified path for both base (srcW === W) and expanded
-      // (srcW > W) inpaints:
-      //   1. draw original underneath
-      //   2. center-crop the returned image to (W × H) — for base
-      //      this is a no-op; for expanded this pulls out the
-      //      original content the wider crop captured
-      //   3. mask the center-crop to the content region implied by
-      //      the returned dims, then composite over the original
-      //
-      // Base case: center-crop is the whole returned image, mask is
-      // the base diamond, composite is exactly the previous
-      // behaviour.  Expanded case: center-crop discards the black
-      // margins, mask is a larger diamond that covers more of the
-      // non-inpainted content, composite replaces more but is
-      // visually identical there.
-      const composite = document.createElement("canvas");
-      composite.width = W;
-      composite.height = H;
-      const cctx = composite.getContext("2d");
-      cctx.imageSmoothingEnabled = true;
-      cctx.imageSmoothingQuality = "high";
-
-      // 1. Original underneath.
-      cctx.drawImage(board.originalImageEl, 0, 0, W, H);
-
-      // 2. Masked returned, center-cropped to (W × H).
-      const cropX = Math.round((srcW - W) / 2);
-      const cropY = Math.round((srcH - H) / 2);
-
-      const masked = document.createElement("canvas");
-      masked.width = W;
-      masked.height = H;
-      const mctx = masked.getContext("2d");
-      mctx.imageSmoothingEnabled = true;
-      mctx.imageSmoothingQuality = "high";
-      // Draw the returned image at the negative offset so its W × H
-      // center lands at (0, 0) of `masked`.
-      mctx.drawImage(img, -cropX, -cropY, srcW, srcH);
-      mctx.globalCompositeOperation = "destination-in";
-      mctx.drawImage(_buildKeepMask(W, H, rotationDeg, srcW, srcH), 0, 0);
-      mctx.globalCompositeOperation = "source-over";
-
-      // 3. Masked result on top.
-      cctx.drawImage(masked, 0, 0);
-
-      board.originalImageEl  = composite;
-      board.originalDataUrl  = composite.toDataURL("image/png");
-      board.imageEl          = composite;
-      board.imageDataUrl     = board.originalDataUrl;
-    } else {
-      // Fallback: no prior original, or the returned dims are smaller
-      // than W × H (unexpected).  Use the result as-is.
-      board.originalImageEl  = img;
-      board.originalWidth    = img.naturalWidth;
-      board.originalHeight   = img.naturalHeight;
-      board.originalDataUrl  = dataUrl;
-      board.imageEl          = img;
-      board.imageWidth       = img.naturalWidth;
-      board.imageHeight      = img.naturalHeight;
-      board.imageDataUrl     = dataUrl;
-    }
-
-    board.imageHash = "inpaint_" + Date.now();
-    _applyRotation(view.rotation);
-  };
-  img.src = dataUrl;
-}
-
-/* ============================================================
    Shared-prompt hydration
-   ============================================================
-   On boot, pull the daemon's shared-state prompt into the panel
-   if the playground has no prompt of its own.
-
-   This is a one-shot read, not a subscription.  The playground
-   prompt is a view of the shared-state prompt that the user can
-   override on a per-run basis; subscribing to changes would
-   silently clobber whatever the user is typing.  A user who
-   wants a fresh view can reload the page.
-
-   Two emptiness checks bracket the async fetch: one before, so
-   a prompt typed just before boot is not overwritten; one after,
-   so a prompt typed while the fetch is in flight is not
-   overwritten.  Both would otherwise be race conditions. */
+   ============================================================ */
 
 async function _hydrateSharedPrompt() {
   if (board.inpaintPrompt && board.inpaintPrompt.trim()) return;
@@ -651,23 +408,7 @@ async function _hydrateSharedPrompt() {
 
 /* ============================================================
    Shared-selection hydration
-   ============================================================
-   On boot, pull the mask the daemon's config points at via
-   `@theselection` into the playground's mask stack, but only
-   when the stack is empty.
-
-   Only fires when all of:
-     · board.masks is empty (never overwrite user work)
-     · config.resources["@theselection"] exists
-     · its source is "layer" — the only spec shape that maps
-       cleanly onto an importable layer mask.  "global" would
-       mean the live document selection, which no route in this
-       playground exposes; "active" is not a natural source for
-       @theselection and is treated the same (skip).
-
-   One-shot: no retries, no polling.  A failure (daemon down,
-   layer missing, no route) is silent — first boot hydration is
-   a "nice to have", not a hard requirement. */
+   ============================================================ */
 
 async function _hydrateSharedSelection() {
   if (board.masks.length > 0) return;
@@ -705,8 +446,6 @@ async function _hydrateSharedSelection() {
   }
   if (addedIndices.length === 0) return;
 
-  // Select the first imported mask so the "Select a mask to inpaint"
-  // gate is satisfied without a manual click.
   board.selectedMaskIndices = [addedIndices[0]];
 
   syncMaskList();
@@ -730,29 +469,14 @@ async function _inpaintAction() {
 
   const idx = selectedMaskIdx();
   if (idx < 0) { flashStatus("Select a mask to inpaint", "warn"); return; }
-  // Empty prompt is allowed: the server falls back to whatever the
-  // docker / web panel last set in the shared state, or to the
-  // workflow's default if neither has set one.  See
-  // `handle_inpaint`'s batch construction in `inpaint_server.py`.
 
   const mask = board.masks[idx];
   if (!mask || !mask.loaded) {
     flashStatus("Mask not loaded", "warn"); return;
   }
 
-  // Mask bbox in original-frame coords, used by `_buildInpaintPayload`
-  // to decide whether the crop needs to expand.  Cached on the mask
-  // entry, so this is O(1) after the first call for a given mask.
   const maskBBox = computeMaskBBox(idx);
-
-  // Doc-sized payloads plus the matching un-rotation the daemon
-  // needs before pasting — see _buildInpaintPayload above.
   const payload = _buildInpaintPayload(mask, maskBBox);
-  // Capture the rotation the payload was built with.  The returned
-  // image is un-rotated by exactly `-payload.outputRotation`, so its
-  // black corners correspond to that rotation.  A scrub during the
-  // 20–60 s poll must not desync the mask from the returned image.
-  const inpaintRotation = view.rotation;
 
   flashStatus("inpainting\u2026", "");
 
@@ -781,15 +505,23 @@ async function _inpaintAction() {
   }
   if (!result) return;
 
-  // Composite the result over the previous original, masked to the
-  // content region that rotation produced — see the module docstring
-  // and _setOriginalFromB64 for the full rationale.
-  _setOriginalFromB64(result.image_b64, inpaintRotation);
-
-  const statusCls = (result.paste_ok === false) ? "warn" : "ok";
-  const statusMsg = result.message
-    || ("inpainted in " + result.timing.toFixed(2) + "s");
-  flashStatus(statusMsg, statusCls);
+  // The server already pasted the result into Krita, un-rotated.
+  // Do NOT touch the playground canvas here: what the canvas shows
+  // is whatever `@thecanvas` resolves to, and `pg_autosync.js`
+  // refreshes it on `@thecanvas` spec changes.  Injecting the
+  // inpaint output would make the canvas show something `@thecanvas`
+  // does not point at.  The inpaint result is visible in Krita; the
+  // playground just reports what happened.
+  flashStatus(
+    result.paste_ok
+      ? ("inpainted + pasted to Krita: "
+         + (result.paste_layer_name || "new layer")
+         + " in " + result.timing.toFixed(2) + "s")
+      : ("inpainted in " + result.timing.toFixed(2) + "s, "
+         + "but Krita paste failed: "
+         + (result.paste_message || "unknown")),
+    result.paste_ok ? "ok" : "warn"
+  );
 
   syncPanelFields();
   pgkitNotifyAll();
@@ -846,19 +578,7 @@ async function _kritaStatusRefresh() {
 
 /* ============================================================
    Import masks from Krita
-   ============================================================
-   The `preferSelectionMaskChildren: true` flag tells the daemon:
-   for every image-bearing layer in the selection, do NOT read
-   its alpha channel; instead, expand it to its first
-   `selectionmask` child.  Image layers with no selectionmask
-   child are skipped entirely (no mask emitted for them).
-
-   Explicitly-selected mask layers (transparencymask,
-   selectionmask) still pass through unchanged, so selecting a
-   mask directly keeps working.
-
-   Multimask's identically-named button does not pass this flag,
-   so its behaviour (read image layers via alpha) is unchanged. */
+   ============================================================ */
 
 async function _kritaImportMasksAction() {
   flashStatus("importing masks from Krita\u2026", "");
@@ -1094,8 +814,6 @@ export function inpaintBootSync() {
   pgkitNotifyAll();
   _checkStatusAction();
   _kritaStatusRefresh();
-  // First-boot hydration: both are one-shot, no polling.  Serialized
-  // so their flashStatus() messages do not collide on a fresh load.
   (async () => {
     await _hydrateSharedPrompt();
     await _hydrateSharedSelection();

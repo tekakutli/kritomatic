@@ -97,6 +97,44 @@ correctly.
 The daemon never sees the prefix.  The web panel's localStorage-
 backed filter is independent of this docker's; the two clients can
 filter by different prefixes at the same time without interfering.
+
+Startup workflow autoload
+=========================
+The docker remembers the last-loaded workflow's *slug* in `QSettings`
+under the key `last_workflow`.  `_remember_workflow` is called from
+`_on_state` on every transition to a non-empty `workflow` field — that
+state push is the authoritative "a workflow just got loaded" signal,
+and it fires for every load path (the Load button, a picker change,
+the CLI's `comfy_load`, another client's load).
+
+On the next docker launch, `_maybe_autoload_remembered_workflow` (called
+once from `_on_panel`) does the reverse: if the daemon reports *no*
+active workflow and the remembered slug still appears in the workflow
+picker's option list, it enqueues one `comfy_load`.  The daemon's
+normal autoload of `panel_configs/<slug>.json` then restores the
+user's resources / params / crop / paste alongside the workflow.
+
+Why the decision happens in `_on_panel`, not `_on_conn_state`:
+the picker's option list lives in the panel description, not in
+`comfy_status`.  `_on_state` tells us whether a workflow is loaded
+(authoritative), but only the panel tells us which workflows can be
+loaded.  Deferring the trigger to `_on_panel` gets both signals from
+one place.
+
+Failure modes:
+  * Daemon already has a workflow at startup — nothing fires (the
+    `_description_workflow_name` check).  If it happens to match the
+    remembered slug, nothing needs to happen; if it's a different
+    one (CLI load, another client), the daemon's choice wins — the
+    user explicitly loaded it.
+  * Remembered slug no longer exists in the workflows directory —
+    warn and skip; no phantom load error on the daemon.
+  * Workflows directory empty (a freshly cloned repo before any
+    workflow is dropped in) — silently skip.
+
+Runs at most once per docker lifetime via `_startup_autoload_done`.
+Clearing `QSettings`'s `last_workflow` (or removing the workflows
+directory entry) is how a user opts out.
 """
 
 from __future__ import annotations
@@ -139,6 +177,11 @@ class KritomaticPanel(QDockWidget):
         self._param_prefix_filter: str = ""
         self._current_workflow: str = ""
         self._settings = QSettings("kritomatic", "panel")
+
+        # Startup workflow autoload state.  See the module docstring,
+        # "Startup workflow autoload".
+        self._startup_autoload_done = False
+        self._remembered_workflow: str = self._load_remembered_workflow()
 
         self._pending_apply_timer = QTimer(self)
         self._pending_apply_timer.setSingleShot(True)
@@ -255,6 +298,171 @@ class KritomaticPanel(QDockWidget):
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    #  Startup workflow autoload — persistence
+    # ------------------------------------------------------------------
+
+    def _load_remembered_workflow(self) -> str:
+        """Read the last-loaded workflow's slug from QSettings.
+
+        Returns "" when nothing has been saved yet (first-ever docker
+        launch, or QSettings was cleared by the user).  Errors on
+        read are treated the same as "not remembered" rather than
+        surfacing up to the caller; an unreadable QSettings file
+        should not break the docker.
+        """
+        try:
+            return str(self._settings.value(
+                "last_workflow", "", type=str,
+            ) or "")
+        except Exception:
+            return ""
+
+    def _remember_workflow(self, workflow: str) -> None:
+        """Persist `workflow` as the user's most recent load.
+
+        Called from `_on_state` on every transition to a non-empty
+        `workflow` field.  The daemon's `workflow` field is the
+        authoritative signal — it updates only after a `comfy_load`
+        has succeeded — and it fires for every load path (Load
+        button, picker change, CLI, another client).  That makes
+        this the one place we need to hook to keep QSettings in
+        step with the daemon.
+
+        No-ops when `workflow` is empty or unchanged from what was
+        already remembered, so repeated state pushes for the same
+        workflow do not churn the settings file.
+        """
+        if not workflow:
+            return
+        if workflow == self._remembered_workflow:
+            return
+        self._remembered_workflow = workflow
+        try:
+            self._settings.setValue("last_workflow", workflow)
+        except Exception:
+            pass
+
+    def _description_workflow_name(self, description: dict) -> str:
+        """Return the currently-loaded workflow name from a panel
+        description, or "" if none is loaded.
+
+        The daemon's `WorkflowMetadataProvider` emits a section with
+        `id == "workflow"` and a `label == "Workflow"` field carrying
+        the name — but only when a workflow is loaded.  Its absence is
+        therefore the authoritative "no workflow loaded" signal from
+        the panel description, parallel to `_workflow_loaded` from the
+        state push.  Used by `_maybe_autoload_remembered_workflow` so
+        the decision can be made from a single input source (the panel
+        description) rather than depending on state-before-panel
+        ordering at startup.
+        """
+        for s in description.get("sections") or []:
+            if not isinstance(s, dict):
+                continue
+            if s.get("id") != "workflow":
+                continue
+            for f in s.get("fields") or []:
+                if isinstance(f, dict) and f.get("label") == "Workflow":
+                    return str(f.get("value") or "")
+        return ""
+
+    @staticmethod
+    def _available_workflow_slugs(description: dict) -> list:
+        """Return the workflow slugs the picker is offering, or [].
+
+        `WorkflowPickerProvider` emits one `workflow-name` field inside
+        the `workflow-picker` section; when there are any workflows in
+        the directory, it is a `select` whose `options` list is the
+        available slugs.  When the directory is empty, it degrades to
+        a `text` field with no `options` key, so this returns [].
+        """
+        for s in description.get("sections") or []:
+            if not isinstance(s, dict):
+                continue
+            if s.get("id") != "workflow-picker":
+                continue
+            for f in s.get("fields") or []:
+                if isinstance(f, dict) and f.get("key") == "workflow-name":
+                    return list(f.get("options") or [])
+        return []
+
+    def _maybe_autoload_remembered_workflow(self, description) -> None:
+        """Auto-load the remembered workflow, once per docker lifetime.
+
+        Fired from `_on_panel` on the first panel description the
+        daemon pushes.  Conditions to fire:
+
+          * `_startup_autoload_done` is False (first call);
+          * a remembered workflow exists in QSettings;
+          * the panel description shows no workflow currently loaded
+            (via `_description_workflow_name`);
+          * the picker is offering at least one slug;
+          * the remembered slug is among the offered options.
+
+        On a hit, enqueues one `comfy_load` for the remembered slug
+        on the command socket.  The daemon's own `panel_configs/<slug>`
+        autoload then restores resources / params / crop / paste
+        alongside the workflow, so the panel comes up fully primed.
+
+        Runs at most once per docker lifetime; `_startup_autoload_done`
+        is set before any of the conditions are tested so a transient
+        condition (say, remembered slug temporarily missing during a
+        directory scan) does not spuriously succeed on a later panel
+        push — the user can always click Load manually.
+        """
+        if self._startup_autoload_done:
+            return
+        self._startup_autoload_done = True
+
+        if not isinstance(description, dict):
+            return
+        if not self._remembered_workflow:
+            return
+
+        # Daemon already has a workflow loaded — leave it alone.
+        # Whether it matches the remembered slug or not, the daemon's
+        # current choice is what the user asked for last time (or
+        # what another client just loaded).  Overriding it would be
+        # surprising.
+        if self._description_workflow_name(description):
+            return
+
+        available = self._available_workflow_slugs(description)
+        if not available:
+            # No workflows in the directory at all — nothing to load.
+            # Fresh clone with no workflows dropped in yet, or the
+            # workflows dir was cleaned out.  Silent skip; the user
+            # sees the empty picker and its "no workflows" hint.
+            return
+
+        if self._remembered_workflow not in available:
+            self._append_log(
+                "warn",
+                f"Auto-load skipped: remembered workflow "
+                f"{self._remembered_workflow!r} no longer exists in "
+                f"the workflows directory.",
+            )
+            return
+
+        command = {
+            "type": "comfy_load",
+            "name": self._remembered_workflow,
+        }
+        request_id = f"autoload-{int(time.time() * 1000)}"
+        self._conn.enqueue(
+            request_id, {"id": request_id, "commands": [command]},
+        )
+        self._append_log(
+            "hdr",
+            f"Auto-loading remembered workflow "
+            f"{self._remembered_workflow!r}\u2026",
+        )
+
+    # ------------------------------------------------------------------
+    #  Event handlers
+    # ------------------------------------------------------------------
+
     def _on_conn_state(self, connected: bool) -> None:
         if connected:
             self._status.setText("Connected to daemon.")
@@ -278,6 +486,14 @@ class KritomaticPanel(QDockWidget):
             self._current_workflow = new_workflow
             if new_workflow != old_workflow:
                 self._restore_param_filter_for_workflow(new_workflow)
+                if new_workflow:
+                    # The daemon reports this workflow loaded — that's
+                    # the user's most recent choice, regardless of the
+                    # path that got it there (Load button, picker
+                    # change, CLI).  Persist for the next docker
+                    # startup's auto-load.  See the module docstring,
+                    # "Startup workflow autoload".
+                    self._remember_workflow(new_workflow)
         except Exception:
             pass
         self._update_run_buttons()
@@ -364,6 +580,14 @@ class KritomaticPanel(QDockWidget):
         if structure_changed and self._workflow_loaded:
             self._apply_config_from_widgets("auto_load")
 
+        # Startup autoload — fire once per session, on the first panel
+        # description.  Uses the panel description (not state) as its
+        # input so the decision depends on a single, ordered source of
+        # truth: the picker's available-slug list and the presence of a
+        # `workflow` metadata section.  See the module docstring,
+        # "Startup workflow autoload".
+        self._maybe_autoload_remembered_workflow(description)
+
     def _on_layers_changed(self) -> None:
         self._conn.request_layers()
 
@@ -439,6 +663,37 @@ class KritomaticPanel(QDockWidget):
             else:
                 msg = summary.get("message", "")
                 self._append_log("err", f"Load failed: {msg}")
+            return
+
+        if request_id.startswith("autoload-"):
+            # Autoload's response body is a batch_complete whose
+            # top-level message is empty; the actual daemon message
+            # lives on the single command's result entry.  Pull it
+            # from there so the log shows the load's own message
+            # ("Loaded workflow 'X' (N nodes) ...") rather than an
+            # empty string.  Fall back to the batch-level fields for
+            # the connection-failed shape, and finally to a generic
+            # "unknown error" — all three are better than a blank
+            # line after "Auto-load failed: ".
+            results = summary.get("results", []) or []
+            detail = ""
+            if results and isinstance(results[0], dict):
+                detail = results[0].get("message", "") or ""
+            if not detail:
+                detail = (summary.get("message")
+                          or summary.get("error")
+                          or "")
+            if ok:
+                self._append_log(
+                    "ok",
+                    "Auto-loaded: "
+                    + (detail or repr(self._remembered_workflow)),
+                )
+            else:
+                self._append_log(
+                    "err",
+                    "Auto-load failed: " + (detail or "unknown error"),
+                )
             return
 
         if request_id != self._active_run_request_id:

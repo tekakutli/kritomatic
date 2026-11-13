@@ -855,6 +855,74 @@ class GenerationCommands(AutoDispatchHandler):
             blend_mode=blend_mode,
         )
 
+    @command(
+        category="comfyui",
+        help_text="Paste a base64-encoded PNG into the active document as "
+                  "a new paint layer.  When --rotation is nonzero, the "
+                  "image is rotated about its center via "
+                  "QTransform().rotate(rotation) and center-cropped to "
+                  "the document's dimensions before being written.  This "
+                  "is the paste step for external submissions (e.g. the "
+                  "inpaint playground's option-2 pipeline), which bypass "
+                  "the daemon's own comfy_generate and so need a "
+                  "standalone way to get their result into Krita.",
+        args={
+            "--name":       {"type": "str",   "default": ""},
+            "--image_b64":  {"type": "str",   "required": True},
+            "--x":          {"type": "int",   "default": 0},
+            "--y":          {"type": "int",   "default": 0},
+            "--rotation":   {"type": "float", "default": 0.0},
+            "--blend_mode": {"type": "str",   "default": "normal"},
+        },
+    )
+    def comfy_paste_image_b64(self, params):
+        import base64 as _b64
+        import time as _time
+        from krita import Krita
+        from ..utils.comfyui_krita import paste_image
+
+        name = (params.get("name") or "").strip()
+        image_b64 = params.get("image_b64") or ""
+        if not image_b64:
+            return {"success": False, "message": "image_b64 is required"}
+
+        try:
+            x = int(params.get("x", 0))
+            y = int(params.get("y", 0))
+            rotation = float(params.get("rotation", 0.0))
+        except (TypeError, ValueError) as e:
+            return {"success": False, "message": f"bad numeric arg: {e}"}
+
+        blend_mode = params.get("blend_mode") or "normal"
+
+        try:
+            png = _b64.b64decode(image_b64)
+        except Exception as e:
+            return {"success": False, "message": f"bad base64: {e}"}
+
+        doc = Krita.instance().activeDocument()
+        if doc is None:
+            return {"success": False, "message": "No active document"}
+
+        if not name:
+            name = f"[Inpaint] {int(_time.time()) & 0xFFFFFF:06x}"
+
+        try:
+            node = paste_image(
+                doc, png, x, y, name,
+                blend_mode=blend_mode,
+                make_active=True,
+                rotation=rotation,
+            )
+        except Exception as e:
+            return {"success": False, "message": f"paste failed: {e}"}
+
+        return {
+            "success": True,
+            "message": f"Pasted {node.name()}",
+            "data": {"layer_name": node.name()},
+        }
+
     # ------------------------------------------------------------------
     #  comfy_history
     # ------------------------------------------------------------------

@@ -40,6 +40,63 @@ so its converter inherits the frontend's serialization semantics,
 including virtual-node stripping. It is the authoritative UI→API
 conversion outside the browser.
 
+CORRECTION PASSES
+=================
+`comfy-cli run --workflow <path> --print-prompt` maps
+`widgets_values` POSITIONALLY against the current node schema.  When
+a node's widget schema has changed since the workflow was authored
+— a widget added, removed, or reordered — every value after the
+change point lands in the wrong input slot.  The classic symptom is
+a stale string value dropped into a newly-introduced INT field, so
+ComfyUI rejects the prompt at validation time with "Failed to
+convert an input value to a INT value: <field>, <value>".
+
+Two correction passes run against comfy-cli's output before
+annotation:
+
+  1. `_apply_ui_widget_overrides` — for each API node, prefer the
+     UI workflow's `widgets_values_named` map (keyed by input name,
+     immune to positional drift) over `comfy-cli`'s positional
+     assignment.  Fields absent from the named map are left as
+     comfy-cli produced them.
+
+  2. `_apply_schema_validation` — fetch ComfyUI's `/object_info`
+     and replace any remaining *type*-mismatched widget value with
+     the schema's default.  Catches the case (1) cannot: an input
+     that did not exist when the workflow was authored, and so is
+     absent from `widgets_values_named`, but now has a stale
+     positionally-mapped value in the API output.
+
+Pass (2) fixes type mismatches only.  It deliberately does NOT
+replace COMBO values whose scalar choice is not present in the
+choices list.  Two important classes live there:
+
+  · `@`-prefixed daemon resource markers (`@thecanvas`,
+    `@theselection`, `@thecontext`).  `comfy-cli` preserves the
+    string verbatim; the daemon's `prepare_workflow` substitutes a
+    `core/ASSET` reference before ComfyUI sees it.  Replacing these
+    with the schema default would hide them from the daemon's
+    resource-slot extraction, leaving the workflow with no assets
+    and the docker with no Resources section.
+
+  · Model or filename values that were selected when the workflow
+    was authored but are not installed on the current ComfyUI.  The
+    user selected those values; silently replacing them with a
+    different installed file would produce a run the user did not
+    ask for.  ComfyUI's own prompt validation reports missing
+    choices with a clear error at submit time.
+
+The converter's job is to not corrupt what `comfy-cli` produced, not
+to be a validator.  Type-level repair is safe and clearly bounded;
+choice-level repair is not.
+
+Pass (2) is best-effort: `url` must be reachable for the
+`/object_info` fetch to succeed.  When it isn't, the conversion
+completes with a warning and pass (1)'s corrections only;
+re-converting with ComfyUI running applies (2).  Bumping
+`CONVERTER_VERSION` invalidates every cached conversion, so
+existing sidecars do not mask this fix.
+
 Two callers, two shapes of the output graph
 ===========================================
 `convert_workflow` writes the API graph in one of two forms, chosen
@@ -103,16 +160,19 @@ candidate, and accepts the first one that either *is* an API graph
 common wrapper key. This is robust against the shape changing between
 releases, and it never mistakes a warning blob for the graph.
 
+The `--url` parameter on `convert_workflow` / `convert_if_ui` is
+used by the schema-validation pass to fetch `/object_info`.
+Passing `url=""` disables it explicitly; otherwise an unreachable
+server is a soft failure (logged, conversion proceeds without
+schema validation).
+
 Requirements:
   * comfy-cli in the repo venv:
         <repo>/.venv/bin/pip install comfy-cli
-  * A running ComfyUI server is NOT required for the conversion itself.
-    `--print-prompt` exits after printing; it does not submit anything.
-
-The `--url` parameter on `convert_workflow` / `convert_if_ui` is
-currently unused by the comfy-cli path. It is retained on the signature
-so existing callers do not break; the conversion is a pure data
-transformation and needs no server address.
+  * A running ComfyUI server is NOT required for the conversion
+    itself.  `--print-prompt` exits after printing; it does not
+    submit anything.  Only the schema-validation pass queries
+    ComfyUI, and it degrades gracefully when ComfyUI is down.
 """
 
 from __future__ import annotations
@@ -120,7 +180,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
+import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -486,6 +550,284 @@ def is_ui_format(workflow: object) -> bool:
 
 
 # ============================================================================
+#  Correction passes
+# ============================================================================
+
+def _warn(msg: str) -> None:
+    """Emit a non-fatal warning to stderr."""
+    print(f"[convert] warning: {msg}", file=sys.stderr)
+
+
+def _is_edge(value) -> bool:
+    """True iff `value` looks like a ComfyUI prompt-format edge.
+
+    Shape: two-element list, first element is a string (node id),
+    second is an int (output slot).  `bool` is excluded because
+    `isinstance(True, int)` is True in Python, and a two-element
+    list of a str and a bool is never a real edge.
+
+    Literal values — ints, floats, strings, bools, longer lists,
+    nested lists — return False.
+    """
+    return (
+        isinstance(value, list)
+        and len(value) == 2
+        and isinstance(value[0], str)
+        and isinstance(value[1], int)
+        and not isinstance(value[1], bool)
+    )
+
+
+def _collect_ui_nodes(ui_workflow: dict) -> dict:
+    """Flat {api_node_id: ui_node_dict} covering top-level and one
+    level of subgraph-internal nodes.
+
+    The API graph keys nodes by `"<id>"` for top-level nodes and
+    `"<subgraph_id>:<inner_id>"` for nodes inside a subgraph.  This
+    map mirrors that so a single lookup handles both.
+
+    Nested subgraphs (subgraph within subgraph) are not covered.
+    Extend the `definitions.subgraphs[*].definitions.subgraphs`
+    recursion if a future workflow needs them; the outer pass's
+    name-override still works for top-level and single-level
+    subgraph nodes, and schema validation catches type mismatches
+    everywhere regardless.
+    """
+    out: dict = {}
+    for node in ui_workflow.get("nodes", []) or []:
+        nid = node.get("id")
+        if nid is None:
+            continue
+        out[str(nid)] = node
+
+    subgraphs = (
+        (ui_workflow.get("definitions") or {}).get("subgraphs") or []
+    )
+    for sg in subgraphs:
+        sg_id = sg.get("id")
+        if not sg_id:
+            continue
+        for node in sg.get("nodes", []) or []:
+            nid = node.get("id")
+            if nid is None:
+                continue
+            out[f"{sg_id}:{nid}"] = node
+
+    return out
+
+
+def _apply_ui_widget_overrides(api_graph: dict, ui_nodes: dict) -> None:
+    """Overwrite non-edge inputs from `widgets_values_named`.
+
+    `comfy-cli` maps `widgets_values` positionally.  When a node's
+    widget schema has changed since the workflow was authored, the
+    positional mapping lands values in the wrong slots.  The UI
+    workflow's `widgets_values_named` map is keyed by input name
+    and so is immune to positional drift; it is authoritative for
+    every field it contains.
+
+    Only fields already present in the API node are overridden.
+    Fields absent from the API node are left alone: either they
+    don't exist in the current schema (re-adding them would fail
+    ComfyUI validation), or `comfy-cli` dropped them for a reason
+    the converter can't see.  The schema-validation pass fills in
+    missing defaults for fields that *should* be present.
+    """
+    for api_nid, api_node in api_graph.items():
+        if not isinstance(api_node, dict):
+            continue
+        ui_node = ui_nodes.get(str(api_nid))
+        if ui_node is None:
+            continue
+        named = ui_node.get("widgets_values_named")
+        if not isinstance(named, dict):
+            continue
+        inputs = api_node.get("inputs") or {}
+        for field, value in named.items():
+            if field not in inputs:
+                continue
+            if _is_edge(inputs[field]):
+                continue
+            inputs[field] = value
+        api_node["inputs"] = inputs
+
+
+def _fetch_object_info(url: str, timeout: float = 5.0) -> Optional[dict]:
+    """GET ComfyUI's `/object_info`.  None on any failure."""
+    if not url:
+        return None
+    try:
+        req = urllib.request.Request(
+            url.rstrip("/") + "/object_info", method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except (urllib.error.URLError, socket.timeout, OSError, ValueError):
+        return None
+
+
+def _schema_default(field):
+    """Extract the default value from one `/object_info` field entry.
+
+    Mirrors `_schema_default` in
+    `kritomatic_daemon/utils/comfyui_tooling.py` but kept separate
+    because the two modules sit on opposite sides of the sys.path
+    bootstrap and share no import path.
+
+    Returns None when no default can be inferred.  The caller treats
+    None as "cannot recover; leave the value alone" rather than
+    guessing.
+    """
+    if not isinstance(field, list) or not field:
+        return None
+
+    field_type = field[0]
+    options = (
+        field[1]
+        if len(field) > 1 and isinstance(field[1], dict)
+        else {}
+    )
+
+    if "default" in options:
+        return options["default"]
+
+    # Legacy combo: the type slot is itself a list of allowed values.
+    if isinstance(field_type, list) and field_type:
+        return field_type[0]
+
+    if field_type == "INT":
+        return 0
+    if field_type == "FLOAT":
+        return 0.0
+    if field_type == "STRING":
+        return ""
+    if field_type == "BOOLEAN":
+        return False
+    if field_type == "COMBO":
+        choices = options.get("options") or options.get("choices")
+        if isinstance(choices, list) and choices:
+            return choices[0]
+
+    return None
+
+
+def _matches_schema(value, field) -> bool:
+    """True iff `value` is a type-valid widget value for `field`.
+
+    Checks the *type* of the value, not choice-list membership.
+    Choice membership is deliberately not checked; see the module
+    docstring's CORRECTION PASSES section for why.
+
+    In short: a scalar value in a COMBO field may be a daemon-managed
+    `@`-resource marker or a model/filename the user selected but
+    that isn't installed locally.  Replacing either silently would
+    hide a real problem; ComfyUI's own prompt validation reports both
+    clearly at submit time.  Type mismatches — a STRING in an INT
+    field, a float in a BOOLEAN field, a list where a scalar is
+    expected — are unambiguously wrong and safe to replace with the
+    schema default.
+
+    Range (min/max) is not checked: an out-of-range INT is ComfyUI's
+    problem to clamp, and clamping it here would override a
+    deliberate user setting.
+    """
+    if not isinstance(field, list) or not field:
+        return True
+
+    field_type = field[0]
+
+    # Both legacy (list-of-choices) and newer ("COMBO") combo
+    # encodings.  Scalar values pass; containers and None do not.
+    if isinstance(field_type, list) or field_type == "COMBO":
+        return not isinstance(value, (list, dict, type(None)))
+
+    if field_type == "INT":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if field_type == "FLOAT":
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        )
+    if field_type == "STRING":
+        return isinstance(value, str)
+    if field_type == "BOOLEAN":
+        return isinstance(value, bool)
+
+    # Unknown type: be permissive.
+    return True
+
+
+def _apply_schema_validation(api_graph: dict,
+                             object_info: dict) -> None:
+    """Replace widget values that don't match their schema type.
+
+    For each non-edge input:
+
+      · If the value matches the schema type (and is not a
+        `@`-prefixed daemon resource marker), leave it alone.
+      · Otherwise replace it with the schema's default.  This is
+        what fixes the `crop_padding = "http://..."` class of bug:
+        the value is a stale widget mapped positionally into a slot
+        whose type changed.  The schema default is always valid; a
+        genuine user value of the wrong type was never going to
+        execute.
+
+    Missing inputs are left alone: ComfyUI fills them from schema
+    defaults for optional widgets, or rejects the prompt for
+    required ones.  Inventing values for absent fields is outside
+    the converter's remit.
+
+    Inputs whose schema default cannot be inferred (a required
+    field with no default and no choice list) are left alone;
+    ComfyUI's own validation error names them more usefully than
+    guessing here would.
+    """
+    for api_node in api_graph.values():
+        if not isinstance(api_node, dict):
+            continue
+        cls = api_node.get("class_type")
+        if not isinstance(cls, str) or not cls:
+            continue
+        spec = object_info.get(cls)
+        if not isinstance(spec, dict):
+            continue
+        inputs_spec = spec.get("input") or {}
+        all_fields: dict = {}
+        for category in ("required", "optional"):
+            fields = inputs_spec.get(category) or {}
+            if isinstance(fields, dict):
+                all_fields.update(fields)
+
+        inputs = api_node.get("inputs") or {}
+        for name, field in all_fields.items():
+            if name not in inputs:
+                continue
+            value = inputs[name]
+            if _is_edge(value):
+                continue
+            # Daemon-managed resource markers.  Never replace, in
+            # either COMBO or STRING slots; `prepare_workflow`
+            # substitutes them before ComfyUI sees them.
+            if isinstance(value, str) and value.startswith("@"):
+                continue
+            if _matches_schema(value, field):
+                continue
+            default = _schema_default(field)
+            if default is None:
+                continue
+            _warn(
+                f"{cls}.{name}: value {value!r} "
+                f"(type {type(value).__name__}) does not match "
+                f"schema type {field[0]!r}; replaced with schema "
+                f"default {default!r}.  Fix the source workflow's "
+                f"widget values or re-save it in ComfyUI to silence "
+                f"this warning."
+            )
+            inputs[name] = default
+        api_node["inputs"] = inputs
+
+
+# ============================================================================
 #  Handle annotation
 # ============================================================================
 
@@ -554,7 +896,7 @@ def annotate_handles(api: dict,
             hid = _make_handle_id(node_id, node, field, scheme)
             if hid in seen:
                 raise ConversionError(
-                    f"handle id collision \u2014 {hid!r} is claimed by both "
+                    f"handle id collision — {hid!r} is claimed by both "
                     f"node {seen[hid]} and node {node_id}. "
                     f"Try --id-scheme auto."
                 )
@@ -599,10 +941,26 @@ def convert_workflow(source_path: Path,
     """Read a UI-format workflow, convert it, optionally annotate
     handles, save.
 
-    The `url` parameter is accepted for backward compatibility with
-    callers that pass it (the CLI still exposes `--url`), but it is
-    not used: comfy-cli's `--print-prompt` conversion is a pure data
-    transformation and needs no server address.
+    The conversion is `comfy-cli run --workflow <path> --print-prompt`,
+    which is authoritative for UI→API translation.  Two correction
+    passes then run against its output before annotation:
+
+      · `_apply_ui_widget_overrides` — prefers the UI workflow's
+        `widgets_values_named` map (authoritative, keyed by input
+        name) over `comfy-cli`'s positional mapping.  Fixes nodes
+        whose widget schema has shifted since the workflow was
+        authored.
+
+      · `_apply_schema_validation` — fetches ComfyUI's
+        `/object_info` and replaces any remaining *type*-mismatched
+        widget value with the schema default.  Best-effort: skipped
+        (with a warning) if ComfyUI is unreachable at conversion
+        time.
+
+    `url` is used only for the `/object_info` fetch.  Pass `url=""`
+    to skip schema validation explicitly; otherwise an unreachable
+    server is a soft failure and the conversion proceeds with
+    pass (1)'s corrections only.
 
     `source_path` must exist and be UI-format JSON. `output_path` is
     where the converted file is written; its directory is created if
@@ -636,6 +994,23 @@ def convert_workflow(source_path: Path,
         )
 
     api = _run_comfy_print_prompt(source_path)
+
+    ui_nodes = _collect_ui_nodes(workflow)
+    _apply_ui_widget_overrides(api, ui_nodes)
+
+    object_info = _fetch_object_info(url) if url else None
+    if object_info is not None:
+        _apply_schema_validation(api, object_info)
+    else:
+        _warn(
+            f"could not reach ComfyUI at {url!r} for schema "
+            f"validation; the converted graph may still contain "
+            f"stale widget values for nodes whose widget schema "
+            f"has changed since the workflow was authored.  Start "
+            f"ComfyUI and re-run `kritomatic comfyui convert` to "
+            f"fix."
+        )
+
     records: list[dict] = []
     if annotate:
         api, records = annotate_handles(api, scheme=id_scheme)
@@ -673,12 +1048,14 @@ def default_output_dir() -> Path:
 #
 #   - converter_version: hand-bumped integer. Bump when the parsing
 #     contract in `_parse_api_graph_from_stdout` changes shape (e.g. a
-#     comfy-cli release that emits a different stdout wrapper). One
-#     integer bump invalidates every cache entry at once, which is the
-#     alternative to hunting down every stale output on disk.
+#     comfy-cli release that emits a different stdout wrapper), or
+#     when a correction pass is added or changed such that existing
+#     cached graphs would need to be re-corrected. One integer bump
+#     invalidates every cache entry at once, which is the alternative
+#     to hunting down every stale output on disk.
 #   - source_path: absolute. /a/foo.json and /b/foo.json share a
-#     basename but must not share a cache slot, or one gets served the
-#     other's graph.
+#     basename but must not share a cache slot, or one gets served
+#     the other's graph.
 #   - source_mtime, source_size: the source's identity at conversion
 #     time. Recording both and requiring both to match is strictly
 #     stronger than "output mtime > source mtime" — some editors
@@ -696,7 +1073,7 @@ def default_output_dir() -> Path:
 # upgrade re-converts once, writes the sidecar, and from then on hits
 # the cache.
 
-CONVERTER_VERSION = 1
+CONVERTER_VERSION = 3   # bumped: COMBO values preserved; @-prefix skipped
 
 
 def _cache_sidecar_path(out_path: Path) -> Path:

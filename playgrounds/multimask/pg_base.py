@@ -30,13 +30,15 @@ PG_CSS = r"""
   }
   #ui button#importImageBtn,
   #ui button#pickImageBtn,
-  #ui button#clearImageBtn {
+  #ui button#clearImageBtn,
+  #ui button#refreshCanvasBtn {
     border-color: rgba(120, 220, 255, 0.72);
     color: #b8ecff;
   }
   #ui button#importImageBtn:hover:not(:disabled),
   #ui button#pickImageBtn:hover:not(:disabled),
-  #ui button#clearImageBtn:hover:not(:disabled) {
+  #ui button#clearImageBtn:hover:not(:disabled),
+  #ui button#refreshCanvasBtn:hover:not(:disabled) {
     border-color: rgba(140, 225, 255, 1.00);
     background: rgba(120, 220, 255, 0.10);
     color: #d8f4ff;
@@ -220,6 +222,12 @@ PG_PANEL_BODY = r"""
             + From Krita
           </button>
         </div>
+        <div class="row">
+          <button id="refreshCanvasBtn"
+                  title="Re-fetch the current @thecanvas from Krita. Use when the canvas image changed in Krita but the autosync poller didn't pick it up — the poller only fires when the @thecanvas *spec* changes (active ↔ layer X ↔ layer Y), not when the pixels behind a constant spec change. Areas are preserved.">
+            ↻ Refresh @thecanvas
+          </button>
+        </div>
         <div id="imageInfo">No image loaded</div>
         <div class="row" style="margin-top:4px;">
           <button id="kritaCheckBtn">Check Krita</button>
@@ -251,7 +259,7 @@ PG_PANEL_BODY = r"""
       </div>
     </details>
 
-    <details class="section">
+    <details class="section" open>
       <summary>Defaults</summary>
       <div class="section-body">
         <div class="field">
@@ -281,7 +289,7 @@ PG_PANEL_BODY = r"""
       </div>
     </details>
 
-    <details class="section">
+    <details class="section" open>
       <summary>State</summary>
       <div class="section-body">
         <div id="stateInfo">

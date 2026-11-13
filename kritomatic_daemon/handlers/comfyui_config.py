@@ -19,9 +19,15 @@ Three commands:
     `data/comfy_panel/panel_configs/<workflow>.json`. Creates the file
     if it doesn't exist; preserves `host`/`port`/`exclusive`/`watch`/
     `timeout`/`count`/`seed` from the existing file if present; always
-    sets `workflow` to `_active_workflow_name`. Values for
-    `resources`/`params`/`crop`/`paste` come from the caller if
-    provided (docker path), or from `_active_config` if not (CLI path).
+    sets `workflow` to `_active_workflow_name`. Values for `resources`/
+    `params` come from the caller if provided (docker path), or from
+    `_active_config` if not (CLI path). `crop` and the dead half of
+    `paste` (`x`, `y`, `resize_canvas`) are no longer written — they
+    were dropped from the panel (see `panel.py`'s module docstring)
+    because neither can influence an inpaint run. The daemon still
+    honors all four on the read side (`comfy_apply_config` and the
+    `parse_config_dict` defaults reproduce them), so the on-disk format
+    stays backward-compatible.
 
 Panel config files are JSON. The TOML format is gone.
 """
@@ -444,9 +450,11 @@ class ConfigCommands(AutoDispatchHandler):
                   "Creates the file if missing; preserves "
                   "host/port/exclusive/watch/timeout/count/seed from the "
                   "existing file if present; always sets workflow to the "
-                  "active workflow name. Resources/params/crop/paste come "
-                  "from the provided args if any are supplied (docker "
-                  "path), else from the current _active_config (CLI path).",
+                  "active workflow name. Resources/params come from the "
+                  "provided args if any are supplied (docker path), else "
+                  "from the current _active_config (CLI path). Crop and "
+                  "paste.x/y/resize_canvas are not written; only "
+                  "paste.name and paste.batch_mode are persisted.",
         args={
             "--resources": {"type": "str", "required": False,
                             "help": "JSON resources. Omit to use "
@@ -505,6 +513,18 @@ class ConfigCommands(AutoDispatchHandler):
             except ValueError:
                 existing = {}
 
+        # The panel no longer surfaces the Crop section or the
+        # paste.x/y/resize_canvas fields (see panel.py's module
+        # docstring). They still exist in `_active_config` because
+        # `comfy_apply_config` fills defaults for them, and every
+        # reader inside the daemon still reads them from there. But
+        # the file we persist is now trimmed: no `crop` key at all,
+        # and only `name` + `batch_mode` under `paste`. A fresh load
+        # of this file therefore flows through `comfy_apply_config`
+        # and gets the same defaults it always did, so the daemon's
+        # `_active_config` invariant ("all four sections, fully
+        # populated") is preserved without carrying the dead fields
+        # on disk.
         file_data: dict = {
             "host": existing.get("host", parent._host),
             "port": existing.get("port", parent._port),
@@ -516,8 +536,10 @@ class ConfigCommands(AutoDispatchHandler):
             "seed": existing.get("seed"),
             "resources": parent._active_config["resources"],
             "params": parent._active_config["params"],
-            "crop": parent._active_config["crop"],
-            "paste": parent._active_config["paste"],
+            "paste": {
+                "name":       parent._active_config["paste"]["name"],
+                "batch_mode": parent._active_config["paste"]["batch_mode"],
+            },
         }
         # Preserve any _notes the user wrote by hand.
         if "_notes" in existing:

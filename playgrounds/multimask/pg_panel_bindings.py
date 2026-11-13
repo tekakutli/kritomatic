@@ -16,6 +16,15 @@ The displayed image is whatever the user picked or imported — no
 auto-refresh after generation.  Use `+ From Krita` to pull the
 current composite into the canvas.
 
+`Refresh @thecanvas` re-fetches the current `@thecanvas` on demand.
+The autosync poller (`pg_autosync.js`) only reacts to *spec* changes
+(`active` → `layer X`, `layer X` → `layer Y`), not to pixels behind
+a constant spec, so a paint layer whose content was edited in Krita
+keeps showing the old pixels until something else triggers a poll.
+The button bypasses that gate.  `applyCanvasImage` is used (not
+`setImage`), so the area list survives the refresh — same semantics
+as the autosync path.
+
 `Clear all areas` empties the area list (masks + prompts) without
 touching the loaded image.  This is the counterpart of `Clear image`
 which resets both.  The action flows through the same debounced
@@ -34,7 +43,7 @@ terminal write is the durable record.
 
 PANEL_BINDINGS_JS = r"""
 import {
-  board, setImage, clearImage,
+  board, setImage, clearImage, applyCanvasImage,
 } from "./pg_state.js";
 import {
   addAreaFromB64, removeArea, selectArea, areaById,
@@ -43,7 +52,7 @@ import { syncAreaList, setStateChangeHook } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
 import {
   importFromKrita, importKritaMasks, uploadImageFile,
-  checkKritaStatus,
+  checkKritaStatus, fetchActiveState, fetchResourceImage,
 } from "./pg_client.js";
 import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitRegisterField,
@@ -202,6 +211,87 @@ async function _importImageFromKritaAction() {
   } catch (e) {
     flashStatus("import failed: " + e.message, "bad");
   }
+}
+
+/* ============================================================
+   Manual @thecanvas refresh
+   ============================================================
+   The autosync poller reacts only to changes in the @thecanvas
+   *spec* — `active` → `layer X`, `layer X` → `layer Y`.  A paint
+   layer whose content was edited in Krita keeps the same spec, so
+   the poller does not fire and the playground keeps showing the
+   old pixels.  This button bypasses the spec-change gate: read the
+   current spec, resolve it to pixels, applyCanvasImage.
+
+   `applyCanvasImage` preserves the area list (and invalidates each
+   mask's pixel caches so the tinted overlays rebuild).  If the new
+   image's dimensions differ from the old, a console warning is
+   emitted because the area masks are unlikely to line up — the
+   user can re-import them if needed. */
+
+async function _refreshCanvasAction() {
+  flashStatus("refreshing @thecanvas\u2026", "");
+  let state;
+  try {
+    state = await fetchActiveState();
+  } catch (e) {
+    flashStatus("@thecanvas refresh failed: " + e.message, "bad");
+    return;
+  }
+  if (!state || !state.success) {
+    flashStatus(
+      "@thecanvas refresh failed: "
+        + ((state && state.message) || "no active state"),
+      "bad",
+    );
+    return;
+  }
+  const cfg = (state.data && state.data.config) || null;
+  const res = (cfg && cfg.resources) || {};
+  const spec = res["@thecanvas"];
+  if (!spec || typeof spec !== "object") {
+    flashStatus("@thecanvas not set in daemon config", "warn");
+    return;
+  }
+  const normalized = {
+    source: spec.source || "active",
+    layer_name: spec.layer_name || null,
+  };
+
+  let img;
+  try {
+    img = await fetchResourceImage(normalized);
+  } catch (e) {
+    flashStatus("@thecanvas refresh failed: " + e.message, "bad");
+    return;
+  }
+  if (!img || !img.success) {
+    flashStatus(
+      "@thecanvas refresh failed: "
+        + ((img && img.message) || "unknown"),
+      "bad",
+    );
+    return;
+  }
+  if (!img.data_url) {
+    flashStatus("@thecanvas refresh: no data_url", "bad");
+    return;
+  }
+
+  applyCanvasImage(
+    img.hash || ("thecanvas_" + Date.now()),
+    img.data_url,
+    img.width,
+    img.height,
+  );
+  const label = normalized.source === "layer"
+    ? normalized.layer_name
+    : normalized.source;
+  flashStatus("@thecanvas \u2192 " + label, "ok");
+
+  syncPanelFields();
+  syncAreaList();
+  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
 }
 
 /* ============================================================
@@ -571,6 +661,7 @@ export function installPanelBindings() {
     "importMasksBtn", "blankAreaBtn", "clearAreasBtn", "kritaCheckBtn",
     "saveStateBtn", "loadStateBtn", "exportGraphBtn",
     "fetchHistoryBtn",
+    "refreshCanvasBtn",
   ]) {
     el[id] = document.getElementById(id);
   }
@@ -585,6 +676,7 @@ export function installPanelBindings() {
   if (el.loadStateBtn)    el.loadStateBtn.addEventListener("click", _loadStateAction);
   if (el.exportGraphBtn)  el.exportGraphBtn.addEventListener("click", _exportGraphAction);
   if (el.fetchHistoryBtn) el.fetchHistoryBtn.addEventListener("click", _fetchHistoryAction);
+  if (el.refreshCanvasBtn) el.refreshCanvasBtn.addEventListener("click", _refreshCanvasAction);
 
   // Combine-mode select
   const cms = document.getElementById("combineModeSelect");
@@ -697,6 +789,14 @@ pgkitRegisterAction("action.clearAreas", {
 pgkitRegisterAction("action.clearImage", {
   label: "Clear image", scope: "global",
   run: _clearImageAction, meta: { variant: "plain" },
+});
+pgkitRegisterAction("action.refreshCanvas", {
+  label: "Refresh @thecanvas", scope: "global",
+  run: _refreshCanvasAction,
+  meta: { variant: "plain",
+          description: "Re-fetch the current @thecanvas from Krita. " +
+                       "Use when the canvas image changed in Krita but " +
+                       "autosync did not pick it up." },
 });
 pgkitRegisterAction("action.kritaStatus", {
   label: "Check Krita", scope: "global",

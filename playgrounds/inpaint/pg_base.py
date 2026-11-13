@@ -14,7 +14,15 @@ shared-state prompt (the docker / web panel's
 `comfy_apply_config` params).  Left blank, the workflow uses whatever
 the docker or web panel has set, with the workflow's own
 `PrimitiveString` default as the last resort.  See
-`inpaint_server.py`'s PROMPT RESOLUTION section."""
+`inpaint_server.py`'s PROMPT RESOLUTION section.
+
+The Refresh button re-fetches the current `@thecanvas` from the
+daemon on demand.  The `@thecanvas` spec normally tracks layer
+edits through `pg_autosync.js`, but that poller only reacts to spec
+*changes* (`active` -> `layer X`, `layer X` -> `layer Y`).  A spec
+that stays constant while the underlying pixels change (e.g. a
+paint layer whose content was edited in Krita) does not trigger a
+refresh.  The button is the manual escape hatch."""
 
 PG_CSS = r"""
   #ui button#inpaintBtn {
@@ -44,12 +52,14 @@ PG_CSS = r"""
     color: #ffd0d8;
   }
   #ui button#pickImageBtn,
-  #ui button#pickMaskBtn {
+  #ui button#pickMaskBtn,
+  #ui button#refreshCanvasBtn {
     border-color: rgba(120, 220, 255, 0.72);
     color: #b8ecff;
   }
   #ui button#pickImageBtn:hover:not(:disabled),
-  #ui button#pickMaskBtn:hover:not(:disabled) {
+  #ui button#pickMaskBtn:hover:not(:disabled),
+  #ui button#refreshCanvasBtn:hover:not(:disabled) {
     border-color: rgba(140, 225, 255, 1.00);
     background: rgba(120, 220, 255, 0.10);
     color: #d8f4ff;
@@ -221,6 +231,12 @@ PG_PANEL_BODY = r"""
           <button id="pickMaskBtn"
                   title="Pick a PNG from disk as a mask. White = selected, black = not selected. Resized to the canvas if needed.">
             + Pick mask file…
+          </button>
+        </div>
+        <div class="row">
+          <button id="refreshCanvasBtn"
+                  title="Re-fetch the current @thecanvas from Krita. Use when the canvas image changed in Krita but the autosync poller didn't pick it up — the poller only fires when the @thecanvas *spec* changes (active ↔ layer X ↔ layer Y), not when the pixels behind a constant spec change.">
+            ↻ Refresh @thecanvas
           </button>
         </div>
         <div id="imageInfo">No image loaded — drop one on the canvas</div>

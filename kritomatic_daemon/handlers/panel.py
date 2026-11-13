@@ -92,6 +92,32 @@ When a workflow changes, each client restores its saved prefix for
 that workflow.  The config file does not carry the prefix — a
 display preference in a shared, daemon-owned file would let one
 client's choice leak into another client's UI.
+
+Crop section removed
+====================
+The Crop section (`context`, `padding`) was removed because neither
+field can influence an inpaint run.  Rule 1 of `_determine_crop_bounds`
+reads `@thecontext`'s bbox and ignores `[crop]`.  Rule 2 only fires for
+`source="global"` resources, which the user's workflows do not use.
+The daemon still honors `[crop]` in config files and CLI batches —
+`comfy_apply_config` validates and normalizes it — the fields just
+are not surfaced in the panel.  This keeps the file format
+backward-compatible while removing noise from the UI.
+
+Paste section: name + batch mode only
+=====================================
+`x`, `y`, and `resize_canvas` used to be exposed here.  They are gone
+from the panel because none of them can influence an inpaint run:
+the paste origin is `crop_bounds[0..1] + (x, y)`, and `crop_bounds`
+comes from `@thecontext`'s bbox — pasting at that origin is already
+exact, so `x = y = 0` is the only correct value.  `resize_canvas`
+only matters for dimension-changing workflows; inpaint preserves
+dimensions.  The daemon still honors all three fields if a config
+file sets them; they are just not exposed in the panel.
+
+`name` and `batch_mode` stay because they *can* matter the day a
+workflow produces more than one image per run (naming the pasted
+layers; choosing between stack-as-layers and import-as-animation).
 """
 
 from __future__ import annotations
@@ -453,43 +479,31 @@ class ParamsProvider:
         })
 
 
-class CropProvider:
-    """Context and padding."""
-
-    def contribute(self, builder, ctx):
-        status = ctx.get("comfy_status") or {}
-        slots = status.get("workflow_resource_slots") or {}
-        if not slots:
-            return
-        config = status.get("config") or {}
-        crop = config.get("crop") or {}
-        builder.add_section({
-            "id": "crop",
-            "kind": "form",
-            "title": "Crop",
-            "fields": [
-                {
-                    "key": "cfg-crop.context",
-                    "label": "Context",
-                    "type": "select",
-                    "options": ["entire_image", "automatic", "mask_bounds"],
-                    "value": crop.get("context") or "entire_image",
-                    "config_path": ["crop", "context"],
-                },
-                {
-                    "key": "cfg-crop.padding",
-                    "label": "Padding",
-                    "type": "integer",
-                    "value": int(crop.get("padding") or 0),
-                    "min": 0,
-                    "config_path": ["crop", "padding"],
-                },
-            ],
-        })
-
-
 class PasteProvider:
-    """Where and how to paste SaveImage outputs."""
+    """Layer name and batch mode for pasted results.
+
+    X / Y / resize_canvas used to live here.  They are gone from the
+    panel because none of them can influence an inpaint run:
+
+      * The paste origin is `crop_bounds[0..1] + (x, y)`, and
+        `crop_bounds` comes from `@thecontext`'s bbox — pasting at
+        that origin is already exact, so `x = y = 0` is the only
+        correct value.
+
+      * `resize_canvas` only matters for dimension-changing workflows
+        (outpaint, tile upscale); inpaint preserves dimensions.
+
+    The daemon still honors all three fields if a config file sets
+    them — `comfy_apply_config` validates and normalizes them — they
+    just are not exposed in the panel.  This keeps the file format
+    backward-compatible while removing noise from the UI.
+
+    `name` and `batch_mode` stay because they *can* matter the day a
+    workflow produces more than one image per run (naming the pasted
+    layers; choosing between stack-as-layers and import-as-animation).
+    See `comfyui_generation._paste_result` for the exact multi-image
+    behavior.
+    """
 
     def contribute(self, builder, ctx):
         status = ctx.get("comfy_status") or {}
@@ -504,20 +518,6 @@ class PasteProvider:
             "title": "Paste",
             "fields": [
                 {
-                    "key": "cfg-paste.x",
-                    "label": "X",
-                    "type": "integer",
-                    "value": int(paste.get("x") or 0),
-                    "config_path": ["paste", "x"],
-                },
-                {
-                    "key": "cfg-paste.y",
-                    "label": "Y",
-                    "type": "integer",
-                    "value": int(paste.get("y") or 0),
-                    "config_path": ["paste", "y"],
-                },
-                {
                     "key": "cfg-paste.name",
                     "label": "Name",
                     "type": "text",
@@ -531,13 +531,6 @@ class PasteProvider:
                     "options": ["default", "layers", "animation"],
                     "value": paste.get("batch_mode") or "default",
                     "config_path": ["paste", "batch_mode"],
-                },
-                {
-                    "key": "cfg-paste.resize_canvas",
-                    "label": "Resize canvas",
-                    "type": "toggle",
-                    "value": bool(paste.get("resize_canvas")),
-                    "config_path": ["paste", "resize_canvas"],
                 },
             ],
         })
@@ -667,7 +660,6 @@ class PanelHandler(AutoDispatchHandler):
             WorkflowMetadataProvider(),
             ResourcesProvider(),
             ParamsProvider(),
-            CropProvider(),
             PasteProvider(),
             RunOptionsProvider(),
             RunActionsProvider(),

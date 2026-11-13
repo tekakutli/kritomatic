@@ -11,6 +11,7 @@ Operations exposed by this playground:
   - Inpaint (local, or routed via the interceptor playground when
     the "Route via interceptor" checkbox is on)
   - Cancel (local interrupt, or interceptor cancellation)
+  - Manually re-fetch @thecanvas from Krita (Refresh button)
   - ComfyUI / Krita status checks
 
 Not present: Segment All, Refine, mask prompt, region painting,
@@ -18,6 +19,18 @@ points, undo/redo, export to Krita.  Also: the old "Import image from
 Krita" button is gone — `pg_autosync.js` pulls the current
 `@thecanvas` in automatically when the daemon's config points at
 one.
+
+MANUAL REFRESH
+==============
+`_refreshCanvasAction` re-fetches `@thecanvas` on demand.  The
+autosync poller only reacts to *spec* changes, so a paint layer
+whose content was edited in Krita keeps showing the old pixels
+until something else triggers a poll.  The button bypasses the
+spec-change detection: read the current spec, fetch the pixels
+that spec resolves to, `applyCanvasImage`.  Masks and the context
+rect survive if the new image has matching dimensions — same
+semantics as the autosync path — so the manual refresh is safe to
+invoke at any point in a session.
 
 PASTE ≠ PLAYGROUND UPDATE
 =========================
@@ -68,7 +81,7 @@ only when the stack is empty.
 
 PANEL_BINDINGS_JS = r"""
 import { board, setImage, clearImage, _scheduleDraw,
-         view, _rotateImage } from "./pg_state.js";
+         view, _rotateImage, applyCanvasImage } from "./pg_state.js";
 import {
   setMasks, addMaskFromB64,
   selectedMask, selectedMaskIdx,
@@ -84,6 +97,7 @@ import {
 } from "./pg_comfy_client.js";
 import {
   checkKritaStatus, importKritaMasks, fetchActiveState,
+  fetchResourceImage,
 } from "./pg_krita_client.js";
 import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyAll,
@@ -173,6 +187,94 @@ function _clearImageAction() {
   // user does not see a stale angle on a cleared canvas.
   const rotEl = document.getElementById("viewRotation");
   if (rotEl) rotEl.value = "0";
+  syncPanelFields();
+  syncMaskList();
+  pgkitNotifyAll();
+  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+}
+
+/* ============================================================
+   Manual @thecanvas refresh
+   ============================================================
+   The autosync poller in `pg_autosync.js` reacts only to changes
+   in the @thecanvas *spec* — `active` → `layer X`, `layer X` →
+   `layer Y`, etc.  A paint layer whose content was edited in
+   Krita keeps the same spec, so the poller does not fire and the
+   playground keeps showing the old pixels.  This button is the
+   manual escape hatch.
+
+   Shape of the operation is identical to the poller's
+   `_fetchAndSet`: read the current spec, resolve it to pixels via
+   `/krita/resource_image`, applyCanvasImage.  The difference is
+   that we do it unconditionally, not gated on a spec change.
+
+   `applyCanvasImage` preserves masks and the inpaint context rect
+   when the new image has the same dimensions, so invoking this mid-
+   session does not nuke the user's mask stack.  If dimensions
+   changed, the context rect is cleared (it pointed at the old
+   dims), masks keep their pixel data and will be re-tinted on the
+   next draw. */
+
+async function _refreshCanvasAction() {
+  flashStatus("refreshing @thecanvas\u2026", "");
+  let state;
+  try {
+    state = await fetchActiveState();
+  } catch (e) {
+    flashStatus("@thecanvas refresh failed: " + e.message, "bad");
+    return;
+  }
+  if (!state || !state.success) {
+    flashStatus(
+      "@thecanvas refresh failed: "
+        + ((state && state.message) || "no active state"),
+      "bad",
+    );
+    return;
+  }
+  const cfg = (state.data && state.data.config) || null;
+  const res = (cfg && cfg.resources) || {};
+  const spec = res["@thecanvas"];
+  if (!spec || typeof spec !== "object") {
+    flashStatus("@thecanvas not set in daemon config", "warn");
+    return;
+  }
+  const normalized = {
+    source: spec.source || "active",
+    layer_name: spec.layer_name || null,
+  };
+
+  let img;
+  try {
+    img = await fetchResourceImage(normalized);
+  } catch (e) {
+    flashStatus("@thecanvas refresh failed: " + e.message, "bad");
+    return;
+  }
+  if (!img || !img.success) {
+    flashStatus(
+      "@thecanvas refresh failed: "
+        + ((img && img.message) || "unknown"),
+      "bad",
+    );
+    return;
+  }
+  if (!img.data_url) {
+    flashStatus("@thecanvas refresh: no data_url", "bad");
+    return;
+  }
+
+  applyCanvasImage(
+    img.hash || ("thecanvas_" + Date.now()),
+    img.data_url,
+    img.width,
+    img.height,
+  );
+  const label = normalized.source === "layer"
+    ? normalized.layer_name
+    : normalized.source;
+  flashStatus("@thecanvas \u2192 " + label, "ok");
+
   syncPanelFields();
   syncMaskList();
   pgkitNotifyAll();
@@ -657,6 +759,7 @@ export function installPanelBindings() {
     "kritaImportMasksBtn",
     "kritaCheckBtn",
     "maskFromRectBtn",
+    "refreshCanvasBtn",
   ];
   for (const id of ids) el[id] = document.getElementById(id);
 
@@ -668,6 +771,7 @@ export function installPanelBindings() {
   if (el.kritaImportMasksBtn) el.kritaImportMasksBtn.addEventListener("click", _kritaImportMasksAction);
   if (el.kritaCheckBtn) el.kritaCheckBtn.addEventListener("click", _kritaStatusRefresh);
   if (el.maskFromRectBtn) el.maskFromRectBtn.addEventListener("click", _maskFromRectAction);
+  if (el.refreshCanvasBtn) el.refreshCanvasBtn.addEventListener("click", _refreshCanvasAction);
 
   const statusEl = document.getElementById("statusLine");
   if (statusEl) {
@@ -714,6 +818,13 @@ pgkitRegisterAction("action.cancel", {
 pgkitRegisterAction("action.clearImage", {
   label: "Clear image", scope: "global", run: _clearImageAction,
   meta: { variant: "plain" },
+});
+pgkitRegisterAction("action.refreshCanvas", {
+  label: "Refresh @thecanvas", scope: "global", run: _refreshCanvasAction,
+  meta: { variant: "plain",
+          description: "Re-fetch the current @thecanvas from Krita. " +
+                       "Use when the canvas image changed in Krita but " +
+                       "autosync did not pick it up." },
 });
 pgkitRegisterAction("action.checkStatus", {
   label: "Check connection", scope: "global", run: _checkStatusAction,

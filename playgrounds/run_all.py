@@ -2,11 +2,11 @@
 """
 run_all.py — launch playgrounds in one shared Python process.
 
-    python playgrounds/run_all.py                       # start all seven
+    python playgrounds/run_all.py                       # start every discovered playground
     python playgrounds/run_all.py --only board,cone     # start two
     python playgrounds/run_all.py --browser             # open tabs too
 
-    python playgrounds/run_all.py -i                    # all seven, then REPL
+    python playgrounds/run_all.py -i                    # all, then REPL
     python playgrounds/run_all.py -i --only ""          # start nothing, REPL only
     python playgrounds/run_all.py -i --only board,cone  # two, then REPL
 
@@ -21,11 +21,7 @@ Two modes:
   Interactive (-i)      Start the initial set, then drop into a REPL
                         where you can `start <name>` / `stop <name>`
                         at runtime, all still in this one process, all
-                        still registering under the same group.  Use
-                        this when you want to add a playground after
-                        the fact — for instance, start with board only,
-                        then add cone, inpaint, segment as you need
-                        them, and stop the ones you are done with.
+                        still registering under the same group.
 
         REPL commands:
             list              — running playgrounds and their URLs
@@ -39,77 +35,70 @@ Two modes:
             quit / Ctrl+D     — shut down the group and exit
 
         Ctrl+C at the REPL prompt shuts down the whole group cleanly,
-        same as it does in fixed-set mode.  There is no "cancel current
-        command" gesture; the underlying operations are sub-second.
+        same as it does in fixed-set mode.
 
-Participants and ports
-======================
-    board        8770
-    cone         8766
-    inpaint      8774
-    interceptor  8775
-    segment      8773
-    text_boxes   8771
-    text_wall    8767
-    multimask    8776
+Playground discovery
+====================
+A "playground" is any subpackage `<name>/` of this directory that
+contains a submodule `<name>/<name>_playground.py` exposing a
+callable `descriptor()`.  That function returns the fields the
+launcher needs:
 
-Each descriptor below supplies:
     name           hub registration name
-    module         python package name
-    port           preferred TCP port (nearby free one is used if
-                   taken)
+    port           preferred TCP port
     html_file      file the launcher renders and serves
     html_render    zero-argument callable returning the HTML string
     routes         JSON POST routes
     raw_routes     binary POST routes (file drops)
     module_sources module manifest served at /modules/
 
-Every panel's routes are the same ones the standalone launcher
-registers; the two entry points diverge only in how the HTTP server
-is started (blocking vs threaded).
+Adding a new playground therefore requires only creating the
+subpackage and exposing `descriptor()`.  Nothing in this file needs
+to change.  Discovery is tolerant: a playground whose entry module
+raises on import is skipped with a stderr line, and packages without
+a `<name>_playground` module (pgkit, pg_comfy, `shared_cable_room`,
+`__pycache__`) are silently ignored.
 
-The interceptor playground is off by default (its `--only` default is
-unchanged); when the inpaint panel's "Route via interceptor" checkbox
-is on, its payload flows through interceptor at 8775.  The two are
-independent — inpaint works alone with the checkbox off, interceptor
-sits idle alone with no source feeding it.
+Note that `cable`, `remote_panel`, `room`, `kritomatic_nodes`, and
+`remote_cli` are not subpackages of `playgrounds/` in the Python
+sense — they have no `__init__.py` — so `pkgutil.iter_modules`
+never yields them and discovery never reaches their import path.
+They remain independently runnable via their own entry scripts.
+
+The `--shutdown-hub` path does not invoke discovery, so it keeps
+working even when a playground is broken.
 
 Standalone vs grouped
 =====================
-Each of the seven remains independently runnable:
+Each playground remains independently runnable, e.g.:
 
     python playgrounds/board/board_playground.py
-    python playgrounds/interceptor/interceptor_playground.py
 
-In that mode the playground registers with the hub under its own
-name, with `group=None`.  Killing it via the hub only shuts down
-that one process.  Grouped mode wires `group` so the hub knows
-killing one member takes down all seven; the interactive panel warns
-about that before the kill.
+In that mode it registers with the hub under its own name, with
+`group=None`.  Killing it via the hub only shuts down that one
+process.  Grouped mode wires `group` so the hub knows killing one
+member takes down the whole group.
 
 sys.path setup
 ==============
 Two directories must be importable:
 
   _HERE                playgrounds/
-                       → `from board import …`, `from pgkit.launcher
-                         import …` all resolve here.
+                       → `from pgkit.launcher import …`, discovery,
+                         and each playground's `<name>_playground`
+                         module all resolve here.
 
   _SHARED_CABLE_ROOM   playgrounds/shared_cable_room/
                        → `cone/pg_state.py` does
                          `from playground_fonts import …`, and
                          `playground_fonts.py` lives here.  Without
-                         this on sys.path, the mere act of importing
-                         `cone_html` (which imports `pg_state`)
-                         raises ModuleNotFoundError, and because
-                         `_descriptors()` imports all eight, one
-                         broken import takes down every `--only`
-                         selection too.  (It does not take down
-                         `--shutdown-hub`, which short-circuits
-                         before `_descriptors()` is reached.)
+                         this on sys.path, importing `cone_html` (which
+                         imports `pg_state`) raises ModuleNotFoundError.
+                         Discovery surfaces this as a per-playground
+                         stderr line rather than a fatal error.
 
 The parent of `playgrounds/` (the repo root) does not need to be on
-sys.path: nothing imported from here uses it, and the playgrounds'
+sys.path: nothing imported from here uses it, and each playground's
 own `_find_repo_src()` helpers walk up from `__file__` to locate
 `src/kritomatic/` independently.
 """
@@ -135,113 +124,85 @@ GROUP_NAME = "core"
 
 
 # ============================================================================
-#  Descriptors
+#  Playground discovery
 # ============================================================================
+
+def _discover_playgrounds():
+    """Scan this directory for playground subpackages.
+
+    A playground is any subpackage `<name>/` whose entry module
+    `<name>/<name>_playground.py` exposes a callable `descriptor()`.
+    The descriptor carries the fields the launcher expects.
+
+    Import failures split two ways:
+
+      · Not a playground — pgkit, pg_comfy, `shared_cable_room`,
+        `__pycache__`, etc. do not have a `<name>_playground.py`, so
+        `import <name>.<name>_playground` raises and we silently skip.
+        Directories without an `__init__.py` (cable, remote_panel,
+        room, kritomatic_nodes, remote_cli) are not yielded by
+        `pkgutil.iter_modules` in the first place, so they never
+        reach this branch either.
+
+      · A playground whose entry module is broken — the file exists
+        but its imports (or any module-scope statement it runs on
+        load) fail.  Printed to stderr; skipped.
+
+    Either way, discovery itself never raises, and one broken
+    playground does not take down the others.  The exception class is
+    deliberately `Exception`, not `ImportError`: a properly-packaged
+    playground can fail its import for reasons other than a missing
+    module (`FileNotFoundError` on a module-scope JSON read,
+    `KeyError` on a config dict, `SyntaxError` in a sibling), and
+    those must not propagate out of discovery.
+    """
+    import importlib
+    import pkgutil
+
+    out = []
+    for _, name, ispkg in pkgutil.iter_modules([_HERE]):
+        if not ispkg:
+            continue
+
+        module_path = f"{name}.{name}_playground"
+        try:
+            mod = importlib.import_module(module_path)
+        except Exception as e:
+            if _has_playground_entry(name):
+                print(f"  [{name}] could not import {module_path}: {e}",
+                      file=sys.stderr)
+            continue
+
+        descriptor_fn = getattr(mod, "descriptor", None)
+        if not callable(descriptor_fn):
+            continue
+
+        try:
+            out.append(descriptor_fn())
+        except Exception as e:
+            print(f"  [{name}] descriptor() failed: {e}", file=sys.stderr)
+
+    out.sort(key=lambda d: d.get("name", ""))
+    return out
+
+
+def _has_playground_entry(name):
+    """True iff `name` is a directory containing `name_playground.py`.
+
+    Distinguishes "not a playground" (silent skip) from "a playground
+    whose entry module failed to import" (warn on stderr).  The check
+    is a cheap file-existence probe — no imports.
+    """
+    entry = os.path.join(_HERE, name, f"{name}_playground.py")
+    return os.path.isfile(entry)
+
 
 def _descriptors():
-    """Build the playground descriptors.
-
-    The playground module imports live here, not at module scope, so
-    that `--shutdown-hub` — which exists precisely to be reachable
-    when a playground is misbehaving — never has to import a
-    playground to run.  `main()` short-circuits that flag before
-    calling this function; see `_shutdown_hub()`.
-    """
-    from board       import board_html, board_server
-    from cone        import cone_html, cone_kra
-    from inpaint     import inpaint_html, inpaint_server
-    from interceptor import interceptor_html, interceptor_server
-    from segment     import segment_html, segment_server
-    from text_boxes  import text_boxes_html, text_boxes_server
-    from text_wall   import text_wall_html, text_wall_kra
-    from multimask   import multimask_html, multimask_server
-
-    return [
-        {
-            "name":           "board",
-            "module":         "board",
-            "port":           8770,
-            "html_file":      "board_playground.html",
-            "html_render":    board_html.render,
-            "routes":         board_server.ROUTES,
-            "raw_routes":     board_server.RAW_ROUTES,
-            "module_sources": board_html.module_sources(),
-        },
-        {
-            "name":           "cone",
-            "module":         "cone",
-            "port":           8766,
-            "html_file":      "cone_playground.html",
-            "html_render":    cone_html.render,
-            "routes":         {"/generate-kra": cone_kra.generate},
-            "raw_routes":     {},
-            "module_sources": cone_html.module_sources(),
-        },
-        {
-            "name":           "inpaint",
-            "module":         "inpaint",
-            "port":           8774,
-            "html_file":      "inpaint.html",
-            "html_render":    inpaint_html.render,
-            "routes":         inpaint_server.ROUTES,
-            "raw_routes":     inpaint_server.RAW_ROUTES,
-            "module_sources": inpaint_html.module_sources(),
-        },
-        {
-            "name":           "interceptor",
-            "module":         "interceptor",
-            "port":           8775,
-            "html_file":      "interceptor.html",
-            "html_render":    interceptor_html.render,
-            "routes":         interceptor_server.ROUTES,
-            "raw_routes":     {},
-            "module_sources": interceptor_html.module_sources(),
-        },
-        {
-            "name":           "segment",
-            "module":         "segment",
-            "port":           8773,
-            "html_file":      "segment.html",
-            "html_render":    segment_html.render,
-            "routes":         segment_server.ROUTES,
-            "raw_routes":     segment_server.RAW_ROUTES,
-            "module_sources": segment_html.module_sources(),
-        },
-        {
-            "name":           "text_boxes",
-            "module":         "text_boxes",
-            "port":           8771,
-            "html_file":      "text_boxes.html",
-            "html_render":    text_boxes_html.render,
-            "routes":         text_boxes_server.ROUTES,
-            "raw_routes":     {},
-            "module_sources": text_boxes_html.module_sources(),
-        },
-        {
-            "name":           "text_wall",
-            "module":         "text_wall",
-            "port":           8767,
-            "html_file":      "text_wall_playground.html",
-            "html_render":    text_wall_html.render,
-            "routes":         {"/generate-kra": text_wall_kra.generate},
-            "raw_routes":     {},
-            "module_sources": text_wall_html.module_sources(),
-        },
-        {
-            "name":           "multimask",
-            "module":         "multimask",
-            "port":           8776,
-            "html_file":      "multimask.html",
-            "html_render":    multimask_html.render,
-            "routes":         multimask_server.ROUTES,
-            "raw_routes":     multimask_server.RAW_ROUTES,
-            "module_sources": multimask_html.module_sources(),
-        },
-    ]
+    return _discover_playgrounds()
 
 
 # ============================================================================
-#  Hub shutdown (unchanged from previous revision)
+#  Hub shutdown
 # ============================================================================
 
 def _shutdown_hub() -> None:
@@ -254,6 +215,11 @@ def _shutdown_hub() -> None:
     system-wide or `PYTHONPATH` is already set.  Augmenting the child's
     `PYTHONPATH` with `_HERE` is the same technique
     `pgkit/hub_client.py`'s detached spawn uses.
+
+    Called from `main()` before discovery; no playground is imported
+    on this path.  That is deliberate: the command exists to be
+    reachable when a playground misbehaves, and must not fail on the
+    misbehaving playground's behalf.
     """
     env = os.environ.copy()
     prev = env.get("PYTHONPATH", "")
@@ -276,11 +242,6 @@ class _StdinReader:
     `abort_event` breaks the block — but the reader thread itself
     stays blocked in `sys.stdin.readline()`, which is fine: it is a
     daemon, and it dies when the launcher process exits.
-
-    Using a dedicated thread rather than `select()` avoids the
-    buffered-stdin race (Python's `sys.stdin` may hold bytes that
-    `select` cannot see).  The cost is one thread for the whole
-    session, not one per prompt.
     """
 
     def __init__(self):
@@ -446,6 +407,8 @@ def main():
                    help="Ask a running pgkit hub to exit, then exit.")
     args = p.parse_args()
 
+    # Short-circuit before any playground is imported.  See
+    # `_shutdown_hub` and the module docstring.
     if args.shutdown_hub:
         _shutdown_hub()
         return

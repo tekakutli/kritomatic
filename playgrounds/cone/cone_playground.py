@@ -66,6 +66,23 @@ SERVE        = True
 OPEN_BROWSER = True
 
 
+def descriptor():
+    """Return the run_all.py descriptor for this playground.
+
+    Cone has no `<name>_server` module: the `/generate-kra` route is
+    a single entry pointing at `cone_kra.generate`.  No raw routes.
+    """
+    return {
+        "name":           "cone",
+        "port":           PORT,
+        "html_file":      HTML_FILE,
+        "html_render":    cone_html.render,
+        "routes":         {"/generate-kra": cone_kra.generate},
+        "raw_routes":     {},
+        "module_sources": cone_html.module_sources(),
+    }
+
+
 def main():
     html = cone_html.render()
     with open(HTML_FILE, "w", encoding="utf-8") as f:

@@ -34,6 +34,23 @@ SERVE        = True
 OPEN_BROWSER = True
 
 
+def descriptor():
+    """Return the run_all.py descriptor for this playground.
+
+    `text_boxes_server` exposes `ROUTES` only; there is no
+    `RAW_ROUTES` because every text_boxes endpoint takes JSON.
+    """
+    return {
+        "name":           "text_boxes",
+        "port":           PORT,
+        "html_file":      HTML_FILE,
+        "html_render":    text_boxes_html.render,
+        "routes":         text_boxes_server.ROUTES,
+        "raw_routes":     {},
+        "module_sources": text_boxes_html.module_sources(),
+    }
+
+
 def _probe_daemon():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

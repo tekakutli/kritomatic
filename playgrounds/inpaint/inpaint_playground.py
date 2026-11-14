@@ -38,6 +38,19 @@ PORT         = 8774
 OPEN_BROWSER = True
 
 
+def descriptor():
+    """Return the run_all.py descriptor for this playground."""
+    return {
+        "name":           "inpaint",
+        "port":           PORT,
+        "html_file":      HTML_FILE,
+        "html_render":    inpaint_html.render,
+        "routes":         inpaint_server.ROUTES,
+        "raw_routes":     inpaint_server.RAW_ROUTES,
+        "module_sources": inpaint_html.module_sources(),
+    }
+
+
 def main():
     html = inpaint_html.render()
     with open(HTML_FILE, "w", encoding="utf-8") as f:

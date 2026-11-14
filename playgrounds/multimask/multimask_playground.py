@@ -29,6 +29,19 @@ PORT         = 8776
 OPEN_BROWSER = True
 
 
+def descriptor():
+    """Return the run_all.py descriptor for this playground."""
+    return {
+        "name":           "multimask",
+        "port":           PORT,
+        "html_file":      HTML_FILE,
+        "html_render":    multimask_html.render,
+        "routes":         multimask_server.ROUTES,
+        "raw_routes":     multimask_server.RAW_ROUTES,
+        "module_sources": multimask_html.module_sources(),
+    }
+
+
 def main():
     html = multimask_html.render()
     with open(HTML_FILE, "w", encoding="utf-8") as f:

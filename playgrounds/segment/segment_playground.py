@@ -39,6 +39,19 @@ PORT         = 8773
 OPEN_BROWSER = True
 
 
+def descriptor():
+    """Return the run_all.py descriptor for this playground."""
+    return {
+        "name":           "segment",
+        "port":           PORT,
+        "html_file":      HTML_FILE,
+        "html_render":    segment_html.render,
+        "routes":         segment_server.ROUTES,
+        "raw_routes":     segment_server.RAW_ROUTES,
+        "module_sources": segment_html.module_sources(),
+    }
+
+
 def main():
     html = segment_html.render()
     with open(HTML_FILE, "w", encoding="utf-8") as f:

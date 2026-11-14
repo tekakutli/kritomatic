@@ -32,6 +32,25 @@ SERVE        = True
 OPEN_BROWSER = True
 
 
+def descriptor():
+    """Return the run_all.py descriptor for this playground.
+
+    `run_all.py` discovers playgrounds by importing
+    `<name>/<name>_playground.py` and calling its `descriptor()`.
+    Adding a new playground requires only creating the subpackage and
+    exposing this function — run_all.py never needs to be edited.
+    """
+    return {
+        "name":           "board",
+        "port":           PORT,
+        "html_file":      HTML_FILE,
+        "html_render":    board_html.render,
+        "routes":         board_server.ROUTES,
+        "raw_routes":     board_server.RAW_ROUTES,
+        "module_sources": board_html.module_sources(),
+    }
+
+
 def main():
     html = board_html.render()
     with open(HTML_FILE, "w", encoding="utf-8") as f:

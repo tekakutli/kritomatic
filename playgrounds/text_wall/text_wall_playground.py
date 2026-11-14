@@ -32,6 +32,24 @@ SERVE        = True
 OPEN_BROWSER = True
 
 
+def descriptor():
+    """Return the run_all.py descriptor for this playground.
+
+    Like cone, text_wall has no `<name>_server` module: the
+    `/generate-kra` route is a single entry pointing at
+    `text_wall_kra.generate`.  No raw routes.
+    """
+    return {
+        "name":           "text_wall",
+        "port":           PORT,
+        "html_file":      HTML_FILE,
+        "html_render":    text_wall_html.render,
+        "routes":         {"/generate-kra": text_wall_kra.generate},
+        "raw_routes":     {},
+        "module_sources": text_wall_html.module_sources(),
+    }
+
+
 def main():
     html = text_wall_html.render()
     with open(HTML_FILE, "w", encoding="utf-8") as f:

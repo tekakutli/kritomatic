@@ -34,6 +34,19 @@ PORT         = 8775
 OPEN_BROWSER = True
 
 
+def descriptor():
+    """Return the run_all.py descriptor for this playground."""
+    return {
+        "name":           "interceptor",
+        "port":           PORT,
+        "html_file":      HTML_FILE,
+        "html_render":    interceptor_html.render,
+        "routes":         interceptor_server.ROUTES,
+        "raw_routes":     {},
+        "module_sources": interceptor_html.module_sources(),
+    }
+
+
 def main():
     html = interceptor_html.render()
     with open(HTML_FILE, "w", encoding="utf-8") as f:

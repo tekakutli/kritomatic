@@ -3,12 +3,27 @@
 `comfy_connect` establishes the HTTP client, auto-starts the proxy if
 needed, and queries /object_info.
 
+Short-circuit on repeat
+=======================
+When the handler is already connected to the same host:port, the
+command returns success immediately without touching the proxy. This
+matters when multiple runs are launched concurrently (multiple docker
+Run clicks, CLI multi-terminal): each `comfy_panel_run` calls
+`comfy_connect` first, and the repeat calls would otherwise re-run
+the proxy check-then-spawn sequence on every launch. That sequence is
+already locked, so it is correct without the short-circuit; the
+short-circuit is a small latency win and makes the common "already
+connected" case trivially cheap.
+
+If the proxy died since the last successful connect, the short-circuit
+does not notice. The next operation that actually needs the proxy
+(`prepare_workflow` via `ProxyV2.from_pid_file`) fails cleanly with
+`ProxyUnreachable`, which is the appropriate error. Re-probing on
+every connect would cost a round trip that adds nothing.
+
 The browser-workflow watcher and publisher pinning that used to live
 here were removed in Stage 6 — the v2 pipeline is file-or-config
-driven, not browser-published. If a future feature needs to react to
-browser graph changes, it re-adds a watcher on top of the v2 proxy's
-job/asset surface, not on top of ComfyUI's `etn_workflow_published`
-bus.
+driven, not browser-published.
 """
 
 from __future__ import annotations
@@ -43,6 +58,20 @@ class ConnectionCommands(AutoDispatchHandler):
         host = params.get("host", "127.0.0.1")
         port = int(params.get("port", 8188))
         check = bool(params.get("check", True))
+
+        # ---- Short-circuit when already connected to this ComfyUI ----
+        if (parent._client is not None
+                and parent._host == host
+                and parent._port == port):
+            return {
+                "success": True,
+                "message": f"Already connected to {host}:{port}",
+                "data": {
+                    "host": host,
+                    "port": port,
+                    "short_circuit": True,
+                },
+            }
 
         # ---- Proxy prelude ----
         # Every generation path goes through /api/v2/* via the proxy;

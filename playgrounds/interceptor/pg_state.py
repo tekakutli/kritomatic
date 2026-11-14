@@ -93,6 +93,34 @@ PER-AREA COLOURS
 area id to pick from `MASK_COLORS`.  Duplicated (rather than shared)
 so this playground has no import-time dependency on multimask; the
 list is stable and small.
+
+PENDING LOCAL RUNS
+==================
+`board.pendingLocalRuns` tracks the task ids this client has fired
+`_runAction` / `_discardAction` for, and whose terminal status has
+not yet been confirmed by a list refresh.  `effectiveStatus(task)`
+returns `"running"` for any task in that set regardless of the
+task's last-polled status, so:
+
+  · The panel's Run / Discard buttons disable immediately on click
+    and stay disabled across the brief window between the click and
+    the server's status flip.  Without the set, re-selecting the
+    task during that window (against a stale poll cache) would
+    re-enable the buttons and a second click would reach
+    `handle_run`, which correctly returns `"task is running"` — a
+    graceful failure, but a visible flicker.
+
+  · The task-list row does not flip back to `"queued"` on the next
+    poll before the server has processed the request.
+
+The set is in-process state only.  It never reaches the server,
+never mutates `board.tasks`, and is cleared in `_runAction` /
+`_discardAction`'s `finally` block after the post-run refresh.  The
+server side already flips `_TASKS[tid].status` to `"running"` under
+its lock before doing any work, so the local set is just a mirror of
+a fact the server has already committed to; the two cannot disagree
+except in the interval after the click and before the server's flip,
+which is exactly what the set exists to cover.
 """
 
 STATE_JS = r"""
@@ -171,7 +199,34 @@ export const board = {
   showMultimask:       false,
   // Multimask snapshot from the daemon, or null.
   multimask:           null,
+  // Task ids this client has fired _runAction / _discardAction for,
+  // whose terminal status has not yet been confirmed by a list
+  // refresh.  See this module's docstring, "PENDING LOCAL RUNS".
+  pendingLocalRuns:    new Set(),
 };
+
+/* ============================================================
+   Effective status
+   ============================================================
+   The status the UI should display and gate on.  A task in
+   `pendingLocalRuns` reports "running" regardless of the last-
+   polled `task.status`, so the Run/Discard buttons disable
+   immediately on click and stay disabled across the brief window
+   between the click and the server's status flip.
+
+   Every UI consumer that renders or gates on a task's status reads
+   through this function, not `task.status` directly: the task-list
+   row, the info pane, the result line, and `syncPanelFields`'
+   button gating.  That is what keeps the panel consistent during
+   the window. */
+
+export function effectiveStatus(task) {
+  if (!task) return null;
+  if (task.task_id && board.pendingLocalRuns.has(task.task_id)) {
+    return "running";
+  }
+  return task.status;
+}
 
 /* ============================================================
    Draw scheduling — two levels
@@ -218,17 +273,6 @@ export function _scheduleDrawView() {
   if (typeof requestAnimationFrame === "function") requestAnimationFrame(_fire);
   else setTimeout(_fire, 16);
 }
-
-/* ============================================================
-   Resize — sizes BOTH canvases and clears the sig caches.
-   Setting `canvas.width` clears the pixel buffer regardless of
-   whether the sig would have changed, so the sigs MUST be reset
-   here unconditionally.
-
-   Calls `_drawViewFn` (if set) rather than `_drawFn`: a resize
-   invalidates canvas state only, not panel state, so the panel
-   sync in `draw()` would be a guaranteed no-op.  Fallback to
-   `_drawFn` for safety if `_setDrawView` was never called. */
 
 export function resize() {
   _dpr = window.devicePixelRatio || 1;

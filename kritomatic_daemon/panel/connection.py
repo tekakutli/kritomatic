@@ -9,45 +9,46 @@ Everything runs on plain Python threads and communicates with the
 GUI thread through Qt signals. No widget is ever touched off the
 GUI thread.
 
+Why the serial worker (and when it is bypassed)
+===============================================
 The single command worker is by design: it serialises state-mutating
 commands so an edit is committed before the next command reaches the
 daemon. That is what makes "edit a parameter then click Run" reliable.
 
 The corollary is that a command sent while the worker is busy waits.
-For long-running commands (comfy_generate holds the worker for the
+For long-running commands (`comfy_generate` holds the worker for the
 whole duration of the run), a queued follow-up would never be
 delivered until the run finished — which is exactly wrong for a
-cancel or for a read.
+cancel, for a read, or for the user's second Run click.
 
-Two methods therefore bypass the queue and open their own socket
+Three methods therefore bypass the queue and open their own socket
 per call:
 
-  send_cancel_now(batch_id, request_id)
-  request_layers()
+  send_run_now(request_id, bundle)      fire a run on its own thread
+                                         and socket; streams progress
+                                         and the batch_complete summary
+                                         back through the same Qt
+                                         signals the serial worker
+                                         uses.
+  send_cancel_now(batch_id, request_id)  fire a cancel; single reply
+                                         line.
+  request_layers()                       two commands, two sockets;
+                                         the daemon's inner loop parses
+                                         each chunk as one JSON object,
+                                         so two commands concatenated on
+                                         one socket would fail to parse.
 
-Both run on their own background thread, send one command, read one
-line, and close. The daemon's command server is per-connection and
-stateless across calls, so a fresh socket is safe, and the run's own
-socket is undisturbed.
+Each runs on its own background thread, so N concurrent calls to any
+of them do not interfere. `send_run_now` in particular is what makes
+"click Run twice" work: each click fires a bundle on its own socket,
+the daemon's per-connection handler spawns a handler thread for each,
+and the two runs proceed concurrently.
 
-`request_layers` sends two commands — `list_layers --all` and
-`comfy_list_recent_aliases` — on **two separate sockets**, one after
-the other. That is intentional: the daemon's socket server's inner
-loop parses each received chunk as one JSON object, so two commands
-concatenated on one socket would fail to parse. Two sequential
-sockets avoid the problem with a bounded, negligible cost on
-localhost.
-
-There is deliberately no `request_batches()` here. The docker used
-to poll `comfy_batches` on events to keep the Cancel-All button's
-precondition fresh, but that is unnecessary now: the daemon
-publishes a `state` event at batch *start* (see
-`handlers/comfyui.py` — `_publish_state_change` is called at batch
-registration) and again at batch *end* (via `execute()`'s wrapper
-when `comfy_generate` returns). The `active_batches` field in those
-state events is the sole source of truth for "is anything running
-anywhere", and the docker's `_on_state` handler reads it directly.
-No fetch, no timer.
+There is deliberately no `request_batches()` here. The daemon
+publishes a `state` event at batch *start* and again at batch *end*,
+and the `active_batches` field in those state events is the sole
+source of truth for "is anything running anywhere". The docker's
+`_on_state` handler reads it directly.
 
 Layer cache invalidation
 ========================
@@ -102,7 +103,10 @@ class DaemonConnection(QObject):
 
       stateReceived(dict)          — comfy_status state snapshots
       panelReceived(dict)          — panel description updates
-      runEventReceived(dict)       — progress entries from our own commands
+      runEventReceived(dict)       — progress entries from any running
+                                     command (serial worker or
+                                     send_run_now); `request_id` in the
+                                     payload identifies which run
       connectionStateChanged(bool) — event socket up/down
       commandCompleted(str, bool, dict)
                                    — (request_id, ok, summary)
@@ -168,8 +172,7 @@ class DaemonConnection(QObject):
         close, return the parsed reply or None.
 
         The daemon's socket server parses each incoming chunk as one
-        JSON object; one command per socket is what it expects. See
-        the module docstring for the two-command case.
+        JSON object; one command per socket is what it expects.
         """
         sock = None
         try:
@@ -225,6 +228,34 @@ class DaemonConnection(QObject):
         threading.Thread(
             target=_run,
             name="kritomatic-cancel",
+            daemon=True,
+        ).start()
+
+    def send_run_now(self, request_id: str, bundle: dict) -> None:
+        """Fire a run bundle on its own thread and socket, bypassing
+        the serial command worker.
+
+        Runs a `{"id": ..., "commands": [...]}` bundle exactly the way
+        the serial worker would, but without queueing. This is what
+        lets the docker user click Run multiple times in quick
+        succession: each click calls this method once, and N concurrent
+        calls run on N threads with N sockets.
+
+        Delegates to `_run_one_command`, which already implements the
+        protocol: send the bundle, stream `progress` messages through
+        `runEventReceived`, and terminate with one `commandCompleted`
+        carrying the `batch_complete` summary. The only difference
+        between this and the serial worker's path is that the call
+        happens on a fresh thread instead of through the queue.
+
+        The daemon accepts concurrent connections (one handler thread
+        per inbound socket), so the two runs proceed concurrently on
+        the daemon side too; see `server/socket_server.py`.
+        """
+        threading.Thread(
+            target=self._run_one_command,
+            args=(request_id, bundle),
+            name=f"kritomatic-run-{request_id}",
             daemon=True,
         ).start()
 
@@ -398,6 +429,14 @@ class DaemonConnection(QObject):
                 )
 
     def _run_one_command(self, request_id: str, bundle: dict) -> None:
+        """Send one bundle on a fresh socket, stream progress, emit
+        the summary.
+
+        Runs on the serial worker thread (from `_command_loop`) when
+        invoked through `enqueue`, or on a fresh thread when invoked
+        through `send_run_now`. Both call sites share this
+        implementation because the wire protocol is the same.
+        """
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(10.0)

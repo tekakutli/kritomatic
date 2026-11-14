@@ -25,10 +25,39 @@ never interrupted.  Each card carries:
 
 The section itself is hidden when `board.multimask` is null (no
 snapshot → the workflow doesn't use multimask).
+
+PENDING LOCAL RUNS
+==================
+Every status render and every status gate in this module reads
+through `effectiveStatus(task)` (exported from `pg_state.js`), not
+through `task.status` directly:
+
+  · `_syncTaskList` builds its diff signature from
+    `effectiveStatus(t)`, so a task entering or leaving
+    `board.pendingLocalRuns` re-renders the list, and the row's
+    status badge does not flip back to `"queued"` before the
+    server has actually flipped the status.
+
+  · `_syncTaskInfo` reads through `effectiveStatus(item)` so the
+    detail pane's "status:" line reports `"running"` during the
+    local-pending window.
+
+  · `_syncResult` gates its "inpainting…" line on
+    `effectiveStatus(item) === "running"` so the result line
+    matches the button state.
+
+  · `syncPanelFields` gates the Run / Discard buttons on
+    `effectiveStatus(summary) === "queued"` so they disable
+    immediately on click and stay disabled across the brief window
+    before the server has processed the request.
+
+This is what keeps the panel consistent during the click → server-
+flip window.  See `pg_state.py`'s "PENDING LOCAL RUNS" for the full
+rationale.
 """
 
 PANEL_FIELDS_JS = r"""
-import { board, areaColorById } from "./pg_state.js";
+import { board, areaColorById, effectiveStatus } from "./pg_state.js";
 
 let _els = null;
 function _get() {
@@ -68,9 +97,14 @@ function _syncTaskList() {
   const e = _get();
   if (!e.taskList) return;
 
+  // The signature reads through effectiveStatus so a task entering or
+  // leaving board.pendingLocalRuns re-renders the list (the row's
+  // status badge is what the user sees, and it should stay "running"
+  // until the server confirms).  See this module's "PENDING LOCAL
+  // RUNS" docstring section.
   const sig = board.order.map(tid => {
     const t = board.tasks[tid];
-    return tid + ":" + (t ? t.status : "");
+    return tid + ":" + (t ? effectiveStatus(t) : "");
   }).join("|") + "|" + (board.selectedTaskId || "");
   if (sig === _taskListSig) return;
   _taskListSig = sig;
@@ -100,9 +134,13 @@ function _syncTaskList() {
     label.title = tid;
     row.appendChild(label);
 
+    // Effective status, not t.status: a task this client has fired
+    // Run / Discard for reports "running" even if the last poll still
+    // shows "queued".  See pg_state.py's "PENDING LOCAL RUNS".
+    const eff = effectiveStatus(t);
     const st = document.createElement("span");
-    st.className = "taskStatus " + t.status;
-    st.textContent = t.status;
+    st.className = "taskStatus " + eff;
+    st.textContent = eff;
     row.appendChild(st);
 
     row.addEventListener("click", () => {
@@ -125,9 +163,13 @@ function _syncTaskInfo(item) {
     text = "no task selected";
   } else {
     const p = item.payload || {};
+    // Effective status, not item.status: reports "running" during the
+    // local-pending window so the detail pane stays consistent with
+    // the button state.
+    const eff = effectiveStatus(item) || "?";
     const lines = [
       "workflow: " + (p.workflow_name || "?"),
-      "status:   " + item.status,
+      "status:   " + eff,
       "id:       " + item.task_id,
     ];
     if (item.message) lines.push("message:  " + item.message);
@@ -171,6 +213,11 @@ function _syncResult(item) {
   const e = _get();
   if (!e.resultInfo) return;
   let text = "", cls = "";
+  // Effective status, not item.status: `effectiveStatus(item)` reports
+  // "running" during the local-pending window, so the "inpainting…"
+  // line appears as soon as Run is clicked rather than after the next
+  // poll.  See pg_state.py's "PENDING LOCAL RUNS".
+  const eff = item ? effectiveStatus(item) : null;
   if (item && item.result) {
     const r = item.result;
     const layers = (r.layer_names || []).join(", ") || "(none)";
@@ -180,13 +227,13 @@ function _syncResult(item) {
     text = "pasted " + (r.output_count || 0) + " layer(s) in " + timing
          + "\n" + layers;
     cls = "ok";
-  } else if (item && item.status === "error") {
+  } else if (item && eff === "error") {
     text = "failed: " + (item.message || "unknown");
     cls = "err";
-  } else if (item && item.status === "running") {
+  } else if (item && eff === "running") {
     text = "inpainting\u2026";
     cls = "";
-  } else if (item && item.status === "cancelled") {
+  } else if (item && eff === "cancelled") {
     text = "cancelled";
     cls = "";
   }
@@ -340,9 +387,14 @@ export function syncPanelFields() {
   // docstring.  It is set on task selection (in _selectTask) and
   // updated by the textarea's own input handler.
 
-  const status = summary ? summary.status : null;
-  const canRun     = status === "queued";
-  const canDiscard = status === "queued";
+  // Button gating reads through effectiveStatus: a task this client
+  // has fired Run / Discard for reports "running" even if the last
+  // poll still shows "queued", so the buttons disable on click and
+  // stay disabled across the click → server-flip window.  See
+  // pg_state.py's "PENDING LOCAL RUNS".
+  const eff = effectiveStatus(summary);
+  const canRun     = eff === "queued";
+  const canDiscard = eff === "queued";
   if (e.runBtn)     e.runBtn.disabled     = !canRun;
   if (e.discardBtn) e.discardBtn.disabled = !canDiscard;
 }

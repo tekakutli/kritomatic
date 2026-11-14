@@ -50,18 +50,32 @@ between `_sweep_expired_intercepts` (which publishes when it removes
 something) and `_publish_state_change` (which used to call
 `comfy_status`, which itself sweeps and publishes).
 
-Intercept mode
-==============
-When `_intercept_enabled` is True, `comfy_generate` prepares the
-workflow, POSTs the prepared graph + blobs to the interceptor
-playground, and returns immediately with `intercepted: True` in the
-response data.  The interceptor queues the task for user review; the
-user clicks Run, and the interceptor calls
-`comfy_resume_intercepted`, which runs the submit/poll/download/paste
-half of generation against the prepared snapshot.
+Concurrency
+===========
+The daemon's socket server spawns one handler thread per inbound
+connection (see `server/socket_server.py`). That means two concurrent
+`comfy_panel_run` bundles — whether from two docker clicks, the web
+panel, or two CLI terminals — are dispatched on two threads that
+share this handler's state.
 
-See `_comfy_generate_intercepted` and `comfy_resume_intercepted` in
-`comfyui_generation.py` for the full protocol.
+Three locks protect that state:
+
+  `_batches_lock`       guards `_batches`. Every mutation is a
+                        dict insert/pop; the lock has held since before
+                        concurrency was exposed at the client level.
+  `_intercepted_lock`   guards `_intercepted_batches`; same story.
+  `_paste_lock`         NEW. Guards the document-mutating half of the
+                        generation pipeline (`_paste_result` and the
+                        `_last_result` / `_last_document` writes that
+                        follow it). Two concurrent pastes on the same
+                        Krita document corrupt its layer tree: the two
+                        `rootNode().addChildNode` calls interleave, one
+                        node is lost, and the `refreshProjection` sees
+                        an inconsistent tree mid-rebuild. The lock
+                        serializes pastes so each sees a consistent
+                        document; prepares, network uploads, and the
+                        proxy poll loops are still fully concurrent
+                        because none of them touch the document.
 
 Workflow activation
 ===================
@@ -86,6 +100,15 @@ consumes `_active_config` for the native v2 pipeline.
 Both `_active_config` and the three slot tables are cleared on any
 workflow change (via `_set_active_workflow`) so a stale config can
 never accidentally apply to the wrong workflow.
+
+`comfy_panel_run` bypasses `_active_config` entirely: it validates the
+config inline (against the current slot tables) and passes it as a
+kwarg to `comfy_generate`. This is what makes concurrent runs safe —
+run-2's config never lands in `_active_config`, so it cannot overwrite
+run-1's config mid-prepare. `_active_config` remains the fallback for
+CLI callers that omit some sections; those callers are inherently
+serial (one CLI invocation, one batch), so the fallback's shared-
+mutable-state risk does not apply to them.
 
 Slot extraction failures
 ========================
@@ -137,6 +160,12 @@ class ComfyUIHandler(AutoDispatchHandler):
         # ---- batch tracking ----
         self._batches: dict = {}
         self._batches_lock = threading.Lock()
+        # Serializes the document-mutating half of generation
+        # (`_paste_result` plus the `_last_result` / `_last_document`
+        # writes it feeds). Prepare, uploads, and proxy polls stay
+        # concurrent; only the paste-critical section is serialized.
+        # See the module docstring, "Concurrency".
+        self._paste_lock = threading.Lock()
 
         # ---- intercept mode ----
         # Config-loaded at construction; updated by comfy_set_intercept.

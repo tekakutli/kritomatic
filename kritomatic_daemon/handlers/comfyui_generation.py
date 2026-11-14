@@ -1,6 +1,43 @@
 """comfyui_generation.py — submit workflows via the v2 proxy, poll,
 download outputs, paste into Krita.
 
+CONCURRENCY
+===========
+The daemon's socket server spawns one handler thread per inbound
+connection. Concurrent `comfy_panel_run` bundles therefore land on
+two threads sharing one handler. Three things make that safe:
+
+  1. `_comfy_generate_impl` snapshots everything it needs from handler
+     state (`_active_workflow_graph`, `_active_workflow_*_slots`,
+     `_active_config` — or the caller-supplied `config`) *once*, at
+     entry. Everything downstream reads the local snapshot. A
+     concurrent `comfy_load` / `comfy_apply_config` / another
+     `comfy_panel_run` cannot corrupt an in-flight run.
+
+  2. `comfy_panel_run` passes the validated config as a kwarg, not
+     through `_active_config`. Two concurrent runs never race on
+     `_active_config`. See `comfyui_config.py`'s module docstring.
+
+  3. The document-mutating half of the pipeline runs under
+     `self.parent._paste_lock`. That is `_paste_result` and the
+     `_last_result` / `_last_document` writes it feeds. Two concurrent
+     pastes on the same document corrupt its layer tree (interleaved
+     `rootNode().addChildNode` calls, lost node, `refreshProjection`
+     on an inconsistent tree); the lock serializes pastes so each
+     sees a consistent document. Prepare, upload, and poll remain
+     fully concurrent — they do not touch the document.
+
+The intercept branch takes the same snapshots. `_comfy_generate_
+intercepted` receives `graph`, `resource_slots`, `param_slots`,
+`config` as explicit kwargs, and passes `param_slots` and
+`interceptor_url` through to `_make_intercepted_batch` rather than
+letting it re-read `parent._active_workflow_param_slots` /
+`parent._intercept_url`. The one read that would otherwise race — the
+prompt-node lookup inside the intercepted batch — is thereby fixed:
+a concurrent `comfy_load` cannot swap the param tables out from
+under the batch-build step and cause the later
+`comfy_resume_intercepted` to look up a nonexistent node.
+
 ROTATION
 ========
 The paste stage reads `prepared.rotation` (set by `prepare_workflow`).
@@ -52,18 +89,16 @@ and its `MultiAreaConditioning` node pulls the just-pushed multimask
 state — so the state the user reviewed in the interceptor is the
 state the model runs against.
 
-See `comfy_resume_intercepted` below for the full flow.
+`_comfy_generate_intercepted` takes `config`, `graph`,
+`resource_slots`, `param_slots` as explicit kwargs, populated from
+`_comfy_generate_impl`'s entry-time snapshot.  This makes intercepted
+runs safe under concurrent clicks too: two intercepted runs cannot
+each pull a different `_active_config` at their own prepare time and
+then paste into each other's snapshots.
 
-A batch that is not resumed within `INTERCEPT_TIMEOUT_SEC` (15 min)
-is swept by `ComfyUIHandler._sweep_expired_intercepts` and disappears
-from `active_batches`.  A `comfy_resume_intercepted` for such a batch
-returns "batch expired or unknown".
-
-A `comfy_cancel` for an intercepted batch pops it from
-`_intercepted_batches` and best-effort POSTs `/intercept/cancel` to
-the interceptor's URL sibling so the interceptor can drop its queued
-copy.  If the POST fails, the interceptor's next resume gets "batch
-expired or unknown" and marks the task as errored — same net effect.
+The interceptor branch does NOT touch `_last_result` /
+`_last_document`. Those are written by `comfy_resume_intercepted`
+when the interceptor's Run actually completes.
 
 MULTIMASK SNAPSHOT
 ==================
@@ -87,13 +122,6 @@ Run, it pushes `{"op": "set", "state": <edited>}` to `<url>/state`
 with **no** `masks` field — multimask's own `_masks` dict keeps the
 originals so the `/mask` handler re-transforms correctly at execution
 time.  See `interceptor_server.handle_run` for the push side.
-
-FILES
-=====
-`_paste_result` rotation branch: un-rotation math preserved; the
-clipping-to-doc + paste-at-visible-bounds logic is preserved; the only
-change vs. the previous version is the sign of the `drawImage` offset,
-which was inverted for top/left clip cases.
 """
 
 from __future__ import annotations
@@ -306,11 +334,26 @@ class GenerationCommands(AutoDispatchHandler):
     def _comfy_generate_impl(self, params):
         parent = self.parent
 
+        # ---- Snapshot handler state at entry ----
+        #
+        # `comfy_panel_run` passes an explicit `config` as a kwarg so
+        # concurrent runs never touch `_active_config`. Callers that
+        # don't pass it (CLI's build_batch, comfy_save_config's
+        # followup) fall back to `parent._active_config`; those
+        # callers are inherently serial. The rest of this method uses
+        # only the local snapshots below. A concurrent comfy_load /
+        # comfy_apply_config cannot corrupt an in-flight run.
+        graph = parent._active_workflow_graph
+        resource_slots = parent._active_workflow_resource_slots
+        param_slots = parent._active_workflow_param_slots
+        workflow_name = parent._active_workflow_name or "(unnamed)"
+        config = params.get("config") or parent._active_config
+
         # ----- validate -----
-        if parent._active_workflow_graph is None:
+        if graph is None:
             return {"success": False,
                     "message": "No workflow loaded. Run comfy_load first."}
-        if parent._active_config is None:
+        if config is None:
             return {"success": False,
                     "message": "No panel config applied. Run "
                                "comfy_apply_config first."}
@@ -351,7 +394,6 @@ class GenerationCommands(AutoDispatchHandler):
                 base_seed = int(time.time()) & 0xFFFFFFFF
 
         batch_id = params.get("_batch_id") or str(uuid.uuid4())
-        workflow_name = parent._active_workflow_name or "(unnamed)"
 
         # ----- intercept branch -----
         #
@@ -368,9 +410,14 @@ class GenerationCommands(AutoDispatchHandler):
                 requested_count=requested_count,
                 base_seed=base_seed,
                 workflow_name=workflow_name,
+                graph=graph,
+                resource_slots=resource_slots,
+                param_slots=param_slots,
+                config=config,
+                interceptor_url=parent._intercept_url,
             )
 
-        # ----- normal path (unchanged) -----
+        # ----- normal path -----
         record = _BatchRecord(
             batch_id=batch_id,
             workflow_name=workflow_name,
@@ -386,7 +433,7 @@ class GenerationCommands(AutoDispatchHandler):
         try:
             warnings: list = []
 
-            has_seed_slot = "seed" in parent._active_workflow_param_slots
+            has_seed_slot = "seed" in param_slots
             if count > 1 and not has_seed_slot:
                 warnings.append(
                     f"count={requested_count} clamped to 1: the workflow "
@@ -395,7 +442,7 @@ class GenerationCommands(AutoDispatchHandler):
                 count = 1
                 record.total_runs = 1
 
-            paste_config = dict(parent._active_config["paste"])
+            paste_config = dict(config["paste"])
             batch_started = time.time()
 
             record.current_phase = "preparing"
@@ -422,10 +469,10 @@ class GenerationCommands(AutoDispatchHandler):
                 try:
                     prepared = prepare_workflow(
                         doc,
-                        parent._active_workflow_graph,
-                        parent._active_workflow_resource_slots,
-                        parent._active_workflow_param_slots,
-                        parent._active_config,
+                        graph,
+                        resource_slots,
+                        param_slots,
+                        config,
                         proxy,
                         seed=seed_i,
                     )
@@ -535,6 +582,56 @@ class GenerationCommands(AutoDispatchHandler):
                         "layer_names": [],
                         "_downloaded": downloaded,
                     })
+                    with parent._paste_lock:
+                        parent._last_result = {
+                            "outputs": downloaded,
+                            "job_id": job_id,
+                            "crop_bounds": prepared.crop_bounds,
+                            "paste_config": paste_config,
+                            "output_rotation": prepared.rotation,
+                        }
+                        parent._last_document = doc
+                    continue
+
+                with parent._paste_lock:
+                    try:
+                        paste_result = self._paste_result(
+                            doc,
+                            downloaded,
+                            crop_bounds=prepared.crop_bounds,
+                            paste_config=paste_config,
+                            job_id=job_id,
+                            seed_suffix=seed_i if count > 1 else None,
+                            output_rotation=prepared.rotation,
+                        )
+                    except Exception as e:
+                        import traceback
+                        print(f"[comfyui] paste raised:", flush=True)
+                        traceback.print_exc()
+                        record.run_records.append({
+                            "seed": seed_i, "prompt_id": job_id,
+                            "status": "paste_failed",
+                            "error": f"paste raised: {e}",
+                        })
+                        continue
+
+                    if not paste_result.get("success"):
+                        record.run_records.append({
+                            "seed": seed_i, "prompt_id": job_id,
+                            "status": "paste_failed",
+                            "error": paste_result.get(
+                                "message", "paste failed"),
+                        })
+                        continue
+
+                    pdata = paste_result.get("data") or {}
+                    record.run_records.append({
+                        "seed": seed_i, "prompt_id": job_id,
+                        "status": "success",
+                        "image_count": len(downloaded),
+                        "output_count": pdata.get("output_count", 0),
+                        "layer_names": list(pdata.get("layer_names", [])),
+                    })
                     parent._last_result = {
                         "outputs": downloaded,
                         "job_id": job_id,
@@ -543,68 +640,20 @@ class GenerationCommands(AutoDispatchHandler):
                         "output_rotation": prepared.rotation,
                     }
                     parent._last_document = doc
-                    continue
-
-                try:
-                    paste_result = self._paste_result(
-                        doc,
-                        downloaded,
-                        crop_bounds=prepared.crop_bounds,
-                        paste_config=paste_config,
-                        job_id=job_id,
-                        seed_suffix=seed_i if count > 1 else None,
-                        output_rotation=prepared.rotation,
-                    )
-                except Exception as e:
-                    import traceback
-                    print(f"[comfyui] paste raised:", flush=True)
-                    traceback.print_exc()
-                    record.run_records.append({
-                        "seed": seed_i, "prompt_id": job_id,
-                        "status": "paste_failed",
-                        "error": f"paste raised: {e}",
-                    })
-                    continue
-
-                if not paste_result.get("success"):
-                    record.run_records.append({
-                        "seed": seed_i, "prompt_id": job_id,
-                        "status": "paste_failed",
-                        "error": paste_result.get(
-                            "message", "paste failed"),
-                    })
-                    continue
-
-                pdata = paste_result.get("data") or {}
-                record.run_records.append({
-                    "seed": seed_i, "prompt_id": job_id,
-                    "status": "success",
-                    "image_count": len(downloaded),
-                    "output_count": pdata.get("output_count", 0),
-                    "layer_names": list(pdata.get("layer_names", [])),
-                })
-                parent._last_result = {
-                    "outputs": downloaded,
-                    "job_id": job_id,
-                    "crop_bounds": prepared.crop_bounds,
-                    "paste_config": paste_config,
-                    "output_rotation": prepared.rotation,
-                }
-                parent._last_document = doc
 
             record.current_phase = "finalizing"
 
             self._write_history_record(
                 batch_id=batch_id,
                 base_seed=base_seed,
-                base_params=dict(parent._active_config["params"]),
+                base_params=dict(config["params"]),
                 run_records=record.run_records,
                 warnings=warnings,
                 duration_s=time.time() - batch_started,
             )
 
             if any_prepare_succeeded:
-                self._record_used_layers(parent._active_config)
+                self._record_used_layers(config)
 
             successful = sum(1 for r in record.run_records
                              if r["status"] == "success")
@@ -693,8 +742,31 @@ class GenerationCommands(AutoDispatchHandler):
 
     def _comfy_generate_intercepted(self, *, doc, proxy,
                                     requested_count, base_seed,
-                                    workflow_name):
+                                    workflow_name,
+                                    graph, resource_slots, param_slots,
+                                    config, interceptor_url):
         """Prepare N workflows and hand them to the interceptor.
+
+        All inputs (`graph`, `resource_slots`, `param_slots`, `config`,
+        `interceptor_url`) come from `_comfy_generate_impl`'s
+        entry-time snapshot. This is what makes intercepted runs safe
+        under concurrent clicks: two intercepted runs each read the
+        same handler state at their own entry, and neither reads
+        `_active_config` / `_active_workflow_param_slots` /
+        `_intercept_url` at prepare time.
+
+        `interceptor_url` is used both in the log message and in every
+        `InterceptedBatch.interceptor_url`, so a concurrent
+        `comfy_set_intercept --url` cannot result in a batch that is
+        half-registered against one URL and half against another.
+
+        `param_slots` is passed to `_make_intercepted_batch` for the
+        prompt-node lookup. Without it, a concurrent `comfy_load`
+        could swap the param tables between `_comfy_generate_impl`'s
+        snapshot and the batch-build step, causing the prompt node id
+        to point at a nonexistent node in the prepared graph; the
+        later prompt override would then silently no-op (no error,
+        no warning).
 
         Unlike the normal path, this method never enters `_batches`: it
         builds `InterceptedBatch` records and stores them in
@@ -720,7 +792,7 @@ class GenerationCommands(AutoDispatchHandler):
         """
         parent = self.parent
 
-        has_seed_slot = "seed" in parent._active_workflow_param_slots
+        has_seed_slot = "seed" in param_slots
         if requested_count > 1 and not has_seed_slot:
             count = 1
             warnings_list = [
@@ -732,14 +804,7 @@ class GenerationCommands(AutoDispatchHandler):
             warnings_list = []
 
         # ---- Multimask snapshot, fetched once before the prepare loop ----
-        #
-        # Fetching it here (rather than per-run) ensures all N runs see
-        # the same multimask state, and puts the /mask transform call
-        # immediately before prepare_workflow's /crop_frame query, so
-        # both operate on the same frame under normal user idleness.
-        multimask_url = _get_multimask_url_from_graph(
-            parent._active_workflow_graph
-        )
+        multimask_url = _get_multimask_url_from_graph(graph)
         multimask_snapshot: Optional[dict] = None
         if multimask_url:
             print(f"[comfyui] intercept: fetching multimask snapshot "
@@ -775,10 +840,10 @@ class GenerationCommands(AutoDispatchHandler):
             try:
                 prepared = prepare_workflow(
                     doc,
-                    parent._active_workflow_graph,
-                    parent._active_workflow_resource_slots,
-                    parent._active_workflow_param_slots,
-                    parent._active_config,
+                    graph,
+                    resource_slots,
+                    param_slots,
+                    config,
                     proxy,
                     seed=seed_i,
                 )
@@ -804,6 +869,9 @@ class GenerationCommands(AutoDispatchHandler):
                     seed=seed_i,
                     base_seed=base_seed,
                     multimask_snapshot=multimask_snapshot,
+                    config=config,
+                    param_slots=param_slots,
+                    interceptor_url=interceptor_url,
                 )
             except Exception as e:
                 errors.append(f"batch_build[{i}]: {e}")
@@ -840,7 +908,7 @@ class GenerationCommands(AutoDispatchHandler):
             }
 
         msg = (f"Intercepted {len(intercepted_ids)} of "
-               f"{requested_count} run(s) at {parent._intercept_url}")
+               f"{requested_count} run(s) at {interceptor_url}")
         combined = list(warnings_list) + list(errors)
         if combined:
             msg += " \u2014 " + "; ".join(combined)
@@ -853,7 +921,7 @@ class GenerationCommands(AutoDispatchHandler):
                 "batch_ids": intercepted_ids,
                 "count": len(intercepted_ids),
                 "requested_count": requested_count,
-                "interceptor_url": parent._intercept_url,
+                "interceptor_url": interceptor_url,
                 "warnings": warnings_list,
                 "errors": errors,
                 "multimask_url": multimask_url,
@@ -866,8 +934,25 @@ class GenerationCommands(AutoDispatchHandler):
 
     def _make_intercepted_batch(self, *, index, count, workflow_name,
                                 prepared, seed, base_seed,
-                                multimask_snapshot: Optional[dict] = None):
+                                multimask_snapshot: Optional[dict] = None,
+                                config, param_slots, interceptor_url):
         """Build one InterceptedBatch from a prepared workflow.
+
+        `config`, `param_slots`, and `interceptor_url` are the
+        snapshots taken at `_comfy_generate_impl` entry. They are used
+        here — instead of `parent._active_config` /
+        `parent._active_workflow_param_slots` / `parent._intercept_url`
+        — so a concurrent `comfy_load`, `comfy_apply_config`, or
+        `comfy_set_intercept` cannot corrupt this batch's construction.
+
+        `param_slots` is the load-time snapshot the prepared graph was
+        built against. `prompt_slot = param_slots.get("prompt")` is
+        therefore guaranteed to reference a node that exists in
+        `prepared.graph`. Without this guarantee, a concurrent
+        `comfy_load` could swap the param tables, `prompt_node_id`
+        could point at a node from the new graph, and the later
+        `comfy_resume_intercepted` prompt override would silently
+        no-op (the lookup would find no node).
 
         Snapshots everything the resume path will need: the prepared
         graph (for submit), crop bounds + paste config + rotation (for
@@ -875,8 +960,6 @@ class GenerationCommands(AutoDispatchHandler):
         `@`-resource blobs (for display in the interceptor's canvas),
         and the multimask snapshot (for area display + prompt edits).
         """
-        parent = self.parent
-
         # batch_id: suffix per-run index when count > 1 so ids are
         # distinct across runs of the same comfy_generate call.
         token = uuid.uuid4().hex[:12]
@@ -887,8 +970,11 @@ class GenerationCommands(AutoDispatchHandler):
         )
 
         # Resolve the prompt node.  The workflow's `prompt` Primitive
-        # slot, if it has one, is where the override goes.
-        prompt_slot = parent._active_workflow_param_slots.get("prompt") or {}
+        # slot, if it has one, is where the override goes. Look it up
+        # in the load-time param_slots snapshot; the node is guaranteed
+        # to exist in prepared.graph because the same snapshot was
+        # passed to prepare_workflow.
+        prompt_slot = param_slots.get("prompt") or {}
         prompt_node_id = prompt_slot.get("node_id")
         prompt_original = ""
         if prompt_node_id:
@@ -896,10 +982,7 @@ class GenerationCommands(AutoDispatchHandler):
             v = (node.get("inputs") or {}).get("value", "")
             prompt_original = str(v) if v is not None else ""
 
-        # Pull the three resource blobs.  Missing keys become empty
-        # strings on the wire; the interceptor handles that gracefully
-        # (shows a placeholder) but we already refused to intercept
-        # without @thecanvas, so the canvas will always be present.
+        # Pull the three resource blobs.
         blobs = prepared.blobs or {}
         canvas_bytes = blobs.get("@thecanvas", b"")
         sel_bytes = blobs.get("@theselection", b"")
@@ -932,15 +1015,15 @@ class GenerationCommands(AutoDispatchHandler):
             prompt_original=prompt_original,
             crop_bounds=tuple(prepared.crop_bounds),
             output_rotation=float(prepared.rotation),
-            paste_config=dict(parent._active_config["paste"]),
+            paste_config=dict(config["paste"]),
             base_seed=int(base_seed),
             seed=int(seed),
             canvas_b64=_b64(canvas_bytes),
             selection_b64=_b64(sel_bytes),
             context_b64=_b64(ctx_bytes),
-            params_snapshot=dict(parent._active_config.get("params") or {}),
+            params_snapshot=dict(config.get("params") or {}),
             warnings=warnings,
-            interceptor_url=parent._intercept_url,
+            interceptor_url=interceptor_url,
             multimask_url=mm_url,
             multimask_state=mm_state,
             multimask_masks=mm_masks,
@@ -1018,11 +1101,6 @@ class GenerationCommands(AutoDispatchHandler):
         before the user tries to run it and gets "batch expired or
         unknown".  Failure is swallowed: the interceptor's resume path
         handles a missing batch gracefully.
-
-        The sibling URL is derived by replacing the intake endpoint's
-        last path component (`intake` → `cancel`).  If the URL doesn't
-        end in `/intake`, we fall back to `/intercept/cancel` relative
-        to the origin.
         """
         if not url:
             return
@@ -1036,7 +1114,6 @@ class GenerationCommands(AutoDispatchHandler):
                     p._replace(path=path_parts[0] + "/cancel")
                 )
             else:
-                # Fallback: replace the last component unconditionally.
                 if len(path_parts) == 2:
                     cancel_url = urlunparse(
                         p._replace(path=path_parts[0] + "/cancel")
@@ -1162,10 +1239,6 @@ class GenerationCommands(AutoDispatchHandler):
             }
 
         # Apply the prompt override in-place on the prepared graph.
-        # We mutate the graph dict rather than re-running
-        # `substitute_into_graph` because the graph has already been
-        # substituted with asset refs and param values; only the prompt
-        # node's `value` needs updating, and its node id is recorded.
         prompt_override_applied = False
         if prompt_override is not None:
             if record.prompt_node_id:
@@ -1173,9 +1246,6 @@ class GenerationCommands(AutoDispatchHandler):
                 if node is not None and "inputs" in node:
                     node["inputs"]["value"] = str(prompt_override)
                     prompt_override_applied = True
-            # If no prompt slot, silently keep the original.  The
-            # record already warns about this; surfacing it in the
-            # response too is useful for CLI users.
 
         # Notify the docker the batch is gone from the review queue.
         parent._publish_state_change()
@@ -1262,58 +1332,54 @@ class GenerationCommands(AutoDispatchHandler):
             }
 
         # ---- paste ----
-        #
-        # The seed suffix is used only when the batch had multiple
-        # runs.  We stored both base_seed and per-run seed on the
-        # record, so a mismatch means this was a multi-run batch and
-        # the layer name should be disambiguated.
         seed_suffix = (
             record.seed if record.base_seed != record.seed else None
         )
 
-        try:
-            paste_result = self._paste_result(
-                doc,
-                downloaded,
-                crop_bounds=record.crop_bounds,
-                paste_config=record.paste_config,
-                job_id=job_id,
-                seed_suffix=seed_suffix,
-                output_rotation=record.output_rotation,
-            )
-        except Exception as e:
-            import traceback
-            print("[comfyui] resume paste raised:", flush=True)
-            traceback.print_exc()
+        with parent._paste_lock:
+            try:
+                paste_result = self._paste_result(
+                    doc,
+                    downloaded,
+                    crop_bounds=record.crop_bounds,
+                    paste_config=record.paste_config,
+                    job_id=job_id,
+                    seed_suffix=seed_suffix,
+                    output_rotation=record.output_rotation,
+                )
+            except Exception as e:
+                import traceback
+                print("[comfyui] resume paste raised:", flush=True)
+                traceback.print_exc()
+                return {
+                    "success": False,
+                    "message": f"paste raised: {e}",
+                    "data": {
+                        "batch_id": record.batch_id,
+                        "job_id": job_id,
+                    },
+                }
+
+            if not paste_result.get("success"):
+                return paste_result
+
+            pdata = paste_result.get("data") or {}
+            elapsed = time.time() - started
+
             return {
-                "success": False,
-                "message": f"paste raised: {e}",
+                "success": True,
+                "message": paste_result.get("message") or "Pasted",
                 "data": {
                     "batch_id": record.batch_id,
                     "job_id": job_id,
+                    "workflow": record.workflow_name,
+                    "layer_names": list(pdata.get("layer_names") or []),
+                    "output_count": int(pdata.get("output_count", 0)),
+                    "image_count": len(downloaded),
+                    "timing": round(elapsed, 3),
+                    "prompt_override_applied": prompt_override_applied,
                 },
             }
-
-        if not paste_result.get("success"):
-            return paste_result
-
-        pdata = paste_result.get("data") or {}
-        elapsed = time.time() - started
-
-        return {
-            "success": True,
-            "message": paste_result.get("message") or "Pasted",
-            "data": {
-                "batch_id": record.batch_id,
-                "job_id": job_id,
-                "workflow": record.workflow_name,
-                "layer_names": list(pdata.get("layer_names") or []),
-                "output_count": int(pdata.get("output_count", 0)),
-                "image_count": len(downloaded),
-                "timing": round(elapsed, 3),
-                "prompt_override_applied": prompt_override_applied,
-            },
-        }
 
     def _poll_job_for_resume(self, proxy, job_id, *,
                              timeout: float) -> Optional[dict]:
@@ -1521,15 +1587,6 @@ class GenerationCommands(AutoDispatchHandler):
         batch_id = params.get("batch_id") or None
 
         # ---- intercepted batches first ----
-        #
-        # Cancelling an intercepted batch means dropping the record
-        # and best-effort POSTing /intercept/cancel to the interceptor
-        # so the interceptor's queued task is marked cancelled before
-        # the user tries to run it.  We do this before touching
-        # `_batches` so a batch_id that names an intercepted record
-        # gets the correct treatment even if a same-named internal
-        # record also exists (it shouldn't, but this is the
-        # least-surprise ordering).
         intercepted_url_to_notify: Optional[str] = None
         intercepted_ids_cancelled: list = []
 
@@ -1548,8 +1605,6 @@ class GenerationCommands(AutoDispatchHandler):
                     del parent._intercepted_batches[bid]
 
         if intercepted_ids_cancelled:
-            # One notify per batch_id (or one nil-batch_id broadcast
-            # for cancel-all).
             threading.Thread(
                 target=self._notify_interceptor_cancel,
                 args=(intercepted_url_to_notify,
@@ -1562,7 +1617,6 @@ class GenerationCommands(AutoDispatchHandler):
             if batch_id:
                 record = parent._batches.get(batch_id)
                 if record is None:
-                    # Only intercepted hits so far? Success.
                     if intercepted_ids_cancelled:
                         return {
                             "success": True,
@@ -1659,21 +1713,22 @@ class GenerationCommands(AutoDispatchHandler):
             paste_config["name"] = params["name"]
         blend_mode = params.get("blend_mode") or "normal"
 
-        return self._paste_result(
-            doc,
-            parent._last_result["outputs"],
-            crop_bounds=parent._last_result.get(
-                "crop_bounds",
-                (0, 0, int(doc.width()), int(doc.height())),
-            ),
-            paste_config=paste_config,
-            job_id=parent._last_result.get("job_id", "?"),
-            seed_suffix=None,
-            output_rotation=parent._last_result.get(
-                "output_rotation", 0.0,
-            ),
-            blend_mode=blend_mode,
-        )
+        with parent._paste_lock:
+            return self._paste_result(
+                doc,
+                parent._last_result["outputs"],
+                crop_bounds=parent._last_result.get(
+                    "crop_bounds",
+                    (0, 0, int(doc.width()), int(doc.height())),
+                ),
+                paste_config=paste_config,
+                job_id=parent._last_result.get("job_id", "?"),
+                seed_suffix=None,
+                output_rotation=parent._last_result.get(
+                    "output_rotation", 0.0,
+                ),
+                blend_mode=blend_mode,
+            )
 
     # ------------------------------------------------------------------
     #  comfy_paste_image_b64

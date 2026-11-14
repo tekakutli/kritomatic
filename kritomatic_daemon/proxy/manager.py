@@ -39,6 +39,37 @@ DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP (Windows) so it is not killed
 when the daemon's parent thread exits. On daemon restart, status()
 re-discovers a still-running proxy via pid.json.
 
+Concurrent start() calls
+========================
+`start()` performs a check-then-spawn sequence:
+
+    status()       → not running
+    _port_open()   → False
+    Popen(...)     → spawn
+    write pid.json
+
+Two threads (e.g. two concurrent `comfy_panel_run` calls, each of
+which calls `comfy_connect`, each of which calls `start()`) can race
+the check. Without a lock, both can pass both checks and both spawn
+a child. The second child's bind() fails, and one of the two
+`start()` calls returns `{"success": False, "message": "port already
+in use"}` — surfacing as an apparently-random "connect failed" on a
+user's second Run click, even though the proxy is healthy.
+
+`_START_LOCK` serializes the whole sequence. It is a module-level
+lock; the venv directory on disk is the shared state it protects, and
+that state is process-global within a single daemon, so a module
+lock is the right scope. The second caller wakes to find `status()`
+reporting the child that the first caller spawned; it short-circuits
+at the `existing running` branch and returns cleanly.
+
+The lock is *not* held during the health-probe wait (`_wait_health`
+polling for up to 15 s). Holding it there would block every other
+`comfy_connect` for the duration of the probe, which is worse than
+the race it prevents. The check-then-spawn window is what matters:
+it is tens of microseconds between `_port_open` and `Popen`, and it
+is inside the lock.
+
 Async install
 =============
 `install()` takes ~30s (venv + pip). The CLI's command transport has a
@@ -70,6 +101,13 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+
+# ---------------------------------------------------------------------------
+#  Start-race lock (see module docstring)
+# ---------------------------------------------------------------------------
+
+_START_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -527,103 +565,114 @@ def start(*,
     Idempotent when an existing proxy already points at the same
     ComfyUI. Errors when one points elsewhere (stop it first), or when
     the port is already taken by another process.
+
+    The check-then-spawn sequence runs under `_START_LOCK` so two
+    concurrent `comfy_connect` calls (e.g. from two concurrently-firing
+    `comfy_panel_run` runs) cannot both decide "not running" and both
+    spawn a child. See the module docstring, "Concurrent start() calls".
     """
-    existing = status()
-    existing_data = existing.get("data") or {}
-    if existing_data.get("running"):
-        existing_comfyui = existing_data.get("comfyui")
-        if existing_comfyui and existing_comfyui != comfyui:
+    with _START_LOCK:
+        existing = status()
+        existing_data = existing.get("data") or {}
+        if existing_data.get("running"):
+            existing_comfyui = existing_data.get("comfyui")
+            if existing_comfyui and existing_comfyui != comfyui:
+                return {
+                    "success": False,
+                    "message": (
+                        f"proxy already running (pid {existing_data['pid']}) "
+                        f"pointed at {existing_comfyui}, not {comfyui}. "
+                        f"Run `comfy_proxy_stop` first."
+                    ),
+                    "data": existing_data,
+                }
+            return {
+                "success": True,
+                "message": f"already running (pid {existing_data['pid']})",
+                "data": existing_data,
+            }
+
+        binary: str | None = None
+        if _proxy_bin().exists():
+            binary = str(_proxy_bin())
+        else:
+            on_path = shutil.which("comfy-api-proxy")
+            if on_path:
+                binary = on_path
+        if binary is None:
             return {
                 "success": False,
                 "message": (
-                    f"proxy already running (pid {existing_data['pid']}) "
-                    f"pointed at {existing_comfyui}, not {comfyui}. "
-                    f"Run `comfy_proxy_stop` first."
+                    "comfy-api-proxy is not installed. Run "
+                    "`comfy_proxy_install` first, or install it manually "
+                    "with `pipx install comfy-api-proxy`."
                 ),
-                "data": existing_data,
             }
-        return {
-            "success": True,
-            "message": f"already running (pid {existing_data['pid']})",
-            "data": existing_data,
+
+        if _port_open(host, port):
+            return {
+                "success": False,
+                "message": f"port {port} on {host} is already in use",
+            }
+
+        argv = [binary, "run", "--comfyui", comfyui,
+                "--host", host, "--port", str(port)]
+        if comfyui_base_dir:
+            argv += ["--comfyui-base-dir", comfyui_base_dir]
+        if token:
+            argv += ["--token", token]
+
+        _data_root().mkdir(parents=True, exist_ok=True)
+        _log_file().touch(exist_ok=True)
+        log_handle = _log_file().open("ab")
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": log_handle,
+            "stderr": log_handle,
         }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED | NEW_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
 
-    binary: str | None = None
-    if _proxy_bin().exists():
-        binary = str(_proxy_bin())
-    else:
-        on_path = shutil.which("comfy-api-proxy")
-        if on_path:
-            binary = on_path
-    if binary is None:
-        return {
-            "success": False,
-            "message": (
-                "comfy-api-proxy is not installed. Run "
-                "`comfy_proxy_install` first, or install it manually "
-                "with `pipx install comfy-api-proxy`."
-            ),
-        }
+        try:
+            proc = subprocess.Popen(argv, **popen_kwargs)
+        except OSError as e:
+            log_handle.close()
+            return {"success": False, "message": f"failed to spawn proxy: {e}"}
+        finally:
+            log_handle.close()
 
-    if _port_open(host, port):
-        return {
-            "success": False,
-            "message": f"port {port} on {host} is already in use",
-        }
+        # Health probe runs *outside* the lock; blocking every other
+        # comfy_connect for the full ~15 s probe would be worse than
+        # the race it prevents. The check-then-spawn window (below
+        # `_port_open` and above `Popen`) is the part that matters,
+        # and that is inside the lock.
+        if not _wait_health(host, port, proc, timeout=15.0):
+            _terminate(proc.pid)
+            return {
+                "success": False,
+                "message": f"proxy failed to become healthy; see {_log_file()}",
+                "data": {"pid": proc.pid, "log": str(_log_file())},
+            }
 
-    argv = [binary, "run", "--comfyui", comfyui,
-            "--host", host, "--port", str(port)]
-    if comfyui_base_dir:
-        argv += ["--comfyui-base-dir", comfyui_base_dir]
-    if token:
-        argv += ["--token", token]
-
-    _data_root().mkdir(parents=True, exist_ok=True)
-    _log_file().touch(exist_ok=True)
-    log_handle = _log_file().open("ab")
-    popen_kwargs: dict[str, Any] = {
-        "stdin": subprocess.DEVNULL,
-        "stdout": log_handle,
-        "stderr": log_handle,
-    }
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED | NEW_GROUP
-    else:
-        popen_kwargs["start_new_session"] = True
-
-    try:
-        proc = subprocess.Popen(argv, **popen_kwargs)
-    except OSError as e:
-        log_handle.close()
-        return {"success": False, "message": f"failed to spawn proxy: {e}"}
-    finally:
-        log_handle.close()
-
-    if not _wait_health(host, port, proc, timeout=15.0):
-        _terminate(proc.pid)
-        return {
-            "success": False,
-            "message": f"proxy failed to become healthy; see {_log_file()}",
-            "data": {"pid": proc.pid, "log": str(_log_file())},
-        }
-
-    _pid_file().write_text(json.dumps({
-        "pid": proc.pid,
-        "host": host,
-        "port": port,
-        "comfyui": comfyui,
-    }))
-
-    return {
-        "success": True,
-        "message": f"started on {host}:{port} (pid {proc.pid})",
-        "data": {
+        _pid_file().write_text(json.dumps({
             "pid": proc.pid,
             "host": host,
             "port": port,
             "comfyui": comfyui,
-        },
-    }
+        }))
+
+        return {
+            "success": True,
+            "message": f"started on {host}:{port} (pid {proc.pid})",
+            "data": {
+                "pid": proc.pid,
+                "host": host,
+                "port": port,
+                "comfyui": comfyui,
+            },
+        }
 
 
 def stop() -> dict[str, Any]:

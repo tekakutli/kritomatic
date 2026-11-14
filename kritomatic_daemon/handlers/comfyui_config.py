@@ -8,8 +8,52 @@ Config commands:
     against the loaded workflow's slot tables, and stores the normalized
     result on the handler for `comfy_generate` to consume.
   * `comfy_prepare_only` — diagnostic.
-  * `comfy_panel_run` — connect, apply, generate.
+  * `comfy_panel_run` — connect, validate, generate.  Passes the
+    validated config to `comfy_generate` as a kwarg; does NOT write
+    `_active_config`.
   * `comfy_save_config` — write the current panel config.
+
+Concurrency
+===========
+`comfy_apply_config` writes `_active_config`. `comfy_panel_run` does
+NOT: it validates the config inline and passes the result through to
+`comfy_generate` as an explicit argument. This is the load-bearing
+change that makes concurrent Run clicks work.
+
+Consider the previous shape — `comfy_panel_run` = `comfy_apply_config`
+followed by `comfy_generate` reading `_active_config`:
+
+    run-1: apply(A)  →  _active_config = A
+    run-2: apply(B)  →  _active_config = B      ← overwrites A
+    run-1: generate  →  reads _active_config, sees B     ✗
+
+The race window is the entire duration of `comfy_apply_config`'s own
+validation, tens of milliseconds for a normal config. Two Run clicks
+50 ms apart reliably trip it: the second click's apply runs while the
+first click's generate has not yet read `_active_config`.
+
+The new shape:
+
+    run-1: validate(A)  →  local_a = A
+    run-2: validate(B)  →  local_b = B
+    run-1: generate(config=local_a)  →  uses A     ✓
+    run-2: generate(config=local_b)  →  uses B     ✓
+
+`comfy_apply_config` continues to exist and continues to write
+`_active_config`. Two callers still rely on that: the CLI's `panel run`
+sends the batch
+`comfy_connect → comfy_load → comfy_apply_config → comfy_generate`,
+and `comfy_save_config` writes the current `_active_config` to disk.
+Both callers are inherently serial (one batch per CLI invocation), so
+the shared-mutable-state risk does not apply to them.
+
+`_validate_config` — the pure validator, shared by `comfy_apply_config`
+and `comfy_panel_run` — takes the slot tables as parameters rather
+than reading them from `self.parent`. Two concurrent `comfy_panel_run`
+calls may see the same slot tables (both read from
+`parent._active_workflow_*` at snapshot time), and if `comfy_load`
+does change them mid-run, the run that already validated keeps its
+own snapshot.
 
 Scratch-layer command:
 
@@ -82,6 +126,142 @@ class ConfigCommands(AutoDispatchHandler):
     def __init__(self, parent):
         self.parent = parent
         super().__init__()
+
+    # ------------------------------------------------------------------
+    #  _validate_config (pure)
+    # ------------------------------------------------------------------
+    #
+    # Pure validator: takes the raw four-section inputs plus the slot
+    # tables to validate against. Returns (normalized_config, None) on
+    # success, (None, error_message) on failure. Does not touch handler
+    # state. Callers decide what to do with the result:
+    #
+    #   comfy_apply_config  stores it in `_active_config`
+    #   comfy_panel_run     passes it as a kwarg to `comfy_generate`
+    #
+    # Both call sites share this body so validation is identical. See
+    # the module docstring, "Concurrency", for why comfy_panel_run
+    # must not use the store-and-read path.
+
+    def _validate_config(self,
+                         resources_str,
+                         params_str,
+                         crop_str,
+                         paste_str,
+                         resource_slots: dict,
+                         param_slots: dict):
+        try:
+            resources = json.loads(resources_str or "{}")
+            params_obj = json.loads(params_str or "{}")
+            crop = json.loads(crop_str or "{}")
+            paste = json.loads(paste_str or "{}")
+        except json.JSONDecodeError as e:
+            return None, f"config parse error: {e}"
+
+        for name, obj in (("resources", resources), ("params", params_obj),
+                          ("crop", crop), ("paste", paste)):
+            if not isinstance(obj, dict):
+                return None, f"'{name}' must be a JSON object"
+
+        unknown_resources = set(resources) - set(resource_slots)
+        if unknown_resources:
+            return None, (
+                f"[resources] references unknown @-name(s): "
+                f"{sorted(unknown_resources)}. "
+                f"Available in the loaded graph: "
+                f"{sorted(resource_slots) or '(none)'}."
+            )
+
+        unknown_params = set(params_obj) - set(param_slots)
+        if unknown_params:
+            return None, (
+                f"[params] references unknown _meta.title(s): "
+                f"{sorted(unknown_params)}. "
+                f"Available in the loaded graph: "
+                f"{sorted(param_slots) or '(none)'}."
+            )
+
+        normalized_resources: dict[str, dict] = {}
+        for res_name, res_spec in resources.items():
+            if not isinstance(res_spec, dict):
+                return None, (
+                    f"resource {res_name!r}: must be a JSON object with "
+                    f"a 'source' field"
+                )
+            source = res_spec.get("source")
+            if source not in _RESOURCE_SOURCES:
+                return None, (
+                    f"resource {res_name!r}: source must be one of "
+                    f"{sorted(_RESOURCE_SOURCES)}, got {source!r}"
+                )
+            layer_name = res_spec.get("layer_name")
+            if source == "layer":
+                if not isinstance(layer_name, str) or not layer_name:
+                    return None, (
+                        f"resource {res_name!r}: source='layer' requires "
+                        f"a non-empty layer_name"
+                    )
+            else:
+                layer_name = None
+            normalized_resources[res_name] = {
+                "source": source,
+                "layer_name": layer_name,
+            }
+
+        for param_name, param_value in params_obj.items():
+            kind = param_slots[param_name]["kind"]
+            if not _KIND_ACCEPTORS[kind](param_value):
+                return None, (
+                    f"param {param_name!r}: expected {kind}, "
+                    f"got {type(param_value).__name__} ({param_value!r})"
+                )
+
+        crop_context = crop.get("context", "entire_image")
+        if crop_context not in _CROP_CONTEXTS:
+            return None, (
+                f"crop.context must be one of "
+                f"{sorted(_CROP_CONTEXTS)}, got {crop_context!r}"
+            )
+        crop_padding = crop.get("padding", 0)
+        if (not isinstance(crop_padding, int)
+                or isinstance(crop_padding, bool)
+                or crop_padding < 0):
+            return None, (
+                f"crop.padding must be a non-negative integer, "
+                f"got {crop_padding!r}"
+            )
+
+        paste_batch_mode = paste.get("batch_mode", "default")
+        if paste_batch_mode not in _PASTE_BATCH_MODES:
+            return None, (
+                f"paste.batch_mode must be one of "
+                f"{sorted(_PASTE_BATCH_MODES)}, got {paste_batch_mode!r}"
+            )
+
+        def _coerce_int(obj, key, default=0):
+            v = obj.get(key, default)
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return default
+
+        normalized_paste = {
+            "x": _coerce_int(paste, "x"),
+            "y": _coerce_int(paste, "y"),
+            "name": str(paste.get("name") or ""),
+            "batch_mode": paste_batch_mode,
+            "resize_canvas": bool(paste.get("resize_canvas", False)),
+        }
+
+        return {
+            "resources": normalized_resources,
+            "params": dict(params_obj),
+            "crop": {
+                "context": crop_context,
+                "padding": crop_padding,
+            },
+            "paste": normalized_paste,
+        }, None
 
     # ------------------------------------------------------------------
     #  comfy_set_layer_pixels
@@ -285,7 +465,7 @@ class ConfigCommands(AutoDispatchHandler):
         }
 
     # ------------------------------------------------------------------
-    #  comfy_apply_config (unchanged)
+    #  comfy_apply_config
     # ------------------------------------------------------------------
 
     @command(
@@ -305,149 +485,39 @@ class ConfigCommands(AutoDispatchHandler):
             return {"success": False,
                     "message": "No workflow loaded; run comfy_load first"}
 
-        try:
-            resources = json.loads(params.get("resources") or "{}")
-            params_obj = json.loads(params.get("params") or "{}")
-            crop = json.loads(params.get("crop") or "{}")
-            paste = json.loads(params.get("paste") or "{}")
-        except json.JSONDecodeError as e:
-            return {"success": False,
-                    "message": f"config parse error: {e}"}
+        config, err = self._validate_config(
+            params.get("resources"), params.get("params"),
+            params.get("crop"), params.get("paste"),
+            parent._active_workflow_resource_slots,
+            parent._active_workflow_param_slots,
+        )
+        if err is not None:
+            return {"success": False, "message": err}
 
-        for name, obj in (("resources", resources), ("params", params_obj),
-                          ("crop", crop), ("paste", paste)):
-            if not isinstance(obj, dict):
-                return {"success": False,
-                        "message": f"'{name}' must be a JSON object"}
-
-        resource_slots = parent._active_workflow_resource_slots
-        param_slots = parent._active_workflow_param_slots
-
-        unknown_resources = set(resources) - set(resource_slots)
-        if unknown_resources:
-            return {
-                "success": False,
-                "message": (
-                    f"[resources] references unknown @-name(s): "
-                    f"{sorted(unknown_resources)}. "
-                    f"Available in the loaded graph: "
-                    f"{sorted(resource_slots) or '(none)'}."
-                ),
-            }
-
-        unknown_params = set(params_obj) - set(param_slots)
-        if unknown_params:
-            return {
-                "success": False,
-                "message": (
-                    f"[params] references unknown _meta.title(s): "
-                    f"{sorted(unknown_params)}. "
-                    f"Available in the loaded graph: "
-                    f"{sorted(param_slots) or '(none)'}."
-                ),
-            }
-
-        normalized_resources: dict[str, dict] = {}
-        for res_name, res_spec in resources.items():
-            if not isinstance(res_spec, dict):
-                return {"success": False,
-                        "message": f"resource {res_name!r}: must be a JSON "
-                                   f"object with a 'source' field"}
-            source = res_spec.get("source")
-            if source not in _RESOURCE_SOURCES:
-                return {"success": False,
-                        "message": f"resource {res_name!r}: source must be "
-                                   f"one of {sorted(_RESOURCE_SOURCES)}, "
-                                   f"got {source!r}"}
-            layer_name = res_spec.get("layer_name")
-            if source == "layer":
-                if not isinstance(layer_name, str) or not layer_name:
-                    return {"success": False,
-                            "message": f"resource {res_name!r}: "
-                                       f"source='layer' requires a "
-                                       f"non-empty layer_name"}
-            else:
-                layer_name = None
-            normalized_resources[res_name] = {
-                "source": source,
-                "layer_name": layer_name,
-            }
-
-        for param_name, param_value in params_obj.items():
-            kind = param_slots[param_name]["kind"]
-            if not _KIND_ACCEPTORS[kind](param_value):
-                return {"success": False,
-                        "message": f"param {param_name!r}: expected {kind}, "
-                                   f"got {type(param_value).__name__} "
-                                   f"({param_value!r})"}
-
-        crop_context = crop.get("context", "entire_image")
-        if crop_context not in _CROP_CONTEXTS:
-            return {"success": False,
-                    "message": f"crop.context must be one of "
-                               f"{sorted(_CROP_CONTEXTS)}, got "
-                               f"{crop_context!r}"}
-        crop_padding = crop.get("padding", 0)
-        if (not isinstance(crop_padding, int)
-                or isinstance(crop_padding, bool)
-                or crop_padding < 0):
-            return {"success": False,
-                    "message": f"crop.padding must be a non-negative "
-                               f"integer, got {crop_padding!r}"}
-
-        paste_batch_mode = paste.get("batch_mode", "default")
-        if paste_batch_mode not in _PASTE_BATCH_MODES:
-            return {"success": False,
-                    "message": f"paste.batch_mode must be one of "
-                               f"{sorted(_PASTE_BATCH_MODES)}, got "
-                               f"{paste_batch_mode!r}"}
-
-        def _coerce_int(obj, key, default=0):
-            v = obj.get(key, default)
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                return default
-
-        normalized_paste = {
-            "x": _coerce_int(paste, "x"),
-            "y": _coerce_int(paste, "y"),
-            "name": str(paste.get("name") or ""),
-            "batch_mode": paste_batch_mode,
-            "resize_canvas": bool(paste.get("resize_canvas", False)),
-        }
-
-        parent._active_config = {
-            "resources": normalized_resources,
-            "params": dict(params_obj),
-            "crop": {
-                "context": crop_context,
-                "padding": crop_padding,
-            },
-            "paste": normalized_paste,
-        }
+        parent._active_config = config
 
         return {
             "success": True,
             "message": (
-                f"applied: {len(normalized_resources)} resource(s), "
-                f"{len(params_obj)} param(s), "
-                f"crop={crop_context} (padding={crop_padding}), "
-                f"paste={paste_batch_mode}"
+                f"applied: {len(config['resources'])} resource(s), "
+                f"{len(config['params'])} param(s), "
+                f"crop={config['crop']['context']} "
+                f"(padding={config['crop']['padding']}), "
+                f"paste={config['paste']['batch_mode']}"
             ),
             "data": {
-                "resources": sorted(normalized_resources.keys()),
-                "params": sorted(params_obj.keys()),
+                "resources": sorted(config["resources"].keys()),
+                "params": sorted(config["params"].keys()),
                 "output_nodes": sorted(
                     parent._active_workflow_output_nodes.keys()
                 ),
-                "crop": parent._active_config["crop"],
-                "paste": parent._active_config["paste"],
+                "crop": config["crop"],
+                "paste": config["paste"],
             },
         }
 
     # ------------------------------------------------------------------
-    #  comfy_prepare_only (unchanged)
+    #  comfy_prepare_only
     # ------------------------------------------------------------------
 
     @command(
@@ -535,7 +605,7 @@ class ConfigCommands(AutoDispatchHandler):
         }
 
     # ------------------------------------------------------------------
-    #  comfy_panel_run (unchanged)
+    #  comfy_panel_run
     # ------------------------------------------------------------------
 
     @command(
@@ -568,31 +638,47 @@ class ConfigCommands(AutoDispatchHandler):
                     "message": f"connect failed: "
                                f"{conn.get('message', 'unknown error')}"}
 
-        active = parent._active_config or {}
-        apply_params = {}
+        if parent._active_workflow_graph is None:
+            return {"success": False,
+                    "message": "No workflow loaded; run comfy_load first"}
+
+        # Snapshot _active_config once, at the top, for the omitted-
+        # section fallback. Two concurrent comfy_panel_run calls from
+        # this daemon would both snapshot the same _active_config; if a
+        # third client (CLI) writes it between the snapshots, each run
+        # still uses what it saw. See the module docstring,
+        # "Concurrency".
+        active_snapshot = dict(parent._active_config or {})
+
+        apply_args = {}
         fallback_keys: list[str] = []
         for key in ("resources", "params", "crop", "paste"):
             if key in params:
-                apply_params[key] = params[key]
+                apply_args[key] = params[key]
             else:
-                value = active.get(key) or {}
-                if isinstance(value, str):
-                    apply_params[key] = value
-                else:
-                    apply_params[key] = json.dumps(value)
+                value = active_snapshot.get(key) or {}
+                apply_args[key] = (
+                    value if isinstance(value, str) else json.dumps(value)
+                )
                 fallback_keys.append(key)
 
-        apply_result = self.comfy_apply_config(apply_params)
-        if not isinstance(apply_result, dict):
-            return {"success": False,
-                    "message": f"comfy_apply_config returned non-dict: "
-                               f"{apply_result!r}"}
-        if not apply_result.get("success"):
-            return apply_result
+        # Validate against the current slot tables. Do NOT write
+        # _active_config — a concurrent comfy_panel_run must not
+        # overwrite another run's config, and a concurrent
+        # comfy_apply_config must not be visible to this run mid-flight.
+        config, err = self._validate_config(
+            apply_args["resources"], apply_args["params"],
+            apply_args["crop"], apply_args["paste"],
+            parent._active_workflow_resource_slots,
+            parent._active_workflow_param_slots,
+        )
+        if err is not None:
+            return {"success": False, "message": err}
 
         gen_params: dict = {
             "timeout": params.get("timeout", 55.0),
             "count": params.get("count", 1),
+            "config": config,
         }
         if params.get("seed") is not None:
             gen_params["seed"] = params.get("seed")
@@ -614,7 +700,7 @@ class ConfigCommands(AutoDispatchHandler):
         return gen_result
 
     # ------------------------------------------------------------------
-    #  comfy_save_config (unchanged)
+    #  comfy_save_config
     # ------------------------------------------------------------------
 
     @command(

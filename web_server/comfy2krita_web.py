@@ -15,14 +15,6 @@ from `kritomatic.client`, and that one import is what makes it
 addressable as a proper package module (the REPO_ROOT/src bootstrap at
 the top of the file does that).
 
-The server, the SSE forwarding, the in-browser renderer, and the
-comfy_panel_run / comfy_save_config enrichment all live in this one
-file. That is deliberate: the web panel is meant to be copy-pasteable
-into a fresh machine and runnable with `python comfy2krita_web.py`,
-without a plugin install, without a daemon module tree, without the
-`kritomatic_shared` bootstrap. The only external dependency is the
-Krita plugin's socket server already running on the machine.
-
 Routes
 ======
     GET  /              HTML shell + inline CSS + inline JS
@@ -39,8 +31,33 @@ only for their own duration. `comfy_generate` blocks the worker for the
 entire run (tens of seconds). /api/run spawns the generate on its own
 thread with its own socket, so the worker stays available for cancel
 requests, state reads, and other panel edits that would otherwise be
-stuck in the queue behind the long run. This is the same reason the
-docker uses `send_cancel_now` out-of-band for its Cancel button.
+stuck in the queue behind the long run.
+
+Concurrent runs
+===============
+The web panel supports multiple concurrent runs from this panel. Each
+`/api/run` call:
+
+  · allocates a fresh `run-<ts>-<rand>` id via `_new_run_id()`,
+  · opens its own socket to the daemon inside `_do_run`, and
+  · streams progress and the final summary back through `/api/events`.
+
+The frontend tracks each run in `app.activeRuns: Map<run_id, {…}>` and
+keys `handleRunEvent` on `run_id`, so two runs' progress lines go to
+the same log widget without one clobbering the other's state.
+
+The `comfy_panel_run` command embeds the four config sections from
+widget state at click time (see `runAction`). That is the same
+load-bearing change the docker does — the daemon's `comfy_panel_run`
+passes the validated config as a kwarg to `comfy_generate`, so two
+concurrent clicks' configs never race on `_active_config`. See the
+daemon's `comfyui_config.py` docstring for the detail.
+
+Cancel semantics
+================
+`scope: "current"` cancels every run this panel started — a loop over
+`_runs` calling `comfy_cancel --batch_id <rid>` on each. `scope: "all"`
+cancels every batch on the daemon (across all clients).
 
 Config auto-apply
 =================
@@ -51,21 +68,18 @@ of them starts a 150 ms single-shot debounce; when it fires,
 state and POSTs one `comfy_apply_config`, matching the docker's
 `_apply_config_from_widgets` on the same timer.
 
-`comfy_panel_run` and `comfy_save_config` receive the four sections
-assembled from widget state at click time; the daemon's fallback to
-`_active_config` only fires when the caller omits the sections
-entirely (a CLI invocation without them), never on the web panel's
-click path.
+`startRun` no longer awaits `flushPendingApply` or `commitQueue` before
+posting `/api/run`. The reason that wait existed — "make sure the
+daemon's `_active_config` reflects the panel before Run reads it" — no
+longer applies: `comfy_panel_run` embeds the config in its own payload.
+Removing the wait is what makes a second click fire while the first is
+still in flight. See "Concurrent runs", above.
 
 Composite (row) fields
 ======================
 A field with `type: "row"` renders as one flex row containing one
 sub-widget per `sub_fields` entry. Sub-widgets carry their own
 `data-field`, so the existing per-field plumbing works unchanged.
-Used by the daemon's `ResourcesProvider` so each resource renders as
-    @thecanvas    [ global/active/layer ▼ ]   [ thecanvas_______ ]
-on one line, with the layer-name input collapsed to zero width when
-the dropdown is "active" or "global".
 
 Hidden fields (`visible: false`)
 ================================
@@ -74,10 +88,6 @@ like any other leaf field, but its `data-field-container` div gets
 `style="display: none;"`. This preserves the per-field plumbing:
 `readConfigWidgetValue` and `buildConfigFromWidgets` still find the
 element, so the field is still submitted to `comfy_apply_config`.
-Only the user-visible row is hidden.
-
-`evaluateVisibility` treats `visible: false` as a hard-hide that
-`visible_when` cannot override.
 
 Local handlers (`local_handler`)
 ================================
@@ -85,36 +95,15 @@ A field carrying `local_handler: "name"` is a client-side widget whose
 edits are not sent to the daemon.  `commitField` checks the spec for
 `local_handler` and, if present, dispatches to the handler registered
 in `app.localHandlers` under that name instead of scheduling a daemon
-command.  The daemon's panel description carries such fields so their
-label and position are consistent with the rest of the layout, and so
-the client's structure-id hash matches the daemon's — the client-side
-value of the field is not part of the hash, so a client-local edit
-never causes a structural rebuild.
+command.
 
 Parameters filter prefix (client-side)
 ======================================
 The Parameters section carries a "Filter prefix" text field at the
 top with `local_handler: "param_prefix_filter"`.  This client registers
-a handler for that name which:
-
-  - writes the new prefix to `app.paramPrefixByWorkflow`, keyed by
-    the current workflow name;
-  - persists that map to `localStorage`;
-  - triggers a `rebuildPanel` against the latest description, so the
-    filter takes effect immediately.
-
-`_filteredDescription` runs before every `rebuildPanel` and
-`syncValues` and marks each `cfg-param.*` field whose title does not
-start with the current workflow's prefix as `visible: false`.  The
-daemon never sees the prefix — it emits every param unconditionally.
-
-`_onState` watches for workflow changes and, on transition, triggers
-a `rebuildPanel` so the newly-loaded workflow's saved prefix is
-applied immediately, before any other panel push.
-
-The docker persists its own prefix in `QSettings`.  The web panel's
-`localStorage` is independent of the docker's `QSettings`; the two
-clients can filter by different prefixes at the same time.
+a handler for that name which persists the prefix per workflow in
+`localStorage` and triggers a `rebuildPanel` against the latest
+description. The daemon never sees the prefix.
 """
 
 import json
@@ -414,7 +403,7 @@ def _fetch_batches() -> list:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "KritomaticWebPanel/2.3"
+    server_version = "KritomaticWebPanel/2.4"
 
     def log_message(self, fmt, *args):
         pass
@@ -569,13 +558,10 @@ class Handler(BaseHTTPRequestHandler):
                 "command", status=400)
             return
 
-        with _runs_lock:
-            for r in _runs.values():
-                if r.get("status") == "running":
-                    self._send_error_json(
-                        "a run is already in progress", status=409)
-                    return
-
+        # Concurrent runs are supported. Each call allocates a fresh
+        # run_id, opens its own socket inside `_do_run`, and streams
+        # events keyed on that id. See this module's docstring,
+        # "Concurrent runs".
         run_id = _new_run_id()
         with _runs_lock:
             _runs[run_id] = {"status": "running", "started": time.time()}
@@ -598,17 +584,16 @@ class Handler(BaseHTTPRequestHandler):
         scope = body.get("scope", "current")
 
         if scope == "all":
+            # Cancel every batch on the daemon (across every client).
             with _runs_lock:
-                run_id = None
-                for rid, r in _runs.items():
-                    if r.get("status") == "running":
-                        run_id = rid
+                run_ids = list(_runs.keys())
+                for rid in run_ids:
+                    r = _runs.get(rid)
+                    if r is not None:
                         r["cancel_requested"] = True
-                        break
 
-            if run_id:
-                _broadcast("run", {"run_id": run_id,
-                                   "status": "cancelling"})
+            for rid in run_ids:
+                _broadcast("run", {"run_id": rid, "status": "cancelling"})
 
             ok, msg = _send_daemon_cancel(None)
             if not ok:
@@ -617,33 +602,37 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             print("[web_panel] cancel_all requested")
-            self._send_json({"status": "cancelling_all", "message": msg})
+            self._send_json({"status": "cancelling_all", "message": msg,
+                             "run_ids": run_ids})
             return
 
+        # scope == "current" (default): cancel every run this panel
+        # started. Concurrent runs are the whole point; "current" means
+        # "all my current runs", not "the one".
         with _runs_lock:
-            run_id = None
-            for rid, r in _runs.items():
-                if r.get("status") == "running":
-                    run_id = rid
-                    break
-            if run_id is None:
-                self._send_error_json("no run is in progress", status=409)
-                return
-            entry = _runs[run_id]
-            if entry.get("cancel_requested"):
-                self._send_json({"run_id": run_id,
-                                 "status": "already-cancelling"})
-                return
-            entry["cancel_requested"] = True
+            run_ids = list(_runs.keys())
+            for rid in run_ids:
+                r = _runs.get(rid)
+                if r is not None:
+                    r["cancel_requested"] = True
 
-        _broadcast("run", {"run_id": run_id, "status": "cancelling"})
-        print(f"[web_panel] cancel requested for run {run_id}")
+        if not run_ids:
+            self._send_error_json("no run is in progress", status=409)
+            return
 
-        ok, msg = _send_daemon_cancel(run_id)
-        if not ok:
-            print(f"[web_panel] cancel for {run_id} failed: {msg}")
+        errors = []
+        for rid in run_ids:
+            _broadcast("run", {"run_id": rid, "status": "cancelling"})
+            ok, msg = _send_daemon_cancel(rid)
+            if not ok:
+                errors.append(f"{rid}: {msg}")
+        print(f"[web_panel] cancel requested for {len(run_ids)} run(s)")
 
-        self._send_json({"run_id": run_id, "status": "cancelling"})
+        self._send_json({
+            "run_ids": run_ids,
+            "status": "cancelling",
+            "errors": errors,
+        })
 
 
 HTML_PAGE = r"""<!DOCTYPE html>
@@ -845,7 +834,11 @@ const app = {
   focusKeys: new Set(),
   inFlight: new Set(),
   commitQueue: Promise.resolve(),
-  running: false,
+  // Concurrent runs this panel started. Keyed by run_id; the value
+  // is a small record (startedAt for potential future display).
+  // Replaces the old `running: bool`. See this module's docstring,
+  // "Concurrent runs".
+  activeRuns: new Map(),
   activeBatchesCount: 0,
   eventsConnected: false,
   firstPanelReceived: false,
@@ -1094,14 +1087,8 @@ function buildFieldHtml(f) {
   </div>`;
   }
   if (t === "text") {
-    // Prefix-filter fields (or any `local_handler` field) can be
-    // identified by the extra attribute; `commitField` uses the spec,
-    // not the attribute, so this is informational.
     const lhAttr = f.local_handler
       ? ` data-local-handler="${escAttr(f.local_handler)}"` : "";
-    // Seed the input's value from the current client-side state so a
-    // rebuild (e.g. after a workflow change) shows the restored
-    // prefix.  The daemon's spec carries `value: ""` for this field.
     let value = f.value ?? "";
     if (f.local_handler === "param_prefix_filter") {
       value = app.paramPrefixByWorkflow.get(app.currentWorkflow) || "";
@@ -1141,11 +1128,6 @@ function buildFieldHtml(f) {
 }
 
 function rebuildPanel(description) {
-  // Apply the current workflow's client-side prefix filter before
-  // laying out.  Deep copy inside `_filteredDescription` keeps the
-  // original pristine; `app.latestPanel` stays the daemon's view so
-  // switching prefixes and re-calling `rebuildPanel(app.latestPanel)`
-  // works.
   const filtered = _filteredDescription(description);
   const form = document.getElementById("config-form");
   app.fields = new Map();
@@ -1194,7 +1176,7 @@ function rebuildPanel(description) {
     }
   }
 
-  setRunning(app.running);
+  updateRunButtons();
 }
 
 function syncValues(description) {
@@ -1226,9 +1208,6 @@ function syncValues(description) {
       } else if (el.type === "radio") {
         el.checked = String(spec.value) === String(el.value);
       } else {
-        // `local_handler` fields: the value lives in client state,
-        // not the daemon's spec.  Skip overwrite so the user's typed
-        // prefix isn't clobbered by the empty daemon value.
         if (spec.local_handler) continue;
         const target = String(spec.value ?? "");
         if (el.value !== target) el.value = target;
@@ -1250,15 +1229,12 @@ function syncValues(description) {
       }
     }
   }
-  setRunning(app.running);
+  updateRunButtons();
 }
 
 function evaluateVisibility(key) {
   const spec = app.specs.get(key);
   if (!spec) return;
-  // Hard-hidden fields (`visible: false`) stay hidden regardless of
-  // `visible_when`. Used by the param-prefix filter, whose excluded
-  // params have no visible_when of their own.
   if (spec.visible === false) {
     const container = document.querySelector(
       `[data-field-container="${cssEsc(key)}"]`);
@@ -1416,19 +1392,10 @@ async function flushApply() {
     crop:      JSON.stringify(cfg.crop),
     paste:     JSON.stringify(cfg.paste),
   };
-  // [] for affectedKeys → a whole-config rejection does not paint every
-  // config field's error slot.  _configFieldKeys() for in-flight keys →
-  // syncValues will not overwrite mid-edit during the fetch.
   return sendCommand("apply", command, [], _configFieldKeys());
 }
 
 async function flushPendingApply() {
-  // Drain any in-flight apply, then fire any pending timer, loop
-  // until both are clear.  Correctness: a config edit that lands
-  // during the await schedules a new timer; the loop's next iteration
-  // catches it.  A config edit that lands before flushPendingApply
-  // was called is either a pending timer (cancelled and re-fired with
-  // current widget state) or an in-flight apply (awaited).
   while (true) {
     if (_applyTimer !== null) {
       clearTimeout(_applyTimer);
@@ -1448,9 +1415,6 @@ function commitField(key) {
   const section = app.sections.get(key);
   if (!spec || !section) return;
 
-  // Client-side `local_handler`: dispatch to the registered JS
-  // handler instead of sending a command to the daemon.  Used by the
-  // Parameters prefix filter; see the module docstring.
   if (spec.local_handler) {
     const handler = app.localHandlers.get(spec.local_handler);
     if (!handler) return;
@@ -1460,9 +1424,6 @@ function commitField(key) {
     return;
   }
 
-  // v2 config fields: debounce a whole-config re-apply, matching the
-  // Krita docker's model.  See the "v2 config auto-apply" comment
-  // above for why this is a whole-config push, not per-field.
   if (Array.isArray(spec.config_path) && spec.config_path.length) {
     scheduleApply();
     return;
@@ -1492,13 +1453,6 @@ function commitField(key) {
 }
 
 async function sendCommand(requestId, command, affectedKeys, inFlightKeys) {
-  // inFlightKeys controls what syncValues skips while the request is
-  // outstanding.  affectedKeys controls which fields get the error
-  // painted on failure.  They differ for the whole-config apply: every
-  // config field must be held in-flight during the fetch (so an
-  // arriving panel event from the daemon does not overwrite a value
-  // the user just typed), but the rejection message is generic and
-  // should not be copied onto every field's error slot.
   const track = inFlightKeys !== undefined ? inFlightKeys : affectedKeys;
   for (const k of track) {
     app.inFlight.add(k);
@@ -1581,18 +1535,20 @@ async function runAction(key) {
 
   if (key === "run") {
     // Enrich the comfy_panel_run command with the current config
-    // sections assembled from widget state, matching what the Docker's
-    // _on_action handler does.  Without this, the daemon's
-    // comfy_panel_run falls back to _active_config, which is only as
-    // fresh as the last comfy_apply_config call.  If the web panel's
-    // debounce hadn't fired yet, that's stale — the daemon uses the
-    // Docker's values instead of the web panel's.
+    // sections assembled from widget state. The daemon validates them
+    // inline and passes them as a kwarg to comfy_generate, so a
+    // second click's config never races the first's. See this
+    // module's docstring, "Concurrent runs".
     const cfg = buildConfigFromWidgets();
     command.resources = JSON.stringify(cfg.resources);
     command.params    = JSON.stringify(cfg.params);
     command.crop      = JSON.stringify(cfg.crop);
     command.paste     = JSON.stringify(cfg.paste);
 
+    // Intentionally NO flushPendingApply / commitQueue wait: the run
+    // embeds its own config, so the daemon does not need to read
+    // _active_config before starting. Removing the wait is what makes
+    // a second click land while the first is still preparing.
     await startRun(command);
   } else if (key === "cancel" || cancelAll) {
     await cancelRun(command, cancelAll ? "all" : "current");
@@ -1612,9 +1568,9 @@ function rowDiv(cls, text) {
   return d;
 }
 
-function setRunning(running) {
-  app.running = running;
-  const anyBatch = running || (app.activeBatchesCount > 0);
+function updateRunButtons() {
+  const anyRun = app.activeRuns.size > 0;
+  const anyBatch = anyRun || (app.activeBatchesCount > 0);
   for (const s of app.sectionSpecs) {
     if (s.kind !== "actions" && s.kind !== "workflow-bar") continue;
     for (const item of (s.items || [])) {
@@ -1622,16 +1578,22 @@ function setRunning(running) {
         `[data-action-key="${cssEsc(item.key)}"]`);
       if (!btn) continue;
       if (item.key === "run") {
-        btn.disabled = running;
+        // Enabled whenever a workflow is loaded. Concurrent clicks are
+        // supported by design.
+        btn.disabled = !(app.latestState
+                         && app.latestState.daemon
+                         && app.latestState.daemon.workflow);
       } else if (item.key === "cancel") {
-        btn.disabled = !running;
+        btn.disabled = !anyRun;
       } else if (isCancelAllItem(item)) {
         btn.disabled = !anyBatch;
       } else if (item.key === "load") {
-        btn.disabled = running;
+        btn.disabled = anyRun;
       } else if (item.key === "save_config") {
-        btn.disabled = running || !app.latestState
-          || !(app.latestState.daemon && app.latestState.daemon.workflow);
+        btn.disabled = anyRun
+          || !(app.latestState
+               && app.latestState.daemon
+               && app.latestState.daemon.workflow);
       }
     }
   }
@@ -1639,16 +1601,9 @@ function setRunning(running) {
 
 async function startRun(command) {
   const log = document.getElementById("progress");
-  log.innerHTML = "";
-  setRunning(true);
-  log.appendChild(rowDiv("hdr", "Starting run\u2026"));
-
-  // If the user edited a param and clicked Run within 150 ms, the
-  // debounce has not fired yet.  Fire it now and wait, so the daemon's
-  // _active_config reflects what the panel shows before comfy_panel_run
-  // reads it.
-  await flushPendingApply();
-  try { await app.commitQueue; } catch (_) {}
+  // Do NOT clear the log: a second click while the first is
+  // in-flight must not wipe the first run's progress lines.
+  // Per-run completion lines are appended with the run id prefix.
 
   let resp;
   try {
@@ -1658,22 +1613,20 @@ async function startRun(command) {
       body: JSON.stringify({command: command}),
     });
   } catch (e) {
-    log.innerHTML = "";
     log.appendChild(rowDiv("err", "Request failed: " + e.message));
-    setRunning(false);
     return;
   }
   if (!resp.ok) {
     let msg = "HTTP " + resp.status;
     try { const b = await resp.json(); if (b && b.error) msg = b.error; } catch (_) {}
-    log.innerHTML = "";
     log.appendChild(rowDiv("err", "Cannot run: " + msg));
-    setRunning(false);
     return;
   }
   const body = await resp.json();
-  log.innerHTML = "";
-  log.appendChild(rowDiv("hdr", "Run " + body.run_id + " started."));
+  const runId = body.run_id;
+  app.activeRuns.set(runId, { startedAt: Date.now() });
+  log.appendChild(rowDiv("hdr", "Run " + runId + " started."));
+  updateRunButtons();
 }
 
 async function cancelRun(command, scope) {
@@ -1694,39 +1647,45 @@ async function cancelRun(command, scope) {
     try { const b = await resp.json(); if (b && b.error) msg = b.error; } catch (_) {}
     log.appendChild(rowDiv("err", "Cannot cancel: " + msg));
     if (resp.status === 409) {
-      app.running = false;
-      setRunning(false);
+      updateRunButtons();
     }
   } else {
     log.appendChild(rowDiv("warn",
-      scope === "all" ? "Cancel All sent." : "Cancel sent."));
+      scope === "all" ? "Cancel All sent." : "Cancel sent for all active runs."));
   }
 }
 
 function handleRunEvent(e) {
   const s = JSON.parse(e.data);
   const log = document.getElementById("progress");
+  const runId = s.run_id || "?";
+  const short = String(runId).slice(-8);
+  const prefix = "[" + short + "] ";
   if (s.status === "progress") {
     const cls = s.run_status === "success" ? "ok"
                : s.run_status === "error" ? "err" : "";
     log.appendChild(rowDiv(cls,
-      "[" + (s.index + 1) + "/" + s.total + "] "
+      prefix + "[" + (s.index + 1) + "/" + s.total + "] "
       + s.command + ": " + s.message));
   } else if (s.status === "cancelling") {
-    log.appendChild(rowDiv("warn", "Cancelling\u2026"));
+    log.appendChild(rowDiv("warn", prefix + "Cancelling\u2026"));
   } else if (s.status === "cancelled") {
     const n = s.cancelled != null ? s.cancelled : "";
     log.appendChild(rowDiv("warn",
-      "Cancelled. " + n + " run(s) not completed."));
-    setRunning(false);
+      prefix + "Cancelled. " + n + " run(s) not completed."));
+    app.activeRuns.delete(runId);
+    updateRunButtons();
   } else if (s.status === "done") {
     let text = "Done. " + s.successful + " ok, " + s.failed + " failed.";
     if (s.cancelled) text += " (" + s.cancelled + " cancelled)";
-    log.appendChild(rowDiv("hdr", text));
-    setRunning(false);
+    log.appendChild(rowDiv("hdr", prefix + text));
+    app.activeRuns.delete(runId);
+    updateRunButtons();
   } else if (s.status === "error") {
-    log.appendChild(rowDiv("err", "Run failed: " + (s.error || "unknown")));
-    setRunning(false);
+    log.appendChild(rowDiv("err",
+      prefix + "Run failed: " + (s.error || "unknown")));
+    app.activeRuns.delete(runId);
+    updateRunButtons();
   }
 }
 
@@ -1755,7 +1714,7 @@ function connectEvents() {
                        && Array.isArray(s.daemon.active_batches))
         ? s.daemon.active_batches.length : 0;
       app.activeBatchesCount = batches;
-      setRunning(app.running);
+      updateRunButtons();
       renderStatus(s);
     } catch (err) {
       console.error("state parse error", err);

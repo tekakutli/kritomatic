@@ -39,6 +39,24 @@ Task selection, task list refresh, and Run/Discard remain on
 `_scheduleDraw` — those changes actually touch panel state (task
 list highlight, task info text, payload / result lines, multimask
 area cards).
+
+PENDING LOCAL RUNS — SEE ALSO `pg_state.py`'s "PENDING LOCAL RUNS"
+==================================================================
+`_runAction` and `_discardAction` add the selected task's id to
+`board.pendingLocalRuns` *before* firing their fetch, and remove it
+after the post-fetch refresh completes.  `effectiveStatus(task)`
+(exported from `pg_state.js`) reports any tracked task as
+`"running"`, so the buttons disable immediately and stay disabled
+even if the user re-selects the task before the next poll confirms
+the server's status flip.
+
+The task id is removed from `pendingLocalRuns` only *after* the
+post-fetch refresh completes, not before.  That ordering closes the
+otherwise-possible window where the refresh has not yet updated
+`board.tasks[tid].status` and a `_scheduleDraw` triggered by some
+other event (a hover, a selection change) would re-enable the
+buttons against the stale `"queued"` state.  See `pg_state.py`'s
+"PENDING LOCAL RUNS" section for the full rationale.
 """
 
 PANEL_BINDINGS_JS = r"""
@@ -152,13 +170,28 @@ export async function _selectTask(taskId) {
 
 /* ============================================================
    Run / Discard
-   ============================================================ */
+   ============================================================
+   See this module's "PENDING LOCAL RUNS" docstring section and
+   pg_state.py's corresponding section for the full rationale of
+   the `board.pendingLocalRuns` add/remove ordering. */
 
 async function _runAction() {
   const tid = board.selectedTaskId;
   if (!tid) return;
+  if (board.pendingLocalRuns.has(tid)) return;   // double-click guard
   const summary = board.tasks[tid];
   if (!summary || summary.status !== "queued") return;
+
+  // Mark the task as locally pending BEFORE the fetch.  The server
+  // flips its own status to "running" under its lock before doing
+  // any work, so a poll landing after the fetch begins will see it;
+  // a poll landing between this line and the server's flip, or a
+  // re-selection during the await, would otherwise re-enable the
+  // buttons against stale "queued".  `effectiveStatus` and the
+  // panel's button gating both read this set.  See pg_state.py's
+  // "PENDING LOCAL RUNS".
+  board.pendingLocalRuns.add(tid);
+  _scheduleDraw();
 
   const runBtn     = document.getElementById("runBtn");
   const discardBtn = document.getElementById("discardBtn");
@@ -170,7 +203,12 @@ async function _runAction() {
   const override = (board.prompt || "").trim();
   const areaPrompts = board.areaPromptOverrides[tid] || {};
 
-  const res = await interceptRun(tid, override || null, areaPrompts);
+  let res;
+  try {
+    res = await interceptRun(tid, override || null, areaPrompts);
+  } catch (e) {
+    res = { success: false, message: e.message || String(e) };
+  }
 
   if (res.success) {
     const timing = res.data && res.data.timing != null
@@ -183,22 +221,56 @@ async function _runAction() {
     );
   }
 
-  await _refreshList();
-  await _refreshItem(tid);
-  _scheduleDraw();
+  // Refresh BEFORE clearing the pending marker.  `handle_run` on the
+  // server flips status to done/error inside the request handler,
+  // before returning the HTTP response, so by the time this refresh
+  // runs the fresh list already reflects the terminal status.
+  // Clearing the marker after the refresh means there is no window
+  // where the button could be re-enabled against stale "queued"
+  // data.  See pg_state.py's "PENDING LOCAL RUNS".
+  try {
+    await _refreshList();
+    if (board.selectedTaskId === tid) await _refreshItem(tid);
+  } finally {
+    board.pendingLocalRuns.delete(tid);
+    _scheduleDraw();
+  }
 }
 
 async function _discardAction() {
   const tid = board.selectedTaskId;
   if (!tid) return;
-  const res = await interceptDiscard(tid);
+  if (board.pendingLocalRuns.has(tid)) return;   // double-click guard
+  const summary = board.tasks[tid];
+  if (!summary || summary.status !== "queued") return;
+
+  board.pendingLocalRuns.add(tid);
+  _scheduleDraw();
+
+  const runBtn     = document.getElementById("runBtn");
+  const discardBtn = document.getElementById("discardBtn");
+  if (runBtn)     runBtn.disabled     = true;
+  if (discardBtn) discardBtn.disabled = true;
+
+  let res;
+  try {
+    res = await interceptDiscard(tid);
+  } catch (e) {
+    res = { success: false, message: e.message || String(e) };
+  }
+
   if (res.success) flashStatus("discarded", "ok");
   else             flashStatus(
     "discard failed: " + (res.message || "unknown"), "bad",
   );
-  await _refreshList();
-  if (board.selectedTaskId === tid) await _refreshItem(tid);
-  _scheduleDraw();
+
+  try {
+    await _refreshList();
+    if (board.selectedTaskId === tid) await _refreshItem(tid);
+  } finally {
+    board.pendingLocalRuns.delete(tid);
+    _scheduleDraw();
+  }
 }
 
 /* ============================================================

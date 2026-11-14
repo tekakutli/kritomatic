@@ -35,28 +35,37 @@ root layout.  The effect: the run controls stay visible at all times,
 regardless of how far the user has scrolled the Resources /
 Parameters / Crop / Paste fields.
 
-Mechanism: the renderer accepts an optional `actions_layout` and
-routes `kind == "actions"` sections to it instead of into the
-scrollable form.  The docker builds that layout (`_actions_layout`),
-places it in the root layout, and passes it to the renderer.  See
-"Pinned actions" in `renderer.py`'s module docstring for the full
-contract.
-
 Cancel semantics
 ================
-Cancel targets this docker's own batch via `send_cancel_now`.
-Cancel-All targets every batch on the daemon (including external
-jobs registered by the inpaint playground and intercepted batches
-awaiting review in the interceptor playground).
+Cancel targets every run *this docker* started, one `comfy_cancel` per
+run, each on its own socket via `send_cancel_now`.  A docker that has
+N runs in flight and presses Cancel issues N cancels; the daemon's
+`comfy_generate` handlers each see their own `cancel_event` and route
+to the proxy independently.  Cancel-All targets every batch on the
+daemon (including external jobs registered by the inpaint playground,
+intercepted batches awaiting review in the interceptor playground,
+and runs started by another docker or by the CLI or the web panel).
 
-Intercept mode logging
-======================
-When `comfy_generate` runs with intercept mode on, it returns
-`{success: true, data: {intercepted: true, ...}}` before running
-any generation.  The `_on_command_completed` handler sees the
-flattened response — `intercepted: True` lives at the top level
-after the wire wrapper merges `data` — and logs a single "Run
-intercepted" line instead of the usual "Run done: N ok, M failed".
+Concurrent runs
+===============
+The Run button allows multiple concurrent clicks. Each click:
+
+  · allocates a unique `run-<ts>-<uuid>` request_id,
+  · records it in `self._active_runs: dict[str, float]`,
+  · enqueues the bundle via `DaemonConnection.send_run_now`, which runs
+    the send/stream/reply on its own thread and socket — bypassing the
+    serial command worker so the next click is not delayed by the
+    first's duration.
+
+The daemon accepts concurrent connections (one handler thread per
+inbound socket) and its `comfy_panel_run` embeds its config in the
+bundle, so two in-flight runs cannot clobber each other's config.
+See `comfyui_config.py` and `comfyui_generation.py`'s module
+docstrings for the daemon-side detail.
+
+The run log prefixes every line with a short suffix of the run's
+request id so concurrent runs' progress entries remain distinguishable
+in the shared log widget.
 
 Workflow hint text
 ==================
@@ -140,6 +149,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 
 from PyQt6.QtCore import Qt, QSettings, QTimer
 from PyQt6.QtWidgets import (
@@ -165,8 +175,11 @@ class KritomaticPanel(QDockWidget):
             | Qt.DockWidgetArea.RightDockWidgetArea
         )
 
-        self._running = False
-        self._active_run_request_id = None
+        # Runs this docker started, keyed by request_id, value = start
+        # timestamp (monotonic, informational only). Multiple concurrent
+        # entries are the whole point; see the module docstring,
+        # "Concurrent runs".
+        self._active_runs: dict[str, float] = {}
         self._active_batches_count = 0
         self._workflow_loaded = False
 
@@ -219,12 +232,7 @@ class KritomaticPanel(QDockWidget):
         self._scroll.setWidget(self._form_container)
         root_layout.addWidget(self._scroll, 1)
 
-        # Pinned action row container.  The renderer routes
-        # `kind == "actions"` sections here instead of into the
-        # scrollable form layout, so Run / Cancel / Cancel-All stay
-        # visible at all times (see the module docstring, "Pinned
-        # action row").  When the layout is empty, the container has
-        # zero natural height and simply does not take space.
+        # Pinned action row container.
         self._actions_container = QWidget()
         self._actions_layout = QVBoxLayout(self._actions_container)
         self._actions_layout.setContentsMargins(0, 0, 0, 0)
@@ -302,14 +310,6 @@ class KritomaticPanel(QDockWidget):
     # ------------------------------------------------------------------
 
     def _load_remembered_workflow(self) -> str:
-        """Read the last-loaded workflow's slug from QSettings.
-
-        Returns "" when nothing has been saved yet (first-ever docker
-        launch, or QSettings was cleared by the user).  Errors on
-        read are treated the same as "not remembered" rather than
-        surfacing up to the caller; an unreadable QSettings file
-        should not break the docker.
-        """
         try:
             return str(self._settings.value(
                 "last_workflow", "", type=str,
@@ -318,20 +318,6 @@ class KritomaticPanel(QDockWidget):
             return ""
 
     def _remember_workflow(self, workflow: str) -> None:
-        """Persist `workflow` as the user's most recent load.
-
-        Called from `_on_state` on every transition to a non-empty
-        `workflow` field.  The daemon's `workflow` field is the
-        authoritative signal — it updates only after a `comfy_load`
-        has succeeded — and it fires for every load path (Load
-        button, picker change, CLI, another client).  That makes
-        this the one place we need to hook to keep QSettings in
-        step with the daemon.
-
-        No-ops when `workflow` is empty or unchanged from what was
-        already remembered, so repeated state pushes for the same
-        workflow do not churn the settings file.
-        """
         if not workflow:
             return
         if workflow == self._remembered_workflow:
@@ -343,19 +329,6 @@ class KritomaticPanel(QDockWidget):
             pass
 
     def _description_workflow_name(self, description: dict) -> str:
-        """Return the currently-loaded workflow name from a panel
-        description, or "" if none is loaded.
-
-        The daemon's `WorkflowMetadataProvider` emits a section with
-        `id == "workflow"` and a `label == "Workflow"` field carrying
-        the name — but only when a workflow is loaded.  Its absence is
-        therefore the authoritative "no workflow loaded" signal from
-        the panel description, parallel to `_workflow_loaded` from the
-        state push.  Used by `_maybe_autoload_remembered_workflow` so
-        the decision can be made from a single input source (the panel
-        description) rather than depending on state-before-panel
-        ordering at startup.
-        """
         for s in description.get("sections") or []:
             if not isinstance(s, dict):
                 continue
@@ -368,14 +341,6 @@ class KritomaticPanel(QDockWidget):
 
     @staticmethod
     def _available_workflow_slugs(description: dict) -> list:
-        """Return the workflow slugs the picker is offering, or [].
-
-        `WorkflowPickerProvider` emits one `workflow-name` field inside
-        the `workflow-picker` section; when there are any workflows in
-        the directory, it is a `select` whose `options` list is the
-        available slugs.  When the directory is empty, it degrades to
-        a `text` field with no `options` key, so this returns [].
-        """
         for s in description.get("sections") or []:
             if not isinstance(s, dict):
                 continue
@@ -387,29 +352,6 @@ class KritomaticPanel(QDockWidget):
         return []
 
     def _maybe_autoload_remembered_workflow(self, description) -> None:
-        """Auto-load the remembered workflow, once per docker lifetime.
-
-        Fired from `_on_panel` on the first panel description the
-        daemon pushes.  Conditions to fire:
-
-          * `_startup_autoload_done` is False (first call);
-          * a remembered workflow exists in QSettings;
-          * the panel description shows no workflow currently loaded
-            (via `_description_workflow_name`);
-          * the picker is offering at least one slug;
-          * the remembered slug is among the offered options.
-
-        On a hit, enqueues one `comfy_load` for the remembered slug
-        on the command socket.  The daemon's own `panel_configs/<slug>`
-        autoload then restores resources / params / crop / paste
-        alongside the workflow, so the panel comes up fully primed.
-
-        Runs at most once per docker lifetime; `_startup_autoload_done`
-        is set before any of the conditions are tested so a transient
-        condition (say, remembered slug temporarily missing during a
-        directory scan) does not spuriously succeed on a later panel
-        push — the user can always click Load manually.
-        """
         if self._startup_autoload_done:
             return
         self._startup_autoload_done = True
@@ -419,20 +361,11 @@ class KritomaticPanel(QDockWidget):
         if not self._remembered_workflow:
             return
 
-        # Daemon already has a workflow loaded — leave it alone.
-        # Whether it matches the remembered slug or not, the daemon's
-        # current choice is what the user asked for last time (or
-        # what another client just loaded).  Overriding it would be
-        # surprising.
         if self._description_workflow_name(description):
             return
 
         available = self._available_workflow_slugs(description)
         if not available:
-            # No workflows in the directory at all — nothing to load.
-            # Fresh clone with no workflows dropped in yet, or the
-            # workflows dir was cleaned out.  Silent skip; the user
-            # sees the empty picker and its "no workflows" hint.
             return
 
         if self._remembered_workflow not in available:
@@ -486,22 +419,12 @@ class KritomaticPanel(QDockWidget):
             if new_workflow != old_workflow:
                 self._restore_param_filter_for_workflow(new_workflow)
                 if new_workflow:
-                    # The daemon reports this workflow loaded — that's
-                    # the user's most recent choice, regardless of the
-                    # path that got it there (Load button, picker
-                    # change, CLI).  Persist for the next docker
-                    # startup's auto-load.  See the module docstring,
-                    # "Startup workflow autoload".
                     self._remember_workflow(new_workflow)
         except Exception:
             pass
         self._update_run_buttons()
 
     def _restore_param_filter_for_workflow(self, workflow: str) -> None:
-        """Restore this client's saved prefix for `workflow` (or clear
-        it when the workflow name is empty).  Called from `_on_state`
-        on every workflow transition so the very first panel render
-        for a newly-loaded workflow is already filtered."""
         if not workflow:
             self._param_prefix_filter = ""
             try:
@@ -522,12 +445,6 @@ class KritomaticPanel(QDockWidget):
             pass
 
     def _on_param_prefix_committed(self, prefix: str) -> None:
-        """Local handler for the Parameters filter prefix field.
-
-        Persists the prefix under the current workflow's name in
-        `QSettings`, then tells the renderer to re-filter.  The daemon
-        never sees this value.
-        """
         self._param_prefix_filter = str(prefix or "")
         if self._current_workflow:
             try:
@@ -555,17 +472,6 @@ class KritomaticPanel(QDockWidget):
         self._update_run_buttons()
 
         if structure_changed:
-            # The renderer just tore down and rebuilt its widget tree.
-            # Every _LayerComboBox in the new tree was constructed
-            # empty — its *text* was set from the spec, but the item
-            # list is only populated by set_layers, which only runs on
-            # a layersFetched emit. If the daemon's layer set is
-            # unchanged since the last emit, request_layers's
-            # signature dedup would skip the emit and leave the new
-            # combos empty. Invalidating forces the next fetch to
-            # emit regardless of signature, so set_layers repopulates
-            # them. See this module's docstring, "Layer cache
-            # invalidation on structure change".
             try:
                 self._conn.invalidate_layers_cache()
             except Exception:
@@ -579,12 +485,6 @@ class KritomaticPanel(QDockWidget):
         if structure_changed and self._workflow_loaded:
             self._apply_config_from_widgets("auto_load")
 
-        # Startup autoload — fire once per session, on the first panel
-        # description.  Uses the panel description (not state) as its
-        # input so the decision depends on a single, ordered source of
-        # truth: the picker's available-slug list and the presence of a
-        # `workflow` metadata section.  See the module docstring,
-        # "Startup workflow autoload".
         self._maybe_autoload_remembered_workflow(description)
 
     def _on_layers_changed(self) -> None:
@@ -618,6 +518,20 @@ class KritomaticPanel(QDockWidget):
             )
             self._hint.show()
 
+    @staticmethod
+    def _short_id_from_request_id(request_id: str) -> str:
+        """Short display id for a run's request id.
+
+        `run-<ts>-<uuid>` — the trailing `<uuid>` is already short
+        and unique per run; use the whole thing rather than slicing
+        it. Callers that pass a bare request id (e.g. `cancel-<ts>`)
+        fall back to the last hyphen segment.
+        """
+        if not request_id:
+            return "?"
+        parts = request_id.split("-")
+        return parts[-1] if parts else request_id
+
     def _on_run_event(self, event: dict) -> None:
         if event.get("kind") != "progress":
             return
@@ -628,7 +542,11 @@ class KritomaticPanel(QDockWidget):
         status = result.get("status", "?")
         message = result.get("message", "")
         cls = "ok" if status == "success" else "err"
-        self._append_log(cls, f"[{idx + 1}/{total}] {cmd}: {message}")
+        rid = event.get("request_id") or ""
+        short_id = self._short_id_from_request_id(rid)
+        self._append_log(
+            cls, f"[{short_id}] [{idx + 1}/{total}] {cmd}: {message}"
+        )
 
     def _on_command_completed(self, request_id: str, ok: bool,
                               summary: dict) -> None:
@@ -665,15 +583,6 @@ class KritomaticPanel(QDockWidget):
             return
 
         if request_id.startswith("autoload-"):
-            # Autoload's response body is a batch_complete whose
-            # top-level message is empty; the actual daemon message
-            # lives on the single command's result entry.  Pull it
-            # from there so the log shows the load's own message
-            # ("Loaded workflow 'X' (N nodes) ...") rather than an
-            # empty string.  Fall back to the batch-level fields for
-            # the connection-failed shape, and finally to a generic
-            # "unknown error" — all three are better than a blank
-            # line after "Auto-load failed: ".
             results = summary.get("results", []) or []
             detail = ""
             if results and isinstance(results[0], dict):
@@ -695,22 +604,21 @@ class KritomaticPanel(QDockWidget):
                 )
             return
 
-        if request_id != self._active_run_request_id:
+        # ---- Any run-<id> completion ----
+        if not request_id.startswith("run-"):
             return
 
-        self._active_run_request_id = None
-        self._running = False
+        self._active_runs.pop(request_id, None)
+        short_id = self._short_id_from_request_id(request_id)
 
         # Intercept mode: comfy_generate returned early with
-        # `intercepted: True` in the response data.  The wire wrapper
-        # merges data's fields into the response dict, so we read it
-        # at the top level.  Nothing actually ran here — skip the
-        # "N ok, M failed" reporting.
+        # `intercepted: True` in the response data.  Nothing actually
+        # ran here — skip the "N ok, M failed" reporting.
         if summary.get("intercepted"):
             msg = summary.get("message") or "Run intercepted"
             self._append_log(
                 "hdr",
-                msg + " \u2014 review in interceptor playground",
+                f"[{short_id}] {msg} \u2014 review in interceptor playground",
             )
             self._update_run_buttons()
             return
@@ -727,14 +635,16 @@ class KritomaticPanel(QDockWidget):
         if cancelled_count > 0 and succ == 0:
             self._append_log(
                 "warn",
-                f"Run cancelled. {cancelled_count} run(s) not completed.",
+                f"[{short_id}] Run cancelled. {cancelled_count} run(s) "
+                f"not completed.",
             )
         elif summary.get("status") == "batch_complete":
             self._append_log(
-                "hdr", f"Run done: {succ} ok, {fail} failed."
+                "hdr",
+                f"[{short_id}] Run done: {succ} ok, {fail} failed.",
             )
         else:
-            self._append_log("hdr", "Run done.")
+            self._append_log("hdr", f"[{short_id}] Run done.")
         self._update_run_buttons()
 
     # ---- command submission ----
@@ -813,27 +723,40 @@ class KritomaticPanel(QDockWidget):
             command["paste"] = json.dumps(cfg["paste"])
 
         if key == "run":
+            # Cancel any pending debounce — the config we are about to
+            # send is what the user has right now, and we don't want
+            # a stray comfy_apply_config to land after the run is
+            # already on the wire.
             self._pending_apply_timer.stop()
             self._pending_apply_source = ""
 
-            request_id = f"run-{int(time.time() * 1000)}"
-            self._active_run_request_id = request_id
-            self._running = True
+            # Unique per click; two rapid clicks do not collide.
+            request_id = (
+                f"run-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+            )
+            self._active_runs[request_id] = time.time()
             bundle = {"id": request_id, "commands": [command]}
-            self._conn.enqueue(request_id, bundle)
-            self._append_log("hdr", "Run started.")
+            # Bypass the serial command worker so a second click lands
+            # while the first is still preparing. See the module
+            # docstring, "Concurrent runs".
+            self._conn.send_run_now(request_id, bundle)
+            short_id = self._short_id_from_request_id(request_id)
+            self._append_log("hdr", f"[{short_id}] Run started.")
             self._update_run_buttons()
 
         elif key == "cancel":
-            if not self._active_run_request_id:
+            if not self._active_runs:
                 self._append_log(
                     "warn", "No run in progress to cancel.",
                 )
                 return
-            request_id = f"cancel-{int(time.time() * 1000)}"
-            self._conn.send_cancel_now(
-                self._active_run_request_id, request_id,
-            )
+            # One cancel per active run, each on its own socket.
+            for run_id in list(self._active_runs.keys()):
+                cancel_request_id = (
+                    f"cancel-{int(time.time() * 1000)}-"
+                    f"{uuid.uuid4().hex[:6]}"
+                )
+                self._conn.send_cancel_now(run_id, cancel_request_id)
 
         elif key == "cancel_all":
             request_id = f"cancel_all-{int(time.time() * 1000)}"
@@ -852,14 +775,18 @@ class KritomaticPanel(QDockWidget):
             self._append_log("hdr", f"Action {key} sent.")
 
     def _update_run_buttons(self) -> None:
+        any_run = bool(self._active_runs)
+        # Run stays enabled while any run is in flight: concurrent
+        # clicks are supported by design. It still requires a loaded
+        # workflow.
         self._renderer.set_action_enabled(
-            "run", not self._running and self._workflow_loaded)
-        self._renderer.set_action_enabled("cancel", self._running)
-        any_batch = self._running or self._active_batches_count > 0
+            "run", self._workflow_loaded)
+        self._renderer.set_action_enabled("cancel", any_run)
+        any_batch = any_run or self._active_batches_count > 0
         self._renderer.set_action_enabled("cancel_all", any_batch)
-        self._renderer.set_action_enabled("load", not self._running)
+        self._renderer.set_action_enabled("load", not any_run)
         self._renderer.set_action_enabled(
-            "save_config", self._workflow_loaded and not self._running)
+            "save_config", self._workflow_loaded and not any_run)
 
     def _append_log(self, kind: str, text: str) -> None:
         color = {

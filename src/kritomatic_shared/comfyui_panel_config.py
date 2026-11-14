@@ -47,11 +47,22 @@ are CLI-only: `panel run` uses them for the batch's connection and
 generate commands. The panel itself only reads/writes
 `resources`/`params`/`crop`/`paste`, and only those are autoloaded on
 `comfy_load`.
+
+Bundle id
+=========
+`build_batch` uses a fresh unique id per invocation. The daemon keys
+its live-batch registry by that id, so two CLI `panel run` calls
+from separate terminals are tracked as two distinct batches — a
+cancel aimed at one does not touch the other, and `comfy_batches`
+reports both. A static id here made concurrent CLI runs collide:
+whichever registered second overwrote the first's record, and a
+mid-overlap `comfy_cancel` targeted whichever was last registered.
 """
 
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -532,7 +543,16 @@ def build_file_template(workflow_ref: str) -> Optional[str]:
 # ============================================================================
 
 def build_batch(config: PanelConfig) -> dict:
-    """Build the batch `panel run` sends to the daemon."""
+    """Build the batch `panel run` sends to the daemon.
+
+    The bundle id is unique per invocation. The daemon's batch registry
+    keys by that id, so two `panel run` calls from separate terminals
+    are tracked as two distinct batches — a `comfy_cancel` aimed at one
+    does not touch the other, and `comfy_batches` reports both. A static
+    id here (the previous behaviour) made concurrent CLI runs collide:
+    whichever registered second overwrote the first's record, and any
+    cancel during the overlap targeted whichever was last registered.
+    """
     resources_json = json.dumps({
         name: {
             "source": spec.source,
@@ -568,7 +588,7 @@ def build_batch(config: PanelConfig) -> dict:
         generate_cmd["seed"] = config.seed
 
     return {
-        "id": "comfy_panel_v2",
+        "id": f"comfy_panel_v2_{uuid.uuid4().hex[:8]}",
         "commands": [
             {"type": "comfy_connect",
              "host": config.host,

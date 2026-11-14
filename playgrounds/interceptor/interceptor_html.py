@@ -4,6 +4,12 @@ Small manifest: state, view, view_image, dispatch, client,
 panel_fields, panel_bindings.  No scrubs module — the interceptor's
 only editable input is the prompt textarea, which lives in
 panel_bindings.
+
+The boot module now imports `drawView` from `pg_view.js` and wires
+it via `_setDrawView`.  This is what makes `_scheduleDrawView()` work
+— the canvas-only scheduler that pan, zoom, and overlay toggles use
+to bypass `syncPanelFields` entirely.  See `pg_state.py`'s
+TWO CANVASES / draw scheduling notes for the split.
 """
 
 import sys
@@ -31,13 +37,17 @@ import { setPanelDraw } from "./pgkit/panel_core.js";
 import {
   installPanelBindings, interceptorBootSync,
 } from "./pg_panel_bindings.js";
-import { draw } from "./pg_dispatch.js";
-import { resize, _setDraw } from "./pg_state.js";
+import { draw }     from "./pg_dispatch.js";
+import { drawView } from "./pg_view.js";
+import {
+  resize, _setDraw, _setDrawView,
+} from "./pg_state.js";
 
 console.log("[boot] modules loaded");
 
 try {
   _setDraw(draw);
+  _setDrawView(drawView);
   setPanelDraw(draw);
   setRemoteDraw(draw);
   setRemoteSelect(() => false);

@@ -6,6 +6,24 @@
     · Wheel at cursor           → zoom
     · Home / 0                  → fit view
 
+PAN / ZOOM USE `_scheduleDrawView`, NOT `_scheduleDraw`
+=======================================================
+Panning and zooming change only `view.zoom / offsetX / offsetY` —
+pure canvas state.  The panel fields and the mask/area cards are
+entirely unaffected.  Routing these through `_scheduleDraw` (which
+runs `draw()` = `drawView()` + `syncPanelFields()`) would schedule a
+panel sync that is guaranteed to be a no-op, on every animation
+frame of a pan.  `_scheduleDrawView` calls `drawView()` only — the
+sig-based layer dispatch inside it already skips the raw image blit
+when nothing about the image changed, and the panel sync is not
+called at all.
+
+The panel sync happens through `_scheduleDraw` (called from
+`pg_panel_bindings.js`) when an actual panel-state change occurs —
+task selection, task list refresh, task status updates, result
+arrival.  Those are rare, discrete events; the correctness of the
+split is not sensitive to timing.
+
 The old edge-drag / expansion-feature input paths are gone.  There
 is no longer an "expand the crop" interaction — that whole concept
 lived in the pre-refactor interceptor and depended on re-preparing
@@ -15,7 +33,9 @@ re-run with different crop padding in the docker.
 """
 
 DISPATCH_JS = r"""
-import { canvas, board, view, _scheduleDraw } from "./pg_state.js";
+import {
+  canvas, board, view, _scheduleDrawView,
+} from "./pg_state.js";
 import { drawView, zoomAt, fitView } from "./pg_view.js";
 import { syncPanelFields }      from "./pg_panel_fields.js";
 
@@ -60,7 +80,7 @@ window.addEventListener("mousemove", (e) => {
   if (_panDrag) {
     view.offsetX = _panDrag.startOffsetX + (e.clientX - _panDrag.startClientX);
     view.offsetY = _panDrag.startOffsetY + (e.clientY - _panDrag.startClientY);
-    _scheduleDraw();
+    _scheduleDrawView();
     return;
   }
   canvas.style.cursor = _spaceDown ? "grab" : "grab";
@@ -83,7 +103,7 @@ canvas.addEventListener("wheel", (e) => {
                        : 1);
   const factor = Math.exp(-dy * 0.0015);
   zoomAt(mx, my, factor);
-  _scheduleDraw();
+  _scheduleDrawView();
 }, { passive: false });
 
 window.addEventListener("keydown", (e) => {
@@ -102,7 +122,7 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "Home" || e.key === "0") {
     e.preventDefault();
     fitView();
-    _scheduleDraw();
+    _scheduleDrawView();
   }
 });
 

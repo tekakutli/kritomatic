@@ -40,6 +40,20 @@ CANVAS INTERACTION (hinted in the panel, implemented in
     space + drag     pan
     middle drag      pan
     Home / 0         reset view
+
+OVERLAY CANVAS
+==============
+`#overlayCanvas` is created dynamically by `pg_state.py`.  Its CSS
+lives here.  It sits above `#c` (image layer), has a transparent
+background so the image shows through, and `pointer-events: none`
+so all mouse input still lands on `#c` where the event handlers
+are attached.
+
+The `#overlayCanvas` selector has higher specificity than the
+shared `canvas { … }` rule in `pgkit/styles.py`, so
+`background: transparent` wins over the shared
+`background: #0a0e14`.  Without that override the overlay would be
+opaque dark and hide the image layer entirely.
 """
 
 PG_CSS = r"""
@@ -251,6 +265,20 @@ PG_CSS = r"""
     resize:vertical; min-height: 34px;
   }
   .mmAreaPrompt:focus { border-color:#00e5ff; }
+
+  /* ---- overlay layer (tints + placeholder) ----
+     Created dynamically by pg_state.py.  Sits on top of #c, is
+     transparent so the image shows through, and passes all pointer
+     events through to #c.  Specificity (100) beats the shared
+     `canvas { … }` rule (1), so `background: transparent` wins
+     over the shared `background: #0a0e14`. */
+  #overlayCanvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    background: transparent;
+    pointer-events: none;
+  }
 """
 
 PG_PANEL_BODY = r"""

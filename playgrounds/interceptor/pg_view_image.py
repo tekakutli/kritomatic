@@ -1,18 +1,19 @@
-"""The payload's canvas, plus opt-in tint overlays.
+"""The payload's raw canvas, plus opt-in tint overlays.
 
-Layers, in order of drawing:
-  1. Raw prepared canvas (always).
-  2. Multimask per-area masks, each tinted with its own colour
-     (opt-in via `board.showMultimask`, default on when snapshot
-     exists — the areas are the whole point of reviewing a multimask
-     workflow).
-  3. Context mask, purple (opt-in via `board.showContext`).
-  4. Selection mask, cyan (opt-in via `board.showSelection`).
+`drawImageLayer` draws the raw prepared PNG (what the model sees as
+input) and its border on `#c`.  Nothing else — no tints, no chrome.
+Repaints only when the image or transform changed.
 
-Order matters when multiple overlays are on simultaneously:
-multimask first (largest total area, lowest alpha per area),
-context next, selection last — so the pixel that matters most
-(what the model edits) has the final say visually.
+`drawTintOverlays` draws the three optional mask overlays on
+`#overlayCanvas`:
+
+  · multimask  — per-area colours (mirrors multimask's own palette)
+  · context    — purple at 25%
+  · selection  — cyan at 45%
+
+Draw order: multimask → context → selection.  The selection tint
+that matters most (what the model actually edits) has the final say
+visually.
 
 Tint mechanics
 ==============
@@ -25,18 +26,21 @@ ARGB32-then-PNG sources have mask copied into R before encode.  So
 
 Cache
 =====
-The tinted canvas is cached per `(b64, color, alpha)`.  Repeat draws
-on the same task (pan, zoom) reuse the cached tint instead of
-re-tinting every frame.  Cache is unbounded; a normal session sees a
-handful of tasks and masks.  If a session ever loads many distinct
-masks, evict by LRU.
+The tinted canvas is cached per `(b64, color)` — alpha is applied
+at draw time so it is not part of the key.  Repeat draws on the
+same task (pan, zoom, toggle flips) reuse the cached tint instead
+of re-tinting every frame.  `_buildTinted` is the only non-trivial
+cost in the draw path, and the cache reduces it to once per
+(mask, colour) pair per session.
 """
 
 VIEW_IMAGE_JS = r"""
-import { ctx, board, getCachedImage, areaColorById } from "./pg_state.js";
+import {
+  ctx, overlayCtx, board, getCachedImage, areaColorById,
+} from "./pg_state.js";
 
-// Cache the tinted canvas per (b64, color) — alpha is applied at
-// draw time so it does not need to be part of the key.
+// Cache the tinted canvas per (b64, color).  Alpha is applied at
+// draw time, so it is not part of the key.
 const _tintCache = new Map();
 
 function _cacheKey(b64, color) {
@@ -75,25 +79,25 @@ function _buildTinted(b64, color) {
   return tinted;
 }
 
-function _drawTintedLayer(b64, x0, y0, w, h, color, alpha) {
+function _drawTintedLayer(targetCtx, b64, x0, y0, w, h, color, alpha) {
   if (!b64) return;
   const key = _cacheKey(b64, color);
   let tinted = _tintCache.get(key);
   if (!tinted) {
     tinted = _buildTinted(b64, color);
-    if (!tinted) return;  // image not loaded yet — draw on next frame
+    if (!tinted) return;   // image not loaded yet — next frame will retry
     _tintCache.set(key, tinted);
   }
 
-  ctx.save();
-  ctx.globalAlpha = alpha;
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(tinted, x0, y0, w, h);
-  ctx.restore();
+  targetCtx.save();
+  targetCtx.globalAlpha = alpha;
+  targetCtx.imageSmoothingEnabled = true;
+  targetCtx.imageSmoothingQuality = "high";
+  targetCtx.drawImage(tinted, x0, y0, w, h);
+  targetCtx.restore();
 }
 
-function _drawMultimaskAreas(fit) {
+function _drawMultimaskAreas(targetCtx, fit) {
   const mm = board.multimask;
   if (!mm || !mm.state || !mm.masks) return;
   const areas = mm.state.areas || [];
@@ -104,13 +108,16 @@ function _drawMultimaskAreas(fit) {
     const b64 = mm.masks[h];
     if (!b64) continue;
     const color = areaColorById(area.id);
-    _drawTintedLayer(b64, fit.x0, fit.y0, fit.w, fit.h, color, 0.30);
+    _drawTintedLayer(targetCtx, b64, fit.x0, fit.y0, fit.w, fit.h,
+                     color, 0.30);
   }
 }
 
-export function drawCanvasLayer(fit) {
-  // 1. The raw canvas.  This is what the model receives — the whole
-  //    point of the interceptor.  Drawn first, always.
+/* ============================================================
+   Public — image layer (on #c)
+   ============================================================ */
+
+export function drawImageLayer(fit) {
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
   ctx.drawImage(fit.img, fit.x0, fit.y0, fit.w, fit.h);
@@ -118,26 +125,28 @@ export function drawCanvasLayer(fit) {
   ctx.strokeStyle = "#1e2836";
   ctx.lineWidth = 1;
   ctx.strokeRect(fit.x0 + 0.5, fit.y0 + 0.5, fit.w - 1, fit.h - 1);
+}
 
+/* ============================================================
+   Public — overlay layer (on #overlayCanvas)
+   ============================================================ */
+
+export function drawTintOverlays(fit) {
   const item = board.selectedItem;
   if (!item || !item.payload) return;
   const p = item.payload;
 
-  // 2. Multimask area tints (opt-in, default on when snapshot exists).
   if (board.showMultimask) {
-    _drawMultimaskAreas(fit);
+    _drawMultimaskAreas(overlayCtx, fit);
   }
-
-  // 3. Context tint (opt-in, default off).
   if (board.showContext) {
-    _drawTintedLayer(p.context_b64, fit.x0, fit.y0, fit.w, fit.h,
+    _drawTintedLayer(overlayCtx, p.context_b64,
+                     fit.x0, fit.y0, fit.w, fit.h,
                      { r: 180, g: 155, b: 255 }, 0.25);
   }
-
-  // 4. Selection tint (opt-in, default off).  Last, so the "what
-  //    the model actually edits" tint has visual priority.
   if (board.showSelection) {
-    _drawTintedLayer(p.selection_b64, fit.x0, fit.y0, fit.w, fit.h,
+    _drawTintedLayer(overlayCtx, p.selection_b64,
+                     fit.x0, fit.y0, fit.w, fit.h,
                      { r: 120, g: 220, b: 255 }, 0.45);
   }
 }

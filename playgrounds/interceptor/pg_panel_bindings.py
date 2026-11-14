@@ -1,20 +1,13 @@
 """Panel handlers: task selection, prompt textarea, overlay toggles,
 poll loop, Run / Discard.
 
-Run does two things (in order):
-  1. Sends `area_prompts` (from `board.areaPromptOverrides[task_id]`)
-     to the interceptor server; the server pushes them to multimask's
-     `/state` if the snapshot exists.
-  2. Sends the inpaint prompt override and calls
-     `comfy_resume_intercepted` on the daemon.
-
-The two steps are one atomic action from the user's perspective —
-the server handles ordering and aborts the whole run if the multimask
-push fails.
+Run sends `comfy_resume_intercepted` to the daemon, which applies the
+prompt override, submits the prepared workflow, polls, downloads, and
+pastes.  The daemon returns the same shape as `comfy_generate`: layer
+names, timing, etc.
 
 Discard sends `comfy_discard_intercepted`, which just drops the
-pending record from the daemon's `_intercepted_batches`.  No
-multimask push on discard.
+pending record from the daemon's `_intercepted_batches`.
 
 The poll loop refreshes the task list every 2 s while the tab is
 visible.  The `_consecutivePollFailures` counter is the same
@@ -34,10 +27,24 @@ OVERLAY TOGGLES
 Three checkboxes in the Canvas section: selection, context,
 multimask.  Selection and context default OFF; multimask defaults ON
 when a snapshot exists.  See `pg_base.py`'s module docstring.
+
+Toggle flips use `_scheduleDrawView` — canvas-only.  The panel state
+does not react to overlay toggles: the checkboxes are DOM-driven,
+the tint layers are canvas-driven, and no field in
+`syncPanelFields` reads `showSelection` / `showContext` /
+`showMultimask`.  Using `_scheduleDraw` there would schedule a
+guaranteed-no-op panel sync per click for zero benefit.
+
+Task selection, task list refresh, and Run/Discard remain on
+`_scheduleDraw` — those changes actually touch panel state (task
+list highlight, task info text, payload / result lines, multimask
+area cards).
 """
 
 PANEL_BINDINGS_JS = r"""
-import { board, _scheduleDraw, getCachedImage } from "./pg_state.js";
+import {
+  board, _scheduleDraw, _scheduleDrawView, getCachedImage,
+} from "./pg_state.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
 import {
   interceptList, interceptItem, interceptRun, interceptDiscard,
@@ -219,25 +226,26 @@ export function installPanelBindings() {
     });
   }
 
+  // Overlay toggles: canvas-only.  See the module docstring.
   if (showSelCb) {
     showSelCb.checked = !!board.showSelection;
     showSelCb.addEventListener("change", () => {
       board.showSelection = !!showSelCb.checked;
-      _scheduleDraw();
+      _scheduleDrawView();
     });
   }
   if (showCtxCb) {
     showCtxCb.checked = !!board.showContext;
     showCtxCb.addEventListener("change", () => {
       board.showContext = !!showCtxCb.checked;
-      _scheduleDraw();
+      _scheduleDrawView();
     });
   }
   if (showMmCb) {
     showMmCb.checked = !!board.showMultimask;
     showMmCb.addEventListener("change", () => {
       board.showMultimask = !!showMmCb.checked;
-      _scheduleDraw();
+      _scheduleDrawView();
     });
   }
 

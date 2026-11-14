@@ -37,18 +37,57 @@ Sync cadence:
 Change detection: each piece of payload is hashed before push and
 skipped if unchanged.  This keeps a mask-select from re-pushing the
 whole canvas, and keeps a rotation-only change from re-pushing
-anything."""
+anything.
+
+FAILURE MIRRORING
+=================
+`/sync` failures are shown persistently in `#statusLine` (via
+`board.syncError`, written by `pg_panel_fields.js`).  They are ALSO
+mirrored to the playground server's stdout through
+`pgkit/panel_core.js`'s `flashStatus` → `./__log` path, but only on
+the *transition* from "sync working" to "sync broken":
+
+    · first failure after a success  → one `flashStatus(..., "bad")`
+                                       line (transient `#status` popup
+                                       + one stdout line)
+    · subsequent failures            → silent on stdout (`#statusLine`
+                                       still updates the persistent
+                                       message in case the reason
+                                       changed)
+    · success                        → clears the warn-streak flag, so
+                                       the next failure warns again
+
+This mirrors autosync's failure handling in `pg_autosync.js`: same
+"warn once per streak" cadence, same reset-on-success contract.  The
+difference is class: autosync's pull failures are `"warn"` (display
+may be stale, everything else works); sync's push failures are
+`"bad"` (docker's next Run will operate on stale state).  A
+`"warn"` mirror is silenced by `?pgkit_no_mirror_warn=1`; a `"bad"`
+one is not — deliberate, because a broken push path is a functional
+problem the operator should see.
+
+The class choice also matches interceptor's `_runAction` /
+`_discardAction` failures, which use `flashStatus(..., "bad")` for
+resume failures.  The two playgrounds now agree on "hard failure →
+bad, soft failure → warn"."""
 
 SYNC_JS = r"""
 import { board, view } from "./pg_state.js";
 import { selectedMaskIdx } from "./pg_masks.js";
 import { SYNC_DEBOUNCE_MS } from "./pg_tuning.js";
+import { flashStatus } from "./pgkit/panel_core.js";
 
 let _timer            = null;
 let _lastCanvasHash   = "";
 let _lastSelectionB64 = "";
 let _lastContextHash  = "";
 let _lastRotation     = null;
+/* Warn-streak flag for /sync failures.  False after a success,
+   set true on the first failure, kept true across subsequent
+   failures.  Flipping back to false on success is what lets the
+   *next* failure warn again.  See the module docstring,
+   FAILURE MIRRORING. */
+let _warnedSyncFailure = false;
 
 function _stripDataUrl(b64) {
   return String(b64 || "").replace(/^data:image\/png;base64,/, "");
@@ -128,11 +167,20 @@ async function _doSync() {
     if (data.success) {
       board.lastSync  = Date.now();
       board.syncError = null;
+      _warnedSyncFailure = false;
     } else {
       board.syncError = data.message || "sync failed";
+      if (!_warnedSyncFailure) {
+        _warnedSyncFailure = true;
+        flashStatus("sync failed: " + board.syncError, "bad");
+      }
     }
   } catch (e) {
     board.syncError = e.message || "network error";
+    if (!_warnedSyncFailure) {
+      _warnedSyncFailure = true;
+      flashStatus("sync failed: " + board.syncError, "bad");
+    }
   } finally {
     board.syncing = false;
   }

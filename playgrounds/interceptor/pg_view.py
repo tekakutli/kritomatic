@@ -1,32 +1,69 @@
-"""The interceptor's canvas: zoomable, pannable, showing three layers
-of the payload the daemon prepared:
+"""The interceptor's canvas: zoomable, pannable, two-layer, sig-
+dispatched.
 
-  1. canvas    — payload.canvas_b64 (what the model sees as input)
-  2. selection — payload.selection_b64, tinted (what the model edits)
-  3. context   — payload.context_b64, tinted (what the model considers
-                 context / what the workflow crops to)
+`drawView()` computes a content signature for each of the two
+stacked canvases and repaints only the layers whose signature
+changed.
 
-Layers 2 and 3 are drawn at low opacity over the canvas so the user
-can see exactly what will be affected.  See `pg_view_image.js` for
-the tint composition.
+    image sig  covers:  board.selectedItem identity, image loaded
+                        state, view.zoom/offsetX/offsetY, viewport
+                        dims + DPR
+    overlay sig covers: same base, plus overlay toggles
+                        (board.showSelection / showContext /
+                        showMultimask)
 
-When the payload's `output_rotation` is non-zero, the canvas is the
-rotated + cropped frame — that's what the model actually consumes,
-and it's the right thing to display for review.  There is no
-"un-rotated preview" mode: what you see here is what the model gets.
+Placeholder text (`"waiting for a task"`, `"loading…"`) lives on
+the OVERLAY layer.  The image layer clears to transparent when
+there is no image or the image hasn't loaded yet; the shared pgkit
+CSS provides the dark fill under both layers.
+
+CHROME TEXT — CACHED AS AN OFFSCREEN BLIT
+=========================================
+`_placeholder` runs whenever the overlay repaints in the empty /
+loading states.  Two unique strings, so the cache collapses them
+to one blit each.  First paint per string: measure the text once,
+allocate an offscreen canvas to fit, draw the string there.
+Subsequent paints: one `drawImage` at the centered position — no
+`measureText`, no `fillText`, no per-frame string work.
+
+PIXEL COST PER FRAME
+====================
+Image layer:
+    clearRect                          (cheap)
+    drawImage(raw canvas)              (cheap, GPU accelerated)
+    strokeRect border                  (cheap)
+
+Overlay layer (loaded case, all toggles on):
+    clearRect                          (cheap)
+    N drawImage(tinted multimask)      (cheap, cached blits)
+    drawImage(tinted context)          (cheap, cached blit)
+    drawImage(tinted selection)        (cheap, cached blit)
+
+Overlay layer (placeholder case):
+    clearRect                          (cheap)
+    drawImage(cached placeholder)      (cheap)
+
+The only non-cached work is `_buildTinted` in `pg_view_image.js`,
+which iterates every pixel of a grayscale mask to tint it.  It runs
+exactly once per (mask, color) pair — the results are cached on
+`_tintCache` and reused until the tab is closed.
+
+The point of the split is that toggling an overlay checkbox
+repaints one layer, not two; and that the raw image blit (which is
+still the single largest `drawImage` in the frame) is skipped
+entirely when nothing about the image changed.
 """
 
 VIEW_JS = r"""
-import { board, view, ctx, getCachedImage } from "./pg_state.js";
-import { drawCanvasLayer } from "./pg_view_image.js";
+import {
+  ctx, overlayCtx, board, view, _layerSigs, getCachedImage,
+} from "./pg_state.js";
+import { drawImageLayer, drawTintOverlays } from "./pg_view_image.js";
 
-function _placeholder(cw, ch, text) {
-  ctx.fillStyle = "#5a6774";
-  ctx.font = "700 12px 'JetBrains Mono', monospace";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(text, cw / 2, ch / 2);
-}
+/* ============================================================
+   Fit-rect helpers (unchanged interface; callers in
+   pg_dispatch.js use zoomAt / fitView from here)
+   ============================================================ */
 
 export function currentFitRect() {
   const item = board.selectedItem;
@@ -82,17 +119,157 @@ export function zoomAt(screenX, screenY, factor) {
   view.offsetY = screenY - wy * newZoom;
 }
 
-export function drawView() {
-  const cw = window.innerWidth, ch = window.innerHeight;
-  ctx.fillStyle = "#0a0e14";
-  ctx.fillRect(0, 0, cw, ch);
+/* ============================================================
+   Signatures
+   ============================================================ */
 
+function _viewportKey() {
+  return window.innerWidth + "x" + window.innerHeight
+       + "@" + (window.devicePixelRatio || 1);
+}
+
+function _itemKey() {
   const item = board.selectedItem;
-  if (!item) { _placeholder(cw, ch, "waiting for a task"); return; }
+  if (!item) return "none";
+  const payload = item.payload || {};
+  return String(item.task_id || "")
+       + ":" + (payload.canvas_b64 ? payload.canvas_b64.length : 0);
+}
+
+function _transformKey() {
+  return view.zoom + "," + view.offsetX + "," + view.offsetY;
+}
+
+function _imageSig() {
+  const item = board.selectedItem;
+  if (!item) return "none|" + _viewportKey();
+  const payload = item.payload || {};
+  if (!payload.canvas_b64) return "none|" + _viewportKey();
+  const img = getCachedImage(payload.canvas_b64);
+  const loaded = (img && img.complete && img.naturalWidth) ? "1" : "0";
+  return _itemKey()
+       + "|" + loaded
+       + "|" + _transformKey()
+       + "|" + _viewportKey();
+}
+
+function _overlaySig() {
+  const item = board.selectedItem;
+  if (!item) return "no-item|" + _viewportKey();
+  const payload = item.payload || {};
+  if (!payload.canvas_b64) return "no-canvas|" + _viewportKey();
+  const img = getCachedImage(payload.canvas_b64);
+  if (!img || !img.complete || !img.naturalWidth) {
+    return "loading|" + _viewportKey();
+  }
+  // Number of multimask masks helps the sig change when a snapshot
+  // gains/loses entries without an item switch.  Cheap: object-key
+  // count of a per-task dict.
+  const mm = board.multimask;
+  const mmMaskCount = (mm && mm.masks)
+    ? Object.keys(mm.masks).length : 0;
+  return "loaded|" + _itemKey()
+       + "|" + _transformKey()
+       + "|" + _viewportKey()
+       + "|" + (board.showSelection ? "1" : "0")
+       + "|" + (board.showContext   ? "1" : "0")
+       + "|" + (board.showMultimask ? "1" : "0")
+       + "|" + mmMaskCount;
+}
+
+/* ============================================================
+   Placeholder text — cached offscreen blit
+   ============================================================
+   Two unique strings ever ("waiting for a task" / "loading…").
+   Cache by text; rebuild only on miss.  The blit is centered per-
+   frame using targetCtx, so a viewport resize correctly re-centers
+   without rebuilding the cache. */
+
+const _placeholderCache = new Map();
+
+function _getPlaceholderCanvas(text) {
+  let cached = _placeholderCache.get(text);
+  if (cached) return cached;
+
+  // Measure with a throwaway context so the caller's targetCtx
+  // state stays untouched.
+  const measure = document.createElement("canvas").getContext("2d");
+  measure.font = "700 12px 'JetBrains Mono', monospace";
+  const w = Math.ceil(measure.measureText(text).width) + 4;
+
+  const c = document.createElement("canvas");
+  c.width  = Math.max(1, w);
+  c.height = 20;
+  const cx = c.getContext("2d");
+  cx.font = "700 12px 'JetBrains Mono', monospace";
+  cx.fillStyle = "#5a6774";
+  cx.textAlign = "left";
+  cx.textBaseline = "middle";
+  cx.fillText(text, 2, 10);
+
+  _placeholderCache.set(text, c);
+  return c;
+}
+
+function _drawPlaceholder(targetCtx, cw, ch, text) {
+  const c = _getPlaceholderCanvas(text);
+  targetCtx.drawImage(
+    c,
+    Math.round((cw - c.width)  / 2),
+    Math.round((ch - c.height) / 2),
+  );
+}
+
+/* ============================================================
+   Layer draws
+   ============================================================ */
+
+function _drawImageCanvas() {
+  const cw = window.innerWidth, ch = window.innerHeight;
+  // Clear to transparent; CSS #c { background: #0a0e14 } shows
+  // through as the dark fill.
+  ctx.clearRect(0, 0, cw, ch);
 
   const fit = currentFitRect();
-  if (!fit) { _placeholder(cw, ch, "loading\u2026"); return; }
+  if (!fit) return;   // no image / not loaded yet — image layer stays empty
 
-  drawCanvasLayer(fit);
+  drawImageLayer(fit);
+}
+
+function _drawOverlayCanvas() {
+  const cw = window.innerWidth, ch = window.innerHeight;
+  overlayCtx.clearRect(0, 0, cw, ch);
+
+  const item = board.selectedItem;
+  if (!item || !(item.payload && item.payload.canvas_b64)) {
+    _drawPlaceholder(overlayCtx, cw, ch, "waiting for a task");
+    return;
+  }
+
+  const fit = currentFitRect();
+  if (!fit) {
+    _drawPlaceholder(overlayCtx, cw, ch, "loading\u2026");
+    return;
+  }
+
+  drawTintOverlays(fit);
+}
+
+/* ============================================================
+   Public entry point — sig-dispatched
+   ============================================================ */
+
+export function drawView() {
+  const imgSig = _imageSig();
+  const ovlSig = _overlaySig();
+
+  if (imgSig !== _layerSigs.image) {
+    _layerSigs.image = imgSig;
+    _drawImageCanvas();
+  }
+  if (ovlSig !== _layerSigs.overlay) {
+    _layerSigs.overlay = ovlSig;
+    _drawOverlayCanvas();
+  }
 }
 """

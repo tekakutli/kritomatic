@@ -65,7 +65,31 @@ The context rect used for cropping is derived from:
 
 Both `/sync` and `/crop_frame` are liveness-gated: kill the playground
 server, and the daemon's calls fail, falls back to legacy behavior
-(no rotation, no context rect)."""
+(no rotation, no context rect).
+
+SYNC FAILURE LOGGING
+====================
+Every `handle_sync` failure path produces one `[inpaint] sync error:
+<reason>` line on the server's stdout, alongside the JSON error
+response that goes back to the browser:
+
+  · transport exception       → `sync error: <exception>` (pre-existing)
+  · daemon did not respond    → `sync error: daemon did not respond`
+  · daemon returned error     → `sync error: daemon reported: <msg>`
+  · one or more sub-commands  → `sync error: <cmd>: <msg>[; ...]`
+    failed
+
+The success path already logs `sync: pushed [...] rotation=... 
+context=...`.  Failure logging completes the picture so a terminal
+watching the inpaint server sees *why* pushes stopped landing —
+previously the transport-exception path was the only one that logged,
+and the three response-side failure modes were silent.
+
+The browser mirrors the same error via `flashStatus(..., "bad")` in
+`pg_sync.js` on the first failure of a streak, so both sides agree on
+what went wrong and neither side depends on the other for
+observability.  See `pg_sync.py`'s module docstring, FAILURE
+MIRRORING."""
 
 from __future__ import annotations
 
@@ -292,14 +316,17 @@ def handle_sync(payload: dict) -> dict:
                 "context": context_state}
 
     if summary is None:
+        _log("sync error: daemon did not respond")
         return {"success": False,
                 "message": "daemon did not respond",
                 "rotation": rotation,
                 "context": context_state}
 
     if summary.get("status") == "error":
+        msg = summary.get("message", "daemon error")
+        _log(f"sync error: daemon reported: {msg}")
         return {"success": False,
-                "message": summary.get("message", "daemon error"),
+                "message": msg,
                 "rotation": rotation,
                 "context": context_state}
 
@@ -309,8 +336,10 @@ def handle_sync(payload: dict) -> dict:
         for r in summary.get("results", []) or []:
             if r.get("status") == "error":
                 msgs.append(f"{r.get('command')}: {r.get('message')}")
+        joined = "; ".join(msgs) or f"{failed} command(s) failed"
+        _log(f"sync error: {joined}")
         return {"success": False,
-                "message": "; ".join(msgs) or f"{failed} command(s) failed",
+                "message": joined,
                 "rotation": rotation,
                 "context": context_state}
 

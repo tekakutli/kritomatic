@@ -1,5 +1,5 @@
-"""Interceptor state: board, view transform, canvas, draw scheduling,
-image cache.
+"""Interceptor state: board, view transform, two canvases, draw
+scheduling, image cache.
 
 Leaf module.  Every other interceptor module imports from here and
 nothing here imports any of them.
@@ -10,6 +10,46 @@ VIEW
 `zoom` is *absolute* — screen pixels per canvas pixel.  At `zoom = 1`
 the canvas is drawn 1:1.  `offsetX, offsetY` is the screen position
 of the canvas's top-left corner.
+
+TWO CANVASES
+============
+The render surface is split into two stacked canvases:
+
+    #c              image layer: raw prepared canvas + border.  The
+                    dark fill is provided by the shared pgkit CSS
+                    (`canvas { background:#0a0e14 }`); the canvas is
+                    cleared to transparent so the CSS shows through.
+    #overlayCanvas  UI layer: tint overlays (multimask, context,
+                    selection) plus the placeholder text for the
+                    no-task / loading states.  Transparent background;
+                    `pointer-events: none` so all mouse events still
+                    land on `#c`.
+
+`pg_view.js` computes a content signature of each layer's input set
+per `drawView()` call and repaints a layer only when its signature
+changed.  The sigs live in `_layerSigs`, exported from here so
+`resize()` can invalidate them (`canvas.width = …` clears the pixel
+buffer regardless of whether the sig would have changed).
+
+The split exists to exploit disjoint change triggers:
+
+  · Pan / zoom move every layer — both repaint (unavoidable).
+  · Overlay toggles (selection / context / multimask) touch only
+    the overlay — the raw image blit is skipped entirely.
+  · Poll refresh or task-status updates touch neither canvas —
+    `syncPanelFields` handles those, both sigs are unchanged, both
+    layers skip.
+  · Task switches change `_itemKey` in both sigs — both repaint once.
+  · Image load (asynchronous, after a task switch) flips
+    `loaded` from 0 to 1 in both sigs — both repaint once, then
+    the overlay's tint layers become drawable.
+
+`_scheduleDraw`      → full `draw()` (canvas + panel syncs).
+`_scheduleDrawView`  → `drawView()` only (canvas-only repaint).
+
+A pending `_scheduleDraw` upgrades a queued `_scheduleDrawView`;
+a pending view-only scheduler is a no-op if a full draw is already
+queued (the full draw calls `drawView` internally).
 
 PROMPT OVERRIDES
 ================
@@ -59,7 +99,22 @@ STATE_JS = r"""
 export const canvas = document.getElementById("c");
 export const ctx    = canvas.getContext("2d");
 
+export const overlayCanvas = document.createElement("canvas");
+overlayCanvas.id = "overlayCanvas";
+document.body.appendChild(overlayCanvas);
+export const overlayCtx = overlayCanvas.getContext("2d");
+
 let _dpr = window.devicePixelRatio || 1;
+
+/* ============================================================
+   Per-layer sig caches — shared with resize().
+   ============================================================ */
+
+export const _layerSigs = { image: null, overlay: null };
+
+/* ============================================================
+   View
+   ============================================================ */
 
 export const view = {
   zoom: 1,
@@ -118,50 +173,90 @@ export const board = {
   multimask:           null,
 };
 
-/* --------------------------------------------------------------- */
-/*  Draw scheduling                                                 */
-/* --------------------------------------------------------------- */
+/* ============================================================
+   Draw scheduling — two levels
+   ============================================================
+   `_drawPending`  a RAF is queued.
+   `_drawFull`     the queued RAF should call `_drawFn` (draw), not
+                   `_drawViewFn` (drawView).
 
-let _drawFn = null;
-let _drawScheduled = false;
+   `_scheduleDraw`     sets `_drawFull = true` and (re)uses the
+                       pending RAF.  Upgrades a pending view-only
+                       RAF to full.
+   `_scheduleDrawView` sets `_drawFull = false` only if no RAF is
+                       pending.  A pending full draw is left alone
+                       (it will call `drawView` internally). */
 
-export function _setDraw(fn) { _drawFn = fn; }
+let _drawPending = false;
+let _drawFull    = false;
+let _drawFn      = null;
+let _drawViewFn  = null;
 
-export function _scheduleDraw() {
-  if (_drawScheduled) return;
-  _drawScheduled = true;
-  if (typeof requestAnimationFrame === "function") {
-    requestAnimationFrame(() => {
-      _drawScheduled = false;
-      if (_drawFn) _drawFn();
-    });
-  } else {
-    setTimeout(() => {
-      _drawScheduled = false;
-      if (_drawFn) _drawFn();
-    }, 16);
-  }
+export function _setDraw(fn)     { _drawFn = fn; }
+export function _setDrawView(fn) { _drawViewFn = fn; }
+
+function _fire() {
+  const full = _drawFull;
+  _drawPending = false;
+  _drawFull = false;
+  if (full) { if (_drawFn) _drawFn(); }
+  else      { if (_drawViewFn) _drawViewFn(); }
 }
 
-/* --------------------------------------------------------------- */
-/*  Resize                                                          */
-/* --------------------------------------------------------------- */
+export function _scheduleDraw() {
+  _drawFull = true;
+  if (_drawPending) return;
+  _drawPending = true;
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(_fire);
+  else setTimeout(_fire, 16);
+}
+
+export function _scheduleDrawView() {
+  if (_drawPending) return;   // don't downgrade a pending full draw
+  _drawFull = false;
+  _drawPending = true;
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(_fire);
+  else setTimeout(_fire, 16);
+}
+
+/* ============================================================
+   Resize — sizes BOTH canvases and clears the sig caches.
+   Setting `canvas.width` clears the pixel buffer regardless of
+   whether the sig would have changed, so the sigs MUST be reset
+   here unconditionally.
+
+   Calls `_drawViewFn` (if set) rather than `_drawFn`: a resize
+   invalidates canvas state only, not panel state, so the panel
+   sync in `draw()` would be a guaranteed no-op.  Fallback to
+   `_drawFn` for safety if `_setDrawView` was never called. */
 
 export function resize() {
   _dpr = window.devicePixelRatio || 1;
   const cw = window.innerWidth, ch = window.innerHeight;
+
   canvas.width  = Math.round(cw * _dpr);
   canvas.height = Math.round(ch * _dpr);
   canvas.style.width  = cw + "px";
   canvas.style.height = ch + "px";
   ctx.setTransform(_dpr, 0, 0, _dpr, 0, 0);
-  if (_drawFn) _drawFn();
+
+  overlayCanvas.width  = Math.round(cw * _dpr);
+  overlayCanvas.height = Math.round(ch * _dpr);
+  overlayCanvas.style.width  = cw + "px";
+  overlayCanvas.style.height = ch + "px";
+  overlayCtx.setTransform(_dpr, 0, 0, _dpr, 0, 0);
+
+  _layerSigs.image = null;
+  _layerSigs.overlay = null;
+
+  if (_drawViewFn) _drawViewFn();
+  else if (_drawFn) _drawFn();
 }
 window.addEventListener("resize", resize);
 
-/* --------------------------------------------------------------- */
-/*  Image cache                                                     */
-/* --------------------------------------------------------------- */
+/* ============================================================
+   Image cache
+   ============================================================ */
 
 const _imgCache = {};
 

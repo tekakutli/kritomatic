@@ -11,7 +11,21 @@ Two responsibilities remain, since the daemon owns the rotation step:
 The rotated-payload construction, crop projection, and rotation
 disambiguation that used to live here moved to the daemon side when
 rotation became a state value the daemon queries.  See
-`kritomatic_daemon/utils/comfy_apply.py`'s rotated prepare path."""
+`kritomatic_daemon/utils/comfy_apply.py`'s rotated prepare path.
+
+NO BOUNDS CLAMP
+===============
+`applyContextDrag` does NOT clamp the rect to the image bounds.  The
+user can drag the rect anywhere on the canvas — including off the
+image, and (during rotation) past the rotated diamond's corners.  The
+daemon extends the crop frame with transparent pixels to cover any
+out-of-bounds crop region (see `_extend_and_crop` in
+`comfy_apply.py`), so an off-image rect is a supported case, not a
+malformed one.
+
+Clamping at θ=0 is preserved in `inpaint_server._compute_crop_frame`
+(clamp to the image intersection), since at θ=0 there is no rotated
+frame to extend into."""
 
 INPAINT_JS = r"""
 import { board, view, screenToImageUnrotated } from "./pg_state.js";
@@ -122,7 +136,21 @@ export function hitContextRect(r, sx, sy) {
 
 /* ============================================================
    Pure drag math
-   ============================================================ */
+   ============================================================
+   No bounds clamp.  The user can drag the rect anywhere in the
+   image coordinate system — including into negative coordinates,
+   and past (imageWidth, imageHeight).  The rotated-crop path in
+   the daemon extends the crop frame with transparent pixels for
+   the out-of-bounds part; the un-rotated path in
+   `inpaint_server._compute_crop_frame` clamps to the image
+   intersection (there is no frame to extend into at θ=0).
+
+   The minimum-size clamp is preserved so that a resize handle
+   dragged past its opposite edge (or a shrink below 16×16 px)
+   still yields a well-defined rect; when the drag would invert
+   the rect, the min-size clamp symmetrises around the midpoint
+   rather than swapping the edges (which would flip the handle's
+   role mid-drag). */
 
 export function applyContextDrag(startRect, startIx, startIy,
                                   currentIx, currentIy,
@@ -166,10 +194,11 @@ export function applyContextDrag(startRect, startIx, startIy,
     y1 = cy + CONTEXT_MIN_SIZE / 2;
   }
 
-  x0 = Math.max(0, Math.min(board.imageWidth,  x0));
-  y0 = Math.max(0, Math.min(board.imageHeight, y0));
-  x1 = Math.max(0, Math.min(board.imageWidth,  x1));
-  y1 = Math.max(0, Math.min(board.imageHeight, y1));
+  // No clamp to [0, imageWidth] × [0, imageHeight] here.  The
+  // rotated-crop path in the daemon extends the crop frame with
+  // transparent pixels for out-of-bounds regions; the θ=0 path
+  // in `inpaint_server._compute_crop_frame` clamps to the image
+  // intersection since there is no rotated frame to extend into.
 
   return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
@@ -186,7 +215,12 @@ export function applyContextDrag(startRect, startIx, startIy,
 
    The daemon at prepare time translates this un-rotated rect into the
    crop frame accounting for rotation — it does not rotate the
-   rectangle itself.  See `comfy_apply.py`'s rotated prepare path. */
+   rectangle itself.  See `comfy_apply.py`'s rotated prepare path.
+
+   `fillRect` clips to the W×H canvas, so a rect that extends past the
+   image only contributes mask values inside the image — which is the
+   only place there are pixels to mask.  The out-of-image part of the
+   crop is handled by the daemon's `_extend_and_crop`. */
 
 export function buildContextMaskCanvas() {
   const W = board.imageWidth, H = board.imageHeight;

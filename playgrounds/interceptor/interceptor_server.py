@@ -10,6 +10,18 @@ Routes:
   POST /intercept/krita_open     open the (expanded) canvas in Krita
   POST /intercept/krita_refresh  fetch active document composite as PNG
 
+DORMANT STATUS
+==============
+The module imports cleanly today even though
+`inpaint_server.handle_inpaint` does not exist (inpaint's playground
+was refactored into a state-synchronizer — no generation — so that
+symbol is gone).  `handle_run` calls `_resolve_handle_inpaint()`, which
+returns the real function once inpaint's generation path is restored,
+and a stub that produces a normal task-error until then.  This keeps
+`run_all.py`, lint, and the dev tooling working while the interceptor
+is parked; nothing on the interceptor side needs to change when the
+generation path returns.
+
 DOCUMENT NAME RESOLUTION
 ========================
 The daemon's `open_document` response carries no `name` field.  The
@@ -48,7 +60,13 @@ from pathlib import Path
 
 from PIL import Image
 
-from inpaint.inpaint_server import handle_inpaint
+# `from inpaint.inpaint_server import handle_inpaint` used to live
+# here.  It no longer resolves: inpaint's playground was refactored
+# into a state-synchronizer (no generation), so its
+# inpaint_server.py does not define `handle_inpaint` today.  The
+# generation path is expected to return; until it does, the call
+# site uses `_resolve_handle_inpaint()` below to fetch it lazily and
+# fall back to a dormant stub.  See that function's docstring.
 from inpaint import krita_client
 
 
@@ -228,8 +246,49 @@ def handle_item(payload):
 
 
 # ---------------------------------------------------------------------------
-#  Run — unchanged
+#  Run
 # ---------------------------------------------------------------------------
+#
+# Inpaint's generation path (`inpaint_server.handle_inpaint`) is not
+# present in the current tree; the playground no longer submits
+# generation.  Interceptor is parked until that path returns, but the
+# surrounding tooling (run_all.py, pgkit.lint, the dev servers) must
+# still import this module cleanly.  `_resolve_handle_inpaint` gives
+# us both: a clean import today, and a transparent swap to the real
+# function the moment it exists again.
+
+def _resolve_handle_inpaint():
+    """Return `inpaint_server.handle_inpaint`, or a stub.
+
+    On a tree where inpaint's generation path exists, this resolves
+    the real function and returns it — no behavioural difference from
+    the previous top-of-file import.
+
+    On a tree where it does not (the current one), this returns
+    `_unavailable_inpaint`, whose return value matches the shape the
+    rest of `handle_run` already expects from a failed call:
+    `{"success": False, "message": ...}`.  The existing failure path
+    (task status → `"error"`, one callback with `{"error": msg}`)
+    handles it without any branching.
+    """
+    try:
+        from inpaint.inpaint_server import handle_inpaint
+        return handle_inpaint
+    except ImportError:
+        return _unavailable_inpaint
+
+
+def _unavailable_inpaint(_body):
+    return {
+        "success": False,
+        "message": (
+            "interceptor is dormant: inpaint_server.handle_inpaint "
+            "is unavailable (inpaint playground does not currently "
+            "generate). Interceptor resumes automatically once "
+            "inpaint's generation path returns."
+        ),
+    }
+
 
 def handle_run(payload):
     payload = payload or {}
@@ -288,7 +347,7 @@ def handle_run(payload):
          + ")")
 
     try:
-        result = handle_inpaint(body)
+        result = _resolve_handle_inpaint()(body)
     except Exception as e:
         result = {"success": False,
                   "message": f"handle_inpaint threw: {e}"}

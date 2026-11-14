@@ -38,15 +38,16 @@ to "what does the daemon crop @thecanvas to."  The math:
   · theta = 0, context disabled: crop = @thecontext layer's tight
     bbox (queried from the daemon), or whole canvas if the layer has
     no content.
-  · theta ≠ 0: rotate frame to W'×H'; `_project_crop_dims_py` picks a
-    centered cropW×cropH based on the selection bbox ∩ context rect
-    in the rotated frame; crop at ((W'-cropW)//2, (H'-cropH)//2).
-
-The daemon queries `/crop_frame` once per generation, applies those
-exact numbers, and hands the workflow cropW×cropH blobs.  Multimask's
-`/mask` handler queries the same frame and applies the same
-rotate+crop to each area mask.  No duplication of the projection
-math.
+  · theta ≠ 0, context enabled: rotate frame to W'×H'; translate the
+    user's context rect into the rotated frame by
+    ((W'-W)//2 + cx, (H'-H)//2 + cy).  The translated rect's
+    axis-aligned position in the rotated frame matches the *visual*
+    position of the user's rect over the rotated image, so corners
+    of the diamond are fully coverable by a crop that reaches them.
+    Crops that extend past the W'×H' frame are honoured — the daemon
+    extends the canvas to cover them.  This is a pure translation,
+    NOT a rotation of the context rect.
+  · theta ≠ 0, context disabled: crop = whole rotated frame W'×H'.
 
 If the playground has no image (empty state), `/crop_frame` returns
 `{success: true, frame: null}` — the daemon falls back to its legacy
@@ -336,83 +337,12 @@ def handle_rotation(_payload) -> dict:
 #  /crop_frame — authoritative crop window
 # ---------------------------------------------------------------------------
 
-def _project_crop_dims_py(W, H, maskBBoxOrig, theta, c, inpaintEnabled):
-    """Port of the pre-refactor `projectCropDims`.  Kept identical so
-    daemon and multimask can rely on it without divergence."""
-    base = (W, H)
-    if maskBBoxOrig is None:
-        return base
-    if not theta or theta % 360 == 0:
-        return base
-
-    rad = (theta % 360) * math.pi / 180.0
-    cosA, sinA = abs(math.cos(rad)), abs(math.sin(rad))
-    Wp = max(1, round(W * cosA + H * sinA))
-    Hp = max(1, round(W * sinA + H * cosA))
-
-    cosR, sinR = math.cos(rad), math.sin(rad)
-    cx, cy = W / 2.0, H / 2.0
-    cxp, cyp = Wp / 2.0, Hp / 2.0
-
-    mx0, my0, mw, mh = maskBBoxOrig
-    mcorners = [
-        (mx0, my0),
-        (mx0 + mw, my0),
-        (mx0 + mw, my0 + mh),
-        (mx0, my0 + mh),
-    ]
-    rminX = rminY = float("inf")
-    rmaxX = rmaxY = float("-inf")
-    for px, py in mcorners:
-        dx = px - cx
-        dy = py - cy
-        rx = dx * cosR - dy * sinR
-        ry = dx * sinR + dy * cosR
-        wx = cxp + rx
-        wy = cyp + ry
-        if wx < rminX: rminX = wx
-        if wy < rminY: rminY = wy
-        if wx > rmaxX: rmaxX = wx
-        if wy > rmaxY: rmaxY = wy
-
-    if inpaintEnabled:
-        ctxL = (Wp - W) / 2.0 + c[0]
-        ctxT = (Hp - H) / 2.0 + c[1]
-        ctxR = ctxL + c[2]
-        ctxB = ctxT + c[3]
-    else:
-        ctxL = ctxT = float("-inf")
-        ctxR = ctxB = float("inf")
-
-    effL = max(rminX, ctxL)
-    effT = max(rminY, ctxT)
-    effR = min(rmaxX, ctxR)
-    effB = min(rmaxY, ctxB)
-    if effR <= effL or effB <= effT:
-        return base
-
-    baseL = (Wp - W) / 2.0
-    baseT = (Hp - H) / 2.0
-    baseR = baseL + W
-    baseB = baseT + H
-    if effL >= baseL and effT >= baseT and effR <= baseR and effB <= baseB:
-        return base
-
-    halfW = max(Wp / 2.0 - effL, effR - Wp / 2.0, W / 2.0)
-    halfH = max(Hp / 2.0 - effT, effB - Hp / 2.0, H / 2.0)
-    return (
-        min(Wp, math.ceil(halfW * 2)),
-        min(Hp, math.ceil(halfH * 2)),
-    )
-
-
 def _compute_crop_frame() -> Optional[dict]:
     with _state_lock:
         W = _canvas_w
         H = _canvas_h
         theta = _rotation
         ctx = dict(_context_state)
-        sel_b64 = _selection_b64
 
     if W <= 0 or H <= 0:
         return None
@@ -429,8 +359,6 @@ def _compute_crop_frame() -> Optional[dict]:
         if layer_bbox is not None:
             inpaint_enabled = True
             context_rect = layer_bbox
-
-    sel_bbox = _decode_bbox(sel_b64) if sel_b64 else None
 
     if theta == 0:
         if inpaint_enabled:
@@ -461,11 +389,27 @@ def _compute_crop_frame() -> Optional[dict]:
     Wp = max(1, round(W * cos_a + H * sin_a))
     Hp = max(1, round(W * sin_a + H * cos_a))
 
-    cropW, cropH = _project_crop_dims_py(
-        W, H, sel_bbox, theta, context_rect, inpaint_enabled,
-    )
-    cropX = round((Wp - cropW) / 2)
-    cropY = round((Hp - cropH) / 2)
+    if inpaint_enabled:
+        # Translate the user's context rect into the rotated frame,
+        # preserving the rect's visual position (see the module
+        # docstring, CROP FRAME).  The rect's size is preserved
+        # unchanged.  This is a pure TRANSLATION — NOT a rotation
+        # of the context rect.  If the translated crop extends past
+        # the Wp×Hp frame, the daemon extends the canvas to cover it.
+        cx = int(context_rect[0])
+        cy = int(context_rect[1])
+        cw = int(context_rect[2])
+        ch = int(context_rect[3])
+        cropX = round((Wp - W) / 2) + cx
+        cropY = round((Hp - H) / 2) + cy
+        cropW = cw
+        cropH = ch
+    else:
+        # No context rect: crop the whole rotated frame.
+        cropX = 0
+        cropY = 0
+        cropW = Wp
+        cropH = Hp
 
     result = {
         "theta": theta, "W": W, "H": H, "Wp": Wp, "Hp": Hp,

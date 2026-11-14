@@ -101,10 +101,12 @@ Two directories must be importable:
                          `playground_fonts.py` lives here.  Without
                          this on sys.path, the mere act of importing
                          `cone_html` (which imports `pg_state`)
-                         raises ModuleNotFoundError, and because this
-                         file imports all six at module load, one
+                         raises ModuleNotFoundError, and because
+                         `_descriptors()` imports all eight, one
                          broken import takes down every `--only`
-                         selection too.
+                         selection too.  (It does not take down
+                         `--shutdown-hub`, which short-circuits
+                         before `_descriptors()` is reached.)
 
 The parent of `playgrounds/` (the repo root) does not need to be on
 sys.path: nothing imported from here uses it, and the playgrounds'
@@ -128,15 +130,6 @@ for _p in (_HERE, _SHARED_CABLE_ROOM):
 
 from pgkit.launcher import Launcher, serve_group
 
-from board       import board_html, board_server
-from cone        import cone_html, cone_kra
-from inpaint     import inpaint_html, inpaint_server
-from interceptor import interceptor_html, interceptor_server
-from segment     import segment_html, segment_server
-from text_boxes  import text_boxes_html, text_boxes_server
-from text_wall   import text_wall_html, text_wall_kra
-from multimask   import multimask_html, multimask_server
-
 
 GROUP_NAME = "core"
 
@@ -146,6 +139,23 @@ GROUP_NAME = "core"
 # ============================================================================
 
 def _descriptors():
+    """Build the playground descriptors.
+
+    The playground module imports live here, not at module scope, so
+    that `--shutdown-hub` — which exists precisely to be reachable
+    when a playground is misbehaving — never has to import a
+    playground to run.  `main()` short-circuits that flag before
+    calling this function; see `_shutdown_hub()`.
+    """
+    from board       import board_html, board_server
+    from cone        import cone_html, cone_kra
+    from inpaint     import inpaint_html, inpaint_server
+    from interceptor import interceptor_html, interceptor_server
+    from segment     import segment_html, segment_server
+    from text_boxes  import text_boxes_html, text_boxes_server
+    from text_wall   import text_wall_html, text_wall_kra
+    from multimask   import multimask_html, multimask_server
+
     return [
         {
             "name":           "board",

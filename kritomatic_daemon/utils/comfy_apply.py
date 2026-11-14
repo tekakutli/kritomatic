@@ -28,7 +28,20 @@ Cases:
 `PreparedWorkflow.rotation = theta`.  The paste stage un-rotates by
 `-theta` and pastes at `(paste_config.x, paste_config.y)` when theta
 ≠ 0; otherwise pastes at `(crop_bounds[0]+x, crop_bounds[1]+y)` (the
-existing un-rotated semantics)."""
+existing un-rotated semantics).
+
+EXTENDED CANVAS
+===============
+`cropX`/`cropY` returned by `/crop_frame` may be negative, or
+`cropX+cropW` may exceed `Wp` (and likewise for Y) when the user
+drags the context rect past the un-rotated canvas bounds — the
+daemon is expected to be able to crop any region of the rotated
+frame, including regions past `Wp×Hp`, with the outside-of-frame
+region rendered as transparent (canvas) / black (mask).  The
+`_extend_and_crop` helper draws the rotated image at a negative
+offset into a `cropW×cropH` blank image; QPainter clips the
+negative coordinates so the parts of the crop outside the frame
+stay transparent."""
 
 from __future__ import annotations
 
@@ -201,7 +214,6 @@ def _prepare_cropped(doc, graph, resource_slots, param_slots,
     cropW = int(frame["cropW"])
     cropH = int(frame["cropH"])
     inpaint_enabled = bool(frame.get("inpaintEnabled", False))
-    context_rect_raw = frame.get("contextRect")
 
     warnings: list[str] = []
     warnings.append(
@@ -243,31 +255,25 @@ def _prepare_cropped(doc, graph, resource_slots, param_slots,
         )
 
     # ---- Crop to (cropX, cropY, cropW, cropH) ----
-    cropped_canvas = rotated_canvas.copy(cropX, cropY, cropW, cropH)
-    cropped_selection = rotated_selection.copy(cropX, cropY, cropW, cropH)
+    #
+    # `_extend_and_crop` draws the rotated image at (-cropX, -cropY)
+    # inside a blank cropW×cropH image, so a crop that extends past
+    # the rotated frame boundary (cropX<0, or cropX+cropW>Wp, or the
+    # Y analogue) is filled with transparent (ARGB) / black
+    # (grayscale) where the frame has no data.  In-bounds crops
+    # produce byte-identical output to the old `.copy()` call.
+    cropped_canvas    = _extend_and_crop(rotated_canvas,    cropX, cropY, cropW, cropH)
+    cropped_selection = _extend_and_crop(rotated_selection, cropX, cropY, cropW, cropH)
 
     # ---- Context mask ----
     #
-    # theta = 0: crop = context rect by construction → context = whole crop.
-    # theta ≠ 0, context enabled: axis-aligned rect at rotated bbox of the
-    #   context rect, translated into crop frame.
-    # theta ≠ 0, context disabled: whole crop.
-    if theta == 0:
-        ctx_mask = _all_white_qimage(cropW, cropH)
-    elif inpaint_enabled and isinstance(context_rect_raw, list) \
-            and len(context_rect_raw) == 4:
-        cx, cy, cw, ch = context_rect_raw
-        bbox_in_crop = _rotated_bbox_in_crop(
-            (int(cx), int(cy), int(cw), int(ch)),
-            theta, W, H, Wp, Hp, cropX, cropY,
-        )
-        ctx_mask = _make_rect_qimage(bbox_in_crop, cropW, cropH)
-        warnings.append(f"context rect in crop: {bbox_in_crop}")
-        print(f"[comfyui] context rect in crop: {bbox_in_crop}", flush=True)
-    else:
-        ctx_mask = _all_white_qimage(cropW, cropH)
-
-    cropped_selection = _multiply_qimages(cropped_selection, ctx_mask)
+    # The daemon crop IS the user's context rect (translated into the
+    # rotated frame).  So the whole crop is context; the workflow's
+    # InpaintCropImproved sees a full-white context mask, which means
+    # "the entire crop is context" and its own crop is
+    # selection ∪ full_crop = full_crop.  The model sees the whole
+    # crop, restricted only by the selection mask.
+    ctx_mask = _all_white_qimage(cropW, cropH)
 
     # ---- Encode + upload ----
     canvas_enc_out = _encode_qimage_png(cropped_canvas)
@@ -291,7 +297,7 @@ def _prepare_cropped(doc, graph, resource_slots, param_slots,
 
     return PreparedWorkflow(
         graph=prepared_graph,
-        crop_bounds=(0, 0, cropW, cropH),
+        crop_bounds=(cropX, cropY, cropW, cropH),
         assets=assets,
         seed_applied=(
             seed if seed is not None and "seed" in param_slots else None
@@ -302,12 +308,42 @@ def _prepare_cropped(doc, graph, resource_slots, param_slots,
 
 
 # ---------------------------------------------------------------------------
+#  Crop with extension
+# ---------------------------------------------------------------------------
+
+def _extend_and_crop(img, cropX, cropY, cropW, cropH):
+    """Extract a cropW × cropH region from img starting at (cropX, cropY).
+
+    Regions outside img's bounds are filled with transparent (ARGB32)
+    or black (Grayscale8).  Handles cropX/cropY < 0 and crops that
+    extend past img's right/bottom edge — the rotated frame may be
+    smaller than the requested crop when the user drags the context
+    rect past the frame boundary.  For in-bounds crops this produces
+    exactly the same output as `img.copy(cropX, cropY, cropW, cropH)`.
+    """
+    from PyQt6.QtGui import QImage, QPainter
+
+    fmt = img.format()
+    out = QImage(int(cropW), int(cropH), fmt)
+    out.fill(0)
+    painter = QPainter(out)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    painter.drawImage(-int(cropX), -int(cropY), img)
+    painter.end()
+    return out
+
+
+# ---------------------------------------------------------------------------
 #  Rotation helpers
 # ---------------------------------------------------------------------------
 
 def _rotated_bbox_in_crop(rect, theta, W, H, Wp, Hp, cropX, cropY):
     """Return the axis-aligned bbox of the rect (in W×H) transformed
-    into the rotated frame (W'×H'), translated into the crop frame."""
+    into the rotated frame (W'×H'), translated into the crop frame.
+
+    Kept for future use; the current cropped path uses a full-white
+    context mask since the daemon crop already IS the context rect.
+    """
     cx, cy, cw, ch = rect
     rad = math.radians(theta)
     cos_t, sin_t = math.cos(rad), math.sin(rad)
@@ -390,6 +426,7 @@ def _all_white_qimage(W, H):
 
 
 def _make_rect_qimage(bbox, W, H):
+    """Kept for future use; no longer called from the cropped path."""
     from PyQt6.QtGui import QImage
     q = QImage(W, H, QImage.Format.Format_Grayscale8)
     q.fill(0)

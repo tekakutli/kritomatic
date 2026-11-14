@@ -8,21 +8,37 @@ The paste stage reads `prepared.rotation` (set by `prepare_workflow`).
   · rotation == 0: unchanged — paste at
     `(crop_bounds[0]+x, crop_bounds[1]+y)`.
 
-  · rotation != 0: the workflow ran on pre-rotated content at
-    `(0, 0, cropW, cropH)` where `cropW × cropH` is centered on the
-    rotated frame `W' × H'`.  `InpaintStitchImproved` returns
-    `cropW × cropH`.  **Before un-rotating**, the output is padded
-    back to `W' × H'` at `((W' - cropW) // 2, (H' - cropH) // 2)` so
-    the un-rotation recovers the full un-rotated canvas (no clipped
-    corners — see `comfyui_krita.pad_png`).  Then `paste_image`
-    rotates the padded image by `-rotation`, center-crops to doc dims,
-    and pastes at `(paste_config.x, paste_config.y)` (default 0, 0).
+  · rotation != 0: the workflow ran on a rotated-frame crop at
+    `(cropX, cropY, cw, ch)`.  The output is `cw × ch`.  We un-rotate
+    it by `-rotation`, yielding a diamond whose bbox is
+    `cw_bbox × ch_bbox`.  The diamond's centre lands on the un-rotated
+    position of the crop centre (computed by **un-rotating**
+    `(cropX + cw/2, cropY + ch/2)` around the rotated frame's centre,
+    then translating by `(W/2, H/2)`).
+
+    The diamond is clipped to the document bounds and the resulting
+    visible fragment is pasted at its actual doc position
+    `(doc_x0, doc_y0)` — NOT at `(0, 0)` with full-document bounds.
+    This is what makes Krita's layer panel show the layer at its
+    content position, matching the visible content.
+
+    When the diamond is clipped on the left or top (diamond_x < 0 or
+    diamond_y < 0), the visible fragment starts at diamond pixel
+    `(-diamond_x, -diamond_y)`, so the diamond must be drawn into the
+    smaller vis canvas at offset `(diamond_x - doc_x0, diamond_y - doc_y0)`.
+    Since `doc_x0 = max(0, diamond_x)` and `doc_y0 = max(0, diamond_y)`,
+    those offsets are non-positive exactly when there is a left/top
+    clip, and 0 otherwise.  Using the opposite sign (`doc_x0 - diamond_x`)
+    shifts the content *down/right* by `2*|diamond_y|` (or `2*|diamond_x|`)
+    in the doc — a bug that only fires for top/left clips, matching
+    the "sometimes the paste is shifted" symptom.
 
 FILES
 =====
-`_paste_result` gains the padding branch and uses `prepared.rotation`
-(no per-call `--output_rotation`).  Everything else (submit, poll,
-download, batch semantics, cancel, history) is unchanged."""
+`_paste_result` rotation branch: un-rotation math preserved; the
+clipping-to-doc + paste-at-visible-bounds logic is preserved; the only
+change vs. the previous version is the sign of the `drawImage` offset,
+which was inverted for top/left clip cases."""
 
 from __future__ import annotations
 
@@ -40,7 +56,6 @@ from krita import Krita
 from ..decorators import command, AutoDispatchHandler
 from ..utils.comfy_apply import prepare_workflow
 from ..utils.comfyui_krita import (
-    pad_png,
     paste_animation,
     paste_batch_as_layers,
     paste_image,
@@ -744,10 +759,12 @@ class GenerationCommands(AutoDispatchHandler):
     #
     # Rotation branch:
     #   · rotation == 0 → paste at (crop_bounds[0]+x, crop_bounds[1]+y)
-    #   · rotation != 0 → pad workflow output back to rotated frame
-    #                     dims, pass rotation=-rotation to paste_image
-    #                     (un-rotate + center-crop to doc dims),
-    #                     paste at (x, y)
+    #   · rotation != 0 → un-rotate each workflow output by -rotation
+    #                     into a diamond; compute the diamond's centre
+    #                     by un-rotating the crop centre; clip the
+    #                     diamond to the doc bounds; paste the visible
+    #                     fragment at its actual doc position
+    #                     (doc_x0, doc_y0) — not at (0,0).
 
     def _paste_result(self, doc, outputs: list, *,
                       crop_bounds: tuple,
@@ -786,41 +803,129 @@ class GenerationCommands(AutoDispatchHandler):
         configured_y = int(paste_config.get("y", 0))
 
         if output_rotation != 0:
-            # Pad workflow output back to rotated frame dims so un-rotation
-            # recovers the full un-rotated canvas (no clipped corners).
-            try:
-                W_doc = int(doc.width())
-                H_doc = int(doc.height())
-                rad = math.radians(abs(float(output_rotation)))
-                cos_a = abs(math.cos(rad))
-                sin_a = abs(math.sin(rad))
-                Wp = max(1, int(round(W_doc * cos_a + H_doc * sin_a)))
-                Hp = max(1, int(round(W_doc * sin_a + H_doc * cos_a)))
-                cropW = int(crop_bounds[2])
-                cropH = int(crop_bounds[3])
-                pad_x = max(0, (Wp - cropW) // 2)
-                pad_y = max(0, (Hp - cropH) // 2)
-                print(f"[_paste_result] rotated prepare: "
-                      f"theta={output_rotation} doc={W_doc}x{H_doc} "
-                      f"frame={Wp}x{Hp} crop={cropW}x{cropH} "
-                      f"pad_at=({pad_x},{pad_y})", flush=True)
-                new_outputs = []
-                for o in outputs:
-                    padded_bytes = pad_png(o["png_bytes"],
-                                           pad_x, pad_y, Wp, Hp)
-                    o2 = dict(o)
-                    o2["png_bytes"] = padded_bytes
-                    new_outputs.append(o2)
-                outputs = new_outputs
-            except Exception as e:
-                import traceback
-                print(f"[_paste_result] padding failed "
-                      f"(continuing unpadded): {e}", flush=True)
-                traceback.print_exc()
+            from PyQt6.QtGui import QImage, QPainter
+            from ..utils.comfyui_krita import (
+                _decode_png, _rotate_about_center, _save_png,
+            )
 
-            paste_x = configured_x
-            paste_y = configured_y
-            effective_rotation = -output_rotation
+            W_doc = int(doc.width())
+            H_doc = int(doc.height())
+            cropX = int(crop_bounds[0])
+            cropY = int(crop_bounds[1])
+            cw = int(crop_bounds[2])
+            ch = int(crop_bounds[3])
+            theta = float(output_rotation)
+
+            rad = math.radians(theta)
+            cos_t = math.cos(rad)
+            sin_t = math.sin(rad)
+            cos_abs = abs(cos_t)
+            sin_abs = abs(sin_t)
+            Wp = max(1, int(round(W_doc * cos_abs + H_doc * sin_abs)))
+            Hp = max(1, int(round(W_doc * sin_abs + H_doc * cos_abs)))
+
+            crop_cx_rot = cropX + cw / 2.0
+            crop_cy_rot = cropY + ch / 2.0
+            dx = crop_cx_rot - Wp / 2.0
+            dy = crop_cy_rot - Hp / 2.0
+            target_cx = W_doc / 2.0 + dx * cos_t + dy * sin_t
+            target_cy = H_doc / 2.0 - dx * sin_t + dy * cos_t
+
+            print(f"[_paste_result] rotated prepare: theta={theta} "
+                  f"doc={W_doc}x{H_doc} frame={Wp}x{Hp} "
+                  f"crop=({cropX},{cropY},{cw},{ch}) "
+                  f"crop_centre_rot=({crop_cx_rot:.1f},{crop_cy_rot:.1f}) "
+                  f"target_centre=({target_cx:.1f},{target_cy:.1f})",
+                  flush=True)
+
+            new_outputs = []
+            for o in outputs:
+                img = _decode_png(o["png_bytes"])
+                diamond = _rotate_about_center(img, -theta)
+                dw = diamond.width()
+                dh = diamond.height()
+
+                # Diamond top-left in doc coords.  configured_x /
+                # configured_y are added as an additional offset,
+                # matching the non-rotated path's paste_config.x/y
+                # semantics.
+                diamond_x = int(round(target_cx - dw / 2.0)) + configured_x
+                diamond_y = int(round(target_cy - dh / 2.0)) + configured_y
+
+                # Clip the diamond to the doc bounds.  The pasted
+                # layer is exactly the visible fragment of the
+                # diamond, so Krita's layer panel shows the layer at
+                # its actual content position rather than (0,0) with
+                # full-document bounds.
+                doc_x0 = max(0, diamond_x)
+                doc_y0 = max(0, diamond_y)
+                doc_x1 = min(W_doc, diamond_x + dw)
+                doc_y1 = min(H_doc, diamond_y + dh)
+
+                if doc_x1 <= doc_x0 or doc_y1 <= doc_y0:
+                    print(f"[_paste_result] output "
+                          f"{o.get('name', '?')} entirely outside doc; "
+                          f"skipping", flush=True)
+                    continue
+
+                vis_w = doc_x1 - doc_x0
+                vis_h = doc_y1 - doc_y0
+
+                fully_inside = (
+                    doc_x0 == diamond_x
+                    and doc_y0 == diamond_y
+                    and doc_x1 == diamond_x + dw
+                    and doc_y1 == diamond_y + dh
+                )
+                if fully_inside:
+                    vis = diamond
+                else:
+                    vis = QImage(vis_w, vis_h,
+                                 QImage.Format.Format_ARGB32)
+                    vis.fill(0)
+                    p = QPainter(vis)
+                    p.setRenderHint(
+                        QPainter.RenderHint.SmoothPixmapTransform,
+                    )
+                    # Offset the diamond so its content lands at the
+                    # correct doc position.  When the diamond is
+                    # clipped on the left or top (diamond_x < 0 or
+                    # diamond_y < 0), the visible fragment starts at
+                    # diamond pixel (-diamond_x, -diamond_y), so the
+                    # diamond must be drawn at
+                    # (diamond_x - doc_x0, diamond_y - doc_y0).  That
+                    # is non-positive exactly when there is a
+                    # left/top clip, and 0 otherwise.  The opposite
+                    # sign (doc_x0 - diamond_x) shifts the content
+                    # DOWN/RIGHT by 2·|clip| in the doc, which is the
+                    # "sometimes the paste is shifted" bug.
+                    p.drawImage(diamond_x - doc_x0,
+                                diamond_y - doc_y0, diamond)
+                    p.end()
+
+                print(f"[_paste_result]  output "
+                      f"{o.get('name', '?')}: diamond@{diamond_x},"
+                      f"{diamond_y} {dw}x{dh} → layer@{doc_x0},{doc_y0} "
+                      f"{vis_w}x{vis_h}", flush=True)
+
+                o2 = dict(o)
+                o2["png_bytes"] = _save_png(vis)
+                o2["_paste_x"] = doc_x0
+                o2["_paste_y"] = doc_y0
+                new_outputs.append(o2)
+            outputs = new_outputs
+
+            groups = {}
+            for o in outputs:
+                groups.setdefault(o["node_id"], []).append(o)
+
+            if outputs:
+                paste_x = outputs[0]["_paste_x"]
+                paste_y = outputs[0]["_paste_y"]
+            else:
+                paste_x = configured_x
+                paste_y = configured_y
+            effective_rotation = 0.0
         else:
             paste_x = int(crop_bounds[0]) + configured_x
             paste_y = int(crop_bounds[1]) + configured_y

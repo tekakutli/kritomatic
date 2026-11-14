@@ -9,22 +9,27 @@ The paste stage reads `prepared.rotation` (set by `prepare_workflow`).
     `(crop_bounds[0]+x, crop_bounds[1]+y)`.
 
   · rotation != 0: the workflow ran on pre-rotated content at
-    `(0, 0, cropW, cropH)` where `cropW × cropH` is centered on the
-    rotated frame `W' × H'`.  `InpaintStitchImproved` returns
-    `cropW × cropH`.  We un-rotate by `-rotation` and center-crop to
-    doc dims (via `paste_image(rotation=-rotation)`), then paste at
-    `(paste_config.x, paste_config.y)` (default 0, 0).  The result
-    lands back at the user's original rect position.
+    `(cropX, cropY, cropW, cropH)` in the rotated frame.  We pad the
+    output back into a `W' × H'` blank frame at `(cropX, cropY)`
+    (QPainter clips any negative/large coordinates; regions the
+    workflow never covered stay transparent), then un-rotate by
+    `-rotation` and centre-crop to doc dims (via
+    `paste_image(rotation=-rotation)`), then paste at
+    `(paste_config.x, paste_config.y)` (default 0, 0).  The inpainted
+    content lands at the user's original rect position.
 
-Files touched vs the previous version: `_paste_result` gains the
-rotation branch and uses `prepared.rotation` (not the removed
-`--output_rotation` param).  Everything else (submit, poll,
-download, batch semantics, cancel, history) is unchanged."""
+FILES
+=====
+`_paste_result` pads at `crop_bounds[0..1]` (no longer re-derives a
+centre) and uses `prepared.rotation` (no per-call `--output_rotation`).
+Everything else (submit, poll, download, batch semantics, cancel,
+history) is unchanged."""
 
 from __future__ import annotations
 
 import base64
 import json
+import math
 import time
 import uuid
 from datetime import datetime, timezone
@@ -36,6 +41,7 @@ from krita import Krita
 from ..decorators import command, AutoDispatchHandler
 from ..utils.comfy_apply import prepare_workflow
 from ..utils.comfyui_krita import (
+    pad_png,
     paste_animation,
     paste_batch_as_layers,
     paste_image,
@@ -530,7 +536,7 @@ class GenerationCommands(AutoDispatchHandler):
         return downloaded
 
     # ------------------------------------------------------------------
-    #  comfy_cancel (unchanged)
+    #  comfy_cancel
     # ------------------------------------------------------------------
 
     @command(
@@ -594,7 +600,7 @@ class GenerationCommands(AutoDispatchHandler):
         }
 
     # ------------------------------------------------------------------
-    #  comfy_paste_last (unchanged)
+    #  comfy_paste_last
     # ------------------------------------------------------------------
 
     @command(
@@ -639,7 +645,7 @@ class GenerationCommands(AutoDispatchHandler):
         )
 
     # ------------------------------------------------------------------
-    #  comfy_paste_image_b64 (unchanged)
+    #  comfy_paste_image_b64
     # ------------------------------------------------------------------
 
     @command(
@@ -659,7 +665,7 @@ class GenerationCommands(AutoDispatchHandler):
         import base64 as _b64
         import time as _time
         from krita import Krita
-        from ..utils.comfyui_krita import paste_image
+        from ..utils.comfyui_krita import paste_image as _paste_image
 
         name = (params.get("name") or "").strip()
         image_b64 = params.get("image_b64") or ""
@@ -688,7 +694,7 @@ class GenerationCommands(AutoDispatchHandler):
             name = f"[Inpaint] {int(_time.time()) & 0xFFFFFF:06x}"
 
         try:
-            node = paste_image(
+            node = _paste_image(
                 doc, png, x, y, name,
                 blend_mode=blend_mode,
                 make_active=True,
@@ -704,7 +710,7 @@ class GenerationCommands(AutoDispatchHandler):
         }
 
     # ------------------------------------------------------------------
-    #  comfy_history (unchanged)
+    #  comfy_history
     # ------------------------------------------------------------------
 
     @command(
@@ -739,9 +745,12 @@ class GenerationCommands(AutoDispatchHandler):
     #
     # Rotation branch:
     #   · rotation == 0 → paste at (crop_bounds[0]+x, crop_bounds[1]+y)
-    #   · rotation != 0 → paste at (x, y), pass rotation=-rotation to
-    #                     paste_image (which un-rotates and center-crops
-    #                     to doc dims)
+    #   · rotation != 0 → pad workflow output into a Wp×Hp frame at
+    #                     (crop_bounds[0], crop_bounds[1]) — QPainter
+    #                     clips negative/oversized coordinates, so
+    #                     out-of-frame regions stay transparent — then
+    #                     pass rotation=-rotation to paste_image (which
+    #                     un-rotates + centre-crops to doc dims).
 
     def _paste_result(self, doc, outputs: list, *,
                       crop_bounds: tuple,
@@ -755,6 +764,12 @@ class GenerationCommands(AutoDispatchHandler):
                     "message": "No outputs to paste",
                     "data": {"layer_names": [],
                              "output_count": 0, "frame_count": 0}}
+
+        print(f"[_paste_result] output_rotation={output_rotation} "
+              f"crop_bounds={crop_bounds} "
+              f"paste_config.x={paste_config.get('x', 0)} "
+              f"y={paste_config.get('y', 0)} "
+              f"outputs={len(outputs)}", flush=True)
 
         groups: dict[str, list] = {}
         for o in outputs:
@@ -774,14 +789,46 @@ class GenerationCommands(AutoDispatchHandler):
         configured_y = int(paste_config.get("y", 0))
 
         if output_rotation != 0:
-            # Rotated prepare path: content is centered on the rotated
-            # frame's crop.  Un-rotate via paste_image; land at (x, y).
+            # Pad workflow output into a Wp×Hp frame at the crop's
+            # actual (cropX, cropY) origin, so un-rotation recovers
+            # the original un-rotated canvas and the inpainted pixels
+            # land at the right place.  cropX/cropY may be negative
+            # (the crop extends past the frame boundary); QPainter
+            # clips, leaving the out-of-frame part transparent.
+            try:
+                W_doc = int(doc.width())
+                H_doc = int(doc.height())
+                rad = math.radians(abs(float(output_rotation)))
+                cos_a = abs(math.cos(rad))
+                sin_a = abs(math.sin(rad))
+                Wp = max(1, int(round(W_doc * cos_a + H_doc * sin_a)))
+                Hp = max(1, int(round(W_doc * sin_a + H_doc * cos_a)))
+                cropX = int(crop_bounds[0])
+                cropY = int(crop_bounds[1])
+                cropW = int(crop_bounds[2])
+                cropH = int(crop_bounds[3])
+                print(f"[_paste_result] rotated prepare: "
+                      f"theta={output_rotation} doc={W_doc}x{H_doc} "
+                      f"frame={Wp}x{Hp} crop={cropW}x{cropH} "
+                      f"pad_at=({cropX},{cropY})", flush=True)
+                new_outputs = []
+                for o in outputs:
+                    padded_bytes = pad_png(o["png_bytes"],
+                                           cropX, cropY, Wp, Hp)
+                    o2 = dict(o)
+                    o2["png_bytes"] = padded_bytes
+                    new_outputs.append(o2)
+                outputs = new_outputs
+            except Exception as e:
+                import traceback
+                print(f"[_paste_result] padding failed "
+                      f"(continuing unpadded): {e}", flush=True)
+                traceback.print_exc()
+
             paste_x = configured_x
             paste_y = configured_y
             effective_rotation = -output_rotation
         else:
-            # Un-rotated prepare path: content already occupies the
-            # crop frame; paste at the crop origin (plus user offset).
             paste_x = int(crop_bounds[0]) + configured_x
             paste_y = int(crop_bounds[1]) + configured_y
             effective_rotation = 0.0

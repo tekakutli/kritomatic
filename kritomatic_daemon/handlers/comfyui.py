@@ -64,7 +64,7 @@ Three locks protect that state:
                         dict insert/pop; the lock has held since before
                         concurrency was exposed at the client level.
   `_intercepted_lock`   guards `_intercepted_batches`; same story.
-  `_paste_lock`         NEW. Guards the document-mutating half of the
+  `_paste_lock`         guards the document-mutating half of the
                         generation pipeline (`_paste_result` and the
                         `_last_result` / `_last_document` writes that
                         follow it). Two concurrent pastes on the same
@@ -76,6 +76,15 @@ Three locks protect that state:
                         document; prepares, network uploads, and the
                         proxy poll loops are still fully concurrent
                         because none of them touch the document.
+
+A fourth lock guards the shared proxy client:
+
+  `_proxy_client_lock`  guards the lazily-created `_proxy_client`.
+                        The client is created once per proxy lifetime
+                        and reused across every run; the lock
+                        serializes the "check-then-create" so a burst
+                        of concurrent runs performs exactly one
+                        `ProxyV2.from_pid_file()` probe, not N.
 
 Workflow activation
 ===================
@@ -109,6 +118,17 @@ run-1's config mid-prepare. `_active_config` remains the fallback for
 CLI callers that omit some sections; those callers are inherently
 serial (one CLI invocation, one batch), so the fallback's shared-
 mutable-state risk does not apply to them.
+
+Shared ProxyV2 client
+=====================
+`_proxy_client` caches the proxy HTTP client across runs so
+`ProxyV2.from_pid_file()` — which does a health probe on construction
+— fires once per proxy lifetime, not once per run.  The client is
+invalidated on `ProxyUnreachable` (proxy died or was stopped) and on
+`comfy_proxy_start` / `comfy_proxy_stop` / `comfy_connect`-starts-proxy
+(pid changed).  `get_proxy_client()` is what every generation path
+calls; `invalidate_proxy_client()` is what failures and command
+handlers call to reset it.
 
 Slot extraction failures
 ========================
@@ -166,6 +186,15 @@ class ComfyUIHandler(AutoDispatchHandler):
         # concurrent; only the paste-critical section is serialized.
         # See the module docstring, "Concurrency".
         self._paste_lock = threading.Lock()
+
+        # ---- shared proxy client ----
+        # Lazily created by `get_proxy_client()`; reused across every
+        # run so the health probe in `ProxyV2.from_pid_file()` fires
+        # once per proxy lifetime, not once per run.  The lock
+        # serializes check-then-create so a burst of concurrent runs
+        # performs exactly one probe.  See "Shared ProxyV2 client".
+        self._proxy_client = None
+        self._proxy_client_lock = threading.Lock()
 
         # ---- intercept mode ----
         # Config-loaded at construction; updated by comfy_set_intercept.
@@ -311,3 +340,39 @@ class ComfyUIHandler(AutoDispatchHandler):
             self._active_workflow_slot_error = str(e)
             self._clear_native_slots()
         self._active_config = None
+
+    # ------------------------------------------------------------------
+    #  Proxy client cache
+    # ------------------------------------------------------------------
+
+    def get_proxy_client(self):
+        """Return the shared ProxyV2 client, creating it on first use.
+
+        Raises `ProxyUnreachable` (from `ProxyV2.from_pid_file()`) if
+        the proxy pid file is missing or its health probe fails.
+        Cached clients are returned as-is: if the proxy died since the
+        cache was populated, the caller's next operation raises
+        `ProxyUnreachable`, and the caller is expected to call
+        `invalidate_proxy_client()` before retrying (or letting the
+        next run pick up a fresh client).  See the module docstring,
+        "Shared ProxyV2 client".
+        """
+        from ..utils.comfyui_proxy_client import ProxyV2
+
+        with self._proxy_client_lock:
+            if self._proxy_client is not None:
+                return self._proxy_client
+            client = ProxyV2.from_pid_file()
+            self._proxy_client = client
+            return client
+
+    def invalidate_proxy_client(self) -> None:
+        """Drop the cached proxy client.  Idempotent.
+
+        Called when a caller observes `ProxyUnreachable` (proxy died
+        between runs, or was stopped), and by `comfy_proxy_start` /
+        `comfy_proxy_stop` / `comfy_connect`-started-proxy so the next
+        `get_proxy_client()` re-probes fresh state.
+        """
+        with self._proxy_client_lock:
+            self._proxy_client = None

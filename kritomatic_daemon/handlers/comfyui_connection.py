@@ -21,6 +21,26 @@ does not notice. The next operation that actually needs the proxy
 `ProxyUnreachable`, which is the appropriate error. Re-probing on
 every connect would cost a round trip that adds nothing.
 
+Cache invalidation on auto-start
+================================
+When `comfy_connect` finds the proxy not running and starts it, both
+of the handler's proxy-side caches must be dropped:
+
+  · `parent.invalidate_proxy_client()` — the new proxy has a new pid,
+    so any cached `ProxyV2` client bound to the old pid is stale.
+    Without this, the first generation after the start would use the
+    dead client (fails with ProxyUnreachable, then invalidates). With
+    this, the next `get_proxy_client()` picks up the new pid
+    immediately.
+  · `invalidate_proxy_status_cache()` — the "is the proxy running"
+    display cache from `comfyui_status.py` shows "not running" from
+    the pre-start probe; without invalidation the UI would lag up to
+    a second behind.
+
+Both invalidations are cheap no-ops when the proxy was already
+running (which is the common case; start only fires on first connect
+or after a proxy death that `comfy_connect` observed directly).
+
 The browser-workflow watcher and publisher pinning that used to live
 here were removed in Stage 6 — the v2 pipeline is file-or-config
 driven, not browser-published.
@@ -30,6 +50,7 @@ from __future__ import annotations
 
 from ..decorators import command, AutoDispatchHandler
 from ..utils.comfyui_client import ComfyError, get_client
+from .comfyui_status import invalidate_proxy_status_cache
 
 
 class ConnectionCommands(AutoDispatchHandler):
@@ -83,6 +104,11 @@ class ConnectionCommands(AutoDispatchHandler):
             proxy_start = proxy_manager.start(
                 comfyui=f"http://{host}:{port}",
             )
+            # The proxy just came up (or failed to). Either way the
+            # cached state is stale.  Drop both caches so the next
+            # read / run picks up the actual post-start state.
+            invalidate_proxy_status_cache()
+            parent.invalidate_proxy_client()
             proxy_state = proxy_manager.status()
             proxy_data = proxy_state.get("data") or {}
             if not proxy_start.get("success"):

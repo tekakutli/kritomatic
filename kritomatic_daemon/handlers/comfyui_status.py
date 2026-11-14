@@ -10,11 +10,91 @@ handler state but neither sweeps expired intercepts nor publishes —
 those are the caller's jobs.  Splitting the read from the sweep is
 what prevents a recursion between `_sweep_expired_intercepts` →
 `_publish_state_change` → `comfy_status` → sweep → publish.
+
+PROXY STATUS CACHE
+==================
+`_compute_status_data` calls `proxy_manager.status()`, which is
+expensive on POSIX: it spawns `ps -p <pid> -o args=` to verify the
+proxy is ours (~5-10ms per call).  With a batch of concurrent runs,
+`_publish_state_change` fires on each run start and each run finish,
+so `_compute_status_data` can run 4+ times within milliseconds of a
+concurrent burst — 4+ `ps` subprocesses for the same proxy state.
+
+`_cached_proxy_status()` caches the `proxy_manager.status()` result
+for 1 second.  This is fine because:
+
+  · The proxy indicator in the docker / web panel is a display
+    element that already tolerates ~1 s of staleness by design.
+  · The generation path (`_comfy_generate_impl` etc.) does not go
+    through `proxy_manager.status()` at all — it uses the cached
+    `ProxyV2` client (`ComfyUIHandler.get_proxy_client()`) whose
+    health state is queried lazily per operation.  So caching
+    `status()` does not affect run correctness, only the display.
+
+Invalidation sites (call `invalidate_proxy_status_cache()`):
+
+  · `comfy_connect` after `proxy_manager.start()` when the proxy was
+    not already running.  The state changed from "not running" to
+    "running"; the UI should reflect this without waiting for the
+    TTL.
+  · `comfy_proxy_start` after `manager.start()` returns.
+  · `comfy_proxy_stop` after `manager.stop()` returns.
+  · `comfy_proxy_uninstall` after `manager.uninstall()` returns.
+
+Without invalidation, the toggle/indicator would take up to 1 s to
+reflect the just-issued state.  Self-heals via TTL even if a caller
+forgets an invalidation.
 """
 
 from __future__ import annotations
 
+import threading
+import time
+
 from ..decorators import command, AutoDispatchHandler
+
+
+# ---------------------------------------------------------------------------
+#  Proxy status cache
+# ---------------------------------------------------------------------------
+
+_PROXY_STATUS_TTL = 1.0
+_PROXY_STATUS_LOCK = threading.Lock()
+_PROXY_STATUS_CACHE: dict = {"data": None, "at": 0.0}
+
+
+def _cached_proxy_status() -> dict:
+    """Return the cached proxy_manager.status() result, refreshing if stale.
+
+    See the module docstring, PROXY STATUS CACHE.  Held under
+    `_PROXY_STATUS_LOCK` for the full check-and-refresh, so a burst of
+    concurrent `_compute_status_data` calls performs exactly one
+    `status()` call.
+    """
+    from ..proxy import manager as proxy_manager
+
+    with _PROXY_STATUS_LOCK:
+        now = time.monotonic()
+        cached = _PROXY_STATUS_CACHE["data"]
+        if (cached is not None
+                and (now - _PROXY_STATUS_CACHE["at"]) < _PROXY_STATUS_TTL):
+            return cached
+        fresh = proxy_manager.status()
+        _PROXY_STATUS_CACHE["data"] = fresh
+        _PROXY_STATUS_CACHE["at"] = time.monotonic()
+        return fresh
+
+
+def invalidate_proxy_status_cache() -> None:
+    """Drop the cached proxy status.  Idempotent.
+
+    Called from `comfy_connect` (after auto-starting the proxy),
+    `comfy_proxy_start` / `comfy_proxy_stop` / `comfy_proxy_uninstall`
+    so the next `_compute_status_data` reads fresh state.
+    """
+    with _PROXY_STATUS_LOCK:
+        _PROXY_STATUS_CACHE["data"] = None
+        _PROXY_STATUS_CACHE["at"] = 0.0
 
 
 class StatusCommands(AutoDispatchHandler):
@@ -36,6 +116,10 @@ class StatusCommands(AutoDispatchHandler):
           - `comfy_status` (after its own sweep),
           - `ComfyUIHandler._publish_state_change` (no sweep: publishes
             whatever the current state is).
+
+        `proxy_manager.status()` is replaced with the 1 s TTL cache
+        `_cached_proxy_status()` — see the module docstring, PROXY
+        STATUS CACHE, for the rationale and invalidation sites.
         """
         parent = self.parent
 
@@ -55,8 +139,7 @@ class StatusCommands(AutoDispatchHandler):
         intercepted_ids = sorted(e["batch_id"] for e in intercepted)
         active_batches = internal_ids + intercepted_ids
 
-        from ..proxy import manager as proxy_manager
-        proxy_state = proxy_manager.status()
+        proxy_state = _cached_proxy_status()
 
         return {
             "connected_to": (

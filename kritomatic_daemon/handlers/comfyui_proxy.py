@@ -23,6 +23,21 @@ comfy_connect auto-starts the proxy if it isn't running (see
 comfyui_connection.py). These explicit commands are for setup,
 inspection, and recovery.
 
+Cache invalidation
+==================
+Every command that mutates the proxy's lifecycle invalidates both of
+the handler's proxy-side caches:
+
+  · `parent.invalidate_proxy_client()` — drops the cached ProxyV2
+    client bound to the old pid.  After start, a new pid must be
+    picked up.  After stop / uninstall, the old client is dead.
+  · `invalidate_proxy_status_cache()` — drops the 1s display cache
+    in `comfyui_status.py` so the docker/panel indicator reflects
+    the new lifecycle state on the next state push, not 1s later.
+
+`comfy_proxy_health` and `comfy_proxy_test` are left alone: they are
+diagnostics that explicitly want fresh, uncached state.
+
 External-job registration
 =========================
 `comfy_register_external_job` / `comfy_unregister_external_job` let a
@@ -42,6 +57,7 @@ from __future__ import annotations
 
 from ..decorators import command, AutoDispatchHandler
 from ..proxy import manager
+from .comfyui_status import invalidate_proxy_status_cache
 from .comfyui_types import _BatchRecord
 
 
@@ -69,7 +85,13 @@ class ProxyCommands(AutoDispatchHandler):
         },
     )
     def comfy_proxy_install(self, params):
-        return manager.install_async(force=bool(params.get("force", False)))
+        result = manager.install_async(force=bool(params.get("force", False)))
+        # No proxy process state changed on install; the pending
+        # `install.state` is what changes, and `status()` reflects it
+        # via the manager's own module-level snapshot.  Invalidate
+        # anyway, for symmetry with the other lifecycle commands.
+        invalidate_proxy_status_cache()
+        return result
 
     @command(
         category="comfyui",
@@ -96,13 +118,19 @@ class ProxyCommands(AutoDispatchHandler):
         },
     )
     def comfy_proxy_start(self, params):
-        return manager.start(
+        result = manager.start(
             host=params.get("host", "127.0.0.1"),
             port=int(params.get("port", 8189)),
             comfyui=params.get("comfyui", "http://127.0.0.1:8188"),
             comfyui_base_dir=params.get("comfyui_base_dir"),
             token=params.get("token"),
         )
+        if result.get("success"):
+            # New pid → the cached client is stale.  Also drop the
+            # status cache so the display shows "running" immediately.
+            invalidate_proxy_status_cache()
+            self.parent.invalidate_proxy_client()
+        return result
 
     @command(
         category="comfyui",
@@ -110,7 +138,12 @@ class ProxyCommands(AutoDispatchHandler):
         args={},
     )
     def comfy_proxy_stop(self, params):
-        return manager.stop()
+        result = manager.stop()
+        # Unconditional: even a "not running" result means the cached
+        # state was stale.
+        invalidate_proxy_status_cache()
+        self.parent.invalidate_proxy_client()
+        return result
 
     @command(
         category="comfyui",
@@ -141,7 +174,10 @@ class ProxyCommands(AutoDispatchHandler):
         args={},
     )
     def comfy_proxy_uninstall(self, params):
-        return manager.uninstall()
+        result = manager.uninstall()
+        invalidate_proxy_status_cache()
+        self.parent.invalidate_proxy_client()
+        return result
 
     # ------------------------------------------------------------------
     #  Diagnostics
@@ -150,8 +186,8 @@ class ProxyCommands(AutoDispatchHandler):
     @command(
         category="comfyui",
         help_text="Call GET /api/v2/health from the daemon's own "
-                  "ProxyV2 client. Confirms the client module loads "
-                  "and the proxy answers. Returns the health dict.",
+                  "ProxyV2 client. Confirms the client module loads and "
+                  "the proxy answers. Returns the health dict.",
         args={},
     )
     def comfy_proxy_health(self, params):

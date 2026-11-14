@@ -37,11 +37,49 @@ Layer lookups go through the scope-aware resolver in `layer_resolve.py`,
 not `Document.nodeByName`. That means a bundle that creates a layer
 named `X` and later references `X` resolves to the layer it created,
 even if another layer called `X` exists in the document.
+
+=============================================================================
+ASSET UPLOAD CACHE
+=============================================================================
+`_ASSET_UPLOAD_CACHE` deduplicates proxy asset uploads across concurrent
+`prepare_workflow` calls. Keyed by `(proxy_pid, content_hash)`:
+
+  · **content_hash** comes from `EncodedImage.content_hash` (crc32 of
+    the PNG bytes). Two runs that read the same `@thecanvas` pixels
+    produce the same PNG bytes, get the same hash, and share one
+    upload. A canvas that changed between runs produces different
+    bytes, gets a different hash, and uploads fresh. Invalidation is
+    automatic — the key changes when the content changes.
+
+  · **proxy_pid** is the OS pid of the proxy process the client is
+    bound to (`ProxyV2.pid`, populated by `from_pid_file()`). Proxy
+    restart means new pid, meaning the old cache entries are
+    unreachable. The pid component is what makes proxy restart safe:
+    without it, a live daemon with a restarted proxy would submit
+    asset references the new proxy doesn't know about.
+
+The cache is bypassed entirely when `ProxyV2.pid` is None (client
+constructed directly with `(host, port)`, no pid file consulted) —
+in that case the caller is either a diagnostic or a non-daemon path
+where the cache's "shared across runs" property is not useful.
+
+A 5-minute TTL bounds cache growth when the daemon outlives many
+proxies. A per-key `threading.Lock` serializes concurrent uploads of
+the *same* bytes (the second waiter finds the cached entry after the
+first completes); different hashes upload in parallel.
+
+`invalidate_asset_cache(pid)` drops every entry for one pid.  The
+caller (in `comfyui_generation.py`) invokes it on a submit-time
+`ProxyHTTPError`, so a stale asset reference in the proxy's view
+(self-healing case: proxy evicted assets within one pid lifetime)
+forces the *next* run to re-upload.
 """
 
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +88,7 @@ from typing import Optional
 from PyQt6.QtCore import QBuffer, QIODevice
 from PyQt6.QtGui import QImage
 
+from .comfyui_proxy_client import ProxyHTTPError, ProxyUnreachable
 from .layer_resolve import resolve as resolve_node
 from .layer_types import IMAGE_LAYER_TYPES, MASK_LAYER_TYPES
 
@@ -77,6 +116,86 @@ class EncodedImage:
     def content_hash(self) -> str:
         """8-character lowercase hex CRC32 of the PNG bytes."""
         return f"{zlib.crc32(self.data) & 0xFFFFFFFF:08x}"
+
+
+# ============================================================================
+#  Asset upload cache
+# ============================================================================
+
+class _AssetUploadCache:
+    """Dedup of proxy asset uploads keyed by (proxy_pid, content_hash).
+
+    See the module docstring, ASSET UPLOAD CACHE, for the full design.
+    """
+
+    def __init__(self, ttl_sec: float = 300.0):
+        self._ttl = ttl_sec
+        self._lock = threading.Lock()
+        self._entries: dict[tuple[int, str], tuple[dict, float]] = {}
+        self._key_locks: dict[tuple[int, str], threading.Lock] = {}
+
+    def get(self, proxy_pid: int, content_hash: str) -> Optional[dict]:
+        key = (proxy_pid, content_hash)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            asset, stored_at = entry
+            if time.monotonic() - stored_at > self._ttl:
+                self._entries.pop(key, None)
+                return None
+            return asset
+
+    def get_or_upload(
+        self,
+        proxy_pid: int,
+        blob: EncodedImage,
+        proxy,
+        file_path: str,
+    ) -> dict:
+        h = blob.content_hash
+        cached = self.get(proxy_pid, h)
+        if cached is not None:
+            return cached
+        key = (proxy_pid, h)
+        with self._lock:
+            lk = self._key_locks.get(key)
+            if lk is None:
+                lk = threading.Lock()
+                self._key_locks[key] = lk
+        with lk:
+            # Recheck under the per-key lock: another thread may have
+            # uploaded while this one waited for the lock.
+            cached = self.get(proxy_pid, h)
+            if cached is not None:
+                return cached
+            asset = proxy.upload_asset(blob.data, file_path, "image/png")
+            with self._lock:
+                self._entries[key] = (asset, time.monotonic())
+            return asset
+
+    def invalidate_pid(self, proxy_pid: int) -> None:
+        with self._lock:
+            for k in [k for k in self._entries if k[0] == proxy_pid]:
+                del self._entries[k]
+            for k in [k for k in self._key_locks if k[0] == proxy_pid]:
+                del self._key_locks[k]
+
+
+_ASSET_UPLOAD_CACHE = _AssetUploadCache()
+
+
+def invalidate_asset_cache(proxy_pid: Optional[int]) -> None:
+    """Drop every cached upload for `proxy_pid`.  No-op for None/0.
+
+    Called by the generation pipeline when a submit attempt fails with
+    a `ProxyHTTPError` (proxy-side rejection — could be a stale asset
+    reference, e.g. the proxy evicted assets within one pid lifetime).
+    Invalidation is cheap; the *next* run re-uploads and succeeds.
+    The current run has already failed and is reported as such.
+    """
+    if proxy_pid:
+        _ASSET_UPLOAD_CACHE.invalidate_pid(int(proxy_pid))
 
 
 # ============================================================================
@@ -535,3 +654,45 @@ def _clamp_bounds(bounds: Bounds, container: Bounds) -> Bounds:
         y -= excess
 
     return (x, y, w, h)
+
+
+# ============================================================================
+#  Upload
+# ============================================================================
+
+def _upload_resource_blobs(blobs: dict[str, EncodedImage],
+                           proxy_client) -> dict[str, dict]:
+    """Upload every blob to the proxy, returning {name: asset_dict}.
+
+    Uses `_ASSET_UPLOAD_CACHE` (keyed by `(proxy_pid, content_hash)`)
+    when the client exposes a `.pid`, so concurrent prepare calls
+    within one proxy lifetime skip duplicate uploads.  See the module
+    docstring, ASSET UPLOAD CACHE.
+
+    `ProxyUnreachable` and `ProxyHTTPError` are propagated unchanged
+    (not wrapped in ValueError) so callers can invalidate the client /
+    asset cache and treat the run as failed.  Only unexpected local
+    errors (e.g. missing bytes) are wrapped as ValueError.
+    """
+    pid = getattr(proxy_client, "pid", None)
+    refs: dict[str, dict] = {}
+    for name, blob in blobs.items():
+        slug = name.lstrip("@") or "resource"
+        file_path = f"input/{slug}.png"
+        try:
+            if pid:
+                asset = _ASSET_UPLOAD_CACHE.get_or_upload(
+                    pid, blob, proxy_client, file_path,
+                )
+            else:
+                asset = proxy_client.upload_asset(
+                    blob.data, file_path, "image/png",
+                )
+        except (ProxyUnreachable, ProxyHTTPError):
+            raise
+        except Exception as e:
+            raise ValueError(
+                f"upload of {name!r} failed: {e}"
+            ) from e
+        refs[name] = asset
+    return refs

@@ -51,6 +51,18 @@ proxy is dead) without the playground needing to import
 `kritomatic_daemon`.  The playground inherits the same fail-fast
 semantics at the cost of one health round trip at construction time.
 
+`pid` attribute
+===============
+`from_pid_file()` also populates the client's `pid` attribute from the
+pid file — the OS pid of the proxy process it is bound to.  Callers
+that cache work keyed by "which proxy instance" (the daemon's asset
+upload cache, in particular) use `client.pid` as the second component
+of their cache key: proxy restart means new pid, meaning the cache
+misses and old entries are unreachable.  When the client is
+constructed directly with `(host, port)` — no pid file consulted —
+`pid` is `None`, and any caller that keys by pid simply skips the
+cache.
+
 core/ASSET references
 =====================
 `upload_asset()` returns the proxy's `Asset` dict. The daemon uses
@@ -140,6 +152,11 @@ class ProxyV2:
     Construction is cheap and idempotent — the client does no I/O until
     a method is called. The default (host=127.0.0.1, port=8189) matches
     what `comfy_proxy_start` spawns.
+
+    `pid` is `None` until populated by `from_pid_file()`, which reads
+    the pid file and stores the proxy process's pid here.  Caches that
+    key by proxy instance (asset upload dedup) use `client.pid` as the
+    second key component; when it is None, those caches are bypassed.
     """
 
     def __init__(self,
@@ -150,6 +167,10 @@ class ProxyV2:
         self.host = host
         self.port = port
         self.timeout = timeout
+        # Pid of the proxy process this client is bound to. Populated
+        # by `from_pid_file()`; None when constructed directly with
+        # (host, port). Caches that key by proxy identity use this.
+        self.pid: Optional[int] = None
         # IPv6 literal in the base URL must be bracketed.
         netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
         self.base_url = f"http://{netloc}"
@@ -159,8 +180,9 @@ class ProxyV2:
         """Construct pointing at the currently running proxy.
 
         Reads the pid file the daemon's `proxy/manager.py` writes on
-        `comfy_proxy_start`, then probes `/api/v2/health` to confirm
-        the proxy is actually answering.  A missing pid file, an
+        `comfy_proxy_start`, stores the proxy process's pid on
+        `client.pid`, then probes `/api/v2/health` to confirm the
+        proxy is actually answering.  A missing pid file, an
         unreadable one, or a failed health probe all raise
         `ProxyUnreachable` — the caller can treat this as "the proxy
         is not usable right now", which is the same failure mode the
@@ -187,6 +209,14 @@ class ProxyV2:
         host = data.get("host", "127.0.0.1")
         port = int(data.get("port", 8189))
         client = cls(host=host, port=port)
+
+        # Populate pid for cache consumers. A malformed/missing pid is
+        # treated as "unknown" (None), which callers interpret as
+        # "skip the cache".
+        try:
+            client.pid = int(data.get("pid", 0)) or None
+        except (TypeError, ValueError):
+            client.pid = None
 
         try:
             client.health(timeout=0.5)

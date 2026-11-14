@@ -3,9 +3,8 @@
 
 Structure
 =========
-This module is now a container (`GenerationCommands`) that
-instantiates two leaf handlers and forwards `comfy_generate` for
-direct callers:
+This module is a container (`GenerationCommands`) that instantiates
+two leaf handlers and forwards `comfy_generate` for direct callers:
 
     NormalGenerationCommands   comfy_generate, comfy_cancel,
                                comfy_history, comfy_paste_last,
@@ -29,6 +28,50 @@ Helpers that used to be methods on `GenerationCommands` and are used
 by both the normal pipeline and the intercept path now live in
 `comfyui_paste.py` and are imported here.  The poll loop
 (`_poll_job`) stays local because only the normal path uses it.
+
+Poll-loop budgets
+=================
+`_poll_job` uses four budgets, chosen so a slow-but-progressing
+workflow succeeds instead of failing at the first deadline:
+
+  · `_MAX_QUEUE_WAIT_S` (300s) — cap on how long we'll wait for a
+    queued job to reach "running".  A slow ComfyUI queue is normal;
+    the job will eventually run.
+
+  · `_MIN_EXEC_TIMEOUT_S` (300s) — floor on the execution budget.
+    Even a tight `--timeout 55` gets 300s of execution once the job
+    is "running".
+
+  · `_MAX_TOTAL_POLL_S` (600s) — hard cap on total poll duration
+    for one job.  Defensive bound so a job that somehow cycles
+    between states cannot hang the daemon forever.
+
+  · The caller's `--timeout` (default 55s) — the user's expected
+    per-run execution budget.  Combined with the floor: the actual
+    execution budget is `max(--timeout, _MIN_EXEC_TIMEOUT_S)`.
+
+Progress detection: whenever the job dict's `progress` or
+`queue_position` field changes between polls, the execution deadline
+resets.  The v2 proxy exposes `progress` as a structured snapshot
+dict (e.g. `{"value": 12, "max": 20, "node_id": "..."}`); comparing
+the whole dict — not guessing at `step`/`total` key names — is what
+makes idle detection work regardless of which keys the current proxy
+build emits.  A workflow that advances its progress counter is
+demonstrably alive; a workflow stuck at the same snapshot past the
+execution budget is presumed hung and fails with a clear message.
+
+Polling is the right primitive here, not SSE
+============================================
+The v2 API is poll-first by design: `GET /api/v2/jobs/{id}` is the
+authoritative, resumable view (status, latest progress snapshot,
+outputs committed so far, survives a client disconnect until
+`expires_at`).  The SSE stream at `GET /api/v2/jobs/{id}/events` is a
+live enhancement, not a replacement — it carries no event ids, has no
+resume cursor, and frames emitted while disconnected are lost.  A CLI
+batch runner needs a durable result even across a brief proxy
+connection blip, so the poll is the only safe primitive for
+termination; the stream would only be useful as an in-process
+progress display, which is not what this handler produces.
 
 Concurrency
 ===========
@@ -95,13 +138,58 @@ from .comfyui_intercept import (
 )
 
 
-_POLL_MARGIN_S = 60.0
 _POLL_INTERVAL_S = 0.25
+
+# Poll-loop budgets for _poll_job.  See the module docstring,
+# "Poll-loop budgets".
+_MAX_QUEUE_WAIT_S = 300.0
+_MIN_EXEC_TIMEOUT_S = 300.0
+_MAX_TOTAL_POLL_S = 600.0
 
 
 # ---------------------------------------------------------------------------
 #  Poll loop (module-level, normal path only)
 # ---------------------------------------------------------------------------
+
+def _job_progress_snapshot(job: dict) -> tuple:
+    """Snapshot the fields that indicate real job progress.
+
+    ComfyUI's v2 job dict exposes `progress` as a structured snapshot
+    dict (e.g. ``{"value": 12, "max": 20, "node_id": "..."}``).  We
+    compare the whole dict rather than guessing at key names — the
+    previous version looked for ``step``/``total``, which do not
+    appear in the v2 wire shape, and would have silently failed to
+    detect progress on a real job (causing a legitimately slow
+    workflow to be killed as if it were hung).
+
+    ``tuple(sorted(prog.items()))`` gives a hashable, order-stable
+    representation of the dict.  If the proxy later adds ``eta`` or
+    ``node_progress`` to ``progress``, the snapshot picks it up
+    automatically without a code change.
+
+    ``queue_position`` is compared separately: while a job is
+    ``queued``, the ``progress`` field is usually ``None`` or
+    ``{}``, but a decrease in queue position is a real signal that
+    the queue is draining and the job is about to run.  See
+    ``_poll_job``'s queued branch.
+
+    ``status`` is included unconditionally so a queued→running
+    transition is always detected as a state change.
+    """
+    parts = [job.get("status")]
+
+    prog = job.get("progress")
+    if isinstance(prog, dict):
+        # Sorted items: dict order never causes a false "change".
+        parts.append(("progress", tuple(sorted(prog.items()))))
+    elif prog is not None:
+        parts.append(("progress", prog))
+
+    if "queue_position" in job:
+        parts.append(("queue", job["queue_position"]))
+
+    return tuple(parts)
+
 
 def _poll_job(
     proxy: ProxyV2,
@@ -110,10 +198,58 @@ def _poll_job(
     *,
     timeout: float,
 ) -> Optional[dict]:
-    deadline = time.monotonic() + timeout
+    """Poll one proxy job to terminal.
+
+    Four budgets apply (see the module docstring):
+
+      · Queue phase: up to `_MAX_QUEUE_WAIT_S`.  A queued job is
+        not a failure; it will run once ComfyUI's queue reaches it.
+
+      · Execution phase: up to `max(timeout, _MIN_EXEC_TIMEOUT_S)`.
+        Resets whenever the job dict changes.
+
+      · Hard cap: `_MAX_TOTAL_POLL_S`.  Bounds the worst case.
+
+    Returns the terminal job dict, or None on timeout.  None is
+    converted by the caller into a "poll timed out" run-record
+    entry, which surfaces in the batch summary and in history.
+    """
+    started = time.monotonic()
+    exec_budget = max(float(timeout), _MIN_EXEC_TIMEOUT_S)
+
+    queue_deadline = started + _MAX_QUEUE_WAIT_S
+    run_deadline: Optional[float] = None
+
+    last_snapshot: Optional[tuple] = None
     last_error: Optional[str] = None
 
-    while time.monotonic() < deadline:
+    while True:
+        now = time.monotonic()
+
+        if now - started > _MAX_TOTAL_POLL_S:
+            print(
+                f"[comfyui] poll {job_id[:8]} gave up after "
+                f"_MAX_TOTAL_POLL_S={_MAX_TOTAL_POLL_S:.0f}s",
+                flush=True,
+            )
+            return None
+
+        if run_deadline is not None:
+            if now > run_deadline:
+                print(
+                    f"[comfyui] poll {job_id[:8]} timed out: "
+                    f"execution exceeded {exec_budget:.0f}s",
+                    flush=True,
+                )
+                return None
+        elif now > queue_deadline:
+            print(
+                f"[comfyui] poll {job_id[:8]} timed out: "
+                f"queued >{_MAX_QUEUE_WAIT_S:.0f}s",
+                flush=True,
+            )
+            return None
+
         if (record.cancel_event.is_set()
                 and job_id not in record._cancel_sent):
             try:
@@ -145,12 +281,25 @@ def _poll_job(
         if status in ("succeeded", "failed", "canceled", "expired"):
             return job
 
-        time.sleep(_POLL_INTERVAL_S)
+        snapshot = _job_progress_snapshot(job)
+        state_changed = (snapshot != last_snapshot)
 
-    if last_error:
-        print(f"[comfyui] poll {job_id[:8]} timed out; last error: "
-              f"{last_error}", flush=True)
-    return None
+        if status == "running":
+            if run_deadline is None:
+                # First "running" observation: start the execution
+                # budget.  From here on, the queue budget is
+                # irrelevant — the job has been picked up.
+                run_deadline = now + exec_budget
+            elif state_changed:
+                # Progress detected.  Reset the execution deadline.
+                run_deadline = now + exec_budget
+        elif status == "queued" and state_changed:
+            # Queue progressed (e.g. queue position changed); reset
+            # the queue budget.  Rarely needed but harmless.
+            queue_deadline = now + _MAX_QUEUE_WAIT_S
+
+        last_snapshot = snapshot
+        time.sleep(_POLL_INTERVAL_S)
 
 
 # ---------------------------------------------------------------------------
@@ -160,10 +309,10 @@ def _poll_job(
 class GenerationCommands(AutoDispatchHandler):
     """Container for the two leaf generation handlers.
 
-    Provides a plain `comfy_generate` forwarding method for the direct
-    call from `comfyui_config.py::comfy_panel_run`.  All actual
-    `@command` methods live on the leaf handlers and are reached via
-    `_sub_handlers`.
+    Provides a plain `comfy_generate` forwarding method for the
+    direct call from `comfyui_config.py::comfy_panel_run`.  All
+    actual `@command` methods live on the leaf handlers and are
+    reached via `_sub_handlers`.
     """
 
     def __init__(self, parent):
@@ -175,11 +324,12 @@ class GenerationCommands(AutoDispatchHandler):
 
     def comfy_generate(self, params):
         """Forward for direct callers.  The `@command`-decorated
-        `comfy_generate` lives on `NormalGenerationCommands`; dispatch
-        reaches it through `_sub_handlers`.  This method exists only
-        so `parent._generation_cmds.comfy_generate(gen_params)` from
-        `comfy_panel_run` keeps working without that module having to
-        know about the split.
+        `comfy_generate` lives on `NormalGenerationCommands`;
+        dispatch reaches it through `_sub_handlers`.  This method
+        exists only so
+        `parent._generation_cmds.comfy_generate(gen_params)` from
+        `comfy_panel_run` keeps working without that module having
+        to know about the split.
         """
         return self.normal.comfy_generate(params)
 
@@ -437,7 +587,7 @@ class NormalGenerationCommands(AutoDispatchHandler):
 
                 terminal = _poll_job(
                     proxy, job_id, record,
-                    timeout=timeout + _POLL_MARGIN_S,
+                    timeout=timeout,
                 )
                 if terminal is None:
                     record.run_records.append({

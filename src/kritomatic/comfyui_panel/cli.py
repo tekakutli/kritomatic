@@ -303,10 +303,22 @@ def cmd_run(args) -> int:
     print(f"Config:   {path}   ({label})")
     print(f"Commands: {len(batch['commands'])}\n")
 
+    # The daemon's poll loop gives each run:
+    #   · up to _MIN_EXEC_TIMEOUT_S (300s) of execution time
+    #     (larger than the caller's --timeout so a slow workflow
+    #     succeeds instead of failing at the first deadline), plus
+    #   · up to _MAX_QUEUE_WAIT_S (300s) of queue wait.
+    # Total per-run budget = 600s.  The client's read timeout must
+    # cover the daemon's worst case, or it would fire before the
+    # daemon does.
+    _DAEMON_QUEUE_BUDGET_S = 300.0
+    _DAEMON_EXEC_FLOOR_S = 300.0
     per_run = float(cfg.timeout)
-    read_timeout = per_run * (cfg.count + 1) + 60.0
+    daemon_exec_budget = max(per_run, _DAEMON_EXEC_FLOOR_S)
+    per_run_worst = _DAEMON_QUEUE_BUDGET_S + daemon_exec_budget
+    read_timeout = per_run_worst * max(1, cfg.count) + 60.0
     print(f"Client read timeout: {read_timeout:.0f}s "
-          f"({cfg.count} run(s) × {per_run:.0f}s + margin)\n")
+          f"({cfg.count} run(s) × {per_run_worst:.0f}s + margin)\n")
 
     executor = BatchExecutor()
     try:

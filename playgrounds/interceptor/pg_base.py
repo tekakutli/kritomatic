@@ -1,33 +1,36 @@
 """Interceptor's panel body and CSS.
 
-Sections: Tasks, Selected task, Canvas.
+Sections: Tasks, Selected task, Multimask areas, Canvas.
 
 The Selected task section shows the workflow name, params, crop
 bounds, and (if present) warnings from the daemon, plus the prompt
 textarea and the Run / Discard buttons.  After Run returns, the
 result line (pasted layers, timing) appears below the buttons.
 
-The Canvas section carries:
-  · the pan/zoom hint text,
-  · two opt-in overlay toggles.
+The Multimask areas section is populated when the daemon sends a
+multimask snapshot (i.e. the intercepted workflow uses a
+`MultiAreaConditioning` node).  Each area gets a card with a tinted
+swatch (same per-area colour scheme multimask itself uses), the
+area's name and dimensions, and an editable prompt textarea.  The
+edited prompts are pushed to multimask's `/state` by
+`interceptor_server.handle_run` before the daemon resumes, so
+`MultiAreaConditioning` sees exactly what the user reviewed.
 
 Overlay defaults
 ================
-Both toggles default OFF.  The canvas is drawn as the raw prepared
-image the model will receive — no tint, no wash, no annotation.  This
-is the "raw image" the reviewer expects to see.
+Three toggles live in the Canvas section:
 
-When a toggle is on, the corresponding mask is tinted over the
-canvas:
-  · selection  → cyan at 45%   (what the model edits)
-  · context    → purple at 25% (what region the workflow crops to)
+  · selection    — cyan tint at 45% (what the model edits).
+  · context      — purple tint at 25% (what region the workflow
+                   crops to).
+  · multimask    — each area's own per-area tint at 30%, drawn
+                   from the snapshot's transformed masks.  Only
+                   shown when a multimask snapshot exists.
 
-Tinting is useful for verification — "yes, the mask is where I drew
-it" — but it obscures the raw image, so it is a review aid, not a
-default.  The cropped path's context mask is all-white (whole crop is
-context), so its tint is a full-frame wash; the toggle is there so a
-user who wants that view can opt into it, but they never see it
-unasked.
+Selection and context default OFF: the canvas shows the raw
+prepared image unless the user opts in.  Multimask defaults ON when
+a snapshot is present, because seeing the area masks is the whole
+point of reviewing a multimask workflow.
 
 CANVAS INTERACTION (hinted in the panel, implemented in
 `pg_dispatch.js`):
@@ -171,6 +174,7 @@ PG_CSS = r"""
     display: flex; align-items: center; gap: 12px;
     font-size: 10px; color: #a8b5c4;
     margin-top: 6px;
+    flex-wrap: wrap;
   }
   .overlayRow .label {
     font-size: 9px;
@@ -188,6 +192,65 @@ PG_CSS = r"""
     margin: 0;
     cursor: pointer;
   }
+
+  /* ---- Multimask areas ---- */
+  #multimaskInfo {
+    font-size:10px; color:#5a6774;
+    line-height:1.5; margin-bottom:6px;
+    white-space: pre-line; overflow-wrap: anywhere;
+  }
+  #multimaskInfo.warn { color: #ffe600; }
+
+  .mmAreaList {
+    display: flex; flex-direction: column;
+    gap: 6px; margin-top: 6px;
+    max-height: 320px; overflow-y: auto;
+  }
+  .mmAreaList::-webkit-scrollbar { width:6px; }
+  .mmAreaList::-webkit-scrollbar-thumb {
+    background:#1e2836; border-radius:3px;
+  }
+  .mmAreaList .empty {
+    font-size:10px; color:#3d4756;
+    font-style:italic; padding:3px 4px;
+  }
+
+  .mmAreaCard {
+    border:1px solid #223040;
+    border-radius:3px;
+    padding:5px 6px;
+    background: rgba(220,230,242,0.015);
+    display:flex; flex-direction:column; gap:5px;
+  }
+  .mmAreaCard:hover { border-color:#34445a; }
+
+  .mmAreaHeader {
+    display:flex; align-items:center; gap:6px;
+  }
+  .mmAreaSwatch {
+    width:12px; height:12px; border-radius:2px;
+    flex:0 0 auto;
+    border:1px solid rgba(255,255,255,0.10);
+  }
+  .mmAreaName {
+    flex:1 1 auto; min-width:0;
+    color:#dce6f2; font-weight:700; font-size:11px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .mmAreaDims {
+    flex:0 0 auto;
+    font-size:9px; color:#5a6774;
+    font-variant-numeric: tabular-nums;
+  }
+  .mmAreaPrompt {
+    width:100%; box-sizing:border-box;
+    background:#0d1219; color:#00e5ff;
+    border:1px solid #223040; border-radius:2px;
+    font-family:inherit; font-size:11px;
+    padding:4px 6px; outline:none;
+    resize:vertical; min-height: 34px;
+  }
+  .mmAreaPrompt:focus { border-color:#00e5ff; }
 """
 
 PG_PANEL_BODY = r"""
@@ -217,6 +280,14 @@ PG_PANEL_BODY = r"""
       </div>
     </details>
 
+    <details class="section" open id="multimaskSection" style="display:none;">
+      <summary>Multimask areas</summary>
+      <div class="section-body">
+        <div id="multimaskInfo"></div>
+        <div id="multimaskList" class="mmAreaList"></div>
+      </div>
+    </details>
+
     <details class="section" open>
       <summary>Canvas</summary>
       <div class="section-body">
@@ -233,6 +304,10 @@ PG_PANEL_BODY = r"""
           <label class="check">
             <input type="checkbox" id="showContext">
             context
+          </label>
+          <label class="check" id="showMultimaskLabel" style="display:none;">
+            <input type="checkbox" id="showMultimask">
+            multimask
           </label>
         </div>
       </div>

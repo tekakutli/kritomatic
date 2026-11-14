@@ -22,18 +22,6 @@ The paste stage reads `prepared.rotation` (set by `prepare_workflow`).
     This is what makes Krita's layer panel show the layer at its
     content position, matching the visible content.
 
-    When the diamond is clipped on the left or top (diamond_x < 0 or
-    diamond_y < 0), the visible fragment starts at diamond pixel
-    `(-diamond_x, -diamond_y)`, so the diamond must be drawn into the
-    smaller vis canvas at offset `(diamond_x - doc_x0, diamond_y - doc_y0)`.
-    Since `doc_x0 = max(0, diamond_x)` and `doc_y0 = max(0, diamond_y)`,
-    those offsets are non-positive exactly when there is a left/top
-    clip, and 0 otherwise.  Using the opposite sign
-    (`doc_x0 - diamond_x`) shifts the content *down/right* by
-    `2*|diamond_y|` (or `2*|diamond_x|`) in the doc — a bug that only
-    fires for top/left clips, matching the "sometimes the paste is
-    shifted" symptom.
-
 INTERCEPT MODE
 ==============
 When the daemon's `_intercept_enabled` flag is on (toggled by
@@ -41,18 +29,30 @@ When the daemon's `_intercept_enabled` flag is on (toggled by
 `_comfy_generate_intercepted` instead of running the normal pipeline:
 
     1. Prepare N workflows (one per count, each with its own seed).
-    2. For each: build an `InterceptedBatch` snapshot, POST it to the
-       interceptor playground's `/intercept/intake`, and register it
-       in `_intercepted_batches`.
-    3. Return immediately with `intercepted: True` and the batch ids.
+    2. If the workflow contains a `MultiAreaConditioning` node,
+       snapshot multimask's state and per-area masks via its own HTTP
+       API (see `_fetch_multimask_snapshot`).
+    3. For each run: build an `InterceptedBatch` (including the
+       multimask snapshot), POST it to the interceptor playground's
+       `/intercept/intake`, and register it in
+       `_intercepted_batches`.
+    4. Return immediately with `intercepted: True` and the batch ids.
 
 The interceptor queues the tasks for user review.  When the user
-clicks Run on a task, the interceptor calls `comfy_resume_intercepted`
-with the batch id and (optionally) a prompt override.  That command
-pops the record, applies the override in-place on the prepared
-graph, and runs the submit/poll/download/paste half of the normal
-pipeline against the snapshot.  See `comfy_resume_intercepted` below
-for the full flow.
+clicks Run on a task, the interceptor:
+
+    · pushes an updated multimask state (snapshot with any per-area
+      prompt edits) to the multimask URL it received in the snapshot;
+    · calls `comfy_resume_intercepted` with the batch id.
+
+Resume pops the record, applies any prompt override in-place on the
+prepared graph, and runs the submit/poll/download/paste half of the
+normal pipeline against the snapshot.  ComfyUI executes the graph,
+and its `MultiAreaConditioning` node pulls the just-pushed multimask
+state — so the state the user reviewed in the interceptor is the
+state the model runs against.
+
+See `comfy_resume_intercepted` below for the full flow.
 
 A batch that is not resumed within `INTERCEPT_TIMEOUT_SEC` (15 min)
 is swept by `ComfyUIHandler._sweep_expired_intercepts` and disappears
@@ -65,19 +65,35 @@ the interceptor's URL sibling so the interceptor can drop its queued
 copy.  If the POST fails, the interceptor's next resume gets "batch
 expired or unknown" and marks the task as errored — same net effect.
 
+MULTIMASK SNAPSHOT
+==================
+`_get_multimask_url_from_graph` walks the active workflow graph for a
+`MultiAreaConditioning` node and returns its `playground_url` widget
+value (or the default).  When present, `_comfy_generate_intercepted`
+calls `_fetch_multimask_snapshot` once, before the per-run prepare
+loop, so all runs share the same snapshot and the crop-frame used by
+multimask's `/mask` transform matches the one `prepare_workflow` will
+use for `@thecanvas`.
+
+The snapshot is `{"url", "state", "masks"}`:
+  · `url` is the multimask base URL;
+  · `state` is the `/state` response body (globals + areas, no masks);
+  · `masks` is `{mask_hash: b64}` for each area, fetched via
+    `/mask?hash=…` and therefore already transformed to the prepared
+    frame.
+
+The interceptor displays `masks` and edits prompts in `state`.  On
+Run, it pushes `{"op": "set", "state": <edited>}` to `<url>/state`
+with **no** `masks` field — multimask's own `_masks` dict keeps the
+originals so the `/mask` handler re-transforms correctly at execution
+time.  See `interceptor_server.handle_run` for the push side.
+
 FILES
 =====
 `_paste_result` rotation branch: un-rotation math preserved; the
 clipping-to-doc + paste-at-visible-bounds logic is preserved; the only
 change vs. the previous version is the sign of the `drawImage` offset,
 which was inverted for top/left clip cases.
-
-Intercept additions: `_comfy_generate_intercepted`,
-`_make_intercepted_batch`, `_post_intake`,
-`_notify_interceptor_cancel`, `_poll_job_for_resume`,
-`comfy_set_intercept`, `comfy_resume_intercepted`,
-`comfy_discard_intercepted`, `comfy_list_intercepted`.
-`comfy_cancel` was extended to also handle intercepted batches.
 """
 
 from __future__ import annotations
@@ -111,6 +127,7 @@ from ..utils.comfyui_proxy_client import (
 )
 from .comfyui_types import (
     _BatchRecord,
+    _DEFAULT_MULTIMASK_URL,
     _HISTORY_DIR,
     InterceptedBatch,
     INTERCEPT_TIMEOUT_SEC,
@@ -135,6 +152,118 @@ _RESUME_POLL_TIMEOUT_S = 180.0
 # Timeout for the intake POST.  The interceptor's intake handler is
 # lightweight (just queues the task); 5 s is generous.
 _INTAKE_TIMEOUT_S = 5.0
+
+# Timeouts for the multimask snapshot fetch.  /state is metadata-only
+# (sub-100 ms); /mask triggers a transform per area (still fast on
+# localhost, but give it room for a few areas).
+_MULTIMASK_STATE_TIMEOUT_S = 5.0
+_MULTIMASK_MASK_TIMEOUT_S = 10.0
+
+
+# ---------------------------------------------------------------------------
+#  Multimask helpers (module-level, no state)
+# ---------------------------------------------------------------------------
+
+def _get_multimask_url_from_graph(graph: dict) -> Optional[str]:
+    """Return the multimask playground URL if `graph` uses
+    `MultiAreaConditioning`, else None.
+
+    The URL comes from that node's `playground_url` widget value.  An
+    empty/blank value falls back to `_DEFAULT_MULTIMASK_URL`, matching
+    the node's own default.  A workflow with two `MultiAreaConditioning`
+    nodes picks the first one — they always share one multimask URL in
+    practice, and picking deterministically is better than picking "last
+    one wins".
+    """
+    if not isinstance(graph, dict):
+        return None
+    for _node_id, node in graph.items():
+        if not isinstance(node, dict):
+            continue
+        if node.get("class_type") != "MultiAreaConditioning":
+            continue
+        url = (node.get("inputs") or {}).get("playground_url")
+        if isinstance(url, str) and url.strip():
+            return url.strip()
+        return _DEFAULT_MULTIMASK_URL
+    return None
+
+
+def _post_json(url: str, body: dict,
+               timeout: float = 5.0) -> dict:
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+    return json.loads(raw) if raw else {}
+
+
+def _fetch_multimask_snapshot(url: str) -> Optional[dict]:
+    """Fetch multimask's state and per-area transformed masks.
+
+    Returns `{"url": str, "state": {...}, "masks": {hash: b64}}`, or
+    `None` on unrecoverable failure (multimask unreachable, `/state`
+    rejected, or returned non-JSON).  A partial mask-fetch failure is
+    tolerated — the affected areas are simply absent from `masks`, and
+    the interceptor draws the ones that made it.
+
+    `/mask?hash=…` returns the mask transformed to the prepared frame
+    (rotate+crop per `/crop_frame`) at the moment of the call.  Since
+    `_fetch_multimask_snapshot` runs before the prepare loop, the crop
+    frame it sees is the same one `prepare_workflow` will use for
+    `@thecanvas` on the immediately-following iteration — unless the
+    user rotates inpaint during the microsecond between the two calls,
+    in which case the caller's warning list will already note the
+    multimask fetch succeeded and the prepare is per-run consistent.
+    The real risk window is user rotation during *review*, which is
+    orthogonal and noted in `InterceptedBatch.multimask_masks`'s
+    docstring.
+    """
+    base = url.rstrip("/")
+    try:
+        state = _post_json(
+            base + "/state", {}, timeout=_MULTIMASK_STATE_TIMEOUT_S,
+        )
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"[comfyui] multimask /state failed at {url!r}: {e}",
+              flush=True)
+        return None
+
+    if not isinstance(state, dict) or not state.get("success", False):
+        print(f"[comfyui] multimask /state rejected at {url!r}",
+              flush=True)
+        return None
+
+    areas = list(state.get("areas") or [])
+    masks: dict = {}
+    for area in areas:
+        mask_meta = area.get("mask") or {}
+        h = mask_meta.get("hash")
+        if not h:
+            continue
+        try:
+            mr = _post_json(
+                base + "/mask", {"hash": h},
+                timeout=_MULTIMASK_MASK_TIMEOUT_S,
+            )
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            print(f"[comfyui] multimask /mask {h[:8]} failed: {e}",
+                  flush=True)
+            continue
+        if mr.get("success") and mr.get("b64"):
+            masks[h] = mr["b64"]
+
+    return {
+        "url": url,
+        "state": {
+            "globals": state.get("globals") or {},
+            "areas": areas,
+        },
+        "masks": masks,
+    }
 
 
 class GenerationCommands(AutoDispatchHandler):
@@ -573,6 +702,11 @@ class GenerationCommands(AutoDispatchHandler):
         interceptor's `comfy_resume_intercepted` runs the submit/poll/
         download/paste half later, on the user's schedule.
 
+        A multimask snapshot (when the workflow uses
+        `MultiAreaConditioning`) is fetched once, before the prepare
+        loop, so all runs share it and the crop frame it uses matches
+        what `prepare_workflow` will use on the first iteration.
+
         Partial failures are tolerated.  A failed `prepare_workflow`
         or `POST intake` for run i is recorded in `errors` and the
         loop continues; the runs that succeeded are still handed to
@@ -596,6 +730,37 @@ class GenerationCommands(AutoDispatchHandler):
         else:
             count = requested_count
             warnings_list = []
+
+        # ---- Multimask snapshot, fetched once before the prepare loop ----
+        #
+        # Fetching it here (rather than per-run) ensures all N runs see
+        # the same multimask state, and puts the /mask transform call
+        # immediately before prepare_workflow's /crop_frame query, so
+        # both operate on the same frame under normal user idleness.
+        multimask_url = _get_multimask_url_from_graph(
+            parent._active_workflow_graph
+        )
+        multimask_snapshot: Optional[dict] = None
+        if multimask_url:
+            print(f"[comfyui] intercept: fetching multimask snapshot "
+                  f"from {multimask_url}", flush=True)
+            multimask_snapshot = _fetch_multimask_snapshot(multimask_url)
+            if multimask_snapshot is None:
+                warnings_list.append(
+                    f"multimask unreachable at {multimask_url}; "
+                    f"workflow may fail at MultiAreaConditioning"
+                )
+                print(f"[comfyui] intercept: multimask unreachable; "
+                      f"workflow's MultiAreaConditioning node may fail",
+                      flush=True)
+            else:
+                n_areas = len(
+                    (multimask_snapshot.get("state") or {}).get("areas") or []
+                )
+                n_masks = len(multimask_snapshot.get("masks") or {})
+                print(f"[comfyui] intercept: multimask snapshot "
+                      f"fetched ({n_areas} area(s), {n_masks} mask(s))",
+                      flush=True)
 
         intercepted_ids: list = []
         errors: list = []
@@ -638,6 +803,7 @@ class GenerationCommands(AutoDispatchHandler):
                     prepared=prepared,
                     seed=seed_i,
                     base_seed=base_seed,
+                    multimask_snapshot=multimask_snapshot,
                 )
             except Exception as e:
                 errors.append(f"batch_build[{i}]: {e}")
@@ -690,17 +856,24 @@ class GenerationCommands(AutoDispatchHandler):
                 "interceptor_url": parent._intercept_url,
                 "warnings": warnings_list,
                 "errors": errors,
+                "multimask_url": multimask_url,
+                "multimask_areas": (
+                    len((multimask_snapshot.get("state") or {}).get("areas") or [])
+                    if multimask_snapshot else 0
+                ),
             },
         }
 
     def _make_intercepted_batch(self, *, index, count, workflow_name,
-                                prepared, seed, base_seed):
+                                prepared, seed, base_seed,
+                                multimask_snapshot: Optional[dict] = None):
         """Build one InterceptedBatch from a prepared workflow.
 
         Snapshots everything the resume path will need: the prepared
         graph (for submit), crop bounds + paste config + rotation (for
-        paste), the prompt node id (for the override), and the three
-        `@`-resource blobs (for display in the interceptor's canvas).
+        paste), the prompt node id (for the override), the three
+        `@`-resource blobs (for display in the interceptor's canvas),
+        and the multimask snapshot (for area display + prompt edits).
         """
         parent = self.parent
 
@@ -742,6 +915,15 @@ class GenerationCommands(AutoDispatchHandler):
                 "prompt override will have no effect."
             )
 
+        # Multimask snapshot fields, flattened from the optional dict.
+        mm_url = None
+        mm_state = None
+        mm_masks: dict = {}
+        if multimask_snapshot:
+            mm_url = multimask_snapshot.get("url")
+            mm_state = multimask_snapshot.get("state")
+            mm_masks = multimask_snapshot.get("masks") or {}
+
         return InterceptedBatch(
             batch_id=batch_id,
             workflow_name=workflow_name,
@@ -759,6 +941,9 @@ class GenerationCommands(AutoDispatchHandler):
             params_snapshot=dict(parent._active_config.get("params") or {}),
             warnings=warnings,
             interceptor_url=parent._intercept_url,
+            multimask_url=mm_url,
+            multimask_state=mm_state,
+            multimask_masks=mm_masks,
         )
 
     def _post_intake(self, record):
@@ -769,6 +954,11 @@ class GenerationCommands(AutoDispatchHandler):
         non-JSON body, `{success: false}` response) is returned as
         `(False, reason)` so the caller can accumulate it in the
         batch-level errors list.
+
+        The multimask snapshot rides as a SIBLING of `payload`, not
+        inside it — `payload` is conceptually the inpaint data, and
+        the multimask fields are a different concern the interceptor
+        stores in its own state.
         """
         url = record.interceptor_url
         body = {
@@ -786,6 +976,13 @@ class GenerationCommands(AutoDispatchHandler):
                 "warnings":        list(record.warnings),
             },
         }
+        if record.multimask_state is not None:
+            body["multimask"] = {
+                "url": record.multimask_url,
+                "state": record.multimask_state,
+                "masks": record.multimask_masks or {},
+            }
+
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(
             url, data=data, method="POST",
@@ -931,7 +1128,10 @@ class GenerationCommands(AutoDispatchHandler):
                   "same shape as comfy_generate's success path. The "
                   "batch record is removed from the daemon on entry — "
                   "a second call on the same batch_id returns "
-                  "'expired or unknown'.",
+                  "'expired or unknown'.  The interceptor is expected "
+                  "to have pushed an updated multimask state before "
+                  "calling this; the daemon does not push multimask "
+                  "state itself.",
         args={
             "--batch_id":         {"type": "str", "required": True,
                                    "help": "batch id from the intake "
@@ -1210,11 +1410,13 @@ class GenerationCommands(AutoDispatchHandler):
         with parent._intercepted_lock:
             entries = [
                 {
-                    "batch_id":      r.batch_id,
-                    "workflow_name": r.workflow_name,
-                    "created_at":    r.created_at,
-                    "expiry_at":     r.expiry_at,
+                    "batch_id":       r.batch_id,
+                    "workflow_name":  r.workflow_name,
+                    "created_at":     r.created_at,
+                    "expiry_at":      r.expiry_at,
                     "interceptor_url": r.interceptor_url,
+                    "multimask_url":  r.multimask_url,
+                    "has_multimask":  r.multimask_state is not None,
                 }
                 for r in parent._intercepted_batches.values()
             ]
@@ -1571,15 +1773,6 @@ class GenerationCommands(AutoDispatchHandler):
     # ------------------------------------------------------------------
     #  Paste
     # ------------------------------------------------------------------
-    #
-    # Rotation branch:
-    #   · rotation == 0 → paste at (crop_bounds[0]+x, crop_bounds[1]+y)
-    #   · rotation != 0 → un-rotate each workflow output by -rotation
-    #                     into a diamond; compute the diamond's centre
-    #                     by un-rotating the crop centre; clip the
-    #                     diamond to the doc bounds; paste the visible
-    #                     fragment at its actual doc position
-    #                     (doc_x0, doc_y0) — not at (0,0).
 
     def _paste_result(self, doc, outputs: list, *,
                       crop_bounds: tuple,
@@ -1660,18 +1853,9 @@ class GenerationCommands(AutoDispatchHandler):
                 dw = diamond.width()
                 dh = diamond.height()
 
-                # Diamond top-left in doc coords.  configured_x /
-                # configured_y are added as an additional offset,
-                # matching the non-rotated path's paste_config.x/y
-                # semantics.
                 diamond_x = int(round(target_cx - dw / 2.0)) + configured_x
                 diamond_y = int(round(target_cy - dh / 2.0)) + configured_y
 
-                # Clip the diamond to the doc bounds.  The pasted
-                # layer is exactly the visible fragment of the
-                # diamond, so Krita's layer panel shows the layer at
-                # its actual content position rather than (0,0) with
-                # full-document bounds.
                 doc_x0 = max(0, diamond_x)
                 doc_y0 = max(0, diamond_y)
                 doc_x1 = min(W_doc, diamond_x + dw)
@@ -1702,18 +1886,6 @@ class GenerationCommands(AutoDispatchHandler):
                     p.setRenderHint(
                         QPainter.RenderHint.SmoothPixmapTransform,
                     )
-                    # Offset the diamond so its content lands at the
-                    # correct doc position.  When the diamond is
-                    # clipped on the left or top (diamond_x < 0 or
-                    # diamond_y < 0), the visible fragment starts at
-                    # diamond pixel (-diamond_x, -diamond_y), so the
-                    # diamond must be drawn at
-                    # (diamond_x - doc_x0, diamond_y - doc_y0).  That
-                    # is non-positive exactly when there is a
-                    # left/top clip, and 0 otherwise.  The opposite
-                    # sign (doc_x0 - diamond_x) shifts the content
-                    # DOWN/RIGHT by 2·|clip| in the doc, which is the
-                    # "sometimes the paste is shifted" bug.
                     p.drawImage(diamond_x - doc_x0,
                                 diamond_y - doc_y0, diamond)
                     p.end()

@@ -1,37 +1,39 @@
 """Panel handlers: task selection, prompt textarea, overlay toggles,
 poll loop, Run / Discard.
 
-Run sends `comfy_resume_intercepted` to the daemon, which applies the
-prompt override, submits the prepared workflow, polls, downloads, and
-pastes.  The daemon returns the same shape as `comfy_generate`: layer
-names, timing, etc.
+Run does two things (in order):
+  1. Sends `area_prompts` (from `board.areaPromptOverrides[task_id]`)
+     to the interceptor server; the server pushes them to multimask's
+     `/state` if the snapshot exists.
+  2. Sends the inpaint prompt override and calls
+     `comfy_resume_intercepted` on the daemon.
+
+The two steps are one atomic action from the user's perspective —
+the server handles ordering and aborts the whole run if the multimask
+push fails.
 
 Discard sends `comfy_discard_intercepted`, which just drops the
-pending record from the daemon's `_intercepted_batches`.
+pending record from the daemon's `_intercepted_batches`.  No
+multimask push on discard.
 
 The poll loop refreshes the task list every 2 s while the tab is
 visible.  The `_consecutivePollFailures` counter is the same
 warn-streak pattern used by the old interceptor: silence the first
 two failures, warn on the third, and re-warn every ten after that.
 
-PROMPT OVERRIDE PER TASK
-========================
+PROMPT OVERRIDES PER TASK
+=========================
 `board.promptOverrides[task_id]` holds each task's user-typed
-override (or the payload's original prompt if never typed over).
-`_selectTask` restores it on selection.  The prompt textarea's own
-`input` handler writes to both `board.prompt` (current value) and
-`board.promptOverrides[selectedTaskId]` (per-task persistence) so
-switching back to a task after editing another one restores the
-edit.
+inpaint prompt.  `board.areaPromptOverrides[task_id]` holds each
+task's user-typed multimask area prompts.  Both are restored on
+task selection so switching back to a task after editing another
+one preserves the edits.
 
 OVERLAY TOGGLES
 ===============
-Two checkboxes in the Canvas section drive `board.showSelection` and
-`board.showContext`.  Both default OFF so the canvas shows the raw
-prepared image; turning either on triggers an immediate redraw with
-the corresponding tint.  See `pg_view_image.js` for the tint
-mechanics and `pg_base.py`'s module docstring for the design
-rationale.
+Three checkboxes in the Canvas section: selection, context,
+multimask.  Selection and context default OFF; multimask defaults ON
+when a snapshot exists.  See `pg_base.py`'s module docstring.
 """
 
 PANEL_BINDINGS_JS = r"""
@@ -106,10 +108,7 @@ export async function _selectTask(taskId) {
   const item = board.selectedItem;
   if (!item) { _scheduleDraw(); return; }
 
-  // Restore the prompt for this task.  If the user has previously
-  // typed an override for this task, use it; otherwise seed from the
-  // payload's original prompt.  `board.prompt` mirrors the textarea
-  // value so `_runAction` can read it without touching the DOM.
+  // Restore the inpaint prompt for this task.
   const promptInput = document.getElementById("promptInput");
   const existingOverride = board.promptOverrides[taskId];
   const initialValue = (
@@ -117,15 +116,28 @@ export async function _selectTask(taskId) {
       ? existingOverride
       : (item.payload && item.payload.prompt) || ""
   );
-  if (promptInput) {
-    promptInput.value = initialValue;
-  }
+  if (promptInput) promptInput.value = initialValue;
   board.prompt = initialValue;
 
+  // Multimask snapshot + per-area prompt overrides for this task.
+  board.multimask = item.multimask || null;
+  if (!board.areaPromptOverrides[taskId]) {
+    board.areaPromptOverrides[taskId] = {};
+  }
+  // Default the multimask overlay ON when a snapshot exists —
+  // reviewing the masks is the point.
+  board.showMultimask = !!board.multimask;
+
+  // Preload the images the canvas will draw.
   if (item.payload && item.payload.canvas_b64) {
     getCachedImage(item.payload.canvas_b64);
     getCachedImage(item.payload.selection_b64);
     getCachedImage(item.payload.context_b64);
+    if (item.multimask && item.multimask.masks) {
+      for (const b64 of Object.values(item.multimask.masks)) {
+        if (typeof b64 === "string" && b64) getCachedImage(b64);
+      }
+    }
     fitView();
   }
   _scheduleDraw();
@@ -149,7 +161,9 @@ async function _runAction() {
   flashStatus("inpainting\u2026", "");
 
   const override = (board.prompt || "").trim();
-  const res = await interceptRun(tid, override || null);
+  const areaPrompts = board.areaPromptOverrides[tid] || {};
+
+  const res = await interceptRun(tid, override || null, areaPrompts);
 
   if (res.success) {
     const timing = res.data && res.data.timing != null
@@ -190,6 +204,7 @@ export function installPanelBindings() {
   const promptInput  = document.getElementById("promptInput");
   const showSelCb    = document.getElementById("showSelection");
   const showCtxCb    = document.getElementById("showContext");
+  const showMmCb     = document.getElementById("showMultimask");
 
   if (runBtn)     runBtn.addEventListener("click", _runAction);
   if (discardBtn) discardBtn.addEventListener("click", _discardAction);
@@ -204,9 +219,6 @@ export function installPanelBindings() {
     });
   }
 
-  // Overlay toggles.  Both default OFF (matching `board`'s initial
-  // state); the checkbox `checked` attribute is initialized from
-  // `board` in case a future change flips the default.
   if (showSelCb) {
     showSelCb.checked = !!board.showSelection;
     showSelCb.addEventListener("change", () => {
@@ -218,6 +230,13 @@ export function installPanelBindings() {
     showCtxCb.checked = !!board.showContext;
     showCtxCb.addEventListener("change", () => {
       board.showContext = !!showCtxCb.checked;
+      _scheduleDraw();
+    });
+  }
+  if (showMmCb) {
+    showMmCb.checked = !!board.showMultimask;
+    showMmCb.addEventListener("change", () => {
+      board.showMultimask = !!showMmCb.checked;
       _scheduleDraw();
     });
   }

@@ -38,6 +38,11 @@ INTERCEPT_TIMEOUT_SEC = 900
 
 _DEFAULT_INTERCEPT_URL = "http://127.0.0.1:8775/intercept/intake"
 
+# Default multimask playground URL, used when a `MultiAreaConditioning`
+# node declares no `playground_url` widget value (or one that is blank).
+# Mirrors the node's own default in kritomatic_nodes/__init__.py.
+_DEFAULT_MULTIMASK_URL = "http://127.0.0.1:8776"
+
 
 _READ_ONLY_COMMANDS = frozenset({
     "comfy_status",
@@ -249,6 +254,31 @@ class InterceptedBatch:
     and cropped per `/crop_frame` when the inpaint playground was
     active; raw when it wasn't.  They are exactly what the model sees,
     which is what the interceptor should display.
+
+    Multimask snapshot
+    ------------------
+    When the workflow contains a `MultiAreaConditioning` node, the
+    daemon fetches multimask's state at intercept time and stores it
+    here so the interceptor can display the areas and let the user
+    edit their prompts.  The three fields together form the snapshot:
+
+      * `multimask_url` — the URL the daemon used; the interceptor
+        pushes back to this same URL on Run.
+      * `multimask_state` — the `/state` response body:
+        `{"globals": {...}, "areas": [...]}`.  No masks; only metadata
+        and prompt strings.
+      * `multimask_masks` — `{mask_hash: transformed_b64}` for every
+        area.  These are the /mask-transformed PNGs (rotate+crop per
+        the prepared frame at intercept time), so they line up with
+        `canvas_b64` 1:1 and can be drawn over it directly.
+
+    On `comfy_resume_intercepted`, the interceptor is expected to have
+    pushed an updated state (from `multimask_state` with any per-area
+    prompt edits applied) back to `multimask_url` before calling the
+    daemon.  `MultiAreaConditioning` pulls that state at execution
+    time.  The `multimask_masks` dict is display-only — the interceptor
+    never pushes masks, only prompts, so multimask's originals stay
+    intact and re-transformation at execution time is correct.
     """
 
     def __init__(self, *,
@@ -267,7 +297,10 @@ class InterceptedBatch:
                  context_b64: str,
                  params_snapshot: dict,
                  warnings: list,
-                 interceptor_url: str):
+                 interceptor_url: str,
+                 multimask_url: Optional[str] = None,
+                 multimask_state: Optional[dict] = None,
+                 multimask_masks: Optional[dict] = None):
         self.batch_id = batch_id
         self.workflow_name = workflow_name
         now = time.time()
@@ -287,3 +320,7 @@ class InterceptedBatch:
         self.params_snapshot = dict(params_snapshot or {})
         self.warnings = list(warnings or [])
         self.interceptor_url = interceptor_url
+        # Multimask snapshot — see class docstring.
+        self.multimask_url = multimask_url
+        self.multimask_state = multimask_state
+        self.multimask_masks = dict(multimask_masks or {})

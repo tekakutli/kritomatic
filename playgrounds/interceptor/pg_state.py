@@ -19,6 +19,12 @@ so switching between tasks preserves each task's edit.  `_selectTask`
 in `pg_panel_bindings.js` restores the override (or the payload's
 original prompt if no override yet) on selection.
 
+`board.areaPromptOverrides` is the analogous per-task-id dict for
+per-area multimask prompts:
+`{task_id: {area_id: prompt}}`.  Edits to an area's prompt are
+written here; on Run they're shipped to the server, which pushes them
+to multimask before resuming.  Cleared on task switch.
+
 RESULTS
 =======
 `board.selectedItem.result` is the daemon's response data from a
@@ -26,16 +32,27 @@ successful resume: `{batch_id, job_id, layer_names, output_count,
 timing, prompt_override_applied}`.  `syncPanelFields` in
 `pg_panel_fields.js` renders it below the Run / Discard buttons.
 
-OVERLAYS
-========
-`board.showSelection` and `board.showContext` gate the two tinted
-mask overlays in `pg_view_image.js`.  Both default OFF so the canvas
-shows the raw prepared image the model receives.  Toggling a flag
-redraws via `_scheduleDraw()`.
+MULTIMASK SNAPSHOT
+==================
+`board.multimask` is the multimask snapshot from the daemon, or null
+when the workflow has no `MultiAreaConditioning` node:
 
-The toggles are session-scoped (no persistence).  Reloading the
-interceptor tab resets them to OFF, which matches the "raw image by
-default" contract.
+    {
+      url: "<multimask base>",
+      state: {globals, areas},
+      masks: {<hash>: <b64>},
+    }
+
+`board.showMultimask` gates the per-area tinted overlay in
+`pg_view_image.js`.  Default true when the snapshot exists — the
+masks are the whole point of reviewing a multimask workflow.
+
+PER-AREA COLOURS
+================
+`areaColorById(id)` mirrors multimask's own colour logic: hash the
+area id to pick from `MASK_COLORS`.  Duplicated (rather than shared)
+so this playground has no import-time dependency on multimask; the
+list is stable and small.
 """
 
 STATE_JS = r"""
@@ -56,6 +73,32 @@ export function resetView() {
   view.offsetY = 0;
 }
 
+/* ============================================================
+   Per-area colours — must match multimask/pg_state.js's
+   MASK_COLORS + areaColorById so the same area shows the same
+   colour in both playgrounds.
+   ============================================================ */
+
+export const MASK_COLORS = [
+  { r: 255, g:  90, b: 105 },
+  { r: 120, g: 220, b: 255 },
+  { r: 255, g: 200, b:  90 },
+  { r: 140, g: 225, b: 160 },
+  { r: 180, g: 155, b: 255 },
+  { r: 255, g: 165, b: 105 },
+  { r: 110, g: 220, b: 210 },
+  { r: 220, g: 230, b: 120 },
+];
+
+export function areaColorById(id) {
+  let h = 0;
+  const s = String(id || "");
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  }
+  return MASK_COLORS[Math.abs(h) % MASK_COLORS.length];
+}
+
 export const board = {
   tasks:               {},
   order:               [],
@@ -63,11 +106,16 @@ export const board = {
   selectedItem:        null,
   prompt:              "",
   promptOverrides:     {},
+  areaPromptOverrides: {},   // {task_id: {area_id: prompt}}
   pollTimer:           null,
-  // Overlay toggles.  Both OFF by default so the canvas shows the
-  // raw prepared image; toggled on for verification aid.
+  // Overlay toggles.  selection/context default OFF (raw canvas
+  // contract); multimask defaults ON when a snapshot exists (see
+  // _selectTask).
   showSelection:       false,
   showContext:         false,
+  showMultimask:       false,
+  // Multimask snapshot from the daemon, or null.
+  multimask:           null,
 };
 
 /* --------------------------------------------------------------- */

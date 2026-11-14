@@ -1,31 +1,51 @@
 """Panel sync: task list, selected-task details, prompt textarea,
-button enable/disable, result display.
+multimask area cards, button enable/disable, result display.
 
 `syncPanelFields` is called every frame from `draw()`.  Every DOM
 write is guarded against the current value so a steady-state frame
 touches nothing.
 
-The prompt textarea is NOT written by `syncPanelFields` — that would
-stomp user input every frame.  `_selectTask` in
-`pg_panel_bindings.js` sets the textarea when the selection changes,
-using the per-task override if it exists or the payload's original
-prompt if not.
+The prompt textarea and the multimask prompt textareas are NOT
+written by `syncPanelFields` unless the current DOM value differs
+from the model AND the element is not focused.  `_selectTask` in
+`pg_panel_bindings.js` sets the initial values when the selection
+changes; user typing is preserved across frames.
+
+MULTIMASK AREA CARDS
+====================
+Cards are rebuilt only when the set of area ids changes.  Prompt
+values are updated in place per-frame (skip-if-focused) so typing is
+never interrupted.  Each card carries:
+
+    · swatch       — area colour (mirrors multimask)
+    · name         — from the snapshot's area.name
+    · dims         — from area.mask.width × area.mask.height
+    · prompt       — textarea, value from board.areaPromptOverrides
+                     if present, else area.prompt
+
+The section itself is hidden when `board.multimask` is null (no
+snapshot → the workflow doesn't use multimask).
 """
 
 PANEL_FIELDS_JS = r"""
-import { board } from "./pg_state.js";
+import { board, areaColorById } from "./pg_state.js";
 
 let _els = null;
 function _get() {
   if (_els) return _els;
   _els = {
-    taskInfo:    document.getElementById("taskInfo"),
-    taskList:    document.getElementById("taskList"),
-    taskPayload: document.getElementById("taskPayload"),
-    promptInput: document.getElementById("promptInput"),
-    runBtn:      document.getElementById("runBtn"),
-    discardBtn:  document.getElementById("discardBtn"),
-    resultInfo:  document.getElementById("resultInfo"),
+    taskInfo:         document.getElementById("taskInfo"),
+    taskList:         document.getElementById("taskList"),
+    taskPayload:      document.getElementById("taskPayload"),
+    promptInput:      document.getElementById("promptInput"),
+    runBtn:           document.getElementById("runBtn"),
+    discardBtn:       document.getElementById("discardBtn"),
+    resultInfo:       document.getElementById("resultInfo"),
+    multimaskSection: document.getElementById("multimaskSection"),
+    multimaskInfo:    document.getElementById("multimaskInfo"),
+    multimaskList:    document.getElementById("multimaskList"),
+    showMultimaskLabel: document.getElementById("showMultimaskLabel"),
+    showMultimaskCb:  document.getElementById("showMultimask"),
   };
   return _els;
 }
@@ -136,6 +156,10 @@ function _syncTaskPayload(item) {
     if (w.length) {
       text += "\nwarnings: " + w.join("; ");
     }
+    if (item.multimask && item.multimask.state) {
+      const n = (item.multimask.state.areas || []).length;
+      text += "\nmultimask: " + n + " area(s)";
+    }
   }
   if (text === _taskPayloadSig) return;
   _taskPayloadSig = text;
@@ -173,6 +197,129 @@ function _syncResult(item) {
   e.resultInfo.className = cls;
 }
 
+/* ============================================================
+   Multimask area cards
+   ============================================================ */
+
+let _mmAreasSig = null;
+
+function _makeMmAreaCard(area, overridePrompt) {
+  const card = document.createElement("div");
+  card.className = "mmAreaCard";
+  card.dataset.mmAreaId = area.id;
+
+  const header = document.createElement("div");
+  header.className = "mmAreaHeader";
+
+  const swatch = document.createElement("span");
+  swatch.className = "mmAreaSwatch";
+  const hue = areaColorById(area.id);
+  swatch.style.background = "rgb(" + hue.r + "," + hue.g + "," + hue.b + ")";
+  header.appendChild(swatch);
+
+  const name = document.createElement("span");
+  name.className = "mmAreaName";
+  name.textContent = area.name || area.id;
+  header.appendChild(name);
+
+  const dims = document.createElement("span");
+  dims.className = "mmAreaDims";
+  const m = area.mask || {};
+  dims.textContent = (m.width || 0) + "\u00d7" + (m.height || 0);
+  header.appendChild(dims);
+
+  card.appendChild(header);
+
+  const ta = document.createElement("textarea");
+  ta.className = "mmAreaPrompt";
+  ta.rows = 2;
+  ta.spellcheck = false;
+  ta.placeholder = "prompt for this area";
+  ta.value = overridePrompt !== undefined
+    ? overridePrompt
+    : (area.prompt || "");
+  ta.addEventListener("input", () => {
+    const tid = board.selectedTaskId;
+    if (!tid) return;
+    const map = board.areaPromptOverrides[tid] || {};
+    map[area.id] = ta.value;
+    board.areaPromptOverrides[tid] = map;
+  });
+  card.appendChild(ta);
+
+  return card;
+}
+
+function _syncMultimaskAreas(item) {
+  const e = _get();
+  if (!e.multimaskSection) return;
+
+  const mm = item && item.multimask;
+  if (!mm || !mm.state || !Array.isArray(mm.state.areas)) {
+    e.multimaskSection.style.display = "none";
+    _mmAreasSig = null;
+    return;
+  }
+  e.multimaskSection.style.display = "";
+
+  const areas = mm.state.areas;
+  const tid = board.selectedTaskId;
+  const overrides = (tid && board.areaPromptOverrides[tid]) || {};
+
+  // Info line
+  const url = mm.url || "?";
+  const nMasks = Object.keys(mm.masks || {}).length;
+  const infoText =
+    "source: " + url + "\n"
+    + areas.length + " area(s), " + nMasks + " mask(s) drawn";
+  if (e.multimaskInfo && e.multimaskInfo.textContent !== infoText) {
+    e.multimaskInfo.textContent = infoText;
+    e.multimaskInfo.className = "";
+  }
+
+  // Rebuild only when the set of area ids changes.
+  const idsSig = areas.map(a => a.id).join("|");
+  if (idsSig !== _mmAreasSig) {
+    _mmAreasSig = idsSig;
+    e.multimaskList.innerHTML = "";
+    if (areas.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "no areas in multimask";
+      e.multimaskList.appendChild(empty);
+    } else {
+      for (const area of areas) {
+        e.multimaskList.appendChild(
+          _makeMmAreaCard(area, overrides[area.id]),
+        );
+      }
+    }
+  } else {
+    // Same area set — just sync prompt values in place, skipping
+    // focused textareas so user typing is never stomped.
+    for (const area of areas) {
+      const card = e.multimaskList.querySelector(
+        '[data-mm-area-id="' + area.id + '"]'
+      );
+      if (!card) continue;
+      const ta = card.querySelector(".mmAreaPrompt");
+      if (!ta || document.activeElement === ta) continue;
+      const want = overrides[area.id] !== undefined
+        ? overrides[area.id]
+        : (area.prompt || "");
+      if (ta.value !== want) ta.value = want;
+    }
+  }
+
+  // Toggle visibility
+  if (e.showMultimaskLabel) {
+    e.showMultimaskLabel.style.display = "flex";
+  }
+  if (e.showMultimaskCb) {
+    e.showMultimaskCb.checked = !!board.showMultimask;
+  }
+}
+
 export function syncPanelFields() {
   const e = _get();
   const summary = board.tasks[board.selectedTaskId];
@@ -182,6 +329,12 @@ export function syncPanelFields() {
   _syncTaskInfo(item);
   _syncTaskPayload(item);
   _syncResult(item);
+  _syncMultimaskAreas(item);
+
+  // Hide the multimask overlay toggle when there is no snapshot.
+  if (!(item && item.multimask)) {
+    if (e.showMultimaskLabel) e.showMultimaskLabel.style.display = "none";
+  }
 
   // The prompt textarea is NOT written here — see the module
   // docstring.  It is set on task selection (in _selectTask) and

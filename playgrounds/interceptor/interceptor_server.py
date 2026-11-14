@@ -6,17 +6,19 @@ prepares the workflow — reads the canvas / selection / context pixels
 out of Krita, uploads them as assets, substitutes the graph — and then,
 instead of submitting to ComfyUI, POSTs the prepared snapshot to this
 playground's `/intercept/intake`.  The user reviews the snapshot in
-the browser, optionally edits the prompt, and clicks Run.  This
-playground calls `comfy_resume_intercepted` on the daemon, which
-submits the prepared graph, polls to completion, downloads the
-result, and pastes it into Krita.
+the browser, optionally edits the prompt and (when the workflow uses
+multimask) the per-area prompts, and clicks Run.  This playground
+calls `comfy_resume_intercepted` on the daemon, which submits the
+prepared graph, polls to completion, downloads the result, and pastes
+it into Krita.
 
 Routes
 ======
     POST /intercept/intake   daemon → here: new intercepted task
     POST /intercept/list     browser poll: summary of all tasks
     POST /intercept/item     browser: full task body incl. payload
-    POST /intercept/run      browser → daemon: resume generation
+    POST /intercept/run      browser → daemon: push multimask state,
+                             then resume generation
     POST /intercept/discard  browser → daemon: drop the batch
     POST /intercept/cancel   daemon → here (best-effort): user clicked
                              Cancel-All in the docker; drop the task
@@ -34,26 +36,69 @@ keys: reconciliation is a key-set comparison, not a content match.
 
 Payload shape
 =============
-The daemon sends one `payload` dict per task:
+The daemon sends one `payload` dict per task plus an OPTIONAL
+`multimask` sibling:
 
     {
-      "canvas_b64":      <base64 PNG>,
-      "selection_b64":   <base64 PNG, grayscale mask>,
-      "context_b64":     <base64 PNG, grayscale mask>,
-      "prompt":          <current prompt>,
-      "workflow_name":   <slug>,
-      "params":          {<param title>: <value>, ...},
-      "crop_bounds":     [x, y, w, h],
-      "output_rotation": <float>,
-      "warnings":        [<string>, ...],
+      "payload": {
+        "canvas_b64":      <base64 PNG>,
+        "selection_b64":   <base64 PNG, grayscale mask>,
+        "context_b64":     <base64 PNG, grayscale mask>,
+        "prompt":          <current prompt>,
+        "workflow_name":   <slug>,
+        "params":          {<param title>: <value>, ...},
+        "crop_bounds":     [x, y, w, h],
+        "output_rotation": <float>,
+        "warnings":        [<string>, ...],
+      },
+      "multimask": {                # omitted when workflow has no
+                                    # MultiAreaConditioning node
+        "url": "<multimask base url>",
+        "state": {
+          "globals": {...},
+          "areas": [                # each area has id, name, prompt,
+                                    # strength, use_tagger, mask: {hash,
+                                    # width, height}, ...
+            ...
+          ],
+        },
+        "masks": {<hash>: <b64>},   # transformed PNG per area
+      },
     }
 
 `canvas_b64` is what the model sees as input (rotated + cropped for
 theta≠0, raw when the inpaint playground was not running at prepare
 time).  `selection_b64` and `context_b64` are the two masks the
-workflow will consume.  The browser renders all three overlaid on the
-canvas so the user sees exactly what will be affected before they
-click Run.
+workflow will consume.
+
+`multimask.masks` are the SAME frame as `canvas_b64` — the daemon
+fetched them via multimask's `/mask`, which auto-transforms to the
+prepared crop.  Overlaying them on `canvas_b64` at 1:1 is therefore
+aligned.
+
+Multimask push-on-run
+=====================
+The only piece of state the interceptor pushes to a service OTHER
+than the daemon is the multimask area prompts.  On `/intercept/run`:
+
+    1. Build an updated state from the snapshot with the browser's
+       per-area prompt edits applied.
+    2. POST `{"op": "set", "state": <updated>}` to `<multimask_url>/state`.
+       **No `masks` field** — multimask's `_masks` dict keeps its
+       originals, so `/mask` re-transforms correctly at ComfyUI
+       execution time.
+    3. Call the daemon's `comfy_resume_intercepted`.
+
+Step 2 runs UNCONDITIONALLY when a snapshot exists, even if the user
+made no edits.  The snapshot is the source of truth for this run — if
+the user (or another tab) changed multimask between intercept and
+Run, the snapshot still wins, matching "what you reviewed is what
+runs".
+
+If step 2 fails (multimask unreachable, `/state` rejected), the run
+aborts before the daemon is called.  The local task flips to `error`
+so the user can retry.  This is safer than submitting a run whose
+multimask state disagrees with what was displayed.
 
 Timeouts
 ========
@@ -70,6 +115,8 @@ Failure modes
   false, message: "<error>"}`; the local task flips to `error`.
 - Daemon says "batch expired or unknown" (swept between intake and
   resume): same — local task flips to `error`.
+- Multimask push fails: same — local task flips to `error` with the
+  push error as the message.  The daemon is not called.
 - Paste fails during resume: the daemon's `comfy_resume_intercepted`
   returns `{success: false, message: "<paste error>"}`; local task
   flips to `error`; the user can retry with a different prompt, but
@@ -78,8 +125,11 @@ Failure modes
 
 from __future__ import annotations
 
+import json
 import threading
 import time
+import urllib.error
+import urllib.request
 
 from inpaint import krita_client
 
@@ -105,6 +155,19 @@ def _gc():
             del _TASKS[tid]
 
 
+def _post_json(url, body, timeout=5.0):
+    """POST a JSON body and parse a JSON response.  Raises on any
+    transport or parse failure.  Used for the multimask push."""
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+    return json.loads(raw) if raw else {}
+
+
 # ---------------------------------------------------------------------------
 #  Intake
 # ---------------------------------------------------------------------------
@@ -115,6 +178,12 @@ def handle_intake(payload):
     Called by `comfy_generate` in intercept mode.  The task_id is the
     daemon's batch_id; storing it verbatim here means the two task
     lists are the same set of keys and reconciliation is trivial.
+
+    The `multimask` sibling (when present) carries the snapshot the
+    daemon captured at intercept time: URL, state metadata, and the
+    transformed mask b64s per area.  Stored as-is so `/intercept/item`
+    can return it to the browser and `/intercept/run` can push edited
+    prompts back to `<url>/state`.
     """
     payload = payload or {}
     task_id = payload.get("task_id")
@@ -123,6 +192,25 @@ def handle_intake(payload):
         return {"success": False, "message": "bad intake shape"}
 
     source_label = payload.get("source_label") or "daemon"
+
+    # Optional multimask snapshot, sent as a sibling of `payload`.
+    mm = payload.get("multimask")
+    mm_url = None
+    mm_state = None
+    mm_masks: dict = {}
+    if isinstance(mm, dict):
+        url = mm.get("url")
+        if isinstance(url, str) and url.strip():
+            mm_url = url.strip()
+        state = mm.get("state")
+        if isinstance(state, dict):
+            mm_state = state
+        masks = mm.get("masks")
+        if isinstance(masks, dict):
+            mm_masks = {
+                k: v for k, v in masks.items()
+                if isinstance(k, str) and isinstance(v, str)
+            }
 
     with _LOCK:
         if task_id in _TASKS:
@@ -146,11 +234,16 @@ def handle_intake(payload):
                 "output_rotation": inner.get("output_rotation", 0.0),
                 "warnings":        inner.get("warnings", []) or [],
             },
-            "result": None,
+            "multimask_url":   mm_url,
+            "multimask_state": mm_state,
+            "multimask_masks": mm_masks,
+            "result":  None,
             "message": "",
         }
     _gc()
-    _log(f"intake {task_id[:8]} from {source_label!r}")
+    _log(f"intake {task_id[:8]} from {source_label!r}"
+         + (f" (multimask: {len((mm_state or {}).get('areas') or [])} area(s))"
+            if mm_state is not None else ""))
     return {"success": True, "task_id": task_id}
 
 
@@ -168,6 +261,7 @@ def handle_list(_payload):
                 "received_at":   t["received_at"],
                 "status":        t["status"],
                 "has_result":    t["result"] is not None,
+                "has_multimask": t.get("multimask_state") is not None,
             }
             for t in sorted(_TASKS.values(),
                             key=lambda x: -x["received_at"])
@@ -181,7 +275,7 @@ def handle_item(payload):
         t = _TASKS.get(task_id)
         if t is None:
             return {"success": False, "message": "unknown task"}
-        return {"success": True, "task": {
+        item = {
             "task_id":      t["task_id"],
             "source_label": t["source_label"],
             "received_at":  t["received_at"],
@@ -189,24 +283,48 @@ def handle_item(payload):
             "payload":      t["payload"],
             "result":       t["result"],
             "message":      t["message"],
-        }}
+        }
+        # Multimask snapshot is a sibling, mirroring the intake shape.
+        if t.get("multimask_state") is not None:
+            item["multimask"] = {
+                "url":   t.get("multimask_url"),
+                "state": t.get("multimask_state"),
+                "masks": t.get("multimask_masks") or {},
+            }
+        else:
+            item["multimask"] = None
+        return {"success": True, "task": item}
 
 
 # ---------------------------------------------------------------------------
-#  Run
+#  Run — push multimask state, then resume daemon
 # ---------------------------------------------------------------------------
 
 def handle_run(payload):
-    """Resume the intercepted batch on the daemon.
+    """Push updated multimask state (if any), then resume the daemon.
 
     Blocks for the full generation duration.  The browser's fetch is a
-    long-poll against this handler.  On success, the daemon returns
-    the pasted layer names + timing, which we echo back to the
-    browser and store on the local task for the next `/intercept/item`
-    read.
+    long-poll against this handler.
+
+    Multimask state push happens FIRST and is FATAL on failure: if the
+    workflow uses `MultiAreaConditioning`, its node pulls from
+    multimask at ComfyUI execution time.  If we cannot make multimask's
+    state match the snapshot the user reviewed, we must not submit
+    anything — the alternative is a run with mismatched masks or
+    prompts.
+
+    `area_prompts` in the request payload is `{area_id: prompt}`.  If
+    an area's prompt is not present, the snapshot's original is used.
+    The updated state is always pushed (even with no edits) so that
+    drift between intake and Run does not silently override the
+    reviewer's intent.
     """
     payload = payload or {}
     task_id = payload.get("task_id")
+    area_prompts = payload.get("area_prompts") or {}
+    if not isinstance(area_prompts, dict):
+        area_prompts = {}
+
     with _LOCK:
         t = _TASKS.get(task_id)
         if t is None:
@@ -216,7 +334,57 @@ def handle_run(payload):
                     "message": f"task is {t['status']}"}
         t["status"] = "running"
 
+        # Snapshot the multimask fields outside the lock.  Copy the
+        # state so any concurrent mutation (e.g. a new intake, unlikely
+        # but cheap to guard) cannot affect this run's push.
+        mm_url = t.get("multimask_url")
+        mm_state = t.get("multimask_state")
+        if isinstance(mm_state, dict):
+            mm_state = {
+                "globals": dict(mm_state.get("globals") or {}),
+                "areas": [dict(a) for a in (mm_state.get("areas") or [])],
+            }
+
     prompt_override = payload.get("prompt")
+
+    # ---- Multimask push (before resume) ----
+    if mm_url and mm_state is not None:
+        areas = mm_state.get("areas") or []
+        for area in areas:
+            aid = area.get("id")
+            if aid and aid in area_prompts:
+                area["prompt"] = str(area_prompts[aid])
+        updated_state = {
+            "globals": mm_state.get("globals") or {},
+            "areas": areas,
+        }
+        try:
+            _post_json(
+                mm_url.rstrip("/") + "/state",
+                {
+                    "op": "set",
+                    "state": updated_state,
+                    # masks intentionally omitted — multimask's _masks
+                    # dict keeps its originals; /mask re-transforms
+                    # correctly at ComfyUI execution time.
+                },
+                timeout=10.0,
+            )
+        except Exception as e:
+            _log(f"multimask push failed for {task_id[:8]}: {e}")
+            with _LOCK:
+                tt = _TASKS.get(task_id)
+                if tt is not None:
+                    tt["status"] = "error"
+                    tt["message"] = f"multimask push failed: {e}"
+            return {
+                "success": False,
+                "message": f"multimask push failed: {e}",
+            }
+        _log(f"multimask state pushed for {task_id[:8]} "
+             f"({len(areas)} area(s))")
+
+    # ---- Resume daemon ----
     _log(f"run {task_id[:8]} prompt={(prompt_override or '')[:40]!r}")
 
     resp = krita_client.send({
@@ -260,7 +428,8 @@ def handle_discard(payload):
 
     Idempotent from the daemon's perspective: it returns
     `{success: true}` even if the record was already gone, so this
-    handler can always call it without checking.
+    handler can always call it without checking.  No multimask
+    interaction — discard means "do not run", so no state is pushed.
     """
     task_id = (payload or {}).get("task_id")
     with _LOCK:

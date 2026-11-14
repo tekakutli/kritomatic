@@ -25,10 +25,21 @@ malformed one.
 
 Clamping at θ=0 is preserved in `inpaint_server._compute_crop_frame`
 (clamp to the image intersection), since at θ=0 there is no rotated
-frame to extend into."""
+frame to extend into.
+
+HIT-CONTEXT-RECT TAKES PRE-PROJECTED COORDS
+===========================================
+`hitContextRect(r, ix, iy)` used to take `(r, sx, sy)` and call
+`screenToImageUnrotated` internally.  That forced a redundant
+`fittedImageRect()` call (inside the projection helper) on top of the
+one the caller (`pg_dispatch.js`'s mousemove handler) had already
+computed — three `fittedImageRect()` invocations per mousemove where
+two were needed.  The function now takes the un-rotated image coords
+the caller already has.  Behaviour is identical; only the call shape
+changed, and `pg_dispatch.js` is the sole caller."""
 
 INPAINT_JS = r"""
-import { board, view, screenToImageUnrotated } from "./pg_state.js";
+import { board, view } from "./pg_state.js";
 
 /* ============================================================
    Tolerances
@@ -100,14 +111,16 @@ export function handleCursor(name) {
 
 /* ============================================================
    Click classification
-   ============================================================ */
+   ============================================================
+   `ix, iy` are un-rotated image coords, pre-projected by the
+   caller.  See the module docstring, HIT-CONTEXT-RECT TAKES
+   PRE-PROJECTED COORDS. */
 
-export function hitContextRect(r, sx, sy) {
+export function hitContextRect(r, ix, iy) {
   if (!r) return null;
   const c = board.inpaintContext;
   if (c.w === 0 || c.h === 0) return null;
 
-  const [ix, iy] = screenToImageUnrotated(sx, sy);
   const handleTol = CONTEXT_HANDLE_HALF / r.s;
   const borderTol = CONTEXT_BORDER_HALF / r.s;
 

@@ -1,12 +1,16 @@
 """The loaded image and the tinted overlay for each selected mask.
 
-The single most stable view file — the image is always drawn first,
-the overlays are always tinted from the same palette.  Every layer
-here is drawn against the fitted image rect `r` (from
+The single most stable view file.  Draws on the IMAGE layer (`ctx`,
+`#c`), under the view-rotation transform.  The UI layer (context
+rect, chrome text) is drawn on `overlayCtx` by `pg_view_inpaint.py`
+and `pg_view.py` respectively — see `pg_state.py`'s TWO CANVASES
+note.
+
+Every layer here is drawn against the fitted image rect `r` (from
 `pg_state.fittedImageRect`), wrapped in the same rotation transform
-that `pg_view_inpaint.js` uses for the context rectangle, so the
-image, mask overlays, and context rect stay visually aligned at
-every angle.
+that both the image and the mask tint share.  The context rect on
+the overlay layer is deliberately NOT wrapped in that transform, so
+it stays visually fixed while the image rotates underneath.
 
 Mask overlays iterate `board.selectedMaskIndices` directly rather
 than allocating a `Set` and iterating the whole mask array.  Every

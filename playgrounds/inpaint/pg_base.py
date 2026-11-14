@@ -16,7 +16,20 @@ When off, the daemon falls back to the `@thecontext` layer's own tight
 bbox (if any) or the whole canvas.
 
 The `#statusLine` element is repurposed as the sync status: `Synced
-14:22:08 · rotation 15.0° · mask 3/5 · context on`."""
+14:22:08 · rotation 15.0° · mask 3/5 · context on`.
+
+OVERLAY CANVAS
+==============
+`#overlayCanvas` is created dynamically by `pg_state.py`.  Its CSS
+lives here.  It sits on top of `#c` (image layer), has a transparent
+background so the image shows through, and `pointer-events: none`
+so all mouse input still lands on `#c` where the event handlers are
+attached.
+
+The `#overlayCanvas` selector has higher specificity than the shared
+`canvas { … }` rule in `pgkit/styles.py`, so `background: transparent`
+wins over the shared `background: #0a0e14`.  Without that override
+the overlay would be opaque dark and hide the image layer entirely."""
 
 PG_CSS = r"""
   #ui button#pickImageBtn,
@@ -180,6 +193,20 @@ PG_CSS = r"""
     font-size:9px; color:#3d4756; font-style:italic;
     margin: 4px 0 0;
     line-height: 1.45;
+  }
+
+  /* ---- overlay layer (UI: context rect + chrome text) ----
+     Created dynamically by pg_state.py.  Sits on top of #c, is
+     transparent so the image shows through, and passes all pointer
+     events through to #c.  Specificity (100) beats the shared
+     `canvas { … }` rule (1), so `background: transparent` wins over
+     the shared `background: #0a0e14`. */
+  #overlayCanvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    background: transparent;
+    pointer-events: none;
   }
 """
 

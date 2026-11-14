@@ -6,7 +6,34 @@ nothing here imports from them.
 `applyCanvasImage` is the autosync target — updates the displayed
 image in response to a `@thecanvas` spec change without wiping the
 area list.  Used by `pg_autosync.js`; NOT called from any
-generation path."""
+generation path.
+
+TWO SCHEDULERS
+==============
+`_scheduleDraw`      → full `draw()`: canvas + `syncPanelFields` +
+                       `syncAreaList` (card DOM rebuild).
+`_scheduleDrawView`  → `drawView()` only: canvas repaint.
+
+Hover changes (`board.hoveredAreaId`) and selection changes feed only
+the canvas's alpha and chrome text — no panel field or card row reads
+either — so callers that know their mutation is canvas-only (currently
+`hoverArea`) use `_scheduleDrawView`, avoiding a full card-DOM rebuild
+on every mask-boundary crossing.
+
+Both schedulers coalesce via `requestAnimationFrame`.  A pending
+`_scheduleDraw` supersedes a pending `_scheduleDrawView` — the full
+draw already calls `drawView()`, so the view-only RAF is dropped.
+
+`fittedImageRect()` is memoized on the tuple of inputs that fully
+determine its result: `(innerWidth, innerHeight, imageWidth,
+imageHeight, zoom, panX, panY)`.  The function runs 2–4 times per
+`mousemove` frame (once explicitly in `pg_dispatch`, once inside
+`screenToImage`, once inside `drawView`, once inside `zoomAt`).
+The cache turns all but the first into a string compare.
+
+Callers must treat the returned object as read-only — none of them
+mutate it, verified across `pg_view.py`, `pg_view_image.py`,
+`pg_dispatch.py`, `pg_areas.py`, `pg_autosync.py`."""
 
 STATE_JS = r"""
 import {
@@ -222,9 +249,24 @@ export function clearImage() {
   _scheduleDraw();
 }
 
+/* ============================================================
+   Image-fit rect — MEMOIZED on the input tuple.
+   See the module docstring.  Callers must not mutate the
+   returned object.
+   ============================================================ */
+
+let _firCacheKey = null;
+let _firCacheVal = null;
+
 export function fittedImageRect() {
   const cw = window.innerWidth, ch = window.innerHeight;
   if (!board.imageWidth || !board.imageHeight) return null;
+
+  const key = cw + "," + ch + ","
+            + board.imageWidth + "," + board.imageHeight + ","
+            + view.zoom + "," + view.panX + "," + view.panY;
+  if (key === _firCacheKey) return _firCacheVal;
+
   const pad = 40;
   const sx = (cw - 2 * pad) / board.imageWidth;
   const sy = (ch - 2 * pad) / board.imageHeight;
@@ -234,7 +276,11 @@ export function fittedImageRect() {
   const h = board.imageHeight * s;
   const x0 = (cw - w) / 2 + view.panX;
   const y0 = (ch - h) / 2 + view.panY;
-  return { x0, y0, w, h, s };
+
+  const val = { x0, y0, w, h, s };
+  _firCacheKey = key;
+  _firCacheVal = val;
+  return val;
 }
 
 export function imageToScreen(x, y) {
@@ -249,17 +295,50 @@ export function screenToImage(sx, sy) {
   return [(sx - r.x0) / r.s, (sy - r.y0) / r.s];
 }
 
-let _drawScheduled = false;
-let _drawFn = null;
+/* ============================================================
+   Draw scheduling — two levels
+   ============================================================
+   `_drawPending`  a RAF is queued.
+   `_drawFull`     the queued RAF should call `_drawFn` (draw), not
+                   `_drawViewFn` (drawView).
 
-export function _setDraw(fn) { _drawFn = fn; }
+   `_scheduleDraw`     sets `_drawFull = true` and (re)uses the
+                       pending RAF.  Upgrades a pending view-only
+                       RAF to full.
+   `_scheduleDrawView` sets `_drawFull = false` only if no RAF is
+                       pending.  A pending full draw is left alone
+                       (it will call `drawView` internally). */
+
+let _drawPending = false;
+let _drawFull    = false;
+let _drawFn      = null;
+let _drawViewFn  = null;
+
+export function _setDraw(fn)     { _drawFn = fn; }
+export function _setDrawView(fn) { _drawViewFn = fn; }
+
+function _fire() {
+  const full = _drawFull;
+  _drawPending = false;
+  _drawFull = false;
+  if (full) { if (_drawFn) _drawFn(); }
+  else      { if (_drawViewFn) _drawViewFn(); }
+}
 
 export function _scheduleDraw() {
-  if (_drawScheduled) return;
-  _drawScheduled = true;
-  const fire = () => { _drawScheduled = false; if (_drawFn) _drawFn(); };
-  if (typeof requestAnimationFrame === "function") requestAnimationFrame(fire);
-  else setTimeout(fire, 16);
+  _drawFull = true;
+  if (_drawPending) return;
+  _drawPending = true;
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(_fire);
+  else setTimeout(_fire, 16);
+}
+
+export function _scheduleDrawView() {
+  if (_drawPending) return;   // don't downgrade a pending full draw
+  _drawFull = false;
+  _drawPending = true;
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(_fire);
+  else setTimeout(_fire, 16);
 }
 
 export function resize() {

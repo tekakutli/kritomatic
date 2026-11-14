@@ -1,7 +1,22 @@
-"""The area list: creation, mutation, selection."""
+"""The area list: creation, mutation, selection.
+
+`hoverArea` uses `_scheduleDrawView` (canvas-only) instead of
+`_scheduleDraw` (full draw).  Hover affects only `drawImageLayer`'s
+`globalAlpha` — no panel field or card row reads `board.hoveredAreaId`
+— so a full `draw()` on every mask-boundary crossing would rebuild the
+entire area-card DOM for nothing.  See `pg_state.py`'s TWO SCHEDULERS.
+
+`selectArea` keeps `_scheduleDraw` (full).  Selection is
+canvas-visible (alpha bump on the selected area, chrome label change)
+AND flows into pgkit entities via `syncAreaList` → `pgkitNotifyEntities`,
+so a full draw is correct.  Every `selectArea` caller in
+`pg_dispatch.js` and `pg_panel_bindings.js` also calls `draw()`
+explicitly right after, so the scheduled `_scheduleDraw` is redundant
+but harmless — kept as a safety net for any future caller that
+forgets the explicit follow-up."""
 
 AREAS_JS = r"""
-import { board, _scheduleDraw } from "./pg_state.js";
+import { board, _scheduleDraw, _scheduleDrawView } from "./pg_state.js";
 
 function _makeId() {
   return Math.random().toString(36).slice(2, 10);
@@ -90,7 +105,9 @@ export function selectArea(id) {
 export function hoverArea(id) {
   if (board.hoveredAreaId !== id) {
     board.hoveredAreaId = id;
-    _scheduleDraw();
+    // Canvas-only: hover changes only `drawImageLayer`'s globalAlpha.
+    // See the module docstring.
+    _scheduleDrawView();
   }
 }
 """

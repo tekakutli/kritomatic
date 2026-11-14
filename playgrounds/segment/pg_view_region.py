@@ -3,19 +3,24 @@
 Two modes:
 
   live stroke    — while `board.regionStrokeActive` is true, show the
-                   inverted image under the region mask (the classic
-                   "what will be refined" preview).  During an erase
-                   stroke, tint the region red.
-
+                   inverted image under the region mask.  During an
+                   erase stroke, tint the region red.
   idle           — after the stroke, trace the region boundary and
                    place a dot every few screen-pixels along it.  The
-                   boundary trace is expensive; the result is cached on
-                   the mask entry (`_regionEdgePoints`, `_regionChains`)
-                   and invalidated by `pg_region` on every mutation."""
+                   boundary trace is expensive; the result is cached
+                   on the mask entry (`_regionEdgePoints`,
+                   `_regionChains`) and invalidated by `pg_region` on
+                   every mutation.
+
+Draws on the REGION canvas (`regionCtx`, `#regionCanvas`), a
+transparent overlay stacked above `#c`.  Region content is
+independent of the image, mask tints, points, drafts, and chrome
+text — repainting the region never touches any of them, and
+`pg_view.js`'s sig check skips region repaints entirely when the
+region hasn't changed (hover, point-click, pan-only chrome update)."""
 
 VIEW_REGION_JS = r"""
-import { ctx, board } from "./pg_state.js";
-import { maskPixelData } from "./pg_pixels.js";
+import { regionCtx, board } from "./pg_state.js";
 import { selectedMask } from "./pg_masks.js";
 
 /* ============================================================
@@ -77,12 +82,12 @@ function _drawLiveRegionStroke(r, sm) {
 
   const inverted = _getInvertedImage();
   if (!inverted) {
-    ctx.save();
-    ctx.globalAlpha = 0.45;
-    ctx.globalCompositeOperation = "screen";
-    ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(sm.regionCanvas, r.x0, r.y0, r.w, r.h);
-    ctx.restore();
+    regionCtx.save();
+    regionCtx.globalAlpha = 0.45;
+    regionCtx.globalCompositeOperation = "screen";
+    regionCtx.imageSmoothingEnabled = false;
+    regionCtx.drawImage(sm.regionCanvas, r.x0, r.y0, r.w, r.h);
+    regionCtx.restore();
     return;
   }
 
@@ -103,10 +108,10 @@ function _drawLiveRegionStroke(r, sm) {
   }
 
   cctx.globalCompositeOperation = "source-over";
-  ctx.save();
-  ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(comp, r.x0, r.y0, r.w, r.h);
-  ctx.restore();
+  regionCtx.save();
+  regionCtx.imageSmoothingEnabled = false;
+  regionCtx.drawImage(comp, r.x0, r.y0, r.w, r.h);
+  regionCtx.restore();
 }
 
 /* ============================================================
@@ -292,24 +297,24 @@ function _drawRegionEdge(r) {
 
   const halfB = 2, halfD = 2.5, offD = 1;
 
-  ctx.save();
-  ctx.fillStyle = "rgba(10, 10, 10, 0.75)";
+  regionCtx.save();
+  regionCtx.fillStyle = "rgba(10, 10, 10, 0.75)";
   for (let i = 0; i < dots.length; i += 2) {
     const sx = Math.round(r.x0 + dots[i] * r.s);
     const sy = Math.round(r.y0 + dots[i + 1] * r.s);
-    ctx.fillRect(sx - halfD + offD, sy - halfD + offD,
-                 halfD * 2, halfD * 2);
+    regionCtx.fillRect(sx - halfD + offD, sy - halfD + offD,
+                       halfD * 2, halfD * 2);
   }
-  ctx.restore();
+  regionCtx.restore();
 
-  ctx.save();
-  ctx.fillStyle = "rgba(255, 235, 130, 1.0)";
+  regionCtx.save();
+  regionCtx.fillStyle = "rgba(255, 235, 130, 1.0)";
   for (let i = 0; i < dots.length; i += 2) {
     const sx = Math.round(r.x0 + dots[i] * r.s);
     const sy = Math.round(r.y0 + dots[i + 1] * r.s);
-    ctx.fillRect(sx - halfB, sy - halfB, halfB * 2, halfB * 2);
+    regionCtx.fillRect(sx - halfB, sy - halfB, halfB * 2, halfB * 2);
   }
-  ctx.restore();
+  regionCtx.restore();
 }
 
 /* ============================================================

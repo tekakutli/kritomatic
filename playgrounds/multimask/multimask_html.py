@@ -1,4 +1,9 @@
-"""Multimask HTML assembly and module manifest."""
+"""Multimask HTML assembly and module manifest.
+
+`_setDrawView` is wired at boot alongside `_setDraw` so that
+`_scheduleDrawView()` (used by `pg_areas.hoverArea`) can repaint the
+canvas without touching the panel.  See `pg_state.py`'s TWO
+SCHEDULERS."""
 
 import sys
 
@@ -31,7 +36,8 @@ import {
   installPanelBindings, pgkitHandleSelect, multimaskBootSync,
 } from "./pg_panel_bindings.js";
 import { draw } from "./pg_dispatch.js";
-import { resize, _setDraw } from "./pg_state.js";
+import { drawView } from "./pg_view.js";
+import { resize, _setDraw, _setDrawView } from "./pg_state.js";
 import { syncAreaList } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
 import { selectArea } from "./pg_areas.js";
@@ -41,6 +47,7 @@ import { startAutosync } from "./pg_autosync.js";
   console.log("[boot] modules loaded");
   try {
     _setDraw(draw);                     console.log("[boot] _setDraw");
+    _setDrawView(drawView);             console.log("[boot] _setDrawView");
     setPanelDraw(draw);                 console.log("[boot] setPanelDraw");
     setRemoteDraw(draw);                console.log("[boot] setRemoteDraw");
     setRemoteSelect(pgkitHandleSelect); console.log("[boot] setRemoteSelect");

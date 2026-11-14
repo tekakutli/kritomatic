@@ -1,20 +1,25 @@
 """The inpaint context rectangle.
 
-Only draws the context rect.  It is an axis-aligned UI region anchored
-to the un-rotated fit rect and does NOT rotate with the image: as the
-user spins the rotation slider, the image rotates underneath, but the
-rect stays fixed on screen.  `board.inpaintContext` therefore stays in
-un-rotated image coords, and the pushed `thecontext` layer stays
-axis-aligned at those coords — matching the pre-refactor behaviour.
+Draws on the OVERLAY layer (`overlayCtx`, `#overlayCanvas`), NOT on
+the image layer.  The rect is an axis-aligned UI region anchored to
+the un-rotated fit rect and does NOT rotate with the image: as the
+user spins the rotation slider, the image rotates underneath (on the
+image layer), but the rect stays fixed on screen.
+
+Because the rect lives on a separate layer, a rotation repaint of
+the image layer does not touch it — the overlay sig excludes
+`view.rotation`, so the overlay is not repainted at all on rotation.
+This is the whole reason the layers are split.
 
 The rectangle's drag interaction (resize handles, border-band move,
-Shift-symmetric resize) is dispatched in `pg_dispatch.js`, which calls
-the pure helpers in `pg_inpaint.js` in un-rotated image coords.
+Shift-symmetric resize) is dispatched in `pg_dispatch.js`, which
+calls the pure helpers in `pg_inpaint.js` in un-rotated image coords.
 
-The rectangle is drawn only when `board.inpaintEnabled` is true."""
+The rectangle is drawn only when `board.inpaintEnabled` is true and
+an image is loaded."""
 
 VIEW_INPAINT_JS = r"""
-import { ctx, board } from "./pg_state.js";
+import { overlayCtx, board } from "./pg_state.js";
 import {
   contextRectScreen, contextHandles, ensureDefaultContext,
 } from "./pg_inpaint.js";
@@ -35,8 +40,9 @@ export function drawInpaintContext(r) {
   const halo   = "rgba(8, 10, 14, 0.82)";
 
   // No rotation transform: the rect is a fixed UI region, not image
-  // content.  See the module docstring.
+  // content.  Drawn on the overlay layer.  See the module docstring.
 
+  const ctx = overlayCtx;
   ctx.save();
   ctx.lineJoin = "round";
   ctx.lineCap  = "round";

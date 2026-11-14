@@ -8,10 +8,17 @@
 These are three distinct layers with one thing in common: they are
 transient and drawn only while the user is interacting with the
 region tool.  Each is its own private function; the exported names
-are the ones `pg_view.js` calls in order."""
+are the ones `pg_view.js` calls in order.
+
+Draws on the OVERLAY canvas (`overlayCtx`, `#overlayCanvas`).  The
+brush cursor follows `board.mouse` on every move; the drafts follow
+`board.lassoPoints` and `board.freehandPoints`.  Splitting these onto
+their own canvas means a brush-mode mousemove (no button, no state
+change beyond the cursor position) repaints only the overlay, not the
+image, region, or point layers."""
 
 VIEW_BRUSH_JS = r"""
-import { ctx, board, imageToScreen } from "./pg_state.js";
+import { overlayCtx, board, imageToScreen } from "./pg_state.js";
 import { selectedMask } from "./pg_masks.js";
 
 /* ============================================================
@@ -53,65 +60,61 @@ function _drawBrushCursor(r) {
   const coreWidth  = anchor ? 2.2 : 1.8;
   const haloWidth  = coreWidth + 3.2;
 
-  ctx.save();
+  overlayCtx.save();
 
-  ctx.beginPath();
-  ctx.arc(sx, sy, radiusScreen, 0, Math.PI * 2);
-  ctx.fillStyle = fillColor;
-  ctx.fill();
+  overlayCtx.beginPath();
+  overlayCtx.arc(sx, sy, radiusScreen, 0, Math.PI * 2);
+  overlayCtx.fillStyle = fillColor;
+  overlayCtx.fill();
 
-  ctx.beginPath();
-  ctx.arc(sx, sy, radiusScreen, 0, Math.PI * 2);
-  ctx.strokeStyle = "rgba(8, 10, 14, 0.82)";
-  ctx.lineWidth = haloWidth;
-  ctx.stroke();
+  overlayCtx.beginPath();
+  overlayCtx.arc(sx, sy, radiusScreen, 0, Math.PI * 2);
+  overlayCtx.strokeStyle = "rgba(8, 10, 14, 0.82)";
+  overlayCtx.lineWidth = haloWidth;
+  overlayCtx.stroke();
 
-  ctx.beginPath();
-  ctx.arc(sx, sy, radiusScreen, 0, Math.PI * 2);
-  ctx.strokeStyle = anchor ? anchorColor : ringColor;
-  ctx.lineWidth = coreWidth;
-  ctx.stroke();
+  overlayCtx.beginPath();
+  overlayCtx.arc(sx, sy, radiusScreen, 0, Math.PI * 2);
+  overlayCtx.strokeStyle = anchor ? anchorColor : ringColor;
+  overlayCtx.lineWidth = coreWidth;
+  overlayCtx.stroke();
 
-  ctx.beginPath();
-  ctx.arc(sx, sy, 3.5, 0, Math.PI * 2);
-  ctx.fillStyle = "rgba(8, 10, 14, 0.85)";
-  ctx.fill();
-  ctx.beginPath();
-  ctx.arc(sx, sy, 1.5, 0, Math.PI * 2);
-  ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
-  ctx.fill();
+  overlayCtx.beginPath();
+  overlayCtx.arc(sx, sy, 3.5, 0, Math.PI * 2);
+  overlayCtx.fillStyle = "rgba(8, 10, 14, 0.85)";
+  overlayCtx.fill();
+  overlayCtx.beginPath();
+  overlayCtx.arc(sx, sy, 1.5, 0, Math.PI * 2);
+  overlayCtx.fillStyle = "rgba(255, 255, 255, 0.95)";
+  overlayCtx.fill();
 
-  ctx.restore();
+  overlayCtx.restore();
 }
 
 /* ============================================================
-   Shared halo stroke
-   ============================================================
-   Dark halo + bright line over the same path, so the draft stays
-   legible over both bright and dark parts of the image. */
+   Shared halo stroke */
 
 function _haloStroke(drawPath, brightColor, width, dash) {
   const dashes = dash || [];
 
-  ctx.beginPath();
+  overlayCtx.beginPath();
   drawPath();
-  ctx.strokeStyle = "rgba(8, 10, 14, 0.82)";
-  ctx.lineWidth = width + 3.2;
-  ctx.setLineDash(dashes);
-  ctx.stroke();
+  overlayCtx.strokeStyle = "rgba(8, 10, 14, 0.82)";
+  overlayCtx.lineWidth = width + 3.2;
+  overlayCtx.setLineDash(dashes);
+  overlayCtx.stroke();
 
-  ctx.beginPath();
+  overlayCtx.beginPath();
   drawPath();
-  ctx.strokeStyle = brightColor;
-  ctx.lineWidth = width;
-  ctx.setLineDash(dashes);
-  ctx.stroke();
-  ctx.setLineDash([]);
+  overlayCtx.strokeStyle = brightColor;
+  overlayCtx.lineWidth = width;
+  overlayCtx.setLineDash(dashes);
+  overlayCtx.stroke();
+  overlayCtx.setLineDash([]);
 }
 
 /* ============================================================
-   Lasso draft
-   ============================================================ */
+   Lasso draft */
 
 function _drawLassoDraft() {
   if (board.lassoPoints.length === 0) return;
@@ -131,15 +134,15 @@ function _drawLassoDraft() {
     ? "rgba(255, 130, 150, 0.95)"
     : "rgba(255, 220, 100, 0.95)";
 
-  ctx.save();
-  ctx.lineJoin = "round";
-  ctx.lineCap = "round";
+  overlayCtx.save();
+  overlayCtx.lineJoin = "round";
+  overlayCtx.lineCap = "round";
 
   if (screenPts.length > 1) {
     _haloStroke(() => {
-      ctx.moveTo(screenPts[0][0], screenPts[0][1]);
+      overlayCtx.moveTo(screenPts[0][0], screenPts[0][1]);
       for (let i = 1; i < screenPts.length; i++) {
-        ctx.lineTo(screenPts[i][0], screenPts[i][1]);
+        overlayCtx.lineTo(screenPts[i][0], screenPts[i][1]);
       }
     }, bright, 2.8, null);
   }
@@ -149,15 +152,15 @@ function _drawLassoDraft() {
     const last = screenPts[screenPts.length - 1];
 
     _haloStroke(() => {
-      ctx.moveTo(last[0], last[1]);
-      ctx.lineTo(sx, sy);
+      overlayCtx.moveTo(last[0], last[1]);
+      overlayCtx.lineTo(sx, sy);
     }, brightSoft, 2.4, [7, 5]);
 
     if (screenPts.length >= 3) {
       const first = screenPts[0];
       _haloStroke(() => {
-        ctx.moveTo(sx, sy);
-        ctx.lineTo(first[0], first[1]);
+        overlayCtx.moveTo(sx, sy);
+        overlayCtx.lineTo(first[0], first[1]);
       }, brightFaint, 1.8, [6, 6]);
     }
   }
@@ -168,51 +171,50 @@ function _drawLassoDraft() {
     const isLast  = (i === screenPts.length - 1);
 
     if (isFirst && screenPts.length >= 3) {
-      ctx.beginPath();
-      ctx.arc(px, py, 11, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(8, 10, 14, 0.85)";
-      ctx.fill();
-      ctx.beginPath();
-      ctx.arc(px, py, 8.5, 0, Math.PI * 2);
-      ctx.fillStyle = vertexColor;
-      ctx.fill();
-      ctx.strokeStyle = "rgba(255, 255, 255, 1.0)";
-      ctx.lineWidth = 2.2;
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.arc(px, py, 3, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(255, 255, 255, 1.0)";
-      ctx.fill();
+      overlayCtx.beginPath();
+      overlayCtx.arc(px, py, 11, 0, Math.PI * 2);
+      overlayCtx.fillStyle = "rgba(8, 10, 14, 0.85)";
+      overlayCtx.fill();
+      overlayCtx.beginPath();
+      overlayCtx.arc(px, py, 8.5, 0, Math.PI * 2);
+      overlayCtx.fillStyle = vertexColor;
+      overlayCtx.fill();
+      overlayCtx.strokeStyle = "rgba(255, 255, 255, 1.0)";
+      overlayCtx.lineWidth = 2.2;
+      overlayCtx.stroke();
+      overlayCtx.beginPath();
+      overlayCtx.arc(px, py, 3, 0, Math.PI * 2);
+      overlayCtx.fillStyle = "rgba(255, 255, 255, 1.0)";
+      overlayCtx.fill();
     } else if (isLast) {
-      ctx.beginPath();
-      ctx.arc(px, py, 8, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(8, 10, 14, 0.80)";
-      ctx.fill();
-      ctx.beginPath();
-      ctx.arc(px, py, 5.5, 0, Math.PI * 2);
-      ctx.fillStyle = vertexColor;
-      ctx.fill();
-      ctx.strokeStyle = "rgba(255, 255, 255, 1.0)";
-      ctx.lineWidth = 2;
-      ctx.stroke();
+      overlayCtx.beginPath();
+      overlayCtx.arc(px, py, 8, 0, Math.PI * 2);
+      overlayCtx.fillStyle = "rgba(8, 10, 14, 0.80)";
+      overlayCtx.fill();
+      overlayCtx.beginPath();
+      overlayCtx.arc(px, py, 5.5, 0, Math.PI * 2);
+      overlayCtx.fillStyle = vertexColor;
+      overlayCtx.fill();
+      overlayCtx.strokeStyle = "rgba(255, 255, 255, 1.0)";
+      overlayCtx.lineWidth = 2;
+      overlayCtx.stroke();
     } else {
-      ctx.beginPath();
-      ctx.arc(px, py, 7, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(8, 10, 14, 0.75)";
-      ctx.fill();
-      ctx.beginPath();
-      ctx.arc(px, py, 4.5, 0, Math.PI * 2);
-      ctx.fillStyle = vertexColor;
-      ctx.fill();
+      overlayCtx.beginPath();
+      overlayCtx.arc(px, py, 7, 0, Math.PI * 2);
+      overlayCtx.fillStyle = "rgba(8, 10, 14, 0.75)";
+      overlayCtx.fill();
+      overlayCtx.beginPath();
+      overlayCtx.arc(px, py, 4.5, 0, Math.PI * 2);
+      overlayCtx.fillStyle = vertexColor;
+      overlayCtx.fill();
     }
   }
 
-  ctx.restore();
+  overlayCtx.restore();
 }
 
 /* ============================================================
-   Freehand draft
-   ============================================================ */
+   Freehand draft */
 
 function _drawFreehandDraft() {
   if (!board.freehandActive) return;
@@ -231,56 +233,52 @@ function _drawFreehandDraft() {
     ? "rgba(255, 130, 150, 0.18)"
     : "rgba(255, 220, 100, 0.18)";
 
-  ctx.save();
-  ctx.lineJoin = "round";
-  ctx.lineCap = "round";
+  overlayCtx.save();
+  overlayCtx.lineJoin = "round";
+  overlayCtx.lineCap = "round";
 
   if (screenPts.length > 1) {
     _haloStroke(() => {
-      ctx.moveTo(screenPts[0][0], screenPts[0][1]);
+      overlayCtx.moveTo(screenPts[0][0], screenPts[0][1]);
       for (let i = 1; i < screenPts.length; i++) {
-        ctx.lineTo(screenPts[i][0], screenPts[i][1]);
+        overlayCtx.lineTo(screenPts[i][0], screenPts[i][1]);
       }
     }, strokeBright, 2.8, null);
   }
 
   if (screenPts.length >= 3) {
-    ctx.beginPath();
-    ctx.moveTo(screenPts[0][0], screenPts[0][1]);
+    overlayCtx.beginPath();
+    overlayCtx.moveTo(screenPts[0][0], screenPts[0][1]);
     for (let i = 1; i < screenPts.length; i++) {
-      ctx.lineTo(screenPts[i][0], screenPts[i][1]);
+      overlayCtx.lineTo(screenPts[i][0], screenPts[i][1]);
     }
-    ctx.closePath();
-    ctx.fillStyle = fillSoft;
-    ctx.fill();
+    overlayCtx.closePath();
+    overlayCtx.fillStyle = fillSoft;
+    overlayCtx.fill();
 
     const first = screenPts[0];
     const last  = screenPts[screenPts.length - 1];
     _haloStroke(() => {
-      ctx.moveTo(last[0], last[1]);
-      ctx.lineTo(first[0], first[1]);
+      overlayCtx.moveTo(last[0], last[1]);
+      overlayCtx.lineTo(first[0], first[1]);
     }, strokeSoft, 1.8, [6, 6]);
   }
 
   const [fx, fy] = screenPts[0];
-  ctx.beginPath();
-  ctx.arc(fx, fy, 6.5, 0, Math.PI * 2);
-  ctx.fillStyle = "rgba(8, 10, 14, 0.85)";
-  ctx.fill();
-  ctx.beginPath();
-  ctx.arc(fx, fy, 4.5, 0, Math.PI * 2);
-  ctx.fillStyle = strokeBright;
-  ctx.fill();
-  ctx.strokeStyle = "rgba(255, 255, 255, 1.0)";
-  ctx.lineWidth = 1.8;
-  ctx.stroke();
+  overlayCtx.beginPath();
+  overlayCtx.arc(fx, fy, 6.5, 0, Math.PI * 2);
+  overlayCtx.fillStyle = "rgba(8, 10, 14, 0.85)";
+  overlayCtx.fill();
+  overlayCtx.beginPath();
+  overlayCtx.arc(fx, fy, 4.5, 0, Math.PI * 2);
+  overlayCtx.fillStyle = strokeBright;
+  overlayCtx.fill();
+  overlayCtx.strokeStyle = "rgba(255, 255, 255, 1.0)";
+  overlayCtx.lineWidth = 1.8;
+  overlayCtx.stroke();
 
-  ctx.restore();
+  overlayCtx.restore();
 }
-
-/* ============================================================
-   Public aliases
-   ============================================================ */
 
 export {
   _drawBrushCursor as drawBrushCursor,

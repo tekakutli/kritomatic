@@ -1,11 +1,18 @@
 """Segment playground HTML assembly and module manifest.
 
-MODULE MANIFEST
-===============
+`_setDrawView` is wired at boot alongside `_setDraw`, so
+`_scheduleDrawView()` can repaint the canvas without touching the
+panel.  In segment this wiring is defensive — `drawView()` already
+does sig-based layer dispatch, so `_scheduleDraw` (which calls
+`draw()` → `drawView()` + panel syncs) and `_scheduleDrawView` (which
+calls `drawView()` only) both short-circuit to the same set of layer
+repaints when state is unchanged.  The distinction matters when a
+caller knows the panel didn't change: `_scheduleDrawView` skips
+`syncPanelFields` + `syncMaskList` entirely.
+
 The module list is ordered from leaf to entry point.  `pgkit_modules()`
 supplies the shared shell.  Every other module is a Python-side string
-constant (the `_JS` suffix) imported from its own Python file; the
-file name in `_MODULE_SOURCES` is the `.js` name the browser sees.
+constant (the `_JS` suffix) imported from its own Python file.
 
 The order in the manifest does not affect runtime — every module is an
 ES module with its own imports resolved at load time.  It only affects
@@ -55,7 +62,10 @@ import {
   installPanelBindings, pgkitHandleSelect, segmentBootSync,
 } from "./pg_panel_bindings.js";
 import { draw }                             from "./pg_dispatch.js";
-import { board, resize, _setDraw }          from "./pg_state.js";
+import { drawView }                         from "./pg_view.js";
+import {
+  board, resize, _setDraw, _setDrawView,
+} from "./pg_state.js";
 import { syncMaskList }                     from "./pg_panel_lists.js";
 import { syncPanelFields }                  from "./pg_panel_fields.js";
 
@@ -63,6 +73,7 @@ console.log("[boot] modules loaded");
 
 try {
   _setDraw(draw);                     console.log("[boot] _setDraw");
+  _setDrawView(drawView);             console.log("[boot] _setDrawView");
   setPanelDraw(draw);                 console.log("[boot] setPanelDraw");
   setRemoteDraw(draw);                console.log("[boot] setRemoteDraw");
   setRemoteSelect(pgkitHandleSelect); console.log("[boot] setRemoteSelect");
@@ -74,7 +85,7 @@ try {
 
   installShellControls();     console.log("[boot] installShellControls");
   installPanelBindings();     console.log("[boot] installPanelBindings");
-  segmentBootSync();              console.log("[boot] segmentBootSync");
+  segmentBootSync();          console.log("[boot] segmentBootSync");
   resize();                   console.log("[boot] BOOT COMPLETE");
 } catch (e) {
   console.error("[boot] FAILED:", e);

@@ -13,7 +13,61 @@ array, staging points, region stroke, op log) rather than importing
 `pg_masks.clearMasks`.  That preserves this module as a leaf.  The
 behaviour is identical to the original `clearMasks()` call chain — the
 whole synchronous reset block completes before the scheduled
-`requestAnimationFrame` fires."""
+`requestAnimationFrame` fires.
+
+THREE CANVASES
+==============
+The render surface is split into three stacked canvases:
+
+    #c              image layer: dark fill, image, tinted masks
+    #regionCanvas   region layer: live stroke preview OR edge dots
+    #overlayCanvas  overlay layer: points, brush cursor, drafts, chrome
+
+`pg_view.js` computes a per-layer content signature on every
+`drawView()` call and repaints a layer only when its signature
+changed.  The sigs are stored in `_layerSigs`; `resize()` clears them
+because `canvas.width = …` wipes the pixel buffer regardless of
+whether the sig would have changed.
+
+The split exists to exploit disjoint change triggers:
+
+  · Brush-mode mousemove (no button): only the overlay's brush cursor
+    moves.  Image, tints, region, points, chrome are unchanged.
+  · Brush stroke painting: `regionCanvas` mutates per frame; image,
+    tints, points, chrome unchanged.
+  · Hover across a mask boundary: image alpha changes; region, points,
+    chrome unchanged.
+  · Pan: all three translate.
+  · Zoom: all three translate; chrome text changes.
+
+Why not more layers: drafts-following-cursor and chrome-text are both
+on the overlay; they were split into separate layers in one design but
+they share the "rarely changes" property and separating them would
+quadruple per-frame layer bookkeeping for no additional saving.
+
+`_masksVersion` is a monotonic counter, bumped by `pg_masks.js`
+whenever a mask's visible contribution changes without moving any
+other sig input: `img.onload`, `img.onerror`, `setMasks`, `replaceMaskAt`,
+`restoreMasks`, `addMaskFromB64`.  It's part of the image-layer sig.
+
+`_scheduleDraw`      → full `draw()` (canvas + panel syncs).
+`_scheduleDrawView`  → `drawView()` only (canvas-only repaint).
+
+A pending `_scheduleDraw` upgrades a queued `_scheduleDrawView`
+(full draw implies view draw); a pending view-only scheduler is a
+no-op if a full draw is already queued.
+
+`fittedImageRect()` is memoized on the tuple of inputs that fully
+determine its result: `(innerWidth, innerHeight, imageWidth,
+imageHeight, zoom, panX, panY)`.  The function runs many times per
+frame — once explicitly in `pg_dispatch`, once inside each
+`imageToScreen` / `screenToImage`, and once per point / lasso vertex
+that the view layers project.  Cache hits become string compares.
+
+Callers must treat the returned object as read-only — none of them
+mutate it, verified across `pg_view.py`, `pg_view_image.py`,
+`pg_view_region.py`, `pg_view_points.py`, `pg_view_brush.py`,
+`pg_dispatch.py`."""
 
 STATE_JS = r"""
 import {
@@ -21,15 +75,37 @@ import {
 } from "./pg_tuning.js";
 
 /* ============================================================
-   Canvas and 2D context
+   Canvases and 2D contexts
    ============================================================ */
 
 export const canvas = document.getElementById("c");
 export const ctx    = canvas.getContext("2d");
 
-/* `dpr` is module-private.  The original pg_core exported it, but
-   nothing outside the module ever read it; it only fed `resize()`. */
+export const regionCanvas = document.createElement("canvas");
+regionCanvas.id = "regionCanvas";
+document.body.appendChild(regionCanvas);
+export const regionCtx = regionCanvas.getContext("2d");
+
+export const overlayCanvas = document.createElement("canvas");
+overlayCanvas.id = "overlayCanvas";
+document.body.appendChild(overlayCanvas);
+export const overlayCtx = overlayCanvas.getContext("2d");
+
 let _dpr = window.devicePixelRatio || 1;
+
+/* ============================================================
+   Per-layer sig caches — shared with resize().
+   ============================================================ */
+
+export const _layerSigs = { image: null, region: null, overlay: null };
+
+/* ============================================================
+   Masks version — see the module docstring.
+   ============================================================ */
+
+let _masksVersion = 0;
+export function _bumpMasksVersion() { _masksVersion++; }
+export function _getMasksVersion()   { return _masksVersion; }
 
 /* ============================================================
    View (zoom + pan)
@@ -43,9 +119,6 @@ export function resetView() {
   view.panY = 0;
 }
 
-/* Clamp pan so at least VIEW_PAN_MARGIN screen pixels of image stay
-   inside the viewport on each axis.  Called after any pan/zoom change
-   and on window resize. */
 export function clampPan() {
   if (!board.imageWidth || !board.imageHeight) return;
   const cw = window.innerWidth, ch = window.innerHeight;
@@ -60,9 +133,6 @@ export function clampPan() {
   const baseY = (ch - h) / 2;
   const m = VIEW_PAN_MARGIN;
 
-  // x0 = baseX + panX.  Constraints:
-  //   x0 + w >= m        (right edge visible)
-  //   x0     <= cw - m   (left edge visible)
   const minPanX = m - baseX - w;
   const maxPanX = cw - m - baseX;
   view.panX = Math.max(minPanX, Math.min(maxPanX, view.panX));
@@ -72,8 +142,6 @@ export function clampPan() {
   view.panY = Math.max(minPanY, Math.min(maxPanY, view.panY));
 }
 
-/* Zoom to `newZoom`, anchored at the given screen coordinate so the
-   image point currently under the cursor stays under the cursor. */
 export function zoomAt(screenX, screenY, newZoom) {
   const r0 = fittedImageRect();
   if (!r0) return;
@@ -82,12 +150,10 @@ export function zoomAt(screenX, screenY, newZoom) {
 
   view.zoom = Math.max(VIEW_ZOOM_MIN, Math.min(VIEW_ZOOM_MAX, newZoom));
 
-  // Where does (ix, iy) land on screen with the new zoom, old pan?
   const r1 = fittedImageRect();
   const newSx = r1.x0 + ix * r1.s;
   const newSy = r1.y0 + iy * r1.s;
 
-  // Compensate pan so the anchored image point stays under the cursor.
   view.panX += screenX - newSx;
   view.panY += screenY - newSy;
 
@@ -121,6 +187,7 @@ export function setImage(hash, dataUrl, width, height) {
   board.regionStrokeActive = false;
   board.opLog = [];
   board.redoLog = [];
+  _bumpMasksVersion();
   _scheduleDraw();
 }
 
@@ -142,6 +209,7 @@ export function clearImage() {
   board.regionStrokeActive = false;
   board.opLog = [];
   board.redoLog = [];
+  _bumpMasksVersion();
   _scheduleDraw();
 }
 
@@ -209,25 +277,6 @@ export const board = {
   running:       false,
   lastTiming:    null,
 
-  // Krita export options. Persist across runs so a user who tunes
-  // feather once doesn't re-tune it on every mask; the values are
-  // copied into every applyToKrita / extractMaskToLayer call.
-  //
-  // kritaOpacity is in PERCENT (0-100), not Krita's native 0-255.
-  // Every UI surface here — the scrub input, the field registration,
-  // the number a remote client sees — uses percent. The single
-  // conversion to 0-255 happens at the boundary in
-  // pg_panel_bindings._getKritaExtractOptions, right before the
-  // extract payload is built. That keeps the daemon's byte-range
-  // contract the daemon's problem, and keeps the user's mental model
-  // ("I want 50% opacity") straightforward.
-  //
-  // kritaOpacityEnabled gates the opacity value: when false, no
-  // set_layer_opacity command is issued during extraction, so the
-  // new layer inherits whatever opacity the source has (relevant for
-  // duplicate mode where the dup inherits from the source). When
-  // true, the value is applied explicitly, overriding whatever the
-  // source carried.
   kritaFeather:        0,
   kritaExpand:         0,
   kritaContract:       0,
@@ -241,12 +290,21 @@ export const board = {
 };
 
 /* ============================================================
-   Image-fit rect — applies view.zoom and view.panX/panY
+   Image-fit rect — MEMOIZED on the input tuple.
    ============================================================ */
+
+let _firCacheKey = null;
+let _firCacheVal = null;
 
 export function fittedImageRect() {
   const cw = window.innerWidth, ch = window.innerHeight;
   if (!board.imageWidth || !board.imageHeight) return null;
+
+  const key = cw + "," + ch + ","
+            + board.imageWidth + "," + board.imageHeight + ","
+            + view.zoom + "," + view.panX + "," + view.panY;
+  if (key === _firCacheKey) return _firCacheVal;
+
   const pad = 40;
   const sx = (cw - 2 * pad) / board.imageWidth;
   const sy = (ch - 2 * pad) / board.imageHeight;
@@ -256,7 +314,11 @@ export function fittedImageRect() {
   const h = board.imageHeight * s;
   const x0 = (cw - w) / 2 + view.panX;
   const y0 = (ch - h) / 2 + view.panY;
-  return { x0, y0, w, h, s };
+
+  const val = { x0, y0, w, h, s };
+  _firCacheKey = key;
+  _firCacheVal = val;
+  return val;
 }
 
 export function imageToScreen(x, y) {
@@ -272,36 +334,70 @@ export function screenToImage(sx, sy) {
 }
 
 /* ============================================================
-   Draw scheduling
+   Draw scheduling — two levels
    ============================================================ */
 
 let _drawScheduled = false;
-let _drawFn = null;
+let _drawFull      = false;
+let _drawFn        = null;
+let _drawViewFn    = null;
 
-export function _setDraw(fn) { _drawFn = fn; }
+export function _setDraw(fn)     { _drawFn = fn; }
+export function _setDrawView(fn) { _drawViewFn = fn; }
 
-export function _scheduleDraw() {
+function _queue() {
   if (_drawScheduled) return;
   _drawScheduled = true;
-  if (typeof requestAnimationFrame === "function") {
-    requestAnimationFrame(() => { _drawScheduled = false; if (_drawFn) _drawFn(); });
-  } else {
-    setTimeout(() => { _drawScheduled = false; if (_drawFn) _drawFn(); }, 16);
-  }
+  const fire = () => {
+    const full = _drawFull;
+    _drawScheduled = false;
+    _drawFull = false;
+    if (full && _drawFn) _drawFn();
+    else if (!full && _drawViewFn) _drawViewFn();
+  };
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(fire);
+  else setTimeout(fire, 16);
+}
+
+export function _scheduleDraw() {
+  _drawFull = true;
+  _queue();
+}
+
+export function _scheduleDrawView() {
+  _queue();
 }
 
 /* ============================================================
-   Resize
+   Resize — sizes all three canvases and clears sigs.
    ============================================================ */
 
 export function resize() {
   _dpr = window.devicePixelRatio || 1;
   const cw = window.innerWidth, ch = window.innerHeight;
+
   canvas.width  = Math.round(cw * _dpr);
   canvas.height = Math.round(ch * _dpr);
   canvas.style.width  = cw + "px";
   canvas.style.height = ch + "px";
   ctx.setTransform(_dpr, 0, 0, _dpr, 0, 0);
+
+  regionCanvas.width  = Math.round(cw * _dpr);
+  regionCanvas.height = Math.round(ch * _dpr);
+  regionCanvas.style.width  = cw + "px";
+  regionCanvas.style.height = ch + "px";
+  regionCtx.setTransform(_dpr, 0, 0, _dpr, 0, 0);
+
+  overlayCanvas.width  = Math.round(cw * _dpr);
+  overlayCanvas.height = Math.round(ch * _dpr);
+  overlayCanvas.style.width  = cw + "px";
+  overlayCanvas.style.height = ch + "px";
+  overlayCtx.setTransform(_dpr, 0, 0, _dpr, 0, 0);
+
+  _layerSigs.image   = null;
+  _layerSigs.region  = null;
+  _layerSigs.overlay = null;
+
   clampPan();
   if (_drawFn) _drawFn();
 }

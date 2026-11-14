@@ -5,6 +5,17 @@
 canvas-only redraw, used wherever the state that changed is visible
 only on the canvas.
 
+HOVER REPAINT IS CANVAS-ONLY
+============================
+`board.hoveredMaskIdx` is read by exactly one consumer: `pg_view_image.
+js::drawImageLayer`, to pick `globalAlpha` (0.40 vs 0.55) on selected
+masks' tint.  Neither `syncPanelFields` nor `syncMaskList` reads it —
+mask rows reflect `selectedMaskIndices` only, and the panel fields
+never look at hover.  The hover-change branch in `mousemove` therefore
+calls `drawView()`, not `draw()`.  On a dense mask stack, sweeping the
+cursor across mask boundaries used to trigger dozens of pointless
+panel-diff runs per second; this eliminates them.
+
 COORDINATE SYSTEMS
 ==================
 Two projections to image coords exist:
@@ -26,7 +37,24 @@ Two projections to image coords exist:
 
 The `overImage` decision is made in ROTATED image coords (via
 `screenToImage`), so alt-click mask selection works on the actual
-rotated extent."""
+rotated extent.
+
+PROJECTION DEFERRED DURING PAN / SPACE-DRAG
+===========================================
+`screenToImage` and `screenToImageUnrotated` both call
+`fittedImageRect()` internally.  The pan branch and the space-drag
+branch of `mousemove` only update `view.panX/Y` and repaint — they
+never touch `(ix, iy)` or `(uix, uiy)`.  Computing the projections
+before those early-returns means paying for two `fittedImageRect()`
+calls (`pg_state.py` now memoizes, so it's a string compare each, but
+that was three calls before the memoization landed and it's still
+strictly wasted work).  The projections are moved below the
+early-returns.
+
+`hitContextRect` now takes `(r, ix, iy)` — pre-projected un-rotated
+image coords — instead of `(r, sx, sy)`.  That removes the third
+internal `fittedImageRect()` call the old signature carried.
+"""
 
 DISPATCH_JS = r"""
 import {
@@ -126,7 +154,7 @@ canvas.addEventListener("mousedown", (e) => {
 
   if (e.button === 0 && board.inpaintEnabled) {
     ensureDefaultContext();
-    const hit = hitContextRect(r, sx, sy);
+    const hit = hitContextRect(r, uix, uiy);
     if (hit) {
       e.preventDefault();
       _contextDrag.active    = true;
@@ -159,23 +187,15 @@ canvas.addEventListener("contextmenu", (e) => {
 
 /* ============================================================
    Mousemove
-   ============================================================ */
+   ============================================================
+   Pan and space-drag early-return before the projections — see the
+   module docstring, PROJECTION DEFERRED DURING PAN / SPACE-DRAG.
+   Hover change repaints canvas-only — see HOVER REPAINT IS
+   CANVAS-ONLY. */
 
 canvas.addEventListener("mousemove", (e) => {
   const rect = canvas.getBoundingClientRect();
   const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
-  const r = fittedImageRect();
-
-  let ix = 0, iy = 0, uix = 0, uiy = 0, overImage = false;
-  if (r) {
-    [ix, iy] = screenToImage(sx, sy);
-    [uix, uiy] = screenToImageUnrotated(sx, sy);
-    board.mouse.x = ix;
-    board.mouse.y = iy;
-    overImage = ix >= 0 && ix <= board.imageWidth
-             && iy >= 0 && iy <= board.imageHeight;
-    board.mouse.inside = overImage;
-  }
 
   if (_panActive) {
     view.panX = _panStartPanX + (e.clientX - _panStartScreenX);
@@ -190,6 +210,18 @@ canvas.addEventListener("mousemove", (e) => {
     canvas.style.cursor = "grab";
     drawView();
     return;
+  }
+
+  const r = fittedImageRect();
+  let ix = 0, iy = 0, uix = 0, uiy = 0, overImage = false;
+  if (r) {
+    [ix, iy] = screenToImage(sx, sy);
+    [uix, uiy] = screenToImageUnrotated(sx, sy);
+    board.mouse.x = ix;
+    board.mouse.y = iy;
+    overImage = ix >= 0 && ix <= board.imageWidth
+             && iy >= 0 && iy <= board.imageHeight;
+    board.mouse.inside = overImage;
   }
 
   if (_contextDrag.active && r) {
@@ -211,7 +243,7 @@ canvas.addEventListener("mousemove", (e) => {
   }
 
   if (board.inpaintEnabled && r && !_contextDrag.active) {
-    const hit = hitContextRect(r, sx, sy);
+    const hit = hitContextRect(r, uix, uiy);
     if (hit) {
       canvas.style.cursor = (hit.kind === 'handle')
         ? handleCursor(hit.handle)
@@ -229,7 +261,7 @@ canvas.addEventListener("mousemove", (e) => {
 
   if (hoveredMask !== board.hoveredMaskIdx) {
     board.hoveredMaskIdx = hoveredMask;
-    draw();
+    drawView();
   }
 
   if (hoveredMask >= 0) canvas.style.cursor = "pointer";

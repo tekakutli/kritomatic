@@ -5,10 +5,31 @@ Every mutation calls `_scheduleDraw()`.  There is no `clearMasks` export
 because nothing outside this file ever cleared the stack — `setMasks([])`
 does the same thing and is what the panel's "Clear masks" button
 actually invokes.  `setImage` and `clearImage` (in `pg_state.js`) reset
-the array directly to keep `pg_state` a leaf."""
+the array directly to keep `pg_state` a leaf.
+
+MASKS VERSION BUMPS
+===================
+`_bumpMasksVersion()` is called at every point where a mask's visible
+contribution changes without moving any other sig input:
+
+    · `img.onload`          — `loaded` flips false→true; the mask
+                              becomes drawable for the first time.
+    · `img.onerror`         — entry state settles.
+    · `setMasks`            — full replacement, entry identity changes.
+    · `addMaskFromB64`      — appends.
+    · `replaceMaskAt`       — same-length replacement.
+    · `restoreMasks`        — full replacement from an undo snapshot.
+
+The image-layer sig includes `_getMasksVersion()`, so any of these
+triggers exactly one image repaint on the next `drawView()`.
+
+`_pixels` / `_tinted` cache invalidation from `applyCanvasImage` is
+covered by `pg_state.js`'s own bump (it does not import this file)."""
 
 MASKS_JS = r"""
-import { board, _scheduleDraw } from "./pg_state.js";
+import {
+  board, _scheduleDraw, _bumpMasksVersion,
+} from "./pg_state.js";
 
 /* ============================================================
    Mask entries
@@ -21,12 +42,17 @@ function _makeMaskEntry(b64, points, textPrompt, regionCanvas) {
     points: points ? points.map(p => ({ x: p.x, y: p.y, isPositive: p.isPositive })) : [],
     textPrompt: textPrompt != null ? textPrompt : "",
     regionCanvas: regionCanvas || null,
-    _regionEdgePoints: null,   // cached flat [x1,y1,x2,y2,...] of edge pixels
-    _regionChains: null,       // cached traced polylines for even dot spacing
+    _regionEdgePoints: null,
+    _regionChains: null,
     _pixels: null, _tinted: null, _tintedKey: null, _bbox: null,
   };
   img.onload = () => {
     entry.w = img.width; entry.h = img.height; entry.loaded = true;
+    _bumpMasksVersion();
+    _scheduleDraw();
+  };
+  img.onerror = () => {
+    _bumpMasksVersion();
     _scheduleDraw();
   };
   img.src = "data:image/png;base64," + b64;
@@ -42,13 +68,10 @@ export function setMasks(b64List) {
   board.freehandActive = false;
   board.freehandIsErase = false;
   board.regionStrokeActive = false;
+  _bumpMasksVersion();
   _scheduleDraw();
 }
 
-/* Append one mask to the existing stack. Used by the "import masks
-   from Krita" flow, which layers imported masks on top of whatever
-   is already present rather than replacing. Returns the new index so
-   a caller can select it. */
 export function addMaskFromB64(b64, options) {
   const opts = options || {};
   const entry = _makeMaskEntry(
@@ -58,6 +81,7 @@ export function addMaskFromB64(b64, options) {
     opts.regionCanvas || null,
   );
   board.masks.push(entry);
+  _bumpMasksVersion();
   _scheduleDraw();
   return board.masks.length - 1;
 }
@@ -68,6 +92,7 @@ export function replaceMaskAt(idx, b64, points) {
   const prevPoints = (points !== undefined) ? points : old.points;
   board.masks[idx] = _makeMaskEntry(b64, prevPoints, old.textPrompt, old.regionCanvas);
   board.hoveredMaskIdx = -1;
+  _bumpMasksVersion();
   _scheduleDraw();
 }
 
@@ -81,6 +106,7 @@ export function restoreMasks(maskSnapshots, selection) {
   board.freehandActive = false;
   board.freehandIsErase = false;
   board.regionStrokeActive = false;
+  _bumpMasksVersion();
   _scheduleDraw();
 }
 

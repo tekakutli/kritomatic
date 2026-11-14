@@ -4,7 +4,21 @@ This playground is segmentation-only: SAM3 detection, SAM2 refinement,
 region-constrained refinement, and mask export to Krita.  Inpainting
 lives in its own playground (`playgrounds/inpaint`); the Inpainting
 section, the inpaint button, and the inpaint context rectangle have been
-removed from this file along with the rest of the inpaint scaffolding."""
+removed from this file along with the rest of the inpaint scaffolding.
+
+OVERLAY CANVASES
+================
+`#regionCanvas` and `#overlayCanvas` are created dynamically by
+`pg_state.py`.  Their CSS lives here.  They sit above `#c`, have
+transparent backgrounds so the image shows through, and
+`pointer-events: none` so all mouse input still lands on `#c` where
+the event handlers are attached.
+
+`#regionCanvas` and `#overlayCanvas` selectors have higher
+specificity than the shared `canvas { … }` rule in
+`pgkit/styles.py`, so `background: transparent` wins over the
+shared `background: #0a0e14`.  Without that override each overlay
+would be opaque dark and hide the image layer entirely."""
 
 PG_CSS = r"""
   #ui button#runBtn {
@@ -75,12 +89,6 @@ PG_CSS = r"""
     background: rgba(140, 225, 160, 0.10);
     color: #d8ffe0;
   }
-
-  /* Export-option checkboxes next to the two Export buttons.
-     Small pill-shaped labels so they read as inline toggles rather
-     than separate form fields. Checked state uses the same accent
-     color as other interactive controls so the "on" state is
-     visually consistent with the rest of the panel. */
   .exportOpt {
     display: inline-flex; align-items: center; gap: 4px;
     font-size: 10px;
@@ -110,8 +118,6 @@ PG_CSS = r"""
     opacity: 0.55;
     cursor: not-allowed;
   }
-
-  /* Export to Krita */
   #ui button#kritaCheckBtn {
     border-color: rgba(140, 225, 160, 0.72);
     color: #b8ecff;
@@ -180,10 +186,6 @@ PG_CSS = r"""
     padding:4px 6px;outline:none;resize:vertical;
   }
 
-  /* Sub-header inside a section — small uppercase label that groups
-     related controls. Used to split "Edge cleanup", "Selection",
-     "Transparency mask", and "Extract" inside the Export to Krita
-     block. */
   .section-subhead {
     font-size: 9px;
     color: #5a6774;
@@ -304,6 +306,20 @@ PG_CSS = r"""
     font-size:9px; color:#3d4756; font-style:italic;
     margin: 4px 0 0;
     line-height: 1.45;
+  }
+
+  /* ---- overlay canvases (region + points/drafts/chrome) ----
+     Created dynamically by pg_state.py.  Sit above #c, transparent
+     so the image shows through, pointer-events:none so all mouse
+     input lands on #c.  Specificity (100) beats the shared
+     `canvas { … }` rule (1), so `background: transparent` wins. */
+  #regionCanvas,
+  #overlayCanvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    background: transparent;
+    pointer-events: none;
   }
 """
 

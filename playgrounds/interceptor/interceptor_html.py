@@ -1,8 +1,9 @@
 """Interceptor playground HTML assembly and module manifest.
 
-Small manifest: state, view, dispatch, client, panel_fields,
-panel_bindings.  No scrubs module — the interceptor's only editable
-input is the prompt textarea, which lives in panel_bindings.
+Small manifest: state, view, view_image, dispatch, client,
+panel_fields, panel_bindings.  No scrubs module — the interceptor's
+only editable input is the prompt textarea, which lives in
+panel_bindings.
 """
 
 import sys
@@ -10,6 +11,7 @@ import sys
 from .pg_base           import PG_CSS, PG_PANEL_BODY
 from .pg_state          import STATE_JS
 from .pg_view           import VIEW_JS
+from .pg_view_image     import VIEW_IMAGE_JS
 from .pg_dispatch       import DISPATCH_JS
 from .pg_client         import CLIENT_JS
 from .pg_panel_fields   import PANEL_FIELDS_JS
@@ -57,6 +59,7 @@ _MODULE_SOURCES = {
     **pgkit_modules(),
     "pg_state.js":           STATE_JS,
     "pg_view.js":            VIEW_JS,
+    "pg_view_image.js":      VIEW_IMAGE_JS,
     "pg_dispatch.js":        DISPATCH_JS,
     "pg_client.js":          CLIENT_JS,
     "pg_panel_fields.js":    PANEL_FIELDS_JS,

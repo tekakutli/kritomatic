@@ -1,16 +1,41 @@
 """Interceptor's panel body and CSS.
 
-The prompt is not shown as a text field; it is still registered as
-the `intercept.prompt` pgkit field.
+Sections: Tasks, Selected task, Canvas.
+
+The Selected task section shows the workflow name, params, crop
+bounds, and (if present) warnings from the daemon, plus the prompt
+textarea and the Run / Discard buttons.  After Run returns, the
+result line (pasted layers, timing) appears below the buttons.
+
+The Canvas section carries:
+  · the pan/zoom hint text,
+  · two opt-in overlay toggles.
+
+Overlay defaults
+================
+Both toggles default OFF.  The canvas is drawn as the raw prepared
+image the model will receive — no tint, no wash, no annotation.  This
+is the "raw image" the reviewer expects to see.
+
+When a toggle is on, the corresponding mask is tinted over the
+canvas:
+  · selection  → cyan at 45%   (what the model edits)
+  · context    → purple at 25% (what region the workflow crops to)
+
+Tinting is useful for verification — "yes, the mask is where I drew
+it" — but it obscures the raw image, so it is a review aid, not a
+default.  The cropped path's context mask is all-white (whole crop is
+context), so its tint is a full-frame wash; the toggle is there so a
+user who wants that view can opt into it, but they never see it
+unasked.
 
 CANVAS INTERACTION (hinted in the panel, implemented in
 `pg_dispatch.js`):
 
     wheel            zoom at cursor
-    drag empty       pan
+    drag             pan
     space + drag     pan
     middle drag      pan
-    drag edge handle add surrounding context
     Home / 0         reset view
 """
 
@@ -39,38 +64,6 @@ PG_CSS = r"""
   }
   #ui button#discardBtn:disabled {
     opacity: 0.4;
-    cursor: not-allowed;
-  }
-  #ui button#openKritaBtn,
-  #ui button#refreshKritaBtn {
-    border-color: rgba(140, 225, 160, 0.72);
-    color: #b8ecc8;
-  }
-  #ui button#openKritaBtn:hover:not(:disabled),
-  #ui button#refreshKritaBtn:hover:not(:disabled) {
-    border-color: rgba(160, 240, 180, 1.00);
-    background: rgba(140, 225, 160, 0.10);
-    color: #d8ffe0;
-  }
-  #ui button#openKritaBtn:disabled,
-  #ui button#refreshKritaBtn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
-  #ui button#resetExpansionBtn {
-    border-color: rgba(255, 200, 90, 0.55);
-    color: #ffd89b;
-    font-size: 9px;
-    padding: 2px 8px;
-    width: auto;
-  }
-  #ui button#resetExpansionBtn:hover:not(:disabled) {
-    border-color: rgba(255, 200, 90, 1.00);
-    background: rgba(255, 200, 90, 0.10);
-    color: #ffe6b8;
-  }
-  #ui button#resetExpansionBtn:disabled {
-    opacity: 0.35;
     cursor: not-allowed;
   }
 
@@ -122,18 +115,6 @@ PG_CSS = r"""
   .taskStatus.error     { color:#d48590; }
   .taskStatus.cancelled { color:#5a6774; }
 
-  #viewToggle {
-    font-size:10px; color:#5a6774;
-    margin:4px 0 4px;
-    display:none;
-  }
-  #viewToggle.visible { display:block; }
-  #viewToggle a {
-    color:#00e5ff; text-decoration:none; cursor:pointer;
-    border-bottom:1px dotted #00e5ff;
-  }
-  #viewToggle a:hover { color:#b8ecff; }
-
   #taskInfo {
     font-size:10px; color:#5a6774;
     line-height:1.5;
@@ -142,15 +123,71 @@ PG_CSS = r"""
     overflow-wrap: anywhere;
   }
 
-  #expansionInfo {
+  #taskPayload {
     font-size:10px;
     line-height:1.5;
     margin-bottom:6px;
     color:#7b8794;
     white-space: pre-line;
+    overflow-wrap: anywhere;
   }
-  #expansionInfo.active { color:#cbbdf5; }
-  #expansionInfo.warn   { color:#ffe600; }
+
+  #promptRow {
+    margin-top:8px;
+  }
+  .small-label {
+    font-size:9px;
+    color:#5a6774;
+    text-transform:uppercase;
+    letter-spacing:0.10em;
+    font-weight:700;
+    margin-bottom:4px;
+  }
+  #promptInput {
+    width:100%; box-sizing:border-box;
+    background:#0d1219; color:#00e5ff;
+    border:1px solid #223040;
+    border-radius:2px;
+    font-family:inherit; font-size:11px;
+    padding:4px 6px;
+    outline:none;
+    resize:vertical;
+    min-height: 34px;
+  }
+  #promptInput:focus { border-color:#00e5ff; }
+
+  #resultInfo {
+    font-size:10px;
+    line-height:1.5;
+    margin-top:6px;
+    color:#7b8794;
+    white-space: pre-line;
+    overflow-wrap: anywhere;
+  }
+  #resultInfo.ok  { color: #00e5ff; }
+  #resultInfo.err { color: #d48590; }
+
+  .overlayRow {
+    display: flex; align-items: center; gap: 12px;
+    font-size: 10px; color: #a8b5c4;
+    margin-top: 6px;
+  }
+  .overlayRow .label {
+    font-size: 9px;
+    color: #5a6774;
+    text-transform: uppercase;
+    letter-spacing: 0.10em;
+    font-weight: 700;
+  }
+  .overlayRow label.check {
+    display: flex; gap: 4px; align-items: center;
+    cursor: pointer;
+  }
+  .overlayRow input[type=checkbox] {
+    accent-color: #00e5ff;
+    margin: 0;
+    cursor: pointer;
+  }
 """
 
 PG_PANEL_BODY = r"""
@@ -165,29 +202,38 @@ PG_PANEL_BODY = r"""
       <summary>Selected task</summary>
       <div class="section-body">
         <div id="taskInfo">no task selected</div>
-        <div id="viewToggle">
-          <a id="toggleViewLink">show result</a>
+        <div id="taskPayload"></div>
+        <div id="promptRow">
+          <div class="small-label">Prompt</div>
+          <textarea id="promptInput" rows="2" spellcheck="false"
+                    placeholder="prompt override (blank = keep original)"
+          ></textarea>
         </div>
         <div class="row" style="margin-top:8px;">
           <button id="runBtn" disabled>Inpaint</button>
           <button id="discardBtn" disabled>Discard</button>
         </div>
+        <div id="resultInfo"></div>
       </div>
     </details>
 
     <details class="section" open>
-      <summary>Canvas context</summary>
+      <summary>Canvas</summary>
       <div class="section-body">
-        <div id="expansionInfo">
+        <div style="font-size:9px;color:#3d4756;margin-bottom:6px;
+                    line-height:1.5;">
           wheel: zoom  ·  drag: pan  ·  space+drag: pan
-          drag boundary handles outward to add context
         </div>
-        <div class="row">
-          <button id="openKritaBtn" disabled>Open in Krita</button>
-          <button id="refreshKritaBtn" disabled>Refresh from Krita</button>
-        </div>
-        <div class="row">
-          <button id="resetExpansionBtn" disabled>Reset expansion</button>
+        <div class="overlayRow">
+          <span class="label">Overlays</span>
+          <label class="check">
+            <input type="checkbox" id="showSelection">
+            selection
+          </label>
+          <label class="check">
+            <input type="checkbox" id="showContext">
+            context
+          </label>
         </div>
       </div>
     </details>

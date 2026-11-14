@@ -46,7 +46,17 @@ Cancel semantics
 ================
 Cancel targets this docker's own batch via `send_cancel_now`.
 Cancel-All targets every batch on the daemon (including external
-jobs registered by the inpaint playground).
+jobs registered by the inpaint playground and intercepted batches
+awaiting review in the interceptor playground).
+
+Intercept mode logging
+======================
+When `comfy_generate` runs with intercept mode on, it returns
+`{success: true, data: {intercepted: true, ...}}` before running
+any generation.  The `_on_command_completed` handler sees the
+flattened response — `intercepted: True` lives at the top level
+after the wire wrapper merges `data` — and logs a single "Run
+intercepted" line instead of the usual "Run done: N ok, M failed".
 
 Workflow hint text
 ==================
@@ -114,13 +124,6 @@ picker's option list, it enqueues one `comfy_load`.  The daemon's
 normal autoload of `panel_configs/<slug>.json` then restores the
 user's resources / params / crop / paste alongside the workflow.
 
-Why the decision happens in `_on_panel`, not `_on_conn_state`:
-the picker's option list lives in the panel description, not in
-`comfy_status`.  `_on_state` tells us whether a workflow is loaded
-(authoritative), but only the panel tells us which workflows can be
-loaded.  Deferring the trigger to `_on_panel` gets both signals from
-one place.
-
 Failure modes:
   * Daemon already has a workflow at startup — nothing fires (the
     `_description_workflow_name` check).  If it happens to match the
@@ -131,10 +134,6 @@ Failure modes:
     warn and skip; no phantom load error on the daemon.
   * Workflows directory empty (a freshly cloned repo before any
     workflow is dropped in) — silently skip.
-
-Runs at most once per docker lifetime via `_startup_autoload_done`.
-Clearing `QSettings`'s `last_workflow` (or removing the workflows
-directory entry) is how a user opts out.
 """
 
 from __future__ import annotations
@@ -701,6 +700,20 @@ class KritomaticPanel(QDockWidget):
 
         self._active_run_request_id = None
         self._running = False
+
+        # Intercept mode: comfy_generate returned early with
+        # `intercepted: True` in the response data.  The wire wrapper
+        # merges data's fields into the response dict, so we read it
+        # at the top level.  Nothing actually ran here — skip the
+        # "N ok, M failed" reporting.
+        if summary.get("intercepted"):
+            msg = summary.get("message") or "Run intercepted"
+            self._append_log(
+                "hdr",
+                msg + " \u2014 review in interceptor playground",
+            )
+            self._update_run_buttons()
+            return
 
         results = summary.get("results", []) or []
         cancelled_count = sum(

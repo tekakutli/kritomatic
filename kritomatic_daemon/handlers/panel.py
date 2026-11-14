@@ -10,7 +10,7 @@ Two config models
 =================
   * **Command fields** — carry a `set_command`; the docker sends the
     command on edit. Used for state the daemon owns (run options,
-    workflow picker).
+    workflow picker, intercept toggle).
 
   * **Config fields** — carry a `config_path` into the v2 config dict
     (resources/params/crop/paste). The docker watches these for edits
@@ -118,6 +118,25 @@ file sets them; they are just not exposed in the panel.
 `name` and `batch_mode` stay because they *can* matter the day a
 workflow produces more than one image per run (naming the pasted
 layers; choosing between stack-as-layers and import-as-animation).
+
+Intercept toggle
+================
+"Route via interceptor" lives in the **Run options** section,
+alongside timeout / count / seed — it is a run-time routing decision,
+so it belongs with the other per-run switches, not in its own
+section.
+
+The field has `set_command`, not `config_path`: the toggle is
+daemon-owned state, not a per-client display preference.  It is
+rendered only when the daemon reports an `intercept` block in
+`comfy_status` — older daemon builds without intercept mode simply
+hide it.  Because it is a `set_command` field, its edits are not
+included in `build_config_from_widgets` and therefore do not trigger
+the debounced `comfy_apply_config` path.  The daemon command
+(`comfy_set_intercept --enabled <bool>`) fires directly.
+
+The field's appearance does not depend on whether a workflow is
+loaded — a user can pre-configure the mode before their first Run.
 """
 
 from __future__ import annotations
@@ -309,6 +328,13 @@ class WorkflowMetadataProvider:
             fields.append({
                 "label": "Active batches",
                 "value": str(len(active_batches)),
+                "emphasis": "dim",
+            })
+        intercepted = status.get("intercepted_batches") or []
+        if intercepted:
+            fields.append({
+                "label": "Intercepted",
+                "value": str(len(intercepted)) + " pending",
                 "emphasis": "dim",
             })
         builder.add_section({
@@ -537,9 +563,20 @@ class PasteProvider:
 
 
 class RunOptionsProvider:
-    """Timeout, count, seed. Auto-commit via `panel_set_run_options`."""
+    """Timeout, count, seed — and the 'Route via interceptor' toggle.
+
+    Timeout / count / seed commit via `panel_set_run_options`; the
+    toggle commits via `comfy_set_intercept`.  All four are per-run
+    routing decisions, so they live in one section together.
+
+    The intercept toggle is rendered only when the daemon reports an
+    `intercept` block in `comfy_status` — an older daemon build
+    without intercept mode simply hides it.  See the module
+    docstring, "Intercept toggle".
+    """
 
     def contribute(self, builder, ctx):
+        status = ctx.get("comfy_status") or {}
         opts = (ctx.get("panel_state") or {}).get("run_options") or {}
         try:
             timeout = float(opts.get("timeout", 55.0))
@@ -550,47 +587,65 @@ class RunOptionsProvider:
         except (TypeError, ValueError):
             count = 1
         seed = opts.get("seed", "")
+
+        fields = [
+            {
+                "key": "run-timeout",
+                "label": "Timeout (s)",
+                "type": "number",
+                "value": timeout,
+                "min": 1.0, "max": 3600.0,
+                "set_command": {
+                    "type": "panel_set_run_options",
+                    "name": "timeout",
+                },
+                "arg_key": "value",
+            },
+            {
+                "key": "run-count",
+                "label": "Count",
+                "type": "integer",
+                "value": count,
+                "min": 1, "max": 64,
+                "set_command": {
+                    "type": "panel_set_run_options",
+                    "name": "count",
+                },
+                "arg_key": "value",
+            },
+            {
+                "key": "run-seed",
+                "label": "Seed (blank = auto)",
+                "type": "text",
+                "value": str(seed) if seed not in (None, "") else "",
+                "set_command": {
+                    "type": "panel_set_run_options",
+                    "name": "seed",
+                },
+                "arg_key": "value",
+            },
+        ]
+
+        # Intercept toggle — only when the daemon reports the feature.
+        # Placed last so the numeric run parameters stay grouped at the
+        # top; the toggle is the final "and where does this go?" switch
+        # before the Run button below.
+        intercept = status.get("intercept")
+        if isinstance(intercept, dict):
+            fields.append({
+                "key": "run-intercept",
+                "label": "Route via interceptor",
+                "type": "toggle",
+                "value": bool(intercept.get("enabled", False)),
+                "set_command": {"type": "comfy_set_intercept"},
+                "arg_key": "enabled",
+            })
+
         builder.add_section({
             "id": "run-options",
             "kind": "form",
             "title": "Run options",
-            "fields": [
-                {
-                    "key": "run-timeout",
-                    "label": "Timeout (s)",
-                    "type": "number",
-                    "value": timeout,
-                    "min": 1.0, "max": 3600.0,
-                    "set_command": {
-                        "type": "panel_set_run_options",
-                        "name": "timeout",
-                    },
-                    "arg_key": "value",
-                },
-                {
-                    "key": "run-count",
-                    "label": "Count",
-                    "type": "integer",
-                    "value": count,
-                    "min": 1, "max": 64,
-                    "set_command": {
-                        "type": "panel_set_run_options",
-                        "name": "count",
-                    },
-                    "arg_key": "value",
-                },
-                {
-                    "key": "run-seed",
-                    "label": "Seed (blank = auto)",
-                    "type": "text",
-                    "value": str(seed) if seed not in (None, "") else "",
-                    "set_command": {
-                        "type": "panel_set_run_options",
-                        "name": "seed",
-                    },
-                    "arg_key": "value",
-                },
-            ],
+            "fields": fields,
         })
 
 

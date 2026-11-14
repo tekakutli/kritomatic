@@ -2,13 +2,14 @@
 comfyui.py — the @command surface for driving ComfyUI from a bundle.
 
 The container. Owns the shared state (connection, active workflow,
-batch tracking, active panel config) and dispatches to six sub-handlers,
-each in its own file:
+batch tracking, active panel config, intercept mode) and dispatches to
+six sub-handlers, each in its own file:
 
     comfyui_connection   comfy_connect
     comfyui_workflow     comfy_load, comfy_list_workflows, recent aliases
     comfyui_config       comfy_apply_config, comfy_prepare_only
-    comfyui_generation   comfy_generate, cancel, paste, history
+    comfyui_generation   comfy_generate, cancel, paste, history,
+                         intercept mode (set/resume/discard/list)
     comfyui_status       comfy_status, comfy_batches
     comfyui_proxy        proxy install / start / stop / status / logs /
                          health / test / uninstall
@@ -41,6 +42,26 @@ State publishing
 command (success or failure), so subscribers to the event bus always
 see a current `active_batches` list. Sub-handlers do not publish;
 the container does, once, after the sub-handler returns.
+
+`_publish_state_change` reads `_compute_status_data` (a pure read of
+handler state, no sweep, no publish) rather than calling
+`comfy_status` itself.  That separation is what prevents a recursion
+between `_sweep_expired_intercepts` (which publishes when it removes
+something) and `_publish_state_change` (which used to call
+`comfy_status`, which itself sweeps and publishes).
+
+Intercept mode
+==============
+When `_intercept_enabled` is True, `comfy_generate` prepares the
+workflow, POSTs the prepared graph + blobs to the interceptor
+playground, and returns immediately with `intercepted: True` in the
+response data.  The interceptor queues the task for user review; the
+user clicks Run, and the interceptor calls
+`comfy_resume_intercepted`, which runs the submit/poll/download/paste
+half of generation against the prepared snapshot.
+
+See `_comfy_generate_intercepted` and `comfy_resume_intercepted` in
+`comfyui_generation.py` for the full protocol.
 
 Workflow activation
 ===================
@@ -80,11 +101,13 @@ silently rendering a form with no fields.
 from __future__ import annotations
 
 import threading
+import time
 from typing import Optional
 
 from ..decorators import AutoDispatchHandler
 from .comfyui_types import (
     _READ_ONLY_COMMANDS,
+    _load_intercept_config,
     _load_recent_aliases,
 )
 from .comfyui_inspect import (
@@ -114,6 +137,16 @@ class ComfyUIHandler(AutoDispatchHandler):
         # ---- batch tracking ----
         self._batches: dict = {}
         self._batches_lock = threading.Lock()
+
+        # ---- intercept mode ----
+        # Config-loaded at construction; updated by comfy_set_intercept.
+        # `_intercepted_batches` holds prepared-but-not-submitted
+        # workflows awaiting user review in the interceptor playground.
+        _cfg = _load_intercept_config()
+        self._intercept_enabled: bool = _cfg["enabled"]
+        self._intercept_url: str = _cfg["url"]
+        self._intercepted_batches: dict = {}
+        self._intercepted_lock = threading.Lock()
 
         # ---- active workflow ----
         self._active_workflow_name: Optional[str] = None
@@ -174,13 +207,45 @@ class ComfyUIHandler(AutoDispatchHandler):
         return result
 
     def _publish_state_change(self):
+        """Publish the current state as a `state` event.
+
+        Uses `_compute_status_data` directly (not `comfy_status`) so
+        this never recurses through `_sweep_expired_intercepts` →
+        `_publish_state_change` → `comfy_status` → sweep → publish.
+        The `state` event's `data` is exactly what `comfy_status`
+        would return, minus the sweep that a fresh read implies.
+        """
         try:
             from ..server.event_bus import get_event_bus
-            status = self._status_cmds.comfy_status({})
-            if isinstance(status, dict) and status.get("success"):
-                get_event_bus().publish("state", status.get("data", {}))
+            status_data = self._status_cmds._compute_status_data()
+            get_event_bus().publish("state", status_data)
         except Exception:
             pass
+
+    def _sweep_expired_intercepts(self) -> None:
+        """Remove expired InterceptedBatch records.
+
+        Called from status queries and command entry points.  Publishes
+        state only if something actually expired, so the common no-op
+        case pays nothing.
+
+        The publish uses `_publish_state_change` (which reads
+        `_compute_status_data` directly), so there is no recursion.
+        """
+        now = time.time()
+        expired_ids = []
+        with self._intercepted_lock:
+            for bid, rec in list(self._intercepted_batches.items()):
+                if rec.expiry_at <= now:
+                    expired_ids.append(bid)
+                    del self._intercepted_batches[bid]
+        if expired_ids:
+            print(
+                f"[comfyui] swept {len(expired_ids)} expired "
+                f"intercept(s)",
+                flush=True,
+            )
+            self._publish_state_change()
 
     def _populate_native_slots(self, graph: dict) -> None:
         """Extract and store the three native slot tables from `graph`.

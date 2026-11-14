@@ -1,5 +1,16 @@
-"""Panel sync: task list, selected task info, expansion status,
-button enable/disable state."""
+"""Panel sync: task list, selected-task details, prompt textarea,
+button enable/disable, result display.
+
+`syncPanelFields` is called every frame from `draw()`.  Every DOM
+write is guarded against the current value so a steady-state frame
+touches nothing.
+
+The prompt textarea is NOT written by `syncPanelFields` — that would
+stomp user input every frame.  `_selectTask` in
+`pg_panel_bindings.js` sets the textarea when the selection changes,
+using the per-task override if it exists or the payload's original
+prompt if not.
+"""
 
 PANEL_FIELDS_JS = r"""
 import { board } from "./pg_state.js";
@@ -8,16 +19,13 @@ let _els = null;
 function _get() {
   if (_els) return _els;
   _els = {
-    taskInfo:           document.getElementById("taskInfo"),
-    taskList:           document.getElementById("taskList"),
-    runBtn:             document.getElementById("runBtn"),
-    discardBtn:         document.getElementById("discardBtn"),
-    viewToggle:         document.getElementById("viewToggle"),
-    toggleViewLink:     document.getElementById("toggleViewLink"),
-    expansionInfo:      document.getElementById("expansionInfo"),
-    openKritaBtn:       document.getElementById("openKritaBtn"),
-    refreshKritaBtn:    document.getElementById("refreshKritaBtn"),
-    resetExpansionBtn:  document.getElementById("resetExpansionBtn"),
+    taskInfo:    document.getElementById("taskInfo"),
+    taskList:    document.getElementById("taskList"),
+    taskPayload: document.getElementById("taskPayload"),
+    promptInput: document.getElementById("promptInput"),
+    runBtn:      document.getElementById("runBtn"),
+    discardBtn:  document.getElementById("discardBtn"),
+    resultInfo:  document.getElementById("resultInfo"),
   };
   return _els;
 }
@@ -28,14 +36,11 @@ function _fmtAge(sec) {
   return Math.round(sec / 3600) + "h";
 }
 
-function _canExpand(item) {
-  if (!item || !item.payload) return false;
-  return (item.payload.output_rotation || 0) === 0;
-}
-
-function _hasExp() {
-  const e = board.expansion;
-  return e.left > 0 || e.top > 0 || e.right > 0 || e.bottom > 0;
+function _fmtParams(params) {
+  if (!params || typeof params !== "object") return "\u2014";
+  const keys = Object.keys(params).sort();
+  if (keys.length === 0) return "\u2014";
+  return keys.map(k => k + "=" + JSON.stringify(params[k])).join(", ");
 }
 
 let _taskListSig = null;
@@ -70,7 +75,7 @@ function _syncTaskList() {
 
     const label = document.createElement("span");
     label.className = "taskLabel";
-    label.textContent = (t.source_label || "task")
+    label.textContent = (t.workflow_name || t.source_label || "task")
                        + " \u00b7 " + _fmtAge(now - t.received_at);
     label.title = tid;
     row.appendChild(label);
@@ -90,39 +95,82 @@ function _syncTaskList() {
   }
 }
 
-let _expSig = null;
-function _syncExpansionInfo(item) {
+let _taskInfoSig = null;
+function _syncTaskInfo(item) {
   const e = _get();
-  if (!e.expansionInfo) return;
+  if (!e.taskInfo) return;
 
-  let text, cls = "";
+  let text;
   if (!item) {
     text = "no task selected";
-  } else if (!_canExpand(item)) {
-    text = "expansion disabled: source payload is rotated ("
-         + (item.payload.output_rotation || 0) + "\u00b0)";
-    cls = "warn";
-  } else if (_hasExp()) {
-    const exp = board.expansion;
-    text = "expansion  L:" + exp.left + "  T:" + exp.top
-         + "  R:" + exp.right + "  B:" + exp.bottom
-         + "   (drag handles to change)";
-    if (board.kritaDocumentName) {
-      text += "\nKrita doc: " + (board.kritaFileHint
-                                 || board.kritaDocumentName);
-    } else {
-      text += "\nnot yet opened in Krita";
-    }
-    cls = "active";
   } else {
-    text = "no expansion \u2014 drag a handle outward to add context";
+    const p = item.payload || {};
+    const lines = [
+      "workflow: " + (p.workflow_name || "?"),
+      "status:   " + item.status,
+      "id:       " + item.task_id,
+    ];
+    if (item.message) lines.push("message:  " + item.message);
+    text = lines.join("\n");
   }
+  if (text === _taskInfoSig) return;
+  _taskInfoSig = text;
+  e.taskInfo.textContent = text;
+}
 
+let _taskPayloadSig = null;
+function _syncTaskPayload(item) {
+  const e = _get();
+  if (!e.taskPayload) return;
+  let text = "";
+  if (item) {
+    const p = item.payload || {};
+    text = "params: " + _fmtParams(p.params);
+    if (p.crop_bounds) {
+      const cb = p.crop_bounds;
+      text += "\ncrop:   " + cb[2] + "\u00d7" + cb[3]
+            + " at (" + cb[0] + "," + cb[1] + ")"
+            + "  rotation: " + (p.output_rotation || 0) + "\u00b0";
+    }
+    const w = p.warnings || [];
+    if (w.length) {
+      text += "\nwarnings: " + w.join("; ");
+    }
+  }
+  if (text === _taskPayloadSig) return;
+  _taskPayloadSig = text;
+  e.taskPayload.textContent = text;
+}
+
+let _resultSig = null;
+function _syncResult(item) {
+  const e = _get();
+  if (!e.resultInfo) return;
+  let text = "", cls = "";
+  if (item && item.result) {
+    const r = item.result;
+    const layers = (r.layer_names || []).join(", ") || "(none)";
+    const timing = r.timing != null
+      ? (r.timing.toFixed ? r.timing.toFixed(2) : r.timing) + "s"
+      : "?";
+    text = "pasted " + (r.output_count || 0) + " layer(s) in " + timing
+         + "\n" + layers;
+    cls = "ok";
+  } else if (item && item.status === "error") {
+    text = "failed: " + (item.message || "unknown");
+    cls = "err";
+  } else if (item && item.status === "running") {
+    text = "inpainting\u2026";
+    cls = "";
+  } else if (item && item.status === "cancelled") {
+    text = "cancelled";
+    cls = "";
+  }
   const sig = text + "|" + cls;
-  if (sig === _expSig) return;
-  _expSig = sig;
-  e.expansionInfo.textContent = text;
-  e.expansionInfo.className = cls;
+  if (sig === _resultSig) return;
+  _resultSig = sig;
+  e.resultInfo.textContent = text;
+  e.resultInfo.className = cls;
 }
 
 export function syncPanelFields() {
@@ -131,45 +179,18 @@ export function syncPanelFields() {
   const item    = board.selectedItem;
 
   _syncTaskList();
+  _syncTaskInfo(item);
+  _syncTaskPayload(item);
+  _syncResult(item);
 
-  if (e.taskInfo) {
-    if (!summary) {
-      e.taskInfo.textContent = "no task selected";
-    } else {
-      const lines = [
-        "source: " + (summary.source_label || "?"),
-        "status: " + summary.status,
-        "id:     " + summary.task_id,
-      ];
-      if (item && item.message) lines.push("message: " + item.message);
-      e.taskInfo.textContent = lines.join("\n");
-    }
-  }
-
-  _syncExpansionInfo(item);
+  // The prompt textarea is NOT written here — see the module
+  // docstring.  It is set on task selection (in _selectTask) and
+  // updated by the textarea's own input handler.
 
   const status = summary ? summary.status : null;
-  const canRun      = status === "queued";
-  const canDiscard  = status === "queued";
-  const canReset    = !!item && _hasExp();
-
+  const canRun     = status === "queued";
+  const canDiscard = status === "queued";
   if (e.runBtn)     e.runBtn.disabled     = !canRun;
   if (e.discardBtn) e.discardBtn.disabled = !canDiscard;
-
-  const canOpenKrita    = !!item && !!board.expandedCanvasEl
-                        && _canExpand(item);
-  const canRefreshKrita = !!item && !!board.kritaDocumentName
-                        && _canExpand(item);
-  if (e.openKritaBtn)    e.openKritaBtn.disabled    = !canOpenKrita;
-  if (e.refreshKritaBtn) e.refreshKritaBtn.disabled = !canRefreshKrita;
-  if (e.resetExpansionBtn)
-    e.resetExpansionBtn.disabled = !canReset;
-
-  const hasResult = !!(item && item.result && item.result.image_b64);
-  if (e.viewToggle) e.viewToggle.classList.toggle("visible", hasResult);
-  if (e.toggleViewLink && hasResult) {
-    e.toggleViewLink.textContent = (board.view === "result")
-      ? "show input" : "show result";
-  }
 }
 """

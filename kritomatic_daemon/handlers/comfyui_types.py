@@ -4,8 +4,12 @@ Data shapes and path constants used across the handler tree:
 
   * `_BatchRecord` — live state of one `comfy_generate` call, or one
     externally-registered proxy job (playground inpaint).
-  * Path constants (`_WORKFLOW_DIR`, `_HISTORY_DIR`, `_RECENT_ALIASES_PATH`).
-  * Recent-alias persistence helpers — tiny, best-effort, swallowed.
+  * `InterceptedBatch` — a prepared-but-not-yet-submitted workflow
+    waiting in the interceptor playground for user review.
+  * Path constants (`_WORKFLOW_DIR`, `_HISTORY_DIR`,
+    `_RECENT_ALIASES_PATH`, `_INTERCEPT_CONFIG_PATH`).
+  * Recent-alias and intercept-config persistence helpers — tiny,
+    best-effort, swallowed.
 
 Nothing here mutates any state the handler tree owns; nothing here
 imports from the handler tree.
@@ -26,6 +30,14 @@ from typing import Optional
 
 _RECENT_ALIASES_CAP = 50
 
+# How long an InterceptedBatch survives between intake and resume.
+# Matches the old interceptor playground's GC window.  After this, the
+# daemon silently drops the record; a late `comfy_resume_intercepted`
+# returns "batch expired or unknown".
+INTERCEPT_TIMEOUT_SEC = 900
+
+_DEFAULT_INTERCEPT_URL = "http://127.0.0.1:8775/intercept/intake"
+
 
 _READ_ONLY_COMMANDS = frozenset({
     "comfy_status",
@@ -33,6 +45,7 @@ _READ_ONLY_COMMANDS = frozenset({
     "comfy_list_workflows",
     "comfy_history",
     "comfy_list_recent_aliases",
+    "comfy_list_intercepted",
     # Proxy diagnostics: read-only, must not trigger a state publish
     # (which would re-probe the proxy on every poll).
     "comfy_proxy_status",
@@ -55,6 +68,7 @@ _PANEL_DIR = _REPO_ROOT / "data" / "comfy_panel"
 _WORKFLOW_DIR = _PANEL_DIR / "workflows"
 _HISTORY_DIR = _PANEL_DIR / "history"
 _RECENT_ALIASES_PATH = _PANEL_DIR / "recent_aliases.json"
+_INTERCEPT_CONFIG_PATH = _PANEL_DIR / "intercept.json"
 
 _WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
 _HISTORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -85,6 +99,57 @@ def _save_recent_aliases(aliases: list) -> None:
         _RECENT_ALIASES_PATH.write_text(
             json.dumps(
                 {"version": 1, "recent_aliases": list(aliases)},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+# ============================================================================
+#  Intercept-config persistence
+# ============================================================================
+
+def _load_intercept_config() -> dict:
+    """Read `data/comfy_panel/intercept.json`, or return defaults.
+
+    Shape: `{"enabled": bool, "url": str}`.  A corrupt or missing file
+    produces the defaults (intercept off, default interceptor URL), so
+    the daemon is never left in a half-configured state by a
+    half-written config file.
+    """
+    default = {
+        "enabled": False,
+        "url": _DEFAULT_INTERCEPT_URL,
+    }
+    try:
+        if not _INTERCEPT_CONFIG_PATH.is_file():
+            return default
+        data = json.loads(
+            _INTERCEPT_CONFIG_PATH.read_text(encoding="utf-8")
+        )
+        if not isinstance(data, dict):
+            return default
+        return {
+            "enabled": bool(data.get("enabled", False)),
+            "url": str(data.get("url") or default["url"]),
+        }
+    except Exception:
+        return default
+
+
+def _save_intercept_config(enabled: bool, url: str) -> None:
+    """Persist the intercept toggle + URL.  Best-effort, swallowed."""
+    try:
+        _INTERCEPT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _INTERCEPT_CONFIG_PATH.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "enabled": bool(enabled),
+                    "url": str(url or _DEFAULT_INTERCEPT_URL),
+                },
                 indent=2,
             ),
             encoding="utf-8",
@@ -154,3 +219,71 @@ class _BatchRecord:
         # `active_batches` and `comfy_cancel` can see it, but does not
         # own its lifecycle.
         self.external_job_ids: list = []
+
+
+class InterceptedBatch:
+    """One prepared workflow waiting in the interceptor playground.
+
+    Created by `comfy_generate` in intercept mode after
+    `prepare_workflow` has run.  Held in
+    `ComfyUIHandler._intercepted_batches` until either:
+
+      * `comfy_resume_intercepted` pops it and runs the
+        submit/poll/download/paste half of generation, or
+      * `comfy_discard_intercepted` pops it without running, or
+      * it expires (`expiry_at <= now`) and a sweep removes it.
+
+    The prepared graph, blobs, and paste parameters are snapshotted at
+    creation time.  A config change in the docker between intercept
+    and resume does not affect the intercepted run.
+
+    `prompt_node_id` is the node in the prepared graph whose `value`
+    input the workflow's "prompt" Primitive writes.  None if the
+    workflow has no such slot; in that case `prompt_override` in the
+    resume command is a no-op and `comfy_resume_intercepted` logs a
+    warning instead of failing.
+
+    `canvas_b64`, `selection_b64`, `context_b64` are the raw PNG bytes
+    (base64-encoded for transport) of the three `@`-resources the
+    workflow will actually consume.  These are post-prepare: rotated
+    and cropped per `/crop_frame` when the inpaint playground was
+    active; raw when it wasn't.  They are exactly what the model sees,
+    which is what the interceptor should display.
+    """
+
+    def __init__(self, *,
+                 batch_id: str,
+                 workflow_name: str,
+                 prepared_graph: dict,
+                 prompt_node_id: Optional[str],
+                 prompt_original: str,
+                 crop_bounds: tuple,
+                 output_rotation: float,
+                 paste_config: dict,
+                 base_seed: int,
+                 seed: int,
+                 canvas_b64: str,
+                 selection_b64: str,
+                 context_b64: str,
+                 params_snapshot: dict,
+                 warnings: list,
+                 interceptor_url: str):
+        self.batch_id = batch_id
+        self.workflow_name = workflow_name
+        now = time.time()
+        self.created_at = now
+        self.expiry_at = now + INTERCEPT_TIMEOUT_SEC
+        self.prepared_graph = prepared_graph
+        self.prompt_node_id = prompt_node_id
+        self.prompt_original = prompt_original
+        self.crop_bounds = tuple(crop_bounds)
+        self.output_rotation = float(output_rotation)
+        self.paste_config = dict(paste_config)
+        self.base_seed = int(base_seed)
+        self.seed = int(seed)
+        self.canvas_b64 = canvas_b64 or ""
+        self.selection_b64 = selection_b64 or ""
+        self.context_b64 = context_b64 or ""
+        self.params_snapshot = dict(params_snapshot or {})
+        self.warnings = list(warnings or [])
+        self.interceptor_url = interceptor_url

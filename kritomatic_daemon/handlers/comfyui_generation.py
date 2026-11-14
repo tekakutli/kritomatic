@@ -28,24 +28,67 @@ The paste stage reads `prepared.rotation` (set by `prepare_workflow`).
     smaller vis canvas at offset `(diamond_x - doc_x0, diamond_y - doc_y0)`.
     Since `doc_x0 = max(0, diamond_x)` and `doc_y0 = max(0, diamond_y)`,
     those offsets are non-positive exactly when there is a left/top
-    clip, and 0 otherwise.  Using the opposite sign (`doc_x0 - diamond_x`)
-    shifts the content *down/right* by `2*|diamond_y|` (or `2*|diamond_x|`)
-    in the doc — a bug that only fires for top/left clips, matching
-    the "sometimes the paste is shifted" symptom.
+    clip, and 0 otherwise.  Using the opposite sign
+    (`doc_x0 - diamond_x`) shifts the content *down/right* by
+    `2*|diamond_y|` (or `2*|diamond_x|`) in the doc — a bug that only
+    fires for top/left clips, matching the "sometimes the paste is
+    shifted" symptom.
+
+INTERCEPT MODE
+==============
+When the daemon's `_intercept_enabled` flag is on (toggled by
+`comfy_set_intercept`), `comfy_generate` branches to
+`_comfy_generate_intercepted` instead of running the normal pipeline:
+
+    1. Prepare N workflows (one per count, each with its own seed).
+    2. For each: build an `InterceptedBatch` snapshot, POST it to the
+       interceptor playground's `/intercept/intake`, and register it
+       in `_intercepted_batches`.
+    3. Return immediately with `intercepted: True` and the batch ids.
+
+The interceptor queues the tasks for user review.  When the user
+clicks Run on a task, the interceptor calls `comfy_resume_intercepted`
+with the batch id and (optionally) a prompt override.  That command
+pops the record, applies the override in-place on the prepared
+graph, and runs the submit/poll/download/paste half of the normal
+pipeline against the snapshot.  See `comfy_resume_intercepted` below
+for the full flow.
+
+A batch that is not resumed within `INTERCEPT_TIMEOUT_SEC` (15 min)
+is swept by `ComfyUIHandler._sweep_expired_intercepts` and disappears
+from `active_batches`.  A `comfy_resume_intercepted` for such a batch
+returns "batch expired or unknown".
+
+A `comfy_cancel` for an intercepted batch pops it from
+`_intercepted_batches` and best-effort POSTs `/intercept/cancel` to
+the interceptor's URL sibling so the interceptor can drop its queued
+copy.  If the POST fails, the interceptor's next resume gets "batch
+expired or unknown" and marks the task as errored — same net effect.
 
 FILES
 =====
 `_paste_result` rotation branch: un-rotation math preserved; the
 clipping-to-doc + paste-at-visible-bounds logic is preserved; the only
 change vs. the previous version is the sign of the `drawImage` offset,
-which was inverted for top/left clip cases."""
+which was inverted for top/left clip cases.
+
+Intercept additions: `_comfy_generate_intercepted`,
+`_make_intercepted_batch`, `_post_intake`,
+`_notify_interceptor_cancel`, `_poll_job_for_resume`,
+`comfy_set_intercept`, `comfy_resume_intercepted`,
+`comfy_discard_intercepted`, `comfy_list_intercepted`.
+`comfy_cancel` was extended to also handle intercepted batches.
+"""
 
 from __future__ import annotations
 
 import base64
 import json
 import math
+import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,7 +109,12 @@ from ..utils.comfyui_proxy_client import (
     ProxyUnreachable,
     ProxyV2,
 )
-from .comfyui_types import _BatchRecord, _HISTORY_DIR
+from .comfyui_types import (
+    _BatchRecord,
+    _HISTORY_DIR,
+    InterceptedBatch,
+    INTERCEPT_TIMEOUT_SEC,
+)
 from .comfyui_document import (
     _check_color_mode,
     _get_live_active_document,
@@ -77,6 +125,16 @@ from .comfyui_document import (
 
 _POLL_MARGIN_S = 60.0
 _POLL_INTERVAL_S = 0.25
+
+# Timeout for the resume command's internal poll loop.  Longer than a
+# normal generate's --timeout because the interceptor user has just
+# clicked Run and there is no separate cancel path once the poll
+# starts.
+_RESUME_POLL_TIMEOUT_S = 180.0
+
+# Timeout for the intake POST.  The interceptor's intake handler is
+# lightweight (just queues the task); 5 s is generous.
+_INTAKE_TIMEOUT_S = 5.0
 
 
 class GenerationCommands(AutoDispatchHandler):
@@ -92,7 +150,10 @@ class GenerationCommands(AutoDispatchHandler):
     @command(
         category="comfyui",
         help_text="Run the active workflow via the v2 proxy. Requires "
-                  "comfy_apply_config to have been called.",
+                  "comfy_apply_config to have been called. When "
+                  "intercept mode is on, prepares the workflows and "
+                  "hands them to the interceptor playground without "
+                  "submitting.",
         args={
             "--timeout": {"type": "float", "default": 55.0},
             "--count":   {"type": "int",   "default": 1},
@@ -116,6 +177,7 @@ class GenerationCommands(AutoDispatchHandler):
     def _comfy_generate_impl(self, params):
         parent = self.parent
 
+        # ----- validate -----
         if parent._active_workflow_graph is None:
             return {"success": False,
                     "message": "No workflow loaded. Run comfy_load first."}
@@ -141,6 +203,7 @@ class GenerationCommands(AutoDispatchHandler):
             return {"success": False,
                     "message": f"proxy unavailable: {e}"}
 
+        # ----- parse common args -----
         requested_count = max(1, int(params.get("count", 1)))
         count = requested_count
         try:
@@ -161,6 +224,24 @@ class GenerationCommands(AutoDispatchHandler):
         batch_id = params.get("_batch_id") or str(uuid.uuid4())
         workflow_name = parent._active_workflow_name or "(unnamed)"
 
+        # ----- intercept branch -----
+        #
+        # `no_paste=True` bypasses intercept: the caller explicitly
+        # asked for raw images with no paste, which is not what an
+        # intercepted review produces.  Without this bypass, a
+        # no_paste caller with intercept on would get "intercepted"
+        # back and never see images.
+        if parent._intercept_enabled and not no_paste:
+            parent._sweep_expired_intercepts()
+            return self._comfy_generate_intercepted(
+                doc=doc,
+                proxy=proxy,
+                requested_count=requested_count,
+                base_seed=base_seed,
+                workflow_name=workflow_name,
+            )
+
+        # ----- normal path (unchanged) -----
         record = _BatchRecord(
             batch_id=batch_id,
             workflow_name=workflow_name,
@@ -478,6 +559,678 @@ class GenerationCommands(AutoDispatchHandler):
             parent._publish_state_change()
 
     # ------------------------------------------------------------------
+    #  Intercept mode — prepare + hand off
+    # ------------------------------------------------------------------
+
+    def _comfy_generate_intercepted(self, *, doc, proxy,
+                                    requested_count, base_seed,
+                                    workflow_name):
+        """Prepare N workflows and hand them to the interceptor.
+
+        Unlike the normal path, this method never enters `_batches`: it
+        builds `InterceptedBatch` records and stores them in
+        `_intercepted_batches` instead.  No poll loop runs here; the
+        interceptor's `comfy_resume_intercepted` runs the submit/poll/
+        download/paste half later, on the user's schedule.
+
+        Partial failures are tolerated.  A failed `prepare_workflow`
+        or `POST intake` for run i is recorded in `errors` and the
+        loop continues; the runs that succeeded are still handed to
+        the interceptor.  If every run fails, the call returns
+        `success: False`.
+
+        The `intercepted: True` marker lives inside `data`, not at
+        the response top level, because the wire wrapper merges
+        `data`'s fields into the response dict — a top-level `status`
+        would collide with the wrapper's own `status: "success"`.
+        """
+        parent = self.parent
+
+        has_seed_slot = "seed" in parent._active_workflow_param_slots
+        if requested_count > 1 and not has_seed_slot:
+            count = 1
+            warnings_list = [
+                f"count={requested_count} clamped to 1: the workflow "
+                f"has no Primitive titled 'seed'."
+            ]
+        else:
+            count = requested_count
+            warnings_list = []
+
+        intercepted_ids: list = []
+        errors: list = []
+
+        for i in range(count):
+            seed_i = (base_seed + i) & 0xFFFFFFFF
+            print(
+                f"[comfyui] intercept {i + 1}/{count}: preparing "
+                f"seed {seed_i}", flush=True,
+            )
+
+            try:
+                prepared = prepare_workflow(
+                    doc,
+                    parent._active_workflow_graph,
+                    parent._active_workflow_resource_slots,
+                    parent._active_workflow_param_slots,
+                    parent._active_config,
+                    proxy,
+                    seed=seed_i,
+                )
+            except ValueError as e:
+                errors.append(f"prepare[{i}]: {e}")
+                continue
+
+            blobs = prepared.blobs or {}
+            if "@thecanvas" not in blobs:
+                errors.append(
+                    f"prepare[{i}]: workflow has no @thecanvas; "
+                    f"intercept mode cannot display anything to review. "
+                    f"Turn off intercept mode for this workflow."
+                )
+                continue
+
+            try:
+                record = self._make_intercepted_batch(
+                    index=i,
+                    count=count,
+                    workflow_name=workflow_name,
+                    prepared=prepared,
+                    seed=seed_i,
+                    base_seed=base_seed,
+                )
+            except Exception as e:
+                errors.append(f"batch_build[{i}]: {e}")
+                continue
+
+            ok, err = self._post_intake(record)
+            if not ok:
+                # The record never reached the interceptor; nothing can
+                # resume it.  Drop it and record the error.
+                errors.append(f"intake[{i}]: {err}")
+                continue
+
+            with parent._intercepted_lock:
+                parent._intercepted_batches[record.batch_id] = record
+            intercepted_ids.append(record.batch_id)
+
+        if intercepted_ids:
+            parent._publish_state_change()
+
+        if not intercepted_ids:
+            msg = "All intercept attempts failed"
+            if warnings_list:
+                msg += "; " + "; ".join(warnings_list)
+            if errors:
+                msg += "; " + "; ".join(errors)
+            return {
+                "success": False,
+                "message": msg,
+                "data": {
+                    "intercepted": False,
+                    "errors": errors,
+                    "warnings": warnings_list,
+                },
+            }
+
+        msg = (f"Intercepted {len(intercepted_ids)} of "
+               f"{requested_count} run(s) at {parent._intercept_url}")
+        combined = list(warnings_list) + list(errors)
+        if combined:
+            msg += " \u2014 " + "; ".join(combined)
+
+        return {
+            "success": True,
+            "message": msg,
+            "data": {
+                "intercepted": True,
+                "batch_ids": intercepted_ids,
+                "count": len(intercepted_ids),
+                "requested_count": requested_count,
+                "interceptor_url": parent._intercept_url,
+                "warnings": warnings_list,
+                "errors": errors,
+            },
+        }
+
+    def _make_intercepted_batch(self, *, index, count, workflow_name,
+                                prepared, seed, base_seed):
+        """Build one InterceptedBatch from a prepared workflow.
+
+        Snapshots everything the resume path will need: the prepared
+        graph (for submit), crop bounds + paste config + rotation (for
+        paste), the prompt node id (for the override), and the three
+        `@`-resource blobs (for display in the interceptor's canvas).
+        """
+        parent = self.parent
+
+        # batch_id: suffix per-run index when count > 1 so ids are
+        # distinct across runs of the same comfy_generate call.
+        token = uuid.uuid4().hex[:12]
+        batch_id = (
+            f"intercept_{token}"
+            if count == 1 else
+            f"intercept_{token}_{index}"
+        )
+
+        # Resolve the prompt node.  The workflow's `prompt` Primitive
+        # slot, if it has one, is where the override goes.
+        prompt_slot = parent._active_workflow_param_slots.get("prompt") or {}
+        prompt_node_id = prompt_slot.get("node_id")
+        prompt_original = ""
+        if prompt_node_id:
+            node = prepared.graph.get(prompt_node_id) or {}
+            v = (node.get("inputs") or {}).get("value", "")
+            prompt_original = str(v) if v is not None else ""
+
+        # Pull the three resource blobs.  Missing keys become empty
+        # strings on the wire; the interceptor handles that gracefully
+        # (shows a placeholder) but we already refused to intercept
+        # without @thecanvas, so the canvas will always be present.
+        blobs = prepared.blobs or {}
+        canvas_bytes = blobs.get("@thecanvas", b"")
+        sel_bytes = blobs.get("@theselection", b"")
+        ctx_bytes = blobs.get("@thecontext", b"")
+
+        def _b64(b: bytes) -> str:
+            return base64.b64encode(b).decode("ascii") if b else ""
+
+        warnings = list(prepared.warnings or [])
+        if not prompt_node_id:
+            warnings.append(
+                "workflow has no 'prompt' Primitive slot; the interceptor "
+                "prompt override will have no effect."
+            )
+
+        return InterceptedBatch(
+            batch_id=batch_id,
+            workflow_name=workflow_name,
+            prepared_graph=prepared.graph,
+            prompt_node_id=prompt_node_id,
+            prompt_original=prompt_original,
+            crop_bounds=tuple(prepared.crop_bounds),
+            output_rotation=float(prepared.rotation),
+            paste_config=dict(parent._active_config["paste"]),
+            base_seed=int(base_seed),
+            seed=int(seed),
+            canvas_b64=_b64(canvas_bytes),
+            selection_b64=_b64(sel_bytes),
+            context_b64=_b64(ctx_bytes),
+            params_snapshot=dict(parent._active_config.get("params") or {}),
+            warnings=warnings,
+            interceptor_url=parent._intercept_url,
+        )
+
+    def _post_intake(self, record):
+        """POST one InterceptedBatch to the interceptor's intake endpoint.
+
+        Returns `(ok, error_message)`.  On success `error_message` is
+        an empty string.  Any failure (connection refused, timeout,
+        non-JSON body, `{success: false}` response) is returned as
+        `(False, reason)` so the caller can accumulate it in the
+        batch-level errors list.
+        """
+        url = record.interceptor_url
+        body = {
+            "task_id": record.batch_id,
+            "source_label": record.workflow_name,
+            "payload": {
+                "canvas_b64":      record.canvas_b64,
+                "selection_b64":   record.selection_b64,
+                "context_b64":     record.context_b64,
+                "prompt":          record.prompt_original,
+                "workflow_name":   record.workflow_name,
+                "params":          record.params_snapshot,
+                "crop_bounds":     list(record.crop_bounds),
+                "output_rotation": record.output_rotation,
+                "warnings":        list(record.warnings),
+            },
+        }
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(
+                req, timeout=_INTAKE_TIMEOUT_S,
+            ) as r:
+                raw = r.read()
+            parsed = json.loads(raw) if raw else {}
+        except urllib.error.URLError as e:
+            return False, f"unreachable: {e.reason}"
+        except OSError as e:
+            return False, f"io error: {e}"
+        except ValueError as e:
+            return False, f"bad response: {e}"
+
+        if not isinstance(parsed, dict):
+            return False, "response not an object"
+        if not parsed.get("success", False):
+            return False, str(
+                parsed.get("message") or "rejected by interceptor"
+            )
+        return True, ""
+
+    def _notify_interceptor_cancel(self, url: str,
+                                   batch_id: Optional[str]) -> None:
+        """Best-effort POST to the interceptor's `/cancel` sibling.
+
+        Called by `comfy_cancel` when it drops an intercepted batch, so
+        the interceptor's own task list can mark the item cancelled
+        before the user tries to run it and gets "batch expired or
+        unknown".  Failure is swallowed: the interceptor's resume path
+        handles a missing batch gracefully.
+
+        The sibling URL is derived by replacing the intake endpoint's
+        last path component (`intake` → `cancel`).  If the URL doesn't
+        end in `/intake`, we fall back to `/intercept/cancel` relative
+        to the origin.
+        """
+        if not url:
+            return
+        cancel_url = None
+        try:
+            from urllib.parse import urlparse, urlunparse
+            p = urlparse(url)
+            path_parts = p.path.rstrip("/").rsplit("/", 1)
+            if len(path_parts) == 2 and path_parts[1] == "intake":
+                cancel_url = urlunparse(
+                    p._replace(path=path_parts[0] + "/cancel")
+                )
+            else:
+                # Fallback: replace the last component unconditionally.
+                if len(path_parts) == 2:
+                    cancel_url = urlunparse(
+                        p._replace(path=path_parts[0] + "/cancel")
+                    )
+                else:
+                    cancel_url = urlunparse(
+                        p._replace(path="/intercept/cancel")
+                    )
+        except Exception:
+            return
+
+        body: dict = {}
+        if batch_id:
+            body["task_id"] = batch_id
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            cancel_url, data=data, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5.0) as r:
+                r.read()
+        except Exception as e:
+            print(
+                f"[comfyui] interceptor cancel notify "
+                f"({cancel_url}) failed: {e}",
+                flush=True,
+            )
+
+    # ------------------------------------------------------------------
+    #  comfy_set_intercept
+    # ------------------------------------------------------------------
+
+    @command(
+        category="comfyui",
+        help_text="Enable or disable interceptor routing of "
+                  "comfy_generate. When enabled, comfy_generate "
+                  "prepares the workflow and hands it to the "
+                  "interceptor playground; the interceptor resumes "
+                  "generation when the user clicks Run. Pass only "
+                  "--url to change the URL without touching the "
+                  "enabled flag.",
+        args={
+            "--enabled": {"type": "bool", "default": None,
+                          "help": "True to enable, False to disable. "
+                                  "Omit to leave unchanged."},
+            "--url":     {"type": "str", "default": None,
+                          "help": "Interceptor intake URL. Omit to "
+                                  "leave unchanged."},
+        },
+    )
+    def comfy_set_intercept(self, enabled=None, url=None):
+        from .comfyui_types import _save_intercept_config
+
+        parent = self.parent
+        changed = False
+        if enabled is not None:
+            parent._intercept_enabled = bool(enabled)
+            changed = True
+        if url is not None:
+            parent._intercept_url = str(url)
+            changed = True
+        if changed:
+            _save_intercept_config(
+                parent._intercept_enabled, parent._intercept_url,
+            )
+
+        state = "enabled" if parent._intercept_enabled else "disabled"
+        return {
+            "success": True,
+            "message": (
+                f"intercept {state}; url={parent._intercept_url}"
+            ),
+            "data": {
+                "enabled": parent._intercept_enabled,
+                "url": parent._intercept_url,
+            },
+        }
+
+    # ------------------------------------------------------------------
+    #  comfy_resume_intercepted
+    # ------------------------------------------------------------------
+
+    @command(
+        category="comfyui",
+        help_text="Resume an intercepted batch: apply the prompt "
+                  "override (if any) in-place on the prepared graph, "
+                  "then submit / poll / download / paste. Returns the "
+                  "same shape as comfy_generate's success path. The "
+                  "batch record is removed from the daemon on entry — "
+                  "a second call on the same batch_id returns "
+                  "'expired or unknown'.",
+        args={
+            "--batch_id":         {"type": "str", "required": True,
+                                   "help": "batch id from the intake "
+                                           "response."},
+            "--prompt_override":  {"type": "str", "default": None,
+                                   "help": "New prompt to substitute "
+                                           "into the workflow's "
+                                           "'prompt' Primitive. "
+                                           "No-op if the workflow has "
+                                           "no such slot."},
+        },
+    )
+    def comfy_resume_intercepted(self, batch_id,
+                                 prompt_override=None):
+        parent = self.parent
+
+        # Sweep first so an expired record cannot be resumed.
+        parent._sweep_expired_intercepts()
+
+        with parent._intercepted_lock:
+            record = parent._intercepted_batches.pop(batch_id, None)
+        if record is None:
+            return {
+                "success": False,
+                "message": (
+                    f"batch {batch_id!r} expired or unknown"
+                ),
+            }
+
+        # Apply the prompt override in-place on the prepared graph.
+        # We mutate the graph dict rather than re-running
+        # `substitute_into_graph` because the graph has already been
+        # substituted with asset refs and param values; only the prompt
+        # node's `value` needs updating, and its node id is recorded.
+        prompt_override_applied = False
+        if prompt_override is not None:
+            if record.prompt_node_id:
+                node = record.prepared_graph.get(record.prompt_node_id)
+                if node is not None and "inputs" in node:
+                    node["inputs"]["value"] = str(prompt_override)
+                    prompt_override_applied = True
+            # If no prompt slot, silently keep the original.  The
+            # record already warns about this; surfacing it in the
+            # response too is useful for CLI users.
+
+        # Notify the docker the batch is gone from the review queue.
+        parent._publish_state_change()
+
+        # ---- resolve resources for the resume ----
+        try:
+            proxy = ProxyV2.from_pid_file()
+        except (ProxyUnreachable, ImportError) as e:
+            return {"success": False,
+                    "message": f"proxy unavailable: {e}"}
+
+        doc = _get_live_active_document()
+        if doc is None:
+            return {"success": False,
+                    "message": "No active document in Krita"}
+        ok, msg = _check_color_mode(doc)
+        if not ok:
+            return {"success": False, "message": msg}
+
+        started = time.time()
+
+        # ---- submit ----
+        try:
+            job = proxy.submit_job(record.prepared_graph)
+        except ProxyHTTPError as e:
+            return {
+                "success": False,
+                "message": f"submit failed: {e} (code={e.code})",
+                "data": {
+                    "batch_id": record.batch_id,
+                    "prompt_override_applied": prompt_override_applied,
+                },
+            }
+        except ProxyUnreachable as e:
+            return {
+                "success": False,
+                "message": f"submit failed: {e}",
+                "data": {
+                    "batch_id": record.batch_id,
+                    "prompt_override_applied": prompt_override_applied,
+                },
+            }
+
+        job_id = job["id"]
+
+        # ---- poll ----
+        terminal = self._poll_job_for_resume(
+            proxy, job_id, timeout=_RESUME_POLL_TIMEOUT_S,
+        )
+        if terminal is None:
+            return {
+                "success": False,
+                "message": "poll timed out",
+                "data": {
+                    "batch_id": record.batch_id,
+                    "job_id": job_id,
+                },
+            }
+
+        status = terminal.get("status")
+        if status != "succeeded":
+            err = (terminal.get("error") or {}).get("message") or status
+            return {
+                "success": False,
+                "message": f"job {status}: {err}",
+                "data": {
+                    "batch_id": record.batch_id,
+                    "job_id": job_id,
+                    "status": status,
+                },
+            }
+
+        # ---- download ----
+        downloaded = self._download_outputs(proxy, terminal)
+        if not downloaded:
+            return {
+                "success": False,
+                "message": "job succeeded but produced no "
+                           "retrievable outputs",
+                "data": {
+                    "batch_id": record.batch_id,
+                    "job_id": job_id,
+                },
+            }
+
+        # ---- paste ----
+        #
+        # The seed suffix is used only when the batch had multiple
+        # runs.  We stored both base_seed and per-run seed on the
+        # record, so a mismatch means this was a multi-run batch and
+        # the layer name should be disambiguated.
+        seed_suffix = (
+            record.seed if record.base_seed != record.seed else None
+        )
+
+        try:
+            paste_result = self._paste_result(
+                doc,
+                downloaded,
+                crop_bounds=record.crop_bounds,
+                paste_config=record.paste_config,
+                job_id=job_id,
+                seed_suffix=seed_suffix,
+                output_rotation=record.output_rotation,
+            )
+        except Exception as e:
+            import traceback
+            print("[comfyui] resume paste raised:", flush=True)
+            traceback.print_exc()
+            return {
+                "success": False,
+                "message": f"paste raised: {e}",
+                "data": {
+                    "batch_id": record.batch_id,
+                    "job_id": job_id,
+                },
+            }
+
+        if not paste_result.get("success"):
+            return paste_result
+
+        pdata = paste_result.get("data") or {}
+        elapsed = time.time() - started
+
+        return {
+            "success": True,
+            "message": paste_result.get("message") or "Pasted",
+            "data": {
+                "batch_id": record.batch_id,
+                "job_id": job_id,
+                "workflow": record.workflow_name,
+                "layer_names": list(pdata.get("layer_names") or []),
+                "output_count": int(pdata.get("output_count", 0)),
+                "image_count": len(downloaded),
+                "timing": round(elapsed, 3),
+                "prompt_override_applied": prompt_override_applied,
+            },
+        }
+
+    def _poll_job_for_resume(self, proxy, job_id, *,
+                             timeout: float) -> Optional[dict]:
+        """Poll one proxy job to terminal.  Standalone helper for the
+        resume path (no `_BatchRecord` available — the resume runs
+        outside a batch)."""
+        deadline = time.monotonic() + timeout
+        last_error: Optional[str] = None
+
+        while time.monotonic() < deadline:
+            try:
+                job = proxy.get_job(job_id)
+            except ProxyUnreachable as e:
+                last_error = str(e)
+                time.sleep(_POLL_INTERVAL_S)
+                continue
+            except ProxyHTTPError as e:
+                if e.status == 404:
+                    return {
+                        "id": job_id,
+                        "status": "expired",
+                        "outputs": [],
+                        "error": {
+                            "code": "not_found",
+                            "message": "job unknown to proxy",
+                        },
+                    }
+                last_error = str(e)
+                time.sleep(_POLL_INTERVAL_S)
+                continue
+
+            status = job.get("status")
+            if status in ("succeeded", "failed", "canceled", "expired"):
+                return job
+
+            time.sleep(_POLL_INTERVAL_S)
+
+        if last_error:
+            print(
+                f"[comfyui] resume poll {job_id[:8]} timed out; "
+                f"last error: {last_error}",
+                flush=True,
+            )
+        return None
+
+    # ------------------------------------------------------------------
+    #  comfy_discard_intercepted
+    # ------------------------------------------------------------------
+
+    @command(
+        category="comfyui",
+        help_text="Discard an intercepted batch without running it. "
+                  "Idempotent; returns success even if the batch was "
+                  "already gone.",
+        args={
+            "--batch_id": {"type": "str", "required": True},
+        },
+    )
+    def comfy_discard_intercepted(self, batch_id):
+        parent = self.parent
+        parent._sweep_expired_intercepts()
+
+        with parent._intercepted_lock:
+            existed = (
+                parent._intercepted_batches.pop(batch_id, None)
+                is not None
+            )
+
+        if existed:
+            return {
+                "success": True,
+                "message": f"discarded {batch_id!r}",
+                "data": {"batch_id": batch_id, "discarded": True},
+            }
+        return {
+            "success": True,
+            "message": f"batch {batch_id!r} was already gone",
+            "data": {"batch_id": batch_id, "discarded": False},
+        }
+
+    # ------------------------------------------------------------------
+    #  comfy_list_intercepted
+    # ------------------------------------------------------------------
+
+    @command(
+        category="comfyui",
+        help_text="List intercepted batches currently awaiting review.",
+        args={},
+    )
+    def comfy_list_intercepted(self, params):
+        parent = self.parent
+        parent._sweep_expired_intercepts()
+
+        with parent._intercepted_lock:
+            entries = [
+                {
+                    "batch_id":      r.batch_id,
+                    "workflow_name": r.workflow_name,
+                    "created_at":    r.created_at,
+                    "expiry_at":     r.expiry_at,
+                    "interceptor_url": r.interceptor_url,
+                }
+                for r in parent._intercepted_batches.values()
+            ]
+        entries.sort(key=lambda e: e["created_at"])
+
+        return {
+            "success": True,
+            "message": f"{len(entries)} intercepted batch(es)",
+            "data": {
+                "batches": entries,
+                "interceptor_url": parent._intercept_url,
+                "enabled": parent._intercept_enabled,
+            },
+        }
+
+    # ------------------------------------------------------------------
     #  Poll
     # ------------------------------------------------------------------
 
@@ -555,7 +1308,8 @@ class GenerationCommands(AutoDispatchHandler):
 
     @command(
         category="comfyui",
-        help_text="Cancel one or more running batches.",
+        help_text="Cancel one or more running batches, including "
+                  "intercepted batches awaiting review.",
         args={
             "--batch_id": {"type": "str", "required": False},
         },
@@ -564,14 +1318,63 @@ class GenerationCommands(AutoDispatchHandler):
         parent = self.parent
         batch_id = params.get("batch_id") or None
 
+        # ---- intercepted batches first ----
+        #
+        # Cancelling an intercepted batch means dropping the record
+        # and best-effort POSTing /intercept/cancel to the interceptor
+        # so the interceptor's queued task is marked cancelled before
+        # the user tries to run it.  We do this before touching
+        # `_batches` so a batch_id that names an intercepted record
+        # gets the correct treatment even if a same-named internal
+        # record also exists (it shouldn't, but this is the
+        # least-surprise ordering).
+        intercepted_url_to_notify: Optional[str] = None
+        intercepted_ids_cancelled: list = []
+
+        with parent._intercepted_lock:
+            if batch_id:
+                record = parent._intercepted_batches.pop(batch_id, None)
+                if record is not None:
+                    intercepted_url_to_notify = record.interceptor_url
+                    intercepted_ids_cancelled.append(record.batch_id)
+            else:
+                for bid, rec in list(
+                    parent._intercepted_batches.items()
+                ):
+                    intercepted_url_to_notify = rec.interceptor_url
+                    intercepted_ids_cancelled.append(bid)
+                    del parent._intercepted_batches[bid]
+
+        if intercepted_ids_cancelled:
+            # One notify per batch_id (or one nil-batch_id broadcast
+            # for cancel-all).
+            threading.Thread(
+                target=self._notify_interceptor_cancel,
+                args=(intercepted_url_to_notify,
+                      batch_id if batch_id else None),
+                daemon=True,
+            ).start()
+
+        # ---- internal / external batches ----
         with parent._batches_lock:
             if batch_id:
                 record = parent._batches.get(batch_id)
                 if record is None:
+                    # Only intercepted hits so far? Success.
+                    if intercepted_ids_cancelled:
+                        return {
+                            "success": True,
+                            "message": (
+                                f"Cancel requested for intercepted "
+                                f"batch {batch_id}"
+                            ),
+                            "data": {
+                                "batches": intercepted_ids_cancelled,
+                            },
+                        }
                     return {
                         "success": False,
-                        "message": (f"No active batch with id "
-                                    f"{batch_id!r}"),
+                        "message": f"No active batch with id {batch_id!r}",
                         "data": {
                             "active_batches": sorted(
                                 parent._batches.keys()
@@ -582,10 +1385,12 @@ class GenerationCommands(AutoDispatchHandler):
             else:
                 records = list(parent._batches.values())
 
-        if not records:
-            return {"success": True,
-                    "message": "Cancel requested (nothing was running)",
-                    "data": {"batches": []}}
+        if not records and not intercepted_ids_cancelled:
+            return {
+                "success": True,
+                "message": "Cancel requested (nothing was running)",
+                "data": {"batches": []},
+            }
 
         for r in records:
             external_ids = getattr(r, "external_job_ids", None) or []
@@ -603,14 +1408,24 @@ class GenerationCommands(AutoDispatchHandler):
                 r.cancel_event.set()
 
         active_ids = sorted(r.batch_id for r in records)
+        all_ids = active_ids + intercepted_ids_cancelled
         if batch_id:
             msg = f"Cancel requested for batch {batch_id}"
         else:
-            msg = f"Cancel requested for {len(records)} batch(es)"
+            msg = (
+                f"Cancel requested for {len(all_ids)} batch(es)"
+                + (
+                    f" ({len(intercepted_ids_cancelled)} intercepted)"
+                    if intercepted_ids_cancelled else ""
+                )
+            )
         return {
             "success": True,
             "message": msg,
-            "data": {"batches": active_ids},
+            "data": {
+                "batches": all_ids,
+                "intercepted": intercepted_ids_cancelled,
+            },
         }
 
     # ------------------------------------------------------------------

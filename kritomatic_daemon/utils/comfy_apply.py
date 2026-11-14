@@ -41,7 +41,18 @@ region rendered as transparent (canvas) / black (mask).  The
 `_extend_and_crop` helper draws the rotated image at a negative
 offset into a `cropW×cropH` blank image; QPainter clips the
 negative coordinates so the parts of the crop outside the frame
-stay transparent."""
+stay transparent.
+
+BLOBS
+=====
+`PreparedWorkflow.blobs` is populated with the raw PNG bytes of every
+resource the workflow will consume.  It exists so the interceptor
+playground can display exactly what the model sees: the rotated +
+cropped canvas, selection, and context for a theta≠0 prepare, and the
+raw un-rotated blobs for a legacy prepare.  Callers that do not use
+intercept mode ignore it; it costs nothing extra — the blobs are the
+same bytes `_upload_resource_blobs` just PUT to the proxy.
+"""
 
 from __future__ import annotations
 
@@ -78,6 +89,11 @@ class PreparedWorkflow:
     seed_applied: Optional[int]
     warnings: list[str] = field(default_factory=list)
     rotation: float = 0.0
+    # Raw PNG bytes for every `@`-resource the workflow will consume.
+    # Populated for both the un-rotated and cropped paths.  Used by
+    # the interceptor playground to display exactly what the model
+    # sees; ignored by callers that do not intercept.
+    blobs: dict[str, bytes] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +208,7 @@ def _prepare_unrotated(doc, graph, resource_slots, param_slots,
         ),
         warnings=warnings,
         rotation=0.0,
+        blobs={name: enc.data for name, enc in blobs.items()},
     )
 
 
@@ -304,6 +321,7 @@ def _prepare_cropped(doc, graph, resource_slots, param_slots,
         ),
         warnings=warnings,
         rotation=theta,
+        blobs={name: enc.data for name, enc in blobs.items()},
     )
 
 

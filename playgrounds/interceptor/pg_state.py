@@ -1,5 +1,5 @@
-"""Interceptor state: board dict, view transform, canvas, draw
-scheduling, image cache.
+"""Interceptor state: board, view transform, canvas, draw scheduling,
+image cache.
 
 Leaf module.  Every other interceptor module imports from here and
 nothing here imports any of them.
@@ -7,43 +7,35 @@ nothing here imports any of them.
 VIEW
 ====
 `view = { zoom, offsetX, offsetY }` is the display transform.
-`zoom` is *absolute* — screen pixels per canvas pixel, not a fit
-multiplier.  At `zoom = 1` the canvas is drawn 1:1.  `offsetX,
-offsetY` is the screen position of the *inner image's* top-left
-corner.  The expanded frame draws at
-`(offsetX - exp.left * zoom, offsetY - exp.top * zoom)`; the inner
-image is the stable reference point that expansion pivots around.
+`zoom` is *absolute* — screen pixels per canvas pixel.  At `zoom = 1`
+the canvas is drawn 1:1.  `offsetX, offsetY` is the screen position
+of the canvas's top-left corner.
 
-This absolute-scale model is what makes the boundary drag feel
-right: expanding the frame doesn't touch `zoom`, so the image
-doesn't shrink.  It also makes zoom-at-cursor exact — the same
-world pixel lands under the cursor before and after.
+PROMPT OVERRIDES
+================
+`board.prompt` reflects the current textarea value.
+`board.promptOverrides` is a per-task-id dict of user-typed overrides
+so switching between tasks preserves each task's edit.  `_selectTask`
+in `pg_panel_bindings.js` restores the override (or the payload's
+original prompt if no override yet) on selection.
 
-`fitView()` (in `pg_view.js`) is the only operation that recomputes
-`zoom` from the current frame dims.  It runs once on task select
-(when the payload is loaded) and on `Home` / `0`.  Expansion drag
-never touches the view.
+RESULTS
+=======
+`board.selectedItem.result` is the daemon's response data from a
+successful resume: `{batch_id, job_id, layer_names, output_count,
+timing, prompt_override_applied}`.  `syncPanelFields` in
+`pg_panel_fields.js` renders it below the Run / Discard buttons.
 
-EXPANSION
-=========
-`board.expansion` is the four margins around the inner canvas, in
-original-canvas pixels.
+OVERLAYS
+========
+`board.showSelection` and `board.showContext` gate the two tinted
+mask overlays in `pg_view_image.js`.  Both default OFF so the canvas
+shows the raw prepared image the model receives.  Toggling a flag
+redraws via `_scheduleDraw()`.
 
-`board.expandedCanvasEl` is a live `HTMLCanvasElement` at
-`W'×H'`, or null when expansion is all zeros.  It is the source of
-truth: every rebuild shifts the *current* canvas element by
-`(Δleft, Δtop)`, so there's no async b64 re-load to race.  The
-base64 the wire needs (Krita open, inpaint run) is derived on
-demand via `_getExpandedB64()` in `pg_panel_bindings.js`.  No
-`board.expandedCanvasB64` field — the double-source-of-truth was
-what allowed the second-drag-wipes-canvas bug.
-
-`board.kritaDocumentName` is the daemon's identifier for the
-document opened by `/intercept/krita_open`.  `board.kritaFileHint`
-is the temp-file basename.
-
-`board.prompt` is the prompt override slot; empty means "use the
-payload's prompt".
+The toggles are session-scoped (no persistence).  Reloading the
+interceptor tab resets them to OFF, which matches the "raw image by
+default" contract.
 """
 
 STATE_JS = r"""
@@ -69,14 +61,13 @@ export const board = {
   order:               [],
   selectedTaskId:      null,
   selectedItem:        null,
-  view:                "input",
   prompt:              "",
+  promptOverrides:     {},
   pollTimer:           null,
-
-  expansion:           { left: 0, top: 0, right: 0, bottom: 0 },
-  expandedCanvasEl:    null,   // HTMLCanvasElement at W'×H', or null
-  kritaDocumentName:   null,
-  kritaFileHint:       null,
+  // Overlay toggles.  Both OFF by default so the canvas shows the
+  // raw prepared image; toggled on for verification aid.
+  showSelection:       false,
+  showContext:         false,
 };
 
 /* --------------------------------------------------------------- */
@@ -121,7 +112,7 @@ export function resize() {
 window.addEventListener("resize", resize);
 
 /* --------------------------------------------------------------- */
-/*  Image cache for the canvas                                      */
+/*  Image cache                                                     */
 /* --------------------------------------------------------------- */
 
 const _imgCache = {};
@@ -136,19 +127,5 @@ export function getCachedImage(b64) {
   img.src = "data:image/png;base64," + b64;
   _imgCache[b64] = img;
   return img;
-}
-
-/* --------------------------------------------------------------- */
-/*  Expansion helpers                                               */
-/* --------------------------------------------------------------- */
-
-export function hasExpansion() {
-  const e = board.expansion;
-  return e.left > 0 || e.top > 0 || e.right > 0 || e.bottom > 0;
-}
-
-export function resetExpansionState() {
-  board.expansion = { left: 0, top: 0, right: 0, bottom: 0 };
-  board.expandedCanvasEl = null;
 }
 """

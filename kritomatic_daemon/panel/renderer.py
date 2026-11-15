@@ -113,6 +113,26 @@ Because the daemon has no value for such fields, the renderer's
 `_filtered_description` is where the client's current value is
 written back into the description before `_rebuild` and
 `_sync_values` consume it. See "Client-side filters" above.
+
+Shared layer picker
+===================
+The `_LayerComboBox` class (an editable QComboBox with a
+case-insensitive, MatchContains completer) is used by both the
+resources section's alias pickers and the docker's playgrounds
+section's layer picker. Repopulation goes through one method on the
+class — `apply_layers(bucket, recent)` — so ordering ("recent-in-
+bucket first, then the rest of the bucket in daemon order"), the
+popup-open guard, and the text-preservation rule are identical
+everywhere. Two call sites use it:
+
+  · `PanelRenderer.set_layers`, which dispatches per-field based on
+    the field spec's `kind_hint` (`image` or `mask`).
+  · `KritomaticPanel._apply_layers_to_playground_combos`, which
+    pushes the `image` bucket into every playground row's combo.
+
+Neither path duplicates the ordering logic. A future widget that
+needs a layer picker instantiates `_LayerComboBox` and calls
+`apply_layers`; no new code beyond wiring the trigger.
 """
 
 from __future__ import annotations
@@ -191,6 +211,47 @@ class _LayerComboBox(QComboBox):
 
     def is_popup_open(self) -> bool:
         return self._popup_open
+
+    def apply_layers(self, bucket: list, recent: list) -> None:
+        """Populate the combo from a bucket of layer names.
+
+        `bucket` is every layer name of this combo's kind (`image`
+        for paint layers, `mask` for selection/transparency masks);
+        `recent` is the daemon's recent-aliases list, unfiltered.
+        Items are ordered: **recent-in-bucket first** (in `recent`'s
+        order), then the rest of the bucket (in `bucket`'s order).
+
+        No-op when the popup is open: repopulating mid-selection
+        would shuffle the list under the user's cursor.  Both the
+        renderer's `set_layers` and the docker's playground rows go
+        through this method, so the ordering and popup guard are the
+        same everywhere.
+
+        Preserves the current text across the repopulation so a
+        typed-but-not-yet-committed value survives a background
+        `layersFetched` emit.
+        """
+        if self.is_popup_open():
+            return
+        bucket_set = set(bucket)
+        recent_in_bucket = [a for a in recent if a in bucket_set]
+        recent_set = set(recent_in_bucket)
+        rest = [b for b in bucket if b not in recent_set]
+        new_list = recent_in_bucket + rest
+
+        current_text = self.currentText()
+        self.blockSignals(True)
+        le = self.lineEdit()
+        if le is not None:
+            le.blockSignals(True)
+        try:
+            self.clear()
+            self.addItems(new_list)
+            self.setCurrentText(current_text)
+        finally:
+            if le is not None:
+                le.blockSignals(False)
+            self.blockSignals(False)
 
 
 class PanelRenderer(QObject):
@@ -1124,32 +1185,9 @@ class PanelRenderer(QObject):
         for key, widget in self._field_widgets.items():
             if not isinstance(widget, _LayerComboBox):
                 continue
-            if widget.is_popup_open():
-                continue
             spec = self._field_specs.get(key) or {}
             hint = spec.get("kind_hint")
             if hint == "image":
-                bucket = image_list
+                widget.apply_layers(image_list, recent)
             elif hint == "mask":
-                bucket = mask_list
-            else:
-                continue
-            bucket_set = set(bucket)
-            recent_in_bucket = [a for a in recent if a in bucket_set]
-            recent_set = set(recent_in_bucket)
-            rest = [b for b in bucket if b not in recent_set]
-            new_list = recent_in_bucket + rest
-
-            current_text = widget.currentText()
-            widget.blockSignals(True)
-            le = widget.lineEdit()
-            if le is not None:
-                le.blockSignals(True)
-            try:
-                widget.clear()
-                widget.addItems(new_list)
-                widget.setCurrentText(current_text)
-            finally:
-                if le is not None:
-                    le.blockSignals(False)
-                widget.blockSignals(False)
+                widget.apply_layers(mask_list, recent)

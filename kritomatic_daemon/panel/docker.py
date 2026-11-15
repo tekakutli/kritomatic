@@ -67,6 +67,55 @@ The run log prefixes every line with a short suffix of the run's
 request id so concurrent runs' progress entries remain distinguishable
 in the shared log widget.
 
+Playground input section (registry-driven, slot-based)
+======================================================
+Live-running playgrounds register with the daemon; each registration
+carries a list of **layer slots** — each an `@`-prefixed identifier
+with its own `{source, layer_name}` selector.  See
+`handlers/playgrounds.py` for the wire shape.  The docker renders one
+row per (playground, slot), in a QGroupBox pinned between the
+scrollable form and the pinned action row:
+
+    Layout Editor   @thelayout   [source▼] [layer_name]
+
+The slot's `@`-prefixed id IS the display name — no separate label
+field, no friendly-name indirection.  Resource-name style, same as
+`@thecanvas` for resources.  For multi-slot playgrounds, the
+playground's name appears only on its first slot's row; subsequent
+slots indent under it.  Slots are addressed independently.
+
+The layer picker is a `_LayerComboBox` — the same widget class the
+resources section's alias fields use — so the completer behaviour
+(case-insensitive, narrows as you type), recent-first ordering,
+popup-open guard, and text-preservation rule are identical on both
+sides.  Repopulation goes through `_LayerComboBox.apply_layers`;
+no ordering logic is duplicated in this file.
+
+Auto-selection on source switch
+-------------------------------
+When the user changes a slot's source dropdown from `active` or
+`global` to `layer`, `_maybe_auto_select_layer` seeds the layer
+picker with the slot's `auto_select_layer` hint (from the register
+call) **if** that layer is present in the current image-layer list
+**and** the picker is empty.  This turns the common "I want my
+companion layer" flow into a single click.
+
+Guards: fires only when the picker is empty (never overwrites a user
+choice); fires only when the hint layer exists.  If the picker is
+still empty after the check (hint not set, or hint layer missing),
+the command is still sent with an empty `layer_name`, and the
+daemon's "layer_name is required" error surfaces in the log.
+
+`self._last_layers_payload` caches the most recent `layersFetched`
+payload so newly-added rows can be populated immediately instead of
+waiting for the next refresh.  `_update_playgrounds` calls
+`_apply_layers_to_playground_combos` after every diff for that reason.
+
+Per-row editing is tracked with `entry["editing"]`: while the user's
+change is in flight, state pushes from the daemon that still carry the
+pre-change selector are ignored for that row.  Cleared when a state
+push arrives whose selector matches the user's choice.
+
 Workflow hint text
 ==================
 `_update_workflow_hint` renders a "No workflow loaded" hint when the
@@ -153,16 +202,18 @@ import uuid
 
 from PyQt6.QtCore import Qt, QSettings, QTimer
 from PyQt6.QtWidgets import (
-    QDockWidget, QWidget, QVBoxLayout, QScrollArea, QLabel,
-    QPlainTextEdit, QFrame,
+    QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
+    QPlainTextEdit, QFrame, QComboBox, QGroupBox,
 )
 
 from .connection import DaemonConnection
 from .layers_watcher import LayersWatcher
-from .renderer import PanelRenderer
+from .renderer import PanelRenderer, _LayerComboBox
 
 
 _CONFIG_APPLY_DEBOUNCE_MS = 150
+
+_LAYER_SOURCES = ("active", "global", "layer")
 
 
 class KritomaticPanel(QDockWidget):
@@ -182,6 +233,15 @@ class KritomaticPanel(QDockWidget):
         self._active_runs: dict[str, float] = {}
         self._active_batches_count = 0
         self._workflow_loaded = False
+
+        # Playground input rows.  Keyed by `(playground_id, slot_id)`;
+        # values are the per-row widget record.  See the module
+        # docstring, "Playground input section".
+        self._playground_rows: dict[tuple, dict] = {}
+        # Cache of the most recent `layersFetched` payload.  Used by
+        # `_update_playgrounds` to populate newly-added rows and by
+        # `_maybe_auto_select_layer`.
+        self._last_layers_payload: dict = {}
 
         # Client-side Parameters filter.  Persisted per workflow in
         # `_settings`; restored by `_on_state` when the workflow
@@ -231,6 +291,25 @@ class KritomaticPanel(QDockWidget):
         self._form_layout.addStretch(1)
         self._scroll.setWidget(self._form_container)
         root_layout.addWidget(self._scroll, 1)
+
+        # Playground input section — pinned between the scrollable
+        # form and the pinned action row.  A QGroupBox (rather than a
+        # hand-styled QLabel header) so its title inherits the theme's
+        # default widget style and matches the form sections above.
+        # Hidden when no playgrounds are registered.  See the module
+        # docstring, "Playground input section".
+        self._playgrounds_container = QGroupBox("Playground Input")
+        playgrounds_outer = QVBoxLayout(self._playgrounds_container)
+        playgrounds_outer.setContentsMargins(8, 6, 8, 6)
+        playgrounds_outer.setSpacing(3)
+
+        self._playgrounds_layout = QVBoxLayout()
+        self._playgrounds_layout.setContentsMargins(0, 0, 0, 0)
+        self._playgrounds_layout.setSpacing(2)
+        playgrounds_outer.addLayout(self._playgrounds_layout)
+
+        self._playgrounds_container.hide()
+        root_layout.addWidget(self._playgrounds_container)
 
         # Pinned action row container.
         self._actions_container = QWidget()
@@ -420,6 +499,10 @@ class KritomaticPanel(QDockWidget):
                 self._restore_param_filter_for_workflow(new_workflow)
                 if new_workflow:
                     self._remember_workflow(new_workflow)
+
+            playgrounds = data.get("playgrounds")
+            if isinstance(playgrounds, list):
+                self._update_playgrounds(playgrounds)
         except Exception:
             pass
         self._update_run_buttons()
@@ -491,10 +574,295 @@ class KritomaticPanel(QDockWidget):
         self._conn.request_layers()
 
     def _on_layers_fetched(self, layers: dict) -> None:
+        self._last_layers_payload = layers
         try:
             self._renderer.set_layers(layers)
         except Exception as e:
             self._append_log("err", f"layers update error: {e}")
+        try:
+            self._apply_layers_to_playground_combos(layers)
+        except Exception as e:
+            self._append_log(
+                "err", f"playground layers update error: {e}",
+            )
+
+    def _apply_layers_to_playground_combos(self, layers: dict) -> None:
+        """Push the shared layer data into every playground picker.
+
+        Same bucket the resources section uses for `@thecanvas`:
+        image layers (paint layers).  Playgrounds display a reference
+        image, not a mask, so the mask bucket is not relevant here.
+        Uses `_LayerComboBox.apply_layers`, so ordering, dedup, and
+        popup guard are shared with the renderer.
+        """
+        image_list = layers.get("image") or []
+        recent = layers.get("recent") or []
+        for entry in self._playground_rows.values():
+            widget = entry.get("layer_combo")
+            if widget is None:
+                continue
+            try:
+                widget.apply_layers(image_list, recent)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    #  Playground input section
+    # ------------------------------------------------------------------
+
+    def _update_playgrounds(self, playgrounds: list) -> None:
+        """Diff the daemon's playground registry against current rows.
+
+        Each (playground, slot) pair gets its own row; the playground's
+        name is shown only on its first slot's row.
+        """
+        desired_keys: set = set()
+        for p in playgrounds:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("id")
+            if not pid:
+                continue
+            for slot in (p.get("layer_slots") or []):
+                sid = slot.get("id") if isinstance(slot, dict) else None
+                if sid:
+                    desired_keys.add((pid, sid))
+
+        # Remove vanished rows.
+        for key in list(self._playground_rows.keys()):
+            if key not in desired_keys:
+                entry = self._playground_rows.pop(key)
+                entry["row"].setParent(None)
+                entry["row"].deleteLater()
+
+        # Add or update rows.
+        for p in playgrounds:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("id")
+            if not pid:
+                continue
+            slots = p.get("layer_slots") or []
+            for i, slot in enumerate(slots):
+                if not isinstance(slot, dict):
+                    continue
+                sid = slot.get("id")
+                if not sid:
+                    continue
+                key = (pid, sid)
+                entry = self._playground_rows.get(key)
+                if entry is None:
+                    entry = self._make_playground_row(
+                        p, slot, show_name=(i == 0),
+                    )
+                    self._playground_rows[key] = entry
+                    self._playgrounds_layout.addWidget(entry["row"])
+                self._sync_playground_row(entry, p, slot)
+
+        self._playgrounds_container.setVisible(bool(self._playground_rows))
+
+        # Populate newly-added rows' pickers from cache.
+        if self._last_layers_payload:
+            self._apply_layers_to_playground_combos(self._last_layers_payload)
+
+    def _make_playground_row(self, p: dict, slot: dict,
+                             show_name: bool) -> dict:
+        pid = p.get("id")
+        sid = slot.get("id")
+        pname = p.get("name") or pid or "?"
+
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 1, 0, 1)
+        h.setSpacing(6)
+
+        name_label = QLabel(pname if show_name else "")
+        name_label.setStyleSheet("font-weight:600;")
+        name_label.setMinimumWidth(110)
+        h.addWidget(name_label, 0)
+
+        # The slot id IS the display name.  No label field.
+        slot_id_widget = QLabel(sid)
+        slot_id_widget.setToolTip(
+            f"Slot {sid!r} of the {pname!r} playground.\n"
+            f"Layer displayed by that playground."
+        )
+        slot_id_widget.setMinimumWidth(90)
+        h.addWidget(slot_id_widget, 0)
+
+        source_combo = QComboBox()
+        for opt in _LAYER_SOURCES:
+            source_combo.addItem(opt)
+        source_combo.setMinimumWidth(80)
+        h.addWidget(source_combo, 0)
+
+        layer_combo = _LayerComboBox(kind_hint="image")
+        layer_combo.setMinimumWidth(110)
+        h.addWidget(layer_combo, 1)
+
+        entry = {
+            "row": row,
+            "name_label": name_label,
+            "slot_id_widget": slot_id_widget,
+            "source_combo": source_combo,
+            "layer_combo": layer_combo,
+            "playground_id": pid,
+            "slot_id": sid,
+            "auto_select_layer": slot.get("auto_select_layer"),
+            "updating": False,
+            "editing": False,
+        }
+
+        def on_source_changed(text, _entry=entry):
+            if _entry["updating"]:
+                return
+            _entry["editing"] = True
+            _entry["layer_combo"].setVisible(text == "layer")
+            if text == "layer":
+                self._maybe_auto_select_layer(
+                    _entry["layer_combo"],
+                    _entry["auto_select_layer"],
+                )
+            self._send_playground_set_layer(
+                _entry["playground_id"], _entry["slot_id"], text,
+                _entry["layer_combo"].currentText().strip()
+                if text == "layer" else "",
+            )
+
+        def on_layer_activated(_i, _entry=entry):
+            if _entry["updating"]:
+                return
+            if _entry["source_combo"].currentText() != "layer":
+                return
+            _entry["editing"] = True
+            self._send_playground_set_layer(
+                _entry["playground_id"], _entry["slot_id"], "layer",
+                _entry["layer_combo"].currentText().strip(),
+            )
+
+        def on_layer_editing_finished(_entry=entry):
+            if _entry["updating"]:
+                return
+            if _entry["source_combo"].currentText() != "layer":
+                return
+            _entry["editing"] = True
+            self._send_playground_set_layer(
+                _entry["playground_id"], _entry["slot_id"], "layer",
+                _entry["layer_combo"].currentText().strip(),
+            )
+
+        source_combo.currentTextChanged.connect(on_source_changed)
+        layer_combo.activated.connect(on_layer_activated)
+        le = layer_combo.lineEdit()
+        if le is not None:
+            le.editingFinished.connect(on_layer_editing_finished)
+        layer_combo.popupAboutToShow.connect(self._layers_watcher.schedule)
+
+        return entry
+
+    def _maybe_auto_select_layer(self, combo: _LayerComboBox,
+                                 layer_name) -> bool:
+        """Seed a slot's layer picker with `layer_name`.
+
+        Fires only when:
+
+          · `layer_name` is set (the slot spec included an
+            `auto_select_layer` hint),
+          · that layer is present in the current image-layer list, and
+          · the combo's text is empty (a layer the user already picked
+            or typed is never overwritten).
+
+        Signals are blocked on both the combo and its line-edit so the
+        programmatic `setCurrentText` does not fire `activated` /
+        `editingFinished` — those would double-send the commit.
+        """
+        if not layer_name:
+            return False
+        image_layers = (self._last_layers_payload or {}).get("image") or []
+        if layer_name not in image_layers:
+            return False
+        if combo.currentText().strip():
+            return False
+
+        combo.blockSignals(True)
+        le = combo.lineEdit()
+        if le is not None:
+            le.blockSignals(True)
+        try:
+            combo.setCurrentText(layer_name)
+        finally:
+            if le is not None:
+                le.blockSignals(False)
+            combo.blockSignals(False)
+        return True
+
+    def _sync_playground_row(self, entry: dict, p: dict, slot: dict) -> None:
+        new_pname = p.get("name") or p.get("id") or "?"
+        # Only update the name text if this row is the one showing it
+        # (the first slot row).  Subsequent rows have an empty text
+        # label already.
+        if entry["name_label"].text() != "":
+            if entry["name_label"].text() != new_pname:
+                entry["name_label"].setText(new_pname)
+
+        # Slot id IS the display name.
+        new_sid = slot.get("id") or "?"
+        if entry["slot_id_widget"].text() != new_sid:
+            entry["slot_id_widget"].setText(new_sid)
+        entry["auto_select_layer"] = slot.get("auto_select_layer")
+
+        selector = slot.get("selector") or {}
+        source = selector.get("source") or "active"
+        layer_name = selector.get("layer_name") or ""
+
+        if entry["editing"]:
+            if entry["source_combo"].currentText() == source:
+                entry["editing"] = False
+            else:
+                return
+
+        entry["updating"] = True
+        try:
+            if entry["source_combo"].currentText() != source:
+                idx = entry["source_combo"].findText(source)
+                if idx >= 0:
+                    entry["source_combo"].setCurrentIndex(idx)
+
+            combo = entry["layer_combo"]
+            le = combo.lineEdit()
+            has_focus = combo.hasFocus() or (
+                le is not None and le.hasFocus()
+            )
+            if not has_focus:
+                if combo.currentText() != layer_name:
+                    combo.blockSignals(True)
+                    if le is not None:
+                        le.blockSignals(True)
+                    try:
+                        combo.setCurrentText(layer_name)
+                    finally:
+                        if le is not None:
+                            le.blockSignals(False)
+                        combo.blockSignals(False)
+            combo.setVisible(source == "layer")
+        finally:
+            entry["updating"] = False
+
+    def _send_playground_set_layer(
+        self, pid: str, slot_id: str, source: str, layer_name: str,
+    ) -> None:
+        command = {
+            "type": "playground_set_layer",
+            "id": pid,
+            "slot_id": slot_id,
+            "source": source,
+            "layer_name": layer_name if source == "layer" else "",
+        }
+        request_id = (
+            f"playground-{pid}-{slot_id}-{int(time.time() * 1000)}"
+        )
+        bundle = {"id": request_id, "commands": [command]}
+        self._conn.enqueue(request_id, bundle)
 
     def _update_workflow_hint(self, description) -> None:
         has_workflow = False
@@ -520,13 +888,6 @@ class KritomaticPanel(QDockWidget):
 
     @staticmethod
     def _short_id_from_request_id(request_id: str) -> str:
-        """Short display id for a run's request id.
-
-        `run-<ts>-<uuid>` — the trailing `<uuid>` is already short
-        and unique per run; use the whole thing rather than slicing
-        it. Callers that pass a bare request id (e.g. `cancel-<ts>`)
-        fall back to the last hyphen segment.
-        """
         if not request_id:
             return "?"
         parts = request_id.split("-")
@@ -550,6 +911,14 @@ class KritomaticPanel(QDockWidget):
 
     def _on_command_completed(self, request_id: str, ok: bool,
                               summary: dict) -> None:
+        if request_id.startswith("playground-"):
+            if not ok:
+                msg = summary.get("message", "") or "unknown error"
+                self._append_log(
+                    "err", f"Playground selector failed: {msg}",
+                )
+            return
+
         if request_id.startswith(("cancel-", "cancel_all-")):
             msg = summary.get("message", "")
             if ok:
@@ -611,9 +980,6 @@ class KritomaticPanel(QDockWidget):
         self._active_runs.pop(request_id, None)
         short_id = self._short_id_from_request_id(request_id)
 
-        # Intercept mode: comfy_generate returned early with
-        # `intercepted: True` in the response data.  Nothing actually
-        # ran here — skip the "N ok, M failed" reporting.
         if summary.get("intercepted"):
             msg = summary.get("message") or "Run intercepted"
             self._append_log(
@@ -712,9 +1078,6 @@ class KritomaticPanel(QDockWidget):
                     continue
                 command[argname] = v
 
-        # comfy_panel_run and comfy_save_config both need the four
-        # v2 config sections, assembled from config widgets at click
-        # time. See the module docstring.
         if command.get("type") in ("comfy_panel_run", "comfy_save_config"):
             cfg = self._renderer.build_config_from_widgets()
             command["resources"] = json.dumps(cfg["resources"])
@@ -723,22 +1086,14 @@ class KritomaticPanel(QDockWidget):
             command["paste"] = json.dumps(cfg["paste"])
 
         if key == "run":
-            # Cancel any pending debounce — the config we are about to
-            # send is what the user has right now, and we don't want
-            # a stray comfy_apply_config to land after the run is
-            # already on the wire.
             self._pending_apply_timer.stop()
             self._pending_apply_source = ""
 
-            # Unique per click; two rapid clicks do not collide.
             request_id = (
                 f"run-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
             )
             self._active_runs[request_id] = time.time()
             bundle = {"id": request_id, "commands": [command]}
-            # Bypass the serial command worker so a second click lands
-            # while the first is still preparing. See the module
-            # docstring, "Concurrent runs".
             self._conn.send_run_now(request_id, bundle)
             short_id = self._short_id_from_request_id(request_id)
             self._append_log("hdr", f"[{short_id}] Run started.")
@@ -750,7 +1105,6 @@ class KritomaticPanel(QDockWidget):
                     "warn", "No run in progress to cancel.",
                 )
                 return
-            # One cancel per active run, each on its own socket.
             for run_id in list(self._active_runs.keys()):
                 cancel_request_id = (
                     f"cancel-{int(time.time() * 1000)}-"
@@ -776,9 +1130,6 @@ class KritomaticPanel(QDockWidget):
 
     def _update_run_buttons(self) -> None:
         any_run = bool(self._active_runs)
-        # Run stays enabled while any run is in flight: concurrent
-        # clicks are supported by design. It still requires a loaded
-        # workflow.
         self._renderer.set_action_enabled(
             "run", self._workflow_loaded)
         self._renderer.set_action_enabled("cancel", any_run)

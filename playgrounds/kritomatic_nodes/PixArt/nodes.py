@@ -2,20 +2,26 @@
 #
 # ComfyUI node wrappers for `fumeisama/drawatoon-v1`.
 #
-# Only drawatoon-specific nodes are registered here — the stock ExtraModels
-# PixArt nodes (`PixArtCheckpointLoader`, `PixArtResolutionSelect`,
-# `PixArtLoraLoader`, ...) are intentionally not duplicated in this pack, so
-# this file and `ComfyUI_ExtraModels` can be installed side-by-side without
-# clobbering each other's node names.
+# Only drawatoon-specific nodes are registered here — the stock
+# ExtraModels PixArt nodes are intentionally not duplicated in this
+# pack, so this file and `ComfyUI_ExtraModels` can be installed
+# side-by-side without clobbering each other's node names.
 #
 # Nodes:
 #   * DrawatoonCheckpointLoader — loads drawatoon as a DrawatoonMS MODEL
 #   * DrawatoonSetIP            — attaches ip_adapter conditioning to a
-#                                 CONDITIONING, so cond and uncond can carry
-#                                 *different* ip tokens (needed for CFG to
-#                                 amplify layout rather than cancel it).
+#                                 CONDITIONING, so cond and uncond can
+#                                 carry *different* ip tokens (needed
+#                                 for CFG to amplify layout rather than
+#                                 cancel it).  Fetches bboxes from the
+#                                 layout playground at
+#                                 http://127.0.0.1:8777/state, or falls
+#                                 back to void_ip_embed when the
+#                                 playground is unreachable.
 
 import json
+import urllib.error
+import urllib.request
 
 import torch
 import folder_paths
@@ -25,26 +31,38 @@ from .loader import load_pixart
 
 
 # ---------------------------------------------------------------------------
+# Layout playground endpoints — fixed contract.
+#
+# The layout playground is served by `playgrounds/layout/` on port 8777.
+# Change these constants if you relocate it, but note the daemon's
+# playground registry uses the same URL for layer-selector syncing —
+# keep them in sync.
+# ---------------------------------------------------------------------------
+_LAYOUT_STATE_URL   = "http://127.0.0.1:8777/state"
+_LAYOUT_VERSION_URL = "http://127.0.0.1:8777/version"
+_LAYOUT_FETCH_TIMEOUT_S = 2.0
+
+
+# ---------------------------------------------------------------------------
 # DrawatoonCheckpointLoader
 # ---------------------------------------------------------------------------
 class DrawatoonCheckpointLoader:
     """
     Loader for `fumeisama/drawatoon-v1` (and future drawatoon fine-tunes).
 
-    Uses the stock `PixArtMS_Sigma_XL_2` config but instantiates `DrawatoonMS`
-    (PixArt-Sigma + IPAdapter + per-block parallel ip cross-attention) so the
-    `ip_adapter.*` and `transformer_blocks.N.ip_attn.*` weights load into the
-    right modules.
+    Uses the stock `PixArtMS_Sigma_XL_2` config but instantiates
+    `DrawatoonMS` (PixArt-Sigma + IPAdapter + per-block parallel ip
+    cross-attention) so the `ip_adapter.*` and
+    `transformer_blocks.N.ip_attn.*` weights load into the right
+    modules.
 
-    Text-only generation works with no extra nodes thanks to the void-embed
-    fallback inside `DrawatoonMS.forward_raw`. Layout conditioning is wired
-    through `DrawatoonSetIP` (below) — one node per CONDITIONING branch.
+    Text-only generation works with no extra nodes thanks to the
+    void-embed fallback inside `DrawatoonMS.forward_raw`.
 
-    IMPORTANT: drawatoon is a **512px model**. Panels were trained at a fixed
-    262,144-pixel budget. Use `PixArtResolutionSelect` with
-    `model = "PixArtMS_Sigma_XL_2_512"` — its preset table keeps the area
-    near 262,144 for any aspect ratio. 1024x1024 will produce blocky output
-    because it is 4x the pixel budget the model ever saw.
+    IMPORTANT: drawatoon is a **512px model**. Panels were trained at a
+    fixed 262,144-pixel budget.  Use `PixArtResolutionSelect` with
+    `model = "PixArtMS_Sigma_XL_2_512"`.  1024x1024 will produce blocky
+    output because it is 4x the pixel budget the model ever saw.
     """
 
     @classmethod
@@ -74,12 +92,11 @@ class DrawatoonCheckpointLoader:
 
 
 # ---------------------------------------------------------------------------
-# Helpers for DrawatoonSetIP
+# Helpers
 # ---------------------------------------------------------------------------
 def _get_ip_adapter(model):
     """Extract the IPAdapter from a MODEL produced by DrawatoonCheckpointLoader."""
     try:
-        # model is a ModelPatcher wrapping EXM_PixArt_Model -> DrawatoonMS
         inner = model.model
         dm = inner.diffusion_model
         return dm.ip_adapter
@@ -87,45 +104,83 @@ def _get_ip_adapter(model):
         return None
 
 
-def _parse_bboxes(s):
-    """Parse a JSON string of bboxes: `[[x1,y1,x2,y2], ...]` (normalized 0..1)."""
-    if not s or not s.strip():
-        return []
-    try:
-        data = json.loads(s)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid bbox JSON: {e}")
-    if not isinstance(data, list):
-        raise ValueError("bboxes JSON must be a list of [x1,y1,x2,y2]")
-    out = []
-    for item in data:
-        if not isinstance(item, (list, tuple)) or len(item) != 4:
-            raise ValueError(f"each bbox must be [x1,y1,x2,y2], got {item!r}")
-        out.append([float(v) for v in item])
-    return out
+def _post_json(url, body, timeout):
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
 
 
-def _parse_reference_embeddings(s):
-    """Parse a JSON string of references: `[null | [768 floats], ...]`."""
-    if not s or not s.strip():
-        return []
+def _probe_version():
+    """Best-effort GET of the layout playground's state hash.
+
+    Returns "" when the playground is unreachable, or its string
+    version when reachable.  Used by IS_CHANGED.
+    """
     try:
-        data = json.loads(s)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid reference embeddings JSON: {e}")
-    if not isinstance(data, list):
-        raise ValueError("reference_embeddings JSON must be a list")
-    out = []
-    for item in data:
-        if item is None:
-            out.append(None)
-        elif isinstance(item, list):
-            out.append(torch.tensor(item, dtype=torch.float32))
+        r = _post_json(_LAYOUT_VERSION_URL, {}, timeout=1.0)
+    except Exception:
+        return ""
+    v = r.get("version") if isinstance(r, dict) else None
+    return str(v) if v is not None else ""
+
+
+def _fetch_layout():
+    """Fetch bboxes from the layout playground.
+
+    Returns (text_bboxes, character_bboxes, refs_raw) on success, or
+    ([], [], []) on any failure (timeout, connection refused, non-JSON
+    body).  The empty triple is exactly the void_ip_embed fallback path
+    in the caller.  No warning is printed: playground-down is a
+    supported state (generation proceeds as if no layout existed).
+    """
+    try:
+        state = _post_json(
+            _LAYOUT_STATE_URL, {}, timeout=_LAYOUT_FETCH_TIMEOUT_S,
+        )
+    except Exception:
+        return [], [], []
+
+    if not isinstance(state, dict):
+        return [], [], []
+
+    def _bboxes(key):
+        raw = state.get(key) or []
+        out = []
+        for b in raw:
+            if not isinstance(b, (list, tuple)) or len(b) != 4:
+                continue
+            try:
+                out.append([float(v) for v in b])
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    text_bboxes = _bboxes("text_bboxes")
+    character_bboxes = _bboxes("character_bboxes")
+    refs_raw = state.get("reference_embeddings") or []
+    return text_bboxes, character_bboxes, refs_raw
+
+
+def _build_references(refs_raw, n_characters, ip_adapter):
+    """Coerce references to the IPAdapter's dtype/device, one per character."""
+    target_dtype = ip_adapter.ref_embedding_proj.weight.dtype
+    target_device = ip_adapter.ref_embedding_proj.weight.device
+    refs = []
+    for r in refs_raw:
+        if isinstance(r, list) and len(r) == 768:
+            refs.append(torch.tensor(
+                r, dtype=target_dtype, device=target_device,
+            ))
         else:
-            raise ValueError(
-                f"each ref must be null or a list of floats, got {type(item)}"
-            )
-    return out
+            refs.append(None)
+    while len(refs) < n_characters:
+        refs.append(None)
+    if len(refs) > n_characters:
+        refs = refs[:n_characters]
+    return refs
 
 
 # ---------------------------------------------------------------------------
@@ -135,10 +190,11 @@ class DrawatoonSetIP:
     """
     Attach IP-adapter conditioning to a CONDITIONING.
 
-    Use this on **both** positive and negative branches feeding KSampler so
-    that cond and uncond pass carry different `ip_hidden_states`. Without it,
-    both passes see the same tokens and the ip branch is identical in both,
-    cancelling out in the CFG delta — layout then barely affects output.
+    Use this on **both** positive and negative branches feeding
+    KSampler so that cond and uncond pass carry different
+    `ip_hidden_states`.  Without it, both passes see the same tokens
+    and the ip branch is identical in both, cancelling out in the CFG
+    delta — layout then barely affects output.
 
     Wiring (typical):
         CLIPTextEncode (positive) -> DrawatoonSetIP(ip_mode="layout")    -> KSampler.positive
@@ -146,32 +202,15 @@ class DrawatoonSetIP:
         DrawatoonCheckpointLoader -> MODEL -> both DrawatoonSetIP nodes
 
     ip_mode:
-      - "layout"    : build ip tokens from text_bboxes_json /
-                      character_bboxes_json / reference_embeddings_json
-                      via the model's IPAdapter. If the JSON arrays are
-                      empty, falls back to the same default layout as
-                      DrawatoonMS._default_layout (1 caption box at top,
-                      1 character box in centre).
+      - "layout"    : probe http://127.0.0.1:8777/state for bboxes.
+                      If the playground is unreachable, or returns empty
+                      bboxes, fall back to `void_ip_embed` (identical
+                      to "void").  Silent — playground-down is a
+                      supported state.
       - "negative"  : use the trained `negative_ip_embed` (the author's
-                      CFG drop-out token). This is the correct value for
-                      the negative branch.
+                      CFG drop-out token).  Never contacts playground.
       - "void"      : use the trained `void_ip_embed` (no-layout token).
-                      Useful for A/B testing against "layout".
-
-    BBOX FORMAT (JSON string, normalized 0..1, `[x1,y1,x2,y2]` per box):
-        text_bboxes_json       = '[[0.10, 0.02, 0.90, 0.12]]'
-        character_bboxes_json  = '[[0.30, 0.15, 0.70, 0.90]]'
-        reference_embeddings_json = '[null]'  (null = let model invent character)
-
-    LIMITATIONS:
-      * Each layout token contributes 2 (text) or 5 (character) tokens.
-        Match the number of character boxes to the length of
-        `reference_embeddings_json` — extra references are ignored, missing
-        ones are padded with `null` (model invents).
-      * Batch size > 1 is only partially supported (the model broadcasts the
-        single-layout ip tokens across the batch, but ExtraModels'
-        block-diagonal mask has a known B>1 quirk that this pack does not
-        work around). Use batch_size = 1.
+                      Never contacts playground.
     """
 
     @classmethod
@@ -180,24 +219,8 @@ class DrawatoonSetIP:
             "required": {
                 "model": ("MODEL",),
                 "conditioning": ("CONDITIONING",),
-                "ip_mode": (["layout", "negative", "void"], {"default": "layout"}),
-            },
-            "optional": {
-                "text_bboxes_json": (
-                    "STRING",
-                    {"multiline": True, "default": "[]",
-                     "tooltip": "JSON list of [x1,y1,x2,y2] normalized (0..1)."},
-                ),
-                "character_bboxes_json": (
-                    "STRING",
-                    {"multiline": True, "default": "[]",
-                     "tooltip": "JSON list of [x1,y1,x2,y2] normalized (0..1)."},
-                ),
-                "reference_embeddings_json": (
-                    "STRING",
-                    {"multiline": True, "default": "[]",
-                     "tooltip": "JSON list of null or 768-float vectors, one per character."},
-                ),
+                "ip_mode": (["layout", "negative", "void"],
+                            {"default": "layout"}),
             },
         }
 
@@ -207,75 +230,62 @@ class DrawatoonSetIP:
     CATEGORY = "ExtraModels/PixArt"
     TITLE = "Drawatoon Set IP Conditioning"
 
-    def apply(
-        self,
-        model,
-        conditioning,
-        ip_mode,
-        text_bboxes_json="[]",
-        character_bboxes_json="[]",
-        reference_embeddings_json="[]",
-    ):
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Return the layout playground's state hash; "" when down.
+        # ComfyUI re-executes when the returned value differs from the
+        # previous call's return.
+        return _probe_version()
+
+    def apply(self, model, conditioning, ip_mode):
         ip_adapter = _get_ip_adapter(model)
         if ip_adapter is None:
             raise RuntimeError(
-                "DrawatoonSetIP: MODEL does not contain a DrawatoonMS with "
-                "ip_adapter. Load the checkpoint with Drawatoon Checkpoint "
-                "Loader."
+                "DrawatoonSetIP: MODEL does not contain a DrawatoonMS "
+                "with ip_adapter. Load the checkpoint with Drawatoon "
+                "Checkpoint Loader."
             )
 
         if ip_mode == "layout":
-            text_bboxes = _parse_bboxes(text_bboxes_json)
-            character_bboxes = _parse_bboxes(character_bboxes_json)
-            reference_embeddings = _parse_reference_embeddings(
-                reference_embeddings_json
-            )
-
-            # Empty = same default as DrawatoonMS._default_layout
+            text_bboxes, character_bboxes, refs_raw = _fetch_layout()
             if not text_bboxes and not character_bboxes:
-                text_bboxes = [[0.10, 0.02, 0.90, 0.12]]
-                character_bboxes = [[0.30, 0.15, 0.70, 0.90]]
-                reference_embeddings = [None]
-
-            # Pad references to match character count
-            while len(reference_embeddings) < len(character_bboxes):
-                reference_embeddings.append(None)
-
-            # Cast references to ref_proj's dtype/device (may be CPU if model
-            # is currently offloaded; forward_raw will move them to x.device).
-            target_dtype = ip_adapter.ref_embedding_proj.weight.dtype
-            target_device = ip_adapter.ref_embedding_proj.weight.device
-            reference_embeddings = [
-                r.to(dtype=target_dtype, device=target_device)
-                if r is not None else None
-                for r in reference_embeddings
-            ]
-
-            with torch.no_grad():
-                ip_hidden_states, ip_attention_mask = ip_adapter(
-                    [text_bboxes],
-                    [character_bboxes],
-                    [reference_embeddings],
-                    False,
+                # Playground unreachable, or has empty bboxes.  Void.
+                ip_hidden_states = (
+                    ip_adapter.void_ip_embed.weight.unsqueeze(0)
                 )
+                ip_attention_mask = torch.ones(
+                    1, 1, dtype=torch.bool,
+                    device=ip_hidden_states.device,
+                )
+            else:
+                references = _build_references(
+                    refs_raw, len(character_bboxes), ip_adapter,
+                )
+                with torch.no_grad():
+                    ip_hidden_states, ip_attention_mask = ip_adapter(
+                        [text_bboxes], [character_bboxes], [references],
+                        False,
+                    )
 
         elif ip_mode == "negative":
-            ip_hidden_states = ip_adapter.negative_ip_embed.weight.unsqueeze(0)
+            ip_hidden_states = (
+                ip_adapter.negative_ip_embed.weight.unsqueeze(0)
+            )
             ip_attention_mask = torch.ones(
-                1, 1, dtype=torch.bool, device=ip_hidden_states.device
+                1, 1, dtype=torch.bool, device=ip_hidden_states.device,
             )
 
         elif ip_mode == "void":
-            ip_hidden_states = ip_adapter.void_ip_embed.weight.unsqueeze(0)
+            ip_hidden_states = (
+                ip_adapter.void_ip_embed.weight.unsqueeze(0)
+            )
             ip_attention_mask = torch.ones(
-                1, 1, dtype=torch.bool, device=ip_hidden_states.device
+                1, 1, dtype=torch.bool, device=ip_hidden_states.device,
             )
 
         else:
             raise ValueError(f"Unknown ip_mode: {ip_mode!r}")
 
-        # Attach to every cond entry's metadata (a single CONDITIONING can
-        # contain multiple entries after ConditioningCombine, etc.).
         out = []
         for cond_tensor, cond_meta in conditioning:
             new_meta = dict(cond_meta)

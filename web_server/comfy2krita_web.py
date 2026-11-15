@@ -36,44 +36,33 @@ stuck in the queue behind the long run.
 Concurrent runs
 ===============
 The web panel supports multiple concurrent runs from this panel. Each
-`/api/run` call:
-
-  · allocates a fresh `run-<ts>-<rand>` id via `_new_run_id()`,
-  · opens its own socket to the daemon inside `_do_run`, and
-  · streams progress and the final summary back through `/api/events`.
-
-The frontend tracks each run in `app.activeRuns: Map<run_id, {…}>` and
-keys `handleRunEvent` on `run_id`, so two runs' progress lines go to
-the same log widget without one clobbering the other's state.
+`/api/run` call allocates a fresh `run-<ts>-<rand>` id, opens its own
+socket to the daemon inside `_do_run`, and streams progress and the
+final summary back through `/api/events`.
 
 The `comfy_panel_run` command embeds the four config sections from
 widget state at click time (see `runAction`). That is the same
 load-bearing change the docker does — the daemon's `comfy_panel_run`
 passes the validated config as a kwarg to `comfy_generate`, so two
-concurrent clicks' configs never race on `_active_config`. See the
-daemon's `comfyui_config.py` docstring for the detail.
+concurrent clicks' configs never race on `_active_config`.
 
 Cancel semantics
 ================
-`scope: "current"` cancels every run this panel started — a loop over
-`_runs` calling `comfy_cancel --batch_id <rid>` on each. `scope: "all"`
-cancels every batch on the daemon (across all clients).
+`scope: "current"` cancels every run this panel started; `scope:
+"all"` cancels every batch on the daemon (across all clients).
 
 Config auto-apply
 =================
 Config fields (resources, params, crop, paste) carry `config_path` and
-neither `set_command` nor a section-level `commit`. Every edit to one
-of them starts a 150 ms single-shot debounce; when it fires,
-`flushApply` assembles the four config sections from current widget
-state and POSTs one `comfy_apply_config`, matching the docker's
-`_apply_config_from_widgets` on the same timer.
+neither `set_command` nor a section-level `commit`. Every edit starts
+a 150 ms single-shot debounce; when it fires, `flushApply` assembles
+the four config sections from current widget state and POSTs one
+`comfy_apply_config`, matching the docker's timer.
 
-`startRun` no longer awaits `flushPendingApply` or `commitQueue` before
+`startRun` does not await `flushPendingApply` or `commitQueue` before
 posting `/api/run`. The reason that wait existed — "make sure the
 daemon's `_active_config` reflects the panel before Run reads it" — no
 longer applies: `comfy_panel_run` embeds the config in its own payload.
-Removing the wait is what makes a second click fire while the first is
-still in flight. See "Concurrent runs", above.
 
 Composite (row) fields
 ======================
@@ -99,11 +88,32 @@ command.
 
 Parameters filter prefix (client-side)
 ======================================
-The Parameters section carries a "Filter prefix" text field at the
-top with `local_handler: "param_prefix_filter"`.  This client registers
+The Parameters section carries a "Filter prefix" text field at the top
+with `local_handler: "param_prefix_filter"`.  This client registers
 a handler for that name which persists the prefix per workflow in
 `localStorage` and triggers a `rebuildPanel` against the latest
 description. The daemon never sees the prefix.
+
+Playground input section (registry-driven, slot-based)
+=====================================================
+Live-running playgrounds register with the daemon; each registration
+carries a list of **layer slots** — each an `@`-prefixed identifier
+with its own `{source, layer_name}` selector.  The web panel renders
+one row per (playground, slot) below the config form:
+
+    Layout Editor   @thelayout   [source▼] [layer_name]
+
+The slot's `@`-prefixed id IS the display name — no separate label
+field.  For multi-slot playgrounds, the playground's name appears only
+on its first slot's row; subsequent slots leave the name cell blank.
+Changes fire `playground_set_layer` via `/api/command`, scoped with
+the slot's `slot_id`.  The selector never touches the workflow graph,
+resource substitution, or `_active_config`.  The section is always
+visible, with a "No playgrounds running" placeholder when empty.
+
+Per-row editing is tracked with `dataset.editing` on the row: while
+the user's change is in flight, state pushes that still carry the
+old selector are ignored for that row.
 """
 
 import json
@@ -128,7 +138,6 @@ from kritomatic.client import KritaClient
 
 
 HOST = os.environ.get("WEB_PANEL_HOST", "127.0.0.1")
-# 8189 is comfy-api-proxy's port. Do not share it.
 PORT = int(os.environ.get("WEB_PANEL_PORT", "8190"))
 
 DAEMON_HOST = "localhost"
@@ -558,10 +567,6 @@ class Handler(BaseHTTPRequestHandler):
                 "command", status=400)
             return
 
-        # Concurrent runs are supported. Each call allocates a fresh
-        # run_id, opens its own socket inside `_do_run`, and streams
-        # events keyed on that id. See this module's docstring,
-        # "Concurrent runs".
         run_id = _new_run_id()
         with _runs_lock:
             _runs[run_id] = {"status": "running", "started": time.time()}
@@ -584,7 +589,6 @@ class Handler(BaseHTTPRequestHandler):
         scope = body.get("scope", "current")
 
         if scope == "all":
-            # Cancel every batch on the daemon (across every client).
             with _runs_lock:
                 run_ids = list(_runs.keys())
                 for rid in run_ids:
@@ -606,9 +610,6 @@ class Handler(BaseHTTPRequestHandler):
                              "run_ids": run_ids})
             return
 
-        # scope == "current" (default): cancel every run this panel
-        # started. Concurrent runs are the whole point; "current" means
-        # "all my current runs", not "the one".
         with _runs_lock:
             run_ids = list(_runs.keys())
             for rid in run_ids:
@@ -802,6 +803,37 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .progress .row.err { color: #c5221f; }
   .progress .row.warn { color: #a05a00; }
   .progress .row.hdr { color: #333; font-weight: 600; }
+
+  /* Playground input section */
+  .playgrounds-section {
+    background: #fafafa;
+    border: 1px solid #eee;
+    border-radius: 4px;
+    padding: 0.75rem 1rem;
+    min-height: 1.5rem;
+  }
+  .playground-row {
+    display: grid;
+    grid-template-columns: 140px 110px 90px 1fr;
+    gap: 0.5rem;
+    align-items: center;
+    padding: 0.35rem 0;
+    border-bottom: 1px solid #f0f0f0;
+    font-size: 0.85rem;
+  }
+  .playground-row:last-child { border-bottom: none; }
+  .playground-row .name { font-weight: 600; color: #333; }
+  .playground-row .slot-id { color: #555; font-family: ui-monospace, monospace; }
+  .playground-row select,
+  .playground-row input[type=text] {
+    font: inherit;
+    font-size: 0.85rem;
+    padding: 0.25rem 0.4rem;
+    border: 1px solid #ccc;
+    border-radius: 3px;
+    background: white;
+  }
+  .playground-row input[type=text][hidden] { display: none; }
 </style>
 </head>
 <body>
@@ -816,6 +848,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </h2>
 <div class="config-form" id="config-form">
   <div class="empty">Loading&hellip;</div>
+</div>
+
+<h2>Playground Input
+  <span class="tag">daemon-registered</span>
+</h2>
+<div class="playgrounds-section" id="playgrounds">
+  <div class="empty">No playgrounds running.</div>
 </div>
 
 <div class="progress" id="progress"></div>
@@ -834,24 +873,15 @@ const app = {
   focusKeys: new Set(),
   inFlight: new Set(),
   commitQueue: Promise.resolve(),
-  // Concurrent runs this panel started. Keyed by run_id; the value
-  // is a small record (startedAt for potential future display).
-  // Replaces the old `running: bool`. See this module's docstring,
-  // "Concurrent runs".
   activeRuns: new Map(),
   activeBatchesCount: 0,
   eventsConnected: false,
   firstPanelReceived: false,
-  // Per-client Parameters filter state:
-  //   currentWorkflow          — last workflow name seen in a state push
-  //   paramPrefixByWorkflow    — Map<workflow, prefix>, persisted to localStorage
-  //   localHandlers            — Map<name, fn> for `local_handler` fields
   currentWorkflow: "",
   paramPrefixByWorkflow: new Map(),
   localHandlers: new Map(),
 };
 
-// ---- localStorage load ----
 (function restoreParamPrefixMap() {
   try {
     const raw = localStorage.getItem("kritomatic_param_prefix_by_workflow");
@@ -878,7 +908,6 @@ function persistParamPrefixMap() {
   } catch (_) {}
 }
 
-// ---- local handler: Parameters filter prefix ----
 app.localHandlers.set("param_prefix_filter", function (prefix) {
   const wf = app.currentWorkflow;
   if (wf) {
@@ -950,13 +979,6 @@ function renderStatus(s) {
     || '<div class="empty">(no state)</div>';
 }
 
-// ---- filter the incoming description with the current workflow's prefix ----
-//
-// Returns a deep copy with `cfg-param.*` fields whose title does not
-// start with the current workflow's prefix marked `visible: false`.
-// The description the server sent is left untouched so `app.latestPanel`
-// stays as the pristine daemon view; re-filtering with a different
-// prefix works by re-calling `rebuildPanel(app.latestPanel)`.
 function _filteredDescription(description) {
   if (!description) return description;
   const prefix = app.paramPrefixByWorkflow.get(app.currentWorkflow) || "";
@@ -1074,8 +1096,6 @@ function buildFieldHtml(f) {
   if (!key) return "";
   const overridden = f.overridden ? " overridden" : "";
   const labelHtml = esc(f.label || key);
-  // `visible: false` hides the row but keeps its <input> in the DOM,
-  // so buildConfigFromWidgets / syncValues still see the value.
   const hiddenStyle = f.visible === false ? ' style="display:none;"' : "";
   let inner = "";
   const t = f.type;
@@ -1310,22 +1330,6 @@ function readAllValues() {
   return out;
 }
 
-/* ---- v2 config auto-apply (parity with the Krita docker) ----
- *
- * Config fields carry `config_path` and neither `set_command` nor a
- * section-level `commit`, so the earlier branches of commitField
- * never fire for them: edits sat in widget state and never reached
- * the daemon's `_active_config`.  The Run button — whose daemon-side
- * comfy_panel_run falls back to `_active_config` for omitted sections
- * — therefore ran with whatever the Krita docker last applied, not
- * what the web panel showed.
- *
- * Model: every config edit re-assembles the four sections from current
- * widget state and POSTs one comfy_apply_config, debounced exactly like
- * the docker's 150 ms timer.  The daemon validates the whole config at
- * once against the loaded workflow's slot tables; per-field pushes
- * would defeat that.
- */
 const APPLY_DEBOUNCE_MS = 150;
 let _applyTimer = null;
 let _applyChain = Promise.resolve();
@@ -1534,27 +1538,15 @@ async function runAction(key) {
   const cancelAll = isCancelAllItem(item);
 
   if (key === "run") {
-    // Enrich the comfy_panel_run command with the current config
-    // sections assembled from widget state. The daemon validates them
-    // inline and passes them as a kwarg to comfy_generate, so a
-    // second click's config never races the first's. See this
-    // module's docstring, "Concurrent runs".
     const cfg = buildConfigFromWidgets();
     command.resources = JSON.stringify(cfg.resources);
     command.params    = JSON.stringify(cfg.params);
     command.crop      = JSON.stringify(cfg.crop);
     command.paste     = JSON.stringify(cfg.paste);
-
-    // Intentionally NO flushPendingApply / commitQueue wait: the run
-    // embeds its own config, so the daemon does not need to read
-    // _active_config before starting. Removing the wait is what makes
-    // a second click land while the first is still preparing.
     await startRun(command);
   } else if (key === "cancel" || cancelAll) {
     await cancelRun(command, cancelAll ? "all" : "current");
   } else {
-    // Save config (and any future generic action) reads _active_config
-    // on the daemon side.  Push pending edits first.
     await flushPendingApply();
     const requestId = "action:" + key;
     await sendCommand(requestId, command, []);
@@ -1578,8 +1570,6 @@ function updateRunButtons() {
         `[data-action-key="${cssEsc(item.key)}"]`);
       if (!btn) continue;
       if (item.key === "run") {
-        // Enabled whenever a workflow is loaded. Concurrent clicks are
-        // supported by design.
         btn.disabled = !(app.latestState
                          && app.latestState.daemon
                          && app.latestState.daemon.workflow);
@@ -1601,10 +1591,6 @@ function updateRunButtons() {
 
 async function startRun(command) {
   const log = document.getElementById("progress");
-  // Do NOT clear the log: a second click while the first is
-  // in-flight must not wipe the first run's progress lines.
-  // Per-run completion lines are appended with the run id prefix.
-
   let resp;
   try {
     resp = await fetch("/api/run", {
@@ -1689,6 +1675,210 @@ function handleRunEvent(e) {
   }
 }
 
+// ---------------------------------------------------------------------
+// Playground input section
+// ---------------------------------------------------------------------
+//
+// Each (playground, slot) pair gets its own row.  The slot's `id` (an
+// `@`-prefixed name like `@thelayout`) is the display — no separate
+// label field.  Playground name is shown only on the first slot row
+// of each playground.  Rows are keyed by (pid, slot_id) for
+// diff-based updates.
+
+const LAYER_SOURCES = ["active", "global", "layer"];
+
+function _rowKey(pid, sid) {
+  return pid + "::" + sid;
+}
+
+function renderPlaygrounds(playgrounds) {
+  if (!Array.isArray(playgrounds)) playgrounds = [];
+  const container = document.getElementById("playgrounds");
+  if (!container) return;
+
+  // Build desired set of (pid, slot_id) keys.
+  const desired = new Map();
+  for (const p of playgrounds) {
+    if (!p || !p.id) continue;
+    const slots = p.layer_slots || [];
+    for (let i = 0; i < slots.length; i++) {
+      const slot = slots[i];
+      if (!slot || !slot.id) continue;
+      desired.set(_rowKey(p.id, slot.id), {
+        playground: p,
+        slot: slot,
+        show_name: (i === 0),
+      });
+    }
+  }
+
+  if (desired.size === 0) {
+    if (container.querySelector(".playground-row")) {
+      container.innerHTML =
+        '<div class="empty">No playgrounds running.</div>';
+    }
+    return;
+  }
+
+  // Remove placeholder.
+  const placeholder = container.querySelector(".empty");
+  if (placeholder) placeholder.remove();
+
+  // Track existing rows.
+  const existing = new Map();
+  for (const row of container.querySelectorAll(".playground-row")) {
+    const pid = row.getAttribute("data-playground-id");
+    const sid = row.getAttribute("data-slot-id");
+    if (pid && sid) existing.set(_rowKey(pid, sid), row);
+  }
+
+  // Remove vanished rows.
+  for (const [key, row] of existing) {
+    if (!desired.has(key)) {
+      row.remove();
+      existing.delete(key);
+    }
+  }
+
+  // Add or update present rows.
+  for (const [key, meta] of desired) {
+    let row = existing.get(key);
+    if (!row) {
+      row = createPlaygroundRow(meta.playground, meta.slot, meta.show_name);
+      container.appendChild(row);
+      existing.set(key, row);
+    }
+    syncPlaygroundRow(row, meta.playground, meta.slot);
+  }
+}
+
+function createPlaygroundRow(p, slot, show_name) {
+  const pid = p.id;
+  const sid = slot.id;
+  const pname = p.name || pid || "?";
+
+  const row = document.createElement("div");
+  row.className = "playground-row";
+  row.setAttribute("data-playground-id", pid);
+  row.setAttribute("data-slot-id", sid);
+
+  const nameSpan = document.createElement("span");
+  nameSpan.className = "name";
+  nameSpan.textContent = show_name ? pname : "";
+  row.appendChild(nameSpan);
+
+  // The slot id IS the display name — no separate label.
+  const slotSpan = document.createElement("span");
+  slotSpan.className = "slot-id";
+  slotSpan.textContent = sid;
+  slotSpan.title = "Slot " + sid + " of " + pname;
+  row.appendChild(slotSpan);
+
+  const select = document.createElement("select");
+  select.setAttribute("data-playground-source", _rowKey(pid, sid));
+  for (const opt of LAYER_SOURCES) {
+    const o = document.createElement("option");
+    o.value = opt;
+    o.textContent = opt;
+    select.appendChild(o);
+  }
+  row.appendChild(select);
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.setAttribute("data-playground-layer", _rowKey(pid, sid));
+  input.placeholder = "layer name";
+  row.appendChild(input);
+
+  // Handlers.
+  select.addEventListener("change", () => {
+    const source = select.value;
+    input.hidden = (source !== "layer");
+    row.dataset.editing = "1";
+    const layerName = (source === "layer") ? input.value.trim() : "";
+    sendPlaygroundSetLayer(pid, sid, source, layerName);
+  });
+  input.addEventListener("change", () => {
+    if (select.value !== "layer") return;
+    row.dataset.editing = "1";
+    sendPlaygroundSetLayer(pid, sid, "layer", input.value.trim());
+  });
+
+  return row;
+}
+
+function syncPlaygroundRow(row, p, slot) {
+  const pid = p.id;
+  const sid = slot.id;
+
+  const selector = slot.selector || {};
+  const source = selector.source || "active";
+  const layerName = selector.layer_name || "";
+
+  const nameSpan = row.querySelector(".name");
+  if (nameSpan && nameSpan.textContent) {
+    const newName = p.name || pid || "";
+    if (nameSpan.textContent !== newName) {
+      nameSpan.textContent = newName;
+    }
+  }
+
+  const slotSpan = row.querySelector(".slot-id");
+  if (slotSpan && slotSpan.textContent !== sid) {
+    slotSpan.textContent = sid;
+  }
+
+  const select = row.querySelector("[data-playground-source]");
+  const input = row.querySelector("[data-playground-layer]");
+  if (!select || !input) return;
+
+  if (row.dataset.editing === "1") {
+    if (select.value === source) {
+      delete row.dataset.editing;
+    } else {
+      return;
+    }
+  }
+
+  if (select.value !== source && select !== document.activeElement) {
+    select.value = source;
+  }
+  if (input !== document.activeElement && input.value !== layerName) {
+    input.value = layerName;
+  }
+  input.hidden = (source !== "layer");
+}
+
+async function sendPlaygroundSetLayer(pid, sid, source, layerName) {
+  const command = {
+    type: "playground_set_layer",
+    id: pid,
+    slot_id: sid,
+    source: source,
+    layer_name: (source === "layer") ? layerName : "",
+  };
+  try {
+    const resp = await fetch("/api/command", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({command: command}),
+    });
+    if (!resp.ok) {
+      let msg = "HTTP " + resp.status;
+      try { const b = await resp.json(); if (b && b.error) msg = b.error; } catch (_) {}
+      console.error("playground_set_layer failed:", msg);
+      const row = document.querySelector(
+        `[data-playground-id="${cssEsc(pid)}"][data-slot-id="${cssEsc(sid)}"]`);
+      if (row) delete row.dataset.editing;
+    }
+  } catch (e) {
+    console.error("playground_set_layer network error:", e.message);
+    const row = document.querySelector(
+      `[data-playground-id="${cssEsc(pid)}"][data-slot-id="${cssEsc(sid)}"]`);
+    if (row) delete row.dataset.editing;
+  }
+}
+
 function connectEvents() {
   const es = new EventSource("/api/events");
 
@@ -1704,10 +1894,6 @@ function connectEvents() {
       const wfChanged = wf !== app.currentWorkflow;
       app.currentWorkflow = wf;
       if (wfChanged && app.latestPanel) {
-        // Workflow changed: re-render using the new workflow's saved
-        // prefix.  Done before the panel push that accompanies the
-        // workflow change so the params appear correctly filtered on
-        // that first render.
         rebuildPanel(app.latestPanel);
       }
       const batches = (s && s.daemon
@@ -1716,6 +1902,11 @@ function connectEvents() {
       app.activeBatchesCount = batches;
       updateRunButtons();
       renderStatus(s);
+      if (s && s.daemon && Array.isArray(s.daemon.playgrounds)) {
+        renderPlaygrounds(s.daemon.playgrounds);
+      } else {
+        renderPlaygrounds([]);
+      }
     } catch (err) {
       console.error("state parse error", err);
     }

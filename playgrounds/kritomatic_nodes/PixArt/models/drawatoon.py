@@ -30,16 +30,17 @@
 #  * `forward` is overridden to make sure `**kwargs` reaches `forward_raw`,
 #    otherwise `ip_hidden_states` / `ip_attention_mask` get dropped by the
 #    parent `PixArtMS.forward` and layout conditioning silently no-ops.
-#  * `forward_raw` moves `ip_hidden_states` / `ip_attention_mask` to `x.device`
-#    and broadcasts single-sample ip conds (as produced by the
+#  * `forward_raw` moves `ip_hidden_states` / `ip_attention_mask` to
+#    `x.device` and broadcasts single-sample ip conds (as produced by the
 #    `DrawatoonSetIP` node) to the latent batch size. This lets the cond
 #    metadata carry CPU-resident tensors that come from an offloaded model
 #    without erroring at attention time.
-#  * `USE_DEFAULT_LAYOUT` controls what happens when NO layout conds are
-#    wired (no `DrawatoonSetIP` node used). True uses a synthetic 7-token
-#    layout; False uses the author's `void_ip_embed`. Once the user wires
-#    `DrawatoonSetIP`, this attribute is irrelevant — `ip_hidden_states`
-#    arrives via kwargs and the branch is skipped.
+#  * When NO `ip_hidden_states` is supplied (no `DrawatoonSetIP` on this
+#    branch), `forward_raw` builds the ip tokens from empty bbox lists.
+#    `IPAdapter.forward` on an empty sample emits a single
+#    `void_ip_embed` token — the trained "no layout" case, which is
+#    exactly what CFG subtraction needs on an uncond branch that was
+#    left unwired.
 #  * In `DrawatoonMSBlock.forward` the text cross-attn and the ip cross-attn
 #    are computed from the SAME `x` input (parallel), matching the author's
 #    patched block which does:
@@ -274,10 +275,6 @@ class DrawatoonMSBlock(PixArtMSBlock):
 # ---------------------------------------------------------------------------
 class DrawatoonMS(PixArtMS):
 
-    # Only relevant when NO DrawatoonSetIP node is wired (ip_hidden_states
-    # arrives via kwargs otherwise, and this branch is skipped).
-    USE_DEFAULT_LAYOUT = True
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.ip_adapter = IPAdapter()
@@ -305,12 +302,6 @@ class DrawatoonMS(PixArtMS):
 
             new_blocks.append(nb)
         self.blocks = new_blocks
-
-    def _default_layout(self, bs):
-        text_bboxes = [[[0.10, 0.02, 0.90, 0.12]] for _ in range(bs)]
-        character_bboxes = [[[0.30, 0.15, 0.70, 0.90]] for _ in range(bs)]
-        reference_embeddings = [[None] for _ in range(bs)]
-        return text_bboxes, character_bboxes, reference_embeddings
 
     def forward(self, x, timesteps, context, img_hw=None, aspect_ratio=None, **kwargs):
         bs = x.shape[0]
@@ -363,43 +354,32 @@ class DrawatoonMS(PixArtMS):
         Same signature as PixArtMS.forward_raw, but accepts and forwards the
         drawatoon layout conditions.
 
-        If `ip_hidden_states` is None (no DrawatoonSetIP wired), behaviour
-        depends on USE_DEFAULT_LAYOUT:
-          * True  -> synth a 7-token layout per sample
-          * False -> empty bboxes -> IPAdapter returns `void_ip_embed`
+        If `ip_hidden_states` is None (no `DrawatoonSetIP` on this branch),
+        empty bbox lists are fed to `IPAdapter`, which emits a single
+        `void_ip_embed` token per sample — the trained no-layout case.
+        That is the correct value for CFG subtraction on an unwired
+        uncond branch.
 
-        If `ip_hidden_states` IS provided (via DrawatoonSetIP), it's used
-        directly. Single-sample tensors are broadcast to the latent batch.
+        If `ip_hidden_states` IS provided (via `DrawatoonSetIP`), it's
+        used directly.  Single-sample tensors are broadcast to the latent
+        batch.
         """
         if ip_hidden_states is None:
             bs = x.shape[0]
-            no_layout_given = (
-                text_bboxes is None
-                and character_bboxes is None
-                and reference_embeddings is None
-            )
-            if no_layout_given and self.USE_DEFAULT_LAYOUT:
-                print(
-                    "[DrawatoonMS] no layout given; using default "
-                    "(caption top + character centre, 7 tokens/sample)"
-                )
-                text_bboxes, character_bboxes, reference_embeddings = \
-                    self._default_layout(bs)
-            else:
-                if text_bboxes is None:
-                    text_bboxes = [[] for _ in range(bs)]
-                if character_bboxes is None:
-                    character_bboxes = [[] for _ in range(bs)]
-                if reference_embeddings is None:
-                    reference_embeddings = [[] for _ in range(bs)]
+            if text_bboxes is None:
+                text_bboxes = [[] for _ in range(bs)]
+            if character_bboxes is None:
+                character_bboxes = [[] for _ in range(bs)]
+            if reference_embeddings is None:
+                reference_embeddings = [[] for _ in range(bs)]
             with torch.no_grad():
                 ip_hidden_states, ip_attention_mask = self.ip_adapter(
                     text_bboxes, character_bboxes, reference_embeddings, False
                 )
 
-        # Device alignment + single-sample broadcast. The DrawatoonSetIP node
-        # may produce [1, L, C] tensors on CPU (if the model is offloaded at
-        # node-execution time); the sampler runs on GPU. Align and broadcast.
+        # Device alignment + single-sample broadcast. The DrawatoonSetIP
+        # node may produce [1, L, C] tensors on CPU (if the model is
+        # offloaded at node-execution time); the sampler runs on GPU.
         if ip_hidden_states is not None:
             ip_hidden_states = ip_hidden_states.to(x.device)
             ip_attention_mask = ip_attention_mask.to(x.device)

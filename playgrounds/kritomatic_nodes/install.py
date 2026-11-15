@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """Symlink this directory (kritomatic_nodes) into a ComfyUI install.
 
-The script lives inside kritomatic_nodes/, so its own location is the
-source.  No need to look up a git root — just resolve the script's
-parent and link it in.
+One pack, one symlink. All nodes register through comfy_entrypoint().
 
     python kritomatic_nodes/install.py
 
 To point at a non-default ComfyUI install, either edit COMFYUI_PATH
-below or set the COMFYUI_DIR environment variable.  COMFYUI_PATH
-wins if both are set.
+below or set the COMFYUI_DIR environment variable. COMFYUI_PATH wins
+if both are set.
 """
 import os
 import shutil
@@ -43,6 +41,13 @@ def main() -> int:
         print("Edit COMFYUI_PATH at the top of this script, or set "
               "COMFYUI_DIR (e.g. /mnt/models/ComfyUI).", file=sys.stderr)
         return 1
+
+    # Remove old split symlinks if they exist.
+    for stale in ("kritomatic_nodes_v1", "kritomatic_nodes_v3"):
+        p = dst.parent / stale
+        if p.is_symlink():
+            p.unlink()
+            print(f"removed old split symlink {p}")
 
     if dst.is_symlink():
         dst.unlink()

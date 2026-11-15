@@ -196,6 +196,27 @@ PG_PANEL_BODY = r"""
     </details>
 
     <details class="section" open>
+      <summary>Generation Frame</summary>
+      <div class="section-body">
+        <div class="field">
+          <label>Ratio</label>
+          <select id="viewerRatio"></select>
+        </div>
+        <div class="runHint">
+          Drag the frame on the canvas to reposition it. Resize from
+          any of its four corners. Bboxes inside the frame are what
+          gets generated.
+        </div>
+        <div class="runHint">
+          drawatoon is a 512-px model; the workflow is pinned to
+          <code>PixArtMS_Sigma_XL_2_512</code>. All ratios fit within
+          that fixed 262,144-pixel budget — resizing the frame does not
+          change output dimensions.
+        </div>
+      </div>
+    </details>
+
+    <details class="section" open>
       <summary>Layout</summary>
       <div class="section-body">
         <div class="row">
@@ -208,7 +229,7 @@ PG_PANEL_BODY = r"""
         </div>
         <div class="row">
           <button id="seedDefaultBtn"
-                  title="Populate with the default layout (caption top + character centre). This matches the model's training-time default."
+                  title="Populate with the default layout (caption top + character centre)."
                   disabled>Seed default</button>
           <button id="clearBboxesBtn"
                   title="Remove all text and character bboxes."
@@ -216,13 +237,8 @@ PG_PANEL_BODY = r"""
         </div>
         <div id="bboxList" class="bboxList"></div>
         <div class="runHint">
-          Drag a bbox to move it. Drag a corner or edge handle of the
-          selected bbox to resize it. Click an empty area to deselect.
-        </div>
-        <div class="runHint">
-          Reference embeddings are currently always
-          <code>null</code> — the model invents the character. MAGI
-          character-encoder support is future work.
+          Drag a bbox to move it within the frame. Drag a corner or
+          edge handle of the selected bbox to resize it.
         </div>
       </div>
     </details>
@@ -236,10 +252,9 @@ PG_PANEL_BODY = r"""
           <code id="stateVersion">—</code>
         </div>
         <div class="runHint" style="margin-top:6px;">
-          drawatoon is a <strong>512-px model</strong>. In the sampler
-          workflow use <code>PixArtResolutionSelect</code> with
-          <code>model = PixArtMS_Sigma_XL_2_512</code>. 1024×1024 will
-          produce blocky output.
+          In the sampler workflow use <code>PlaygroundResolutionSelect</code>
+          instead of <code>PixArtResolutionSelect</code> to use the
+          frame's ratio automatically.
         </div>
         <div id="statusLine">idle</div>
       </div>

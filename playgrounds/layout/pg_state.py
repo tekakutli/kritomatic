@@ -1,7 +1,26 @@
-"""Layout state: image, bboxes, view, drag.
+"""Layout state: image, viewer, bboxes, view, drags.
 
-Leaf module — no imports from other project modules.  Every bbox is
-stored as `{ x, y, w, h }` in normalized [0,1] coordinates.
+Leaf module — no imports from other project modules.
+
+Coordinate systems
+==================
+  · Canvas image pixels     — what `screenToImage()` returns. Range [0, W]×[0, H].
+  · Canvas-normalized       — [0, 1] of canvas image (x / W, y / H).
+  · Viewer-normalized       — [0, 1] of the viewer rectangle. What the model receives.
+
+The viewer is stored as `{x, y, w, h}` in canvas-normalized coords.
+Bboxes are stored as `{x, y, w, h}` in viewer-normalized coords. So
+dragging the viewer carries all bboxes with it (their canvas position
+is `viewer.pos + bbox.pos * viewer.size`); dragging a bbox moves it
+within the frame while the frame stays put.
+
+Image loading has two paths:
+  · `setImage` — full reset. Clear bboxes, reset viewer to fit, reset
+    view. Used when the user explicitly loads a new image (pick file,
+    import from Krita).
+  · `applyCanvasImage` — partial update. Preserve bboxes, reset viewer
+    only when image dims change, preserve view. Used by autosync and
+    the manual "Refresh @thelayout" button.
 """
 
 STATE_JS = r"""
@@ -17,7 +36,9 @@ let _dpr = window.devicePixelRatio || 1;
 export const view = { zoom: 1, panX: 0, panY: 0 };
 
 export function resetView() {
-  view.zoom = 1; view.panX = 0; view.panY = 0;
+  view.zoom = 1;
+  view.panX = 0;
+  view.panY = 0;
 }
 
 export function clampPan() {
@@ -59,15 +80,22 @@ export const board = {
   imageEl:      null,
   imageDataUrl: null,
 
-  textBboxes:          [],   // [{ x, y, w, h }]
-  characterBboxes:     [],   // [{ x, y, w, h }]
-  referenceEmbeddings: [],   // [null | [768 floats]]
+  // Viewer rectangle: normalized [0, 1] of canvas.
+  viewer: {
+    x: 0.05, y: 0.05, w: 0.9, h: 0.9,
+    model: "PixArtMS_Sigma_XL_2_512",
+    ratio: "1.00",
+  },
 
-  selectedKind:  null,       // 'text' | 'character' | null
+  // Bboxes are normalized [0, 1] OF VIEWER, not of canvas.
+  textBboxes:          [],
+  characterBboxes:     [],
+  referenceEmbeddings: [],
+
+  selectedKind:  null,
   selectedIdx:   -1,
-
-  hoveredKind:  null,
-  hoveredIdx:   -1,
+  hoveredKind:   null,
+  hoveredIdx:    -1,
 
   dragActive:    false,
   dragHandle:    null,
@@ -77,8 +105,49 @@ export const board = {
   dragStartIx:   0,
   dragStartIy:   0,
 
+  viewerDragActive:  false,
+  viewerDragHandle:  null,
+  viewerDragStart:   null,
+  viewerDragStartIx: 0,
+  viewerDragStartIy: 0,
+
   mouse: { x: 0, y: 0, inside: false },
 };
+
+/* ============================================================
+   Viewer aspect / fit helpers
+   ============================================================ */
+
+export function viewerAspect() {
+  const r = parseFloat(board.viewer.ratio);
+  return (isFinite(r) && r > 0) ? r : 1.0;
+}
+
+export function resetViewerToFit() {
+  const v = board.viewer;
+  const r = viewerAspect();
+  const cw = board.imageWidth;
+  const ch = board.imageHeight;
+  if (!cw || !ch) return;
+
+  // Try 90% of the height first; fall back to 90% of width if too wide.
+  const targetPxH_fromH = 0.9 * ch;
+  const targetPxW_fromH = targetPxH_fromH * r;
+  if (targetPxW_fromH <= 0.9 * cw) {
+    v.h = 0.9;
+    v.w = targetPxW_fromH / cw;
+  } else {
+    v.w = 0.9;
+    v.h = (0.9 * cw) / (r * ch);
+  }
+  v.x = (1 - v.w) / 2;
+  v.y = (1 - v.h) / 2;
+  _scheduleDraw();
+}
+
+/* ============================================================
+   Image loading
+   ============================================================ */
 
 export function setImage(hash, dataUrl, width, height) {
   board.imageHash    = hash;
@@ -93,6 +162,38 @@ export function setImage(hash, dataUrl, width, height) {
   img.src = dataUrl;
 
   resetView();
+  board.textBboxes          = [];
+  board.characterBboxes     = [];
+  board.referenceEmbeddings = [];
+  board.selectedKind = null;
+  board.selectedIdx  = -1;
+  board.hoveredKind  = null;
+  board.hoveredIdx   = -1;
+  resetViewerToFit();
+  _scheduleDraw();
+}
+
+export function applyCanvasImage(hash, dataUrl, width, height) {
+  const dimsMatch = (
+    board.imageWidth === width && board.imageHeight === height
+  );
+
+  board.imageHash    = hash;
+  board.imageDataUrl = dataUrl;
+  board.imageWidth   = width;
+  board.imageHeight  = height;
+
+  const img = new Image();
+  img.onload = () => {
+    board.imageEl = img;
+    if (!dimsMatch) {
+      // New aspect/size invalidates viewer position; reset it.
+      resetViewerToFit();
+    }
+    _scheduleDraw();
+  };
+  img.onerror = () => { board.imageEl = null; _scheduleDraw(); };
+  img.src = dataUrl;
   _scheduleDraw();
 }
 
@@ -103,13 +204,14 @@ export function clearImage() {
   board.imageHeight  = 0;
   board.imageEl      = null;
   resetView();
-  board.textBboxes       = [];
-  board.characterBboxes  = [];
+  board.textBboxes          = [];
+  board.characterBboxes     = [];
   board.referenceEmbeddings = [];
   board.selectedKind = null;
   board.selectedIdx  = -1;
   board.hoveredKind  = null;
   board.hoveredIdx   = -1;
+  resetViewerToFit();
   _scheduleDraw();
 }
 
@@ -187,6 +289,31 @@ export function selectBbox(kind, idx) {
     board.selectedIdx = idx;
   }
   _scheduleDraw();
+}
+
+/* ============================================================
+   Coordinate conversions
+   ============================================================ */
+
+/* canvas image pixels → viewer-normalized [0,1] */
+export function canvasPxToViewerNorm(cx, cy) {
+  const v = board.viewer;
+  const vPxX = v.x * board.imageWidth;
+  const vPxY = v.y * board.imageHeight;
+  const vPxW = v.w * board.imageWidth;
+  const vPxH = v.h * board.imageHeight;
+  if (!vPxW || !vPxH) return [0, 0];
+  return [(cx - vPxX) / vPxW, (cy - vPxY) / vPxH];
+}
+
+/* viewer-normalized [0,1] → canvas image pixels */
+export function viewerNormToCanvasPx(vnx, vny) {
+  const v = board.viewer;
+  const vPxX = v.x * board.imageWidth;
+  const vPxY = v.y * board.imageHeight;
+  const vPxW = v.w * board.imageWidth;
+  const vPxH = v.h * board.imageHeight;
+  return [vPxX + vnx * vPxW, vPxY + vny * vPxH];
 }
 
 /* ============================================================

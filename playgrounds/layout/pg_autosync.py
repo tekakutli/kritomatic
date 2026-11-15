@@ -1,33 +1,7 @@
-"""Layer-slot autosync.
-
-Polls the playground server's `/active_state` every 500 ms while the
-tab is visible.  Finds our playground entry (`id == "layout"`), then
-our slot within it (`id == "@thelayout"`), and re-fetches the
-selected layer via `/resource_image` whenever the slot's selector
-changes.
-
-The selector is edited by the docker's "Playground Input" section;
-the playground only reads it.  Bootstrap: on the first poll, if no
-image is loaded yet, fetch the current selector's image so the
-canvas starts populated.
-
-The exported `fetchSelectedLayer(selector)` is reused by the manual
-"Refresh @thelayout" button in `pg_panel.js`.
-
-Self-heal on missing entry: if the playground's entry (or its slot)
-is absent from `comfy_status.playgrounds`, the browser calls
-`/playground_reregister` (single-shot, non-blocking).  The next poll
-(500 ms later) sees the re-registered entry and resumes.
-
-Daemon-down: when `/active_state` reports `daemon_reachable: false`,
-the poller flashes a warning after a few consecutive failures.  The
-playground *process* exits on its own after ~10s of daemon-down
-(layout_playground.py's `_watch_daemon_and_exit`); the browser cannot
-survive the server's death regardless.
-"""
+"""Layer-slot autosync — preserves viewer + bboxes on layer refresh."""
 
 AUTOSYNC_JS = r"""
-import { board, setImage } from "./pg_state.js";
+import { board, applyCanvasImage } from "./pg_state.js";
 import { fetchActiveState, fetchResourceImage } from "./pg_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
 
@@ -63,7 +37,7 @@ export async function fetchSelectedLayer(selector) {
     );
     return;
   }
-  setImage(
+  applyCanvasImage(
     img.hash || ("layer_" + Date.now()),
     img.data_url, img.width, img.height,
   );

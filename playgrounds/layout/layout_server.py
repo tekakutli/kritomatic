@@ -9,25 +9,22 @@
   POST /upload_image           raw body (image file)
   POST /playground_reregister  single-shot re-register with the daemon
 
-The layout playground declares one layer slot on register —
-`@thelayout` — and reads that slot's selector from
-`comfy_status.playgrounds` to know which layer to display.
-`LAYER_SLOTS` is the canonical declaration; it is used by both the
-initial register and the browser-triggered re-register.
-
 Lock discipline
 ===============
-`_state_lock` is an `RLock`, and the canonical accessor for reading
-current state is `_read_state_snapshot()`, which acquires the lock
-once and returns a plain dict copy.  Handlers call it and build their
-response from the copy; **no handler holds `_state_lock` while calling
-another function that might also want it**.  The GET path in
-`handle_state` was the previous deadlock: it took `_state_lock` and
-then called `_public_state()`, which took the same lock again — the
-`threading.Lock` deadlocked on the second acquire and every `/state`
-and `/version` after that blocked forever.  Switching to `RLock`
-prevents the immediate crash; restructuring the accessor prevents it
-from coming back on the next edit.
+`_state_lock` is an `RLock`.  The canonical accessor is
+`_read_state_snapshot()`, which acquires the lock once and returns a
+plain dict copy.  Handlers build their response from the copy; no
+handler holds `_state_lock` while calling another function that might
+also want it.
+
+Model is fixed
+==============
+`viewer.model` is pinned to `PixArtMS_Sigma_XL_2_512` on this server
+regardless of what the browser POSTs.  drawatoon is a 512-px model;
+there is no user-facing model choice.  The panel doesn't send a model
+field at all.  If a future fine-tune needs a different preset, change
+`_DEFAULT_VIEWER["model"]` here (and the corresponding hardcoded
+value in `pg_state.js`, only used for display).
 """
 
 import base64
@@ -48,9 +45,6 @@ PLAYGROUND_ID   = "layout"
 PLAYGROUND_NAME = "Layout Editor"
 PLAYGROUND_PORT = 8777
 
-# The canonical slot declaration for this playground.  The daemon
-# stores per-slot selectors keyed by `slot_id`; the docker and web
-# panel render one row per slot.  See `handlers/playgrounds.py`.
 LAYER_SLOTS = [
     {
         "id":                "@thelayout",
@@ -58,14 +52,14 @@ LAYER_SLOTS = [
     },
 ]
 
-# Convenience constant for this playground's single slot id.
 SLOT_ID = "@thelayout"
 
-# RLock (reentrant).  The previous `threading.Lock` deadlocked in
-# `handle_state`'s GET path: it acquired the lock, called
-# `_public_state()` which acquired the lock again on the same thread.
-# RLock lets the same thread re-enter; the restructure below also
-# avoids the re-entry.  See the module docstring, "Lock discipline".
+_DEFAULT_VIEWER = {
+    "x": 0.05, "y": 0.05, "w": 0.9, "h": 0.9,
+    "model": "PixArtMS_Sigma_XL_2_512",
+    "ratio": "1.00",
+}
+
 _state_lock = threading.RLock()
 _state      = None
 _version    = ""
@@ -81,18 +75,11 @@ def _default_state():
         "character_bboxes":     [],
         "reference_embeddings": [],
         "image_dims":           [0, 0],
+        "viewer":               dict(_DEFAULT_VIEWER),
     }
 
 
 def _read_state_snapshot():
-    """Return (state_dict, version_str).  Acquires the lock once.
-
-    Callers build their response from the returned copy without
-    holding the lock.  This is the only accessor handlers should use
-    to read current state; the old `_public_state()` helper took the
-    lock itself and was the deadlock source when called from a
-    locked section.
-    """
     with _state_lock:
         if _state is None:
             return _default_state(), _version
@@ -113,6 +100,30 @@ def _safe_bbox(raw):
     if x2 <= x1 or y2 <= y1:
         return None
     return [x1, y1, x2, y2]
+
+
+def _normalize_viewer(raw):
+    raw = raw if isinstance(raw, dict) else {}
+    try:
+        vx = max(0.0, min(1.0, float(raw.get("x", _DEFAULT_VIEWER["x"]))))
+        vy = max(0.0, min(1.0, float(raw.get("y", _DEFAULT_VIEWER["y"]))))
+        vw = max(0.01, min(1.0, float(raw.get("w", _DEFAULT_VIEWER["w"]))))
+        vh = max(0.01, min(1.0, float(raw.get("h", _DEFAULT_VIEWER["h"]))))
+    except (TypeError, ValueError):
+        vx, vy, vw, vh = (
+            _DEFAULT_VIEWER["x"], _DEFAULT_VIEWER["y"],
+            _DEFAULT_VIEWER["w"], _DEFAULT_VIEWER["h"],
+        )
+    if vx + vw > 1.0:
+        vw = max(0.01, 1.0 - vx)
+    if vy + vh > 1.0:
+        vh = max(0.01, 1.0 - vy)
+
+    # Model is pinned — see module docstring.  Ratio is user-driven.
+    model = _DEFAULT_VIEWER["model"]
+    ratio = str(raw.get("ratio") or _DEFAULT_VIEWER["ratio"])
+    return {"x": vx, "y": vy, "w": vw, "h": vh,
+            "model": model, "ratio": ratio}
 
 
 def _normalize_state(raw):
@@ -151,6 +162,7 @@ def _normalize_state(raw):
         "character_bboxes":     char_bboxes,
         "reference_embeddings": refs,
         "image_dims":           dims,
+        "viewer":               _normalize_viewer(raw.get("viewer")),
     }
 
 
@@ -175,14 +187,13 @@ def handle_state(payload):
         with _state_lock:
             _state = normalized
             _version = new_version
+        v = normalized["viewer"]
         _log(f"state set: text={len(normalized['text_bboxes'])} "
              f"char={len(normalized['character_bboxes'])} "
+             f"viewer={v['ratio']} "
              f"v{new_version[:8]}")
         return {"success": True, "version": new_version}
 
-    # GET path: snapshot once, respond outside the lock.  The previous
-    # version acquired the lock and then called a helper that acquired
-    # it again, deadlocking on the first GET.
     state_snapshot, version_snapshot = _read_state_snapshot()
     return {
         "success": True,
@@ -192,16 +203,12 @@ def handle_state(payload):
 
 
 def handle_version(_payload):
-    # Snapshot under lock, respond outside it.  No re-entry, no
-    # deadlock, and the response shape is unchanged.
     with _state_lock:
         version = _version
     return {"success": True, "version": version}
 
 
 def handle_playground_reregister(_payload):
-    """Single-shot re-register, called by the browser when the daemon's
-    registry no longer contains our entry.  Never blocks."""
     url = f"http://127.0.0.1:{PLAYGROUND_PORT}"
     ok = playground_registry.reregister_once(
         PLAYGROUND_ID, PLAYGROUND_NAME, url, PLAYGROUND_PORT,
@@ -215,7 +222,6 @@ def handle_playground_reregister(_payload):
 # ---------------------------------------------------------------------------
 
 def _fetch_active_state():
-    """Return (data, err) where err is None on success."""
     try:
         resp = krita_client.send({"type": "comfy_status"}, timeout=10.0)
     except Exception as e:

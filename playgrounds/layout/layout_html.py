@@ -2,15 +2,16 @@
 
 import sys
 
-from .pg_base      import PG_CSS, PG_PANEL_BODY
-from .pg_tuning    import TUNING_JS
-from .pg_state     import STATE_JS
-from .pg_client    import CLIENT_JS
-from .pg_view      import VIEW_JS
-from .pg_view_image import VIEW_IMAGE_JS
-from .pg_dispatch  import DISPATCH_JS
-from .pg_panel     import PANEL_JS
-from .pg_autosync  import AUTOSYNC_JS
+from .pg_base        import PG_CSS, PG_PANEL_BODY
+from .pg_tuning      import TUNING_JS
+from .pg_state       import STATE_JS
+from .pg_client      import CLIENT_JS
+from .pg_view        import VIEW_JS
+from .pg_view_image  import VIEW_IMAGE_JS
+from .pg_viewer      import VIEWER_JS
+from .pg_dispatch    import DISPATCH_JS
+from .pg_panel       import PANEL_JS
+from .pg_autosync    import AUTOSYNC_JS
 
 from pgkit.html_shell import page
 from pgkit.js_check   import JsSyntaxError
@@ -43,7 +44,7 @@ try {
   setPanelDraw(draw);
   setRemoteDraw(draw);
   setRemoteSelect((level, name) => {
-    // Not implementing row selection via remote for now.
+    // Row selection via remote not implemented for now.
     return false;
   });
   setRemoteDeselect(() => {
@@ -71,6 +72,7 @@ _MODULE_SOURCES = {
     "pg_client.js":         CLIENT_JS,
     "pg_view.js":           VIEW_JS,
     "pg_view_image.js":     VIEW_IMAGE_JS,
+    "pg_viewer.js":         VIEWER_JS,
     "pg_dispatch.js":       DISPATCH_JS,
     "pg_panel.js":          PANEL_JS,
     "pg_autosync.js":       AUTOSYNC_JS,

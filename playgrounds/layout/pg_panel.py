@@ -1,17 +1,16 @@
-"""Panel: bbox list rendering, buttons, and state sync.
+"""Panel: bbox list, buttons, ratio dropdown, state sync.
 
-The `Refresh @thelayout` button re-fetches the layer selected at
-slot `@thelayout` — the same layer autosync tracks.  It reuses
-`fetchSelectedLayer` from `pg_autosync.js`, so both paths go through
-one implementation.
-
-Every other button is unchanged from the previous design.
+`board.viewer.model` is hardcoded to `"PixArtMS_Sigma_XL_2_512"` in
+`pg_state.js` — drawatoon is a 512-px model, the model choice is not
+user-facing.  The ratio dropdown is the only Frame control the user
+sees.
 """
 
 PANEL_JS = r"""
 import {
-  board, setImage, clearImage,
+  board, setImage, applyCanvasImage, clearImage,
   addBbox, deleteBbox, clearAllBboxes, seedDefault, selectBbox,
+  resetViewerToFit,
 } from "./pg_state.js";
 import {
   uploadImageFile, importFromKrita, checkKritaStatus,
@@ -24,8 +23,25 @@ import { pgkitNotifyAll } from "./pgkit/remote_client.js";
 const PLAYGROUND_ID = "layout";
 const SLOT_ID       = "@thelayout";
 
+// Mirror of pixart_res table keys.  Kept in sync with
+// kritomatic_nodes/PixArt/conf.py — node uses exact dims, this list
+// is only used to populate the dropdown and compute display aspect
+// via float(ratio).
+const RATIO_KEYS = [
+  "0.25", "0.26", "0.27", "0.28",
+  "0.32", "0.33", "0.35", "0.40",
+  "0.42", "0.48", "0.50", "0.52",
+  "0.57", "0.60", "0.68", "0.72",
+  "0.78", "0.82", "0.88", "0.94",
+  "1.00", "1.07", "1.13", "1.21",
+  "1.29", "1.38", "1.46", "1.67",
+  "1.75", "2.00", "2.09", "2.40",
+  "2.50", "2.89", "3.00", "3.11",
+  "3.62", "3.75", "3.88", "4.00",
+];
+
 /* ============================================================
-   State sync (debounced POST to /state)
+   State sync
    ============================================================ */
 
 let _syncTimer = null;
@@ -37,6 +53,7 @@ function _stateSnapshot() {
     c: board.characterBboxes,
     r: board.referenceEmbeddings,
     d: [board.imageWidth, board.imageHeight],
+    v: board.viewer,
   });
 }
 
@@ -52,6 +69,14 @@ function _buildPayload() {
       character_bboxes:     toWire(board.characterBboxes),
       reference_embeddings: board.referenceEmbeddings.map(r => r || null),
       image_dims:           [board.imageWidth, board.imageHeight],
+      viewer: {
+        x: board.viewer.x,
+        y: board.viewer.y,
+        w: board.viewer.w,
+        h: board.viewer.h,
+        model: board.viewer.model,
+        ratio: board.viewer.ratio,
+      },
     },
   };
 }
@@ -103,7 +128,7 @@ async function _doStateSync() {
 window._layoutOnDragEnd = _scheduleStateSync;
 
 /* ============================================================
-   Bbox list rendering
+   Bbox list
    ============================================================ */
 
 function _renderBboxList() {
@@ -145,9 +170,9 @@ function _renderBboxList() {
 
     const dims = document.createElement("span");
     dims.className = "bboxDims";
-    const pxW = Math.round(bbox.w * board.imageWidth);
-    const pxH = Math.round(bbox.h * board.imageHeight);
-    dims.textContent = pxW + "\u00d7" + pxH;
+    const pctW = Math.round(bbox.w * 100);
+    const pctH = Math.round(bbox.h * 100);
+    dims.textContent = pctW + "% \u00d7 " + pctH + "%";
     row.appendChild(dims);
 
     const del = document.createElement("button");
@@ -179,7 +204,7 @@ function _renderBboxList() {
 }
 
 /* ============================================================
-   Panel sync (called from draw)
+   Panel sync
    ============================================================ */
 
 export function syncPanelFields() {
@@ -188,8 +213,8 @@ export function syncPanelFields() {
     addText:        document.getElementById("addTextBboxBtn"),
     addChar:        document.getElementById("addCharacterBboxBtn"),
     seed:           document.getElementById("seedDefaultBtn"),
-    clear:          document.getElementById("clearAllBtn")
-                    || document.getElementById("clearBboxesBtn"),
+    clear:          document.getElementById("clearBboxesBtn"),
+    viewerRatio:    document.getElementById("viewerRatio"),
   };
 
   if (e.imageInfo) {
@@ -198,6 +223,12 @@ export function syncPanelFields() {
         + "   [" + String(board.imageHash).slice(0, 8) + "\u2026]"
       : "No image loaded";
     if (e.imageInfo.textContent !== text) e.imageInfo.textContent = text;
+  }
+
+  if (e.viewerRatio && document.activeElement !== e.viewerRatio) {
+    if (e.viewerRatio.value !== board.viewer.ratio) {
+      e.viewerRatio.value = board.viewer.ratio;
+    }
   }
 
   const hasImage = !!board.imageEl;
@@ -226,6 +257,7 @@ function _pickImageAction() {
       setImage(info.hash, dataUrl, info.width, info.height);
       flashStatus("image loaded", "ok");
       _scheduleStateSync();
+      _renderBboxList();
     } catch (e) {
       flashStatus("upload failed: " + e.message, "bad");
     }
@@ -258,6 +290,7 @@ async function _importImageFromKritaAction() {
   }
   setImage(res.hash, res.data_url, res.width, res.height);
   flashStatus("imported " + res.width + "\u00d7" + res.height, "ok");
+  _renderBboxList();
   _scheduleStateSync();
 }
 
@@ -265,10 +298,7 @@ async function _refreshCanvasAction() {
   flashStatus("refreshing " + SLOT_ID + "\u2026", "");
   const state = await fetchActiveState();
   if (!state || state.daemon_reachable === false) {
-    flashStatus(
-      SLOT_ID + " refresh failed: daemon unreachable",
-      "bad",
-    );
+    flashStatus(SLOT_ID + " refresh failed: daemon unreachable", "bad");
     return;
   }
   const playgrounds = (state.data && state.data.playgrounds) || [];
@@ -355,6 +385,28 @@ function _installDropOverlay() {
   document.body.appendChild(el);
 }
 
+function _installViewerDropdowns() {
+  const ratioSel = document.getElementById("viewerRatio");
+  if (!ratioSel) return;
+
+  if (ratioSel.options.length === 0) {
+    for (const k of RATIO_KEYS) {
+      const opt = document.createElement("option");
+      opt.value = k;
+      opt.textContent = k;
+      ratioSel.appendChild(opt);
+    }
+  }
+  ratioSel.value = board.viewer.ratio;
+
+  ratioSel.addEventListener("change", () => {
+    board.viewer.ratio = ratioSel.value;
+    resetViewerToFit();
+    _scheduleStateSync();
+    _renderBboxList();
+  });
+}
+
 export function installPanelBindings() {
   const ids = {
     pickImage:  "pickImageBtn",
@@ -380,6 +432,7 @@ export function installPanelBindings() {
   if (el.clearAll)    el.clearAll.addEventListener("click", _clearAllAction);
   if (el.kritaCheck)  el.kritaCheck.addEventListener("click", _kritaStatusAction);
 
+  _installViewerDropdowns();
   _installDropOverlay();
   let _dragDepth = 0;
   window.addEventListener("dragenter", () => {
@@ -403,6 +456,7 @@ export function installPanelBindings() {
         const info = await uploadImageFile(file);
         const dataUrl = await _fileToDataUrl(file);
         setImage(info.hash, dataUrl, info.width, info.height);
+        _renderBboxList();
         _scheduleStateSync();
       } catch (e) {
         flashStatus("upload failed: " + e.message, "bad");

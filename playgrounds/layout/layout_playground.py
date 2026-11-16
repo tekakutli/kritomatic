@@ -50,6 +50,15 @@ instead of a silent misbehaviour downstream.
 The previous flow (register with the daemon at `PORT`, then
 `kit_serve(port=PORT)` which silently falls back) was exactly this
 trap.  It worked only when nothing else happened to be on 8777.
+
+Signal handling
+===============
+SIGINT and SIGTERM raise SystemExit, which propagates out of
+`serve_forever()` and runs the surrounding `try/finally` (plus the
+atexit-registered `_cleanup`).  Calling `httpd.shutdown()` directly
+from a signal handler would deadlock: `shutdown()` blocks until
+`serve_forever()` returns, but `serve_forever()` is paused inside
+the handler that's blocking it.
 """
 
 import atexit
@@ -128,12 +137,13 @@ def _watch_daemon_and_exit():
             os._exit(0)
 
 
-def _unregister():
-    playground_registry.unregister(PLAYGROUND_ID)
-
-
 def _sigterm(signum, frame):
-    _unregister()
+    # Raising SystemExit from a signal handler propagates out of
+    # serve_forever() (which doesn't catch it), running the
+    # surrounding try/finally and the atexit-registered _cleanup.
+    # Calling httpd.shutdown() here would deadlock: shutdown() blocks
+    # until serve_forever() returns, but serve_forever() is paused
+    # inside this handler.
     sys.exit(0)
 
 
@@ -266,15 +276,8 @@ def main():
 
     atexit.register(_cleanup)
 
-    def _sigterm_shutdown(signum, frame):
-        # Make serve_forever() return so the finally block cleans up.
-        try:
-            httpd.shutdown()
-        except Exception:
-            pass
-
-    signal.signal(signal.SIGTERM, _sigterm_shutdown)
-    signal.signal(signal.SIGINT, _sigterm_shutdown)
+    signal.signal(signal.SIGTERM, _sigterm)
+    signal.signal(signal.SIGINT,  _sigterm)
 
     # ---- Daemon watcher ----
     threading.Thread(

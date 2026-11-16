@@ -5,17 +5,10 @@ needed to feed the `ref_embedding_proj` in Drawatoon's ip branch:
 
     image + bboxes  →  crops  →  ViT-MAE  →  768-d CLS per crop
 
-No DETR.  No TrOCR.  No HuggingFace `MagiModel`.  No checkpoint
-beyond `facebook/vit-mae-base` (which MAGI used as its crop-embedding
-backbone — see `crop_embedding_model_config._name_or_path` in
-magi's `config.json`).
-
-The class deliberately mirrors MAGI's calling convention:
-
-    embedder.predict(image_np, bboxes_px)  →  list[Tensor[768]]
-
-...so if we ever want to swap in the full `MagiModel`, the caller
-doesn't change.
+All three inputs — ViTMAEConfig, ViTImageProcessor, and the weight
+tensor file — are loaded explicitly from `_DEFAULT_SOURCE`.  No
+Hugging Face Hub download is ever attempted, and no filename
+convention is relied on.
 
 THREADING
 =========
@@ -35,18 +28,34 @@ one parameter away if VRAM is not a constraint.
 
 from __future__ import annotations
 
+import json
 import threading
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
 import torch
 from PIL import Image
-from transformers import ViTImageProcessor, ViTMAEModel
+from safetensors.torch import load_file
+from transformers import ViTMAEConfig, ViTImageProcessor, ViTMAEModel
 
 
-_DEFAULT_SOURCE = "facebook/vit-mae-base"
-_EMBEDDING_DIM  = 768
-_BATCH_SIZE     = 64
+# ---------------------------------------------------------------------------
+# Local model directory.
+#
+# Expected contents (see prepare_magi_crop_embedder.py):
+#   vit_mae_config.json                ViTMAEConfig JSON
+#   vit_mae_preprocessor.json          ViTImageProcessor config
+#   vit_mae_crop_embedder.safetensors  ViT-MAE weights extracted from MAGI
+# ---------------------------------------------------------------------------
+_DEFAULT_SOURCE = str(Path.home() / "ComfyUI/models/magi_crop_embedder")
+
+_CONFIG_FILENAME       = "vit_mae_config.json"
+_PREPROCESSOR_FILENAME = "vit_mae_preprocessor.json"
+_WEIGHTS_FILENAME      = "vit_mae_crop_embedder.safetensors"
+
+_EMBEDDING_DIM = 768
+_BATCH_SIZE    = 64
 
 
 def _log(msg: str) -> None:
@@ -98,6 +107,55 @@ def _crop_image(image: np.ndarray, bboxes: List[List[float]]) -> List[np.ndarray
     return crops
 
 
+def _load_processor(path: Path) -> ViTImageProcessor:
+    """Build a ViTImageProcessor from an explicit JSON file.
+
+    `from_dict` avoids Hugging Face's metadata lookup path entirely —
+    no `_processor_class` resolution, no Hub probe.
+    """
+    cfg = json.loads(path.read_text())
+    cfg.pop("_processor_class", None)   # not meaningful outside HF Hub
+    return ViTImageProcessor.from_dict(cfg)
+
+
+def _load_model(source_path: Path) -> ViTMAEModel:
+    """Build a ViTMAEModel from explicit config + weight files.
+
+    Returns a model whose weights are the ViT-MAE encoder+decoder
+    extracted from MAGI.  `strict=False` because the MAGI extraction
+    retains the pretraining decoder (`ViTMAEForPreTraining` has one;
+    plain `ViTMAEModel` does not), so those keys are reported as
+    unexpected and quietly dropped — exactly the behaviour
+    `from_pretrained` would give.
+
+    A missing *encoder* or *embeddings* key, however, is a hard error:
+    it means the extraction prefix in `prepare_magi_crop_embedder.py`
+    was wrong and the CLS vectors would be garbage.
+    """
+    config = ViTMAEConfig.from_dict(
+        json.loads((source_path / _CONFIG_FILENAME).read_text())
+    )
+    model = ViTMAEModel(config)
+    state = load_file(str(source_path / _WEIGHTS_FILENAME))
+    missing, unexpected = model.load_state_dict(state, strict=False)
+
+    encoder_missing = [
+        k for k in missing
+        if k.startswith(("encoder.", "embeddings."))
+    ]
+    if encoder_missing:
+        raise RuntimeError(
+            "ViT-MAE encoder weights are incomplete.  Missing keys:\n  "
+            + "\n  ".join(encoder_missing)
+        )
+
+    _log(
+        f"weights loaded ({len(state)} tensors; "
+        f"{len(unexpected)} unexpected → dropped pretraining decoder)"
+    )
+    return model
+
+
 class CropEmbedder:
     """ViT-MAE-base CLS extraction over a batch of crops."""
 
@@ -111,16 +169,26 @@ class CropEmbedder:
             device or ("cuda" if torch.cuda.is_available() else "cpu")
         ) if device else torch.device("cpu")
 
-        _log(f"loading ViT-MAE from {source!r} on {self.device}...")
-        self.processor = ViTImageProcessor.from_pretrained(source)
-        self.model     = ViTMAEModel.from_pretrained(source)
+        source_path = Path(source)
+        if not source_path.is_dir():
+            raise FileNotFoundError(
+                f"ViT-MAE model directory not found: {source_path}\n"
+                f"Expected files:\n"
+                f"  {source_path / _CONFIG_FILENAME}\n"
+                f"  {source_path / _PREPROCESSOR_FILENAME}\n"
+                f"  {source_path / _WEIGHTS_FILENAME}\n"
+                f"Run prepare_magi_crop_embedder.py to produce them."
+            )
+
+        _log(f"loading ViT-MAE from {source_path} on {self.device}...")
+        self.processor = _load_processor(source_path / _PREPROCESSOR_FILENAME)
+        self.model     = _load_model(source_path)
         self.model.eval().to(self.device)
 
         # MAGI temporarily forces mask_ratio=0 during inference so the
-        # encoder sees the full image; the decoder (which we don't
-        # instantiate anyway, since we use ViTMAEModel not
-        # ViTMAEForPreTraining) is never invoked.  The CLS token at
-        # position 0 is the correct global feature.
+        # encoder sees the full image; the decoder is never invoked
+        # (we use ViTMAEModel, not ViTMAEForPreTraining).  The CLS
+        # token at position 0 is the correct global feature.
         self.model.config.mask_ratio = 0.0
         if hasattr(self.model, "embeddings") and hasattr(
             self.model.embeddings, "config"
@@ -190,16 +258,25 @@ def get_or_create_embedder(
     """Lazily build (once) and return the process-wide CropEmbedder.
 
     Called by the HTTP route on every request; the lock + cache mean
-    only the first call pays the load cost.  A subsequent call with a
-    *different* `source` rebuilds — intended for the eventual
-    "local MAGI checkpoint" path, unused in practice today.
+    only the first call pays the load cost.
+
+    `source` is coerced to the configured local directory regardless
+    of what the caller passes.  This is deliberate: it removes any
+    code path by which a Hugging Face model name could sneak in and
+    trigger a download.  A different *local* directory would still
+    need an explicit edit here, not a runtime argument.
     """
     global _singleton, _singleton_source
+    source = _DEFAULT_SOURCE
+
     with _singleton_lock:
         if _singleton is not None and _singleton_source == source:
             return _singleton
         if _singleton is not None:
-            _log(f"replacing existing embedder (source {_singleton_source!r} → {source!r})")
+            _log(
+                f"replacing existing embedder "
+                f"(source {_singleton_source!r} → {source!r})"
+            )
             _singleton = None
         _singleton = CropEmbedder(source=source, device=device)
         _singleton_source = source

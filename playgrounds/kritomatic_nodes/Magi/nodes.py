@@ -16,6 +16,10 @@ Two things live here:
      only consumer), but exposed for future graph wiring.  Same
      singleton as the route.
 
+Both the route and the node load ViT-MAE from a local model
+directory (`_DEFAULT_SOURCE` from `crop_embedder`).  No Hugging Face
+Hub download is ever attempted.
+
 The route is registered at module import time so it's live as soon
 as ComfyUI finishes loading the pack.  If ComfyUI is imported
 without a `PromptServer` (e.g. unit-test harness), registration is
@@ -32,7 +36,11 @@ from PIL import Image
 
 from comfy_api.latest import io
 
-from .crop_embedder import get_or_create_embedder, clear_embedder
+from .crop_embedder import (
+    get_or_create_embedder,
+    clear_embedder,
+    _DEFAULT_SOURCE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +127,11 @@ def _register_route() -> None:
                 status=500,
             )
 
+        print(
+            f"[magi] /magi/crop_embed ok: {len(bboxes_px)} bbox(es), "
+            f"image {image_np.shape[1]}x{image_np.shape[0]}",
+            flush=True,
+        )
         return _json({
             "success": True,
             "reference_embeddings": embs,
@@ -142,6 +155,10 @@ class MagiLoader(io.ComfyNode):
     uses; loading here just makes it available earlier, avoiding the
     first-call latency on the HTTP route.  Wiring this node into a
     workflow is optional — the route is self-sufficient.
+
+    The model is loaded from a local directory containing
+    `vit_mae_config.json`, `vit_mae_preprocessor.json`, and
+    `vit_mae_crop_embedder.safetensors`.  No Hub download is attempted.
     """
 
     @classmethod
@@ -151,19 +168,20 @@ class MagiLoader(io.ComfyNode):
             display_name="Magi Crop Embedder Loader",
             category="Magi",
             description=(
-                "Loads ViT-MAE-base for character crop embedding. "
-                "Feeds the magi playground's /analyze_characters route. "
-                "Optional — the HTTP route lazy-loads the same "
-                "singleton on first call."
+                "Loads ViT-MAE-base for character crop embedding from "
+                "the local model directory. Feeds the magi playground's "
+                "/analyze_characters route. Optional — the HTTP route "
+                "lazy-loads the same singleton on first call."
             ),
             inputs=[
                 io.String.Input(
                     "vit_mae_source",
-                    default="facebook/vit-mae-base",
+                    default=_DEFAULT_SOURCE,
                     tooltip=(
-                        "HF Hub name or local path. Default "
-                        "'facebook/vit-mae-base' is the exact backbone "
-                        "MAGI was trained against."
+                        "Local directory containing "
+                        "vit_mae_config.json, vit_mae_preprocessor.json, "
+                        "and vit_mae_crop_embedder.safetensors. "
+                        f"Default: {_DEFAULT_SOURCE}"
                     ),
                 ),
             ],
@@ -174,5 +192,8 @@ class MagiLoader(io.ComfyNode):
 
     @classmethod
     def execute(cls, vit_mae_source: str) -> io.NodeOutput:
+        # The source argument is accepted for schema compatibility but
+        # get_or_create_embedder forces the configured local path, so
+        # the model can never be re-fetched from the Hub.
         embedder = get_or_create_embedder(source=vit_mae_source)
         return io.NodeOutput(embedder)

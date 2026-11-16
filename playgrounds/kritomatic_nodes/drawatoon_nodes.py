@@ -149,7 +149,25 @@ class DrawatoonSetIP(io.ComfyNode):
 
         if ip_mode == "layout":
             text_bboxes, character_bboxes, refs_raw = _fetch_layout()
+
+            n_text = len(text_bboxes)
+            n_char = len(character_bboxes)
+            n_refs = sum(
+                1 for r in refs_raw
+                if isinstance(r, list) and len(r) == 768
+            )
+            print(
+                f"[DrawatoonSetIP] layout fetch: "
+                f"text={n_text} char={n_char} refs={n_refs}",
+                flush=True,
+            )
+
             if not text_bboxes and not character_bboxes:
+                print(
+                    "[DrawatoonSetIP] NO bboxes → void_ip_embed fallback "
+                    "(layout playground down, or empty layout)",
+                    flush=True,
+                )
                 ip_hidden_states = ip_adapter.void_ip_embed.weight.unsqueeze(0)
                 ip_attention_mask = torch.ones(
                     1, 1, dtype=torch.bool, device=ip_hidden_states.device,
@@ -165,27 +183,46 @@ class DrawatoonSetIP(io.ComfyNode):
                         ))
                     else:
                         references.append(None)
-                while len(references) < len(character_bboxes):
+                while len(references) < n_char:
                     references.append(None)
-                if len(references) > len(character_bboxes):
-                    references = references[:len(character_bboxes)]
+                if len(references) > n_char:
+                    references = references[:n_char]
+
+                n_paired = sum(1 for r in references if r is not None)
+                print(
+                    f"[DrawatoonSetIP] building ip tokens: "
+                    f"{n_char} character bbox(es), {n_paired} paired to "
+                    f"an embedding, {n_char - n_paired} unpaired "
+                    f"(→ learned generic character embedding)",
+                    flush=True,
+                )
 
                 with torch.no_grad():
                     ip_hidden_states, ip_attention_mask = ip_adapter(
                         [text_bboxes], [character_bboxes], [references], False,
                     )
+                print(
+                    f"[DrawatoonSetIP] ip_hidden_states shape="
+                    f"{tuple(ip_hidden_states.shape)}, "
+                    f"mask tokens={int(ip_attention_mask.sum().item())}",
+                    flush=True,
+                )
 
         elif ip_mode == "negative":
             ip_hidden_states = ip_adapter.negative_ip_embed.weight.unsqueeze(0)
             ip_attention_mask = torch.ones(
                 1, 1, dtype=torch.bool, device=ip_hidden_states.device,
             )
+            print("[DrawatoonSetIP] negative_ip_embed (CFG drop-out token)",
+                  flush=True)
 
         elif ip_mode == "void":
             ip_hidden_states = ip_adapter.void_ip_embed.weight.unsqueeze(0)
             ip_attention_mask = torch.ones(
                 1, 1, dtype=torch.bool, device=ip_hidden_states.device,
             )
+            print("[DrawatoonSetIP] void_ip_embed (no-layout token)",
+                  flush=True)
 
         else:
             raise ValueError(f"Unknown ip_mode: {ip_mode!r}")

@@ -14,7 +14,12 @@ Nodes exposed:
   * MagiLoader                  (MAGI_CROP_EMBEDDER)
 
 HTTP routes registered on import:
-  * POST /magi/crop_embed       (magi playground → ViT-MAE → 768-d)
+  * POST /magi/crop_embed           (magi playground → ViT-MAE → 768-d)
+  * POST /kritomatic/save_workflow  (frontend “Save To Kritomatic”
+                                     → <repo>/data/comfy_panel/workflows)
+
+Frontend extension (served from ./web):
+  * save_to_kritomatic.js       (adds “Save To Kritomatic” to File menu)
 
 Layout:
   layout_client.py          shared /state transport (URLs, fetch, probe)
@@ -23,6 +28,8 @@ Layout:
   multimask/                MultiAreaConditioning
   PixArt/                   drawatoon transformer port (unchanged)
   Magi/                     ViT-MAE crop embedder (feed for DrawatoonSetIP)
+  kritomatic_workflows.py   HTTP route for saving UI workflows into repo
+  web/                      frontend extensions (JavaScript only)
 """
 
 from __future__ import annotations
@@ -34,8 +41,15 @@ from .playground_resolution import PlaygroundResolutionSelect
 from .multimask import MultiAreaConditioning
 from .Magi.nodes import MagiLoader
 
-# Importing `Magi.nodes` registers `POST /magi/crop_embed` on the
-# ComfyUI PromptServer as a side effect.  No further action needed.
+# Importing `kritomatic_workflows` registers
+# `POST /kritomatic/save_workflow` on the ComfyUI PromptServer as a
+# side effect (same pattern as `Magi.nodes`). No further action needed.
+from . import kritomatic_workflows  # noqa: F401
+
+# Tell ComfyUI to serve everything under ./web as client-side JS.
+WEB_DIRECTORY = "./web"
+
+__all__ = ["WEB_DIRECTORY", "comfy_entrypoint"]
 
 
 class KritomaticExtension(ComfyExtension):

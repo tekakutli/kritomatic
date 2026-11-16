@@ -9,20 +9,13 @@ Coordinate systems
   · Viewer-normalized       — [0, 1] of the viewer rectangle. What the model receives.
 
 The viewer is stored as `{x, y, w, h}` in canvas-normalized coords.
-Bboxes are stored as `{x, y, w, h}` in viewer-normalized coords. So
-dragging the viewer carries all bboxes with it (their canvas position
-is `viewer.pos + bbox.pos * viewer.size`); dragging a bbox moves it
-within the frame while the frame stays put.
+Bboxes are stored as `{x, y, w, h}` in viewer-normalized coords.
 
-Image loading has two paths:
-  · `setImage` — full reset. Clear bboxes, reset viewer to fit, reset
-    view. Used when the user explicitly loads a new image (pick file,
-    import from Krita).
-  · `applyCanvasImage` — partial update. Preserve bboxes, reset viewer
-    only when image dims change, preserve view. Used by autosync and
-    the manual "Refresh @thelayout" button.
+Text bboxes additionally carry a `text` field — the string the user
+wants rendered in that bubble. The DrawatoonSetIP node does not read
+it (the ip branch only encodes position). It travels with the bbox in
+browser memory and is folded into the CLIP prompt at Generate time.
 """
-
 STATE_JS = r"""
 import {
   VIEW_ZOOM_MIN, VIEW_ZOOM_MAX, VIEW_PAN_MARGIN,
@@ -83,11 +76,11 @@ export const board = {
   // Viewer rectangle: normalized [0, 1] of canvas.
   viewer: {
     x: 0.05, y: 0.05, w: 0.9, h: 0.9,
-    model: "PixArtMS_Sigma_XL_2_512",
     ratio: "1.00",
   },
 
   // Bboxes are normalized [0, 1] OF VIEWER, not of canvas.
+  // Text bboxes additionally carry a `text` field (string).
   textBboxes:          [],
   characterBboxes:     [],
   referenceEmbeddings: [],
@@ -130,7 +123,6 @@ export function resetViewerToFit() {
   const ch = board.imageHeight;
   if (!cw || !ch) return;
 
-  // Try 90% of the height first; fall back to 90% of width if too wide.
   const targetPxH_fromH = 0.9 * ch;
   const targetPxW_fromH = targetPxH_fromH * r;
   if (targetPxW_fromH <= 0.9 * cw) {
@@ -187,7 +179,6 @@ export function applyCanvasImage(hash, dataUrl, width, height) {
   img.onload = () => {
     board.imageEl = img;
     if (!dimsMatch) {
-      // New aspect/size invalidates viewer position; reset it.
       resetViewerToFit();
     }
     _scheduleDraw();
@@ -225,7 +216,9 @@ function _listFor(kind) {
 
 export function addBbox(kind, bbox) {
   const list = _listFor(kind);
-  list.push({ ...bbox });
+  const b = { ...bbox };
+  if (kind === 'text' && b.text === undefined) b.text = "";
+  list.push(b);
   if (kind === 'character') board.referenceEmbeddings.push(null);
   _scheduleDraw();
   return list.length - 1;
@@ -255,7 +248,19 @@ export function deleteBbox(kind, idx) {
 export function setBbox(kind, idx, bbox) {
   const list = _listFor(kind);
   if (idx < 0 || idx >= list.length) return false;
+  const old = list[idx];
   list[idx] = { ...bbox };
+  // Preserve the text field across geometry updates
+  if (kind === 'text' && old.text !== undefined) {
+    list[idx].text = old.text;
+  }
+  _scheduleDraw();
+  return true;
+}
+
+export function setBboxText(idx, text) {
+  if (idx < 0 || idx >= board.textBboxes.length) return false;
+  board.textBboxes[idx].text = String(text || "");
   _scheduleDraw();
   return true;
 }
@@ -272,7 +277,7 @@ export function clearAllBboxes() {
 }
 
 export function seedDefault() {
-  board.textBboxes = [{ x: 0.10, y: 0.02, w: 0.80, h: 0.10 }];
+  board.textBboxes = [{ x: 0.10, y: 0.02, w: 0.80, h: 0.10, text: "" }];
   board.characterBboxes = [{ x: 0.30, y: 0.15, w: 0.40, h: 0.75 }];
   board.referenceEmbeddings = [null];
   board.selectedKind = null;
@@ -295,7 +300,6 @@ export function selectBbox(kind, idx) {
    Coordinate conversions
    ============================================================ */
 
-/* canvas image pixels → viewer-normalized [0,1] */
 export function canvasPxToViewerNorm(cx, cy) {
   const v = board.viewer;
   const vPxX = v.x * board.imageWidth;
@@ -306,7 +310,6 @@ export function canvasPxToViewerNorm(cx, cy) {
   return [(cx - vPxX) / vPxW, (cy - vPxY) / vPxH];
 }
 
-/* viewer-normalized [0,1] → canvas image pixels */
 export function viewerNormToCanvasPx(vnx, vny) {
   const v = board.viewer;
   const vPxX = v.x * board.imageWidth;

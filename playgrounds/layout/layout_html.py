@@ -12,6 +12,7 @@ from .pg_viewer      import VIEWER_JS
 from .pg_dispatch    import DISPATCH_JS
 from .pg_panel       import PANEL_JS
 from .pg_autosync    import AUTOSYNC_JS
+from .pg_generate    import GENERATE_JS
 
 from pgkit.html_shell import page
 from pgkit.js_check   import JsSyntaxError
@@ -76,6 +77,7 @@ _MODULE_SOURCES = {
     "pg_dispatch.js":       DISPATCH_JS,
     "pg_panel.js":          PANEL_JS,
     "pg_autosync.js":       AUTOSYNC_JS,
+    "pg_generate.js":       GENERATE_JS,
     "_boot.js":             _BOOT_JS,
 }
 

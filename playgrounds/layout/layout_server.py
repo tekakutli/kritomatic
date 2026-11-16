@@ -8,6 +8,8 @@
   POST /resource_image         resolve a {source, layer_name} spec to a PNG
   POST /upload_image           raw body (image file)
   POST /playground_reregister  single-shot re-register with the daemon
+  POST /generate               start a Drawatoon generation job
+  POST /generate_status        poll a generation job
 
 Lock discipline
 ===============
@@ -17,14 +19,18 @@ plain dict copy.  Handlers build their response from the copy; no
 handler holds `_state_lock` while calling another function that might
 also want it.
 
-Model is fixed
-==============
-`viewer.model` is pinned to `PixArtMS_Sigma_XL_2_512` on this server
-regardless of what the browser POSTs.  drawatoon is a 512-px model;
-there is no user-facing model choice.  The panel doesn't send a model
-field at all.  If a future fine-tune needs a different preset, change
-`_DEFAULT_VIEWER["model"]` here (and the corresponding hardcoded
-value in `pg_state.js`, only used for display).
+Prompt, seed, bubble texts
+==========================
+`/generate` accepts three additional fields that are NOT part of
+`/state` and are used only by `layout_comfy.start_generation`:
+
+    prompt       : str | None
+    seed         : int | str | None
+    bubble_texts : list[str] | None
+
+They are stored on the job, combined on the server, and substituted
+into the workflow's positive CLIP text node.  `/state` and the node
+never see them.
 """
 
 import base64
@@ -38,7 +44,7 @@ from urllib.parse import unquote
 
 from PIL import Image
 
-from . import krita_client, playground_registry
+from . import krita_client, playground_registry, layout_comfy
 
 
 PLAYGROUND_ID   = "layout"
@@ -56,7 +62,6 @@ SLOT_ID = "@thelayout"
 
 _DEFAULT_VIEWER = {
     "x": 0.05, "y": 0.05, "w": 0.9, "h": 0.9,
-    "model": "PixArtMS_Sigma_XL_2_512",
     "ratio": "1.00",
 }
 
@@ -119,11 +124,8 @@ def _normalize_viewer(raw):
     if vy + vh > 1.0:
         vh = max(0.01, 1.0 - vy)
 
-    # Model is pinned — see module docstring.  Ratio is user-driven.
-    model = _DEFAULT_VIEWER["model"]
     ratio = str(raw.get("ratio") or _DEFAULT_VIEWER["ratio"])
-    return {"x": vx, "y": vy, "w": vw, "h": vh,
-            "model": model, "ratio": ratio}
+    return {"x": vx, "y": vy, "w": vw, "h": vh, "ratio": ratio}
 
 
 def _normalize_state(raw):
@@ -215,6 +217,29 @@ def handle_playground_reregister(_payload):
         layer_slots=LAYER_SLOTS,
     )
     return {"success": bool(ok)}
+
+
+def handle_generate(payload):
+    if not isinstance(payload, dict):
+        return {"success": False, "message": "expected a JSON object"}
+    try:
+        job_id = layout_comfy.start_generation(payload)
+    except (ValueError, RuntimeError) as e:
+        return {"success": False, "message": str(e)}
+    return {"success": True, "job_id": job_id}
+
+
+def handle_generate_status(payload):
+    if not isinstance(payload, dict):
+        return {"success": False, "message": "expected a JSON object"}
+    job_id = payload.get("job_id")
+    if not job_id:
+        return {"success": False, "message": "job_id required"}
+    entry = layout_comfy.get_job_status(str(job_id))
+    if not entry:
+        return {"success": False,
+                "message": f"unknown job {job_id!r}"}
+    return {"success": True, **entry}
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +396,8 @@ ROUTES = {
     "/active_state":           handle_active_state,
     "/resource_image":         handle_resource_image,
     "/playground_reregister":  handle_playground_reregister,
+    "/generate":               handle_generate,
+    "/generate_status":        handle_generate_status,
 }
 
 RAW_ROUTES = {

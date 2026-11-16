@@ -1,5 +1,4 @@
 """Layout playground's panel body and CSS."""
-
 PG_CSS = r"""
   #ui button#pickImageBtn,
   #ui button#importImageBtn,
@@ -50,7 +49,6 @@ PG_CSS = r"""
     background: rgba(220, 90, 110, 0.10);
     color: #ffd0d8;
   }
-
   #imageInfo {
     font-size:10px; color:#5a6774;
     margin:4px 0;
@@ -64,7 +62,6 @@ PG_CSS = r"""
   #kritaStatus.ok   { color: #00e5ff; }
   #kritaStatus.bad  { color: #d48590; }
   #kritaStatus.warn { color: #ffe600; }
-
   .bboxList {
     display:flex; flex-direction:column; gap:3px;
     margin:6px 0 0;
@@ -105,7 +102,7 @@ PG_CSS = r"""
     flex:0 0 auto;
   }
   .bboxLabel {
-    flex:1 1 auto; font-weight:700;
+    flex:0 0 auto; font-weight:700;
     font-variant-numeric: tabular-nums;
     overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
   }
@@ -114,6 +111,22 @@ PG_CSS = r"""
     font-size:9px; color:#5a6774;
     font-variant-numeric: tabular-nums;
   }
+  .bboxTextInput {
+    flex: 1 1 60px;
+    min-width: 40px;
+    background: transparent;
+    border: 0;
+    border-bottom: 1px solid #223040;
+    color: #b8ecff;
+    font-family: inherit;
+    font-size: 10px;
+    padding: 1px 3px;
+    outline: none;
+    letter-spacing: 0.02em;
+  }
+  .bboxTextInput:hover { border-bottom-color:#34445a; }
+  .bboxTextInput:focus { border-bottom-color:#00e5ff; }
+  .bboxTextInput::placeholder { color:#3d4756; font-style:italic; }
   .bboxDel {
     width:auto !important;
     padding:1px 6px !important;
@@ -122,13 +135,13 @@ PG_CSS = r"""
     border-color:#4a2830 !important;
     color:#d48590 !important;
     letter-spacing:0 !important;
+    flex: 0 0 auto;
   }
   .bboxDel:hover {
     background:rgba(212,133,144,0.10) !important;
     border-color:#7a3e4a !important;
     color:#e8a0a8 !important;
   }
-
   #dropOverlay {
     position:fixed; inset:0; z-index:100;
     display:none;
@@ -144,7 +157,6 @@ PG_CSS = r"""
     text-shadow:0 0 12px rgba(0,229,255,0.55);
   }
   #dropOverlay.visible { display:flex; }
-
   #statusLine {
     font-size:10px; color:#7b8794;
     margin-top:6px;
@@ -154,21 +166,99 @@ PG_CSS = r"""
   #statusLine.ok   { color:#00e5ff; }
   #statusLine.bad  { color:#d48590; }
   #statusLine.warn { color:#ffe600; }
-
   #stateInfo {
     font-size:10px; color:#5a6774; line-height:1.5;
     margin-bottom:6px;
   }
   #stateInfo code { color:#00e5ff; }
 
-  .runHint {
-    font-size:9px; color:#3d4756; font-style:italic;
-    margin: 6px 0 0;
-    line-height: 1.45;
+  #promptText {
+    width: 100%;
+    background: #0d1219;
+    color: #00e5ff;
+    border: 1px solid #223040;
+    border-radius: 2px;
+    font-family: inherit;
+    font-size: 11px;
+    padding: 4px 6px;
+    outline: none;
+    resize: vertical;
+    min-height: 60px;
+    box-sizing: border-box;
+  }
+  #promptText:focus { border-color: #00e5ff; }
+  #promptText::placeholder {
+    color: #3d4756;
+    font-style: italic;
+  }
+  #seedInput {
+    flex: 1 1 auto;
+    min-width: 0;
+    background: transparent;
+    border: 0;
+    border-bottom: 1px solid #223040;
+    color: #00e5ff;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    padding: 2px 4px;
+    outline: none;
+  }
+  #seedInput:hover { border-bottom-color: #34445a; }
+  #seedInput:focus { border-bottom-color: #00e5ff; }
+  #seedInput::placeholder {
+    color: #3d4756;
+    font-style: italic;
+    font-weight: normal;
+  }
+  .lastSeedLine {
+    font-size: 9px;
+    color: #5a6774;
+    margin: 4px 0 2px;
+    font-variant-numeric: tabular-nums;
+    user-select: text;
+  }
+  .lastSeedLine code {
+    color: #00e5ff;
+    background: transparent;
+    padding: 0;
+    font-family: inherit;
+    user-select: text;
+  }
+  .lastSeedLine code[data-empty="1"] {
+    color: #3d4756;
+  }
+  .lastSeedLine .copy-hint {
+    color: #3d4756;
+    font-style: italic;
   }
 """
-
 PG_PANEL_BODY = r"""
+    <details class="section" open>
+      <summary>Generate</summary>
+      <div class="section-body">
+        <div class="field" style="flex-direction:column;align-items:stretch;">
+          <label style="text-align:left;flex:0 0 auto;margin-bottom:4px;">
+            Prompt
+          </label>
+          <textarea id="promptText" rows="3" spellcheck="false"
+                    placeholder="manga panel, black and white, ..."
+          ></textarea>
+        </div>
+        <div class="field" style="margin-top:6px;">
+          <label>Seed</label>
+          <input type="text" id="seedInput" value=""
+                 placeholder="random" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="row" style="margin-top:8px;">
+          <button id="generateBtn" disabled>Generate</button>
+        </div>
+        <div id="generateStatus" style="font-size:10px;color:#5a6774;margin-top:6px;min-height:1.4em;">
+          idle
+        </div>
+      </div>
+    </details>
     <details class="section" open>
       <summary>Image</summary>
       <div class="section-body">
@@ -194,7 +284,6 @@ PG_PANEL_BODY = r"""
         </div>
       </div>
     </details>
-
     <details class="section" open>
       <summary>Generation Frame</summary>
       <div class="section-body">
@@ -202,20 +291,8 @@ PG_PANEL_BODY = r"""
           <label>Ratio</label>
           <select id="viewerRatio"></select>
         </div>
-        <div class="runHint">
-          Drag the frame on the canvas to reposition it. Resize from
-          any of its four corners. Bboxes inside the frame are what
-          gets generated.
-        </div>
-        <div class="runHint">
-          drawatoon is a 512-px model; the workflow is pinned to
-          <code>PixArtMS_Sigma_XL_2_512</code>. All ratios fit within
-          that fixed 262,144-pixel budget — resizing the frame does not
-          change output dimensions.
-        </div>
       </div>
     </details>
-
     <details class="section" open>
       <summary>Layout</summary>
       <div class="section-body">
@@ -236,13 +313,8 @@ PG_PANEL_BODY = r"""
                   disabled>Clear all</button>
         </div>
         <div id="bboxList" class="bboxList"></div>
-        <div class="runHint">
-          Drag a bbox to move it within the frame. Drag a corner or
-          edge handle of the selected bbox to resize it.
-        </div>
       </div>
     </details>
-
     <details class="section" open>
       <summary>State</summary>
       <div class="section-body">
@@ -251,10 +323,10 @@ PG_PANEL_BODY = r"""
           <code>DrawatoonSetIP</code> node. Version:
           <code id="stateVersion">—</code>
         </div>
-        <div class="runHint" style="margin-top:6px;">
-          In the sampler workflow use <code>PlaygroundResolutionSelect</code>
-          instead of <code>PixArtResolutionSelect</code> to use the
-          frame's ratio automatically.
+        <div class="lastSeedLine">
+          Last used seed:
+          <code id="lastSeedDisplay" data-empty="1">&mdash;</code>
+          <span class="copy-hint">(click to copy)</span>
         </div>
         <div id="statusLine">idle</div>
       </div>

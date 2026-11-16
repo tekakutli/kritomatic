@@ -1,5 +1,4 @@
 """Layer-slot autosync — preserves viewer + bboxes on layer refresh."""
-
 AUTOSYNC_JS = r"""
 import { board, applyCanvasImage } from "./pg_state.js";
 import { fetchActiveState, fetchResourceImage } from "./pg_client.js";
@@ -48,6 +47,28 @@ export async function fetchSelectedLayer(selector) {
   import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
 }
 
+/* Refresh the @thelayout canvas from Krita.  Used by pg_generate.js
+ * after a successful generation so the user sees the pasted result
+ * without manually clicking the refresh button.  Silently fails if
+ * the daemon is unreachable or the slot is missing — the generation
+ * itself already succeeded, so a refresh failure is non-fatal. */
+export async function refreshLayoutCanvas() {
+  try {
+    const state = await fetchActiveState();
+    if (!state || state.daemon_reachable === false) return;
+    const playgrounds = (state.data && state.data.playgrounds) || [];
+    const entry = playgrounds.find(p => p.id === PLAYGROUND_ID);
+    const slots = (entry && entry.layer_slots) || [];
+    const slot = slots.find(s => s.id === SLOT_ID);
+    if (!slot) return;
+    const selector = slot.selector || { source: "active", layer_name: null };
+    await fetchSelectedLayer(selector);
+  } catch (e) {
+    // Silently fail, as generation already succeeded.
+    console.warn("Auto-refresh after generation failed:", e);
+  }
+}
+
 async function _reregisterIfMissing() {
   if (!REREGISTER_ON_MISSING) return;
   const now = Date.now();
@@ -68,7 +89,6 @@ async function _poll() {
   _running = true;
   try {
     const resp = await fetchActiveState();
-
     if (!resp || resp.daemon_reachable === false) {
       _daemonDownStreak += 1;
       if (_daemonDownStreak === DAEMON_DOWN_WARN) {
@@ -80,7 +100,6 @@ async function _poll() {
       return;
     }
     _daemonDownStreak = 0;
-
     const playgrounds = (resp.data && resp.data.playgrounds) || [];
     const entry = playgrounds.find(p => p.id === PLAYGROUND_ID);
     if (!entry) {
@@ -88,7 +107,6 @@ async function _poll() {
       await _reregisterIfMissing();
       return;
     }
-
     const slots = entry.layer_slots || [];
     const slot = slots.find(s => s.id === SLOT_ID);
     if (!slot) {
@@ -99,10 +117,8 @@ async function _poll() {
       await _reregisterIfMissing();
       return;
     }
-
     const selector = slot.selector || { source: "active", layer_name: null };
     const key = _selectorKey(selector);
-
     if (!_bootstrapped) {
       _bootstrapped = true;
       _lastSelectorKey = key;
@@ -111,7 +127,6 @@ async function _poll() {
       }
       return;
     }
-
     if (key === _lastSelectorKey) return;
     _lastSelectorKey = key;
     await fetchSelectedLayer(selector);

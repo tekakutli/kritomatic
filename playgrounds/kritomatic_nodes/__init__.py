@@ -11,6 +11,10 @@ Nodes exposed:
   * DrawatoonSetIP              (CONDITIONING)
   * PlaygroundResolutionSelect  (INT, INT)
   * MultiAreaConditioning       (CONDITIONING)
+  * MagiLoader                  (MAGI_CROP_EMBEDDER)
+
+HTTP routes registered on import:
+  * POST /magi/crop_embed       (magi playground → ViT-MAE → 768-d)
 
 Layout:
   layout_client.py          shared /state transport (URLs, fetch, probe)
@@ -18,6 +22,7 @@ Layout:
   playground_resolution.py  PlaygroundResolutionSelect
   multimask/                MultiAreaConditioning
   PixArt/                   drawatoon transformer port (unchanged)
+  Magi/                     ViT-MAE crop embedder (feed for DrawatoonSetIP)
 """
 
 from __future__ import annotations
@@ -27,6 +32,10 @@ from comfy_api.latest import ComfyExtension
 from .drawatoon_nodes import DrawatoonCheckpointLoader, DrawatoonSetIP
 from .playground_resolution import PlaygroundResolutionSelect
 from .multimask import MultiAreaConditioning
+from .Magi.nodes import MagiLoader
+
+# Importing `Magi.nodes` registers `POST /magi/crop_embed` on the
+# ComfyUI PromptServer as a side effect.  No further action needed.
 
 
 class KritomaticExtension(ComfyExtension):
@@ -36,6 +45,7 @@ class KritomaticExtension(ComfyExtension):
             DrawatoonSetIP,
             PlaygroundResolutionSelect,
             MultiAreaConditioning,
+            MagiLoader,
         ]
 
 

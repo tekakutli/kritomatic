@@ -1,22 +1,22 @@
 """Mutable state, canvas handles, view transforms, draw hook.
 
-Leaf module.  No viewer (magi has no generation frame), no rotation
-(the reference image is never rotated by the user — MAGI analyzes
-the un-rotated image), no text bboxes (magi only needs character
-identities).
+Leaf module.
 
-Coordinates:  all bboxes are normalized [0,1] of image.
+Two view modes:
+  · `viewingCharacterIdx === -1` — @thecharacter reference image.
+    The scratch rectangle is visible and draggable here.
+  · `viewingCharacterIdx >= 0`  — the crop of that character.  Read-
+    only view; pan/zoom still work but scratch rect is hidden.
 
-This module exports:
+Per-character fields (stored in the `characterBboxes[i]` object):
+    x, y, w, h      frozen bbox at analysis time, in @thecharacter
+                    normalized coords
+    label           user-editable name, browser-only
+    crop_b64        base64 PNG of the crop, browser-only
+    cropEl          lazily-built <img> for rendering, browser-only
 
-  · the `board` object (all user-visible state)
-  · the `view` object (zoom + pan only)
-  · image loading / clearing
-  · bbox CRUD for character boxes
-  · reference-embedding assignment
-  · draw scheduling
-  · screen ↔ image projections
-  · canvas resize
+`referenceEmbeddings[i]` stays a parallel array (different type,
+doesn't belong in the bbox object).
 """
 
 STATE_JS = r"""
@@ -25,7 +25,7 @@ import {
 } from "./pg_tuning.js";
 
 /* ============================================================
-   Canvas and 2D context
+   Canvas
    ============================================================ */
 
 export const canvas = document.getElementById("c");
@@ -34,14 +34,10 @@ export const ctx    = canvas.getContext("2d");
 let _dpr = window.devicePixelRatio || 1;
 
 /* ============================================================
-   View — zoom + pan only.  No rotation.
+   View — zoom + pan only
    ============================================================ */
 
-export const view = {
-  zoom: 1,
-  panX: 0,
-  panY: 0,
-};
+export const view = { zoom: 1, panX: 0, panY: 0 };
 
 export function resetView() {
   view.zoom = 1;
@@ -75,11 +71,27 @@ export function zoomAt(screenX, screenY, newZoom) {
 }
 
 /* ============================================================
+   Helpers
+   ============================================================ */
+
+function _defaultScratchRect() {
+  return { x: 0.30, y: 0.15, w: 0.40, h: 0.75 };
+}
+
+function _makeCropImage(b64) {
+  const img = new Image();
+  img.onload  = () => _scheduleDraw();
+  img.onerror = () => _scheduleDraw();
+  img.src = "data:image/png;base64," + b64;
+  return img;
+}
+
+/* ============================================================
    Image loading / clearing
    ============================================================ */
 
 export function setImage(hash, dataUrl, width, height) {
-  board.imageHash     = hash;
+  board.imageHash       = hash;
   board.originalDataUrl = dataUrl;
   board.originalWidth   = width;
   board.originalHeight  = height;
@@ -92,8 +104,8 @@ export function setImage(hash, dataUrl, width, height) {
 
   board.characterBboxes     = [];
   board.referenceEmbeddings = [];
-  board.selectedIdx = -1;
-  board.hoveredIdx  = -1;
+  board.viewingCharacterIdx = -1;
+  board.scratchRect = _defaultScratchRect();
   resetView();
 
   const img = new Image();
@@ -115,15 +127,6 @@ export function setImage(hash, dataUrl, width, height) {
   _scheduleDraw();
 }
 
-/* `applyCanvasImage` is used by the autosync and the manual
-   "Refresh @thecharacter" button.  Unlike `setImage`, it KEEPS the
-   existing bboxes (their relative positions still make sense), but
-   invalidates every reference embedding when the image content
-   changes — the old embeddings were computed against different
-   pixels.
-
-   Same hash → the same image, so keep embeddings.  Different hash
-   → new content, embeddings reset to null and must be re-analyzed. */
 export function applyCanvasImage(hash, dataUrl, width, height) {
   const oldHash = board.imageHash;
   const hashChanged = (oldHash !== hash);
@@ -144,6 +147,7 @@ export function applyCanvasImage(hash, dataUrl, width, height) {
     board.imageDataUrl    = dataUrl;
 
     if (hashChanged) {
+      // New image content invalidates every embedding.
       board.referenceEmbeddings = board.characterBboxes.map(() => null);
     }
 
@@ -155,7 +159,7 @@ export function applyCanvasImage(hash, dataUrl, width, height) {
 }
 
 export function clearImage() {
-  board.imageHash     = null;
+  board.imageHash       = null;
   board.originalDataUrl = null;
   board.originalWidth   = 0;
   board.originalHeight  = 0;
@@ -169,17 +173,26 @@ export function clearImage() {
   resetView();
   board.characterBboxes     = [];
   board.referenceEmbeddings = [];
-  board.selectedIdx = -1;
-  board.hoveredIdx  = -1;
+  board.viewingCharacterIdx = -1;
+  board.scratchRect = _defaultScratchRect();
   _scheduleDraw();
 }
 
 /* ============================================================
-   Character bbox CRUD
+   Character CRUD
    ============================================================ */
 
 export function addCharacterBbox(bbox) {
-  const b = { ...bbox };
+  const b = {
+    x: 0, y: 0, w: 0, h: 0,
+    label:    "",
+    crop_b64: null,
+    cropEl:   null,
+    ...bbox,
+  };
+  if (b.crop_b64 && !b.cropEl) {
+    b.cropEl = _makeCropImage(b.crop_b64);
+  }
   board.characterBboxes.push(b);
   board.referenceEmbeddings.push(null);
   _scheduleDraw();
@@ -190,17 +203,25 @@ export function deleteCharacterBbox(idx) {
   if (idx < 0 || idx >= board.characterBboxes.length) return false;
   board.characterBboxes.splice(idx, 1);
   board.referenceEmbeddings.splice(idx, 1);
-  if (board.selectedIdx === idx) board.selectedIdx = -1;
-  else if (board.selectedIdx > idx) board.selectedIdx -= 1;
-  if (board.hoveredIdx === idx) board.hoveredIdx = -1;
-  else if (board.hoveredIdx > idx) board.hoveredIdx -= 1;
+  if (board.viewingCharacterIdx === idx) {
+    board.viewingCharacterIdx = -1;
+  } else if (board.viewingCharacterIdx > idx) {
+    board.viewingCharacterIdx -= 1;
+  }
   _scheduleDraw();
   return true;
 }
 
+/* Used only by the frozen-bbox path during analysis; kept for
+   completeness so future features can adjust a character's recorded
+   bbox without re-analyzing.  Preserves label / crop / cropEl. */
 export function setCharacterBbox(idx, bbox) {
   if (idx < 0 || idx >= board.characterBboxes.length) return false;
-  board.characterBboxes[idx] = { ...bbox };
+  const old = board.characterBboxes[idx];
+  board.characterBboxes[idx] = {
+    ...old,
+    x: bbox.x, y: bbox.y, w: bbox.w, h: bbox.h,
+  };
   _scheduleDraw();
   return true;
 }
@@ -208,30 +229,58 @@ export function setCharacterBbox(idx, bbox) {
 export function clearAllBboxes() {
   board.characterBboxes     = [];
   board.referenceEmbeddings = [];
-  board.selectedIdx = -1;
-  board.hoveredIdx  = -1;
+  board.viewingCharacterIdx = -1;
+  board.scratchRect = _defaultScratchRect();
   _scheduleDraw();
 }
 
-export function seedDefault() {
-  board.characterBboxes = [{ x: 0.30, y: 0.15, w: 0.40, h: 0.75 }];
-  board.referenceEmbeddings = [null];
-  board.selectedIdx = -1;
-  board.hoveredIdx  = -1;
+export function setCharacterLabel(idx, label) {
+  if (idx < 0 || idx >= board.characterBboxes.length) return false;
+  board.characterBboxes[idx] = {
+    ...board.characterBboxes[idx],
+    label: String(label || ""),
+  };
+  return true;
+}
+
+/* ============================================================
+   Scratch rect
+   ============================================================ */
+
+export function setScratchRect(rect) {
+  const old = board.scratchRect;
+  board.scratchRect = {
+    x: rect.x != null ? rect.x : old.x,
+    y: rect.y != null ? rect.y : old.y,
+    w: rect.w != null ? rect.w : old.w,
+    h: rect.h != null ? rect.h : old.h,
+  };
+  _scheduleDraw();
+  return true;
+}
+
+export function resetScratchRect() {
+  board.scratchRect = _defaultScratchRect();
   _scheduleDraw();
 }
 
-export function selectBbox(idx) {
-  if (typeof idx !== "number" || idx < 0 || idx >= board.characterBboxes.length) {
-    board.selectedIdx = -1;
+/* ============================================================
+   Viewing mode
+   ============================================================ */
+
+export function setViewingCharacter(idx) {
+  if (typeof idx !== "number" || idx < 0) {
+    board.viewingCharacterIdx = -1;
+  } else if (idx >= board.characterBboxes.length) {
+    board.viewingCharacterIdx = -1;
   } else {
-    board.selectedIdx = idx;
+    board.viewingCharacterIdx = idx;
   }
   _scheduleDraw();
 }
 
 /* ============================================================
-   Reference embeddings — 768-d per character, or null
+   Reference embeddings (parallel array)
    ============================================================ */
 
 export function setReferenceEmbedding(idx, embedding) {
@@ -267,26 +316,22 @@ export const board = {
   originalHeight:   0,
   originalDataUrl:  null,
 
-  mouse: { x: 0, y: 0, inside: false },
-
   characterBboxes:     [],
   referenceEmbeddings: [],
 
-  selectedIdx: -1,
-  hoveredIdx:  -1,
+  scratchRect: { x: 0.30, y: 0.15, w: 0.40, h: 0.75 },
 
-  // Drag state
+  viewingCharacterIdx: -1,
+
   dragActive:    false,
   dragHandle:    null,
-  dragIdx:       -1,
-  dragStartBbox: null,
+  dragStartRect: null,
   dragStartIx:   0,
   dragStartIy:   0,
 
-  // Analysis state
-  analyzing:   false,
+  analyzing:    false,
   analyzeError: null,
-  lastSync:    null,
+  lastSync:     null,
 };
 
 /* ============================================================
@@ -320,14 +365,12 @@ export function fittedImageRect() {
   return val;
 }
 
-/* Image → screen.  No rotation in the magi playground. */
 export function imageToScreen(x, y) {
   const r = fittedImageRect();
   if (!r) return [x, y];
   return [r.x0 + x * r.s, r.y0 + y * r.s];
 }
 
-/* Screen → image.  No rotation. */
 export function screenToImage(sx, sy) {
   const r = fittedImageRect();
   if (!r) return [0, 0];

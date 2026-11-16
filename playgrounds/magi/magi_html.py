@@ -24,7 +24,7 @@ import { setRemoteDraw, setRemoteSelect, setRemoteDeselect }
 import { setPanelDraw } from "./pgkit/panel_core.js";
 import { drawView } from "./pg_view.js";
 import {
-  resize, _setDraw, selectBbox,
+  resize, _setDraw, setViewingCharacter,
 } from "./pg_state.js";
 import {
   installPanelBindings, magiBootSync, onDrawComplete,
@@ -47,7 +47,7 @@ try {
     return false;
   });
   setRemoteDeselect(() => {
-    selectBbox(-1);
+    setViewingCharacter(-1);
     draw();
   });
 

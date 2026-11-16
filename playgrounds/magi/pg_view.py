@@ -1,10 +1,20 @@
-"""Main draw entry point."""
+"""Main draw entry point and chrome text."""
 
 VIEW_JS = r"""
 import { ctx, board, view, fittedImageRect } from "./pg_state.js";
 import { drawImageLayer } from "./pg_view_image.js";
 
 function _chromeText() {
+  if (board.viewingCharacterIdx >= 0) {
+    const idx = board.viewingCharacterIdx;
+    const total = board.characterBboxes.length;
+    const bbox = board.characterBboxes[idx];
+    const label = (bbox && bbox.label)
+      ? ("\u00ab" + bbox.label + "\u00bb")
+      : "(unlabeled)";
+    return "VIEWING CHARACTER " + (idx + 1) + "/" + total
+         + "   \u00b7   " + label;
+  }
   const total = board.characterBboxes.length;
   const analyzed = board.referenceEmbeddings.filter(r => r !== null).length;
   return "IMAGE " + board.imageWidth + "\u00d7" + board.imageHeight
@@ -50,7 +60,7 @@ export function drawView() {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(
-      "import a reference image, then place character boxes",
+      "import a reference image, then place the scratch rectangle",
       cw / 2, ch / 2,
     );
     return;

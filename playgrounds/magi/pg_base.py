@@ -1,11 +1,4 @@
-"""Magi playground's panel body and CSS.
-
-Sections: Image, Characters, Analysis, State.
-
-No viewer, no prompt, no seed, no generate.  The playground's only
-job is: display a reference image, let the user draw character
-bounding boxes over it, post to `/analyze_characters` to obtain
-768-d embeddings, and expose the result at `/state`."""
+"""Magi playground's panel body and CSS."""
 
 PG_CSS = r"""
   #ui button#pickImageBtn,
@@ -21,20 +14,20 @@ PG_CSS = r"""
     background: rgba(120, 220, 255, 0.10);
     color: #d8f4ff;
   }
-  #ui button#addCharacterBboxBtn {
-    border-color: rgba(255, 200, 90, 0.72);
-    color: #ffd89b;
+  #ui button#addCharacterBtn {
+    border-color: rgba(0, 229, 255, 0.72);
+    color: #b8ecff;
   }
-  #ui button#addCharacterBboxBtn:hover:not(:disabled) {
-    border-color: rgba(255, 200, 90, 1.00);
-    background: rgba(255, 200, 90, 0.10);
-    color: #ffe6b8;
+  #ui button#addCharacterBtn:hover:not(:disabled) {
+    border-color: rgba(0, 229, 255, 1.00);
+    background: rgba(0, 229, 255, 0.10);
+    color: #d8f4ff;
   }
-  #ui button#seedDefaultBtn {
+  #ui button#backToCanvasBtn {
     border-color: rgba(140, 225, 160, 0.72);
     color: #b8ecc8;
   }
-  #ui button#seedDefaultBtn:hover:not(:disabled) {
+  #ui button#backToCanvasBtn:hover:not(:disabled) {
     border-color: rgba(140, 225, 160, 1.00);
     background: rgba(140, 225, 160, 0.10);
     color: #d8ffe0;
@@ -48,14 +41,23 @@ PG_CSS = r"""
     background: rgba(220, 90, 110, 0.10);
     color: #ffd0d8;
   }
-  #ui button#analyzeAllBtn {
-    border-color: rgba(180, 155, 255, 0.72);
-    color: #d5c8ff;
+  #ui button#saveStateBtn {
+    border-color: rgba(255, 200, 90, 0.72);
+    color: #ffd89b;
   }
-  #ui button#analyzeAllBtn:hover:not(:disabled) {
-    border-color: rgba(200, 180, 255, 1.00);
-    background: rgba(180, 155, 255, 0.10);
-    color: #e8e0ff;
+  #ui button#saveStateBtn:hover:not(:disabled) {
+    border-color: rgba(255, 200, 90, 1.00);
+    background: rgba(255, 200, 90, 0.10);
+    color: #ffe6b8;
+  }
+  #ui button#loadStateBtn {
+    border-color: rgba(140, 225, 255, 0.72);
+    color: #b8ecff;
+  }
+  #ui button#loadStateBtn:hover:not(:disabled) {
+    border-color: rgba(160, 230, 255, 1.00);
+    background: rgba(140, 225, 255, 0.10);
+    color: #d8f4ff;
   }
   #imageInfo {
     font-size:10px; color:#5a6774;
@@ -70,10 +72,11 @@ PG_CSS = r"""
   #kritaStatus.ok   { color: #00e5ff; }
   #kritaStatus.bad  { color: #d48590; }
   #kritaStatus.warn { color: #ffe600; }
+
   .bboxList {
     display:flex; flex-direction:column; gap:3px;
     margin:6px 0 0;
-    max-height: 280px;
+    max-height: 320px;
     overflow-y: auto;
   }
   .bboxList::-webkit-scrollbar { width:6px; }
@@ -85,7 +88,7 @@ PG_CSS = r"""
     font-style:italic; padding:3px 4px;
   }
   .bboxRow {
-    display:flex; align-items:center; gap:7px;
+    display:flex; align-items:center; gap:6px;
     padding:3px 6px;
     border:1px solid #223040;
     border-radius:2px;
@@ -100,32 +103,43 @@ PG_CSS = r"""
     background:rgba(220,230,242,0.03);
   }
   .bboxRow.selected {
-    border-color:rgba(255,200,90,0.65);
-    color:#ffd89b;
-    background:rgba(255,200,90,0.06);
+    border-color:rgba(0,229,255,0.65);
+    color:#b8ecff;
+    background:rgba(0,229,255,0.06);
   }
-  .bboxSwatch {
-    width:9px; height:9px;
-    border-radius:1px;
+  .bboxThumb {
+    width:26px; height:26px;
+    border-radius:2px;
     flex:0 0 auto;
-    background: rgb(255, 200, 90);
-  }
-  .bboxSwatch.dim {
-    background: #3d4756;
+    object-fit:cover;
+    background:#0e1622;
+    border:1px solid #34445a;
   }
   .bboxLabel {
     flex:0 0 auto; font-weight:700;
     font-variant-numeric: tabular-nums;
-    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    min-width: 18px;
+    color: #5a6774;
+    font-size: 9px;
   }
-  .bboxDims {
-    flex:0 0 auto;
-    font-size:9px; color:#5a6774;
-    font-variant-numeric: tabular-nums;
+  .bboxLabelInput {
+    flex: 1 1 auto;
+    min-width: 40px;
+    background: transparent;
+    border: 0;
+    border-bottom: 1px solid #223040;
+    color: #b8ecff;
+    font-family: inherit;
+    font-size: 10px;
+    padding: 1px 3px;
+    outline: none;
+    letter-spacing: 0.02em;
   }
+  .bboxLabelInput:hover { border-bottom-color:#34445a; }
+  .bboxLabelInput:focus { border-bottom-color:#00e5ff; }
+  .bboxLabelInput::placeholder { color:#3d4756; font-style:italic; }
   .bboxEmbed {
-    flex:1 1 auto;
-    text-align:right;
+    flex:0 0 auto;
     font-size:9px;
     font-variant-numeric: tabular-nums;
   }
@@ -206,32 +220,21 @@ PG_PANEL_BODY = r"""
       <summary>Characters</summary>
       <div class="section-body">
         <div class="row">
-          <button id="addCharacterBboxBtn"
-                  title="Add a character region. Character boxes are drawn as yellow outlines."
-                  disabled>+ Character</button>
+          <button id="addCharacterBtn"
+                  title="Crop the scratch rectangle, analyze it via MAGI, and add it as a new character."
+                  disabled>+ Add Character</button>
         </div>
-        <div class="row">
-          <button id="seedDefaultBtn"
-                  title="Populate with a default character box (centre)."
-                  disabled>Seed default</button>
-          <button id="clearBboxesBtn"
-                  title="Remove all character bboxes."
-                  disabled>Clear all</button>
-        </div>
-        <div id="bboxList" class="bboxList"></div>
-      </div>
-    </details>
-    <details class="section" open>
-      <summary>Analysis</summary>
-      <div class="section-body">
-        <div class="row">
-          <button id="analyzeAllBtn"
-                  title="Send the image and every character bbox to MAGI, then store the 768-d embeddings in state."
-                  disabled>Analyze all</button>
+        <div class="row" id="backRow" style="display:none;">
+          <button id="backToCanvasBtn"
+                  title="Return to the @thecharacter image.">← Back to @thecharacter</button>
         </div>
         <div id="analysisHint" style="font-size:9px;color:#3d4756;font-style:italic;margin-top:4px;line-height:1.45;">
-          MAGI integration not yet wired. This button will call the
-          MAGI analysis endpoint once the ComfyUI MAGI port lands.
+          Drag the cyan scratch rect on the canvas to frame a character, then click Add Character.
+          Click a list row to view that character's crop.
+        </div>
+        <div id="bboxList" class="bboxList"></div>
+        <div class="row" style="margin-top:6px;">
+          <button id="clearBboxesBtn" disabled>Clear all characters</button>
         </div>
       </div>
     </details>
@@ -242,6 +245,13 @@ PG_PANEL_BODY = r"""
           Served at <code>/state</code> for
           <code>DrawatoonSetIP</code>. Version:
           <code id="stateVersion">—</code>
+        </div>
+        <div class="row" style="margin:6px 0;">
+          <button id="saveStateBtn"
+                  title="Download a JSON file containing the image, characters, crops, and 768-d embeddings."
+                  disabled>Save state</button>
+          <button id="loadStateBtn"
+                  title="Load a previously-saved magi state file.">Load state</button>
         </div>
         <div id="statusLine">idle</div>
       </div>

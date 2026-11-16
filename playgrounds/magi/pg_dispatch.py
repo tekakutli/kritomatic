@@ -1,24 +1,22 @@
-"""Mouse handling and drag math for character bboxes.
+"""Mouse handling and drag math for the scratch rectangle.
 
-No viewer handles (magi has no viewer).  No text bbox handling.
-Hit priority:
-  1. Selected bbox corner/edge handle → resize
-  2. Character bbox interior          → drag
-  3. Nothing                          → deselect
+No character-bbox drags — those bboxes are frozen historical records.
+The only draggable thing on the canvas is the scratch rect, and only
+when `viewingCharacterIdx === -1`.
 
-Pan (space / middle mouse) and zoom (wheel) behave as before.
+Pan (space / middle mouse) and zoom (wheel) work in both view modes.
 """
 
 DISPATCH_JS = r"""
 import {
   canvas, board, view,
   screenToImage, fittedImageRect, clampPan, zoomAt, resetView,
-  setCharacterBbox, selectBbox, _scheduleDraw,
+  setScratchRect, setViewingCharacter, _scheduleDraw,
 } from "./pg_state.js";
 import { BBOX_MIN_SIZE, HANDLE_TOL_PX } from "./pg_tuning.js";
 
 /* ============================================================
-   Public helpers — used by pg_view_image.js
+   Screen-space geometry helpers
    ============================================================ */
 
 export function bboxScreenRect(bbox) {
@@ -32,8 +30,20 @@ export function bboxScreenRect(bbox) {
   };
 }
 
-export function bboxHandles(bbox) {
-  const rect = bboxScreenRect(bbox);
+export function scratchRectScreen() {
+  const r = fittedImageRect();
+  if (!r) return null;
+  const s = board.scratchRect;
+  return {
+    x0: r.x0 + s.x * r.w,
+    y0: r.y0 + s.y * r.h,
+    x1: r.x0 + (s.x + s.w) * r.w,
+    y1: r.y0 + (s.y + s.h) * r.h,
+  };
+}
+
+export function scratchRectHandles() {
+  const rect = scratchRectScreen();
   if (!rect) return null;
   const { x0, y0, x1, y1 } = rect;
   return [
@@ -48,7 +58,7 @@ export function bboxHandles(bbox) {
   ];
 }
 
-function _bboxCursorFor(name) {
+function _cursorFor(name) {
   switch (name) {
     case 'nw': case 'se': return 'nwse-resize';
     case 'ne': case 'sw': return 'nesw-resize';
@@ -60,14 +70,12 @@ function _bboxCursorFor(name) {
 }
 
 /* ============================================================
-   Hit-testing
+   Hit testing
    ============================================================ */
 
-function _hitBboxHandleOfSelected(sx, sy) {
-  if (board.selectedIdx < 0) return null;
-  const bbox = board.characterBboxes[board.selectedIdx];
-  if (!bbox) return null;
-  const hs = bboxHandles(bbox);
+function _hitScratchHandle(sx, sy) {
+  if (board.viewingCharacterIdx >= 0) return null;
+  const hs = scratchRectHandles();
   if (!hs) return null;
   const tol = HANDLE_TOL_PX;
   for (const h of hs) {
@@ -78,27 +86,23 @@ function _hitBboxHandleOfSelected(sx, sy) {
   return null;
 }
 
-function _hitAnyBbox(ix, iy) {
-  if (board.imageWidth <= 0 || board.imageHeight <= 0) return -1;
-  const nx = ix / board.imageWidth;
-  const ny = iy / board.imageHeight;
-  for (let i = board.characterBboxes.length - 1; i >= 0; i--) {
-    const b = board.characterBboxes[i];
-    if (nx >= b.x && nx <= b.x + b.w
-        && ny >= b.y && ny <= b.y + b.h) {
-      return i;
-    }
-  }
-  return -1;
+function _hitScratchInterior(cx, cy) {
+  if (board.viewingCharacterIdx >= 0) return false;
+  const s = board.scratchRect;
+  const x1 = s.x * board.imageWidth;
+  const y1 = s.y * board.imageHeight;
+  const x2 = (s.x + s.w) * board.imageWidth;
+  const y2 = (s.y + s.h) * board.imageHeight;
+  return cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2;
 }
 
 /* ============================================================
-   Drag math (operates in image-normalized space)
+   Drag math (image-normalized space)
    ============================================================ */
 
-function _applyBboxDrag(bbox, handle, dxNorm, dyNorm) {
-  let x1 = bbox.x, y1 = bbox.y;
-  let x2 = bbox.x + bbox.w, y2 = bbox.y + bbox.h;
+function _applyRectDrag(startRect, handle, dxNorm, dyNorm) {
+  let x1 = startRect.x, y1 = startRect.y;
+  let x2 = startRect.x + startRect.w, y2 = startRect.y + startRect.h;
 
   if (handle === 'move') {
     const w = x2 - x1, h = y2 - y1;
@@ -167,6 +171,7 @@ canvas.addEventListener("mousedown", (e) => {
 
   if (e.button !== 0) return;
   if (!board.imageEl) return;
+  if (board.viewingCharacterIdx >= 0) return;  // read-only crop view
 
   const rect = canvas.getBoundingClientRect();
   const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
@@ -174,39 +179,28 @@ canvas.addEventListener("mousedown", (e) => {
   if (!r) return;
   const [cx, cy] = screenToImage(sx, sy);
 
-  // 1) Selected bbox handle
-  const bboxHandle = _hitBboxHandleOfSelected(sx, sy);
-  if (bboxHandle) {
-    const bbox = board.characterBboxes[board.selectedIdx];
-    board.dragActive = true;
-    board.dragHandle = bboxHandle;
-    board.dragIdx = board.selectedIdx;
-    board.dragStartBbox = { ...bbox };
-    board.dragStartIx = cx;
-    board.dragStartIy = cy;
-    canvas.style.cursor = _bboxCursorFor(bboxHandle);
+  const hname = _hitScratchHandle(sx, sy);
+  if (hname) {
+    board.dragActive    = true;
+    board.dragHandle    = hname;
+    board.dragStartRect = { ...board.scratchRect };
+    board.dragStartIx   = cx;
+    board.dragStartIy   = cy;
+    canvas.style.cursor = _cursorFor(hname);
     e.preventDefault();
     return;
   }
 
-  // 2) Character bbox interior
-  const idx = _hitAnyBbox(cx, cy);
-  if (idx >= 0) {
-    selectBbox(idx);
-    const bbox = board.characterBboxes[idx];
-    board.dragActive = true;
-    board.dragHandle = 'move';
-    board.dragIdx = idx;
-    board.dragStartBbox = { ...bbox };
-    board.dragStartIx = cx;
-    board.dragStartIy = cy;
+  if (_hitScratchInterior(cx, cy)) {
+    board.dragActive    = true;
+    board.dragHandle    = 'move';
+    board.dragStartRect = { ...board.scratchRect };
+    board.dragStartIx   = cx;
+    board.dragStartIy   = cy;
     canvas.style.cursor = 'move';
     e.preventDefault();
     return;
   }
-
-  // 3) Nothing: deselect
-  selectBbox(-1);
 });
 
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
@@ -228,50 +222,37 @@ canvas.addEventListener("mousemove", (e) => {
     return;
   }
 
-  if (_spaceDown) {
-    canvas.style.cursor = "grab";
-    return;
-  }
-
+  if (_spaceDown) { canvas.style.cursor = "grab"; return; }
   if (!board.imageEl) { canvas.style.cursor = "default"; return; }
 
   const r = fittedImageRect();
   if (!r) return;
   const [cx, cy] = screenToImage(sx, sy);
-  board.mouse.x = cx;
-  board.mouse.y = cy;
-  board.mouse.inside = cx >= 0 && cx <= board.imageWidth
-                    && cy >= 0 && cy <= board.imageHeight;
 
   if (board.dragActive) {
     const dxNorm = (cx - board.dragStartIx) / board.imageWidth;
     const dyNorm = (cy - board.dragStartIy) / board.imageHeight;
-    const next = _applyBboxDrag(
-      board.dragStartBbox, board.dragHandle, dxNorm, dyNorm,
+    const next = _applyRectDrag(
+      board.dragStartRect, board.dragHandle, dxNorm, dyNorm,
     );
-    setCharacterBbox(board.dragIdx, next);
-    canvas.style.cursor = _bboxCursorFor(board.dragHandle);
+    setScratchRect(next);
+    canvas.style.cursor = _cursorFor(board.dragHandle);
     return;
   }
 
-  // Hover state (priority order matches mousedown)
-  const bboxHandle = _hitBboxHandleOfSelected(sx, sy);
-  if (bboxHandle) {
-    canvas.style.cursor = _bboxCursorFor(bboxHandle);
+  if (board.viewingCharacterIdx >= 0) {
+    canvas.style.cursor = "default";
     return;
   }
-  const idx = _hitAnyBbox(cx, cy);
-  if (idx >= 0) {
-    if (board.hoveredIdx !== idx) {
-      board.hoveredIdx = idx;
-      _scheduleDraw();
-    }
-    canvas.style.cursor = "move";
+
+  const hname = _hitScratchHandle(sx, sy);
+  if (hname) {
+    canvas.style.cursor = _cursorFor(hname);
     return;
   }
-  if (board.hoveredIdx !== -1) {
-    board.hoveredIdx = -1;
-    _scheduleDraw();
+  if (_hitScratchInterior(cx, cy)) {
+    canvas.style.cursor = 'move';
+    return;
   }
   canvas.style.cursor = "crosshair";
 });
@@ -298,12 +279,10 @@ window.addEventListener("mouseup", () => {
     canvas.style.cursor = _spaceDown ? "grab" : "crosshair";
   }
   if (board.dragActive) {
-    board.dragActive = false;
-    board.dragHandle = null;
-    board.dragIdx = -1;
-    board.dragStartBbox = null;
+    board.dragActive    = false;
+    board.dragHandle    = null;
+    board.dragStartRect = null;
     canvas.style.cursor = "crosshair";
-    if (window._magiOnDragEnd) window._magiOnDragEnd();
   }
 });
 
@@ -315,11 +294,7 @@ window.addEventListener("keyup", (e) => {
 });
 
 canvas.addEventListener("mouseleave", () => {
-  board.mouse.inside = false;
-  if (board.hoveredIdx !== -1) {
-    board.hoveredIdx = -1;
-    _scheduleDraw();
-  }
+  // no persistent hover state to clear in v2
 });
 
 /* ============================================================
@@ -347,7 +322,9 @@ window.addEventListener("keydown", (e) => {
   }
   if (e.key === "Escape") {
     e.preventDefault();
-    selectBbox(-1);
+    if (board.viewingCharacterIdx >= 0) {
+      setViewingCharacter(-1);
+    }
     return;
   }
 });

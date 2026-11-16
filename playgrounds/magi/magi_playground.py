@@ -38,6 +38,15 @@ would see a stale / empty state and silently produce wrong output.
 So: bind first, verify the port matches `PORT`, and refuse to start
 if it doesn't.  The failure mode becomes a loud startup error
 instead of a silent misbehaviour downstream.
+
+Signal handling
+===============
+SIGINT and SIGTERM raise SystemExit, which propagates out of
+`serve_forever()` and runs the surrounding `try/finally` (plus the
+atexit-registered `_cleanup`).  Calling `httpd.shutdown()` directly
+from a signal handler would deadlock: `shutdown()` blocks until
+`serve_forever()` returns, but `serve_forever()` is paused inside
+the handler that's blocking it.
 """
 
 import atexit
@@ -121,7 +130,12 @@ def _unregister():
 
 
 def _sigterm(signum, frame):
-    _unregister()
+    # Raising SystemExit from a signal handler propagates out of
+    # serve_forever() (which doesn't catch it), running the
+    # surrounding try/finally and the atexit-registered _cleanup.
+    # Calling httpd.shutdown() here would deadlock: shutdown() blocks
+    # until serve_forever() returns, but serve_forever() is paused
+    # inside this handler.
     sys.exit(0)
 
 
@@ -234,14 +248,8 @@ def main():
 
     atexit.register(_cleanup)
 
-    def _sigterm_shutdown(signum, frame):
-        try:
-            httpd.shutdown()
-        except Exception:
-            pass
-
-    signal.signal(signal.SIGTERM, _sigterm_shutdown)
-    signal.signal(signal.SIGINT, _sigterm_shutdown)
+    signal.signal(signal.SIGTERM, _sigterm)
+    signal.signal(signal.SIGINT,  _sigterm)
 
     threading.Thread(
         target=_watch_daemon_and_exit,

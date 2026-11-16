@@ -1,99 +1,147 @@
-"""The loaded image and the character bboxes.
+"""The loaded image (or character crop) and the scratch rectangle.
 
-No viewer, no dimming, no rotation.  Draws image + character boxes
-+ a faint border.  Overlays are drawn on a single canvas (`#c`)
-because the magi playground has no separate UI layer."""
+Two rendering modes driven by `board.viewingCharacterIdx`:
+
+  · canvas view (-1) — draw the @thecharacter image, then the scratch
+    rect on top.  Stored character bboxes are NOT rendered — the
+    scratch rect is the only draggable/visible overlay.
+  · character view  — draw only the character's stored crop,
+    letterboxed into the fitted rect.  No overlays.
+"""
 
 VIEW_IMAGE_JS = r"""
 import { ctx, board } from "./pg_state.js";
-import { bboxScreenRect, bboxHandles } from "./pg_dispatch.js";
+import { scratchRectScreen, scratchRectHandles } from "./pg_dispatch.js";
 
 const COLORS = {
-  normal:  "rgba(255, 200, 90, 0.70)",
-  hover:   "rgba(255, 200, 90, 0.90)",
-  selected: "rgba(255, 200, 90, 1.00)",
-  fill:    "rgba(255, 200, 90, 0.06)",
-  analyzed: "rgba(0, 229, 255, 0.85)",
+  scratchBorder: "rgba(0, 229, 255, 0.90)",
+  scratchFill:   "rgba(0, 229, 255, 0.06)",
 };
 
-function _drawOneBbox(idx, bbox, isSelected, isHovered, hasEmbedding) {
-  const r = bboxScreenRect(bbox);
-  if (!r) return;
+/* ============================================================
+   Scratch rect
+   ============================================================ */
 
-  // Analyzed bboxes get a cyan tint on the halo; unanalyzed are pure
-  // yellow.  The distinction is a useful "have I analyzed this one?"
-  // indicator that doesn't require reading the row in the panel.
-  const baseStroke = hasEmbedding ? COLORS.analyzed
-                    : isSelected ? COLORS.selected
-                    : isHovered  ? COLORS.hover
-                    : COLORS.normal;
+function _drawScratchRect() {
+  const r = scratchRectScreen();
+  if (!r) return;
+  const w = r.x1 - r.x0, h = r.y1 - r.y0;
 
   ctx.save();
-  ctx.fillStyle = COLORS.fill;
-  ctx.fillRect(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+  ctx.fillStyle = COLORS.scratchFill;
+  ctx.fillRect(r.x0, r.y0, w, h);
 
+  // Halo
   ctx.strokeStyle = "rgba(8, 10, 14, 0.85)";
-  ctx.lineWidth = isSelected ? 6.0 : 3.5;
+  ctx.lineWidth = 6.0;
   ctx.beginPath();
-  ctx.rect(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+  ctx.rect(r.x0, r.y0, w, h);
   ctx.stroke();
 
-  ctx.strokeStyle = baseStroke;
-  ctx.lineWidth = isSelected ? 2.8 : 2.0;
+  // Bright dashed
+  ctx.strokeStyle = COLORS.scratchBorder;
+  ctx.lineWidth = 2.8;
+  ctx.setLineDash([6, 4]);
   ctx.beginPath();
-  ctx.rect(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+  ctx.rect(r.x0, r.y0, w, h);
   ctx.stroke();
+  ctx.setLineDash([]);
 
-  const label = "CHAR " + (idx + 1);
-  ctx.font = "700 10px 'JetBrains Mono', monospace";
-  ctx.fillStyle = baseStroke;
-  ctx.textBaseline = "bottom";
-  ctx.textAlign = "left";
-  ctx.fillText(label, r.x0 + 3, r.y0 - 3);
-
-  if (hasEmbedding) {
-    // Small "✓" after the label so analyzed boxes read at a glance.
-    const labelW = ctx.measureText(label).width;
-    ctx.fillStyle = COLORS.analyzed;
-    ctx.fillText("\u2713", r.x0 + 3 + labelW + 4, r.y0 - 3);
-  }
-
-  if (isSelected) {
-    const hs = bboxHandles(bbox);
-    if (hs) {
-      for (const h of hs) {
-        const HS = 7;
-        ctx.fillStyle = "rgba(8, 10, 14, 0.85)";
-        ctx.fillRect(h.x - HS - 2, h.y - HS - 2, (HS + 2) * 2, (HS + 2) * 2);
-        ctx.fillStyle = baseStroke;
-        ctx.fillRect(h.x - HS, h.y - HS, HS * 2, HS * 2);
-        ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
-        ctx.lineWidth = 1.5;
-        ctx.strokeRect(h.x - HS, h.y - HS, HS * 2, HS * 2);
-      }
+  // Handles
+  const hs = scratchRectHandles();
+  if (hs) {
+    for (const hd of hs) {
+      const HS = 7;
+      ctx.fillStyle = "rgba(8, 10, 14, 0.85)";
+      ctx.fillRect(hd.x - HS - 2, hd.y - HS - 2, (HS + 2) * 2, (HS + 2) * 2);
+      ctx.fillStyle = COLORS.scratchBorder;
+      ctx.fillRect(hd.x - HS, hd.y - HS, HS * 2, HS * 2);
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(hd.x - HS, hd.y - HS, HS * 2, HS * 2);
     }
   }
+
+  // Label
+  ctx.font = "700 10px 'JetBrains Mono', monospace";
+  ctx.fillStyle = COLORS.scratchBorder;
+  ctx.textBaseline = "bottom";
+  ctx.textAlign = "left";
+  ctx.fillText("NEW CROP", r.x0 + 3, r.y0 - 3);
 
   ctx.restore();
 }
 
-export function drawImageLayer(r) {
+/* ============================================================
+   Canvas view
+   ============================================================ */
+
+function _drawCanvasView(r) {
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
   ctx.drawImage(board.imageEl, r.x0, r.y0, r.w, r.h);
 
-  for (let i = 0; i < board.characterBboxes.length; i++) {
-    _drawOneBbox(
-      i,
-      board.characterBboxes[i],
-      board.selectedIdx === i,
-      board.hoveredIdx === i,
-      board.referenceEmbeddings[i] !== null,
-    );
-  }
+  // Scratch rect only — stored character bboxes are not rendered.
+  _drawScratchRect();
 
+  // Faint image border
   ctx.strokeStyle = "#1e2836";
   ctx.lineWidth = 1;
   ctx.strokeRect(r.x0 + 0.5, r.y0 + 0.5, r.w - 1, r.h - 1);
+}
+
+/* ============================================================
+   Character crop view
+   ============================================================ */
+
+function _drawCharacterCropView(r, idx) {
+  const bbox = board.characterBboxes[idx];
+  if (!bbox) return;
+
+  // Dark backdrop
+  ctx.fillStyle = "#050810";
+  ctx.fillRect(r.x0, r.y0, r.w, r.h);
+
+  const cropEl = bbox.cropEl;
+  if (!cropEl || !cropEl.complete || cropEl.naturalWidth === 0) {
+    ctx.fillStyle = "#5a6774";
+    ctx.font = "700 12px 'JetBrains Mono', monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(
+      "(crop not available)",
+      r.x0 + r.w / 2, r.y0 + r.h / 2,
+    );
+    return;
+  }
+
+  // Letterbox the crop into the fitted rect while preserving aspect
+  const cw = cropEl.naturalWidth;
+  const ch = cropEl.naturalHeight;
+  const s  = Math.min(r.w / cw, r.h / ch);
+  const dw = cw * s;
+  const dh = ch * s;
+  const dx = r.x0 + (r.w - dw) / 2;
+  const dy = r.y0 + (r.h - dh) / 2;
+
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(cropEl, dx, dy, dw, dh);
+
+  ctx.strokeStyle = "#1e2836";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(dx + 0.5, dy + 0.5, dw - 1, dh - 1);
+}
+
+/* ============================================================
+   Public entry point
+   ============================================================ */
+
+export function drawImageLayer(r) {
+  if (board.viewingCharacterIdx >= 0) {
+    _drawCharacterCropView(r, board.viewingCharacterIdx);
+  } else {
+    _drawCanvasView(r);
+  }
 }
 """

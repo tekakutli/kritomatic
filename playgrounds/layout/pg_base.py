@@ -127,6 +127,35 @@ PG_CSS = r"""
   .bboxTextInput:hover { border-bottom-color:#34445a; }
   .bboxTextInput:focus { border-bottom-color:#00e5ff; }
   .bboxTextInput::placeholder { color:#3d4756; font-style:italic; }
+  .bboxMagiSel {
+    flex: 1 1 60px;
+    min-width: 60px;
+    background: #0e1622;
+    color: #ffd89b;
+    border: 1px solid #223040;
+    font-family: inherit;
+    font-size: 10px;
+    padding: 1px 2px;
+    border-radius: 2px;
+    outline: none;
+    cursor: pointer;
+  }
+  .bboxMagiSel:hover:not(:disabled) { border-color: #34445a; color: #ffe6b8; }
+  .bboxMagiSel:focus { border-color: #ffc85a; }
+  .bboxMagiSel:disabled {
+    color: #3d4756;
+    border-color: #1e2836;
+    cursor: not-allowed;
+    font-style: italic;
+  }
+  .bboxEmbed {
+    flex: 0 0 auto;
+    font-size: 9px;
+    font-variant-numeric: tabular-nums;
+    color: #5a6774;
+  }
+  .bboxEmbed.yes { color: #00e5ff; }
+  .bboxEmbed.no  { color: #3d4756; font-style: italic; }
   .bboxDel {
     width:auto !important;
     padding:1px 6px !important;
@@ -301,7 +330,7 @@ PG_PANEL_BODY = r"""
                   title="Add a text region (speech bubble / caption). Text boxes are drawn as blue outlines."
                   disabled>+ Text region</button>
           <button id="addCharacterBboxBtn"
-                  title="Add a character region. Character boxes are drawn as yellow outlines."
+                  title="Add a character region. Character boxes are drawn as yellow outlines. Pair each one with a magi character to control identity."
                   disabled>+ Character</button>
         </div>
         <div class="row">

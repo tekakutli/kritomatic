@@ -12,6 +12,11 @@ Workflow:
   7. Edit labels inline; delete rows; clear all.
   8. Save state → downloads a self-contained JSON (image + chars +
      crops + 768-d embeddings).  Load state → restores it.
+
+Labels are user-editable, browser-authoritative, and published to
+`/state` as `character_labels` (parallel to `character_bboxes`).  They
+are the pairing key downstream consumers (layout) use to bind each of
+their position boxes to one of this playground's identities.
 """
 
 PANEL_JS = r"""
@@ -46,6 +51,7 @@ function _stateSnapshot() {
     c: board.characterBboxes.map(b => ({
       x: b.x, y: b.y, w: b.w, h: b.h,
     })),
+    l: board.characterBboxes.map(b => b.label || ""),
     r: board.referenceEmbeddings,
     d: [board.imageWidth, board.imageHeight],
   });
@@ -59,6 +65,7 @@ function _buildPayload() {
     op: "set",
     state: {
       character_bboxes:     toWire(board.characterBboxes),
+      character_labels:     board.characterBboxes.map(b => b.label || ""),
       reference_embeddings: board.referenceEmbeddings.map(r => r || null),
       image_dims:           [board.imageWidth, board.imageHeight],
     },
@@ -138,7 +145,6 @@ function _renderBboxList() {
   if (sig === _lastListSig) return;
   _lastListSig = sig;
 
-  // Preserve focus state so typing in a label input isn't interrupted
   const ae = document.activeElement;
   const focusedIdx = (ae && ae.classList
     && ae.classList.contains("bboxLabelInput"))
@@ -166,7 +172,6 @@ function _renderBboxList() {
     const row = document.createElement("div");
     row.className = "bboxRow" + (isViewing ? " selected" : "");
 
-    // Thumbnail
     const thumb = document.createElement("img");
     thumb.className = "bboxThumb";
     thumb.alt = "";
@@ -175,13 +180,11 @@ function _renderBboxList() {
       : "";
     row.appendChild(thumb);
 
-    // Index
     const lbl = document.createElement("span");
     lbl.className = "bboxLabel";
     lbl.textContent = "#" + (i + 1);
     row.appendChild(lbl);
 
-    // Editable label
     const input = document.createElement("input");
     input.type = "text";
     input.className = "bboxLabelInput";
@@ -191,18 +194,17 @@ function _renderBboxList() {
     input.addEventListener("input", () => {
       setCharacterLabel(i, input.value);
       _refreshStatusLine();
+      _scheduleStateSync();
     });
     input.addEventListener("click", (e) => e.stopPropagation());
     input.addEventListener("mousedown", (e) => e.stopPropagation());
     row.appendChild(input);
 
-    // Embedding indicator
     const emb = document.createElement("span");
     emb.className = "bboxEmbed " + (hasEmbed ? "yes" : "no");
     emb.textContent = hasEmbed ? "768d" : "—";
     row.appendChild(emb);
 
-    // Delete
     const del = document.createElement("button");
     del.className = "bboxDel";
     del.textContent = "\u00d7";
@@ -217,7 +219,6 @@ function _renderBboxList() {
     });
     row.appendChild(del);
 
-    // Row click → view that character's crop
     row.addEventListener("click", () => {
       setViewingCharacter(i);
       syncPanelFields();
@@ -228,7 +229,6 @@ function _renderBboxList() {
     list.appendChild(row);
   }
 
-  // Restore focus + cursor position after rebuild
   if (focusedIdx >= 0 && focusedIdx < list.children.length) {
     const newInput = list.children[focusedIdx]
       ?.querySelector?.(".bboxLabelInput");
@@ -236,7 +236,7 @@ function _renderBboxList() {
       newInput.focus();
       try {
         newInput.setSelectionRange(focusedSelStart, focusedSelEnd);
-      } catch (_) { /* ignore */ }
+      } catch (_) {}
     }
   }
 }
@@ -505,17 +505,8 @@ function _clearAllAction() {
 }
 
 /* ============================================================
-   Save state
-   ============================================================
-   Writes a single self-contained JSON containing the source image
-   (as data URL), the scratch rect, and every character with its
-   frozen bbox, editable label, crop PNG (base64), and 768-d
-   reference embedding.  Uses a Blob for the download so large
-   payloads (multi-MB image + crops + embeddings) do not hit the
-   data:-URL size limits some browsers impose.
-
-   Format is versioned (`format: "magi-state-v1"`) so future loaders
-   can reject old files cleanly. */
+   Save / Load state
+   ============================================================ */
 
 function _saveStateAction() {
   if (!board.imageHash && board.characterBboxes.length === 0) {
@@ -560,25 +551,6 @@ function _saveStateAction() {
   );
 }
 
-/* ============================================================
-   Load state
-   ============================================================
-   Replaces the current characters with the loaded ones, and
-   replaces the image too if the state has one and its hash does
-   not match the currently-loaded image (avoids the reload flash
-   when loading a state that was saved against the same image).
-
-   Restores: image, characters (bboxes + labels + crops +
-   embeddings), scratch rect.  Everything is then re-pushed to
-   `/state` so `DrawatoonSetIP` sees it immediately.
-
-   Case handling:
-     · state has image + hash matches current  → keep image, reload chars
-     · state has image + hash differs          → reload image, then chars
-     · state has no image                      → keep current image (or
-                                                 none) and warn if there
-                                                 isn't one to display. */
-
 function _loadStateAction() {
   const input = document.createElement("input");
   input.type = "file";
@@ -605,9 +577,6 @@ function _loadStateAction() {
                        && data.image_dims.length === 2;
         const dims = data.image_dims || [0, 0];
 
-        // ---- Image ----
-        // setImage clears characters + scratch_rect; clearAllBboxes
-        // does the same when we're keeping the current image.
         if (hasImage && data.image_hash !== board.imageHash) {
           setImage(
             data.image_hash || "loaded",
@@ -618,7 +587,6 @@ function _loadStateAction() {
           clearAllBboxes();
         }
 
-        // ---- Characters ----
         for (const c of characters) {
           const idx = addCharacterBbox({
             x: Number(c.x) || 0,
@@ -634,22 +602,13 @@ function _loadStateAction() {
           }
         }
 
-        // ---- Scratch rect ----
         if (data.scratch_rect && typeof data.scratch_rect === "object") {
           setScratchRect(data.scratch_rect);
         }
 
-        // ---- Flash summary ----
         let warn = null;
         if (!hasImage && !board.imageHash) {
           warn = "no image \u2014 load one to view bboxes on canvas";
-        } else if (hasImage && data.image_hash !== board.imageHash
-                   && !board.imageHash) {
-          // State has image, we attempted load; imageHash was set
-          // synchronously in setImage so this branch is unreachable
-          // in practice — kept for clarity if setImage's contract
-          // ever changes.
-          warn = "image loading\u2026";
         }
         flashStatus(
           "loaded " + characters.length + " character(s)"

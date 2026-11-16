@@ -12,10 +12,18 @@ The viewer is stored as `{x, y, w, h}` in canvas-normalized coords.
 Bboxes are stored as `{x, y, w, h}` in viewer-normalized coords.
 
 Text bboxes additionally carry a `text` field — the string the user
-wants rendered in that bubble. The DrawatoonSetIP node does not read
-it (the ip branch only encodes position). It travels with the bbox in
+wants rendered in that bubble.  The DrawatoonSetIP node does not read
+it (the ip branch only encodes position).  It travels with the bbox in
 browser memory and is folded into the CLIP prompt at Generate time.
+
+Character bboxes additionally carry a `magiLabel` field — the name of
+the magi character whose embedding should be paired with this
+position.  Empty string means "no pairing" (falls back to the
+learned `character_cls_embedding`, same as if magi were unreachable).
+Layout's server resolves labels to 768-d vectors at read time; the
+browser is the pairing authority, the server is the resolver.
 """
+
 STATE_JS = r"""
 import {
   VIEW_ZOOM_MIN, VIEW_ZOOM_MAX, VIEW_PAN_MARGIN,
@@ -73,7 +81,6 @@ export const board = {
   imageEl:      null,
   imageDataUrl: null,
 
-  // Viewer rectangle: normalized [0, 1] of canvas.
   viewer: {
     x: 0.05, y: 0.05, w: 0.9, h: 0.9,
     ratio: "1.00",
@@ -81,9 +88,16 @@ export const board = {
 
   // Bboxes are normalized [0, 1] OF VIEWER, not of canvas.
   // Text bboxes additionally carry a `text` field (string).
+  // Character bboxes additionally carry a `magiLabel` field (string,
+  // magi character name to pair with this position; empty = none).
   textBboxes:          [],
   characterBboxes:     [],
   referenceEmbeddings: [],
+
+  // Magi discovery — populated from /state responses (server merges
+  // these from magi's own /state).  Display-only.
+  magiLabels:    [],
+  magiReachable: false,
 
   selectedKind:  null,
   selectedIdx:   -1,
@@ -218,6 +232,7 @@ export function addBbox(kind, bbox) {
   const list = _listFor(kind);
   const b = { ...bbox };
   if (kind === 'text' && b.text === undefined) b.text = "";
+  if (kind === 'character' && b.magiLabel === undefined) b.magiLabel = "";
   list.push(b);
   if (kind === 'character') board.referenceEmbeddings.push(null);
   _scheduleDraw();
@@ -250,9 +265,12 @@ export function setBbox(kind, idx, bbox) {
   if (idx < 0 || idx >= list.length) return false;
   const old = list[idx];
   list[idx] = { ...bbox };
-  // Preserve the text field across geometry updates
+  // Preserve non-geometric fields across drags.
   if (kind === 'text' && old.text !== undefined) {
     list[idx].text = old.text;
+  }
+  if (kind === 'character' && old.magiLabel !== undefined) {
+    list[idx].magiLabel = old.magiLabel;
   }
   _scheduleDraw();
   return true;
@@ -265,20 +283,27 @@ export function setBboxText(idx, text) {
   return true;
 }
 
+export function setBboxMagiLabel(idx, label) {
+  if (idx < 0 || idx >= board.characterBboxes.length) return false;
+  board.characterBboxes[idx].magiLabel = String(label || "");
+  _scheduleDraw();
+  return true;
+}
+
 export function clearAllBboxes() {
   board.textBboxes          = [];
   board.characterBboxes     = [];
   board.referenceEmbeddings = [];
   board.selectedKind = null;
-  board.selectedIdx = -1;
-  board.hoveredKind = null;
-  board.hoveredIdx = -1;
+  board.selectedIdx  = -1;
+  board.hoveredKind  = null;
+  board.hoveredIdx   = -1;
   _scheduleDraw();
 }
 
 export function seedDefault() {
   board.textBboxes = [{ x: 0.10, y: 0.02, w: 0.80, h: 0.10, text: "" }];
-  board.characterBboxes = [{ x: 0.30, y: 0.15, w: 0.40, h: 0.75 }];
+  board.characterBboxes = [{ x: 0.30, y: 0.15, w: 0.40, h: 0.75, magiLabel: "" }];
   board.referenceEmbeddings = [null];
   board.selectedKind = null;
   board.selectedIdx = -1;

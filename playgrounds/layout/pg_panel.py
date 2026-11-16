@@ -7,6 +7,12 @@ and it is not sent to `/state`.  At Generate time, `pg_generate.js`
 sends it to the server along with the global prompt, and the server
 folds it into the CLIP text.
 
+Character bboxes carry a `magiLabel` field — the name of the magi
+character whose embedding should be paired with this position box.
+Layout's server resolves labels to 768-d vectors at read time.  Empty
+label = no pairing (falls back to the learned generic character
+embedding, same as if magi were unreachable).
+
 Global prompt and seed:
    · `#promptText` — the base description fed into CLIP.
    · `#seedInput`  — an optional fixed seed; blank = random.
@@ -22,7 +28,7 @@ PANEL_JS = r"""
  import {
    board, setImage, applyCanvasImage, clearImage,
    addBbox, deleteBbox, clearAllBboxes, seedDefault, selectBbox,
-   setBboxText, resetViewerToFit,
+   setBboxText, setBboxMagiLabel, resetViewerToFit,
  } from "./pg_state.js";
  import {
    uploadImageFile, importFromKrita, checkKritaStatus,
@@ -59,16 +65,16 @@ PANEL_JS = r"""
  let _lastStateSnapshot = "";
 
  function _stateSnapshot() {
-   // Strip the per-bbox `text` field: it is browser-only, not part
-   // of `/state`, and shouldn't trigger a spurious state resync when
-   // the user types into a bubble text box.
+   // Strip `text`/`magiLabel`-adjacent irrelevant fields for the
+   // snapshot used only to decide "did anything change worth POSTing".
+   // `magiLabel` IS included — pairing changes need a sync.
    const stripText = (list) => list.map(b => ({
      x: b.x, y: b.y, w: b.w, h: b.h,
    }));
    return JSON.stringify({
      t: stripText(board.textBboxes),
      c: stripText(board.characterBboxes),
-     r: board.referenceEmbeddings,
+     cl: board.characterBboxes.map(b => b.magiLabel || ""),
      d: [board.imageWidth, board.imageHeight],
      v: board.viewer,
    });
@@ -81,10 +87,10 @@ PANEL_JS = r"""
    return {
      op: "set",
      state: {
-       text_bboxes:          toWire(board.textBboxes),
-       character_bboxes:     toWire(board.characterBboxes),
-       reference_embeddings: board.referenceEmbeddings.map(r => r || null),
-       image_dims:           [board.imageWidth, board.imageHeight],
+       text_bboxes:      toWire(board.textBboxes),
+       character_bboxes: toWire(board.characterBboxes),
+       character_labels: board.characterBboxes.map(b => b.magiLabel || ""),
+       image_dims:       [board.imageWidth, board.imageHeight],
        viewer: {
          x: board.viewer.x,
          y: board.viewer.y,
@@ -99,6 +105,23 @@ PANEL_JS = r"""
  function _scheduleStateSync() {
    if (_syncTimer) clearTimeout(_syncTimer);
    _syncTimer = setTimeout(_doStateSync, 250);
+ }
+
+ function _applyMagiFields(data) {
+   if (data && Array.isArray(data.magi_character_labels)) {
+     const labels = data.magi_character_labels;
+     const reachable = !!data.magi_reachable;
+     const changed =
+       JSON.stringify(labels) !== JSON.stringify(board.magiLabels)
+       || reachable !== board.magiReachable;
+     board.magiLabels = labels;
+     board.magiReachable = reachable;
+     if (Array.isArray(data.reference_embeddings)) {
+       board.referenceEmbeddings = data.reference_embeddings;
+     }
+     return changed;
+   }
+   return false;
  }
 
  async function _doStateSync() {
@@ -119,9 +142,11 @@ PANEL_JS = r"""
        if (el) el.textContent = v || "—";
        const sl = document.getElementById("statusLine");
        if (sl) {
-         sl.textContent = "synced \u00b7 v" + v;
+         sl.textContent = "synced \u00b7 v" + v
+           + (board.magiReachable ? "" : " \u00b7 magi down");
          sl.className = "ok";
        }
+       if (_applyMagiFields(data)) _renderBboxList();
      } else {
        const sl = document.getElementById("statusLine");
        if (sl) {
@@ -149,8 +174,6 @@ PANEL_JS = r"""
    const list = document.getElementById("bboxList");
    if (!list) return;
 
-   // Skip while a bbox text input is focused — re-rendering would
-   // destroy the input and lose typing state.
    const ae = document.activeElement;
    if (ae && list.contains(ae) && ae.tagName === "INPUT") {
      return;
@@ -204,12 +227,66 @@ PANEL_JS = r"""
        row.appendChild(ti);
      }
 
+     if (kind === 'character') {
+       const sel = document.createElement("select");
+       sel.className = "bboxMagiSel";
+
+       const blank = document.createElement("option");
+       blank.value = "";
+       blank.textContent = board.magiReachable
+         ? "\u2014 pair with magi \u2014"
+         : "\u2014 magi unreachable \u2014";
+       sel.appendChild(blank);
+
+       const known = board.magiLabels || [];
+       for (const magiLbl of known) {
+         const opt = document.createElement("option");
+         opt.value = magiLbl;
+         opt.textContent = magiLbl;
+         sel.appendChild(opt);
+       }
+       // If the stored label is not in the current magi list, show
+       // it as a disabled "(missing)" option so the user can see
+       // what used to be paired before magi dropped it.
+       const stored = bbox.magiLabel || "";
+       if (stored && !known.includes(stored)) {
+         const opt = document.createElement("option");
+         opt.value = stored;
+         opt.textContent = stored + " (missing)";
+         opt.disabled = true;
+         sel.appendChild(opt);
+       }
+       sel.value = stored;
+       sel.disabled = !board.magiReachable || known.length === 0;
+       sel.title = board.magiReachable
+         ? "Pair this position with a magi character's embedding."
+         : "magi playground is not reachable.";
+       sel.addEventListener("change", () => {
+         setBboxMagiLabel(idx, sel.value);
+         _scheduleStateSync();
+       });
+       sel.addEventListener("click", (e) => e.stopPropagation());
+       sel.addEventListener("mousedown", (e) => e.stopPropagation());
+       row.appendChild(sel);
+     }
+
      const dims = document.createElement("span");
      dims.className = "bboxDims";
      const pctW = Math.round(bbox.w * 100);
      const pctH = Math.round(bbox.h * 100);
      dims.textContent = pctW + "% \u00d7 " + pctH + "%";
      row.appendChild(dims);
+
+     // Embedding indicator: for character rows, show whether the
+     // server resolved a real embedding for this position.
+     if (kind === 'character') {
+       const hasEmb = (board.referenceEmbeddings[idx] !== null
+                       && board.referenceEmbeddings[idx] !== undefined);
+       const emb = document.createElement("span");
+       emb.className = "bboxEmbed " + (hasEmb ? "yes" : "no");
+       emb.textContent = hasEmb ? "768d" : "\u2014";
+       row.appendChild(emb);
+     }
 
      const del = document.createElement("button");
      del.className = "bboxDel";
@@ -375,6 +452,7 @@ PANEL_JS = r"""
      y: 0.15,
      w: 0.40,
      h: 0.75,
+     magiLabel: "",
    });
    selectBbox('character', board.characterBboxes.length - 1);
    _renderBboxList();
@@ -405,6 +483,43 @@ PANEL_JS = r"""
      el.textContent = "\u2717 not reachable";
      el.className = "bad";
    }
+ }
+
+ /* ============================================================
+    Magi labels poll — piggyback on layout's /state
+    ============================================================
+    Every 3s, ask layout's server for the current state.  If the
+    returned version differs from the last one we saw, refresh
+    `board.magiLabels` + `board.referenceEmbeddings` from the
+    response.  This picks up magi changes (label edits, adds,
+    deletes) even when the user is not editing layout — so the
+    dropdowns always reflect what magi currently offers. */
+
+ let _magiPollTimer = null;
+ let _lastSeenVersion = null;
+
+ async function _pollMagiState() {
+   try {
+     const res = await fetch("/state", {
+       method: "POST",
+       headers: { "Content-Type": "application/json" },
+       body: "{}",
+     });
+     const data = await res.json();
+     if (data.success && data.version !== _lastSeenVersion) {
+       _lastSeenVersion = data.version;
+       const changed = _applyMagiFields(data);
+       const el = document.getElementById("stateVersion");
+       if (el) el.textContent = (data.version || "—").slice(0, 8);
+       if (changed) _renderBboxList();
+     }
+   } catch (_) {}
+   _scheduleMagiPoll();
+ }
+
+ function _scheduleMagiPoll() {
+   if (_magiPollTimer) clearTimeout(_magiPollTimer);
+   _magiPollTimer = setTimeout(_pollMagiState, 3000);
  }
 
  /* ============================================================
@@ -515,14 +630,16 @@ PANEL_JS = r"""
      });
      const data = await res.json();
      if (data.success) {
-       const v = (data.version || "").slice(0, 8);
+       _lastSeenVersion = data.version;
+       _applyMagiFields(data);
        const el = document.getElementById("stateVersion");
-       if (el) el.textContent = v || "—";
+       if (el) el.textContent = (data.version || "—").slice(0, 8);
        _lastStateSnapshot = _stateSnapshot();
      }
    } catch (_) {}
    _renderBboxList();
    syncPanelFields();
+   _scheduleMagiPoll();
  }
 
  export function layoutBootSync() {

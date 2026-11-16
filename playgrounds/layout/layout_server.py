@@ -14,29 +14,62 @@
 Lock discipline
 ===============
 `_state_lock` is an `RLock`.  The canonical accessor is
-`_read_state_snapshot()`, which acquires the lock once and returns a
-plain dict copy.  Handlers build their response from the copy; no
-handler holds `_state_lock` while calling another function that might
-also want it.
+`_read_state_snapshot()`, which acquires the lock once, merges magi's
+embeddings, and returns a plain dict copy plus the merged version
+hash.  No handler holds `_state_lock` while calling another function
+that might also want it.
 
-Prompt, seed, bubble texts
-==========================
-`/generate` accepts three additional fields that are NOT part of
-`/state` and are used only by `layout_comfy.start_generation`:
+MAGI INTEGRATION
+================
+Layout's `character_bboxes` are *positions* — where the sampler should
+place a character in the generated output.  Magi's `character_bboxes`
+are *crops* — where in the reference image an embedding was taken
+from.  They are different arrays for different purposes; layout never
+touches magi's bboxes and magi never touches layout's.
 
-    prompt       : str | None
-    seed         : int | str | None
-    bubble_texts : list[str] | None
+What crosses the boundary is *identities*: layout pairs each of its
+position boxes to one of magi's characters via a per-row label
+(`character_labels` in the state dict).  The server merges by looking
+up that label in magi's `/state`, resolving to the 768-d vector at the
+same index as magi's `character_bboxes`.
 
-They are stored on the job, combined on the server, and substituted
-into the workflow's positive CLIP text node.  `/state` and the node
-never see them.
+Layout keeps ownership of:
+  · character_bboxes     (positions, browser-authoritative)
+  · character_labels     (magi pairing, browser-authoritative)
+  · text_bboxes, viewer, image_dims
+
+Magi owns:
+  · character_bboxes     (crop metadata, unused by layout)
+  · character_labels     (identity names)
+  · reference_embeddings (768-d vectors)
+
+Merge is at READ time: on every GET `/state` (and every `/version`),
+the server pulls magi's `/state` (with negative-only caching so magi
+being down doesn't add latency to every poll), matches labels, and
+injects the resolved `reference_embeddings` array plus two
+informational fields (`magi_reachable`, `magi_character_labels`) that
+the browser uses to populate its dropdowns.
+
+Fallback: magi unreachable (or unreachable-for-this-pull) → all
+`reference_embeddings` null → `DrawatoonSetIP` sees the same
+all-null array it has always seen → each position uses
+`character_cls_embedding`.  Behaviour is identical to the current
+implementation before the merge existed.  No error, no warning to
+the user, no delay beyond the 1 s magi timeout on the first miss
+(cached for 2 s thereafter).
+
+Version invalidation is automatic: `_compute_version` hashes the
+*merged* dict, so any magi change (add, delete, rename, re-analyze)
+changes the version that `DrawatoonSetIP.IS_CHANGED` reads, and the
+next queue picks up the new embeddings without any node or workflow
+change.
 """
 
 import base64
 import hashlib
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from io import BytesIO
@@ -65,10 +98,119 @@ _DEFAULT_VIEWER = {
     "ratio": "1.00",
 }
 
+# Magi integration — pull endpoint + negative-cache timing.  Positive
+# results are not cached: magi's `/state` is a pure in-memory dict read
+# on its side, so pulling every layout read costs ~1 ms and gives
+# always-fresh data.  Negative results are cached because the failure
+# mode (connect timeout) costs the full `_MAGI_TIMEOUT_S` each attempt.
+_MAGI_STATE_URL  = "http://127.0.0.1:8778/state"
+_MAGI_TIMEOUT_S  = 1.0
+_MAGI_ERR_TTL_S  = 2.0
+
+
 _state_lock = threading.RLock()
 _state      = None
-_version    = ""
 
+
+# ---------------------------------------------------------------------------
+#  Magi pull + merge
+# ---------------------------------------------------------------------------
+
+_magi_cache_lock = threading.Lock()
+_magi_cache = {"err": False, "at": 0.0}
+
+
+def _pull_magi():
+    """Fetch magi's /state.  Returns None on any failure.
+
+    Positive results are returned fresh (no cache).  Negative results
+    are cached for `_MAGI_ERR_TTL_S` so an unreachable magi does not
+    add a 1-second timeout to every `/state` and `/version` read.
+    """
+    now = time.monotonic()
+    with _magi_cache_lock:
+        if _magi_cache["err"] and now - _magi_cache["at"] < _MAGI_ERR_TTL_S:
+            return None
+
+    try:
+        req = urllib.request.Request(
+            _MAGI_STATE_URL,
+            data=b"{}",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=_MAGI_TIMEOUT_S) as r:
+            data = json.loads(r.read())
+        if isinstance(data, dict) and data.get("success"):
+            with _magi_cache_lock:
+                _magi_cache["err"] = False
+                _magi_cache["at"] = now
+            return data
+    except Exception:
+        pass
+
+    with _magi_cache_lock:
+        _magi_cache["err"] = True
+        _magi_cache["at"] = now
+    return None
+
+
+def _merge_magi_into_state(base_state):
+    """Resolve layout's per-position magi labels to 768-d embeddings.
+
+    Returns a new dict: base_state + reference_embeddings +
+    magi_reachable + magi_character_labels.  All fields the node
+    consumes are present; the two `magi_*` fields are informational
+    (used by the browser to populate dropdowns and disable when
+    magi is down).
+    """
+    merged = dict(base_state)
+    char_count = len(base_state.get("character_bboxes") or [])
+    layout_labels = base_state.get("character_labels") or []
+
+    magi_state = _pull_magi()
+    if magi_state is None:
+        merged["reference_embeddings"] = [None] * char_count
+        merged["magi_reachable"] = False
+        merged["magi_character_labels"] = []
+        return merged
+
+    magi_labels     = magi_state.get("character_labels") or []
+    magi_embeddings = magi_state.get("reference_embeddings") or []
+
+    # Only non-empty labels are pairable — an empty label is "unlabeled"
+    # in magi's UI and means "no identity for this crop".  Duplicate
+    # labels: last occurrence wins (documented; magi's UI does not
+    # enforce uniqueness, so we pick a deterministic tiebreaker).
+    label_to_embedding = {}
+    for i, lbl in enumerate(magi_labels):
+        if isinstance(lbl, str) and lbl and i < len(magi_embeddings):
+            label_to_embedding[lbl] = magi_embeddings[i]
+
+    resolved = []
+    for lbl in layout_labels:
+        if isinstance(lbl, str) and lbl and lbl in label_to_embedding:
+            resolved.append(label_to_embedding[lbl])
+        else:
+            resolved.append(None)
+
+    while len(resolved) < char_count:
+        resolved.append(None)
+    if len(resolved) > char_count:
+        resolved = resolved[:char_count]
+
+    merged["reference_embeddings"] = resolved
+    merged["magi_reachable"] = True
+    merged["magi_character_labels"] = [
+        lbl for lbl in magi_labels
+        if isinstance(lbl, str) and lbl
+    ]
+    return merged
+
+
+# ---------------------------------------------------------------------------
+#  State normalization + versioning
+# ---------------------------------------------------------------------------
 
 def _log(msg):
     print(f"[layout] {msg}", flush=True)
@@ -76,19 +218,20 @@ def _log(msg):
 
 def _default_state():
     return {
-        "text_bboxes":          [],
-        "character_bboxes":     [],
-        "reference_embeddings": [],
-        "image_dims":           [0, 0],
-        "viewer":               dict(_DEFAULT_VIEWER),
+        "text_bboxes":      [],
+        "character_bboxes": [],
+        "character_labels": [],
+        "image_dims":       [0, 0],
+        "viewer":           dict(_DEFAULT_VIEWER),
     }
 
 
 def _read_state_snapshot():
+    """Returns (merged_state_dict, merged_version)."""
     with _state_lock:
-        if _state is None:
-            return _default_state(), _version
-        return dict(_state), _version
+        base = _default_state() if _state is None else dict(_state)
+    merged = _merge_magi_into_state(base)
+    return merged, _compute_version(merged)
 
 
 def _safe_bbox(raw):
@@ -135,23 +278,17 @@ def _normalize_state(raw):
     char_bboxes = [_safe_bbox(b) for b in (raw.get("character_bboxes") or [])]
     char_bboxes = [b for b in char_bboxes if b is not None]
 
-    refs_raw = raw.get("reference_embeddings") or []
-    refs = []
-    for r in refs_raw:
-        if r is None:
-            refs.append(None)
-        elif isinstance(r, (list, tuple)) and len(r) == 768:
-            try:
-                refs.append([float(v) for v in r])
-            except (TypeError, ValueError):
-                refs.append(None)
-        else:
-            refs.append(None)
+    labels_raw = raw.get("character_labels") or []
+    char_labels = []
+    for lbl in labels_raw:
+        char_labels.append(lbl if isinstance(lbl, str) else "")
+    while len(char_labels) < len(char_bboxes):
+        char_labels.append("")
+    if len(char_labels) > len(char_bboxes):
+        char_labels = char_labels[:len(char_bboxes)]
 
-    while len(refs) < len(char_bboxes):
-        refs.append(None)
-    if len(refs) > len(char_bboxes):
-        refs = refs[:len(char_bboxes)]
+    # NOTE: browser-side `reference_embeddings` is deliberately ignored.
+    # The server injects the merged array at read time from magi.
 
     try:
         w, h = raw.get("image_dims") or [0, 0]
@@ -160,11 +297,11 @@ def _normalize_state(raw):
         dims = [0, 0]
 
     return {
-        "text_bboxes":          text_bboxes,
-        "character_bboxes":     char_bboxes,
-        "reference_embeddings": refs,
-        "image_dims":           dims,
-        "viewer":               _normalize_viewer(raw.get("viewer")),
+        "text_bboxes":      text_bboxes,
+        "character_bboxes": char_bboxes,
+        "character_labels": char_labels,
+        "image_dims":       dims,
+        "viewer":           _normalize_viewer(raw.get("viewer")),
     }
 
 
@@ -178,23 +315,32 @@ def _compute_version(state):
 # ---------------------------------------------------------------------------
 
 def handle_state(payload):
-    global _state, _version
+    global _state
     if not isinstance(payload, dict):
         return {"success": False, "message": "expected a JSON object"}
 
     if payload.get("op") == "set":
         raw = payload.get("state") or {}
         normalized = _normalize_state(raw)
-        new_version = _compute_version(normalized)
         with _state_lock:
             _state = normalized
-            _version = new_version
-        v = normalized["viewer"]
-        _log(f"state set: text={len(normalized['text_bboxes'])} "
-             f"char={len(normalized['character_bboxes'])} "
+        merged, version = _read_state_snapshot()
+        n_chars = len(merged.get("character_bboxes") or [])
+        n_paired = sum(1 for r in merged.get("reference_embeddings") or []
+                       if r is not None)
+        v = merged["viewer"]
+        _log(f"state set: text={len(merged['text_bboxes'])} "
+             f"char={n_chars} paired={n_paired} "
+             f"magi={'up' if merged['magi_reachable'] else 'down'} "
              f"viewer={v['ratio']} "
-             f"v{new_version[:8]}")
-        return {"success": True, "version": new_version}
+             f"v{version[:8]}")
+        return {
+            "success":                True,
+            "version":                version,
+            "magi_reachable":         merged["magi_reachable"],
+            "magi_character_labels":  merged["magi_character_labels"],
+            "reference_embeddings":   merged["reference_embeddings"],
+        }
 
     state_snapshot, version_snapshot = _read_state_snapshot()
     return {
@@ -205,8 +351,7 @@ def handle_state(payload):
 
 
 def handle_version(_payload):
-    with _state_lock:
-        version = _version
+    _, version = _read_state_snapshot()
     return {"success": True, "version": version}
 
 

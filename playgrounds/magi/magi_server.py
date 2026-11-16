@@ -5,8 +5,8 @@ single image (pulled from Krita via `@thecharacter`, or uploaded),
 lets the user draw character bounding boxes over it, and posts
 `{image, bboxes}` to a MAGI analysis endpoint to obtain 768-d
 reference embeddings per character.  It exposes the resulting
-`character_bboxes` + `reference_embeddings` at `/state` for the
-`DrawatoonSetIP` node (or any future consumer) to pick up.
+`character_bboxes` + `character_labels` + `reference_embeddings` at
+`/state` for the layout playground (or any other consumer) to pick up.
 
 Routes
 ======
@@ -28,43 +28,24 @@ State shape (POST /state):
       "op": "set",
       "state": {
         "character_bboxes":     [[x1, y1, x2, y2], ...],
+        "character_labels":     ["Alice", "Bob", ...],
         "reference_embeddings": [null | [768 floats], ...],
         "image_dims":           [W, H]
       }
     }
 
 All bboxes are normalized [0,1] of image, in (x1, y1, x2, y2) order.
-`reference_embeddings` length always matches `character_bboxes`.
+`character_labels` and `reference_embeddings` lengths always match
+`character_bboxes`.  Labels are user-editable, browser-authoritative,
+and serve as the pairing key for downstream consumers (layout pairs
+its position boxes to magi's identities by label).
 
 MAGI INTEGRATION
 ================
 `/analyze_characters` forwards to ComfyUI's `POST /magi/crop_embed`
-route, which is provided by `kritomatic_nodes/Magi/`.  That route
-lazy-loads ViT-MAE-base (`facebook/vit-mae-base` — the exact backbone
-MAGI was trained against) on first call and returns the 768-d CLS
-token per bbox.
-
-Wire contract (playground → ComfyUI):
-
-    request:
-      {
-        "image_b64":  "<base64 PNG, no data URL prefix>",
-        "bboxes_px":  [[x1, y1, x2, y2], ...]   # pixel coords
-      }
-
-    response (success):
-      {
-        "success": true,
-        "reference_embeddings": [[768 floats], ...]  # one per bbox
-      }
-
-    response (failure):
-      { "success": false, "message": "<reason>" }
-
-The ComfyUI endpoint URL is hardcoded, matching the convention used
-by the layout playground for its `/state` consumer (see
-`kritomatic_nodes/PixArt/nodes.py::_LAYOUT_STATE_URL`).  If ComfyUI
-runs on a non-default port, update `_COMFY_CROP_EMBED_URL` below.
+route, provided by `kritomatic_nodes/Magi/`.  That route lazy-loads
+ViT-MAE-base (`facebook/vit-mae-base`) on first call and returns the
+768-d CLS token per bbox.
 """
 
 import base64
@@ -95,10 +76,6 @@ LAYER_SLOTS = [
 SLOT_ID = "@thecharacter"
 
 
-# ComfyUI endpoint that serves ViT-MAE crop embedding.  The timeout is
-# generous because the very first call may trigger an HF Hub download
-# (~350 MB) plus model init (~3-5 s).  Subsequent calls return in
-# tens of milliseconds per crop.
 _COMFY_HOST              = "127.0.0.1"
 _COMFY_PORT              = 8188
 _COMFY_CROP_EMBED_URL    = f"http://{_COMFY_HOST}:{_COMFY_PORT}/magi/crop_embed"
@@ -117,6 +94,7 @@ def _log(msg):
 def _default_state():
     return {
         "character_bboxes":     [],
+        "character_labels":     [],
         "reference_embeddings": [],
         "image_dims":           [0, 0],
     }
@@ -149,6 +127,15 @@ def _normalize_state(raw):
     char_bboxes = [_safe_bbox(b) for b in (raw.get("character_bboxes") or [])]
     char_bboxes = [b for b in char_bboxes if b is not None]
 
+    labels_raw = raw.get("character_labels") or []
+    char_labels = []
+    for lbl in labels_raw:
+        char_labels.append(lbl if isinstance(lbl, str) else "")
+    while len(char_labels) < len(char_bboxes):
+        char_labels.append("")
+    if len(char_labels) > len(char_bboxes):
+        char_labels = char_labels[:len(char_bboxes)]
+
     refs_raw = raw.get("reference_embeddings") or []
     refs = []
     for r in refs_raw:
@@ -161,7 +148,6 @@ def _normalize_state(raw):
                 refs.append(None)
         else:
             refs.append(None)
-
     while len(refs) < len(char_bboxes):
         refs.append(None)
     if len(refs) > len(char_bboxes):
@@ -175,6 +161,7 @@ def _normalize_state(raw):
 
     return {
         "character_bboxes":     char_bboxes,
+        "character_labels":     char_labels,
         "reference_embeddings": refs,
         "image_dims":           dims,
     }
@@ -236,14 +223,7 @@ def handle_playground_reregister(_payload):
 # ---------------------------------------------------------------------------
 
 def handle_analyze_characters(payload):
-    """Forward {image_b64, bboxes_px} to ComfyUI's /magi/crop_embed.
-
-    ComfyUI lazy-loads ViT-MAE on the first call (~3-5s + possibly a
-    HF Hub download on a fresh install); subsequent calls return in
-    tens of milliseconds per crop.  The route's response shape is
-    identical to what this handler returns, so it is forwarded
-    verbatim on success.
-    """
+    """Forward {image_b64, bboxes_px} to ComfyUI's /magi/crop_embed."""
     if not isinstance(payload, dict):
         return {"success": False, "message": "expected a JSON object"}
 

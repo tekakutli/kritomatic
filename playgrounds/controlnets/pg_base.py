@@ -15,6 +15,13 @@ tag.  Clicking a tag shows that preprocessed image on the canvas
 (letterboxed into the same fit rect); clicking `Back to
 @thecontrolnet` restores the source image.
 
+Each ready tag also carries an enable checkbox.  Unchecked
+controlnets are omitted from `/state`, so `ControlNetsConditioning`
+in ComfyUI skips their chain step for the next generation.  The row
+is dimmed and the title struck through to signal "present but not
+being applied".  Errors / running / pending rows have no checkbox
+and cannot be toggled.
+
 The `Push to Krita` button copies every done controlnet into a
 scratch Krita document (`kritomatic_controlnets`), one layer per
 image, layer names == preprocessor titles.  `Refresh from Krita`
@@ -135,6 +142,19 @@ PG_CSS = r"""
     border-color:rgba(0,229,255,0.65);
     color:#b8ecff;
     background:rgba(0,229,255,0.06);
+  }
+  .controlnetRow input[type=checkbox] {
+    flex: 0 0 auto;
+    accent-color: #00e5ff;
+    cursor: pointer;
+    margin: 0;
+    width: 13px;
+    height: 13px;
+  }
+  .controlnetRow.disabled { opacity: 0.45; }
+  .controlnetRow.disabled .controlnetTitle {
+    text-decoration: line-through;
+    text-decoration-color: rgba(212,133,144,0.55);
   }
   .controlnetTitle {
     flex: 1 1 auto;

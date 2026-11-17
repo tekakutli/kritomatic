@@ -14,6 +14,24 @@ clickable rows.  Clicking a done row sets
 image (letterboxed into the fit rect).  Clicking "Back to
 @thecontrolnet" resets the tag.
 
+ENABLED / DISABLED ROWS
+=======================
+Each ready row carries a checkbox.  Its `enabled` flag defaults to
+true and is user-toggleable.  Only enabled rows are serialised into
+`/state`'s `controlnets` array — see `_doStateSync`'s filter — so a
+disabled row is completely absent from the state the
+`ControlNetsConditioning` node pulls at generation time.  That is
+how "uncheck DEPTH" turns into "the node skips DEPTH this run":
+the playground does not need a separate channel, the state list
+itself is the channel.
+
+Disabled rows are dimmed and their title struck through; the row
+remains clickable for canvas preview (so a user can compare
+preprocessed variants before choosing which to include).  Toggling
+a checkbox rebuilds the list and re-schedules state sync — the
+`:off` marker in `_stateKey` guarantees the key moves and the sync
+fires.
+
 Krita round-trip:
   · "Push to Krita" POSTs every done controlnet to
     `/krita/push_controlnets`.  The server creates (or replaces) a
@@ -26,7 +44,7 @@ Krita round-trip:
     updates the entries in place and schedules a state sync so the
     workflow sees the new hashes.
 
-State sync fires after preprocess / refresh so the future node's
+State sync fires after preprocess / refresh / toggle so the node's
 `/state` pull sees the current hashes.  Per-entry shape in `/state`
 mirrors the stub: `{id, name, image: {hash, width, height}}`.
 """
@@ -62,7 +80,10 @@ function _stateKey() {
     board.imageWidth + "x" + board.imageHeight,
   ];
   for (const c of board.controlnets) {
-    parts.push(c.title + ":" + (c.hash || "err"));
+    parts.push(
+      c.title + ":" + (c.hash || "err")
+      + (c.status === "done" && c.enabled === false ? ":off" : "")
+    );
   }
   return parts.join("|");
 }
@@ -76,7 +97,7 @@ async function _doStateSync() {
   _syncTimer = null;
   const key = _stateKey();
   const wireControlnets = board.controlnets
-    .filter(c => c.status === "done")
+    .filter(c => c.status === "done" && c.enabled !== false)
     .map(c => ({
       id:    c.title,
       name:  c.title,
@@ -137,9 +158,11 @@ function _refreshStatusLine() {
     text = "no image loaded"; cls = "";
   } else if (board.lastSync) {
     const t = new Date(board.lastSync).toTimeString().slice(0, 8);
+    const total   = board.controlnets.length;
+    const enabled = board.controlnets.filter(c => c.enabled !== false).length;
     text = "synced " + t
          + " \u00b7 " + board.imageWidth + "\u00d7" + board.imageHeight
-         + " \u00b7 " + board.controlnets.length + " controlnet(s)";
+         + " \u00b7 " + enabled + "/" + total + " controlnet(s)";
     cls = "ok";
   } else {
     text = "not yet synced"; cls = "warn";
@@ -169,10 +192,32 @@ function _renderControlnetList() {
   }
 
   for (const c of board.controlnets) {
+    const enabled = (c.status !== "done") || c.enabled !== false;
     const row = document.createElement("div");
     row.className = "controlnetRow"
-      + (board.viewingControlnetTag === c.title ? " selected" : "");
+      + (board.viewingControlnetTag === c.title ? " selected" : "")
+      + (!enabled ? " disabled" : "");
     if (c.status === "done") row.dataset.clickable = "1";
+
+    // Checkbox — only on ready rows.  stopPropagation keeps a
+    // checkbox click from also triggering the row's click handler
+    // (which switches the canvas to that image).
+    if (c.status === "done") {
+      const cb = document.createElement("input");
+      cb.type    = "checkbox";
+      cb.checked = c.enabled !== false;
+      cb.title   = "Include this ControlNet in generation. Unchecked "
+                 + "controlnets are omitted from /state, so "
+                 + "ControlNetsConditioning skips their step.";
+      cb.addEventListener("click", (e) => e.stopPropagation());
+      cb.addEventListener("change", () => {
+        c.enabled = !!cb.checked;
+        _renderControlnetList();
+        _refreshStatusLine();
+        _scheduleStateSync();
+      });
+      row.appendChild(cb);
+    }
 
     const title = document.createElement("span");
     title.className = "controlnetTitle";
@@ -354,6 +399,7 @@ async function _preprocessAction() {
       height:  item.height,
       el:      null,
       error:   null,
+      enabled: true,
     };
     board.controlnets.push(entry);
 

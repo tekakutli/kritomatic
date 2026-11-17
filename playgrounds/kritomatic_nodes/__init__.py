@@ -11,21 +11,25 @@ Nodes exposed:
   * DrawatoonSetIP              (CONDITIONING)
   * PlaygroundResolutionSelect  (INT, INT)
   * MultiAreaConditioning       (CONDITIONING)
+  * ControlNetsConditioning     (CONDITIONING) — playground-driven
+                                replacement for the "ControlNets"
+                                subgraph
   * MagiLoader                  (MAGI_CROP_EMBEDDER)
 
 HTTP routes registered on import:
   * POST /magi/crop_embed           (magi playground → ViT-MAE → 768-d)
-  * POST /kritomatic/save_workflow  (frontend “Save To Kritomatic”
+  * POST /kritomatic/save_workflow  (frontend "Save To Kritomatic"
                                      → <repo>/data/comfy_panel/workflows)
 
 Frontend extension (served from ./web):
-  * save_to_kritomatic.js       (adds “Save To Kritomatic” to File menu)
+  * save_to_kritomatic.js       (adds "Save To Kritomatic" to File menu)
 
 Layout:
   layout_client.py          shared /state transport (URLs, fetch, probe)
   drawatoon_nodes.py        DrawatoonCheckpointLoader + DrawatoonSetIP
   playground_resolution.py  PlaygroundResolutionSelect
   multimask/                MultiAreaConditioning
+  controlnets/              ControlNetsConditioning
   PixArt/                   drawatoon transformer port (unchanged)
   Magi/                     ViT-MAE crop embedder (feed for DrawatoonSetIP)
   kritomatic_workflows.py   HTTP route for saving UI workflows into repo
@@ -39,6 +43,7 @@ from comfy_api.latest import ComfyExtension
 from .drawatoon_nodes import DrawatoonCheckpointLoader, DrawatoonSetIP
 from .playground_resolution import PlaygroundResolutionSelect
 from .multimask import MultiAreaConditioning
+from .controlnets import ControlNetsConditioning
 from .Magi.nodes import MagiLoader
 
 # Importing `kritomatic_workflows` registers
@@ -59,6 +64,7 @@ class KritomaticExtension(ComfyExtension):
             DrawatoonSetIP,
             PlaygroundResolutionSelect,
             MultiAreaConditioning,
+            ControlNetsConditioning,
             MagiLoader,
         ]
 

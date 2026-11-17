@@ -8,11 +8,22 @@ nothing.
 
 The prompt field is gone.  The status line shows sync state instead of
 inpaint state: `Synced HH:MM:SS · rotation N° · mask K/N · context on/off`,
-or `Syncing…` / `Sync failed: …` / `No mask selected · inpaints the whole
-context rect`.
+or `Syncing…` / `Sync failed: …` / `No mask selected · inpaints the
+whole context rect`.
 
 The pick-image / clear-image / pick-mask button-disable checks are
-gone along with those buttons."""
+gone along with those buttons.
+
+SYNC NOW BUTTON REMOVED
+=======================
+The `#syncNowBtn` reference in `_els` and the
+`e.syncNowBtn.disabled = busy` line that used to live in
+`syncPanelFields()` were removed when the button was deleted from
+the panel.  `getElementById("syncNowBtn")` returns `null` now, and
+the guards around the button were null-safe, so no behavioural
+change; the removals are just dead-code cleanup.  See
+`pg_panel_bindings.py`'s module docstring for why the button was
+removed."""
 
 PANEL_FIELDS_JS = r"""
 import { board, view } from "./pg_state.js";
@@ -28,7 +39,6 @@ function _get() {
     statusLine:      document.getElementById("statusLine"),
     inpaintEnabled:  document.getElementById("inpaintEnabled"),
     inpaintRectHint: document.getElementById("inpaintRectHint"),
-    syncNowBtn:      document.getElementById("syncNowBtn"),
     kritaImportMasksBtn: document.getElementById("kritaImportMasksBtn"),
     maskFromRectBtn: document.getElementById("maskFromRectBtn"),
   };
@@ -119,7 +129,6 @@ export function syncPanelFields() {
   }
 
   if (e.kritaImportMasksBtn) e.kritaImportMasksBtn.disabled = busy;
-  if (e.syncNowBtn) e.syncNowBtn.disabled = busy;
 
   if (e.inpaintEnabled) e.inpaintEnabled.disabled = busy;
 }

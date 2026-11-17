@@ -1,42 +1,58 @@
 """State synchronizer.
 
-Pushes the playground's current state into the daemon so the docker's
-Run button can find it.  Two things travel:
+Pushes the playground's current state into the inpaint server's
+in-memory cache.  Two things travel:
 
-  · pixel blobs — the canvas and the selected mask — pushed into the
-    Krita scratch layers `thecanvas` and `theselection` via
-    `comfy_set_layer_pixels`.  The daemon reads them from Krita at
-    prepare time, same as any other `source="layer"` resource.
+  · pixel blobs — the canvas and the selected mask — pushed as
+    `canvas_b64` and `selection_b64` on the `/sync` payload.  The
+    server caches them; nothing is written to Krita.  The daemon
+    reads them back via `/canvas_b64` and `/selection_b64` at
+    `prepare_workflow` time and substitutes them into the graph
+    (the "graph injection" path — no pull node needed).
 
   · scalar state — the view rotation and the context rectangle — as
     fields on the `/sync` payload.  The daemon queries them back via
-    `/rotation` and `/context` on demand.  No Krita layer is written
-    for the context rectangle; the daemon defines `@thecontext` at
-    prepare time from these numbers, accounting for rotation.
+    `/rotation` and `/crop_frame` on demand.  No Krita layer is
+    written for the context rectangle; the daemon defines
+    `@thecontext` at prepare time from these numbers, accounting for
+    rotation.
 
-Rotation is not part of the pixel push.  It travels as a scalar, and
-the daemon queries it at prepare and at paste time.  The value's
-lifetime is scoped to the playground process: kill the server and the
-daemon's `/rotation` call fails, falls back to 0, and no rotation
-happens.
+WHY NO KRITA SCRATCH LAYERS
+===========================
+Pre-Slice-B, the canvas and selection were pushed into Krita scratch
+layers (`thecanvas`, `theselection`) via `comfy_set_layer_pixels`,
+and the daemon read them back from Krita.  That worked but had three
+problems:
 
-Same for the context rect: no `@thecontext` layer is created.  The
-daemon queries `/context` at prepare time; if `enabled`, it uses those
-coords (rotated, translated into the crop frame) as the context mask;
-if not, it falls back to the `@thecontext` layer's own bbox (if any)
-or the whole canvas.
+  · On boot, autosync's first-canvas-arrival scheduled a sync that
+    wrote a full-canvas white mask into a fresh `theselection` paint
+    layer — visible garbage on the user's layer stack.
 
-`theselection` is different.  It is pixel data, so it travels as a
-Krita scratch layer, and the daemon reads it directly.  To keep the
-daemon from picking up a stale `theselection` left over from a
-previous session or from native Krita painting, this module ALWAYS
-pushes a `selection_b64` when a canvas is loaded — the selected mask's
-bytes if one is selected, or an all-white W×H mask if not.  See
-`pg_inpaint.js::buildWhiteMaskB64`.  All-white is the "select all"
-value the workflow reads: the model inpaints every pixel inside the
-context rect.  The previous all-black fallback meant "nothing
-selected", which produced a silent no-op run — the model inpainted
-no pixels and the pasted result looked identical to the input.
+  · The round-trip through Krita was pure overhead: the daemon
+    already knows the doc + crop bounds; it just needs the pixels.
+
+  · The scratch layers shadow the user's own layers by name, so
+    anything called `thecanvas` / `theselection` silently conflicted.
+
+Slice B replaced the transport with two simple HTTP routes on the
+inpaint server (`/canvas_b64`, `/selection_b64`).  The daemon
+queries them at prepare time and substitutes the blobs into the
+graph — the same graph-injection mechanism `controlnets_playground`
+uses for its preprocessed images.  No Krita writes; no shadow layers;
+no boot-time artifacts.
+
+`theselection` semantics
+========================
+Every sync that carries a canvas also carries a `selection_b64`.
+When a mask is selected, that's the mask's bytes.  When no mask is
+selected, that's an **all-white W×H mask** — the "select all" value
+the workflow reads: the model inpaints every pixel inside the
+context rect.  See `pg_inpaint.js::buildWhiteMaskB64`.
+
+The previous design pushed an all-black fallback, meaning "select
+nothing" — the workflow honoured it by inpainting no pixels, which
+looked like a successful run that did nothing.  All-white avoids the
+silent no-op.
 
 Sync cadence:
 
@@ -51,6 +67,34 @@ skipped if unchanged.  This keeps a mask-select from re-pushing the
 whole canvas, and keeps a rotation-only change from re-pushing
 anything.
 
+TRACKER ADVANCE ON SUCCESS ONLY
+===============================
+The four change-detection trackers (`_lastCanvasHash`,
+`_lastSelectionB64`, `_lastContextHash`, `_lastRotation`) record
+what the server has *received*, not what the client has *tried to
+send*.  They are advanced only after `/sync` returns
+`{success: true}`.  On failure they stay where they were, so the
+next `_doSync` compares the current state against the server's
+actual last-known state and retries the delta.
+
+This matters because `/sync` can fail: transient fetch errors, a
+playground server restart in the middle of an edit, a daemon GC
+pause, an oversized payload.  Without this discipline, the tracker
+advances on build (before the `await`), a failure leaves the client
+believing it has pushed a delta it never sent, and every subsequent
+`_doSync` early-returns on "no change" — the client and the server
+silently diverge until the page is reloaded.
+
+With the discipline in place, the recovery path is simply "make one
+more state change": the next `scheduleSync()` / `syncNow()` call
+recomputes the payload against the *old* trackers, sees the
+previously-failed delta still present, and retries it.  No manual
+"Sync now" button is needed — which is why the button was removed
+when this fix landed.  The `syncNow()` JS function remains exported
+(the rotation scrub input calls it for immediate rotation sync, and
+the `action.syncNow` pgkit action exposes the primitive to
+programmatic callers), but the UI no longer surfaces it.
+
 BOOT GATE
 =========
 Every session has a potential race: the first `scheduleSync` may fire
@@ -59,19 +103,20 @@ finishes reading `@theselection` from Krita.  Without intervention the
 sequence would be:
 
     t=0     canvas arrives → scheduleSync → debounce
-    t=250   flush: no mask yet → push BLANK theselection
+    t=250   flush: no mask yet → push WHITE theselection
     t=600   hydration finishes → push HYDRATED theselection
 
-The daemon sees a blank push at t=250, and if a Run fires inside the
-gap between t=250 and t=600, the workflow runs with an empty
-selection.  That is the "window" the gate closes.
+The daemon sees a white push at t=250, and if a Run fires inside the
+gap between t=250 and t=600, the workflow runs with an all-white
+(select-everything) selection instead of the one the user had picked
+in a previous session.  That is the "window" the gate closes.
 
 `inpaintBootSync` calls `setBootSyncGate(hydrationPromise)` BEFORE it
 starts autosync.  Every `_doSync` call while the gate is pending
 awaits it, so the first flush lands after hydration completes with
-the hydrated (or definitively blank) `selection_b64`.  The gate
-clears itself via `.finally`; a 3 s hard cap inside `_doSync` bounds
-worst-case latency on a dead daemon.
+the hydrated (or definitively white-fallback) `selection_b64`.  The
+gate clears itself via `.finally`; a 3 s hard cap inside `_doSync`
+bounds worst-case latency on a dead daemon.
 
 FAILURE MIRRORING
 =================
@@ -128,8 +173,8 @@ let _warnedSyncFailure = false;
    promise; cleared automatically when that promise settles.  Every
    `_doSync` call that fires while the gate is pending awaits it,
    so the first flush of the session carries the hydrated
-   `theselection` (or a definitive blank) rather than racing it.
-   See the module docstring, BOOT GATE. */
+   `theselection` (or a definitive white-fallback) rather than
+   racing it.  See the module docstring, BOOT GATE. */
 let _bootGate = null;
 
 export function setBootSyncGate(promise) {
@@ -154,6 +199,25 @@ export function scheduleSync() {
   _timer = setTimeout(_doSync, SYNC_DEBOUNCE_MS);
 }
 
+/**
+ * Force an immediate sync, bypassing the debounce timer.
+ *
+ * Callers:
+ *   · the rotation scrub input (`pg_panel_scrubs.js`) — rotation
+ *     changes bypass the debounce, because a rotate-then-Run
+ *     sequence would otherwise race the daemon's `/rotation`
+ *     query;
+ *   · boot's post-hydration flush in `inpaintBootSync`, once the
+ *     boot gate clears and the canvas + hydrated mask are ready;
+ *   · the `action.syncNow` pgkit action, for programmatic callers
+ *     (remote_cli, scripts).  This is also the manual retry path
+ *     for a failed push: since the trackers only advance on
+ *     success, calling `syncNow` after a failure re-attempts the
+ *     pending delta.  The in-panel "Sync now" button was removed
+ *     because the next state change automatically retries — see
+ *     the module docstring, TRACKER ADVANCE ON SUCCESS ONLY — so
+ *     a dedicated button added no value.
+ */
 export function syncNow() {
   if (_timer) { clearTimeout(_timer); _timer = null; }
   _doSync();
@@ -178,11 +242,22 @@ async function _doSync() {
   const payload  = { rotation };
   let changed = false;
 
+  // Pending tracker deltas.  These are committed to the module-level
+  // _last* trackers ONLY on `data.success` below.  If the fetch
+  // fails, they stay uncommitted, and the next _doSync call sees
+  // the current state still differs from the server's last-known
+  // state — so it retries the delta.  See the module docstring,
+  // TRACKER ADVANCE ON SUCCESS ONLY.
+  let pendingCanvasHash   = null;
+  let pendingSelectionB64 = null;
+  let pendingContextHash  = null;
+  let pendingRotation     = null;
+
   if (board.imageHash
       && board.imageDataUrl
       && board.imageHash !== _lastCanvasHash) {
     payload.canvas_b64 = _stripDataUrl(board.imageDataUrl);
-    _lastCanvasHash = board.imageHash;
+    pendingCanvasHash = board.imageHash;
     changed = true;
   }
 
@@ -195,7 +270,7 @@ async function _doSync() {
     }
     if (!selB64) {
       // No mask selected: push an all-white W×H mask so the
-      // `theselection` scratch layer reflects "select all" —
+      // `theselection` value reflects "select all" —
       // "inpaint everything inside the context rect" — rather
       // than a leftover from a previous session.  All-black
       // (the previous behaviour) meant "inpaint nothing": the
@@ -205,7 +280,7 @@ async function _doSync() {
     }
     if (selB64 && selB64 !== _lastSelectionB64) {
       payload.selection_b64 = selB64;
-      _lastSelectionB64 = selB64;
+      pendingSelectionB64 = selB64;
       changed = true;
     }
   }
@@ -227,14 +302,14 @@ async function _doSync() {
   const ctxHash = JSON.stringify(
     {e: ctxEnabled, x: cx, y: cy, w: cw, h: ch});
   if (ctxHash !== _lastContextHash) {
-    _lastContextHash = ctxHash;
+    pendingContextHash = ctxHash;
     changed = true;
   }
 
   if (!changed && rotation === _lastRotation) {
     return;
   }
-  _lastRotation = rotation;
+  pendingRotation = rotation;
 
   board.syncing = true;
   try {
@@ -245,6 +320,23 @@ async function _doSync() {
     });
     const data = await res.json();
     if (data.success) {
+      // Commit pending tracker deltas only now that the server has
+      // actually received the state.  On a failure, these stay
+      // uncommitted so the next _doSync call will retry the delta.
+      // See the module docstring, TRACKER ADVANCE ON SUCCESS ONLY.
+      if (pendingCanvasHash !== null) {
+        _lastCanvasHash = pendingCanvasHash;
+      }
+      if (pendingSelectionB64 !== null) {
+        _lastSelectionB64 = pendingSelectionB64;
+      }
+      if (pendingContextHash !== null) {
+        _lastContextHash = pendingContextHash;
+      }
+      if (pendingRotation !== null) {
+        _lastRotation = pendingRotation;
+      }
+
       board.lastSync  = Date.now();
       board.syncError = null;
       _warnedSyncFailure = false;

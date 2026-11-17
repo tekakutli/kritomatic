@@ -43,8 +43,13 @@ poll runs, so re-focusing the tab updates instantly rather than
 waiting for the next tick.
 
 Boot-time behavior: on the first poll, if `@thecanvas` is non-null and
-the playground has no image loaded yet, fetch and display it.  If the
-user already picked or imported an image, leave it alone.
+the playground has no image loaded yet, fetch and display it, then
+schedule one sync so the inpaint server's cache is populated before
+the first Run click.  That sync does NOT write to Krita scratch
+layers — post-Slice-B, the inpaint server is a pure in-memory cache
+and the daemon reads from it via `/canvas_b64` / `/selection_b64` at
+prepare time.  If the user already picked or imported an image, leave
+it alone.
 
 Absent `@thecanvas` (no workflow loaded yet, or a workflow whose
 config does not declare `@thecanvas`) is a no-op: the poller sees
@@ -166,9 +171,12 @@ async function _fetchAndSet(spec) {
     img.height,
   );
   if (wasEmpty) {
-    // First canvas arrival this session.  Schedule one sync so
-    // `theselection` is claimed by inpaint on boot, not left as
-    // whatever was on disk from a previous session.
+    // First canvas arrival this session.  Schedule one sync so the
+    // inpaint server's in-memory cache is populated before the
+    // first Run click.  The sync no longer writes to Krita scratch
+    // layers — the server just caches the canvas + selection, and
+    // the daemon reads them back via `/canvas_b64` and
+    // `/selection_b64` at prepare time.
     scheduleSync();
   }
   const label = spec.source === "layer" ? spec.layer_name : spec.source;

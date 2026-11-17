@@ -1,14 +1,88 @@
 """comfy_apply.py — prepare a native-v2 workflow for submission.
 
-Reads pixels from a Krita document per a panel config's `[resources]`
-spec, uploads each blob to the comfy-api-proxy via POST /api/v2/assets,
-and returns a transformed graph.
+Reads pixels from the inpaint playground (primary) or the Krita
+document (fallback) per a panel config's `[resources]` spec, uploads
+each blob to the comfy-api-proxy via POST /api/v2/assets, and returns
+a transformed graph.
+
+PIXEL SOURCE (Slice B + C)
+==========================
+`prepare_workflow` makes ONE HTTP call to the inpaint server:
+
+    POST http://127.0.0.1:8774/resources
+      → {
+          success:   bool,
+          rotation:  float,
+          frame:     {...} or None,
+          canvas:    {b64, width, height} or None,
+          selection: {b64, width, height} or None,
+        }
+
+Everything the daemon needs for a cropped prepare comes back in one
+response, captured atomically under the inpaint server's
+`_state_lock`.  For a batch of N runs, that is N calls instead of
+3N, and — more importantly — the canvas, selection, and crop frame
+that a given run uses are guaranteed to be mutually consistent: no
+"rotate between /crop_frame and /canvas_b64" race.
+
+The `frame` is `None` when no canvas has been synced yet.  In that
+case `prepare_workflow` falls back to `_prepare_unrotated` (the
+legacy path), which reads the composite / selection / named layers
+directly from the Krita document.
+
+The `canvas` is `None` under the same condition.  The `selection`
+is `None` when no mask has been selected, meaning "select all inside
+the crop" — the daemon uses an all-white mask, matching
+`pg_inpaint.js::buildWhiteMaskB64`.
+
+BACKWARD-COMPAT FALLBACK
+========================
+If `/resources` is unreachable (older inpaint playground server, or
+the server is down), `prepare_workflow` falls back to the Slice-B
+sequence: `POST /crop_frame`, then — if the frame is usable —
+individual `POST /canvas_b64` and `POST /selection_b64` calls from
+inside `_prepare_cropped`.  This keeps the daemon working during a
+partial rollout, where the inpaint playground was not yet updated
+to expose `/resources`.
+
+The fallback path is expected to be unreachable in practice (both
+sides are updated together in a single commit), but keeping it
+costs nothing and makes the daemon robust to a forgotten restart of
+the inpaint process.
+
+If BOTH `/resources` and `/crop_frame` are unreachable, the whole
+cropped path is skipped and `_prepare_unrotated` runs — the same as
+it always has when inpaint is down.
+
+PIXEL SOURCE ORDER (cropped path)
+=================================
+Canvas:
+  1. `/resources` response's `canvas` field (authoritative)
+  2. `/canvas_b64` individual call (backward-compat fallback)
+  3. Krita layer named `thecanvas` (last-resort fallback)
+  4. error — the workflow cannot run without a canvas
+
+Selection:
+  1. `/resources` response's `selection` field:
+     · non-None → use it
+     · None → all-white ("select all inside the crop")
+  2. `/selection_b64` individual call (backward-compat fallback):
+     · b64 present → use it
+     · b64 None → all-white
+  3. Krita layer named `theselection` (last-resort fallback)
+  4. all-white ("select all inside the crop")
+
+The old path — inpaint pushing `thecanvas` / `theselection` into
+Krita scratch layers via `comfy_set_layer_pixels` and this module
+reading them back — is gone.  The playground no longer writes Krita
+layers, and the scratch-layer reads here are only the fallback for
+sessions that don't have the inpaint playground running.
 
 CROP FRAME
 ==========
-Before reading anything, `prepare_workflow` queries the inpaint
-playground's `/crop_frame` endpoint.  That endpoint is the single
-source of truth for what to crop — it returns the definitive
+`prepare_workflow` receives the crop frame from `/resources`'s
+`frame` field.  That endpoint is the single source of truth for
+what to crop — it returns the definitive
 `{theta, W, H, Wp, Hp, cropX, cropY, cropW, cropH}` that the daemon
 must apply to `@thecanvas` (and, by extension, to `@theselection`
 and `@thecontext`) before the workflow runs.  Multimask's `/mask`
@@ -16,14 +90,14 @@ endpoint queries the same frame and applies the same rotate+crop to
 each area mask, so every mask the workflow sees is at cropW×cropH.
 
 Cases:
-  · `/crop_frame` returns null (playground down or empty state) →
-    legacy un-rotated path (`_prepare_unrotated`), which does its own
+  · `frame` is null (playground down or empty state) → legacy
+    un-rotated path (`_prepare_unrotated`), which does its own
     `_determine_crop_bounds` fallback for `@thecontext` layer bbox.
-  · `/crop_frame` says theta=0, whole canvas → same as legacy,
+  · `frame` says theta=0, whole canvas → same as legacy,
     `_prepare_unrotated`.
-  · `/crop_frame` says theta=0 with context crop → `_prepare_cropped`
+  · `frame` says theta=0 with context crop → `_prepare_cropped`
     (no rotation, but crop to context rect).
-  · `/crop_frame` says theta≠0 → `_prepare_cropped` (rotate then crop).
+  · `frame` says theta≠0 → `_prepare_cropped` (rotate then crop).
 
 `PreparedWorkflow.rotation = theta`.  The paste stage un-rotates by
 `-theta` and pastes at `(paste_config.x, paste_config.y)` when theta
@@ -32,7 +106,7 @@ existing un-rotated semantics).
 
 EXTENDED CANVAS
 ===============
-`cropX`/`cropY` returned by `/crop_frame` may be negative, or
+`cropX`/`cropY` returned by `/resources` may be negative, or
 `cropX+cropW` may exceed `Wp` (and likewise for Y) when the user
 drags the context rect past the un-rotated canvas bounds — the
 daemon is expected to be able to crop any region of the rotated
@@ -56,6 +130,7 @@ same bytes `_upload_resource_blobs` just PUT to the proxy.
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import urllib.error
@@ -79,6 +154,11 @@ from .comfyui_substitute import substitute_into_graph
 Bounds = tuple[int, int, int, int]
 
 INPAINT_URL = "http://127.0.0.1:8774"
+
+# Sentinel for "the caller did not pre-fetch this blob; go fetch it
+# from the individual endpoint".  Distinguishes from `None`, which
+# means "pre-fetched and definitively absent" (e.g. no selection).
+_UNSET = object()
 
 
 @dataclass
@@ -115,7 +195,27 @@ def prepare_workflow(doc,
     if doc is None:
         raise ValueError("No active document.")
 
-    frame = _query_inpaint_crop_frame()
+    # ---- Single-call fetch of the whole prepare-time state (Slice C) ----
+    #
+    # `/resources` returns {frame, canvas, selection, rotation}
+    # atomically.  On success, everything the cropped path needs comes
+    # from this one response.  On failure (older playground, server
+    # down), fall through to the Slice-B individual-endpoint path.
+    resources = _query_inpaint_resources()
+    single_call = (resources is not None)
+
+    if single_call:
+        frame = resources.get("frame")
+        canvas_blob = resources.get("canvas")        # dict or None
+        selection_blob = resources.get("selection")  # dict or None
+    else:
+        # Backward-compat: call /crop_frame individually.  The canvas
+        # and selection are left _UNSET so `_prepare_cropped` will
+        # call the individual endpoints (Slice B path).
+        frame = _query_inpaint_crop_frame()
+        canvas_blob = _UNSET
+        selection_blob = _UNSET
+
     print(f"[comfyui] prepare: crop_frame={frame}", flush=True)
 
     if frame is None:
@@ -165,15 +265,45 @@ def prepare_workflow(doc,
 
     return _prepare_cropped(
         doc, graph, resource_slots, param_slots,
-        config, proxy_client, frame=frame, seed=seed,
+        config, proxy_client, frame=frame,
+        canvas_blob=canvas_blob,
+        selection_blob=selection_blob,
+        seed=seed,
     )
 
 
 # ---------------------------------------------------------------------------
-#  /crop_frame probe
+#  Inpaint HTTP probes (Slice C primary + Slice B fallback)
 # ---------------------------------------------------------------------------
 
+def _query_inpaint_resources(timeout: float = 0.75) -> Optional[dict]:
+    """POST /resources on the inpaint server.
+
+    Returns the full response dict on success, or `None` when the
+    endpoint is unreachable (older playground, server down) — the
+    caller treats `None` as "fall back to individual endpoints."
+    """
+    try:
+        req = urllib.request.Request(
+            INPAINT_URL + "/resources",
+            data=b"{}", method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data.get("success"):
+        return None
+    return data
+
+
 def _query_inpaint_crop_frame(timeout: float = 0.5) -> Optional[dict]:
+    """POST /crop_frame on the inpaint server.
+
+    Kept for backward compat when `/resources` is unreachable (an
+    older inpaint playground that predates Slice C).  Same shape and
+    semantics as before.
+    """
     try:
         req = urllib.request.Request(
             INPAINT_URL + "/crop_frame",
@@ -185,6 +315,145 @@ def _query_inpaint_crop_frame(timeout: float = 0.5) -> Optional[dict]:
             return None
         return data.get("frame")
     except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def _query_inpaint_canvas_b64(timeout: float = 0.5) -> Optional[dict]:
+    """POST /canvas_b64 on the inpaint server.
+
+    Slice-B fallback for older playgrounds that do not have
+    `/resources`.  Returns the response dict on a reachable server,
+    or `None` when unreachable.
+    """
+    try:
+        req = urllib.request.Request(
+            INPAINT_URL + "/canvas_b64",
+            data=b"{}", method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data.get("success"):
+        return None
+    return data
+
+
+def _query_inpaint_selection_b64(timeout: float = 0.5) -> Optional[dict]:
+    """POST /selection_b64 on the inpaint server.
+
+    Slice-B fallback for older playgrounds that do not have
+    `/resources`.  Returns the response dict on a reachable server,
+    or `None` when unreachable.
+    """
+    try:
+        req = urllib.request.Request(
+            INPAINT_URL + "/selection_b64",
+            data=b"{}", method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data.get("success"):
+        return None
+    return data
+
+
+def _decode_blob_field(blob: dict, W: int, H: int,
+                       *, is_mask: bool) -> Optional[EncodedImage]:
+    """Decode one `{b64, width, height}` field from `/resources`.
+
+    Returns `None` on a decode failure so the caller can fall back to
+    the individual endpoint / Krita read path.
+    """
+    if not isinstance(blob, dict) or not blob.get("b64"):
+        return None
+    try:
+        png = base64.b64decode(blob["b64"])
+        return EncodedImage(
+            data=png,
+            width=int(blob.get("width") or W),
+            height=int(blob.get("height") or H),
+            is_mask=is_mask,
+        )
+    except Exception as e:
+        print(f"[comfyui] /resources blob decode failed: {e}",
+              flush=True)
+        return None
+
+
+def _read_thecanvas_prepared(doc, W: int, H: int) -> Optional[EncodedImage]:
+    """Read `@thecanvas` from the individual `/canvas_b64` endpoint
+    (Slice-B fallback path), then from a Krita layer named
+    `thecanvas`.
+
+    Only called when `/resources` is unreachable (older playground).
+    The Slice-C path passes the pre-fetched blob directly to
+    `_prepare_cropped`.
+
+    Returns `None` when neither source has pixels.  The caller is
+    expected to raise on `None`.
+    """
+    resp = _query_inpaint_canvas_b64()
+    if resp is not None and resp.get("b64"):
+        try:
+            png = base64.b64decode(resp["b64"])
+            return EncodedImage(
+                data=png,
+                width=int(resp.get("width") or W),
+                height=int(resp.get("height") or H),
+                is_mask=False,
+            )
+        except Exception as e:
+            print(f"[comfyui] inpaint /canvas_b64 decode failed: {e}",
+                  flush=True)
+            # fall through to Krita
+
+    # Fallback: user's own Krita layer, or legacy scratch layer.
+    try:
+        return read_layer_pixels(doc, "thecanvas", (0, 0, W, H))
+    except ValueError:
+        return None
+
+
+def _read_theselection_prepared(doc, W: int, H: int) -> Optional[EncodedImage]:
+    """Read `@theselection` from the individual `/selection_b64`
+    endpoint (Slice-B fallback path), then from a Krita layer named
+    `theselection`.
+
+    Only called when `/resources` is unreachable (older playground)
+    or when the `/resources` response is missing the selection field
+    (defensive).  The Slice-C path passes the pre-fetched blob — or
+    `None` for "no selection" — directly to `_prepare_cropped`.
+
+    `None` means "no selection available"; the caller substitutes an
+    all-white mask, matching `pg_inpaint.js::buildWhiteMaskB64`
+    ("select all inside the context rect").
+    """
+    resp = _query_inpaint_selection_b64()
+    if resp is not None:
+        if resp.get("b64"):
+            try:
+                png = base64.b64decode(resp["b64"])
+                return EncodedImage(
+                    data=png,
+                    width=int(resp.get("width") or W),
+                    height=int(resp.get("height") or H),
+                    is_mask=True,
+                )
+            except Exception as e:
+                print(f"[comfyui] inpaint /selection_b64 decode "
+                      f"failed: {e}", flush=True)
+                # fall through
+        # Inpaint reachable but no selection → all-white.  Do not
+        # fall back to Krita — inpaint is authoritative when up.
+        return None
+
+    # Inpaint unreachable → Krita fallback
+    try:
+        return read_layer_mask(doc, "theselection", (0, 0, W, H))
+    except ValueError:
         return None
 
 
@@ -228,8 +497,19 @@ def _prepare_unrotated(doc, graph, resource_slots, param_slots,
 # ---------------------------------------------------------------------------
 
 def _prepare_cropped(doc, graph, resource_slots, param_slots,
-                     config, proxy_client, *, frame, seed=None
-                     ) -> PreparedWorkflow:
+                     config, proxy_client, *, frame,
+                     canvas_blob=_UNSET,
+                     selection_blob=_UNSET,
+                     seed=None) -> PreparedWorkflow:
+    """Cropped prepare.
+
+    `canvas_blob` / `selection_blob` come pre-fetched from
+    `/resources` (Slice C) when available.  The sentinel `_UNSET`
+    means "not pre-fetched — go call the individual endpoint"
+    (Slice-B fallback path).  A pre-fetched `None` for `canvas_blob`
+    is an error condition (see below); a pre-fetched `None` for
+    `selection_blob` means "no selection, use all-white."
+    """
     from PyQt6.QtGui import QImage
 
     W = int(frame["W"])
@@ -254,15 +534,47 @@ def _prepare_cropped(doc, graph, resource_slots, param_slots,
           f"crop=({cropX},{cropY},{cropW},{cropH}) "
           f"inpaintEnabled={inpaint_enabled}", flush=True)
 
-    # ---- Read canvas + selection at native W×H ----
-    canvas_enc = read_layer_pixels(doc, "thecanvas", (0, 0, W, H))
-    if canvas_enc is None:
-        raise ValueError("thecanvas scratch layer is missing")
+    # ---- Canvas ----
+    #
+    # Pre-fetched from /resources (Slice C) takes priority.  When
+    # not pre-fetched (`_UNSET`), fall back to the individual
+    # endpoint / Krita read (Slice-B path).  A pre-fetched `None`
+    # for canvas would mean "frame present but canvas absent" — an
+    # invariant violation in the inpaint server — but handle it
+    # gracefully by attempting the fallback rather than crashing.
+    if canvas_blob is _UNSET:
+        canvas_enc = _read_thecanvas_prepared(doc, W, H)
+    elif canvas_blob is None:
+        # Defensive: /resources returned frame but no canvas blob.
+        # Try the individual endpoint / Krita before erroring.
+        canvas_enc = _read_thecanvas_prepared(doc, W, H)
+    else:
+        canvas_enc = _decode_blob_field(canvas_blob, W, H, is_mask=False)
+        if canvas_enc is None:
+            # Decode failed; fall back to the individual endpoint.
+            canvas_enc = _read_thecanvas_prepared(doc, W, H)
 
-    try:
-        selection_enc = read_layer_mask(doc, "theselection", (0, 0, W, H))
-    except ValueError:
-        selection_enc = None
+    if canvas_enc is None:
+        raise ValueError(
+            "@thecanvas unavailable: the inpaint playground is not "
+            "reachable (or has not synced a canvas yet), and no "
+            "Krita layer named 'thecanvas' exists."
+        )
+
+    # ---- Selection ----
+    #
+    # `_UNSET` → not pre-fetched, go to /selection_b64 / Krita.
+    # `None` → pre-fetched and definitively "no selection" → all-white.
+    # dict → pre-fetched blob.
+    if selection_blob is _UNSET:
+        selection_enc = _read_theselection_prepared(doc, W, H)
+    elif selection_blob is None:
+        selection_enc = None  # all-white
+    else:
+        selection_enc = _decode_blob_field(selection_blob, W, H, is_mask=True)
+        if selection_enc is None:
+            # Decode failed; fall back to the individual endpoint.
+            selection_enc = _read_theselection_prepared(doc, W, H)
 
     canvas_img = _decode_png_to_qimage(canvas_enc.data)
 
@@ -277,7 +589,10 @@ def _prepare_cropped(doc, graph, resource_slots, param_slots,
             _rotate_qimage(sel_img, theta) if theta != 0 else sel_img
         )
     else:
-        rotated_selection = _blank_qimage(
+        # No selection → all-white ("select all inside the crop").
+        # All-black (the previous default) meant "inpaint nothing",
+        # which produced a silent no-op run.
+        rotated_selection = _all_white_argb_qimage(
             Wp if theta != 0 else W,
             Hp if theta != 0 else H,
         )
@@ -444,6 +759,17 @@ def _blank_qimage(W, H):
     from PyQt6.QtGui import QImage
     q = QImage(W, H, QImage.Format.Format_ARGB32)
     q.fill(0)
+    return q
+
+
+def _all_white_argb_qimage(W, H):
+    """All-opaque-white ARGB32 image.  Used as the "select all"
+    fallback for `@theselection` when no mask is available.
+    Matches `pg_inpaint.js::buildWhiteMaskB64` (which sends an
+    all-white PNG when no mask is selected)."""
+    from PyQt6.QtGui import QImage
+    q = QImage(W, H, QImage.Format.Format_ARGB32)
+    q.fill(0xFFFFFFFF)
     return q
 
 

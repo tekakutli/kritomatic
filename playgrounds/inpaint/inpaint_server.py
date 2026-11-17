@@ -1,15 +1,24 @@
 """HTTP routes for the inpaint playground.
 
-The playground is a state synchronizer.  It no longer submits
-generation — the docker's Run button does.
+The playground is a state synchronizer and a pixel source.  It no
+longer submits generation and no longer writes Krita scratch layers.
 
 Routes
 ======
 
-    POST /sync              push pixel state (canvas + selection) into
-                            Krita scratch layers; also store rotation,
-                            context rect, and canvas dims for
-                            `/rotation` and `/crop_frame`
+    POST /sync              update the playground's in-memory state
+                            (canvas_b64, selection_b64, rotation,
+                            context rect, dims).  No Krita writes.
+    POST /resources         atomic fetch of the whole prepare-time
+                            state: `{frame, canvas, selection,
+                            rotation}` in one round-trip.
+    POST /canvas_b64        return the cached canvas blob
+                            (`{success, b64, width, height}`)
+    POST /selection_b64     return the cached selection blob
+                            (`{success, b64, width, height}` with
+                            `b64` possibly null when no mask is
+                            selected — the caller uses all-white)
+
     POST /rotation          return the last rotation pushed via /sync
     POST /crop_frame        authoritative crop frame the daemon applies
                             to @thecanvas before submission; multimask
@@ -28,16 +37,75 @@ Routes
     POST /rebind_document   clear the pinned target document and
                             re-capture from the daemon's activeDocument()
 
+/resources — the consolidated prepare-time fetch
+=================================================
+`POST /resources` returns the four pieces of state that
+`prepare_workflow` needs, captured atomically under `_state_lock`:
+
+    {
+      "success":   True,
+      "rotation":  float,
+      "frame":     {...} or None,   # same shape as /crop_frame's frame
+      "canvas":    {"b64": str, "width": int, "height": int} or None,
+      "selection": {"b64": str, "width": int, "height": int} or None,
+    }
+
+`frame` is `None` when no canvas has been synced yet — the caller
+must treat that as "not ready for a cropped prepare."
+
+`canvas` is `None` in the same case.  Under the current cache
+invariants, `frame is not None` implies `canvas is not None`: the
+only thing that populates `_canvas_w/_canvas_h` is `handle_sync`
+having seen a `canvas_b64`, and the only thing that clears them is
+process restart, which clears the frame too.
+
+`selection` is `None` when no mask has been selected.  The caller
+uses an all-white mask ("select all inside the crop") — same as
+`pg_inpaint.js::buildWhiteMaskB64`.
+
+Why this exists
+===============
+`prepare_workflow` used to make three separate HTTP calls to this
+server per run (`/crop_frame`, `/canvas_b64`, `/selection_b64`).  For
+a batch of N runs, that was 3N calls, and — more importantly —
+three separate reads of the mutable state with three separate
+`_state_lock` acquisitions in between.  If the user rotated or
+changed masks mid-prepare, different runs in the same batch could
+see different state (each call was individually consistent, but not
+mutually consistent).  `/resources` gives one lock acquisition, one
+snapshot, one round-trip.  The three old endpoints are kept for
+backward compat with older daemons, but nothing in the current
+daemon calls them any more.
+
+WHY NO KRITA SCRATCH LAYERS
+===========================
+The canvas and selection used to round-trip through Krita scratch
+layers (`thecanvas`, `theselection`) via `comfy_set_layer_pixels` on
+`/sync`, and the daemon read them from Krita.  That had three
+problems:
+
+  · On boot, autosync's first-canvas-arrival would write an
+    all-white `theselection` paint layer onto the user's stack
+    (visible garbage).
+  · The round-trip was pure overhead; the daemon knows the doc and
+    crop bounds already.
+  · The scratch layers shadowed real Krita layers of the same name.
+
+Now `/sync` is a pure memory write.  The daemon queries
+`/resources` at `prepare_workflow` time and substitutes the pixels
+into the graph directly (via the same `core/ASSET` rewrite
+`controlnets_playground` uses) — no pull node, no Krita layer, no
+boot-time artifact.
+
 PINNED TARGET DOCUMENT
 ======================
-Every daemon call that touches Krita document state (writing scratch
-layers, reading the composite, reading a named layer, reading mask
-layers) falls back to `Krita.instance().activeDocument()` when no
-document is named.  That fallback is fine for a single-client
-workflow, but breaks when another playground steals the active tab —
-notably controlnets' Push-to-Krita, which calls
-`create_new_with_dimensions` → `addView`, activating
-`kritomatic_controlnets` mid-session.
+Every `/krita/*` daemon call that touches Krita document state
+(reading the composite, reading a named layer, reading mask layers)
+falls back to `Krita.instance().activeDocument()` when no document is
+named.  That fallback is fine for a single-client workflow, but breaks
+when another playground steals the active tab — notably controlnets'
+Push-to-Krita, which calls `create_new_with_dimensions` → `addView`,
+activating `kritomatic_controlnets` mid-session.
 
 This module pins the target document on the first daemon response
 that reports one, and passes the pin on every subsequent call:
@@ -111,27 +179,18 @@ server, and the daemon's calls fail, falls back to legacy behavior
 
 SYNC FAILURE LOGGING
 ====================
-Every `handle_sync` failure path produces one `[inpaint] sync error:
-<reason>` line on the server's stdout, alongside the JSON error
-response that goes back to the browser:
+Every `handle_sync` failure path (bad payload, etc.) produces one
+`[inpaint] sync error: <reason>` line on the server's stdout,
+alongside the JSON error response that goes back to the browser.
 
-  · transport exception       → `sync error: <exception>` (pre-existing)
-  · daemon did not respond    → `sync error: daemon did not respond`
-  · daemon returned error     → `sync error: daemon reported: <msg>`
-  · one or more sub-commands  → `sync error: <cmd>: <msg>[; ...]`
-    failed
-
-The success path already logs `sync: pushed [...] rotation=...
-context=...`.  Failure logging completes the picture so a terminal
-watching the inpaint server sees *why* pushes stopped landing —
-previously the transport-exception path was the only one that logged,
-and the three response-side failure modes were silent.
-
-The browser mirrors the same error via `flashStatus(..., "bad")` in
-`pg_sync.js` on the first failure of a streak, so both sides agree on
-what went wrong and neither side depends on the other for
-observability.  See `pg_sync.py`'s module docstring, FAILURE
-MIRRORING."""
+The success path logs `sync: cached [...] rotation=...
+context=...`.  Since `/sync` no longer contacts the daemon, the only
+failure modes left are payload-shape errors; transport failures are
+gone.  The browser mirrors any `/sync` failure via
+`flashStatus(..., "bad")` in `pg_sync.js` on the first failure of a
+streak, so both sides agree on what went wrong and neither side
+depends on the other for observability.  See `pg_sync.py`'s module
+docstring, FAILURE MIRRORING."""
 
 from __future__ import annotations
 
@@ -249,45 +308,6 @@ def _send_with_pin(command: dict, *,
     return resp
 
 
-def _send_sync_batch(base_commands: list) -> "dict | None":
-    """Send a sync batch with the pinned document injected into every
-    command.  Fresh dicts each call so a stale-pin retry does not
-    reuse previously-injected commands.
-    """
-    with _state_lock:
-        doc_name = _target_document_name
-    if doc_name:
-        cmds = [{**c, "document": doc_name} for c in base_commands]
-    else:
-        cmds = [{**c} for c in base_commands]
-    batch = {"id": f"sync_{int(time.time() * 1000)}", "commands": cmds}
-    return krita_client.send_batch(batch, timeout=SYNC_TIMEOUT)
-
-
-def _batch_failed_on_stale_document(summary) -> bool:
-    """True iff `summary` reports an error whose message contains the
-    word 'document' — the doc-missing signature from
-    comfy_set_layer_pixels / get_layer_pixels_b64 /
-    get_document_composite_b64.  Layer-missing errors ("Layer not
-    found: …") do not contain 'document', so a legitimate layer
-    miss will not trigger a rebind.
-    """
-    if not isinstance(summary, dict):
-        return False
-    if (summary.get("status") == "batch_complete"
-            and not summary.get("failed")):
-        return False
-    top = (summary.get("message") or "").lower()
-    if "document" in top:
-        return True
-    for r in summary.get("results", []) or []:
-        if r.get("status") != "error":
-            continue
-        if "document" in (r.get("message") or "").lower():
-            return True
-    return False
-
-
 # ---------------------------------------------------------------------------
 #  PNG helpers
 # ---------------------------------------------------------------------------
@@ -338,7 +358,7 @@ def handle_active_state(_payload) -> dict:
 
 
 # ---------------------------------------------------------------------------
-#  /sync — push pixel state + rotation + context
+#  /sync — pure memory write (no Krita round-trip)
 # ---------------------------------------------------------------------------
 
 def handle_sync(payload: dict) -> dict:
@@ -397,85 +417,135 @@ def handle_sync(payload: dict) -> dict:
         else:
             _context_state = context_state
 
-    base_commands = []
+    cached = []
     if canvas_b64:
-        base_commands.append({
-            "type": "comfy_set_layer_pixels",
-            "name": "thecanvas",
-            "image_b64": canvas_b64,
-            "is_mask": False,
-        })
+        cached.append("canvas")
     if selection_b64:
-        base_commands.append({
-            "type": "comfy_set_layer_pixels",
-            "name": "theselection",
-            "image_b64": selection_b64,
-            "is_mask": True,
-        })
+        cached.append("selection")
 
-    if not base_commands:
-        return {"success": True,
-                "rotation": rotation,
-                "context": context_state,
-                "pushed": []}
+    _log(f"sync: cached {cached} rotation={rotation} "
+         f"context={_context_state}")
 
-    try:
-        summary = _send_sync_batch(base_commands)
-    except Exception as e:
-        _log(f"sync error: {e}")
-        return {"success": False,
-                "message": f"daemon send failed: {e}",
-                "rotation": rotation,
-                "context": context_state}
+    return {
+        "success": True,
+        "rotation": rotation,
+        "context": _context_state,
+        "cached": cached,
+    }
 
-    if _batch_failed_on_stale_document(summary):
-        with _state_lock:
-            _target_document_name = ""
-        _log("sync: pin was stale; retried against activeDocument()")
-        try:
-            summary = _send_sync_batch(base_commands)
-        except Exception as e:
-            _log(f"sync error: {e}")
-            return {"success": False,
-                    "message": f"daemon send failed: {e}",
-                    "rotation": rotation,
-                    "context": context_state}
 
-    if summary is None:
-        _log("sync error: daemon did not respond")
-        return {"success": False,
-                "message": "daemon did not respond",
-                "rotation": rotation,
-                "context": context_state}
+# ---------------------------------------------------------------------------
+#  /resources — atomic multi-field fetch (Slice C)
+# ---------------------------------------------------------------------------
 
-    if summary.get("status") == "error":
-        msg = summary.get("message", "daemon error")
-        _log(f"sync error: daemon reported: {msg}")
-        return {"success": False,
-                "message": msg,
-                "rotation": rotation,
-                "context": context_state}
+def handle_resources(_payload) -> dict:
+    """Return every field `prepare_workflow` needs, atomically.
 
-    failed = int(summary.get("failed", 0) or 0)
-    if failed:
-        msgs = []
-        for r in summary.get("results", []) or []:
-            if r.get("status") == "error":
-                msgs.append(f"{r.get('command')}: {r.get('message')}")
-        joined = "; ".join(msgs) or f"{failed} command(s) failed"
-        _log(f"sync error: {joined}")
-        return {"success": False,
-                "message": joined,
-                "rotation": rotation,
-                "context": context_state}
+    One `_state_lock` acquisition covers the frame, canvas, selection,
+    and rotation.  No torn reads between "read frame" and "read
+    canvas": a rotate-between-calls race that the three-call sequence
+    (Slice B) had is impossible here.
 
-    pushed = [c["name"] for c in base_commands]
-    _log(f"sync: pushed {pushed} rotation={rotation} "
-         f"context={context_state}")
-    return {"success": True,
-            "rotation": rotation,
-            "context": context_state,
-            "pushed": pushed}
+    Return shape (see the module docstring, /resources):
+
+        {
+          "success":   True,
+          "rotation":  float,
+          "frame":     {...} or None,
+          "canvas":    {"b64": str, "width": int, "height": int} or None,
+          "selection": {"b64": str, "width": int, "height": int} or None,
+        }
+
+    `frame` is `None` before the first canvas sync — the caller must
+    fall back to the legacy un-rotated path in that case.  `canvas`
+    is `None` under the same condition (see the docstring for the
+    invariant that ties the two together).  `selection` is `None`
+    when no mask has been selected; the caller uses all-white.
+    """
+    with _state_lock:
+        rotation = _rotation
+        # Build the frame inside the same lock so it cannot observe
+        # a `_canvas_w` / `_context_state` / `_rotation` triple that
+        # was not true at some single moment in time.
+        frame = _compute_crop_frame_locked()
+        canvas_b64 = _canvas_b64 or None
+        canvas_w = _canvas_w
+        canvas_h = _canvas_h
+        selection_b64 = _selection_b64 or None
+
+    canvas = None
+    if canvas_b64 is not None:
+        canvas = {
+            "b64": canvas_b64,
+            "width": canvas_w,
+            "height": canvas_h,
+        }
+
+    selection = None
+    if selection_b64 is not None:
+        selection = {
+            "b64": selection_b64,
+            "width": canvas_w,
+            "height": canvas_h,
+        }
+
+    return {
+        "success": True,
+        "rotation": rotation,
+        "frame": frame,
+        "canvas": canvas,
+        "selection": selection,
+    }
+
+
+# ---------------------------------------------------------------------------
+#  /canvas_b64 and /selection_b64 — legacy fallback (kept for older daemons)
+# ---------------------------------------------------------------------------
+
+def handle_canvas_b64(_payload) -> dict:
+    """Return the cached canvas blob.
+
+    `b64` is the raw base64 PNG (no data URL prefix).  `b64` is
+    `None` when no canvas has been synced yet.
+
+    Kept for backward compat with daemons that predate `/resources`.
+    Current daemons call `/resources` exclusively.  See the module
+    docstring, /resources.
+    """
+    with _state_lock:
+        b64 = _canvas_b64 or None
+        w = _canvas_w
+        h = _canvas_h
+    return {
+        "success": True,
+        "b64": b64,
+        "width": w,
+        "height": h,
+    }
+
+
+def handle_selection_b64(_payload) -> dict:
+    """Return the cached selection blob.
+
+    `b64` is the raw base64 PNG.  `b64` is `None` when no mask has
+    been selected — the caller must interpret that as "select all"
+    and use an all-white mask at the context rect's extent (see
+    `pg_inpaint.js::buildWhiteMaskB64`).
+
+    Kept for backward compat with daemons that predate `/resources`.
+    Current daemons call `/resources` exclusively.  See the module
+    docstring, /resources.
+    """
+    with _state_lock:
+        b64 = _selection_b64 or None
+        w = _canvas_w
+        h = _canvas_h
+    return {
+        "success": True,
+        "b64": b64,
+        "width": w,
+        "height": h,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -492,12 +562,19 @@ def handle_rotation(_payload) -> dict:
 #  /crop_frame — authoritative crop window
 # ---------------------------------------------------------------------------
 
-def _compute_crop_frame() -> Optional[dict]:
-    with _state_lock:
-        W = _canvas_w
-        H = _canvas_h
-        theta = _rotation
-        ctx = dict(_context_state)
+def _compute_crop_frame_locked() -> Optional[dict]:
+    """Compute the crop frame assuming `_state_lock` is already held.
+
+    Pulled out of `_compute_crop_frame` so `handle_resources` can
+    capture the frame atomically with the canvas and selection blobs
+    under a single `_state_lock` acquisition.  Everything below
+    assumes the caller holds `_state_lock` and reads the module-level
+    state directly.
+    """
+    W = _canvas_w
+    H = _canvas_h
+    theta = _rotation
+    ctx = dict(_context_state)
 
     if W <= 0 or H <= 0:
         return None
@@ -554,6 +631,18 @@ def _compute_crop_frame() -> Optional[dict]:
         "inpaintEnabled": True,
         "contextRect": list(context_rect),
     }
+
+
+def _compute_crop_frame() -> Optional[dict]:
+    """Compute the crop frame under `_state_lock`.
+
+    Thin wrapper that acquires the lock for callers that only need
+    the frame (not the canvas or selection).  `handle_resources`
+    calls `_compute_crop_frame_locked` directly so it can also read
+    the blobs under the same lock.
+    """
+    with _state_lock:
+        return _compute_crop_frame_locked()
 
 
 def handle_crop_frame(_payload) -> dict:
@@ -767,6 +856,9 @@ def handle_rebind_document(_payload) -> dict:
 
 ROUTES = {
     "/sync":                 handle_sync,
+    "/resources":            handle_resources,
+    "/canvas_b64":           handle_canvas_b64,
+    "/selection_b64":        handle_selection_b64,
     "/rotation":             handle_rotation,
     "/crop_frame":           handle_crop_frame,
     "/comfy/status":         handle_status,

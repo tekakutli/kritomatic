@@ -1,23 +1,48 @@
 """Panel button handlers, pgkit actions, mask list levels, and the
 boot-sync routine.
 
-Operations exposed by this playground:
+Operations exposed by this playground (buttons / UI):
   - Import masks from Krita
   - Refresh @thecanvas
   - Rebind target document  (manual escape hatch for pin drift)
   - Select / delete masks
   - Rotate the playground view (single scrub input)
   - Materialise the context rectangle as a mask
-  - Manual "Sync now" (re-push state)
   - ComfyUI / Krita status checks
 
-Not present: Inpaint button, Cancel button, prompt field, interceptor
-routing, pick-image / pick-mask / clear-image buttons, drop overlay.
-Generation is triggered by the docker's Run button; the playground's
-job is to push state into Krita scratch layers so that run finds the
-right canvas / mask / context rectangle.  The image is pulled
-exclusively from the daemon (autosync + manual refresh), never from
-a local file.
+Programmatic operations exposed via `pgkitRegisterAction` (usable
+from `remote_cli`, scripts, other playgrounds over the hub):
+  - `action.refreshCanvas`      re-fetch @thecanvas
+  - `action.rebindDoc`          re-pin the target document
+  - `action.syncNow`            force an immediate state push
+                                (retries a failed delta because
+                                `pg_sync.js` now advances its
+                                change-detection trackers only on
+                                success)
+  - `action.checkStatus`        ComfyUI preflight
+  - `action.kritaCheck`         daemon reachability
+  - `action.kritaImportMasks`   import masks from Krita
+  - `action.maskFromRect`       materialise context rect as mask
+  - `action.selectMask` (row)   select a mask by index
+  - `action.deleteMask` (row)   delete a mask by index
+
+The `action.syncNow` primitive is the only way the "force a push"
+affordance survives.  The in-panel "Sync now" button was removed
+when the tracker-advance-on-success fix landed (see
+`pg_sync.py`'s TRACKER ADVANCE ON SUCCESS ONLY): every real
+trigger for a push is automatic, and the one case the button
+should have rescued — a failed push leaving the client and server
+diverged — is now recovered automatically by the next state
+change.
+
+Not present: Inpaint button, Cancel button, prompt field,
+interceptor routing, pick-image / pick-mask / clear-image buttons,
+drop overlay, "Sync now" button.  Generation is triggered by the
+docker's Run button; the playground's job is to push state into the
+inpaint server's cache (via `/sync`) so that run finds the right
+canvas / mask / context rectangle.  The image is pulled exclusively
+from the daemon (autosync + manual refresh), never from a local
+file.
 
 SYNC TRIGGERS
 =============
@@ -25,9 +50,9 @@ Every user-facing state mutation below calls `scheduleSync()` after
 updating the model.  Mask imports go through the debounced path;
 rotation changes bypass the debounce (handled in
 `pg_panel_scrubs.js`).  Autosync from @thecanvas does NOT schedule a
-push on every poll — only on the first canvas arrival of the session
-(so `theselection` is claimed on boot rather than left as whatever
-the previous session wrote).  See `pg_autosync.js`'s
+push on every poll — only on the first canvas arrival of the
+session, so the inpaint server's cache is warm (canvas + selection)
+before the first Run click.  See `pg_autosync.js`'s
 first-canvas-arrival branch.
 
 BOOT ORDER
@@ -36,8 +61,9 @@ BOOT ORDER
 docstring, BOOT GATE) BEFORE it schedules anything else.  Every sync
 that fires before hydration settles — including the one autosync
 schedules on first-canvas-arrival — is deferred behind that gate, so
-the daemon sees the hydrated (or definitively blank) `theselection`
-on the first sync, never an intermediate blank one.
+the inpaint server receives the hydrated (or definitively white-
+fallback) `theselection` on the first sync, never an intermediate
+white push.
 
 MANUAL @thecanvas REFRESH
 =========================
@@ -54,10 +80,9 @@ daemon's activeDocument().  Use case: another playground
 (controlnets Push-to-Krita) activated its own doc while inpaint was
 open; user manually switched back to their real doc; clicking
 `⟲ Rebind doc` re-pins inpaint to the doc they are now looking at.
-See `inpaint_server.py`'s module docstring, PINNED TARGET DOCUMENT,
-and `pg_base.py`'s, REBIND DOC.  After rebinding, `_refreshCanvasAction`
-runs so the canvas reflects the newly-pinned doc without a manual
-extra click."""
+See `inpaint_server.py`'s module docstring, PINNED TARGET DOCUMENT.
+After rebinding, `_refreshCanvasAction` runs so the canvas reflects
+the newly-pinned doc without a manual extra click."""
 
 PANEL_BINDINGS_JS = r"""
 import { board, applyCanvasImage,
@@ -390,7 +415,6 @@ export function installPanelBindings() {
     "rebindDocBtn",
     "maskFromRectBtn",
     "refreshCanvasBtn",
-    "syncNowBtn",
   ];
   for (const id of ids) el[id] = document.getElementById(id);
 
@@ -399,7 +423,6 @@ export function installPanelBindings() {
   if (el.rebindDocBtn)   el.rebindDocBtn.addEventListener("click", _rebindDocAction);
   if (el.maskFromRectBtn) el.maskFromRectBtn.addEventListener("click", _maskFromRectAction);
   if (el.refreshCanvasBtn) el.refreshCanvasBtn.addEventListener("click", _refreshCanvasAction);
-  if (el.syncNowBtn) el.syncNowBtn.addEventListener("click", syncNow);
 
   const statusEl = document.getElementById("statusLine");
   if (statusEl) {
@@ -426,7 +449,10 @@ pgkitRegisterAction("action.rebindDoc", {
 pgkitRegisterAction("action.syncNow", {
   label: "Sync now", scope: "global", run: syncNow,
   meta: { variant: "plain",
-          description: "Re-push the current state into Krita scratch layers." },
+          description: "Force an immediate state push to the inpaint "
+                     + "server.  Retries any previously-failed delta "
+                     + "because the change-detection trackers advance "
+                     + "only on success." },
 });
 pgkitRegisterAction("action.checkStatus", {
   label: "Check connection", scope: "global", run: _checkStatusAction,

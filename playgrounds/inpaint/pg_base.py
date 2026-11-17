@@ -7,8 +7,8 @@ itself.
 The Inpaint button, Cancel button, prompt textarea, and interceptor
 routing are all gone.  This playground no longer submits generation —
 the docker's Run button does.  This playground's job is to push state
-into Krita scratch layers so the docker's run finds the right canvas,
-mask, and context rectangle.  See `pg_sync.js`.
+into the inpaint server's cache so the docker's run finds the right
+canvas, mask, and context rectangle.  See `pg_sync.js`.
 
 The `+ Pick image…`, `Clear`, and `+ Pick mask file…` buttons and the
 drag-drop overlay are gone too.  The image is pulled from the daemon
@@ -27,8 +27,8 @@ context rect is communicated as scalar fields on the `/sync` payload
 and the server synthesizes `(0, 0, W, H)` when the checkbox is off.
 See `inpaint_server.py`'s module docstring, CONTEXT RECT QUERY.
 
-The `#statusLine` element is repurposed as the sync status: `Synced
-14:22:08 · rotation 15.0° · mask 3/5 · context on`.
+The `#statusLine` element shows sync state: `Synced 14:22:08 ·
+rotation 15.0° · mask 3/5 · context on`.
 
 REBIND DOC
 ==========
@@ -51,7 +51,20 @@ attached.
 The `#overlayCanvas` selector has higher specificity than the shared
 `canvas { … }` rule in `pgkit/styles.py`, so `background: transparent`
 wins over the shared `background: #0a0e14`.  Without that override
-the overlay would be opaque dark and hide the image layer entirely."""
+the overlay would be opaque dark and hide the image layer entirely.
+
+SYNC NOW BUTTON
+===============
+The "Sync now" button was removed.  Every real trigger for a push is
+already automatic (debounce on every state change, `syncNow()` on
+rotation), and the one case the button should have rescued — a
+failed push leaving the client and server diverged — was not
+recoverable by clicking it because the change-detection tracker
+advanced optimistically before the fetch resolved.  Post-fix (see
+`pg_sync.py`'s TRACKER ADVANCE ON SUCCESS ONLY), the next state
+change retries the delta automatically, so a dedicated button added
+no value.  The `action.syncNow` pgkit action is still registered for
+programmatic callers; only the in-panel button is gone."""
 
 PG_CSS = r"""
   #ui button#refreshCanvasBtn {
@@ -111,18 +124,6 @@ PG_CSS = r"""
   #ui button#maskFromRectBtn:disabled {
     opacity: 0.35;
     cursor: not-allowed;
-  }
-  #ui button#syncNowBtn {
-    border-color: rgba(120, 220, 255, 0.72);
-    color: #b8ecff;
-    font-size: 9px;
-    padding: 2px 8px;
-    width: auto;
-  }
-  #ui button#syncNowBtn:hover:not(:disabled) {
-    border-color: rgba(140, 225, 255, 1.00);
-    background: rgba(120, 220, 255, 0.10);
-    color: #d8f4ff;
   }
   #kritaStatus {
     font-size: 10px;
@@ -293,12 +294,6 @@ PG_PANEL_BODY = r"""
           Drag anywhere on the context rectangle's border or interior to move it.
           Drag a handle (four corners, four edge midpoints) to resize.
           Hold Shift while dragging a handle to resize symmetrically around the center.
-        </div>
-        <div class="row" style="margin-top:8px;">
-          <button id="syncNowBtn"
-                  title="Re-push the current state into Krita scratch layers.">
-            Sync now
-          </button>
         </div>
         <div id="statusLine">idle</div>
       </div>

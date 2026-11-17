@@ -703,7 +703,10 @@ class DocumentHandler(AutoDispatchHandler):
     @command(
         category='doc',
         help_text='Get a full-resolution base64 PNG data URL of a '
-                  'document composite (all visible layers flattened).',
+                  'document composite (all visible layers flattened). '
+                  'Response carries `data.document` — the doc name the '
+                  'composite was read from — so callers that want to pin '
+                  'a target document across calls can read it back.',
         args={
             '--name': {'type': 'str', 'required': False,
                        'help': 'Document name (defaults to active)'},
@@ -770,6 +773,7 @@ class DocumentHandler(AutoDispatchHandler):
                 'message': f'Got composite for {doc.name()}',
                 'data': {
                     'name':     doc.name(),
+                    'document': doc.name(),
                     'width':    doc.width(),
                     'height':   doc.height(),
                     'data_url': data_url,

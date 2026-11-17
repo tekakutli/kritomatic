@@ -3,23 +3,32 @@ scrub input, and field registrations.
 
 VIEW ROTATION — SCRUB INPUT
 ===========================
-Same as before: one text field that behaves as both numeric input
-(click to focus, type an angle) and scrub control (press and drag).
-Drag rounds to whole degrees; typed input keeps decimals.
+One text field that behaves as both numeric input (click to focus,
+type an angle) and scrub control (press and drag).  Drag rounds to
+whole degrees; typed input keeps decimals.
 
-NEW: every rotation change schedules an *immediate* sync (bypassing the
-debounce).  Rotation is a scalar field on the sync payload — the daemon
-queries it back via `/rotation` on demand, so keeping it fresh is
-cheap.  Immediate means a rotate-then-Run sequence has no measurable
-stale window.
+Every rotation change schedules an *immediate* sync (bypassing the
+debounce).  Rotation is a scalar field on the sync payload — the
+daemon queries it back via `/rotation` on demand, so keeping it fresh
+is cheap.  Immediate means a rotate-then-Run sequence has no
+measurable stale window.
 
 CONTEXT RECTANGLE CHECKBOX
 ==========================
-Turning it on schedules a debounced sync (the pushed `thecontext`
-changes from "untouched" to "white rect at user rect").  Turning it off
-schedules a debounced sync that pushes all-white once — the ON→OFF
-transition.  Further syncs while off do not touch `thecontext`; the
-daemon reads that layer's own bbox or falls back to the whole canvas."""
+Turning it on and off schedules debounced syncs like any other context
+state change.  The rectangle's coordinates travel as scalar fields on
+the payload (`context_enabled`, `context_x`, `context_y`,
+`context_w`, `context_h`).  No `thecontext` Krita layer is written.
+The server uses these fields to synthesize the effective context:
+
+  · checkbox on  -> the user's drawn rect
+  · checkbox off -> a full-canvas rect (0, 0, W, H), i.e. "inpaint
+                    the whole canvas"
+
+The synthesized rect travels the same code path as a user-drawn one,
+so "off" is structurally identical to "on with a context rectangle
+covering the entire canvas".  See `inpaint_server.py`'s module
+docstring, CONTEXT RECT QUERY."""
 
 PANEL_SCRUBS_JS = r"""
 import { board, view, _applyRotation } from "./pg_state.js";
@@ -119,7 +128,7 @@ if (rotationEl) {
       }
 
       pgkitNotifyLocal("view.rotation");
-      // Rotation → immediate sync.  Debounce would be visible here:
+      // Rotation -> immediate sync.  Debounce would be visible here:
       // rotate-then-Run within 250 ms would race the daemon's
       // /rotation query.
       syncNow();

@@ -8,8 +8,8 @@ nothing.
 
 The prompt field is gone.  The status line shows sync state instead of
 inpaint state: `Synced HH:MM:SS · rotation N° · mask K/N · context on/off`,
-or `Syncing…` / `Sync failed: …` / `No mask selected · workflow will
-not inpaint`.
+or `Syncing…` / `Sync failed: …` / `No mask selected · inpaints the whole
+context rect`.
 
 The pick-image / clear-image / pick-mask button-disable checks are
 gone along with those buttons."""
@@ -95,7 +95,7 @@ export function syncPanelFields() {
     } else if (!board.imageHash) {
       text = "idle"; cls = "";
     } else if (board.selectedMaskIndices.length === 0) {
-      text = "No mask selected · workflow will not inpaint"; cls = "warn";
+      text = "No mask selected · inpaints the whole context rect"; cls = "warn";
     } else {
       text = "not yet synced"; cls = "warn";
     }

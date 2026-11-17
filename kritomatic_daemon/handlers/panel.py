@@ -51,6 +51,28 @@ Used by ResourcesProvider so each resource renders as
 on one line, with the layer-name input shown only when the dropdown
 is "layer".
 
+Playground-claimed resources
+============================
+A registered playground may declare slots that shadow workflow
+resource slots of the same `@`-name.  For example, inpaint registers
+`@thecanvas`, `@thecontext`, and `@theselection` — the playground
+itself drives what those resources point at, and duplicates in the
+Resources section would be a second source of truth for the same
+input.  This produces exactly the bug that "hide the field, keep the
+value working" is meant to prevent: user edits the Resources field,
+the playground overrides it on the next sync, no visible error.
+
+`ResourcesProvider` therefore drops any resource slot whose name is
+claimed by a registered playground's `layer_slots[].id`.  The claimed
+values still flow through `comfy_apply_config` (they retain whatever
+the saved panel config had), but the UI no longer exposes them for
+editing.  If *every* workflow resource is claimed, the Resources
+section disappears entirely rather than rendering as an empty box.
+
+The docker's Playgrounds section renders the corresponding row for
+slots that are not marked `managed_by_playground: True` — see
+`_update_playgrounds` in `panel/docker.py`.
+
 Layer alias kind hints
 ======================
 Each resource slot has a `kind` from `comfyui_inspect`'s resource
@@ -345,9 +367,36 @@ class WorkflowMetadataProvider:
         })
 
 
+def _claimed_resource_names(playgrounds: list) -> set:
+    """Return every `@`-name claimed by any registered playground.
+
+    Walks each registration's `layer_slots[].id`.  `managed_by_playground`
+    does not matter here — the daemon hides any `@`-name a playground
+    claims, whether or not that playground exposes a UI row for it.
+    The playground that claims a slot is the sole source of truth for
+    that resource's value, so a duplicate field in Resources would be
+    an editing trap.
+    """
+    out: set = set()
+    for p in playgrounds or ():
+        if not isinstance(p, dict):
+            continue
+        for slot in (p.get("layer_slots") or ()):
+            if isinstance(slot, dict):
+                sid = slot.get("id")
+                if isinstance(sid, str) and sid.startswith("@"):
+                    out.add(sid)
+    return out
+
+
 class ResourcesProvider:
     """Per-@-name: a single composite row with the source dropdown and
     a conditional layer_name field.
+
+    Resources whose names are claimed by a registered playground are
+    dropped from this section entirely — see the module docstring,
+    "Playground-claimed resources".  If *all* workflow resources are
+    claimed, the section is not emitted at all.
 
     The composite's `key` is only the row's label. Its sub-widgets
     carry the real `config_path`s and are wired independently — the
@@ -376,10 +425,20 @@ class ResourcesProvider:
         slots = status.get("workflow_resource_slots") or {}
         if not slots:
             return
+
+        claimed = _claimed_resource_names(
+            status.get("playgrounds") or []
+        )
+        visible_names = [n for n in sorted(slots.keys()) if n not in claimed]
+        if not visible_names:
+            # Every workflow resource is claimed by a playground.
+            # The section would be an empty box; suppress it.
+            return
+
         config = status.get("config") or {}
         cfg_resources = config.get("resources") or {}
         fields = []
-        for name in sorted(slots.keys()):
+        for name in visible_names:
             slot = slots.get(name) or {}
             # The extractor records `kind` as "image" or "mask"
             # depending on whether the node was LoadImage or

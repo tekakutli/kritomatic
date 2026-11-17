@@ -25,48 +25,85 @@ Routes
     POST /krita/import_masks  fetch selected mask or paint layer(s)
     POST /krita/resource_image  resolve a `{source, layer_name}` spec
                                 to a PNG data URL
+    POST /rebind_document   clear the pinned target document and
+                            re-capture from the daemon's activeDocument()
 
-The `/comfy/upload_image` raw route and its `_image_cache` were
-removed along with the pick-image / pick-mask / drop-overlay
-buttons — every image install is now daemon-mediated (autosync or
-manual `Refresh @thecanvas`), and no other route ever read from the
-cache.
+PINNED TARGET DOCUMENT
+======================
+Every daemon call that touches Krita document state (writing scratch
+layers, reading the composite, reading a named layer, reading mask
+layers) falls back to `Krita.instance().activeDocument()` when no
+document is named.  That fallback is fine for a single-client
+workflow, but breaks when another playground steals the active tab —
+notably controlnets' Push-to-Krita, which calls
+`create_new_with_dimensions` → `addView`, activating
+`kritomatic_controlnets` mid-session.
+
+This module pins the target document on the first daemon response
+that reports one, and passes the pin on every subsequent call:
+
+    · `_capture_document_from_response` pins once, from
+      `data.document` (every doc-targeting command returns it).
+    · `_send_with_pin` injects `command[doc_arg] = pin` on every
+      subsequent call.
+    · A "document … not found" response clears the pin and retries
+      unpinned once, re-capturing from `activeDocument()` — the
+      self-healing case: user closed the pinned doc, opened another.
+    · `/rebind_document` is the manual escape hatch: user switched
+      Krita tabs back to the doc they want inpaint to follow, clicks
+      "⟲ Rebind doc", the pin re-captures.
+
+Layer-missing errors ("Layer not found: …") do NOT trigger a rebind —
+those are real content errors, not stale-doc errors, and rebinding on
+them would mask them.
 
 CROP FRAME
 ==========
 `/crop_frame` returns `{theta, W, H, Wp, Hp, cropX, cropY, cropW,
-cropH, inpaintEnabled, contextRect?}`.  It is the definitive answer
+cropH, inpaintEnabled, contextRect}`.  It is the definitive answer
 to "what does the daemon crop @thecanvas to."  The math:
 
-  · theta = 0, context enabled: crop = user's context rect clamped to
-    the canvas.
-  · theta = 0, context disabled: crop = @thecontext layer's tight
-    bbox (queried from the daemon), or whole canvas if the layer has
-    no content.
-  · theta ≠ 0, context enabled: rotate frame to W'×H'; translate the
-    user's context rect into the rotated frame by
+  · theta = 0: crop = the effective context rect clamped to the
+    canvas.  The effective context rect is the user's drawn rect when
+    the checkbox is on; when the checkbox is off, `handle_sync` has
+    synthesized a full-canvas rect `(0, 0, W, H)`, so the crop is the
+    whole canvas.
+
+  · theta ≠ 0: rotate the frame to W'×H'; translate the effective
+    context rect into the rotated frame by
     ((W'-W)//2 + cx, (H'-H)//2 + cy).  The translated rect's
     axis-aligned position in the rotated frame matches the *visual*
-    position of the user's rect over the rotated image, so corners
-    of the diamond are fully coverable by a crop that reaches them.
-    Crops that extend past the W'×H' frame are honoured — the daemon
+    position of the rect over the rotated image, so corners of the
+    diamond are fully coverable by a crop that reaches them.  Crops
+    that extend past the W'×H' frame are honoured — the daemon
     extends the canvas to cover them.  This is a pure translation,
     NOT a rotation of the context rect.
-  · theta ≠ 0, context disabled: crop = whole rotated frame W'×H'.
 
-If the playground has no image (empty state), `/crop_frame` returns
-`{success: true, frame: null}` — the daemon falls back to its legacy
-un-rotated path.
+    When the checkbox is off, the effective context rect is the full
+    canvas (0, 0, W, H), so the crop is the central W×H region of the
+    W'×H' rotated frame — the same as if the user had drawn a
+    context rect covering the whole canvas at θ=0 and rotated.
+
+`inpaintEnabled` is always True once a canvas has been synced — the
+synthesized full-canvas rect makes the "disabled" branch
+structurally identical to the "enabled" branch.  Before any canvas
+has been synced (empty state), `/crop_frame` returns
+`{success: true, frame: null}` and the daemon falls back to its
+legacy un-rotated path.
 
 CONTEXT RECT QUERY
 ==================
-The context rect used for cropping is derived from:
-  · The user's checkbox + rect on `/sync` when the checkbox is on
-    (inpaintEnabled = True).
-  · Otherwise from the daemon's `@thecontext` layer, per its
-    configured source (default `{source: "layer"}`).  Inpaint queries
-    the daemon, decodes the layer's mask, and takes its tight bbox.
-  · If neither exists, whole canvas.
+The context rect used for cropping is:
+
+  · The user's rect, when the checkbox is on.
+  · A synthesized full-canvas rect (0, 0, W, H) when the checkbox
+    is off — i.e. "inpaint the whole canvas."  This makes the
+    checkbox a pure "restrict the inpaint area" toggle: off means
+    "inpaint everything," not "fall back to whatever @thecontext
+    layer happens to contain."
+  · Before any canvas has been synced, W and H are 0, so no rect
+    can be synthesized; `/crop_frame` returns None and the daemon
+    falls back to its legacy path.
 
 Both `/sync` and `/crop_frame` are liveness-gated: kill the playground
 server, and the daemon's calls fail, falls back to legacy behavior
@@ -84,7 +121,7 @@ response that goes back to the browser:
   · one or more sub-commands  → `sync error: <cmd>: <msg>[; ...]`
     failed
 
-The success path already logs `sync: pushed [...] rotation=... 
+The success path already logs `sync: pushed [...] rotation=...
 context=...`.  Failure logging completes the picture so a terminal
 watching the inpaint server sees *why* pushes stopped landing —
 previously the transport-exception path was the only one that logged,
@@ -125,7 +162,8 @@ def _log(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-#  State — rotation, context rect, canvas dims, selection b64.
+#  State — rotation, context rect, canvas dims, selection b64,
+#          pinned target document.
 # ---------------------------------------------------------------------------
 
 _state_lock = threading.Lock()
@@ -137,6 +175,117 @@ _canvas_w: int = 0
 _canvas_h: int = 0
 _canvas_b64: str = ""
 _selection_b64: str = ""
+
+# Pinned target document.  Empty string means "not yet captured".
+# Set on the first daemon response that reports a document name;
+# cleared on "document … not found" (stale pin — doc was closed) so
+# the next call re-captures from activeDocument().
+#
+# Without this, every inpaint → daemon call falls back to Krita's
+# activeDocument(), which controlnets Push-to-Krita steals by calling
+# create_new_with_dimensions → addView.  See the module docstring,
+# PINNED TARGET DOCUMENT.
+_target_document_name: str = ""
+
+
+# ---------------------------------------------------------------------------
+#  Pinned-document helpers
+# ---------------------------------------------------------------------------
+
+def _capture_document_from_response(resp) -> None:
+    """Pin `_target_document_name` from a successful daemon response.
+
+    Only fires once — subsequent responses are ignored so a later doc
+    switch (e.g. controlnets Push) does not move the pin.  Reads the
+    unambiguous `data.document` field; every document-targeting
+    daemon command returns it.
+    """
+    global _target_document_name
+    if not isinstance(resp, dict) or not resp.get("success"):
+        return
+    with _state_lock:
+        if _target_document_name:
+            return
+        data = resp.get("data") or {}
+        doc = data.get("document")
+        if isinstance(doc, str) and doc:
+            _target_document_name = doc
+            _log(f"pinned target document: {doc!r}")
+
+
+def _send_with_pin(command: dict, *,
+                   doc_arg: str = "document",
+                   timeout: float = 30.0) -> dict:
+    """Send a daemon command targeting the pinned document.
+
+    - No pin yet: send `command` unchanged (daemon uses activeDocument);
+      capture the pin from the response.
+    - Pin set: inject `command[doc_arg] = pin`; on a "document … not
+      found" / "matching document" error, clear the pin and retry once
+      without the hint.  The retry's response re-pins against
+      activeDocument().
+    """
+    global _target_document_name
+
+    with _state_lock:
+        pin = _target_document_name
+
+    if pin:
+        payload = {**command, doc_arg: pin}
+        resp = krita_client.send(payload, timeout=timeout)
+        msg = (resp.get("message") or "").lower()
+        stale = (not resp.get("success")) and ("document" in msg)
+        if not stale:
+            _capture_document_from_response(resp)
+            return resp
+        with _state_lock:
+            if _target_document_name == pin:
+                _target_document_name = ""
+                _log(f"pin {pin!r} stale; rebinding to active")
+        # Fall through to unpinned retry.
+
+    resp = krita_client.send(command, timeout=timeout)
+    _capture_document_from_response(resp)
+    return resp
+
+
+def _send_sync_batch(base_commands: list) -> "dict | None":
+    """Send a sync batch with the pinned document injected into every
+    command.  Fresh dicts each call so a stale-pin retry does not
+    reuse previously-injected commands.
+    """
+    with _state_lock:
+        doc_name = _target_document_name
+    if doc_name:
+        cmds = [{**c, "document": doc_name} for c in base_commands]
+    else:
+        cmds = [{**c} for c in base_commands]
+    batch = {"id": f"sync_{int(time.time() * 1000)}", "commands": cmds}
+    return krita_client.send_batch(batch, timeout=SYNC_TIMEOUT)
+
+
+def _batch_failed_on_stale_document(summary) -> bool:
+    """True iff `summary` reports an error whose message contains the
+    word 'document' — the doc-missing signature from
+    comfy_set_layer_pixels / get_layer_pixels_b64 /
+    get_document_composite_b64.  Layer-missing errors ("Layer not
+    found: …") do not contain 'document', so a legitimate layer
+    miss will not trigger a rebind.
+    """
+    if not isinstance(summary, dict):
+        return False
+    if (summary.get("status") == "batch_complete"
+            and not summary.get("failed")):
+        return False
+    top = (summary.get("message") or "").lower()
+    if "document" in top:
+        return True
+    for r in summary.get("results", []) or []:
+        if r.get("status") != "error":
+            continue
+        if "document" in (r.get("message") or "").lower():
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -188,47 +337,6 @@ def handle_active_state(_payload) -> dict:
     return {"success": True, "data": data}
 
 
-def _query_thecontext_layer_bbox() -> Optional[tuple[int, int, int, int]]:
-    """Read `@thecontext`'s bbox via the daemon, per its config source.
-
-    Only handles source="layer".  Any other source (active / global)
-    returns None; the caller falls back to whole-canvas context.  See
-    the module docstring.
-    """
-    data = _fetch_active_state()
-    if not data:
-        return None
-    config = data.get("config") or {}
-    resources = config.get("resources") or {}
-    spec = resources.get("@thecontext")
-    if not isinstance(spec, dict):
-        return None
-    if spec.get("source") != "layer":
-        return None
-    layer_name = spec.get("layer_name")
-    if not layer_name:
-        return None
-
-    try:
-        resp = krita_client.send({
-            "type": "import_krita_masks_b64",
-            "layer_names": layer_name,
-        }, timeout=10.0)
-    except Exception:
-        return None
-    if not isinstance(resp, dict) or resp.get("status") != "success":
-        return None
-    data = resp.get("data") or {}
-    masks = data.get("masks") or []
-    if not masks:
-        return None
-    m = masks[0]
-    b64 = m.get("mask_b64")
-    if not b64:
-        return None
-    return _decode_bbox(b64)
-
-
 # ---------------------------------------------------------------------------
 #  /sync — push pixel state + rotation + context
 # ---------------------------------------------------------------------------
@@ -258,46 +366,80 @@ def handle_sync(payload: dict) -> dict:
 
     with _state_lock:
         _rotation = rotation
-        _context_state = context_state
         if canvas_b64:
             _canvas_b64 = canvas_b64
             _canvas_w, _canvas_h = _png_dims_from_b64(canvas_b64)
         if selection_b64:
             _selection_b64 = selection_b64
 
-    commands = []
+        # Effective context state.
+        #
+        # When the checkbox is on, the user's rect is authoritative.
+        # When it is off, synthesize a full-canvas rect (0, 0, W, H)
+        # so the disabled branch behaves identically to "checkbox on
+        # with a context rectangle covering the whole canvas."  This
+        # makes the checkbox a pure "restrict the inpaint area"
+        # toggle: off means "inpaint everything", not "fall back to
+        # whatever @thecontext layer happens to contain".
+        #
+        # Before the first canvas has been synced, _canvas_w/_canvas_h
+        # are 0, so no rect can be synthesized; _compute_crop_frame
+        # returns None in that case and the daemon falls back to its
+        # legacy path.
+        if context_state["enabled"]:
+            _context_state = context_state
+        elif _canvas_w > 0 and _canvas_h > 0:
+            _context_state = {
+                "enabled": True,
+                "x": 0, "y": 0,
+                "w": _canvas_w, "h": _canvas_h,
+            }
+        else:
+            _context_state = context_state
+
+    base_commands = []
     if canvas_b64:
-        commands.append({
+        base_commands.append({
             "type": "comfy_set_layer_pixels",
             "name": "thecanvas",
             "image_b64": canvas_b64,
             "is_mask": False,
         })
     if selection_b64:
-        commands.append({
+        base_commands.append({
             "type": "comfy_set_layer_pixels",
             "name": "theselection",
             "image_b64": selection_b64,
             "is_mask": True,
         })
 
-    if not commands:
+    if not base_commands:
         return {"success": True,
                 "rotation": rotation,
                 "context": context_state,
                 "pushed": []}
 
-    batch_id = f"sync_{int(time.time() * 1000)}"
-    batch = {"id": batch_id, "commands": commands}
-
     try:
-        summary = krita_client.send_batch(batch, timeout=SYNC_TIMEOUT)
+        summary = _send_sync_batch(base_commands)
     except Exception as e:
         _log(f"sync error: {e}")
         return {"success": False,
                 "message": f"daemon send failed: {e}",
                 "rotation": rotation,
                 "context": context_state}
+
+    if _batch_failed_on_stale_document(summary):
+        with _state_lock:
+            _target_document_name = ""
+        _log("sync: pin was stale; retried against activeDocument()")
+        try:
+            summary = _send_sync_batch(base_commands)
+        except Exception as e:
+            _log(f"sync error: {e}")
+            return {"success": False,
+                    "message": f"daemon send failed: {e}",
+                    "rotation": rotation,
+                    "context": context_state}
 
     if summary is None:
         _log("sync error: daemon did not respond")
@@ -327,7 +469,7 @@ def handle_sync(payload: dict) -> dict:
                 "rotation": rotation,
                 "context": context_state}
 
-    pushed = [c["name"] for c in commands]
+    pushed = [c["name"] for c in base_commands]
     _log(f"sync: pushed {pushed} rotation={rotation} "
          f"context={context_state}")
     return {"success": True,
@@ -360,41 +502,39 @@ def _compute_crop_frame() -> Optional[dict]:
     if W <= 0 or H <= 0:
         return None
 
-    inpaint_enabled = False
-    context_rect = (0, 0, W, H)
-
-    if ctx.get("enabled") and ctx.get("w", 0) > 0 and ctx.get("h", 0) > 0:
-        inpaint_enabled = True
-        context_rect = (ctx["x"], ctx["y"], ctx["w"], ctx["h"])
+    # The effective context is always populated after the first canvas
+    # sync — handle_sync synthesizes a full-canvas rect when the
+    # checkbox is off.  Defensive fallback: if it's somehow not set,
+    # treat the whole canvas as the context, matching the synthesized
+    # rect's semantics.
+    if (ctx.get("enabled")
+            and ctx.get("w", 0) > 0
+            and ctx.get("h", 0) > 0):
+        context_rect = (int(ctx["x"]), int(ctx["y"]),
+                        int(ctx["w"]), int(ctx["h"]))
     else:
-        # Fallback: @thecontext layer bbox
-        layer_bbox = _query_thecontext_layer_bbox()
-        if layer_bbox is not None:
-            inpaint_enabled = True
-            context_rect = layer_bbox
+        context_rect = (0, 0, W, H)
 
     if theta == 0:
-        if inpaint_enabled:
-            x0 = max(0, int(context_rect[0]))
-            y0 = max(0, int(context_rect[1]))
-            x1 = min(W, int(context_rect[0]) + int(context_rect[2]))
-            y1 = min(H, int(context_rect[1]) + int(context_rect[3]))
-            if x1 > x0 and y1 > y0:
-                result = {
-                    "theta": 0, "W": W, "H": H, "Wp": W, "Hp": H,
-                    "cropX": x0, "cropY": y0,
-                    "cropW": x1 - x0, "cropH": y1 - y0,
-                    "inpaintEnabled": True,
-                    "contextRect": [int(context_rect[0]),
-                                     int(context_rect[1]),
-                                     int(context_rect[2]),
-                                     int(context_rect[3])],
-                }
-                return result
+        x0 = max(0, context_rect[0])
+        y0 = max(0, context_rect[1])
+        x1 = min(W, context_rect[0] + context_rect[2])
+        y1 = min(H, context_rect[1] + context_rect[3])
+        if x1 > x0 and y1 > y0:
+            return {
+                "theta": 0, "W": W, "H": H, "Wp": W, "Hp": H,
+                "cropX": x0, "cropY": y0,
+                "cropW": x1 - x0, "cropH": y1 - y0,
+                "inpaintEnabled": True,
+                "contextRect": list(context_rect),
+            }
+        # Degenerate rect after clamping (shouldn't happen): fall back
+        # to full canvas.
         return {
             "theta": 0, "W": W, "H": H, "Wp": W, "Hp": H,
             "cropX": 0, "cropY": 0, "cropW": W, "cropH": H,
-            "inpaintEnabled": False,
+            "inpaintEnabled": True,
+            "contextRect": [0, 0, W, H],
         }
 
     rad = math.radians(theta)
@@ -402,39 +542,18 @@ def _compute_crop_frame() -> Optional[dict]:
     Wp = max(1, round(W * cos_a + H * sin_a))
     Hp = max(1, round(W * sin_a + H * cos_a))
 
-    if inpaint_enabled:
-        # Translate the user's context rect into the rotated frame,
-        # preserving the rect's visual position (see the module
-        # docstring, CROP FRAME).  The rect's size is preserved
-        # unchanged.  This is a pure TRANSLATION — NOT a rotation
-        # of the context rect.  If the translated crop extends past
-        # the Wp×Hp frame, the daemon extends the canvas to cover it.
-        cx = int(context_rect[0])
-        cy = int(context_rect[1])
-        cw = int(context_rect[2])
-        ch = int(context_rect[3])
-        cropX = round((Wp - W) / 2) + cx
-        cropY = round((Hp - H) / 2) + cy
-        cropW = cw
-        cropH = ch
-    else:
-        # No context rect: crop the whole rotated frame.
-        cropX = 0
-        cropY = 0
-        cropW = Wp
-        cropH = Hp
+    cx, cy, cw, ch = context_rect
+    cropX = round((Wp - W) / 2) + cx
+    cropY = round((Hp - H) / 2) + cy
+    cropW = cw
+    cropH = ch
 
-    result = {
+    return {
         "theta": theta, "W": W, "H": H, "Wp": Wp, "Hp": Hp,
         "cropX": cropX, "cropY": cropY, "cropW": cropW, "cropH": cropH,
-        "inpaintEnabled": inpaint_enabled,
+        "inpaintEnabled": True,
+        "contextRect": list(context_rect),
     }
-    if inpaint_enabled:
-        result["contextRect"] = [int(context_rect[0]),
-                                  int(context_rect[1]),
-                                  int(context_rect[2]),
-                                  int(context_rect[3])]
-    return result
 
 
 def handle_crop_frame(_payload) -> dict:
@@ -478,11 +597,21 @@ def handle_krita_status(_payload) -> dict:
 
 def handle_krita_import(payload: dict) -> dict:
     name = payload.get("name") if isinstance(payload, dict) else None
-    command = {"type": "get_document_composite_b64"}
-    if name:
-        command["name"] = name
 
-    response = krita_client.send(command, timeout=60.0)
+    if name:
+        # Explicit caller-supplied name wins over the pin.
+        command = {"type": "get_document_composite_b64", "name": name}
+        response = krita_client.send(command, timeout=60.0)
+        _capture_document_from_response(response)
+    else:
+        # `get_document_composite_b64` uses `--name` for the doc arg,
+        # not `--document`.
+        response = _send_with_pin(
+            {"type": "get_document_composite_b64"},
+            doc_arg="name",
+            timeout=60.0,
+        )
+
     if response.get("status") != "success":
         return {"success": False,
                 "message": response.get("message") or "daemon rejected"}
@@ -530,7 +659,7 @@ def handle_krita_import_masks(payload: dict) -> dict:
                 payload["prefer_selection_mask_children"]
             )
 
-    response = krita_client.send(command, timeout=60.0)
+    response = _send_with_pin(command, timeout=60.0)
     if response.get("status") != "success":
         return {
             "success": False,
@@ -564,7 +693,7 @@ def handle_resource_image(payload: dict) -> dict:
         if not layer_name:
             return {"success": False,
                     "message": "layer_name is required when source=layer"}
-        response = krita_client.send(
+        response = _send_with_pin(
             {"type": "get_layer_pixels_b64", "name": str(layer_name)},
             timeout=30.0,
         )
@@ -593,6 +722,49 @@ def handle_resource_image(payload: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+#  /rebind_document — manual escape hatch
+# ---------------------------------------------------------------------------
+
+def handle_rebind_document(_payload) -> dict:
+    """Clear the pinned target document and re-capture from the
+    daemon's activeDocument().
+
+    Use case: user had controlnets active when inpaint booted, so the
+    pin points at `kritomatic_controlnets`.  After manually switching
+    back to their real doc, this command re-pins to the doc they are
+    now looking at.
+
+    Proactively does one fetch so the pin is populated immediately —
+    otherwise the user would have to trigger an autosync spec change
+    or a manual Refresh before the pin lands.
+    """
+    global _target_document_name
+    with _state_lock:
+        old = _target_document_name
+        _target_document_name = ""
+
+    try:
+        # get_document_composite_b64 returns data.document on success,
+        # which _capture_document_from_response will pin.
+        resp = krita_client.send(
+            {"type": "get_document_composite_b64"}, timeout=30.0,
+        )
+        _capture_document_from_response(resp)
+    except Exception:
+        pass
+
+    with _state_lock:
+        new = _target_document_name
+
+    _log(f"rebind: was {old!r}, now {new!r}")
+    return {
+        "success": True,
+        "message": f"Rebind: was {old!r}, now {new!r}",
+        "data": {"previous": old, "current": new},
+    }
+
+
 ROUTES = {
     "/sync":                 handle_sync,
     "/rotation":             handle_rotation,
@@ -603,6 +775,7 @@ ROUTES = {
     "/krita/import":         handle_krita_import,
     "/krita/import_masks":   handle_krita_import_masks,
     "/krita/resource_image": handle_resource_image,
+    "/rebind_document":      handle_rebind_document,
 }
 
 RAW_ROUTES = {}

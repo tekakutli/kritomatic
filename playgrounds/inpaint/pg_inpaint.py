@@ -258,6 +258,40 @@ export function buildContextMaskB64() {
 }
 
 /* ============================================================
+   White mask (used by sync when no mask is selected)
+   ============================================================
+   Produces an all-white W × H mask in the un-rotated image frame.
+
+   `pg_sync.js` pushes this into the `theselection` Krita scratch
+   layer when no mask is selected, so the layer reflects
+   "inpaint everything in the context rect" rather than a leftover
+   from a previous session.  All-white is the "select all" value
+   the inpaint workflow reads: the model inpaints every pixel
+   inside the context rect (which /crop_frame has already
+   restricted to the user's drawn rectangle, or the whole canvas
+   when the checkbox is off).
+
+   All-black — the previous behaviour — meant "nothing selected",
+   which the workflow honoured by inpainting no pixels: the run
+   succeeded, the paste landed, and the canvas looked identical
+   to before.  Hard to diagnose; white avoids the silent no-op.
+
+   Returns null when no canvas has been loaded yet — the caller
+   should skip the sync in that case. */
+
+export function buildWhiteMaskB64() {
+  const W = board.imageWidth, H = board.imageHeight;
+  if (!W || !H) return null;
+  const c = document.createElement("canvas");
+  c.width = W; c.height = H;
+  const cx = c.getContext("2d");
+  cx.fillStyle = "#fff";
+  cx.fillRect(0, 0, W, H);
+  return c.toDataURL("image/png")
+    .replace(/^data:image\/png;base64,/, "");
+}
+
+/* ============================================================
    Mask from context rectangle (for the "+ As mask" button)
    ============================================================
    Every mask in the stack is drawn inside the view's rotation

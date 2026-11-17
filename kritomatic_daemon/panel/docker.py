@@ -615,6 +615,14 @@ class KritomaticPanel(QDockWidget):
 
         Each (playground, slot) pair gets its own row; the playground's
         name is shown only on its first slot's row.
+
+        Slots marked `managed_by_playground: True` are skipped entirely
+        — they are claimed by the playground so the daemon can filter
+        the corresponding resource out of its Resources section, but
+        the playground drives them internally and has no UI state to
+        expose.  See `handlers/panel.py`'s `ResourcesProvider` and
+        `inpaint_playground.py`'s `LAYER_SLOTS` for the current
+        claimants.
         """
         desired_keys: set = set()
         for p in playgrounds:
@@ -624,9 +632,14 @@ class KritomaticPanel(QDockWidget):
             if not pid:
                 continue
             for slot in (p.get("layer_slots") or []):
-                sid = slot.get("id") if isinstance(slot, dict) else None
-                if sid:
-                    desired_keys.add((pid, sid))
+                if not isinstance(slot, dict):
+                    continue
+                sid = slot.get("id")
+                if not sid:
+                    continue
+                if slot.get("managed_by_playground", False):
+                    continue
+                desired_keys.add((pid, sid))
 
         # Remove vanished rows.
         for key in list(self._playground_rows.keys()):
@@ -643,17 +656,22 @@ class KritomaticPanel(QDockWidget):
             if not pid:
                 continue
             slots = p.get("layer_slots") or []
-            for i, slot in enumerate(slots):
+            first_visible_slot_done = False
+            for slot in slots:
                 if not isinstance(slot, dict):
                     continue
                 sid = slot.get("id")
                 if not sid:
                     continue
+                if slot.get("managed_by_playground", False):
+                    continue
                 key = (pid, sid)
                 entry = self._playground_rows.get(key)
+                show_name = not first_visible_slot_done
+                first_visible_slot_done = True
                 if entry is None:
                     entry = self._make_playground_row(
-                        p, slot, show_name=(i == 0),
+                        p, slot, show_name=show_name,
                     )
                     self._playground_rows[key] = entry
                     self._playgrounds_layout.addWidget(entry["row"])

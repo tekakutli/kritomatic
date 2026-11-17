@@ -26,6 +26,18 @@ coords (rotated, translated into the crop frame) as the context mask;
 if not, it falls back to the `@thecontext` layer's own bbox (if any)
 or the whole canvas.
 
+`theselection` is different.  It is pixel data, so it travels as a
+Krita scratch layer, and the daemon reads it directly.  To keep the
+daemon from picking up a stale `theselection` left over from a
+previous session or from native Krita painting, this module ALWAYS
+pushes a `selection_b64` when a canvas is loaded — the selected mask's
+bytes if one is selected, or an all-white W×H mask if not.  See
+`pg_inpaint.js::buildWhiteMaskB64`.  All-white is the "select all"
+value the workflow reads: the model inpaints every pixel inside the
+context rect.  The previous all-black fallback meant "nothing
+selected", which produced a silent no-op run — the model inpainted
+no pixels and the pasted result looked identical to the input.
+
 Sync cadence:
 
   · State changes (image load, mask select/deselect, mask add/delete,
@@ -38,6 +50,28 @@ Change detection: each piece of payload is hashed before push and
 skipped if unchanged.  This keeps a mask-select from re-pushing the
 whole canvas, and keeps a rotation-only change from re-pushing
 anything.
+
+BOOT GATE
+=========
+Every session has a potential race: the first `scheduleSync` may fire
+(from autosync's first-canvas-arrival) before `_hydrateSharedSelection`
+finishes reading `@theselection` from Krita.  Without intervention the
+sequence would be:
+
+    t=0     canvas arrives → scheduleSync → debounce
+    t=250   flush: no mask yet → push BLANK theselection
+    t=600   hydration finishes → push HYDRATED theselection
+
+The daemon sees a blank push at t=250, and if a Run fires inside the
+gap between t=250 and t=600, the workflow runs with an empty
+selection.  That is the "window" the gate closes.
+
+`inpaintBootSync` calls `setBootSyncGate(hydrationPromise)` BEFORE it
+starts autosync.  Every `_doSync` call while the gate is pending
+awaits it, so the first flush lands after hydration completes with
+the hydrated (or definitively blank) `selection_b64`.  The gate
+clears itself via `.finally`; a 3 s hard cap inside `_doSync` bounds
+worst-case latency on a dead daemon.
 
 FAILURE MIRRORING
 =================
@@ -74,6 +108,7 @@ bad, soft failure → warn"."""
 SYNC_JS = r"""
 import { board, view } from "./pg_state.js";
 import { selectedMaskIdx } from "./pg_masks.js";
+import { buildWhiteMaskB64 } from "./pg_inpaint.js";
 import { SYNC_DEBOUNCE_MS } from "./pg_tuning.js";
 import { flashStatus } from "./pgkit/panel_core.js";
 
@@ -88,6 +123,27 @@ let _lastRotation     = null;
    *next* failure warn again.  See the module docstring,
    FAILURE MIRRORING. */
 let _warnedSyncFailure = false;
+
+/* Boot sync gate.  Set once by `inpaintBootSync` to the hydration
+   promise; cleared automatically when that promise settles.  Every
+   `_doSync` call that fires while the gate is pending awaits it,
+   so the first flush of the session carries the hydrated
+   `theselection` (or a definitive blank) rather than racing it.
+   See the module docstring, BOOT GATE. */
+let _bootGate = null;
+
+export function setBootSyncGate(promise) {
+  if (!promise || typeof promise.then !== "function") return;
+  // `.finally` clears the gate once hydration settles, success or
+  // failure.  A rejected promise becomes an attached catch here so
+  // the module never produces an unhandled rejection from a
+  // hydration failure that the caller does not await.
+  const gated = promise.finally(() => {
+    if (_bootGate === gated) _bootGate = null;
+  });
+  gated.catch(() => {});
+  _bootGate = gated;
+}
 
 function _stripDataUrl(b64) {
   return String(b64 || "").replace(/^data:image\/png;base64,/, "");
@@ -106,6 +162,18 @@ export function syncNow() {
 async function _doSync() {
   _timer = null;
 
+  // Boot gate.  See the module docstring, BOOT GATE.  The 3 s cap
+  // bounds worst-case latency on a dead daemon: a hung hydration
+  // should not freeze the first sync forever.
+  if (_bootGate) {
+    try {
+      await Promise.race([
+        _bootGate,
+        new Promise(r => setTimeout(r, 3000)),
+      ]);
+    } catch (_) { /* gate errors are not sync errors */ }
+  }
+
   const rotation = board.imageHash ? (view.rotation || 0) : 0;
   const payload  = { rotation };
   let changed = false;
@@ -120,13 +188,25 @@ async function _doSync() {
 
   if (board.imageWidth > 0) {
     const idx = selectedMaskIdx();
+    let selB64 = null;
     if (idx >= 0) {
       const m = board.masks[idx];
-      if (m && m.loaded && m.b64 && m.b64 !== _lastSelectionB64) {
-        payload.selection_b64 = m.b64;
-        _lastSelectionB64 = m.b64;
-        changed = true;
-      }
+      if (m && m.loaded && m.b64) selB64 = m.b64;
+    }
+    if (!selB64) {
+      // No mask selected: push an all-white W×H mask so the
+      // `theselection` scratch layer reflects "select all" —
+      // "inpaint everything inside the context rect" — rather
+      // than a leftover from a previous session.  All-black
+      // (the previous behaviour) meant "inpaint nothing": the
+      // run succeeded but the pasted result was identical to
+      // the input, which was hard to diagnose.
+      selB64 = buildWhiteMaskB64();
+    }
+    if (selB64 && selB64 !== _lastSelectionB64) {
+      payload.selection_b64 = selB64;
+      _lastSelectionB64 = selB64;
+      changed = true;
     }
   }
 

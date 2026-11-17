@@ -144,9 +144,20 @@ def prepare_workflow(doc,
     cropX = int(frame.get("cropX", 0))
     cropY = int(frame.get("cropY", 0))
 
-    if theta == 0 and cropW == doc_W and cropH == doc_H:
-        # No-op frame — legacy un-rotated pipeline.  Same behavior as
-        # before /crop_frame existed.
+    if (theta == 0
+            and cropW == doc_W
+            and cropH == doc_H
+            and not frame.get("inpaintEnabled", False)):
+        # No-op frame AND no context rect — legacy un-rotated pipeline.
+        # Same behavior as before /crop_frame existed.
+        #
+        # `inpaintEnabled` is checked because the disabled checkbox
+        # state now synthesizes a full-canvas context rect in
+        # inpaint's handle_sync, which makes /crop_frame report
+        # inpaintEnabled=True at full canvas.  That case must route to
+        # _prepare_cropped so @thecontext gets an all-white
+        # synthesized mask, not a layer read of a `thecontext` layer
+        # that inpaint no longer writes.
         return _prepare_unrotated(
             doc, graph, resource_slots, param_slots,
             config, proxy_client, seed=seed,

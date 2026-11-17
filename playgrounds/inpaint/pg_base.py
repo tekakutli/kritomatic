@@ -18,13 +18,27 @@ Krita.  Masks come in from `+ Import masks from Krita` and are created
 from the context rectangle via `+ As mask`.  There is no local-file
 or dropped-file install path — every install is daemon-mediated.
 
-The `#inpaintEnabled` checkbox ("Context rectangle") stays: it decides
-whether `thecontext` is pushed with a white rectangle or left alone.
-When off, the daemon falls back to the `@thecontext` layer's own tight
-bbox (if any) or the whole canvas.
+The `#inpaintEnabled` checkbox ("Context rectangle") is a pure
+"restrict the inpaint area" toggle: on means "the context is my drawn
+rect", off means "the context is the whole @thecanvas".  Both states
+are fully determined by the playground server's `/crop_frame`
+response — no `@thecontext` layer is written or read; the effective
+context rect is communicated as scalar fields on the `/sync` payload
+and the server synthesizes `(0, 0, W, H)` when the checkbox is off.
+See `inpaint_server.py`'s module docstring, CONTEXT RECT QUERY.
 
 The `#statusLine` element is repurposed as the sync status: `Synced
 14:22:08 · rotation 15.0° · mask 3/5 · context on`.
+
+REBIND DOC
+==========
+`⟲ Rebind doc` (next to Check Krita) is the manual escape hatch for
+the pinned-document drift described in `inpaint_server.py`'s module
+docstring, PINNED TARGET DOCUMENT.  If another playground (controlnets
+Push-to-Krita, in particular) has activated its own doc and inpaint
+came up during that window, the pin points at the wrong doc.  The
+user clicks Rebind after manually switching Krita back to the doc
+they want inpaint to follow; the pin re-captures from activeDocument().
 
 OVERLAY CANVAS
 ==============
@@ -60,6 +74,18 @@ PG_CSS = r"""
     border-color: rgba(160, 240, 180, 1.00);
     background: rgba(140, 225, 160, 0.10);
     color: #d8ffe0;
+  }
+  #ui button#rebindDocBtn {
+    border-color: rgba(255, 200, 90, 0.72);
+    color: #ffd89b;
+    font-size: 9px;
+    padding: 2px 8px;
+    width: auto;
+  }
+  #ui button#rebindDocBtn:hover:not(:disabled) {
+    border-color: rgba(255, 200, 90, 1.00);
+    background: rgba(255, 200, 90, 0.10);
+    color: #ffe6b8;
   }
   #ui button#kritaImportMasksBtn {
     border-color: rgba(180, 155, 255, 0.72);
@@ -217,6 +243,10 @@ PG_PANEL_BODY = r"""
         <div id="imageInfo">No image loaded — load a workflow in the docker to pull @thecanvas</div>
         <div class="row" style="margin-top:4px;">
           <button id="kritaCheckBtn">Check Krita</button>
+          <button id="rebindDocBtn"
+                  title="Re-pin inpaint to whatever document is currently active in Krita.  Use this if another playground or command stole activeDocument() while inpaint was open.">
+            ⟲ Rebind doc
+          </button>
           <span id="kritaStatus">not checked</span>
         </div>
       </div>
@@ -252,7 +282,7 @@ PG_PANEL_BODY = r"""
           <label>Context rectangle</label>
           <span style="display:flex;gap:6px;align-items:center;">
             <input type="checkbox" id="inpaintEnabled"
-                   title="When checked, pushes a white rectangle at the current context rect into @thecontext. When unchecked, @thecontext is left alone — the daemon falls back to that layer's own bbox or the whole canvas.">
+                   title="When checked, the context rectangle defines the inpaint area. When unchecked, the whole @thecanvas is used as the context — identical to having drawn a context rectangle covering the entire canvas.">
             <button id="maskFromRectBtn"
                     title="Create a new mask from the current context rectangle."
                     disabled>+ As mask</button>

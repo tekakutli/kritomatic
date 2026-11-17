@@ -1,12 +1,34 @@
 """@thecanvas auto-sync.
 
 Polls the daemon's `comfy_status` every 500 ms while the tab is
-visible and, whenever the `@thecanvas` resource spec in
-`config.resources` changes — the user picked a new source or layer in
-the docker's Resources section, or in the web panel at
-comfy2krita_web.py, or loaded a different workflow — re-fetches the
-corresponding pixels and swaps in the returned image via
-`applyCanvasImage`.
+visible and, whenever the `@thecanvas` resource spec changes — the
+user picked a new source or layer in the docker's Playgrounds
+section, in the Resources section (fallback path), or loaded a
+different workflow — re-fetches the corresponding pixels and swaps in
+the returned image via `applyCanvasImage`.
+
+SPEC SOURCE
+===========
+When the playground is registered with the daemon (the normal case),
+`@thecanvas`'s spec comes from the registry entry the daemon writes
+on `playground_set_layer`:
+
+    playgrounds[id="inpaint"].layer_slots[id="@thecanvas"].selector
+
+The docker's Playgrounds section is the only UI that writes this,
+which is why the Resources section no longer shows `@thecanvas` when
+inpaint is registered — the two would show duplicate sources of truth.
+
+Fallbacks, in order:
+
+  1. Playground registry selector (above) — normal path.
+  2. `config.resources["@thecanvas"]` — used when the registry entry
+     exists but the selector has not been set yet (first boot before
+     the user touches the Playgrounds row), or when the playground
+     is not registered at all (old workflow loaded with a manual
+     inpaint start).
+  3. `{source: "active"}` — fetch the composite of the active
+     document.
 
 The trigger is a spec change (`active` → `layer X`, `layer X` →
 `layer Y`, etc.), not a composite change.  Generation does NOT trigger
@@ -47,6 +69,7 @@ import { board, applyCanvasImage } from "./pg_state.js";
 import { fetchActiveState, fetchResourceImage } from "./pg_krita_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
 import { pgkitNotifyAll } from "./pgkit/remote_client.js";
+import { scheduleSync } from "./pg_sync.js";
 
 /* Cadence while visible.  The daemon's `comfy_status` is cheap on
    localhost (~1 ms per call; the proxy health probe is the slowest
@@ -56,6 +79,9 @@ import { pgkitNotifyAll } from "./pgkit/remote_client.js";
    "instant" bottoms out around 100 ms. */
 const POLL_INTERVAL_MS = 500;
 
+const PLAYGROUND_ID = "inpaint";
+const SLOT_ID       = "@thecanvas";
+
 let _lastSpec = null;
 let _bootstrapped = false;
 let _running = false;
@@ -63,14 +89,54 @@ let _timer = null;
 let _warnedNoWorkflow = false;
 let _warnedBackendDown = false;
 
-function _specOf(cfg) {
+/* ============================================================
+   Spec resolution — see the module docstring, SPEC SOURCE
+   ============================================================ */
+
+function _selectorToSpec(sel) {
+  if (!sel || typeof sel !== "object") return null;
+  return {
+    source: sel.source || "active",
+    layer_name: sel.layer_name || null,
+  };
+}
+
+function _specFromPlayground(data) {
+  const playgrounds = (data && data.playgrounds) || [];
+  const entry = playgrounds.find(p => p && p.id === PLAYGROUND_ID);
+  if (!entry) return null;
+  const slots = entry.layer_slots || [];
+  const slot = slots.find(s => s && s.id === SLOT_ID);
+  if (!slot) return null;
+  return _selectorToSpec(slot.selector);
+}
+
+function _specFromConfig(data) {
+  const cfg = (data && data.config) || null;
   const res = (cfg && cfg.resources) || {};
   const spec = res["@thecanvas"];
-  if (!spec || typeof spec !== "object") return null;
-  return {
-    source: spec.source || "active",
-    layer_name: spec.layer_name || null,
-  };
+  return _selectorToSpec(spec);
+}
+
+function _specOf(data) {
+  // Registry first, config fallback, then implicit {source:"active"}.
+  // Returning null means "no @thecanvas slot exists" — the poller
+  // warns once and stays quiet.
+  const fromPlayground = _specFromPlayground(data);
+  if (fromPlayground) return fromPlayground;
+  const fromConfig = _specFromConfig(data);
+  if (fromConfig) return fromConfig;
+  // The registry entry exists but no selector was set and no config
+  // fell through — treat as "not configured yet", not "use active".
+  // (A registered playground with a `@thecanvas` slot and no spec is
+  // a transient pre-first-pick state; letting it default to
+  // `active` would silently overwrite whatever the user was last
+  // viewing.)
+  const playgrounds = (data && data.playgrounds) || [];
+  const registered = playgrounds.some(p => p && p.id === PLAYGROUND_ID);
+  if (registered) return null;
+  // Not registered and no config: no @thecanvas exists at all.
+  return null;
 }
 
 function _hashSpec(spec) {
@@ -92,12 +158,19 @@ async function _fetchAndSet(spec) {
     flashStatus("@thecanvas refresh: no data_url", "bad");
     return;
   }
+  const wasEmpty = !board.imageHash;
   applyCanvasImage(
     img.hash || ("thecanvas_" + Date.now()),
     img.data_url,
     img.width,
     img.height,
   );
+  if (wasEmpty) {
+    // First canvas arrival this session.  Schedule one sync so
+    // `theselection` is claimed by inpaint on boot, not left as
+    // whatever was on disk from a previous session.
+    scheduleSync();
+  }
   const label = spec.source === "layer" ? spec.layer_name : spec.source;
   flashStatus("@thecanvas \u2192 " + label, "ok");
   pgkitNotifyAll();
@@ -131,8 +204,7 @@ async function _poll() {
     }
     _warnedBackendDown = false;
 
-    const cfg = (resp.data && resp.data.config) || null;
-    const spec = _specOf(cfg);
+    const spec = _specOf(resp.data || null);
     const specHash = _hashSpec(spec);
 
     if (!_bootstrapped) {

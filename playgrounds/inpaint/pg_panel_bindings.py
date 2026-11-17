@@ -4,6 +4,7 @@ boot-sync routine.
 Operations exposed by this playground:
   - Import masks from Krita
   - Refresh @thecanvas
+  - Rebind target document  (manual escape hatch for pin drift)
   - Select / delete masks
   - Rotate the playground view (single scrub input)
   - Materialise the context rectangle as a mask
@@ -24,14 +25,39 @@ Every user-facing state mutation below calls `scheduleSync()` after
 updating the model.  Mask imports go through the debounced path;
 rotation changes bypass the debounce (handled in
 `pg_panel_scrubs.js`).  Autosync from @thecanvas does NOT schedule a
-push — pushing back what was just pulled would be wasteful.
+push on every poll — only on the first canvas arrival of the session
+(so `theselection` is claimed on boot rather than left as whatever
+the previous session wrote).  See `pg_autosync.js`'s
+first-canvas-arrival branch.
+
+BOOT ORDER
+==========
+`inpaintBootSync` sets the boot sync gate (see `pg_sync.py`'s module
+docstring, BOOT GATE) BEFORE it schedules anything else.  Every sync
+that fires before hydration settles — including the one autosync
+schedules on first-canvas-arrival — is deferred behind that gate, so
+the daemon sees the hydrated (or definitively blank) `theselection`
+on the first sync, never an intermediate blank one.
 
 MANUAL @thecanvas REFRESH
 =========================
 `_refreshCanvasAction` uses `applyCanvasImage`, which preserves the
 mask stack and the context rectangle when the new image's dims
 match.  (A full-dims mismatch clears the context rect, since its
-coords referred to the old dims, but masks keep their pixel data.)"""
+coords referred to the old dims, but masks keep their pixel data.)
+
+REBIND DOC
+==========
+`_rebindDocAction` POSTs to the playground's `/rebind_document`,
+which clears the pinned target document and re-captures from the
+daemon's activeDocument().  Use case: another playground
+(controlnets Push-to-Krita) activated its own doc while inpaint was
+open; user manually switched back to their real doc; clicking
+`⟲ Rebind doc` re-pins inpaint to the doc they are now looking at.
+See `inpaint_server.py`'s module docstring, PINNED TARGET DOCUMENT,
+and `pg_base.py`'s, REBIND DOC.  After rebinding, `_refreshCanvasAction`
+runs so the canvas reflects the newly-pinned doc without a manual
+extra click."""
 
 PANEL_BINDINGS_JS = r"""
 import { board, applyCanvasImage,
@@ -44,7 +70,7 @@ import {
 import { buildMaskFromContextRectB64 } from "./pg_inpaint.js";
 import { syncMaskList } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
-import { scheduleSync, syncNow } from "./pg_sync.js";
+import { scheduleSync, syncNow, setBootSyncGate } from "./pg_sync.js";
 import { fetchStatus } from "./pg_comfy_client.js";
 import {
   checkKritaStatus, importKritaMasks, fetchActiveState,
@@ -124,6 +150,35 @@ async function _refreshCanvasAction() {
   syncMaskList();
   pgkitNotifyAll();
   import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+}
+
+/* ============================================================
+   Rebind target document
+   ============================================================ */
+
+async function _rebindDocAction() {
+  flashStatus("rebinding target document\u2026", "");
+  try {
+    const res = await fetch("/rebind_document", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const data = await res.json();
+    if (!data.success) {
+      flashStatus(
+        "rebind failed: " + (data.message || "unknown"),
+        "bad",
+      );
+      return;
+    }
+    flashStatus(data.message || "rebound", "ok");
+    // The pin changed; refresh the canvas so the new target's
+    // composite shows up immediately without a second click.
+    await _refreshCanvasAction();
+  } catch (e) {
+    flashStatus("rebind failed: " + e.message, "bad");
+  }
 }
 
 /* ============================================================
@@ -332,6 +387,7 @@ export function installPanelBindings() {
   const ids = [
     "kritaImportMasksBtn",
     "kritaCheckBtn",
+    "rebindDocBtn",
     "maskFromRectBtn",
     "refreshCanvasBtn",
     "syncNowBtn",
@@ -340,6 +396,7 @@ export function installPanelBindings() {
 
   if (el.kritaImportMasksBtn) el.kritaImportMasksBtn.addEventListener("click", _kritaImportMasksAction);
   if (el.kritaCheckBtn)  el.kritaCheckBtn.addEventListener("click", _kritaStatusRefresh);
+  if (el.rebindDocBtn)   el.rebindDocBtn.addEventListener("click", _rebindDocAction);
   if (el.maskFromRectBtn) el.maskFromRectBtn.addEventListener("click", _maskFromRectAction);
   if (el.refreshCanvasBtn) el.refreshCanvasBtn.addEventListener("click", _refreshCanvasAction);
   if (el.syncNowBtn) el.syncNowBtn.addEventListener("click", syncNow);
@@ -360,6 +417,11 @@ pgkitRegisterAction("action.refreshCanvas", {
   label: "Refresh @thecanvas", scope: "global", run: _refreshCanvasAction,
   meta: { variant: "plain",
           description: "Re-fetch the current @thecanvas from Krita." },
+});
+pgkitRegisterAction("action.rebindDoc", {
+  label: "Rebind doc", scope: "global", run: _rebindDocAction,
+  meta: { variant: "plain",
+          description: "Re-pin inpaint to the currently active Krita document." },
 });
 pgkitRegisterAction("action.syncNow", {
   label: "Sync now", scope: "global", run: syncNow,
@@ -468,8 +530,23 @@ export function inpaintBootSync() {
   pgkitNotifyAll();
   _checkStatusAction();
   _kritaStatusRefresh();
+
+  // Boot sync gate.  Set BEFORE the hydration IIFE and BEFORE any
+  // sync scheduling, so autosync's first-canvas-arrival
+  // `scheduleSync()` (fired later, on its own timer) is deferred
+  // behind hydration.  See `pg_sync.py`'s module docstring,
+  // BOOT GATE.
+  //
+  // `.catch(() => {})` here is a safety net: `_hydrateSharedSelection`
+  // already catches its own errors and returns, but a future edit
+  // could introduce a throw that would otherwise leave the gate
+  // forever-pending and freeze syncs.  `setBootSyncGate` attaches its
+  // own `.catch` too, so the double-safety is intentional.
+  const hydration = _hydrateSharedSelection().catch(() => {});
+  setBootSyncGate(hydration);
+
   (async () => {
-    await _hydrateSharedSelection();
+    await hydration;
     if (board.imageHash) syncNow();
   })();
 }

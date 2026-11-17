@@ -77,7 +77,16 @@ Scratch-layer command:
     This preserves the user's mask layers: if they had a
     `theselection` selection mask before, it stays a selection mask;
     only its pixel content is updated to reflect the playground's
-    current mask.  Same for `thecontext`."""
+    current mask.  Same for `thecontext`.
+
+    `--document` targets a specific open document by name; empty (the
+    default) falls back to `Krita.instance().activeDocument()`.  The
+    response carries `data.document` — the doc name actually written
+    to — so callers that want to pin a target across calls can read
+    it back from the first success and pass it on subsequent calls.
+    This is how the inpaint playground survives a controlnets Push-
+    to-Krita stealing `activeDocument()`.
+"""
 
 from __future__ import annotations
 
@@ -275,7 +284,9 @@ class ConfigCommands(AutoDispatchHandler):
                   "Existing mask layers (transparencymask / selectionmask) "
                   "are updated in place with grayscale when is_mask=True; "
                   "other layer types are refused. A missing layer is "
-                  "created as a new paint layer at the document root.",
+                  "created as a new paint layer at the document root. "
+                  "Pass `--document` to target a specific open document "
+                  "by name; empty falls back to activeDocument().",
         args={
             "--name":      {"type": "str",  "required": True,
                             "help": "Layer name to create or update."},
@@ -286,6 +297,8 @@ class ConfigCommands(AutoDispatchHandler):
                                     "(paint layer: store as alpha with "
                                     "RGB=255; mask layer: store as "
                                     "grayscale bytes)."},
+            "--document":  {"type": "str",  "default": "",
+                            "help": "Target document name; empty = active."},
         },
     )
     def comfy_set_layer_pixels(self, params):
@@ -300,15 +313,26 @@ class ConfigCommands(AutoDispatchHandler):
         name = (params.get("name") or "").strip()
         image_b64 = params.get("image_b64") or ""
         is_mask = bool(params.get("is_mask", False))
+        doc_name = (params.get("document") or "").strip()
 
         if not name:
             return {"success": False, "message": "name is required"}
         if not image_b64:
             return {"success": False, "message": "image_b64 is required"}
 
-        doc = Krita.instance().activeDocument()
-        if doc is None:
-            return {"success": False, "message": "No active document"}
+        if doc_name:
+            doc = next(
+                (d for d in Krita.instance().documents()
+                 if d.name() == doc_name),
+                None,
+            )
+            if doc is None:
+                return {"success": False,
+                        "message": f'Document "{doc_name}" not found'}
+        else:
+            doc = Krita.instance().activeDocument()
+            if doc is None:
+                return {"success": False, "message": "No active document"}
 
         try:
             raw = base64.b64decode(image_b64)
@@ -373,6 +397,7 @@ class ConfigCommands(AutoDispatchHandler):
                     "success": True,
                     "message": f"updated mask layer {name!r} ({W}x{H})",
                     "data": {"name": name, "width": W, "height": H,
+                             "document": doc.name(),
                              "kind": existing_type,
                              "updated": True},
                 }
@@ -408,6 +433,7 @@ class ConfigCommands(AutoDispatchHandler):
                     "success": True,
                     "message": f"updated paint layer {name!r} ({W}x{H})",
                     "data": {"name": name, "width": W, "height": H,
+                             "document": doc.name(),
                              "kind": "paintlayer",
                              "updated": True},
                 }
@@ -461,6 +487,7 @@ class ConfigCommands(AutoDispatchHandler):
             "success": True,
             "message": f"created {name!r} ({W}x{H} is_mask={is_mask})",
             "data": {"name": name, "width": W, "height": H,
+                     "document": doc.name(),
                      "is_mask": is_mask, "created": True},
         }
 

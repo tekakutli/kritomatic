@@ -6,14 +6,17 @@ map keyed by playground id, and hands it to `comfy_status` so the
 docker can render a "Playground Input" section.
 
 Each registered playground declares one or more **layer slots** on
-register.  A slot is an `@`-prefixed identifier plus an optional
-auto-select hint:
+register.  A slot is an `@`-prefixed identifier plus optional hints:
 
     layer_slots = [
         {
             "id":                "@thelayout",
             "auto_select_layer": "thelayout",  # optional
-        }
+        },
+        {
+            "id":                    "@thecontext",
+            "managed_by_playground": True,     # optional
+        },
     ]
 
 The slot's `id` is what identifies the slot in the docker and web
@@ -33,6 +36,25 @@ Multi-slot playgrounds are supported by construction: each slot gets
 its own selector, its own docker row, and its own `slot_id` in
 `playground_set_layer`.  Slots are addressed independently; changing
 one does not affect the others.
+
+MANAGED-BY-PLAYGROUND SLOTS
+===========================
+A slot may set `managed_by_playground: True` to declare that its
+selector is driven entirely by the playground itself, not by the
+user.  Such slots are still claimed from the Resources section (the
+panel handler filters them out because the daemon is the sole source
+of truth for the resource's value — see
+`handlers/panel.py::_claimed_resource_names`), but they do not get a
+row in the docker's Playgrounds section: there is no user-facing
+state to edit.  Inpaint uses this for `@thecontext` and
+`@theselection` — the playground derives both internally and exposes
+no layer picker for either.  `@thecanvas` on the same playground is
+not marked, so it does get a row.
+
+The field defaults to False.  A re-register overwrites it from the
+new call's slot spec — unlike `selector`, it is not user state, so
+preserving it across restarts would be wrong; the playground is the
+authority on which of its slots are managed.
 
 No heartbeats.  Clean exits unregister explicitly (signal handler +
 atexit).  Crashes and SIGKILL are caught by a background sweep thread
@@ -70,8 +92,11 @@ def _normalize_slot_specs(raw_specs) -> tuple:
     id -> normalized slot record on success, and `error` is a message
     on failure.
 
-    Each slot is normalized to `{id, auto_select_layer, selector}`.
-    There is no display-label field: the id IS the display name.
+    Each slot is normalized to
+    `{id, auto_select_layer, managed_by_playground, selector}`.  There
+    is no display-label field: the id IS the display name.  See the
+    module docstring, MANAGED-BY-PLAYGROUND SLOTS, for what
+    `managed_by_playground` means.
     """
     if isinstance(raw_specs, str):
         try:
@@ -102,6 +127,9 @@ def _normalize_slot_specs(raw_specs) -> tuple:
         out[sid] = {
             "id": sid,
             "auto_select_layer": auto,
+            "managed_by_playground": bool(
+                spec.get("managed_by_playground", False)
+            ),
             "selector": {"source": "active", "layer_name": None},
         }
     return out, None
@@ -169,16 +197,26 @@ class PlaygroundCommands(AutoDispatchHandler):
     # ------------------------------------------------------------------
 
     def list(self) -> list:
-        """Snapshot for `comfy_status`.  Copy, not a reference."""
+        """Snapshot for `comfy_status`.  Copy, not a reference.
+
+        Every slot's `managed_by_playground` is emitted alongside
+        `id`, `auto_select_layer`, and `selector`.  The docker's
+        `_update_playgrounds` reads it to decide whether to render a
+        row for the slot; the panel handler's
+        `_claimed_resource_names` reads only `id`, so a slot that is
+        managed still gets filtered out of Resources — the flag only
+        affects the Playgrounds section.
+        """
         with self._lock:
             out = []
             for e in self._registry.values():
                 slots = []
                 for slot in e["layer_slots"].values():
                     slots.append({
-                        "id":                slot["id"],
-                        "auto_select_layer": slot["auto_select_layer"],
-                        "selector":          dict(slot["selector"]),
+                        "id":                    slot["id"],
+                        "auto_select_layer":     slot["auto_select_layer"],
+                        "managed_by_playground": slot["managed_by_playground"],
+                        "selector":              dict(slot["selector"]),
                     })
                 out.append({
                     "id":            e["id"],
@@ -235,6 +273,13 @@ class PlaygroundCommands(AutoDispatchHandler):
             # the re-registration (same slot id).  New slots get the
             # default `{"source": "active", "layer_name": None}`;
             # removed slots are dropped.
+            #
+            # `managed_by_playground` is NOT preserved from the
+            # existing record — it comes from the new registration
+            # call's slot spec, always.  It is a claim about how the
+            # playground drives the slot, not user state; the
+            # playground is the authority on it and gets to change
+            # its mind on re-register.
             new_slots: dict = {}
             for sid, new_spec in slot_dict.items():
                 if existing is not None and sid in existing["layer_slots"]:

@@ -1,23 +1,29 @@
-"""Controlnets state: image, controlnets (empty), view, draw hook.
+"""Controlnets state: image, controlnets, view, draw hook.
 
 Leaf module.  Every other JS module imports from here; nothing here
 imports from them.
 
-State model
-===========
-`board.controlnets` is always `[]` in this starter.  When a future
-feature populates it, each entry is expected to have shape
-`{id, name, strength, image: {hash, width, height}}` — the same
-`image-by-hash` pattern multimask uses for masks, so the future
-ComfyUI node mirrors `MultiAreaConditioning`'s state-pull + per-item
-hash fetch.
+`board.controlnets` holds the results of "Preprocess images".  Each
+entry has shape:
 
-Single-level draw scheduling
-============================
-`_scheduleDraw()` coalesces via RAF and calls the single registered
-draw function (`draw()` in `pg_dispatch.js` = `drawView()` +
-`syncPanelFields()`).  Pan / zoom call `drawView()` directly for
-frame-by-frame responsiveness.
+    {
+      title:  str,                    // the ControlNetApply node's title
+      status: "done" | "error",
+      hash:   str,                    // hex digest, for state sync
+      dataUrl: str,                   // "data:image/png;base64,..."
+      width:  int, height: int,
+      el:     HTMLImageElement|null,  // lazily loaded
+      error:  str | null,
+    }
+
+`board.viewingControlnetTag` is the title of the controlnet currently
+being viewed, or `null` when `@thecontrolnet` itself is on the canvas.
+Preprocessed images are not draggable; clicking a tag swaps the canvas
+image, clicking "Back to @thecontrolnet" restores `@thecontrolnet`.
+
+`applyCanvasImage` clears `board.controlnets` and
+`board.viewingControlnetTag` when the image hash changes — old
+preprocessed results are stale against new @thecontrolnet pixels.
 """
 
 STATE_JS = r"""
@@ -25,18 +31,10 @@ import {
   VIEW_ZOOM_MIN, VIEW_ZOOM_MAX, VIEW_PAN_MARGIN,
 } from "./pg_tuning.js";
 
-/* ============================================================
-   Canvas
-   ============================================================ */
-
 export const canvas = document.getElementById("c");
 export const ctx    = canvas.getContext("2d");
 
 let _dpr = window.devicePixelRatio || 1;
-
-/* ============================================================
-   View — zoom + pan only
-   ============================================================ */
 
 export const view = { zoom: 1, panX: 0, panY: 0 };
 
@@ -71,10 +69,6 @@ export function zoomAt(screenX, screenY, newZoom) {
   clampPan();
 }
 
-/* ============================================================
-   Image loading / clearing
-   ============================================================ */
-
 export function setImage(hash, dataUrl, width, height) {
   board.imageHash       = hash;
   board.originalDataUrl = dataUrl;
@@ -87,7 +81,8 @@ export function setImage(hash, dataUrl, width, height) {
   board.imageHeight  = 0;
   board.imageDataUrl = null;
 
-  board.controlnets = [];
+  board.controlnets           = [];
+  board.viewingControlnetTag  = null;
   resetView();
 
   const img = new Image();
@@ -110,10 +105,17 @@ export function setImage(hash, dataUrl, width, height) {
 }
 
 export function applyCanvasImage(hash, dataUrl, width, height) {
+  const hashChanged = (board.imageHash !== hash);
+
   board.imageHash       = hash;
   board.originalDataUrl = dataUrl;
   board.originalWidth   = width;
   board.originalHeight  = height;
+
+  if (hashChanged) {
+    board.controlnets          = [];
+    board.viewingControlnetTag = null;
+  }
 
   const img = new Image();
   img.onload = () => {
@@ -143,14 +145,11 @@ export function clearImage() {
   board.imageHeight  = 0;
   board.imageDataUrl = null;
 
-  board.controlnets = [];
+  board.controlnets          = [];
+  board.viewingControlnetTag = null;
   resetView();
   _scheduleDraw();
 }
-
-/* ============================================================
-   The board
-   ============================================================ */
 
 export const board = {
   imageHash:     null,
@@ -164,7 +163,9 @@ export const board = {
   originalHeight:   0,
   originalDataUrl:  null,
 
-  controlnets:      [],
+  controlnets:          [],
+  viewingControlnetTag: null,
+  preprocessRunning:    false,
 
   lastSync:  null,
   syncError: null,
@@ -239,10 +240,6 @@ export function _scheduleDraw() {
     }, 16);
   }
 }
-
-/* ============================================================
-   Resize
-   ============================================================ */
 
 export function resize() {
   _dpr = window.devicePixelRatio || 1;

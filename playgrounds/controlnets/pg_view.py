@@ -1,16 +1,24 @@
 """Draw entry point: image + chrome text + empty-state placeholder.
 
-Chrome text cached as an offscreen blit — re-shapes the string only
-when the text actually changes (rare)."""
+Chrome text switches between "CONTROLNETS N" (viewing @thecontrolnet)
+and "VIEWING <tag>" (viewing a preprocessed image) so the canvas
+always says what's on it.
+"""
 
 VIEW_JS = r"""
 import { ctx, board, view, fittedImageRect } from "./pg_state.js";
 import { drawImageLayer } from "./pg_view_image.js";
 
 function _chromeText() {
-  return "IMAGE " + board.imageWidth + "\u00d7" + board.imageHeight
-       + "   \u00b7   ZOOM " + view.zoom.toFixed(2) + "\u00d7"
-       + "   \u00b7   CONTROLNETS " + (board.controlnets.length || 0);
+  const parts = [];
+  parts.push("IMAGE " + board.imageWidth + "\u00d7" + board.imageHeight);
+  parts.push("ZOOM " + view.zoom.toFixed(2) + "\u00d7");
+  if (board.viewingControlnetTag) {
+    parts.push("VIEWING " + board.viewingControlnetTag);
+  } else {
+    parts.push("CONTROLNETS " + board.controlnets.length);
+  }
+  return parts.join("   \u00b7   ");
 }
 
 let _chromeCache = { key: null, canvas: null };

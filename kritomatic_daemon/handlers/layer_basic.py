@@ -375,17 +375,34 @@ class LayerBasicHandler(AutoDispatchHandler):
                   'URL, at the full document extent (transparent '
                   'outside the layer\'s own bounds).  Used by the '
                   'inpaint and multimask playgrounds to display '
-                  'whatever `@thecanvas` currently points at.',
+                  'whatever `@thecanvas` currently points at.  Pass '
+                  '`document` to read from a specific document instead '
+                  'of the active one.',
         args={
             '--name': {'type': 'str', 'required': True,
                        'help': 'Layer name'},
+            '--document': {'type': 'str', 'default': '',
+                           'help': 'Document name; empty = active'},
         }
     )
     def get_layer_pixels_b64(self, params):
         try:
-            doc = Krita.instance().activeDocument()
-            if not doc:
-                return {'success': False, 'message': 'No active document'}
+            doc_name = (params or {}).get('document', '') or ''
+            if doc_name:
+                app = Krita.instance()
+                doc = next(
+                    (d for d in app.documents() if d.name() == doc_name),
+                    None,
+                )
+                if not doc:
+                    return {'success': False,
+                            'message': f'Document "{doc_name}" not found'}
+            else:
+                doc = Krita.instance().activeDocument()
+                if not doc:
+                    return {'success': False,
+                            'message': 'No active document'}
+
             name = (params or {}).get('name', '')
             if not name:
                 return {'success': False, 'message': 'Layer name is required'}
@@ -403,6 +420,7 @@ class LayerBasicHandler(AutoDispatchHandler):
                 'message': f'Layer {name!r} pixels fetched',
                 'data': {
                     'name':     name,
+                    'document': doc.name(),
                     'width':    enc.width,
                     'height':   enc.height,
                     'data_url': data_url,

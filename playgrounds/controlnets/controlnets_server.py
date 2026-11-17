@@ -13,48 +13,39 @@ Routes
     POST /active_state           daemon comfy_status + playground registry
     POST /resource_image         resolve a {source, layer_name} spec to a PNG
     POST /playground_reregister  single-shot re-register with the daemon
+    POST /preprocess             run every preprocessor wired into a
+                                 ControlNetApply node in the workflow file;
+                                 returns {title, hash, dataUrl, width, height}
+                                 or {title, error}
+    POST /controlnet_image       serve a preprocessed image by hash
+                                 (consumed by the future node)
+    POST /krita/push_controlnets    create/replace a scratch Krita doc
+                                    with one layer per controlnet
+    POST /krita/refresh_controlnets read back the layers from that doc
+                                    and update the server-side cache
 
 There is no `/import_image` or `/upload_image` — the image can only
-enter `/state` through `@thecontrolnet`, so a browser-side "import
-composite" or "pick a file" path would let the canvas drift from
-what the future node will actually fetch.  `handle_import_image`
-still exists as an internal helper for the `source="active"` branch
-of `handle_resource_image`.
-
-State shape (POST /state):
-
-    {
-      "op": "set",
-      "state": {
-        "image_hash": "abc123...",
-        "image_dims": [W, H],
-        "controlnets": []
-      }
-    }
-
-`controlnets` is currently always `[]`.  Each future entry will have
-shape `{id, name, strength, image: {hash, width, height}}`.  The
-corresponding `MultiControlNetConditioning` node will iterate the
-list, fetch each item's image via a future `/controlnet` route by
-hash, and expand into ControlNetApply branches — mirroring how
-`MultiAreaConditioning` iterates `areas` and fetches masks via
-`/mask`.
+enter `/state` through `@thecontrolnet`.  `handle_import_image` still
+exists as an internal helper for `handle_resource_image`.
 """
 
 import base64
 import hashlib
 import json
 import threading
+import time
 from io import BytesIO
 
 from PIL import Image
 
-from . import krita_client, playground_registry
+from . import krita_client, playground_registry, controlnets_comfy
 
 
 PLAYGROUND_ID   = "controlnets"
 PLAYGROUND_NAME = "Controlnets"
 PLAYGROUND_PORT = 8779
+
+CONTROLNETS_DOC_NAME = "kritomatic_controlnets"
 
 LAYER_SLOTS = [
     {
@@ -68,9 +59,30 @@ _state_lock = threading.RLock()
 _state      = None
 _version    = ""
 
+# Preprocessed-image store.  Server-side so the future node can fetch
+# each hash via /controlnet_image without a live browser.  Capped so a
+# long session that re-preprocesses against many different
+# @thecontrolnet images does not grow without bound.
+_preprocessed_lock  = threading.Lock()
+_preprocessed       = {}
+_PREPROCESSED_MAX   = 64
+
 
 def _log(msg):
     print(f"[controlnets] {msg}", flush=True)
+
+
+def _store_preprocessed(h: str, png_bytes: bytes,
+                        width: int, height: int) -> None:
+    with _preprocessed_lock:
+        if len(_preprocessed) >= _PREPROCESSED_MAX:
+            oldest = next(iter(_preprocessed))
+            _preprocessed.pop(oldest, None)
+        _preprocessed[h] = {
+            "png_bytes": png_bytes,
+            "width":     width,
+            "height":    height,
+        }
 
 
 def _default_state():
@@ -163,7 +175,287 @@ def handle_playground_reregister(_payload):
 
 
 # ---------------------------------------------------------------------------
-#  Krita proxies
+#  /preprocess, /controlnet_image
+# ---------------------------------------------------------------------------
+
+def handle_preprocess(payload):
+    if not isinstance(payload, dict):
+        return {"success": False, "message": "expected a JSON object"}
+
+    image_b64 = payload.get("image_b64")
+    if not image_b64 or not isinstance(image_b64, str):
+        return {"success": False, "message": "image_b64 required"}
+
+    try:
+        png_bytes = base64.b64decode(image_b64)
+    except Exception as e:
+        return {"success": False, "message": f"decode failed: {e}"}
+
+    try:
+        results = controlnets_comfy.preprocess_all(png_bytes)
+    except Exception as e:
+        _log(f"preprocess_all failed: {e}")
+        return {"success": False, "message": str(e)}
+
+    out = []
+    for r in results:
+        if "error" in r:
+            out.append({"title": r["title"], "error": r["error"]})
+            continue
+        png = r["png_bytes"]
+        h = hashlib.sha256(png).hexdigest()[:16]
+        _store_preprocessed(h, png, r["width"], r["height"])
+        data_url = ("data:image/png;base64,"
+                    + base64.b64encode(png).decode("ascii"))
+        out.append({
+            "title":   r["title"],
+            "hash":    h,
+            "dataUrl": data_url,
+            "width":   r["width"],
+            "height":  r["height"],
+        })
+
+    return {"success": True, "results": out}
+
+
+def handle_controlnet_image(payload):
+    if not isinstance(payload, dict):
+        return {"success": False, "message": "expected a JSON object"}
+    h = payload.get("hash")
+    if not h:
+        return {"success": False, "message": "hash required"}
+    with _preprocessed_lock:
+        entry = _preprocessed.get(h)
+    if not entry:
+        return {"success": False, "message": f"unknown hash {h!r}"}
+    b64 = base64.b64encode(entry["png_bytes"]).decode("ascii")
+    return {
+        "success": True,
+        "hash":    h,
+        "b64":     b64,
+        "width":   entry["width"],
+        "height":  entry["height"],
+    }
+
+
+# ---------------------------------------------------------------------------
+#  /krita/push_controlnets, /krita/refresh_controlnets
+# ---------------------------------------------------------------------------
+#
+# A "scratch doc" workflow: the playground pushes its preprocessed
+# controlnet images into a named Krita document (one layer per image,
+# layer names == preprocessor titles), the user paints in Krita,
+# then presses Refresh from Krita to pull the edited pixels back.
+#
+# The doc name is fixed (`CONTROLNETS_DOC_NAME`).  On push, if the doc
+# already exists at the right size, layers are replaced in place; if
+# it exists at a different size it is closed and recreated.  On
+# refresh, the doc is activated (so `get_layer_pixels_b64` reads from
+# it), each layer is read, and the previous active doc is restored.
+
+def _all_documents():
+    resp = krita_client.send({"type": "get_all_documents"}, timeout=15.0)
+    if resp.get("status") != "success":
+        return None, resp.get("message") or "daemon error"
+    return ((resp.get("data") or {}).get("documents") or []), None
+
+
+def handle_krita_push_controlnets(payload):
+    if not isinstance(payload, dict):
+        return {"success": False, "message": "expected a JSON object"}
+
+    doc_name = str(payload.get("doc_name") or CONTROLNETS_DOC_NAME).strip()
+    try:
+        doc_w = int(payload.get("doc_width") or 0)
+        doc_h = int(payload.get("doc_height") or 0)
+    except (TypeError, ValueError):
+        return {"success": False, "message": "bad doc dims"}
+    controlnets = payload.get("controlnets") or []
+
+    if doc_w <= 0 or doc_h <= 0:
+        return {"success": False, "message": "doc dims must be positive"}
+    if not controlnets:
+        return {"success": False, "message": "no controlnets to push"}
+
+    docs, err = _all_documents()
+    if err:
+        return {"success": False, "message": err}
+    doc_exists = any(d.get("name") == doc_name for d in docs)
+
+    if doc_exists:
+        existing = next(d for d in docs if d.get("name") == doc_name)
+        same_dims = (
+            int(existing.get("width") or 0) == doc_w
+            and int(existing.get("height") or 0) == doc_h
+        )
+        if not same_dims:
+            # Wrong size — close and recreate at the new dims.
+            krita_client.send(
+                {"type": "close_document", "name": doc_name},
+                timeout=15.0,
+            )
+            resp = krita_client.send({
+                "type": "create_new_with_dimensions",
+                "name": doc_name,
+                "width": doc_w,
+                "height": doc_h,
+            }, timeout=60.0)
+            if resp.get("status") != "success":
+                return {"success": False,
+                        "message": f"recreate doc failed: "
+                                   f"{resp.get('message')}"}
+        # else: same dims, doc already exists — no view operation
+        #       needed.  The layer-creation batch below targets the doc
+        #       by name and does not require it to be the active tab.
+    else:
+        resp = krita_client.send({
+            "type": "create_new_with_dimensions",
+            "name": doc_name,
+            "width": doc_w,
+            "height": doc_h,
+        }, timeout=60.0)
+        if resp.get("status") != "success":
+            return {"success": False,
+                    "message": f"create doc failed: "
+                               f"{resp.get('message')}"}
+
+    commands = []
+    titles = []
+    for cn in controlnets:
+        title = (cn.get("title") or "").strip()
+        png_b64 = cn.get("png_b64") or ""
+        if not title or not png_b64:
+            continue
+        try:
+            raw = base64.b64decode(png_b64)
+            pil = Image.open(BytesIO(raw))
+            if pil.size != (doc_w, doc_h):
+                pil = pil.convert("RGBA").resize(
+                    (doc_w, doc_h), Image.LANCZOS,
+                )
+                buf = BytesIO()
+                pil.save(buf, "PNG")
+                scaled_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            else:
+                scaled_b64 = png_b64
+        except Exception as e:
+            _log(f"scale failed for {title!r}: {e}")
+            continue
+
+        commands.append({
+            "type": "create_paint_layer_from_image_b64",
+            "image_b64": scaled_b64,
+            "name": title,
+            "replace": True,
+            "document": doc_name,
+        })
+        titles.append(title)
+
+    if not commands:
+        return {"success": False, "message": "no valid controlnets"}
+
+    batch_id = f"push_cn_{int(time.time() * 1000)}"
+    summary = krita_client.send_batch(
+        {"id": batch_id, "commands": commands},
+        timeout=180.0,
+    )
+
+    if not summary or summary.get("status") not in ("batch_complete", "success"):
+        msg = (summary.get("message") if isinstance(summary, dict) else None) \
+              or "batch send failed"
+        return {"success": False, "message": msg}
+
+    failed = int(summary.get("failed", 0) or 0)
+    pushed = []
+    failed_titles = []
+    for r in summary.get("results") or []:
+        idx = r.get("index", -1)
+        title = titles[idx] if 0 <= idx < len(titles) else "?"
+        if r.get("status") == "success":
+            pushed.append(title)
+        else:
+            failed_titles.append(f"{title}: {r.get('message', '?')}")
+
+    _log(
+        f"push to {doc_name!r}: {len(pushed)}/{len(titles)} layer(s)"
+        + (f" ({failed} failed)" if failed else "")
+    )
+    return {
+        "success": failed == 0,
+        "message": f"pushed {len(pushed)}/{len(titles)} layer(s) to {doc_name}",
+        "pushed":   pushed,
+        "failed":   failed_titles,
+        "doc_name": doc_name,
+    }
+
+
+def handle_krita_refresh_controlnets(payload):
+    if not isinstance(payload, dict):
+        return {"success": False, "message": "expected a JSON object"}
+
+    doc_name = str(payload.get("doc_name") or CONTROLNETS_DOC_NAME).strip()
+    titles = payload.get("titles") or []
+    if not titles:
+        return {"success": False, "message": "no titles to refresh"}
+
+    docs, err = _all_documents()
+    if err:
+        return {"success": False, "message": err}
+    if not any(d.get("name") == doc_name for d in docs):
+        return {"success": False,
+                "message": f"doc {doc_name!r} not found — push first"}
+
+    # Read every layer by (document, layer) pair.  No activation, no
+    # tab switching: `get_layer_pixels_b64` targets the document by
+    # name, so the user's current Krita tab is untouched and no clone
+    # tabs are created.
+    results = []
+    for title in titles:
+        try:
+            resp = krita_client.send({
+                "type": "get_layer_pixels_b64",
+                "name": title,
+                "document": doc_name,
+            }, timeout=30.0)
+            if resp.get("status") != "success":
+                results.append({
+                    "title": title,
+                    "error": resp.get("message") or "read failed",
+                })
+                continue
+            data_url = (resp.get("data") or {}).get("data_url")
+            if not data_url:
+                results.append({"title": title, "error": "no data_url"})
+                continue
+
+            raw = base64.b64decode(data_url.split(",", 1)[1])
+            pil = Image.open(BytesIO(raw))
+            w, h = pil.size
+            h_hex = hashlib.sha256(raw).hexdigest()[:16]
+            _store_preprocessed(h_hex, raw, w, h)
+
+            results.append({
+                "title":   title,
+                "hash":    h_hex,
+                "dataUrl": data_url,
+                "width":   w,
+                "height":  h,
+            })
+        except Exception as e:
+            _log(f"refresh failed for {title!r}: {e}")
+            results.append({"title": title, "error": str(e)})
+
+    n_ok = len([r for r in results if "error" not in r])
+    _log(f"refresh from {doc_name!r}: {n_ok}/{len(titles)} layer(s)")
+    return {
+        "success": True,
+        "message": f"refreshed {n_ok}/{len(titles)} layer(s) from {doc_name}",
+        "results": results,
+    }
+
+
+# ---------------------------------------------------------------------------
+#  Krita proxies (unchanged from previous skeleton)
 # ---------------------------------------------------------------------------
 
 def _fetch_active_state():
@@ -198,12 +490,6 @@ def handle_krita_status(_payload):
 
 
 def handle_import_image(payload):
-    """Fetch the active document composite.
-
-    Kept as an internal helper — `handle_resource_image` calls it for
-    the `source="active"` branch.  Not exposed as a route: the only
-    image-load path is `@thecontrolnet`.
-    """
     name = (payload or {}).get("name") if isinstance(payload, dict) else None
     cmd = {"type": "get_document_composite_b64"}
     if name:
@@ -280,12 +566,16 @@ def handle_resource_image(payload):
 
 
 ROUTES = {
-    "/state":                  handle_state,
-    "/version":                handle_version,
-    "/krita_status":           handle_krita_status,
-    "/active_state":           handle_active_state,
-    "/resource_image":         handle_resource_image,
-    "/playground_reregister":  handle_playground_reregister,
+    "/state":                       handle_state,
+    "/version":                     handle_version,
+    "/krita_status":                handle_krita_status,
+    "/active_state":                handle_active_state,
+    "/resource_image":              handle_resource_image,
+    "/playground_reregister":       handle_playground_reregister,
+    "/preprocess":                  handle_preprocess,
+    "/controlnet_image":            handle_controlnet_image,
+    "/krita/push_controlnets":      handle_krita_push_controlnets,
+    "/krita/refresh_controlnets":   handle_krita_refresh_controlnets,
 }
 
 RAW_ROUTES = {}

@@ -1,7 +1,9 @@
 """Minimal TCP client to the kritomatic daemon.
 
 The playground talks to Krita via the kritomatic daemon's TCP socket.
-The daemon protocol is newline-delimited JSON.
+The daemon protocol is newline-delimited JSON.  A single command gets
+one response line; a bundled batch (`{"id": ..., "commands": [...]}`)
+gets a stream of `progress` lines followed by one `batch_complete`.
 """
 
 import json
@@ -49,6 +51,71 @@ def send(command: dict, timeout: float = 60.0) -> dict:
         return json.loads(line.decode("utf-8"))
     except socket.timeout:
         return {"status": "error", "message": "daemon timeout"}
+    except ConnectionRefusedError:
+        return {"status": "error", "message": "kritomatic daemon unreachable"}
+    except json.JSONDecodeError as e:
+        return {"status": "error", "message": f"bad daemon response: {e}"}
+    except OSError as e:
+        return {"status": "error", "message": f"daemon error: {e}"}
+    finally:
+        if sock is not None:
+            try: sock.close()
+            except OSError: pass
+
+
+def send_batch(payload: dict,
+               on_progress: Optional[Callable[[int, dict], None]] = None,
+               timeout: float = 120.0) -> Optional[dict]:
+    """Send one bundled `{"id": ..., "commands": [...]}` payload and
+    stream per-command results.
+
+    Calls `on_progress(index, result_dict)` for each `progress` line the
+    daemon emits.  Returns the final `batch_complete` summary dict, or
+    None on transport failure.
+    """
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((DAEMON_HOST, DAEMON_PORT))
+        sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        sock.settimeout(None)
+
+        buf = b""
+        summary = None
+        while summary is None:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line.decode("utf-8"))
+                except json.JSONDecodeError:
+                    continue
+                mtype = msg.get("type")
+                if mtype == "progress":
+                    if on_progress is not None:
+                        try:
+                            on_progress(msg.get("index", 0),
+                                        msg.get("result", {}))
+                        except Exception:
+                            pass
+                elif (mtype == "batch_complete"
+                      or msg.get("status") == "batch_complete"):
+                    summary = msg
+                    break
+                else:
+                    summary = msg
+                    break
+
+        return summary
+    except socket.timeout:
+        return {"status": "error", "message": "batch timeout"}
     except ConnectionRefusedError:
         return {"status": "error", "message": "kritomatic daemon unreachable"}
     except json.JSONDecodeError as e:

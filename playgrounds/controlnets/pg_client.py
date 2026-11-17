@@ -41,4 +41,32 @@ export async function fetchResourceImage(spec) {
     return { success: false, message: e.message };
   }
 }
+
+export async function pushControlnets(payload) {
+  try {
+    const res = await fetch("/krita/push_controlnets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) return { success: false, message: "HTTP " + res.status };
+    return await res.json();
+  } catch (e) {
+    return { success: false, message: e.message };
+  }
+}
+
+export async function refreshControlnets(payload) {
+  try {
+    const res = await fetch("/krita/refresh_controlnets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) return { success: false, message: "HTTP " + res.status };
+    return await res.json();
+  } catch (e) {
+    return { success: false, message: e.message };
+  }
+}
 """

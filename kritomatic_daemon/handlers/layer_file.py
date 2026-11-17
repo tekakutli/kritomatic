@@ -1,6 +1,7 @@
 import os
 import random
 import string
+import base64
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from PyQt6.QtWidgets import QApplication
@@ -600,3 +601,94 @@ class LayerFileHandler(AutoDispatchHandler):
             _tb.print_exc()
             return {'success': False,
                     'message': f'paste_document_transform_as_layer raised: {exc}'}
+
+    @command(
+        category='layer',
+        help_text='Create a paint layer from a base64-encoded PNG image. '
+                  'The image is written at the document origin and covers '
+                  'its full natural size.',
+        args={
+            '--image_b64': {'type': 'str', 'required': True,
+                            'help': 'Base64-encoded PNG (no data URL prefix)'},
+            '--name': {'type': 'str', 'required': True,
+                       'help': 'Layer name'},
+            '--replace': {'type': 'bool', 'default': False,
+                          'help': 'Delete any existing layer with the same '
+                                  'name before creating the new one'},
+            '--document': {'type': 'str', 'default': '',
+                           'help': 'Target document name; empty = active'},
+        }
+    )
+    def create_paint_layer_from_image_b64(self, params):
+        try:
+            app = Krita.instance()
+            name = params.get('name', '')
+            image_b64 = params.get('image_b64', '')
+            replace = bool(params.get('replace', False))
+            doc_name = params.get('document', '')
+
+            if not name:
+                return {'success': False, 'message': 'name is required'}
+            if not image_b64:
+                return {'success': False, 'message': 'image_b64 is required'}
+
+            if doc_name:
+                doc = next((d for d in app.documents()
+                            if d.name() == doc_name), None)
+                if not doc:
+                    return {'success': False,
+                            'message': f'Document "{doc_name}" not found'}
+            else:
+                doc = app.activeDocument()
+                if not doc:
+                    return {'success': False, 'message': 'No active document'}
+
+            try:
+                png_bytes = base64.b64decode(image_b64)
+            except Exception as e:
+                return {'success': False,
+                        'message': f'base64 decode failed: {e}'}
+
+            qimg = QImage()
+            if not qimg.loadFromData(png_bytes, 'PNG'):
+                return {'success': False, 'message': 'PNG decode failed'}
+            qimg = qimg.convertToFormat(QImage.Format.Format_ARGB32)
+            iw = qimg.width()
+            ih = qimg.height()
+            ptr = qimg.constBits()
+            ptr.setsize(qimg.sizeInBytes())
+            raw = bytes(ptr)
+
+            if replace:
+                existing = doc.nodeByName(name)
+                if existing is not None:
+                    try:
+                        existing.remove()
+                    except Exception:
+                        pass
+
+            layer = doc.createNode(name, 'paintlayer')
+            if layer is None:
+                return {'success': False,
+                        'message': 'createNode returned None'}
+            doc.rootNode().addChildNode(layer, None)
+            layer.setPixelData(raw, 0, 0, iw, ih)
+
+            doc.setActiveNode(layer)
+            refresh(doc)
+
+            return {
+                'success': True,
+                'message': f'Created layer "{name}" ({iw}x{ih}) '
+                           f'in "{doc.name()}"',
+                'data': {
+                    'name': name,
+                    'width': iw,
+                    'height': ih,
+                    'document': doc.name(),
+                },
+            }
+        except Exception as e:
+            import traceback as _tb
+            _tb.print_exc()
+            return {'success': False, 'message': str(e)}

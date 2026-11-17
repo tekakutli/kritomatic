@@ -229,12 +229,25 @@ class DocumentHandler(AutoDispatchHandler):
             app = Krita.instance()
             documents = []
             for doc in app.documents():
+                # `name` is the internal, always-present identifier that
+                # `activate_document`, `get_document_composite_b64`, and
+                # every other name-keyed document command matches on.  It
+                # is what `createDocument(..., name, ...)` set, and it is
+                # also what a user sees in the tab title.  `fileName` is
+                # reported separately for consumers that need the on-disk
+                # path (save/export); it is empty for unsaved documents.
+                #
+                # The old implementation reported `fileName() if fileName()
+                # else 'Untitled'` as `name`, which meant every unsaved
+                # document showed up as 'Untitled' and could not be matched
+                # by its actual name.
                 documents.append({
-                    'name': doc.fileName() if doc.fileName() else 'Untitled',
-                    'width': doc.width(),
-                    'height': doc.height(),
+                    'name':       doc.name() or 'Untitled',
+                    'file_name':  doc.fileName() or '',
+                    'width':      doc.width(),
+                    'height':     doc.height(),
                     'resolution': doc.resolution(),
-                    'modified': doc.modified()
+                    'modified':   doc.modified(),
                 })
 
             return {
@@ -570,9 +583,11 @@ class DocumentHandler(AutoDispatchHandler):
 
     @command(
         category='doc',
-        help_text='Bring a document to the front of the Krita window, '
-                  'adding a view for it if none is open.  Accepts either '
-                  'the document name or its file path.',
+        help_text='Report that a document is open, adding a view for it '
+                  'if none exists.  This Krita build does not expose '
+                  'Window.activateView, so an existing view cannot be '
+                  'raised via the Python API; the command returns success '
+                  'and leaves the current tab alone.',
         args={
             '--name': {'type': 'str', 'required': True,
                        'help': 'Document name or .kra file path'},
@@ -615,19 +630,73 @@ class DocumentHandler(AutoDispatchHandler):
                 return {'success': False,
                         'message': 'No active window'}
 
+            doc_name = doc.name() or key
+
+            # Already active?  Nothing to do.
             try:
-                for view in window.views():
-                    vdoc = view.document()
-                    if vdoc is doc:
-                        window.activateView(view)
-                        return {'success': True,
-                                'message': f'Activated {doc.name() or key}'}
+                cur = app.activeDocument()
+                if cur is not None:
+                    try:
+                        if cur.name() == doc_name:
+                            return {'success': True,
+                                    'message': f'Already active: {doc_name}'}
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
-            window.addView(doc)
+            # Look for an existing view of the target document.
+            #
+            # Krita's Python API on this build does not expose
+            # `Window.activateView`, so we cannot bring the tab to
+            # front.  But we MUST NOT call `addView(doc)` when a view
+            # already exists — that appends a second (third, fourth…)
+            # tab pointing at the same document, and edits in one are
+            # visible in all of them (they are views of the same doc,
+            # not copies).  The user-visible result is clone tabs that
+            # accumulate on every call.
+            #
+            # So: if any view's document reports the target name, return
+            # success.  Try `activateView` defensively in case a future
+            # Krita build adds it; if the method is missing or throws,
+            # the tab simply stays wherever it was — harmless.
+            try:
+                views = list(window.views())
+            except Exception:
+                views = []
+
+            for view in views:
+                try:
+                    vdoc = view.document()
+                except Exception:
+                    continue
+                if vdoc is None:
+                    continue
+                match = False
+                try:
+                    if vdoc is doc:
+                        match = True
+                    elif vdoc.name() == doc_name:
+                        match = True
+                except Exception:
+                    pass
+                if match:
+                    try:
+                        window.activateView(view)
+                    except Exception:
+                        pass
+                    return {'success': True,
+                            'message': f'Existing view for {doc_name}'}
+
+            # No view anywhere.  Adding one is correct — this is the
+            # only path on which a new tab should appear.
+            try:
+                window.addView(doc)
+            except Exception as e:
+                return {'success': False,
+                        'message': f'addView failed: {e}'}
             return {'success': True,
-                    'message': f'Opened a view for {doc.name() or key}'}
+                    'message': f'Opened a view for {doc_name}'}
         except Exception as e:
             return {'success': False, 'message': str(e)}
 

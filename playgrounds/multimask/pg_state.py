@@ -3,10 +3,13 @@
 Leaf module.  Every other project module imports from here and
 nothing here imports from them.
 
-`applyCanvasImage` is the autosync target — updates the displayed
-image in response to a `@thecanvas` spec change without wiping the
-area list.  Used by `pg_autosync.js`; NOT called from any
-generation path.
+`applyCanvasImage` is the sole image-install path: used by the
+autosync poller (`pg_autosync.js`) and by the manual `Refresh
+@thecanvas` button.  It preserves `board.areas` (invalidating each
+mask's pixel caches so tinted overlays rebuild) so refreshing the
+canvas does not wipe out area work.  The former `setImage` /
+`clearImage` helpers existed for the removed pick/clear/import-
+image buttons and are gone.
 
 TWO SCHEDULERS
 ==============
@@ -145,48 +148,15 @@ export const board = {
   globals: _defaultGlobals(),
 };
 
-export function setImage(hash, dataUrl, width, height) {
-  board.imageHash       = hash;
-  board.originalImageEl = null;
-  board.originalWidth   = width;
-  board.originalHeight  = height;
-
-  board.imageEl      = null;
-  board.imageWidth   = 0;
-  board.imageHeight  = 0;
-  board.imageDataUrl = null;
-
-  board.areas          = [];
-  board.selectedAreaId = null;
-  board.hoveredAreaId  = null;
-  board.nextAreaNum    = 1;
-
-  resetView();
-
-  const img = new Image();
-  img.onload = () => {
-    board.originalImageEl = img;
-    board.originalWidth   = img.naturalWidth;
-    board.originalHeight  = img.naturalHeight;
-    board.imageEl         = img;
-    board.imageWidth      = img.naturalWidth;
-    board.imageHeight     = img.naturalHeight;
-    board.imageDataUrl    = dataUrl;
-    _scheduleDraw();
-  };
-  img.onerror = () => _scheduleDraw();
-  img.src = dataUrl;
-  _scheduleDraw();
-}
-
 /* ============================================================
-   applyCanvasImage — autosync target
+   applyCanvasImage — autosync + refresh-canvas target
    ============================================================
    Swap the displayed image in response to a `@thecanvas` spec
-   change.  Unlike `setImage`, this keeps the area list intact
-   (invalidating only each mask's pixel caches so the tinted
-   overlays rebuild).  Warns when the new dims differ from the old,
-   since area masks may no longer align. */
+   change (autosync) or a manual refresh.  Unlike the removed
+   `setImage`, this keeps the area list intact (invalidating only
+   each mask's pixel caches so the tinted overlays rebuild).
+   Warns when the new dims differ from the old, since area masks
+   may no longer align. */
 export function applyCanvasImage(hash, dataUrl, width, height) {
   const oldW = board.imageWidth;
   const oldH = board.imageHeight;
@@ -227,25 +197,6 @@ export function applyCanvasImage(hash, dataUrl, width, height) {
   };
   img.onerror = () => _scheduleDraw();
   img.src = dataUrl;
-  _scheduleDraw();
-}
-
-export function clearImage() {
-  board.imageHash       = null;
-  board.originalImageEl = null;
-  board.originalWidth   = 0;
-  board.originalHeight  = 0;
-  board.imageEl         = null;
-  board.imageWidth      = 0;
-  board.imageHeight     = 0;
-  board.imageDataUrl    = null;
-
-  board.areas          = [];
-  board.selectedAreaId = null;
-  board.hoveredAreaId  = null;
-  board.nextAreaNum    = 1;
-
-  resetView();
   _scheduleDraw();
 }
 

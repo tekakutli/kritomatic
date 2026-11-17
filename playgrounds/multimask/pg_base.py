@@ -1,4 +1,24 @@
-"""Multimask's panel CSS and body."""
+"""Multimask's panel CSS and body.
+
+Sections: Image, Areas, Defaults, State.
+
+The Image section is `@thecanvas`-only — no local file pick, no
+clear, no explicit Krita composite import.  The autosync poller
+(`pg_autosync.js`) pulls the current `@thecanvas` whenever the spec
+in the daemon's config.resources changes; `Refresh @thecanvas`
+forces a re-read when the pixels behind a constant spec changed in
+Krita but the spec did not.
+
+There is no drag-and-drop image install path and no `+ From Krita
+(image)` shortcut — the panel-mutations those buttons performed are
+redundant with `applyCanvasImage` (autosync) and are gone.
+
+Areas can still be added (`+ From Krita (masks)` for Krita-selected
+masks / paint layers, `+ Blank` for a fully-white mask at canvas
+dims), and cleared (`Clear all areas`).  Each is an independent
+entry in `/state.areas`; the `MultiAreaConditioning` node consumes
+them all.
+"""
 
 PG_CSS = r"""
   #ui button#importMasksBtn {
@@ -28,16 +48,10 @@ PG_CSS = r"""
     background: rgba(220, 90, 110, 0.10);
     color: #ffd0d8;
   }
-  #ui button#importImageBtn,
-  #ui button#pickImageBtn,
-  #ui button#clearImageBtn,
   #ui button#refreshCanvasBtn {
     border-color: rgba(120, 220, 255, 0.72);
     color: #b8ecff;
   }
-  #ui button#importImageBtn:hover:not(:disabled),
-  #ui button#pickImageBtn:hover:not(:disabled),
-  #ui button#clearImageBtn:hover:not(:disabled),
   #ui button#refreshCanvasBtn:hover:not(:disabled) {
     border-color: rgba(140, 225, 255, 1.00);
     background: rgba(120, 220, 255, 0.10);
@@ -167,22 +181,6 @@ PG_CSS = r"""
     cursor:pointer; margin:0;
   }
 
-  #dropOverlay {
-    position:fixed; inset:0; z-index:100;
-    display:none;
-    background:rgba(0,229,255,0.06);
-    border:2px dashed rgba(0,229,255,0.65);
-    box-sizing:border-box;
-    pointer-events:none;
-    align-items:center; justify-content:center;
-    font-family:'JetBrains Mono','Fira Code','Consolas','SF Mono',monospace;
-    font-size:14px; font-weight:700;
-    color:#b8ecff;
-    letter-spacing:0.16em; text-transform:uppercase;
-    text-shadow:0 0 12px rgba(0,229,255,0.55);
-  }
-  #dropOverlay.visible { display:flex; }
-
   #statusLine {
     font-size:10px; color:#7b8794;
     margin-top:6px;
@@ -213,15 +211,6 @@ PG_PANEL_BODY = r"""
     <details class="section" open>
       <summary>Image</summary>
       <div class="section-body">
-        <div class="row">
-          <button id="pickImageBtn" title="Pick an image file">+ Pick image…</button>
-          <button id="clearImageBtn" title="Clear the current image">Clear</button>
-        </div>
-        <div class="row">
-          <button id="importImageBtn" title="Import the active document's composite from Krita">
-            + From Krita
-          </button>
-        </div>
         <div class="row">
           <button id="refreshCanvasBtn"
                   title="Re-fetch the current @thecanvas from Krita. Use when the canvas image changed in Krita but the autosync poller didn't pick it up — the poller only fires when the @thecanvas *spec* changes (active ↔ layer X ↔ layer Y), not when the pixels behind a constant spec change. Areas are preserved.">

@@ -6,12 +6,20 @@
                             inpaint's crop frame if available
   POST /export_graph        build the API-format JSON
   POST /fetch_history       fetch the last ComfyUI run
-  POST /import_image        fetch active document composite from Krita
   POST /import_masks        fetch selected mask or paint layer(s)
   POST /krita_status        daemon reachable?
-  POST /upload_image        raw body (image file)
   POST /active_state        daemon comfy_status
   POST /resource_image      resolve a spec to a PNG data URL
+
+The image enters the browser exclusively via `/resource_image`
+(called by autosync and the panel's `Refresh @thecanvas` button).
+The `+ Pick image…`, `Clear`, `+ From Krita (image)` shortcuts and
+their server routes (`/import_image`, `/upload_image`) were removed
+along with the drag-drop overlay — the autosync poller and the
+manual refresh cover every install path those buttons provided.
+
+`handle_import_image` remains as an internal helper for
+`handle_resource_image`'s `source="active"` branch.
 
 MASK TRANSFORM
 ==============
@@ -43,7 +51,6 @@ import time
 import urllib.error
 import urllib.request
 from io import BytesIO
-from urllib.parse import unquote
 
 from PIL import Image
 
@@ -62,16 +69,13 @@ INPAINT_URL = os.environ.get(
 ).rstrip("/")
 
 
-# Crop-frame cache — one query per second at most.  `MultiAreaConditioning`
-# calls `/mask` per-area in quick succession during one execute; caching
-# collapses N fetches into one.
+# Crop-frame cache — one query per second at most.
 _crop_frame_lock = threading.Lock()
 _crop_frame_cache = {"frame": None, "at": 0.0}
 CROP_FRAME_TTL = 1.0
 
 
-# Mask transform cache — keyed by (hash, frame signature).  Bounded by
-# `_MASK_TRANSFORM_CACHE_MAX`; oldest evicted on overflow.
+# Mask transform cache — keyed by (hash, frame signature).
 _mask_transform_lock = threading.Lock()
 _mask_transform_cache: dict = {}
 _MASK_TRANSFORM_CACHE_MAX = 64
@@ -210,16 +214,6 @@ def _frame_signature(frame):
 
 
 def _transform_mask_b64(b64: str, frame) -> str:
-    """Rotate + crop the mask to align with the daemon's prepared frame.
-
-    Assumes the incoming mask is at W×H (the same coordinate frame as
-    `@thecanvas` and `@theselection` before prepare).  Applies the same
-    transform the daemon applies to those:
-
-      · theta ≠ 0  →  rotate by theta (CW) about the canvas center,
-                      producing a W'×H' image
-      · always     →  crop to (cropX, cropY, cropW, cropH)
-    """
     if frame is None:
         return b64
 
@@ -241,13 +235,10 @@ def _transform_mask_b64(b64: str, frame) -> str:
         _log(f"mask decode failed: {e}")
         return b64
 
-    # Ensure native W×H before rotating.
     if W > 0 and H > 0 and img.size != (W, H):
         img = img.resize((W, H), Image.LANCZOS)
 
     if theta != 0:
-        # PIL rotates CCW for positive angles; the playground and
-        # QTransform (daemon) rotate CW on screen.  Negate theta.
         img = img.rotate(
             -theta, expand=True,
             resample=Image.BICUBIC, fillcolor=0,
@@ -721,14 +712,38 @@ def _diagnose_history(details):
 
 
 # ---------------------------------------------------------------------------
-#  /krita_status, /import_image, /import_masks, /resource_image
+#  /krita_status, /import_masks, /resource_image
 # ---------------------------------------------------------------------------
 
 def handle_krita_status(_payload):
     return {"success": True, "reachable": krita_client.is_reachable()}
 
 
+def handle_import_masks(payload):
+    cmd = {"type": "import_krita_masks_b64"}
+    if isinstance(payload, dict):
+        if payload.get("layer_names"):
+            cmd["layer_names"] = str(payload["layer_names"])
+        if "include_paint_alpha" in payload:
+            cmd["include_paint_alpha"] = bool(payload["include_paint_alpha"])
+
+    response = krita_client.send(cmd, timeout=60.0)
+    if response.get("status") != "success":
+        return {"success": False,
+                "message": response.get("message") or "daemon rejected"}
+
+    data = response.get("data") or {}
+    return {
+        "success":        True,
+        "masks":          data.get("masks") or [],
+        "skipped":        data.get("skipped") or [],
+        "selection_path": data.get("selection_path") or "unknown",
+        "message":        response.get("message") or "",
+    }
+
+
 def handle_import_image(payload):
+    """Internal helper — used by `handle_resource_image` for source=active."""
     name = (payload or {}).get("name") if isinstance(payload, dict) else None
     cmd = {"type": "get_document_composite_b64"}
     if name:
@@ -762,29 +777,6 @@ def handle_import_image(payload):
         "height":    h,
         "data_url":  data_url,
         "filename":  data.get("name") or "krita_composite",
-    }
-
-
-def handle_import_masks(payload):
-    cmd = {"type": "import_krita_masks_b64"}
-    if isinstance(payload, dict):
-        if payload.get("layer_names"):
-            cmd["layer_names"] = str(payload["layer_names"])
-        if "include_paint_alpha" in payload:
-            cmd["include_paint_alpha"] = bool(payload["include_paint_alpha"])
-
-    response = krita_client.send(cmd, timeout=60.0)
-    if response.get("status") != "success":
-        return {"success": False,
-                "message": response.get("message") or "daemon rejected"}
-
-    data = response.get("data") or {}
-    return {
-        "success":        True,
-        "masks":          data.get("masks") or [],
-        "skipped":        data.get("skipped") or [],
-        "selection_path": data.get("selection_path") or "unknown",
-        "message":        response.get("message") or "",
     }
 
 
@@ -829,58 +821,16 @@ def handle_resource_image(payload):
     }
 
 
-# ---------------------------------------------------------------------------
-#  /upload_image
-# ---------------------------------------------------------------------------
-
-def handle_upload_image(headers, body):
-    if not body:
-        return {"success": False, "message": "empty upload"}
-
-    raw_filename = (headers.get("X-Filename", "")
-                    or headers.get("x-filename", ""))
-    filename = unquote(raw_filename) if raw_filename else "image"
-
-    try:
-        img = Image.open(BytesIO(body))
-        w, h = img.size
-    except Exception as e:
-        return {"success": False,
-                "message": f"could not decode image: {e}"}
-
-    if img.format and img.format.upper() != "PNG":
-        buf = BytesIO()
-        img.save(buf, "PNG")
-        png_bytes = buf.getvalue()
-    else:
-        png_bytes = body
-
-    hash_hex = hashlib.sha256(png_bytes).hexdigest()[:16]
-    data_url = ("data:image/png;base64,"
-                + base64.b64encode(png_bytes).decode("ascii"))
-    return {
-        "success":  True,
-        "hash":     hash_hex,
-        "width":    w,
-        "height":   h,
-        "data_url": data_url,
-        "filename": filename,
-    }
-
-
 ROUTES = {
     "/state":              handle_state,
     "/version":            handle_version,
     "/mask":               handle_mask,
     "/export_graph":       handle_export_graph,
     "/fetch_history":      handle_fetch_history,
-    "/import_image":       handle_import_image,
     "/import_masks":       handle_import_masks,
     "/krita_status":       handle_krita_status,
     "/active_state":       handle_active_state,
     "/resource_image":     handle_resource_image,
 }
 
-RAW_ROUTES = {
-    "/upload_image": handle_upload_image,
-}
+RAW_ROUTES = {}

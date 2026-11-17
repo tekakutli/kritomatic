@@ -57,7 +57,7 @@ to "one integer key compare + one `drawImage`".
 
 EMPTY-STATE TEXT
 ================
-The "drop an image to begin" text is drawn on the OVERLAY layer, not
+The "waiting for @thecanvas" text is drawn on the OVERLAY layer, not
 the image layer, so the image layer can return immediately when no
 image is loaded.  The image layer's dark fill is provided by CSS
 (`canvas { background: #0a0e14 }`, see `pgkit/styles.py`)."""
@@ -198,7 +198,10 @@ function _drawOverlayCanvas() {
     overlayCtx.font = "700 12px 'JetBrains Mono', monospace";
     overlayCtx.textAlign = "center";
     overlayCtx.textBaseline = "middle";
-    overlayCtx.fillText("drop an image to begin", cw / 2, ch / 2);
+    overlayCtx.fillText(
+      "load a workflow in the docker to pull @thecanvas",
+      cw / 2, ch / 2,
+    );
     return;
   }
 

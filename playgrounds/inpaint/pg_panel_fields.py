@@ -9,7 +9,10 @@ nothing.
 The prompt field is gone.  The status line shows sync state instead of
 inpaint state: `Synced HH:MM:SS · rotation N° · mask K/N · context on/off`,
 or `Syncing…` / `Sync failed: …` / `No mask selected · workflow will
-not inpaint`."""
+not inpaint`.
+
+The pick-image / clear-image / pick-mask button-disable checks are
+gone along with those buttons."""
 
 PANEL_FIELDS_JS = r"""
 import { board, view } from "./pg_state.js";
@@ -26,9 +29,6 @@ function _get() {
     inpaintEnabled:  document.getElementById("inpaintEnabled"),
     inpaintRectHint: document.getElementById("inpaintRectHint"),
     syncNowBtn:      document.getElementById("syncNowBtn"),
-    pickImageBtn:    document.getElementById("pickImageBtn"),
-    clearImageBtn:   document.getElementById("clearImageBtn"),
-    pickMaskBtn:     document.getElementById("pickMaskBtn"),
     kritaImportMasksBtn: document.getElementById("kritaImportMasksBtn"),
     maskFromRectBtn: document.getElementById("maskFromRectBtn"),
   };
@@ -49,7 +49,7 @@ export function syncPanelFields() {
   if (e.imageInfo) {
     let text;
     if (!board.imageHash) {
-      text = "No image loaded \u2014 drop one on the canvas";
+      text = "No image loaded \u2014 load a workflow in the docker to pull @thecanvas";
     } else {
       text = board.imageWidth + " \u00d7 " + board.imageHeight
            + "   [" + board.imageHash.slice(0, 8) + "\u2026]";
@@ -118,9 +118,6 @@ export function syncPanelFields() {
     else                            e.maskFromRectBtn.title = "Create a new mask from the current context rectangle.";
   }
 
-  if (e.pickImageBtn) e.pickImageBtn.disabled = busy;
-  if (e.clearImageBtn) e.clearImageBtn.disabled = busy;
-  if (e.pickMaskBtn) e.pickMaskBtn.disabled = busy;
   if (e.kritaImportMasksBtn) e.kritaImportMasksBtn.disabled = busy;
   if (e.syncNowBtn) e.syncNowBtn.disabled = busy;
 

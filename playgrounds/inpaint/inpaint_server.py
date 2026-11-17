@@ -18,7 +18,6 @@ Routes
                             selection, context mask, multimask area
                             masks) ends up at the same cropW × cropH.
     POST /comfy/status      ComfyUI preflight
-    POST /comfy/upload_image  upload an image file; returns hash + dims
     POST /comfy/active_state  proxy the daemon's `comfy_status`
 
     POST /krita/status      kritomatic daemon reachable?
@@ -26,6 +25,12 @@ Routes
     POST /krita/import_masks  fetch selected mask or paint layer(s)
     POST /krita/resource_image  resolve a `{source, layer_name}` spec
                                 to a PNG data URL
+
+The `/comfy/upload_image` raw route and its `_image_cache` were
+removed along with the pick-image / pick-mask / drop-overlay
+buttons — every image install is now daemon-mediated (autosync or
+manual `Refresh @thecanvas`), and no other route ever read from the
+cache.
 
 CROP FRAME
 ==========
@@ -100,7 +105,6 @@ import threading
 import time
 from io import BytesIO
 from typing import Optional
-from urllib.parse import unquote
 
 from PIL import Image
 
@@ -133,26 +137,6 @@ _canvas_w: int = 0
 _canvas_h: int = 0
 _canvas_b64: str = ""
 _selection_b64: str = ""
-
-
-# ---------------------------------------------------------------------------
-#  Image cache — used by the upload handler.
-# ---------------------------------------------------------------------------
-
-_IMAGE_CACHE_MAX = 8
-_image_cache: dict = {}
-_image_cache_lock = threading.Lock()
-
-
-def _cache_image(hash_hex, raw, width, height, filename):
-    with _image_cache_lock:
-        if len(_image_cache) >= _IMAGE_CACHE_MAX:
-            oldest = next(iter(_image_cache))
-            _image_cache.pop(oldest, None)
-        _image_cache[hash_hex] = {
-            "raw": raw, "width": width, "height": height,
-            "filename": filename,
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -484,32 +468,6 @@ def handle_status(_payload) -> dict:
 
 
 # ---------------------------------------------------------------------------
-#  /comfy/upload_image — unchanged
-# ---------------------------------------------------------------------------
-
-def handle_upload(headers: dict, body: bytes) -> dict:
-    if not body:
-        return {"success": False, "message": "empty upload"}
-
-    raw_filename = headers.get("X-Filename", "") or headers.get("x-filename", "")
-    filename = unquote(raw_filename) if raw_filename else "image"
-
-    try:
-        encoded = make_encoded_image(body)
-    except Exception as e:
-        return {"success": False, "message": f"could not decode image: {e}"}
-
-    _cache_image(encoded.content_hash, body, encoded.width, encoded.height, filename)
-    return {
-        "success": True,
-        "hash": encoded.content_hash,
-        "width": encoded.width,
-        "height": encoded.height,
-        "filename": filename,
-    }
-
-
-# ---------------------------------------------------------------------------
 #  /krita/* — unchanged
 # ---------------------------------------------------------------------------
 
@@ -549,7 +507,6 @@ def handle_krita_import(payload: dict) -> dict:
 
     h = encoded.content_hash
     filename = data.get("name") or "krita_composite"
-    _cache_image(h, png_bytes, encoded.width, encoded.height, filename)
 
     return {
         "success": True,
@@ -648,6 +605,4 @@ ROUTES = {
     "/krita/resource_image": handle_resource_image,
 }
 
-RAW_ROUTES = {
-    "/comfy/upload_image": handle_upload,
-}
+RAW_ROUTES = {}

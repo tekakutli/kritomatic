@@ -12,25 +12,16 @@ build from the current state (works with ComfyUI closed).
 for the most recent run.  The returned JSON is the *submitted*
 graph, not the expanded one; the diagnostic summary explains this.
 
-The displayed image is whatever the user picked or imported — no
-auto-refresh after generation.  Use `+ From Krita` to pull the
-current composite into the canvas.
-
-`Refresh @thecanvas` re-fetches the current `@thecanvas` on demand.
-The autosync poller (`pg_autosync.js`) only reacts to *spec* changes
-(`active` → `layer X`, `layer X` → `layer Y`), not to pixels behind
-a constant spec, so a paint layer whose content was edited in Krita
-keeps showing the old pixels until something else triggers a poll.
-The button bypasses that gate.  `applyCanvasImage` is used (not
-`setImage`), so the area list survives the refresh — same semantics
-as the autosync path.
+The displayed image is the current `@thecanvas` (pulled by
+`pg_autosync.js` from the daemon's resource selector).  `Refresh
+@thecanvas` bypasses the autosync spec-change gate to force a
+re-read when the pixels behind a constant spec changed.
 
 `Clear all areas` empties the area list (masks + prompts) without
-touching the loaded image.  This is the counterpart of `Clear image`
-which resets both.  The action flows through the same debounced
-state sync as every other area mutation, so the daemon's saved
-`/state` becomes empty and the `MultiAreaConditioning` node passes
-`base_positive` through unchanged on the next execute.
+touching the loaded image.  The action flows through the same
+debounced state sync as every other area mutation, so the daemon's
+saved `/state` becomes empty and the `MultiAreaConditioning` node
+passes `base_positive` through unchanged on the next execute.
 
 KRITA STATUS MIRRORING
 ======================
@@ -39,11 +30,20 @@ KRITA STATUS MIRRORING
 to `console.error`, which pgkit/panel_core.js routes to POST
 ./__log.  The persistent DOM write stays visible on the panel; the
 terminal write is the durable record.
+
+REMOVED IMAGE-MANAGEMENT PATH
+=============================
+`+ Pick image…`, `Clear`, `+ From Krita` (image) and the drag/drop
+overlay are gone.  The current `@thecanvas` is pulled by
+`pg_autosync.js`; `applyCanvasImage` preserves areas across hash
+changes.  Every image-install path the removed buttons performed is
+redundant with autosync.  Areas are still addable via `+ From
+Krita` (masks) and `+ Blank`, and clearable via `Clear all areas`.
 """
 
 PANEL_BINDINGS_JS = r"""
 import {
-  board, setImage, clearImage, applyCanvasImage,
+  board, applyCanvasImage,
 } from "./pg_state.js";
 import {
   addAreaFromB64, removeArea, selectArea, areaById,
@@ -51,8 +51,8 @@ import {
 import { syncAreaList, setStateChangeHook } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
 import {
-  importFromKrita, importKritaMasks, uploadImageFile,
-  checkKritaStatus, fetchActiveState, fetchResourceImage,
+  importKritaMasks, checkKritaStatus, fetchActiveState,
+  fetchResourceImage,
 } from "./pg_client.js";
 import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitRegisterField,
@@ -147,74 +147,7 @@ async function _doStateSync() {
 setStateChangeHook(_scheduleStateSync);
 
 /* ============================================================
-   Image actions
-   ============================================================ */
-
-function _fileToDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ""));
-    reader.onerror = () => reject(new Error("could not read file"));
-    reader.readAsDataURL(file);
-  });
-}
-
-async function _installImage(file) {
-  flashStatus("uploading " + file.name + "\u2026", "");
-  try {
-    const info = await uploadImageFile(file);
-    const dataUrl = await _fileToDataUrl(file);
-    setImage(info.hash, dataUrl, info.width, info.height);
-    flashStatus("image loaded", "ok");
-    syncPanelFields();
-    syncAreaList();
-    _scheduleStateSync();
-    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-  } catch (e) {
-    flashStatus("upload failed: " + e.message, "bad");
-  }
-}
-
-function _pickImageAction() {
-  const input = document.createElement("input");
-  input.type = "file";
-  input.accept = "image/*";
-  input.addEventListener("change", () => {
-    const file = input.files && input.files[0];
-    if (file) _installImage(file);
-  });
-  input.click();
-}
-
-function _clearImageAction() {
-  clearImage();
-  syncPanelFields();
-  syncAreaList();
-  _scheduleStateSync();
-  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-}
-
-async function _importImageFromKritaAction() {
-  flashStatus("importing image from Krita\u2026", "");
-  try {
-    const res = await importFromKrita({});
-    if (!res.success) {
-      flashStatus("import failed: " + (res.message || "unknown"), "bad");
-      return;
-    }
-    setImage(res.hash, res.data_url, res.width, res.height);
-    flashStatus("imported " + res.width + "\u00d7" + res.height, "ok");
-    syncPanelFields();
-    syncAreaList();
-    _scheduleStateSync();
-    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-  } catch (e) {
-    flashStatus("import failed: " + e.message, "bad");
-  }
-}
-
-/* ============================================================
-   Manual @thecanvas refresh
+   Image refresh (manual — autosync path covers spec changes)
    ============================================================
    The autosync poller reacts only to changes in the @thecanvas
    *spec* — `active` → `layer X`, `layer X` → `layer Y`.  A paint
@@ -362,9 +295,11 @@ function _addBlankAreaAction() {
 }
 
 /* Empty the area list (masks + prompts) without touching the image.
- * Counterpart to `Clear image`, which resets both.  Kept as its own
- * action so a user who only wants to start over on masks can keep
- * the imported composite in place and re-import masks against it.
+ * Counterpart to `Clear image`, which is now handled by autosync
+ * (a hash change from `applyCanvasImage` clears the areas as a side
+ * effect).  Kept as its own action so a user who only wants to
+ * start over on masks can keep the imported composite in place and
+ * re-import masks against it.
  *
  * Every mutation goes through the same debounced state sync the
  * other area operations use, so the daemon's saved state becomes
@@ -641,23 +576,9 @@ async function _fetchHistoryAction() {
    Install
    ============================================================ */
 
-function _showDropOverlay(on) {
-  const el = document.getElementById("dropOverlay");
-  if (el) el.classList.toggle("visible", on);
-}
-
-function _installDropOverlay() {
-  if (document.getElementById("dropOverlay")) return;
-  const el = document.createElement("div");
-  el.id = "dropOverlay";
-  el.textContent = "Drop an image";
-  document.body.appendChild(el);
-}
-
 export function installPanelBindings() {
   const el = {};
   for (const id of [
-    "pickImageBtn", "clearImageBtn", "importImageBtn",
     "importMasksBtn", "blankAreaBtn", "clearAreasBtn", "kritaCheckBtn",
     "saveStateBtn", "loadStateBtn", "exportGraphBtn",
     "fetchHistoryBtn",
@@ -665,9 +586,6 @@ export function installPanelBindings() {
   ]) {
     el[id] = document.getElementById(id);
   }
-  if (el.pickImageBtn)    el.pickImageBtn.addEventListener("click", _pickImageAction);
-  if (el.clearImageBtn)   el.clearImageBtn.addEventListener("click", _clearImageAction);
-  if (el.importImageBtn)  el.importImageBtn.addEventListener("click", _importImageFromKritaAction);
   if (el.importMasksBtn)  el.importMasksBtn.addEventListener("click", _importMasksFromKritaAction);
   if (el.blankAreaBtn)    el.blankAreaBtn.addEventListener("click", _addBlankAreaAction);
   if (el.clearAreasBtn)   el.clearAreasBtn.addEventListener("click", _clearAreasAction);
@@ -711,27 +629,6 @@ export function installPanelBindings() {
       _scheduleStateSync();
     });
   }
-
-  // Drop-overlay install + drag/drop
-  _installDropOverlay();
-  let _dragDepth = 0;
-  window.addEventListener("dragenter", () => {
-    _dragDepth++;
-    _showDropOverlay(true);
-  });
-  window.addEventListener("dragleave", () => {
-    _dragDepth--;
-    if (_dragDepth <= 0) _showDropOverlay(false);
-  });
-  window.addEventListener("dragover", (e) => e.preventDefault());
-  window.addEventListener("drop", (e) => {
-    e.preventDefault();
-    _dragDepth = 0;
-    _showDropOverlay(false);
-    const file = e.dataTransfer && e.dataTransfer.files
-                 && e.dataTransfer.files[0];
-    if (file && file.type.startsWith("image/")) _installImage(file);
-  });
 }
 
 /* ============================================================
@@ -766,14 +663,6 @@ pgkitRegisterField("globals.bbox", {
   meta: { kind: "bool", label: "Bbox crop" },
 });
 
-pgkitRegisterAction("action.pickImage", {
-  label: "+ Pick image\u2026", scope: "global",
-  run: _pickImageAction, meta: { variant: "plain" },
-});
-pgkitRegisterAction("action.importImage", {
-  label: "+ From Krita (image)", scope: "global",
-  run: _importImageFromKritaAction, meta: { variant: "plain" },
-});
 pgkitRegisterAction("action.importMasks", {
   label: "+ From Krita (masks)", scope: "global",
   run: _importMasksFromKritaAction, meta: { variant: "primary" },
@@ -785,10 +674,6 @@ pgkitRegisterAction("action.blankArea", {
 pgkitRegisterAction("action.clearAreas", {
   label: "Clear all areas", scope: "global",
   run: _clearAreasAction, meta: { variant: "danger" },
-});
-pgkitRegisterAction("action.clearImage", {
-  label: "Clear image", scope: "global",
-  run: _clearImageAction, meta: { variant: "plain" },
 });
 pgkitRegisterAction("action.refreshCanvas", {
   label: "Refresh @thecanvas", scope: "global",
@@ -842,8 +727,9 @@ export function pgkitHandleSelect(level, name) {
    ============================================================
    `multimaskBootSync` pulls the server's saved state on page load
    and rehydrates the area list.  The image is NOT auto-fetched from
-   Krita — the user picks or imports one explicitly with the panel
-   buttons.  There is no image poller. */
+   Krita — the autosync poller (`pg_autosync.js`) does that on the
+   first tick if `@thecanvas` is set.  There is no image poller
+   here. */
 
 async function _applyServerState(payload) {
   if (payload.globals && typeof payload.globals === "object") {

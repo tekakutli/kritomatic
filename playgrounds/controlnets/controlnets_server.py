@@ -1,13 +1,17 @@
 """HTTP routes for the controlnets playground.
 
 The playground is a state host.  It exposes `{image_hash, image_dims,
-controlnets}` at `/state` for a future ComfyUI node to pull at
-generation time, plus Krita-proxy routes for the browser.
+controlnets, apply_enabled}` at `/state` for the `ControlNetsConditioning`
+ComfyUI node to pull at generation time, plus Krita-proxy routes for
+the browser.
 
 Routes
 ======
 
-    POST /state                  set (from browser) or get (from node)
+    POST /state                  set (from browser) or get (from node
+                                 AND browser; GET also returns
+                                 `apply_nodes` merged with current
+                                 enable flags)
     POST /version                version only (for IS_CHANGED sweeps)
     POST /krita_status           daemon reachable?
     POST /active_state           daemon comfy_status + playground registry
@@ -18,7 +22,7 @@ Routes
                                  returns {title, hash, dataUrl, width, height}
                                  or {title, error}
     POST /controlnet_image       serve a preprocessed image by hash
-                                 (consumed by the future node)
+                                 (consumed by the node)
     POST /krita/push_controlnets    create/replace a scratch Krita doc
                                     with one layer per controlnet
     POST /krita/refresh_controlnets read back the layers from that doc
@@ -27,6 +31,27 @@ Routes
 There is no `/import_image` or `/upload_image` — the image can only
 enter `/state` through `@thecontrolnet`.  `handle_import_image` still
 exists as an internal helper for `handle_resource_image`.
+
+APPLY NODES AND ENABLE FLAGS
+============================
+The workflow file at `<repo>/data/controlnets/controlnets_workflow.json`
+contains the canonical list of `ControlNetApplyAdvanced` nodes.  This
+module reads that file on every GET `/state` and returns:
+
+    apply_nodes: [
+        {title, preprocessor_title, controlnet_name, enabled}, ...
+    ]
+
+in `node.order` (i.e. the order the chain will be applied).  `enabled`
+is merged from the state's `apply_enabled` dict, defaulting to `true`
+for any title not explicitly set.
+
+The `ControlNetsConditioning` node iterates its own chain (built from
+the same file) and skips any entry whose `apply_title` maps to a
+false value in `apply_enabled`.  Preprocessor entries in
+`controlnets` are NEVER filtered — both DEPTH and DEPTH FULL need the
+same Zoe-preprocessed image, and dropping the preprocessor because
+one of its downstream applies is disabled would break the other.
 """
 
 import base64
@@ -35,6 +60,7 @@ import json
 import threading
 import time
 from io import BytesIO
+from pathlib import Path
 
 from PIL import Image
 
@@ -59,8 +85,8 @@ _state_lock = threading.RLock()
 _state      = None
 _version    = ""
 
-# Preprocessed-image store.  Server-side so the future node can fetch
-# each hash via /controlnet_image without a live browser.  Capped so a
+# Preprocessed-image store.  Server-side so the node can fetch each
+# hash via /controlnet_image without a live browser.  Capped so a
 # long session that re-preprocesses against many different
 # @thecontrolnet images does not grow without bound.
 _preprocessed_lock  = threading.Lock()
@@ -71,6 +97,112 @@ _PREPROCESSED_MAX   = 64
 def _log(msg):
     print(f"[controlnets] {msg}", flush=True)
 
+
+# ---------------------------------------------------------------------------
+#  Workflow file discovery + apply-node extraction
+# ---------------------------------------------------------------------------
+#
+# Symmetric with `kritomatic_nodes/controlnets/__init__.py`'s
+# discovery — walks up from this file to find
+# `<repo>/data/controlnets/controlnets_workflow.json`.  Server-side
+# the file is only used to *list* the ControlNetApplyAdvanced nodes
+# (so the panel can render their checkboxes and the node can consult
+# `apply_enabled`).  The chain build itself happens in the ComfyUI
+# node, which reads the same file via the symlink back to the repo.
+
+def _find_workflow_path():
+    p = Path(__file__).resolve().parent
+    for _ in range(8):
+        candidate = p / "data" / "controlnets" / "controlnets_workflow.json"
+        if candidate.is_file():
+            return str(candidate)
+        if p == p.parent:
+            break
+        p = p.parent
+    return str(p / "data" / "controlnets" / "controlnets_workflow.json")
+
+
+def _load_workflow_apply_nodes():
+    """Return ordered list of ControlNetApplyAdvanced nodes from the
+    workflow file.  Each entry:
+
+        {
+            "title":              str,
+            "preprocessor_title": str,
+            "controlnet_name":    str,
+        }
+
+    Skip nodes with a missing image or control_net input link, or with
+    an unrecognized control-net loader.  The order is `node.order`, so
+    the panel renders them in chain-application order.
+    """
+    path = _find_workflow_path()
+    try:
+        wf = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as e:
+        _log(f"could not load workflow file {path!r}: {e}")
+        return []
+
+    nodes = {n["id"]: n for n in (wf.get("nodes") or [])}
+    links = {}
+    for link in (wf.get("links") or []):
+        lid, oid, osl, tid, tsl, typ = link
+        links[lid] = (oid, osl, tid, tsl, typ)
+
+    apply_nodes = [
+        n for n in (wf.get("nodes") or [])
+        if n.get("type") == "ControlNetApplyAdvanced"
+    ]
+    apply_nodes.sort(key=lambda n: n.get("order", n.get("id", 0)))
+
+    out = []
+    for node in apply_nodes:
+        image_link = None
+        ctrl_link = None
+        for inp in (node.get("inputs") or []):
+            name = inp.get("name")
+            if name == "image":
+                image_link = inp.get("link")
+            elif name == "control_net":
+                ctrl_link = inp.get("link")
+        if image_link is None or ctrl_link is None:
+            continue
+
+        pre_oid = links.get(image_link, (None,))[0]
+        cn_oid = links.get(ctrl_link, (None,))[0]
+        preproc = nodes.get(pre_oid)
+        cn_loader = nodes.get(cn_oid)
+        if preproc is None or cn_loader is None:
+            continue
+
+        pre_title = preproc.get("title") or preproc.get("type") or ""
+        apply_title = (
+            node.get("title")
+            or f"Apply#{node.get('id', 0)}"
+        )
+
+        cn_name = None
+        named = cn_loader.get("widgets_values_named") or {}
+        if named:
+            cn_name = named.get("control_net_name")
+        if cn_name is None:
+            wv = cn_loader.get("widgets_values") or []
+            if wv:
+                cn_name = wv[0]
+        if not cn_name:
+            continue
+
+        out.append({
+            "title":              apply_title,
+            "preprocessor_title": pre_title,
+            "controlnet_name":    cn_name,
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+#  Preprocessed-image store
+# ---------------------------------------------------------------------------
 
 def _store_preprocessed(h: str, png_bytes: bytes,
                         width: int, height: int) -> None:
@@ -85,11 +217,16 @@ def _store_preprocessed(h: str, png_bytes: bytes,
         }
 
 
+# ---------------------------------------------------------------------------
+#  State normalisation
+# ---------------------------------------------------------------------------
+
 def _default_state():
     return {
-        "image_hash": "",
-        "image_dims": [0, 0],
-        "controlnets": [],
+        "image_hash":    "",
+        "image_dims":    [0, 0],
+        "controlnets":   [],
+        "apply_enabled": {},
     }
 
 
@@ -116,10 +253,18 @@ def _normalize_state(raw):
         if isinstance(cn, dict):
             controlnets.append(cn)
 
+    apply_enabled = {}
+    raw_ae = raw.get("apply_enabled")
+    if isinstance(raw_ae, dict):
+        for k, v in raw_ae.items():
+            if isinstance(k, str) and isinstance(v, bool):
+                apply_enabled[k] = v
+
     return {
-        "image_hash":  hash_val,
-        "image_dims":  dims,
-        "controlnets": controlnets,
+        "image_hash":    hash_val,
+        "image_dims":    dims,
+        "controlnets":   controlnets,
+        "apply_enabled": apply_enabled,
     }
 
 
@@ -140,6 +285,20 @@ def handle_state(payload):
     if payload.get("op") == "set":
         raw = payload.get("state") or {}
         normalized = _normalize_state(raw)
+
+        # If the caller omitted `apply_enabled` (older clients, or the
+        # panel's first sync before it has fetched the apply-node
+        # list), preserve whatever the server already had.  A
+        # non-empty dict in the payload always replaces — including
+        # one where every value is `false` (that is a valid "user
+        # disabled everything" state, not "clear the field").
+        if not normalized["apply_enabled"]:
+            with _state_lock:
+                if _state is not None:
+                    normalized["apply_enabled"] = dict(
+                        _state.get("apply_enabled") or {}
+                    )
+
         new_version = _compute_version(normalized)
         with _state_lock:
             _state = normalized
@@ -148,14 +307,27 @@ def handle_state(payload):
             f"state set: hash={normalized['image_hash'][:8]} "
             f"dims={normalized['image_dims']} "
             f"controlnets={len(normalized['controlnets'])} "
+            f"apply_enabled={len(normalized['apply_enabled'])} "
             f"v{new_version[:8]}"
         )
         return {"success": True, "version": new_version}
 
     state_snapshot, version_snapshot = _read_state_snapshot()
+
+    # Merge in workflow-file apply nodes with current enabled flags.
+    # Re-reads the workflow file every GET so that adding a node to
+    # the file is picked up by the panel on the next page refresh.
+    apply_nodes = _load_workflow_apply_nodes()
+    enabled_map = state_snapshot.get("apply_enabled") or {}
+    apply_nodes_with_state = [
+        {**n, "enabled": enabled_map.get(n["title"], True)}
+        for n in apply_nodes
+    ]
+
     return {
-        "success": True,
-        "version": version_snapshot,
+        "success":     True,
+        "version":     version_snapshot,
+        "apply_nodes": apply_nodes_with_state,
         **state_snapshot,
     }
 
@@ -241,17 +413,6 @@ def handle_controlnet_image(payload):
 # ---------------------------------------------------------------------------
 #  /krita/push_controlnets, /krita/refresh_controlnets
 # ---------------------------------------------------------------------------
-#
-# A "scratch doc" workflow: the playground pushes its preprocessed
-# controlnet images into a named Krita document (one layer per image,
-# layer names == preprocessor titles), the user paints in Krita,
-# then presses Refresh from Krita to pull the edited pixels back.
-#
-# The doc name is fixed (`CONTROLNETS_DOC_NAME`).  On push, if the doc
-# already exists at the right size, layers are replaced in place; if
-# it exists at a different size it is closed and recreated.  On
-# refresh, the doc is activated (so `get_layer_pixels_b64` reads from
-# it), each layer is read, and the previous active doc is restored.
 
 def _all_documents():
     resp = krita_client.send({"type": "get_all_documents"}, timeout=15.0)
@@ -289,7 +450,6 @@ def handle_krita_push_controlnets(payload):
             and int(existing.get("height") or 0) == doc_h
         )
         if not same_dims:
-            # Wrong size — close and recreate at the new dims.
             krita_client.send(
                 {"type": "close_document", "name": doc_name},
                 timeout=15.0,
@@ -304,9 +464,6 @@ def handle_krita_push_controlnets(payload):
                 return {"success": False,
                         "message": f"recreate doc failed: "
                                    f"{resp.get('message')}"}
-        # else: same dims, doc already exists — no view operation
-        #       needed.  The layer-creation batch below targets the doc
-        #       by name and does not require it to be the active tab.
     else:
         resp = krita_client.send({
             "type": "create_new_with_dimensions",
@@ -405,10 +562,6 @@ def handle_krita_refresh_controlnets(payload):
         return {"success": False,
                 "message": f"doc {doc_name!r} not found — push first"}
 
-    # Read every layer by (document, layer) pair.  No activation, no
-    # tab switching: `get_layer_pixels_b64` targets the document by
-    # name, so the user's current Krita tab is untouched and no clone
-    # tabs are created.
     results = []
     for title in titles:
         try:
@@ -455,7 +608,7 @@ def handle_krita_refresh_controlnets(payload):
 
 
 # ---------------------------------------------------------------------------
-#  Krita proxies (unchanged from previous skeleton)
+#  Krita proxies (unchanged)
 # ---------------------------------------------------------------------------
 
 def _fetch_active_state():

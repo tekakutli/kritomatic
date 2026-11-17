@@ -1,6 +1,6 @@
 """Controlnets playground's panel CSS and body.
 
-Sections: Image, Controlnets, State.
+Sections: Image, Controlnets, Apply Nodes, State.
 
 Image loading is `@thecontrolnet`-only — no local file pick, no
 clear, no Krita composite import.  The selector picked in the
@@ -13,14 +13,17 @@ node in `data/controlnets/controlnets_workflow.json` against
 `@thecontrolnet` and lists each preprocessor's title as a clickable
 tag.  Clicking a tag shows that preprocessed image on the canvas
 (letterboxed into the same fit rect); clicking `Back to
-@thecontrolnet` restores the source image.
+@thecontrolnet` restores the source image.  There are NO enable
+checkboxes here — preprocessor results are always serialised into
+`/state.controlnets`.  Two Apply nodes sharing a preprocessor (e.g.
+DEPTH and DEPTH FULL, both Zoe-based) would break if the
+preprocessor itself could be dropped.
 
-Each ready tag also carries an enable checkbox.  Unchecked
-controlnets are omitted from `/state`, so `ControlNetsConditioning`
-in ComfyUI skips their chain step for the next generation.  The row
-is dimmed and the title struck through to signal "present but not
-being applied".  Errors / running / pending rows have no checkbox
-and cannot be toggled.
+The Apply Nodes section lists every `ControlNetApplyAdvanced` from
+the workflow file, labelled with its title, each with an enable
+checkbox.  `ControlNetsConditioning` consults `/state.apply_enabled`
+and skips any disabled entry in its chain build.  That is where the
+per-apply "run this one, skip that one" toggle lives.
 
 The `Push to Krita` button copies every done controlnet into a
 scratch Krita document (`kritomatic_controlnets`), one layer per
@@ -107,21 +110,27 @@ PG_CSS = r"""
   }
   #stateInfo code { color:#00e5ff; }
 
-  .controlnetList {
+  .controlnetList,
+  .applyNodeList {
     display:flex; flex-direction:column; gap:3px;
     margin-top:6px;
     max-height: 240px;
     overflow-y: auto;
   }
-  .controlnetList::-webkit-scrollbar { width:6px; }
-  .controlnetList::-webkit-scrollbar-thumb {
+  .controlnetList::-webkit-scrollbar,
+  .applyNodeList::-webkit-scrollbar { width:6px; }
+  .controlnetList::-webkit-scrollbar-thumb,
+  .applyNodeList::-webkit-scrollbar-thumb {
     background:#1e2836; border-radius:3px;
   }
-  .controlnetList .empty {
+  .controlnetList .empty,
+  .applyNodeList .empty {
     font-size:10px; color:#3d4756;
     font-style:italic; padding:3px 4px;
   }
-  .controlnetRow {
+
+  .controlnetRow,
+  .applyNodeRow {
     display:flex; align-items:center; gap:8px;
     padding:3px 6px;
     border:1px solid #223040;
@@ -131,6 +140,7 @@ PG_CSS = r"""
     letter-spacing:0.04em;
     flex: 0 0 auto;
   }
+
   .controlnetRow[data-clickable="1"] {
     cursor:pointer;
   }
@@ -143,19 +153,7 @@ PG_CSS = r"""
     color:#b8ecff;
     background:rgba(0,229,255,0.06);
   }
-  .controlnetRow input[type=checkbox] {
-    flex: 0 0 auto;
-    accent-color: #00e5ff;
-    cursor: pointer;
-    margin: 0;
-    width: 13px;
-    height: 13px;
-  }
-  .controlnetRow.disabled { opacity: 0.45; }
-  .controlnetRow.disabled .controlnetTitle {
-    text-decoration: line-through;
-    text-decoration-color: rgba(212,133,144,0.55);
-  }
+
   .controlnetTitle {
     flex: 1 1 auto;
     font-weight:700;
@@ -172,6 +170,36 @@ PG_CSS = r"""
   .controlnetStatus.running { color: #ffc966; }
   .controlnetStatus.done    { color: #00e5ff; }
   .controlnetStatus.error   { color: #d48590; }
+
+  .applyNodeRow input[type=checkbox] {
+    flex: 0 0 auto;
+    accent-color: #00e5ff;
+    cursor: pointer;
+    margin: 0;
+    width: 13px;
+    height: 13px;
+  }
+  .applyNodeRow.disabled { opacity: 0.45; }
+  .applyNodeRow.disabled .applyNodeTitle {
+    text-decoration: line-through;
+    text-decoration-color: rgba(212,133,144,0.55);
+  }
+  .applyNodeTitle {
+    flex: 1 1 auto;
+    font-weight: 700;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .applyNodeCn {
+    flex: 0 0 auto;
+    font-size: 9px;
+    color: #5a6774;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 45%;
+  }
 """
 
 
@@ -218,6 +246,13 @@ PG_PANEL_BODY = r"""
           </button>
         </div>
         <div id="controlnetList" class="controlnetList"></div>
+      </div>
+    </details>
+
+    <details class="section" open>
+      <summary>Apply Nodes</summary>
+      <div class="section-body">
+        <div id="applyNodeList" class="applyNodeList"></div>
       </div>
     </details>
 

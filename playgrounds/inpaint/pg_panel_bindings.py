@@ -2,8 +2,8 @@
 boot-sync routine.
 
 Operations exposed by this playground:
-  - Load image (file, drop; autosync from @thecanvas)
-  - Load masks (import from Krita, pick a PNG file)
+  - Import masks from Krita
+  - Refresh @thecanvas
   - Select / delete masks
   - Rotate the playground view (single scrub input)
   - Materialise the context rectangle as a mask
@@ -11,15 +11,18 @@ Operations exposed by this playground:
   - ComfyUI / Krita status checks
 
 Not present: Inpaint button, Cancel button, prompt field, interceptor
-routing.  Generation is triggered by the docker's Run button; the
-playground's job is to push state into Krita scratch layers so that
-run finds the right canvas / mask / context rectangle.
+routing, pick-image / pick-mask / clear-image buttons, drop overlay.
+Generation is triggered by the docker's Run button; the playground's
+job is to push state into Krita scratch layers so that run finds the
+right canvas / mask / context rectangle.  The image is pulled
+exclusively from the daemon (autosync + manual refresh), never from
+a local file.
 
 SYNC TRIGGERS
 =============
 Every user-facing state mutation below calls `scheduleSync()` after
-updating the model.  Image loads and mask imports go through the
-debounced path; rotation changes bypass the debounce (handled in
+updating the model.  Mask imports go through the debounced path;
+rotation changes bypass the debounce (handled in
 `pg_panel_scrubs.js`).  Autosync from @thecanvas does NOT schedule a
 push — pushing back what was just pulled would be wasteful.
 
@@ -31,7 +34,7 @@ match.  (A full-dims mismatch clears the context rect, since its
 coords referred to the old dims, but masks keep their pixel data.)"""
 
 PANEL_BINDINGS_JS = r"""
-import { board, setImage, clearImage, applyCanvasImage,
+import { board, applyCanvasImage,
          _scheduleDraw, view, _applyRotation } from "./pg_state.js";
 import {
   setMasks, addMaskFromB64,
@@ -42,7 +45,7 @@ import { buildMaskFromContextRectB64 } from "./pg_inpaint.js";
 import { syncMaskList } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
 import { scheduleSync, syncNow } from "./pg_sync.js";
-import { uploadImageFile, fetchStatus } from "./pg_comfy_client.js";
+import { fetchStatus } from "./pg_comfy_client.js";
 import {
   checkKritaStatus, importKritaMasks, fetchActiveState,
   fetchResourceImage,
@@ -51,96 +54,6 @@ import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyAll,
 } from "./pgkit/remote_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
-
-/* ============================================================
-   File picking / drop
-   ============================================================ */
-
-function _showDropOverlay(on) {
-  const el = document.getElementById("dropOverlay");
-  if (el) el.classList.toggle("visible", on);
-}
-
-function _installDropOverlay() {
-  if (document.getElementById("dropOverlay")) return;
-  const el = document.createElement("div");
-  el.id = "dropOverlay";
-  el.textContent = "Drop an image";
-  document.body.appendChild(el);
-}
-
-async function _handleDroppedFile(file) {
-  flashStatus("uploading " + file.name + "\u2026", "");
-  try {
-    const info = await uploadImageFile(file);
-    const dataUrl = await _fileToDataUrl(file);
-    setImage(info.hash, dataUrl, info.width, info.height);
-    flashStatus("image loaded: " + file.name, "ok");
-    syncPanelFields();
-    syncMaskList();
-    pgkitNotifyAll();
-    scheduleSync();
-    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-  } catch (e) {
-    flashStatus("upload failed: " + e.message, "bad");
-  }
-}
-
-function _fileToDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ""));
-    reader.onerror = () => reject(new Error("could not read file"));
-    reader.readAsDataURL(file);
-  });
-}
-
-function _pickImageAction() {
-  const input = document.createElement("input");
-  input.type = "file";
-  input.accept = "image/*";
-  input.addEventListener("change", () => {
-    const file = input.files && input.files[0];
-    if (file) _handleDroppedFile(file);
-  });
-  input.click();
-}
-
-function _pickMaskAction() {
-  const input = document.createElement("input");
-  input.type = "file";
-  input.accept = "image/png,image/*";
-  input.addEventListener("change", () => {
-    const file = input.files && input.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = String(reader.result || "");
-      const b64 = dataUrl.replace(/^data:image\/[^;]+;base64,/, "");
-      const newIdx = addMaskFromB64(b64);
-      board.selectedMaskIndices = [newIdx];
-      syncMaskList();
-      syncPanelFields();
-      pgkitNotifyAll();
-      scheduleSync();
-      import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-    };
-    reader.onerror = () => flashStatus("could not read mask file", "bad");
-    reader.readAsDataURL(file);
-  });
-  input.click();
-}
-
-function _clearImageAction() {
-  clearImage();
-  const rotEl = document.getElementById("viewRotation");
-  if (rotEl) rotEl.value = "0";
-  syncPanelFields();
-  syncMaskList();
-  pgkitNotifyAll();
-  scheduleSync();
-  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-}
 
 /* ============================================================
    Manual @thecanvas refresh
@@ -417,7 +330,6 @@ async function _kritaImportMasksAction() {
 export function installPanelBindings() {
   const el = {};
   const ids = [
-    "pickImageBtn", "clearImageBtn", "pickMaskBtn",
     "kritaImportMasksBtn",
     "kritaCheckBtn",
     "maskFromRectBtn",
@@ -426,9 +338,6 @@ export function installPanelBindings() {
   ];
   for (const id of ids) el[id] = document.getElementById(id);
 
-  if (el.pickImageBtn)   el.pickImageBtn.addEventListener("click", _pickImageAction);
-  if (el.clearImageBtn)  el.clearImageBtn.addEventListener("click", _clearImageAction);
-  if (el.pickMaskBtn)    el.pickMaskBtn.addEventListener("click", _pickMaskAction);
   if (el.kritaImportMasksBtn) el.kritaImportMasksBtn.addEventListener("click", _kritaImportMasksAction);
   if (el.kritaCheckBtn)  el.kritaCheckBtn.addEventListener("click", _kritaStatusRefresh);
   if (el.maskFromRectBtn) el.maskFromRectBtn.addEventListener("click", _maskFromRectAction);
@@ -441,36 +350,12 @@ export function installPanelBindings() {
     statusEl.title = "Click to re-check ComfyUI";
     statusEl.addEventListener("click", _checkStatusAction);
   }
-
-  _installDropOverlay();
-  let _dragDepth = 0;
-  window.addEventListener("dragenter", () => {
-    _dragDepth += 1;
-    if (_dragDepth > 0) _showDropOverlay(true);
-  });
-  window.addEventListener("dragleave", () => {
-    _dragDepth -= 1;
-    if (_dragDepth <= 0) _showDropOverlay(false);
-  });
-  window.addEventListener("dragover", (e) => e.preventDefault());
-  window.addEventListener("drop", (e) => {
-    e.preventDefault();
-    _dragDepth = 0;
-    _showDropOverlay(false);
-    const file = e.dataTransfer && e.dataTransfer.files
-                 && e.dataTransfer.files[0];
-    if (file && file.type.startsWith("image/")) _handleDroppedFile(file);
-  });
 }
 
 /* ============================================================
    Actions
    ============================================================ */
 
-pgkitRegisterAction("action.clearImage", {
-  label: "Clear image", scope: "global", run: _clearImageAction,
-  meta: { variant: "plain" },
-});
 pgkitRegisterAction("action.refreshCanvas", {
   label: "Refresh @thecanvas", scope: "global", run: _refreshCanvasAction,
   meta: { variant: "plain",

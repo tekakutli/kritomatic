@@ -49,11 +49,21 @@ The first case covers a playground that returns one entry per
 ControlNetApplyAdvanced; the second covers a playground that returns
 one entry per unique preprocessor.  Either shape works.
 
-If a ControlNetApplyAdvanced node cannot be matched against anything
-in the playground state, it is skipped with a log line — the rest of
-the chain still runs.  When the reason is "the user disabled this
-row in the playground", the skip is the intended effect, not a
-failure.
+PER-APPLY ENABLE FILTER
+=======================
+Before matching to a playground entry, the node consults
+`state.apply_enabled` — a `{apply_title: bool}` dict set by the
+playground's panel.  If an entry's `apply_title` maps to `False`,
+the node skips that chain step with a log line and moves on:
+
+    if apply_enabled.get(entry["apply_title"], True) is False:
+        skipped.append(f"{title!r} (disabled in playground)")
+        continue
+
+This is how a user disables e.g. DEPTH FULL without affecting DEPTH:
+both share the same Zoe preprocessed image, but their apply titles
+are independently toggled.  The node still stages that shared image
+if any enabled chain entry references it.
 
 GRACEFUL DEGRADATION
 ====================
@@ -258,8 +268,7 @@ def _build_chain_config(workflow):
         )
         apply_title = (
             node.get("title")
-            or node.get("type")
-            or ""
+            or f"Apply#{node.get('id', 0)}"
         )
 
         ctrl_name = None
@@ -331,7 +340,9 @@ class ControlNetsConditioning(io.ComfyNode):
                 "end) from `data/controlnets/controlnets_workflow.json` "
                 "and pulls the preprocessed images from the playground "
                 "at generation time.  Slots in place of the original "
-                "ControlNets subgraph — same inputs, same outputs."
+                "ControlNets subgraph — same inputs, same outputs.  "
+                "Per-apply enable flags are read from "
+                "`/state.apply_enabled`; disabled entries are skipped."
             ),
             enable_expand=True,
             inputs=[
@@ -395,11 +406,10 @@ class ControlNetsConditioning(io.ComfyNode):
         ComfyUI will not re-execute a node whose `IS_CHANGED` value
         has not moved since the last run.  The playground `/version`
         covers "user re-preprocessed the controlnet images" and "user
-        toggled an enable checkbox"; the workflow file's content hash
-        covers "user added / removed / edited a ControlNetApplyAdvanced
-        node in `controlnets_workflow.json`".  Without the file hash,
-        editing the workflow file would silently do nothing until
-        something *else* bumped the cache.
+        toggled an Apply Node's checkbox"; the workflow file's content
+        hash covers "user added / removed / edited a
+        ControlNetApplyAdvanced node in
+        `controlnets_workflow.json`".
         """
         playground_url = (playground_url or _DEFAULT_PLAYGROUND_URL).strip()
         wf_path = (workflow_path or "").strip() or _DEFAULT_WORKFLOW_PATH
@@ -476,6 +486,13 @@ class ControlNetsConditioning(io.ComfyNode):
             )
             return io.NodeOutput(positive, negative)
 
+        # Per-apply enable flags.  Missing entries default to enabled,
+        # so a fresh playground with no toggles yet applies all
+        # ControlNets.  See module docstring "PER-APPLY ENABLE FILTER".
+        apply_enabled = state.get("apply_enabled") or {}
+        if not isinstance(apply_enabled, dict):
+            apply_enabled = {}
+
         # --- 3. Stage images and build the graph ---
         input_dir = folder_paths.get_input_directory()
         staged = {}          # hash -> staged filename
@@ -487,6 +504,12 @@ class ControlNetsConditioning(io.ComfyNode):
         skipped = []
 
         for entry in chain:
+            if apply_enabled.get(entry["apply_title"], True) is False:
+                skipped.append(
+                    f"{entry['apply_title']!r} (disabled in playground)"
+                )
+                continue
+
             pg = _find_pg_entry(pg_by_name, entry)
             if pg is None:
                 skipped.append(

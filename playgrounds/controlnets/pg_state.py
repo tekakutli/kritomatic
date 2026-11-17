@@ -1,4 +1,4 @@
-"""Controlnets state: image, controlnets, view, draw hook.
+"""Controlnets state: image, controlnets, apply nodes, view, draw hook.
 
 Leaf module.  Every other JS module imports from here; nothing here
 imports from them.
@@ -7,7 +7,7 @@ imports from them.
 entry has shape:
 
     {
-      title:  str,                    // the ControlNetApply node's title
+      title:  str,                    // the preprocessor's title
       status: "done" | "error",
       hash:   str,                    // hex digest, for state sync
       dataUrl: str,                   // "data:image/png;base64,..."
@@ -16,14 +16,26 @@ entry has shape:
       error:  str | null,
     }
 
+`board.applyNodes` holds the ControlNetApplyAdvanced entries from
+`controlnets_workflow.json`, as returned by `/state`'s `apply_nodes`
+field.  Each entry has shape:
+
+    {
+      title:              str,       // ControlNetApplyAdvanced's title
+      preprocessor_title: str,       // upstream preprocessor's title
+      controlnet_name:    str,       // ControlNetLoader's name
+      enabled:            bool,
+    }
+
+The node iterates its chain (built from the same file) and skips any
+entry whose `apply_title` maps to a `false` value in the state's
+`apply_enabled` dict.  The panel renders a checkbox per entry and
+toggles `enabled`; the next state sync carries the updated dict.
+
 `board.viewingControlnetTag` is the title of the controlnet currently
 being viewed, or `null` when `@thecontrolnet` itself is on the canvas.
 Preprocessed images are not draggable; clicking a tag swaps the canvas
 image, clicking "Back to @thecontrolnet" restores `@thecontrolnet`.
-
-`applyCanvasImage` clears `board.controlnets` and
-`board.viewingControlnetTag` when the image hash changes — old
-preprocessed results are stale against new @thecontrolnet pixels.
 """
 
 STATE_JS = r"""
@@ -166,6 +178,10 @@ export const board = {
   controlnets:          [],
   viewingControlnetTag: null,
   preprocessRunning:    false,
+
+  // ControlNetApplyAdvanced entries from controlnets_workflow.json,
+  // populated from `/state`'s apply_nodes field.  See module docstring.
+  applyNodes: [],
 
   lastSync:  null,
   syncError: null,

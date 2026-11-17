@@ -8,14 +8,12 @@ acyclic.
 
 `board` carries every piece of user-visible state.
 
-`setImage` and `clearImage` inline their board-resetting logic (mask
-array, inpaint context rectangle) rather than importing
-`pg_masks.clearMasks`.  That preserves this module as a leaf.
-
-`applyCanvasImage` is the autosync target: updates the displayed
-image without clearing masks or the inpaint context rect (unless
-image dimensions changed).  Used by `pg_autosync.js` when the
-daemon's `@thecanvas` spec changes, and by the manual refresh action.
+`applyCanvasImage` is the sole image-install path: updates the
+displayed image from an external source (autosync poll on `@thecanvas`
+spec change, or the manual `Refresh @thecanvas` button) without
+clearing masks or the inpaint context rect (unless image dimensions
+changed).  The former `setImage` / `clearImage` helpers existed for
+the removed pick-image / clear / drop-overlay buttons and are gone.
 
 The `lastSync`, `syncing`, and `syncError` fields are set by
 `pg_sync.js` — they drive the panel's status line and nothing else.
@@ -72,16 +70,14 @@ other sig input changing:
       changes (new Image objects), but `masks.length` and
       `selectedMaskIndices` are unchanged.
     · `replaceMaskAt(idx, b64)` — same.
-    · `applyCanvasImage` / `setImage` / `clearImage` invalidate
-      `_pixels`/`_tinted` caches on every mask; the tint must be
-      rebuilt from the same underlying bytes but against the (new)
-      image frame.
+    · `applyCanvasImage` invalidates `_pixels`/`_tinted` caches on
+      every mask; the tint must be rebuilt from the same underlying
+      bytes but against the (new) image frame.
 
 It is exported here so `pg_view.py` can include it in the image
-sig, and so `pg_state.js`'s own `setImage` / `clearImage` /
-`applyCanvasImage` can bump it inline (they mutate `board.masks` or
-its caches directly and cannot import `pg_masks.js` without
-inverting the leaf-module dependency).
+sig, and so `pg_state.js`'s own `applyCanvasImage` can bump it
+inline (it mutates `board.masks` caches directly and cannot import
+`pg_masks.js` without inverting the leaf-module dependency).
 
 `fittedImageRect()` is memoized on the tuple of inputs that fully
 determine its result: `(innerWidth, innerHeight, imageWidth,
@@ -268,54 +264,11 @@ export function _rotateMask(entry, angle) {
 }
 
 /* ============================================================
-   Image loading / clearing
-   ============================================================ */
-
-export function setImage(hash, dataUrl, width, height) {
-  board.imageHash     = hash;
-  board.originalDataUrl = dataUrl;
-  board.originalWidth   = width;
-  board.originalHeight  = height;
-  board.originalImageEl = null;
-
-  board.imageEl      = null;
-  board.imageWidth   = 0;
-  board.imageHeight  = 0;
-  board.imageDataUrl = null;
-
-  board.masks = [];
-  board.selectedMaskIndices = [];
-  board.hoveredMaskIdx = -1;
-  board.inpaintContext = {
-    x: 0, y: 0, w: 0, h: 0, activeHandle: null,
-  };
-  _bumpMasksVersion();
-  resetView();
-
-  const img = new Image();
-  img.onload = () => {
-    board.originalImageEl = img;
-    board.originalWidth   = img.naturalWidth;
-    board.originalHeight  = img.naturalHeight;
-    board.imageEl         = img;
-    board.imageWidth      = img.naturalWidth;
-    board.imageHeight     = img.naturalHeight;
-    board.imageDataUrl    = dataUrl;
-    _applyRotation(view.rotation);
-  };
-  img.onerror = () => {
-    board.originalImageEl = null;
-    _scheduleDraw();
-  };
-  img.src = dataUrl;
-  _scheduleDraw();
-}
-
-/* ============================================================
    applyCanvasImage — autosync / manual-refresh target
    ============================================================
    Swap the displayed image in response to a `@thecanvas` resource
-   spec change or a manual refresh.  Unlike `setImage`, this:
+   spec change or a manual refresh.  This is the sole image-install
+   path: every image enters the playground from the daemon.  It:
 
      * keeps the mask stack (invalidating only their pixel caches so
        the tinted overlays rebuild);
@@ -364,30 +317,6 @@ export function applyCanvasImage(hash, dataUrl, width, height) {
   };
   img.onerror = () => _scheduleDraw();
   img.src = dataUrl;
-  _scheduleDraw();
-}
-
-export function clearImage() {
-  board.imageHash     = null;
-  board.originalDataUrl = null;
-  board.originalWidth   = 0;
-  board.originalHeight  = 0;
-  board.originalImageEl = null;
-
-  board.imageEl      = null;
-  board.imageWidth   = 0;
-  board.imageHeight  = 0;
-  board.imageDataUrl = null;
-
-  view.rotation = 0;
-  resetView();
-  board.masks = [];
-  board.selectedMaskIndices = [];
-  board.hoveredMaskIdx = -1;
-  board.inpaintContext = {
-    x: 0, y: 0, w: 0, h: 0, activeHandle: null,
-  };
-  _bumpMasksVersion();
   _scheduleDraw();
 }
 

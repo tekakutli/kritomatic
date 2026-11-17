@@ -10,6 +10,14 @@ the docker's Run button does.  This playground's job is to push state
 into Krita scratch layers so the docker's run finds the right canvas,
 mask, and context rectangle.  See `pg_sync.js`.
 
+The `+ Pick image…`, `Clear`, and `+ Pick mask file…` buttons and the
+drag-drop overlay are gone too.  The image is pulled from the daemon
+by `pg_autosync.js`; `Refresh @thecanvas` bypasses the spec-change
+gate to re-read when the pixels behind a constant spec changed in
+Krita.  Masks come in from `+ Import masks from Krita` and are created
+from the context rectangle via `+ As mask`.  There is no local-file
+or dropped-file install path — every install is daemon-mediated.
+
 The `#inpaintEnabled` checkbox ("Context rectangle") stays: it decides
 whether `thecontext` is pushed with a white rectangle or left alone.
 When off, the daemon falls back to the `@thecontext` layer's own tight
@@ -32,14 +40,10 @@ wins over the shared `background: #0a0e14`.  Without that override
 the overlay would be opaque dark and hide the image layer entirely."""
 
 PG_CSS = r"""
-  #ui button#pickImageBtn,
-  #ui button#pickMaskBtn,
   #ui button#refreshCanvasBtn {
     border-color: rgba(120, 220, 255, 0.72);
     color: #b8ecff;
   }
-  #ui button#pickImageBtn:hover:not(:disabled),
-  #ui button#pickMaskBtn:hover:not(:disabled),
   #ui button#refreshCanvasBtn:hover:not(:disabled) {
     border-color: rgba(140, 225, 255, 1.00);
     background: rgba(120, 220, 255, 0.10);
@@ -158,22 +162,6 @@ PG_CSS = r"""
     letter-spacing:0 !important;
   }
 
-  #dropOverlay {
-    position:fixed; inset:0; z-index:100;
-    display:none;
-    background:rgba(0,229,255,0.06);
-    border:2px dashed rgba(0,229,255,0.65);
-    box-sizing:border-box;
-    pointer-events:none;
-    align-items:center; justify-content:center;
-    font-family:'JetBrains Mono','Fira Code','Consolas','SF Mono',monospace;
-    font-size:14px; font-weight:700;
-    color:#b8ecff;
-    letter-spacing:0.16em; text-transform:uppercase;
-    text-shadow:0 0 12px rgba(0,229,255,0.55);
-  }
-  #dropOverlay.visible { display:flex; }
-
   #imageInfo {
     font-size:10px; color:#5a6774;
     margin:4px 0;
@@ -215,28 +203,18 @@ PG_PANEL_BODY = r"""
       <summary>Image</summary>
       <div class="section-body">
         <div class="row">
-          <button id="pickImageBtn" title="Pick an image file">+ Pick image…</button>
-          <button id="clearImageBtn" title="Clear the current image">Clear</button>
-        </div>
-        <div class="row">
           <button id="kritaImportMasksBtn"
                   title="Import the selected mask or paint layer(s) from Krita into the playground's mask stack.">
             + Import masks from Krita
           </button>
         </div>
         <div class="row">
-          <button id="pickMaskBtn"
-                  title="Pick a PNG from disk as a mask.">
-            + Pick mask file…
-          </button>
-        </div>
-        <div class="row">
           <button id="refreshCanvasBtn"
-                  title="Re-fetch the current @thecanvas from Krita.">
+                  title="Re-fetch the current @thecanvas from Krita. Use when the canvas changed in Krita but autosync did not pick it up — the poller fires only when the @thecanvas *spec* changes, not when the pixels behind a constant spec change.">
             ↻ Refresh @thecanvas
           </button>
         </div>
-        <div id="imageInfo">No image loaded — drop one on the canvas</div>
+        <div id="imageInfo">No image loaded — load a workflow in the docker to pull @thecanvas</div>
         <div class="row" style="margin-top:4px;">
           <button id="kritaCheckBtn">Check Krita</button>
           <span id="kritaStatus">not checked</span>

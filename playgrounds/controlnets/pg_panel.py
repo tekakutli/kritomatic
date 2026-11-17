@@ -1,5 +1,5 @@
-"""Panel handlers: refresh @thecontrolnet, preprocess, list, state sync,
-and the Krita round-trip (push / refresh).
+"""Panel handlers: refresh @thecontrolnet, preprocess, list, apply
+nodes, state sync, and the Krita round-trip (push / refresh).
 
 Preprocess flow: click "Preprocess images" → the browser POSTs
 `@thecontrolnet`'s PNG to `/preprocess` → the server reads
@@ -14,23 +14,22 @@ clickable rows.  Clicking a done row sets
 image (letterboxed into the fit rect).  Clicking "Back to
 @thecontrolnet" resets the tag.
 
-ENABLED / DISABLED ROWS
-=======================
-Each ready row carries a checkbox.  Its `enabled` flag defaults to
-true and is user-toggleable.  Only enabled rows are serialised into
-`/state`'s `controlnets` array — see `_doStateSync`'s filter — so a
-disabled row is completely absent from the state the
-`ControlNetsConditioning` node pulls at generation time.  That is
-how "uncheck DEPTH" turns into "the node skips DEPTH this run":
-the playground does not need a separate channel, the state list
-itself is the channel.
+APPLY NODES (per-ControlNetApplyAdvanced enable)
+================================================
+Below the preprocessor list there is a second list: one row per
+`ControlNetApplyAdvanced` in the workflow file, labelled with its
+title, with a checkbox.  `board.applyNodes` is populated from
+`/state`'s `apply_nodes` field at boot (see `_bootPull`), which in
+turn derives from a fresh read of the workflow file — so adding an
+apply node to the file is picked up on the next page refresh.
 
-Disabled rows are dimmed and their title struck through; the row
-remains clickable for canvas preview (so a user can compare
-preprocessed variants before choosing which to include).  Toggling
-a checkbox rebuilds the list and re-schedules state sync — the
-`:off` marker in `_stateKey` guarantees the key moves and the sync
-fires.
+Only enabled apply titles are sent to `/state` under
+`apply_enabled`.  The `ControlNetsConditioning` node consults that
+dict and skips disabled entries.  This lets two apply nodes that
+share a preprocessor (e.g. DEPTH and DEPTH FULL, both Zoe-based) be
+toggled independently without dropping the preprocessor's pixels
+from the state.  The preprocessor list is always fully serialised
+into `/state.controlnets` — no filter.
 
 Krita round-trip:
   · "Push to Krita" POSTs every done controlnet to
@@ -45,8 +44,7 @@ Krita round-trip:
     workflow sees the new hashes.
 
 State sync fires after preprocess / refresh / toggle so the node's
-`/state` pull sees the current hashes.  Per-entry shape in `/state`
-mirrors the stub: `{id, name, image: {hash, width, height}}`.
+`/state` pull sees the current hashes and apply_enabled dict.
 """
 
 PANEL_JS = r"""
@@ -80,10 +78,10 @@ function _stateKey() {
     board.imageWidth + "x" + board.imageHeight,
   ];
   for (const c of board.controlnets) {
-    parts.push(
-      c.title + ":" + (c.hash || "err")
-      + (c.status === "done" && c.enabled === false ? ":off" : "")
-    );
+    parts.push(c.title + ":" + (c.hash || "err"));
+  }
+  for (const n of board.applyNodes) {
+    parts.push(n.title + "=" + (n.enabled !== false ? "1" : "0"));
   }
   return parts.join("|");
 }
@@ -97,25 +95,37 @@ async function _doStateSync() {
   _syncTimer = null;
   const key = _stateKey();
   const wireControlnets = board.controlnets
-    .filter(c => c.status === "done" && c.enabled !== false)
+    .filter(c => c.status === "done")
     .map(c => ({
       id:    c.title,
       name:  c.title,
       image: { hash: c.hash, width: c.width, height: c.height },
     }));
 
+  // Build apply_enabled from the panel's current knowledge.  Omitted
+  // from the POST when the panel hasn't yet bootstrapped (bootPull
+  // not finished) — the server preserves whatever it already had.
+  const applyEnabled = {};
+  for (const n of board.applyNodes) {
+    if (n && typeof n.title === "string" && n.title) {
+      applyEnabled[n.title] = n.enabled !== false;
+    }
+  }
+
+  const nextState = {
+    image_hash:  board.imageHash || "",
+    image_dims:  [board.imageWidth, board.imageHeight],
+    controlnets: wireControlnets,
+  };
+  if (Object.keys(applyEnabled).length > 0) {
+    nextState.apply_enabled = applyEnabled;
+  }
+
   try {
     const res = await fetch("/state", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        op: "set",
-        state: {
-          image_hash:  board.imageHash || "",
-          image_dims:  [board.imageWidth, board.imageHeight],
-          controlnets: wireControlnets,
-        },
-      }),
+      body: JSON.stringify({ op: "set", state: nextState }),
     });
     const data = await res.json();
     if (data.success) {
@@ -158,11 +168,13 @@ function _refreshStatusLine() {
     text = "no image loaded"; cls = "";
   } else if (board.lastSync) {
     const t = new Date(board.lastSync).toTimeString().slice(0, 8);
-    const total   = board.controlnets.length;
-    const enabled = board.controlnets.filter(c => c.enabled !== false).length;
+    const total    = board.controlnets.length;
+    const nApply   = board.applyNodes.length;
+    const nApplyOn = board.applyNodes.filter(n => n.enabled !== false).length;
     text = "synced " + t
          + " \u00b7 " + board.imageWidth + "\u00d7" + board.imageHeight
-         + " \u00b7 " + enabled + "/" + total + " controlnet(s)";
+         + " \u00b7 " + total + " preprocessor(s)"
+         + " \u00b7 " + nApplyOn + "/" + nApply + " apply";
     cls = "ok";
   } else {
     text = "not yet synced"; cls = "warn";
@@ -173,7 +185,7 @@ function _refreshStatusLine() {
 }
 
 /* ============================================================
-   Controlnet list
+   Controlnet (preprocessor) list — no enable toggles here
    ============================================================ */
 
 function _renderControlnetList() {
@@ -192,32 +204,10 @@ function _renderControlnetList() {
   }
 
   for (const c of board.controlnets) {
-    const enabled = (c.status !== "done") || c.enabled !== false;
     const row = document.createElement("div");
     row.className = "controlnetRow"
-      + (board.viewingControlnetTag === c.title ? " selected" : "")
-      + (!enabled ? " disabled" : "");
+      + (board.viewingControlnetTag === c.title ? " selected" : "");
     if (c.status === "done") row.dataset.clickable = "1";
-
-    // Checkbox — only on ready rows.  stopPropagation keeps a
-    // checkbox click from also triggering the row's click handler
-    // (which switches the canvas to that image).
-    if (c.status === "done") {
-      const cb = document.createElement("input");
-      cb.type    = "checkbox";
-      cb.checked = c.enabled !== false;
-      cb.title   = "Include this ControlNet in generation. Unchecked "
-                 + "controlnets are omitted from /state, so "
-                 + "ControlNetsConditioning skips their step.";
-      cb.addEventListener("click", (e) => e.stopPropagation());
-      cb.addEventListener("change", () => {
-        c.enabled = !!cb.checked;
-        _renderControlnetList();
-        _refreshStatusLine();
-        _scheduleStateSync();
-      });
-      row.appendChild(cb);
-    }
 
     const title = document.createElement("span");
     title.className = "controlnetTitle";
@@ -241,6 +231,60 @@ function _renderControlnetList() {
         syncPanelFields();
         import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
       });
+    }
+
+    list.appendChild(row);
+  }
+}
+
+/* ============================================================
+   Apply-node list — one row per ControlNetApplyAdvanced, with
+   an independent enable checkbox
+   ============================================================ */
+
+function _renderApplyNodeList() {
+  const list = document.getElementById("applyNodeList");
+  if (!list) return;
+  list.innerHTML = "";
+
+  if (board.applyNodes.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "no Apply nodes in workflow file";
+    list.appendChild(empty);
+    return;
+  }
+
+  for (const n of board.applyNodes) {
+    const enabled = n.enabled !== false;
+    const row = document.createElement("div");
+    row.className = "applyNodeRow" + (!enabled ? " disabled" : "");
+
+    const cb = document.createElement("input");
+    cb.type    = "checkbox";
+    cb.checked = enabled;
+    cb.title   = "Include " + n.title + " in generation. Unchecked "
+               + "Apply nodes are omitted from apply_enabled, so "
+               + "ControlNetsConditioning skips their chain step.";
+    cb.addEventListener("change", () => {
+      n.enabled = !!cb.checked;
+      _renderApplyNodeList();
+      _refreshStatusLine();
+      _scheduleStateSync();
+    });
+    row.appendChild(cb);
+
+    const title = document.createElement("span");
+    title.className = "applyNodeTitle";
+    title.textContent = n.title || "(untitled)";
+    row.appendChild(title);
+
+    if (n.controlnet_name) {
+      const cn = document.createElement("span");
+      cn.className = "applyNodeCn";
+      cn.textContent = String(n.controlnet_name).split("/").pop();
+      cn.title = n.controlnet_name;
+      row.appendChild(cn);
     }
 
     list.appendChild(row);
@@ -301,7 +345,7 @@ export function syncPanelFields() {
       : "\u2193 Refresh from Krita";
   }
 
-  // State sync on image / controlnets change.
+  // State sync on image / controlnets / apply-state change.
   const key = _stateKey();
   if (key !== _lastSyncedKey && _syncTimer === null) {
     _scheduleStateSync();
@@ -399,7 +443,6 @@ async function _preprocessAction() {
       height:  item.height,
       el:      null,
       error:   null,
-      enabled: true,
     };
     board.controlnets.push(entry);
 
@@ -620,7 +663,22 @@ async function _bootPull() {
       const v = (data.version || "").slice(0, 8);
       const el = document.getElementById("stateVersion");
       if (el) el.textContent = v || "—";
+
+      // Populate apply-node list from server.  The server re-reads
+      // the workflow file on every GET /state, so this is also how a
+      // freshly added ControlNetApplyAdvanced gets picked up — on the
+      // next page refresh.
+      if (Array.isArray(data.apply_nodes)) {
+        board.applyNodes = data.apply_nodes.map(n => ({
+          title:              n.title || "",
+          preprocessor_title: n.preprocessor_title || "",
+          controlnet_name:    n.controlnet_name || "",
+          enabled:            n.enabled !== false,
+        }));
+      }
+
       _lastSyncedKey = _stateKey();
+      _renderApplyNodeList();
     }
   } catch (_) {}
   syncPanelFields();
@@ -628,6 +686,7 @@ async function _bootPull() {
 
 export function controlnetsBootSync() {
   _renderControlnetList();
+  _renderApplyNodeList();
   syncPanelFields();
   _kritaStatusAction();
   _bootPull().catch(() => {});

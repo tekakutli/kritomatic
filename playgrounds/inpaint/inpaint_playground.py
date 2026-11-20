@@ -41,6 +41,30 @@ resource-filtering; the docker's `_update_playgrounds` skips them
 when building rows.  See `kritomatic_daemon/handlers/panel.py`'s
 `ResourcesProvider` and `kritomatic_daemon/panel/docker.py`'s
 `_update_playgrounds`.
+
+CANVAS-PUSH WIRING (Slice D)
+============================
+`main()` creates a `pgkit.remote_hub.Hub` instance and passes it to
+both:
+
+  · `kit_serve(hub=_shared_hub)` — so the `/remote` WebSocket
+    endpoint uses this hub instead of creating its own.
+
+  · `inpaint_server.set_browser_hub(_shared_hub)` — so the canvas
+    subscriber thread (spawned by `start_canvas_subscriber()`) has
+    something to broadcast through.
+
+Then `inpaint_server.start_canvas_subscriber()` spawns the thread
+that connects to the daemon's event stream (port 12347) and forwards
+`canvas_update` events to every connected browser over their
+`/remote` WebSocket as `patch` messages on the `canvas.pushed`
+field.  See `inpaint_server.py`'s module docstring, CANVAS_PUSH
+SUBSCRIBER, and `kritomatic_daemon/handlers/comfyui_generation.py`'s
+`_publish_canvas_update` for the daemon side.
+
+The net effect: after a batch pastes into Krita, the playground's
+canvas updates within ~100 ms instead of waiting for the next
+autosync poll tick + a fresh `doc.projection()` composite read.
 """
 
 import atexit
@@ -59,6 +83,7 @@ if _PLAYGROUNDS not in sys.path:
 
 from inpaint import inpaint_html, inpaint_server, playground_registry
 
+from pgkit.remote_hub import Hub
 from pgkit.server import serve as kit_serve
 
 
@@ -135,6 +160,15 @@ def main():
 
     atexit.register(_cleanup)
 
+    # Canvas-push wiring (Slice D).  Create the hub, register it with
+    # the inpaint server so the subscriber thread can broadcast
+    # through it, spawn the subscriber, then pass the same hub to
+    # `kit_serve()` so the `/remote` WebSocket endpoint uses it.  See
+    # the module docstring, CANVAS-PUSH WIRING.
+    shared_hub = Hub()
+    inpaint_server.set_browser_hub(shared_hub)
+    inpaint_server.start_canvas_subscriber()
+
     kit_serve(
         port           = PORT,
         open_browser   = OPEN_BROWSER,
@@ -143,6 +177,7 @@ def main():
         raw_routes     = inpaint_server.RAW_ROUTES,
         module_sources = inpaint_html.module_sources(),
         hub_name       = "inpaint",
+        hub            = shared_hub,
     )
 
 

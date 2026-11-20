@@ -41,19 +41,24 @@ drop overlay, "Sync now" button.  Generation is triggered by the
 docker's Run button; the playground's job is to push state into the
 inpaint server's cache (via `/sync`) so that run finds the right
 canvas / mask / context rectangle.  The image is pulled exclusively
-from the daemon (autosync + manual refresh), never from a local
-file.
+from the daemon (autosync + manual refresh + canvas-push), never
+from a local file.
 
 SYNC TRIGGERS
 =============
 Every user-facing state mutation below calls `scheduleSync()` after
 updating the model.  Mask imports go through the debounced path;
 rotation changes bypass the debounce (handled in
-`pg_panel_scrubs.js`).  Autosync from @thecanvas does NOT schedule a
-push on every poll — only on the first canvas arrival of the
-session, so the inpaint server's cache is warm (canvas + selection)
-before the first Run click.  See `pg_autosync.js`'s
-first-canvas-arrival branch.
+`pg_panel_scrubs.js`).  Autosync from @thecanvas calls
+`scheduleSync()` on every successful fetch (via
+`fetchAndSetCanvas`).  Batch-end canvas pushes call `scheduleSync()`
+via `applyPushedCanvas`.  Paste pushes call `scheduleSync()` via
+`applyPastedCanvas`.  That means:
+  · first canvas arrival → cache warm before the first Run click
+  · spec change → cache reflects the new layer/composite
+  · paste-applied (per paste) → cache reflects the pasted result
+    as soon as each paste lands
+  · batch-end (push) → cache reflects the final composite
 
 BOOT ORDER
 ==========
@@ -67,10 +72,40 @@ white push.
 
 MANUAL @thecanvas REFRESH
 =========================
-`_refreshCanvasAction` uses `applyCanvasImage`, which preserves the
-mask stack and the context rectangle when the new image's dims
-match.  (A full-dims mismatch clears the context rect, since its
-coords referred to the old dims, but masks keep their pixel data.)
+`_refreshCanvasAction` uses `resolveCanvasSpec` + `fetchAndSetCanvas`
+from `pg_autosync.js` so it goes through the same registry-first /
+config-fallback spec resolution as the poller.  Before this change,
+the manual refresh read `state.data.config.resources["@thecanvas"]`
+only — which is the old pre-registration path — and warned
+"@thecanvas not set in daemon config" whenever the workflow relied
+on the playground registry slot.  It also called a bespoke
+`fetchResourceImage` + `applyCanvasImage` sequence that did NOT
+call `scheduleSync`, so the inpaint server's cache was left stale.
+Both bugs are gone; the button now behaves identically to an
+autosync spec-change or batch-end trigger.
+
+PUSH-CHANNEL FIELD REGISTRATION (Slices D + E)
+==============================================
+`installPanelBindings()` registers two hidden fields:
+
+  · `canvas.pushed` — routed to `applyPushedCanvas` in
+    `pg_autosync.js`.  This is the once-at-batch-end authoritative
+    push (Slice D).
+
+  · `paste.applied` — routed to `applyPastedCanvas` in
+    `pg_autosync.js`.  This is the per-paste incremental push
+    (Slice E) that composites the pasted PNG over the pre-paste
+    canvas for optimistic display, arriving ~200 ms before
+    `canvas.pushed`.
+
+Both fields' `get()` returns a tiny hash (or null), so
+`pgkitNotifyAll` echoes carry a few bytes instead of the whole
+canvas.  `applyPushedCanvas` and `applyPastedCanvas` ignore
+echoes — see their respective docstrings.
+
+`meta: { kind: "object", visible: false }` keeps both fields out
+of any UI that renders the field list.  No UI surfaces either;
+they're pure push channels.
 
 REBIND DOC
 ==========
@@ -99,10 +134,14 @@ import { scheduleSync, syncNow, setBootSyncGate } from "./pg_sync.js";
 import { fetchStatus } from "./pg_comfy_client.js";
 import {
   checkKritaStatus, importKritaMasks, fetchActiveState,
-  fetchResourceImage,
 } from "./pg_krita_client.js";
 import {
-  pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyAll,
+  resolveCanvasSpec, fetchAndSetCanvas,
+  applyPushedCanvas, applyPastedCanvas,
+} from "./pg_autosync.js";
+import {
+  pgkitRegisterAction, pgkitRegisterLevel, pgkitRegisterField,
+  pgkitNotifyAll,
 } from "./pgkit/remote_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
 
@@ -127,54 +166,25 @@ async function _refreshCanvasAction() {
     );
     return;
   }
-  const cfg = (state.data && state.data.config) || null;
-  const res = (cfg && cfg.resources) || {};
-  const spec = res["@thecanvas"];
-  if (!spec || typeof spec !== "object") {
-    flashStatus("@thecanvas not set in daemon config", "warn");
-    return;
-  }
-  const normalized = {
-    source: spec.source || "active",
-    layer_name: spec.layer_name || null,
-  };
 
-  let img;
-  try {
-    img = await fetchResourceImage(normalized);
-  } catch (e) {
-    flashStatus("@thecanvas refresh failed: " + e.message, "bad");
-    return;
-  }
-  if (!img || !img.success) {
+  // Use the SAME spec resolution the poller uses (registry first,
+  // config fallback).  The previous version read config.resources
+  // only and warned "@thecanvas not set in daemon config"
+  // whenever the workflow relied on the playground registry slot.
+  const spec = resolveCanvasSpec(state.data || null);
+  if (!spec) {
     flashStatus(
-      "@thecanvas refresh failed: "
-        + ((img && img.message) || "unknown"),
-      "bad",
+      "@thecanvas spec not set \u2014 pick a source in the docker",
+      "warn",
     );
     return;
   }
-  if (!img.data_url) {
-    flashStatus("@thecanvas refresh: no data_url", "bad");
-    return;
-  }
 
-  applyCanvasImage(
-    img.hash || ("thecanvas_" + Date.now()),
-    img.data_url,
-    img.width,
-    img.height,
-  );
-
-  const label = normalized.source === "layer"
-    ? normalized.layer_name
-    : normalized.source;
-  flashStatus("@thecanvas \u2192 " + label, "ok");
-
-  syncPanelFields();
-  syncMaskList();
-  pgkitNotifyAll();
-  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+  // `fetchAndSetCanvas` handles the fetch, apply, scheduleSync,
+  // panel refresh (via draw), and flash.  Same code path the
+  // poller runs on spec-change and batch-end triggers, so the
+  // manual button and the automatic path can never diverge.
+  await fetchAndSetCanvas(spec);
 }
 
 /* ============================================================
@@ -404,10 +414,44 @@ async function _kritaImportMasksAction() {
 }
 
 /* ============================================================
+   Push-channel field registration (Slices D + E)
+   ============================================================
+   Two fields, both hidden.  `get()` returns just the hash (not the
+   full b64) so state-echo patches stay tiny; `set()` routes to the
+   `pg_autosync.js` handlers that own the display logic.
+
+   `canvas.pushed` (Slice D) — once at batch end, authoritative
+   `doc.projection()` composite.  Handled by `applyPushedCanvas`.
+
+   `paste.applied` (Slice E) — per paste, incremental.  Handled by
+   `applyPastedCanvas`, which composites the pasted PNG over the
+   pre-paste canvas for optimistic display.  Arrives ~200 ms before
+   `canvas.pushed`, so the user sees the paste before the daemon
+   finishes `doc.projection()`.
+
+   See the module docstring, PUSH-CHANNEL FIELD REGISTRATION, and
+   `pg_autosync.js`'s handler docstrings for the dedup rules. */
+
+function _registerCanvasPushedField() {
+  pgkitRegisterField("canvas.pushed", {
+    get: () => board.imageHash ? { hash: board.imageHash } : null,
+    set: (v) => applyPushedCanvas(v),
+    meta: { kind: "object", visible: false },
+  });
+  pgkitRegisterField("paste.applied", {
+    get: () => null,
+    set: (v) => applyPastedCanvas(v),
+    meta: { kind: "object", visible: false },
+  });
+}
+
+/* ============================================================
    Install buttons
    ============================================================ */
 
 export function installPanelBindings() {
+  _registerCanvasPushedField();
+
   const el = {};
   const ids = [
     "kritaImportMasksBtn",

@@ -93,6 +93,36 @@ behaviour is unchanged: `rotation == 0` pastes at
 `(crop_bounds[0]+x, crop_bounds[1]+y)`; `rotation != 0` pads to a
 rotated frame, un-rotates by `-rotation`, centre-crops to the doc
 dims, pastes at `(paste_config.x, paste_config.y)`.
+
+CANVAS_PUSH — post-paste canvas publication (Slice D + E)
+=========================================================
+Two events fire from this module after a successful batch:
+
+  1. `paste_applied` — published PER PASTE, from inside the
+     `paste_result` success branch, with the pasted PNG bytes +
+     position.  The inpaint playground's subscriber forwards it to
+     browsers over the `/remote` WS as `patch` on the `paste.applied`
+     field, and the browser composites it onto its pre-paste canvas
+     for instant visual feedback (~20-90 ms).  Slice E.
+
+  2. `canvas_update` — published ONCE AT BATCH END (in the finally
+     block), with the authoritative `doc.projection()` composite.
+     The browser replaces the optimistic composite with this when
+     it arrives (~200-500 ms), which for inpaint is visually
+     identical to the optimistic version — no flicker — but for
+     edge cases (blend modes, user painting mid-batch) corrects any
+     drift the local composite missed.  Slice D.
+
+The two-event split is what gives the user "playground updates at
+the same time as Krita" without paying the `doc.projection()` cost
+on the critical path.  The heavy composite still runs — it just runs
+*after* the optimistic display, in the background, without holding
+up the perceived update.
+
+Both are best-effort: a closed doc, a null composite, or an encode
+failure logs one line and returns without publishing.  The batch
+itself already returned success by that point; the canvas pushes
+are enhancements, not correctness requirements.
 """
 
 from __future__ import annotations
@@ -145,6 +175,121 @@ _POLL_INTERVAL_S = 0.25
 _MAX_QUEUE_WAIT_S = 300.0
 _MIN_EXEC_TIMEOUT_S = 300.0
 _MAX_TOTAL_POLL_S = 600.0
+
+
+# ---------------------------------------------------------------------------
+#  canvas_update + paste_applied publication (Slices D + E)
+# ---------------------------------------------------------------------------
+
+def _publish_canvas_update(doc) -> None:
+    """Compose the document and publish a `canvas_update` event.
+
+    Called from `_comfy_generate_impl`'s finally-block when at least
+    one paste succeeded.  See the module docstring, CANVAS_PUSH.
+
+    Reads the current composite (`doc.projection()`, with the same
+    fallback ladder `DocumentHandler.get_document_composite_b64` uses),
+    encodes to PNG, computes a stable hash, and publishes
+    `{doc_name, hash, b64, width, height}` on the event bus as a
+    `canvas_update` event.  Subscribers (the inpaint server's
+    subscriber thread in particular) forward it to browser clients.
+
+    Best-effort: doc closed mid-batch, null composite, encode failure
+    — all log one line and return.  The batch has already returned
+    success by the time this is called; the push is an enhancement.
+    """
+    try:
+        from .comfyui_document import _document_is_open
+        if not _document_is_open(doc):
+            print("[comfyui] canvas_update: doc no longer open",
+                  flush=True)
+            return
+
+        from PyQt6.QtCore import QBuffer, QIODevice, QByteArray
+
+        qimg = doc.projection()
+        if qimg is None or qimg.isNull():
+            try:
+                doc.refreshProjection()
+                qimg = doc.projection()
+            except Exception:
+                qimg = None
+        if qimg is None or qimg.isNull():
+            try:
+                qimg = doc.thumbnail(doc.width(), doc.height())
+            except Exception:
+                qimg = None
+        if qimg is None or qimg.isNull():
+            print("[comfyui] canvas_update: composite is null",
+                  flush=True)
+            return
+
+        buf = QByteArray()
+        buffer = QBuffer(buf)
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        ok = qimg.save(buffer, "PNG")
+        buffer.close()
+        if not ok:
+            print("[comfyui] canvas_update: PNG encode failed",
+                  flush=True)
+            return
+        png_bytes = bytes(buf)
+        if not png_bytes:
+            print("[comfyui] canvas_update: empty PNG", flush=True)
+            return
+
+        import hashlib as _hashlib
+        b64 = base64.b64encode(png_bytes).decode("ascii")
+        h = _hashlib.sha256(png_bytes).hexdigest()[:16]
+
+        from ..server.event_bus import get_event_bus
+        get_event_bus().publish("canvas_update", {
+            "doc_name": doc.name(),
+            "hash":     h,
+            "b64":      b64,
+            "width":    qimg.width(),
+            "height":   qimg.height(),
+        })
+        print(f"[comfyui] canvas_update published: "
+              f"{qimg.width()}x{qimg.height()} hash={h}", flush=True)
+    except Exception as e:
+        print(f"[comfyui] canvas_update publish failed: {e}",
+              flush=True)
+
+
+def _publish_paste_applied(paste: dict, doc) -> None:
+    """Publish one `paste_applied` event for a just-completed paste.
+
+    Called from `_comfy_generate_impl` immediately after each
+    successful `paste_result`, per item in its `applied` list.  See
+    the module docstring, CANVAS_PUSH.
+
+    The payload is `{doc_name, hash, b64, paste_x, paste_y, width,
+    height}`, where `b64` is the exact PNG the Krita layer received.
+    The browser composites this over its pre-paste canvas for
+    optimistic display (~20-90 ms, vs ~200-500 ms for the full
+    `canvas_update`).
+
+    Best-effort: an exception here logs one line and returns.  The
+    paste already landed in Krita; the authoritative `canvas_update`
+    will correct any display drift at batch end.
+    """
+    if not isinstance(paste, dict):
+        return
+    try:
+        from ..server.event_bus import get_event_bus
+        get_event_bus().publish("paste_applied", {
+            "doc_name": doc.name() if doc else "",
+            "hash":     paste.get("hash"),
+            "b64":      paste.get("b64"),
+            "paste_x":  paste.get("paste_x", 0),
+            "paste_y":  paste.get("paste_y", 0),
+            "width":    paste.get("width", 0),
+            "height":   paste.get("height", 0),
+        })
+    except Exception as e:
+        print(f"[comfyui] paste_applied publish failed: {e}",
+              flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +623,8 @@ class NormalGenerationCommands(AutoDispatchHandler):
             parent._batches[batch_id] = record
         parent._publish_state_change()
 
+        any_paste_succeeded = False
+
         try:
             warnings: list = []
 
@@ -691,6 +838,25 @@ class NormalGenerationCommands(AutoDispatchHandler):
                         continue
 
                     pdata = paste_result_dict.get("data") or {}
+
+                    # Slice E: publish per-paste incremental-display
+                    # events BEFORE the bookkeeping below, so the
+                    # browser starts compositing as early as possible.
+                    # Each `applied` item carries the exact PNG the
+                    # Krita layer received plus its paste position;
+                    # the browser composites it onto its existing
+                    # canvas for optimistic display while the daemon
+                    # is still running doc.projection() for the
+                    # authoritative canvas_update.
+                    for applied_item in (pdata.get("applied") or []):
+                        try:
+                            _publish_paste_applied(applied_item, doc)
+                        except Exception as e:
+                            print(
+                                f"[comfyui] paste_applied publish "
+                                f"failed: {e}", flush=True,
+                            )
+
                     record.run_records.append({
                         "seed": seed_i, "prompt_id": job_id,
                         "status": "success",
@@ -706,6 +872,7 @@ class NormalGenerationCommands(AutoDispatchHandler):
                         "output_rotation": prepared.rotation,
                     }
                     parent._last_document = doc
+                    any_paste_succeeded = True
 
             record.current_phase = "finalizing"
 
@@ -801,6 +968,18 @@ class NormalGenerationCommands(AutoDispatchHandler):
         finally:
             with parent._batches_lock:
                 parent._batches.pop(batch_id, None)
+            # Authoritative post-batch canvas push (Slice D).  Runs
+            # AFTER paste_applied already fired per-paste, so the
+            # browser's optimistic composite has already displayed;
+            # this replaces it with ground truth.  The
+            # doc.projection() cost here is off the perceived-latency
+            # critical path.
+            try:
+                if any_paste_succeeded:
+                    _publish_canvas_update(doc)
+            except Exception as e:
+                print(f"[comfyui] canvas_update publish raised: {e}",
+                      flush=True)
             parent._publish_state_change()
 
     # ------------------------------------------------------------------

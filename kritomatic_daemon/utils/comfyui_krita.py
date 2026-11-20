@@ -406,12 +406,21 @@ def paste_image(doc,
                 *,
                 blend_mode: str = "normal",
                 make_active: bool = True,
-                rotation: float = 0.0):
+                rotation: float = 0.0,
+                return_png: bool = False):
     """Decode a PNG and write it as a new paint layer at (x, y).
 
     `rotation` is degrees, positive = clockwise on screen. When
     nonzero, the image is rotated about its center, then center-cropped
     to the document's current dimensions before being written.
+
+    When `return_png=True`, returns `(node, applied_png_bytes)` where
+    `applied_png_bytes` is the exact PNG the layer received.  For the
+    `rotation == 0` case this is the input bytes (no re-encode — the
+    caller's PNG is byte-identical to what gets written).  For the
+    `rotation != 0` case the rotated/cropped QImage is encoded once.
+    Used by `comfyui_paste.paste_result` to publish a per-paste
+    incremental display event (Slice E).
 
     Refresh strategy: the caller is inside a batch, the document is in
     batchmode, and this runs on the server's worker thread. All three
@@ -421,6 +430,10 @@ def paste_image(doc,
     on, then set the blending mode back to itself.
     """
     img = _decode_png(image_png)
+    # For rotation == 0, `image_png` is exactly what gets written to
+    # the layer — no need to re-encode.  For rotation != 0, we encode
+    # once at the end (below) from the rotated/cropped QImage.
+    applied_png = image_png if not rotation or rotation % 360 == 0 else None
 
     if rotation and rotation % 360 != 0:
         img = _rotate_about_center(img, rotation)
@@ -461,6 +474,10 @@ def paste_image(doc,
     except Exception:
         pass
 
+    if return_png:
+        if applied_png is None:
+            applied_png = _save_png(img)
+        return node, applied_png
     return node
 
 

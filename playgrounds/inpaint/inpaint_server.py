@@ -37,45 +37,51 @@ Routes
     POST /rebind_document   clear the pinned target document and
                             re-capture from the daemon's activeDocument()
 
-/resources — the consolidated prepare-time fetch
-=================================================
-`POST /resources` returns the four pieces of state that
-`prepare_workflow` needs, captured atomically under `_state_lock`:
+CANVAS_PUSH SUBSCRIBER (Slices D + E)
+=====================================
+Besides answering HTTP requests, this module runs a background thread
+(`_canvas_subscriber_loop`) that connects to the daemon's event stream
+(port 12347) and forwards two event types to every browser client
+connected to the inpaint server's `/remote` WebSocket:
 
-    {
-      "success":   True,
-      "rotation":  float,
-      "frame":     {...} or None,   # same shape as /crop_frame's frame
-      "canvas":    {"b64": str, "width": int, "height": int} or None,
-      "selection": {"b64": str, "width": int, "height": int} or None,
-    }
+  · `paste_applied` (per paste, Slice E) — forwarded as a `patch` on
+    the `paste.applied` field:
 
-`frame` is `None` when no canvas has been synced yet — the caller
-must treat that as "not ready for a cropped prepare."
+        {"type": "patch",
+         "values": {"paste.applied": {hash, b64, paste_x, paste_y,
+                                      width, height, doc_name}}}
 
-`canvas` is `None` in the same case.  Under the current cache
-invariants, `frame is not None` implies `canvas is not None`: the
-only thing that populates `_canvas_w/_canvas_h` is `handle_sync`
-having seen a `canvas_b64`, and the only thing that clears them is
-process restart, which clears the frame too.
+    The browser's `applyPastedCanvas` composites the pasted PNG over
+    its pre-paste canvas for optimistic display (~20-90 ms).  For the
+    common inpaint case (checkbox off, no rotation) the pasted PNG
+    IS the full new canvas, so the browser takes a fast-path that
+    just replaces `board.imageEl` — ~20 ms, no compositing.
 
-`selection` is `None` when no mask has been selected.  The caller
-uses an all-white mask ("select all inside the crop") — same as
-`pg_inpaint.js::buildWhiteMaskB64`.
+  · `canvas_update` (once at batch end, Slice D) — forwarded as a
+    `patch` on the `canvas.pushed` field:
 
-Why this exists
-===============
-`prepare_workflow` used to make three separate HTTP calls to this
-server per run (`/crop_frame`, `/canvas_b64`, `/selection_b64`).  For
-a batch of N runs, that was 3N calls, and — more importantly —
-three separate reads of the mutable state with three separate
-`_state_lock` acquisitions in between.  If the user rotated or
-changed masks mid-prepare, different runs in the same batch could
-see different state (each call was individually consistent, but not
-mutually consistent).  `/resources` gives one lock acquisition, one
-snapshot, one round-trip.  The three old endpoints are kept for
-backward compat with older daemons, but nothing in the current
-daemon calls them any more.
+        {"type": "patch",
+         "values": {"canvas.pushed": {hash, b64, width, height,
+                                      doc_name}}}
+
+    The browser's `applyPushedCanvas` replaces the optimistic
+    composite with the authoritative `doc.projection()` output.  For
+    inpaint this is visually identical to the optimistic version
+    (same pixels, different PNG encoding), so no flicker; for edge
+    cases (blend modes, user painting mid-batch) it corrects drift.
+
+The two-event structure is what makes "playground updates at the
+same time as Krita" possible without paying the `doc.projection()`
+cost on the perceived-latency path.  See
+`kritomatic_daemon/handlers/comfyui_generation.py`'s CANVAS_PUSH
+module docstring section for the daemon side.
+
+`set_browser_hub(hub)` must be called once, before
+`start_canvas_subscriber()`, so the subscriber has somewhere to
+forward to.  `inpaint_playground.py` does both — it creates a
+`pgkit.remote_hub.Hub`, passes it to `kit_serve(hub=...)` so the
+`/remote` WebSocket endpoint uses it, and calls `set_browser_hub`
+with the same instance.
 
 WHY NO KRITA SCRATCH LAYERS
 ===========================
@@ -195,7 +201,9 @@ docstring, FAILURE MIRRORING."""
 from __future__ import annotations
 
 import base64
+import json
 import math
+import socket
 import struct
 import threading
 import time
@@ -245,6 +253,163 @@ _selection_b64: str = ""
 # create_new_with_dimensions → addView.  See the module docstring,
 # PINNED TARGET DOCUMENT.
 _target_document_name: str = ""
+
+
+# ---------------------------------------------------------------------------
+#  Canvas-push subscriber (Slices D + E)
+# ---------------------------------------------------------------------------
+
+_browser_hub = None
+_subscriber_running = False
+_subscriber_thread = None
+
+
+def set_browser_hub(hub) -> None:
+    """Register the pgkit `Hub` the canvas/paste subscribers broadcast
+    through.  Must be called once, before `start_canvas_subscriber()`.
+
+    `inpaint_playground.py` creates a `Hub()` instance, passes it to
+    `kit_serve(hub=...)` (so the `/remote` WS endpoint uses it), and
+    calls this with the same instance.  See the module docstring,
+    CANVAS_PUSH SUBSCRIBER.
+    """
+    global _browser_hub
+    _browser_hub = hub
+
+
+def start_canvas_subscriber() -> None:
+    """Spawn the background thread that subscribes to the daemon's
+    event stream and forwards canvas/paste events to browsers.
+
+    Idempotent.  See the module docstring, CANVAS_PUSH SUBSCRIBER.
+    """
+    global _subscriber_running, _subscriber_thread
+    if _subscriber_thread is not None and _subscriber_thread.is_alive():
+        return
+    _subscriber_running = True
+    _subscriber_thread = threading.Thread(
+        target=_canvas_subscriber_loop,
+        name="inpaint-canvas-subscriber",
+        daemon=True,
+    )
+    _subscriber_thread.start()
+
+
+def _canvas_subscriber_loop() -> None:
+    """Connect to the daemon event stream, forward canvas/paste events."""
+    while _subscriber_running:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10.0)
+            sock.connect(("127.0.0.1", 12347))
+            sock.settimeout(None)
+            _log("canvas subscriber: connected to daemon event stream")
+            buf = b""
+            while _subscriber_running:
+                try:
+                    chunk = sock.recv(65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line.decode("utf-8"))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    etype = event.get("type")
+                    if etype == "paste_applied":
+                        _forward_paste_applied(event.get("data") or {})
+                    elif etype == "canvas_update":
+                        _forward_canvas_update(event.get("data") or {})
+        except OSError as e:
+            _log(f"canvas subscriber: {e}")
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        if _subscriber_running:
+            time.sleep(2.0)
+
+
+def _forward_paste_applied(data: dict) -> None:
+    """Broadcast a `paste_applied` payload to every connected browser
+    client as a `patch` message on the `paste.applied` field.
+
+    The browser's `pgkitRemoteApplyPatch` routes the field update to
+    `paste.applied`'s registered `set` handler, which calls
+    `applyPastedCanvas` in `pg_autosync.js`.  See the module
+    docstring, CANVAS_PUSH SUBSCRIBER.
+    """
+    if _browser_hub is None:
+        return
+    if not isinstance(data, dict):
+        return
+    payload = {
+        "hash":     data.get("hash"),
+        "b64":      data.get("b64"),
+        "paste_x":  int(data.get("paste_x") or 0),
+        "paste_y":  int(data.get("paste_y") or 0),
+        "width":    int(data.get("width") or 0),
+        "height":   int(data.get("height") or 0),
+        "doc_name": data.get("doc_name"),
+    }
+    if not payload["hash"] or not payload["b64"]:
+        return
+    try:
+        _browser_hub.broadcast({
+            "type": "patch",
+            "values": {"paste.applied": payload},
+        })
+        _log(f"paste push forwarded: "
+             f"{payload['width']}x{payload['height']} "
+             f"at ({payload['paste_x']},{payload['paste_y']}) "
+             f"hash={payload['hash']}")
+    except Exception as e:
+        _log(f"paste push forward failed: {e}")
+
+
+def _forward_canvas_update(data: dict) -> None:
+    """Broadcast a `canvas_update` payload to every connected browser
+    client as a `patch` message on the `canvas.pushed` field.
+
+    The browser's `pgkitRemoteApplyPatch` (in
+    `pgkit/remote_client.js`) routes the field update to
+    `canvas.pushed`'s registered `set` handler, which calls
+    `applyPushedCanvas` in `pg_autosync.js`.  See the module
+    docstring, CANVAS_PUSH SUBSCRIBER.
+    """
+    if _browser_hub is None:
+        return
+    if not isinstance(data, dict):
+        return
+    payload = {
+        "hash":     data.get("hash"),
+        "b64":      data.get("b64"),
+        "width":    data.get("width"),
+        "height":   data.get("height"),
+        "doc_name": data.get("doc_name"),
+    }
+    if not payload["hash"] or not payload["b64"]:
+        return
+    try:
+        _browser_hub.broadcast({
+            "type": "patch",
+            "values": {"canvas.pushed": payload},
+        })
+        _log(f"canvas push forwarded: "
+             f"{payload['width']}x{payload['height']} "
+             f"hash={payload['hash']}")
+    except Exception as e:
+        _log(f"canvas push forward failed: {e}")
 
 
 # ---------------------------------------------------------------------------

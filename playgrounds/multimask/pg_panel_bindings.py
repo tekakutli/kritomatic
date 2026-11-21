@@ -13,7 +13,7 @@ for the most recent run.  The returned JSON is the *submitted*
 graph, not the expanded one; the diagnostic summary explains this.
 
 The displayed image is the current `@thecanvas` (pulled by
-`pg_autosync.js` from the daemon's resource selector).  `Refresh
+`pg_autosync.js` from inpaint's daemon registry).  `Refresh
 @thecanvas` bypasses the autosync spec-change gate to force a
 re-read when the pixels behind a constant spec changed.
 
@@ -23,23 +23,42 @@ debounced state sync as every other area mutation, so the daemon's
 saved `/state` becomes empty and the `MultiAreaConditioning` node
 passes `base_positive` through unchanged on the next execute.
 
+PUSH-CHANNEL FIELD REGISTRATION
+===============================
+`installPanelBindings()` registers two hidden fields for the
+canvas-push channels:
+
+  · `canvas.pushed` — routed to `applyPushedCanvas` in
+    `pg_autosync.js`.  Batch-end authoritative push.
+
+  · `paste.applied` — routed to `applyPastedCanvas` in
+    `pg_autosync.js`.  Per-paste incremental optimistic display.
+
+Both fields' `get()` returns a tiny hash (or null) so state-echo
+patches stay small.  `applyPushedCanvas` and `applyPastedCanvas`
+ignore echoes — see their respective docstrings in
+`pg_autosync.js`.  `meta: { kind: "object", visible: false }`
+keeps both fields out of any UI that renders the field list.  No
+UI surfaces either; they are pure push channels.
+
+MANUAL @thecanvas REFRESH
+=========================
+`_refreshCanvasAction` uses `resolveCanvasSpec` +
+`fetchAndSetCanvas` from `pg_autosync.js` so it goes through the
+same registry-first spec resolution as the poller.  Before this
+change, the manual refresh read `state.data.config.resources[
+"@thecanvas"]` only — which is the pre-registration path — and
+warned "@thecanvas not set in daemon config" whenever the workflow
+relied on inpaint's registry slot.  Both bugs are gone; the button
+now behaves identically to an autosync spec-change trigger.
+
 KRITA STATUS MIRRORING
 ======================
-`#kritaStatus` is a persistent panel element like inpaint's:
-"✓ reachable" / "✗ not reachable".  The ✗ branch mirrors its reason
-to `console.error`, which pgkit/panel_core.js routes to POST
+`#kritaStatus` is a persistent panel element: "✓ reachable" /
+"✗ not reachable".  The ✗ branch mirrors its reason to
+`console.error`, which pgkit/panel_core.js routes to POST
 ./__log.  The persistent DOM write stays visible on the panel; the
-terminal write is the durable record.
-
-REMOVED IMAGE-MANAGEMENT PATH
-=============================
-`+ Pick image…`, `Clear`, `+ From Krita` (image) and the drag/drop
-overlay are gone.  The current `@thecanvas` is pulled by
-`pg_autosync.js`; `applyCanvasImage` preserves areas across hash
-changes.  Every image-install path the removed buttons performed is
-redundant with autosync.  Areas are still addable via `+ From
-Krita` (masks) and `+ Blank`, and clearable via `Clear all areas`.
-"""
+terminal write is the durable record."""
 
 PANEL_BINDINGS_JS = r"""
 import {
@@ -54,6 +73,10 @@ import {
   importKritaMasks, checkKritaStatus, fetchActiveState,
   fetchResourceImage,
 } from "./pg_client.js";
+import {
+  resolveCanvasSpec, fetchAndSetCanvas,
+  applyPushedCanvas, applyPastedCanvas,
+} from "./pg_autosync.js";
 import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitRegisterField,
 } from "./pgkit/remote_client.js";
@@ -156,11 +179,10 @@ setStateChangeHook(_scheduleStateSync);
    old pixels.  This button bypasses the spec-change gate: read the
    current spec, resolve it to pixels, applyCanvasImage.
 
-   `applyCanvasImage` preserves the area list (and invalidates each
-   mask's pixel caches so the tinted overlays rebuild).  If the new
-   image's dimensions differ from the old, a console warning is
-   emitted because the area masks are unlikely to line up — the
-   user can re-import them if needed. */
+   `applyCanvasImage` preserves the area list.  If the new image's
+   dimensions differ from the old, a console warning is emitted
+   because the area masks are unlikely to line up — the user can
+   re-import them if needed. */
 
 async function _refreshCanvasAction() {
   flashStatus("refreshing @thecanvas\u2026", "");
@@ -179,48 +201,26 @@ async function _refreshCanvasAction() {
     );
     return;
   }
-  const cfg = (state.data && state.data.config) || null;
-  const res = (cfg && cfg.resources) || {};
-  const spec = res["@thecanvas"];
-  if (!spec || typeof spec !== "object") {
-    flashStatus("@thecanvas not set in daemon config", "warn");
-    return;
-  }
-  const normalized = {
-    source: spec.source || "active",
-    layer_name: spec.layer_name || null,
-  };
 
-  let img;
-  try {
-    img = await fetchResourceImage(normalized);
-  } catch (e) {
-    flashStatus("@thecanvas refresh failed: " + e.message, "bad");
-    return;
-  }
-  if (!img || !img.success) {
+  // Use the SAME spec resolution the poller uses (registry first,
+  // config fallback).  The previous version read config.resources
+  // only and warned "@thecanvas not set in daemon config"
+  // whenever inpaint was registered and the panel was filtering
+  // @thecanvas out of the Resources section.
+  const spec = resolveCanvasSpec(state.data || null);
+  if (!spec) {
     flashStatus(
-      "@thecanvas refresh failed: "
-        + ((img && img.message) || "unknown"),
-      "bad",
+      "@thecanvas spec not set \u2014 pick a source in the docker",
+      "warn",
     );
     return;
   }
-  if (!img.data_url) {
-    flashStatus("@thecanvas refresh: no data_url", "bad");
-    return;
-  }
 
-  applyCanvasImage(
-    img.hash || ("thecanvas_" + Date.now()),
-    img.data_url,
-    img.width,
-    img.height,
-  );
-  const label = normalized.source === "layer"
-    ? normalized.layer_name
-    : normalized.source;
-  flashStatus("@thecanvas \u2192 " + label, "ok");
+  // `fetchAndSetCanvas` handles the fetch, apply, panel refresh,
+  // and flash.  Same code path the poller runs on spec-change and
+  // batch-end triggers, so the manual button and the automatic
+  // path can never diverge.
+  await fetchAndSetCanvas(spec);
 
   syncPanelFields();
   syncAreaList();
@@ -573,10 +573,32 @@ async function _fetchHistoryAction() {
 }
 
 /* ============================================================
+   Push-channel field registration
+   ============================================================
+   Two hidden fields, both routed to handlers in pg_autosync.js.
+   See the module docstring, PUSH-CHANNEL FIELD REGISTRATION, and
+   pg_autosync.js's handler docstrings for the dedup rules. */
+
+function _registerCanvasPushedFields() {
+  pgkitRegisterField("canvas.pushed", {
+    get: () => board.imageHash ? { hash: board.imageHash } : null,
+    set: (v) => applyPushedCanvas(v),
+    meta: { kind: "object", visible: false },
+  });
+  pgkitRegisterField("paste.applied", {
+    get: () => null,
+    set: (v) => applyPastedCanvas(v),
+    meta: { kind: "object", visible: false },
+  });
+}
+
+/* ============================================================
    Install
    ============================================================ */
 
 export function installPanelBindings() {
+  _registerCanvasPushedFields();
+
   const el = {};
   for (const id of [
     "importMasksBtn", "blankAreaBtn", "clearAreasBtn", "kritaCheckBtn",

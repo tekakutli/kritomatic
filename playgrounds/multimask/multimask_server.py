@@ -39,13 +39,47 @@ given mask at a given frame isn't re-transformed.
 When inpaint is down (or `/crop_frame` returns null), no transform
 happens — the mask is served as stored.  Matches the daemon's
 behavior, which also falls back to un-rotated when inpaint is
-unreachable."""
+unreachable.
+
+PUSH CHANNELS
+=============
+The inpaint playground's daemon publishes two events on the daemon's
+event bus (port 12347) whenever a batch pastes into Krita:
+
+  · `paste_applied` — per paste, with the pasted PNG + position.
+    Forwarded to browsers as `patch` on `paste.applied`.  The
+    browser composites it onto the current canvas for optimistic
+    display (~20-90 ms).
+
+  · `canvas_update` — at batch end, with the authoritative
+    `doc.projection()` composite.  Forwarded as `patch` on
+    `canvas.pushed`.  The browser replaces the canvas with ground
+    truth (~200-500 ms later).
+
+The subscriber thread (`_canvas_subscriber_loop`) connects to the
+daemon event stream and forwards both.  Recovery on disconnect is
+automatic — 2 s reconnect delay.  A daemon without an event stream
+(older build) means the subscriber retries forever without
+succeeding; the browser's autosync poll fallback still detects
+batch-end via `active_batches` and re-fetches `@thecanvas`, so
+post-paste updates arrive on the poll cadence instead of via push.
+
+`set_browser_hub(hub)` must be called once, before
+`start_canvas_subscriber()`, so the subscriber has somewhere to
+forward to.  `multimask_playground.py` does both — it creates a
+`pgkit.remote_hub.Hub`, passes it to `kit_serve(hub=...)` so the
+`/remote` WebSocket endpoint uses it, and calls `set_browser_hub`
+with the same instance.  This is the same wiring shape inpaint
+uses; see `playgrounds/inpaint/inpaint_server.py`'s module
+docstring, CANVAS_PUSH SUBSCRIBER.
+"""
 
 import base64
 import hashlib
 import json
 import os
 import re
+import socket
 import threading
 import time
 import urllib.error
@@ -79,6 +113,162 @@ CROP_FRAME_TTL = 1.0
 _mask_transform_lock = threading.Lock()
 _mask_transform_cache: dict = {}
 _MASK_TRANSFORM_CACHE_MAX = 64
+
+
+# ---------------------------------------------------------------------------
+#  Canvas-push subscriber
+# ---------------------------------------------------------------------------
+
+_browser_hub = None
+_subscriber_running = False
+_subscriber_thread = None
+
+
+def set_browser_hub(hub) -> None:
+    """Register the pgkit `Hub` the canvas/paste subscribers broadcast
+    through.  Must be called once, before `start_canvas_subscriber()`.
+
+    `multimask_playground.py` creates a `Hub()` instance, passes it
+    to `kit_serve(hub=...)` (so the `/remote` WS endpoint uses it),
+    and calls this with the same instance.  See the module docstring,
+    PUSH CHANNELS.
+    """
+    global _browser_hub
+    _browser_hub = hub
+
+
+def start_canvas_subscriber() -> None:
+    """Spawn the background thread that subscribes to the daemon's
+    event stream and forwards canvas/paste events to browsers.
+
+    Idempotent.  See the module docstring, PUSH CHANNELS.
+    """
+    global _subscriber_running, _subscriber_thread
+    if _subscriber_thread is not None and _subscriber_thread.is_alive():
+        return
+    _subscriber_running = True
+    _subscriber_thread = threading.Thread(
+        target=_canvas_subscriber_loop,
+        name="multimask-canvas-subscriber",
+        daemon=True,
+    )
+    _subscriber_thread.start()
+
+
+def _canvas_subscriber_loop() -> None:
+    """Connect to the daemon event stream, forward canvas/paste events."""
+    while _subscriber_running:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10.0)
+            sock.connect(("127.0.0.1", 12347))
+            sock.settimeout(None)
+            _log("canvas subscriber: connected to daemon event stream")
+            buf = b""
+            while _subscriber_running:
+                try:
+                    chunk = sock.recv(65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line.decode("utf-8"))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    etype = event.get("type")
+                    if etype == "paste_applied":
+                        _forward_paste_applied(event.get("data") or {})
+                    elif etype == "canvas_update":
+                        _forward_canvas_update(event.get("data") or {})
+        except OSError as e:
+            _log(f"canvas subscriber: {e}")
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        if _subscriber_running:
+            time.sleep(2.0)
+
+
+def _forward_paste_applied(data: dict) -> None:
+    """Broadcast a `paste_applied` payload to every connected browser
+    client as a `patch` message on the `paste.applied` field.
+
+    The browser's `pgkitRemoteApplyPatch` routes the field update to
+    `paste.applied`'s registered `set` handler, which calls
+    `applyPastedCanvas` in `pg_autosync.js`.  See the module
+    docstring, PUSH CHANNELS.
+    """
+    if _browser_hub is None:
+        return
+    if not isinstance(data, dict):
+        return
+    payload = {
+        "hash":     data.get("hash"),
+        "b64":      data.get("b64"),
+        "paste_x":  int(data.get("paste_x") or 0),
+        "paste_y":  int(data.get("paste_y") or 0),
+        "width":    int(data.get("width") or 0),
+        "height":   int(data.get("height") or 0),
+        "doc_name": data.get("doc_name"),
+    }
+    if not payload["hash"] or not payload["b64"]:
+        return
+    try:
+        _browser_hub.broadcast({
+            "type": "patch",
+            "values": {"paste.applied": payload},
+        })
+        _log(f"paste push forwarded: "
+             f"{payload['width']}x{payload['height']} "
+             f"at ({payload['paste_x']},{payload['paste_y']}) "
+             f"hash={payload['hash']}")
+    except Exception as e:
+        _log(f"paste push forward failed: {e}")
+
+
+def _forward_canvas_update(data: dict) -> None:
+    """Broadcast a `canvas_update` payload to every connected browser
+    client as a `patch` message on the `canvas.pushed` field.
+
+    The browser's `pgkitRemoteApplyPatch` routes the field update to
+    `canvas.pushed`'s registered `set` handler, which calls
+    `applyPushedCanvas` in `pg_autosync.js`.  See the module
+    docstring, PUSH CHANNELS.
+    """
+    if _browser_hub is None:
+        return
+    if not isinstance(data, dict):
+        return
+    payload = {
+        "hash":     data.get("hash"),
+        "b64":      data.get("b64"),
+        "width":    data.get("width"),
+        "height":   data.get("height"),
+        "doc_name": data.get("doc_name"),
+    }
+    if not payload["hash"] or not payload["b64"]:
+        return
+    try:
+        _browser_hub.broadcast({
+            "type": "patch",
+            "values": {"canvas.pushed": payload},
+        })
+        _log(f"canvas push forwarded: "
+             f"{payload['width']}x{payload['height']} "
+             f"hash={payload['hash']}")
+    except Exception as e:
+        _log(f"canvas push forward failed: {e}")
 
 
 def _log(msg):

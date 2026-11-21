@@ -54,7 +54,22 @@ through `task.status` directly:
 This is what keeps the panel consistent during the click → server-
 flip window.  See `pg_state.py`'s "PENDING LOCAL RUNS" for the full
 rationale.
-"""
+
+EXPIRY AND PROMPT-OVERRIDE FALLTHROUGH
+======================================
+Two additional states surfaced in `_syncResult`:
+
+  · **`expired`** — the daemon's 15-minute intercept timeout swept
+    the batch.  Surfaced with a `"re-intercept from the docker"`
+    action so the user knows there is a recovery path (there is no
+    in-place recovery: the prepared graph has been dropped).
+
+  · **`prompt_override_applied === false`** — the daemon's
+    `comfy_resume_intercepted` reports this when the workflow has no
+    `Primitive` node titled `"prompt"`.  In that case the user's
+    typed override is silently dropped by the daemon; without the
+    suffix below, a successful run with a dropped override is
+    visually identical to a successful run with it applied."""
 
 PANEL_FIELDS_JS = r"""
 import { board, areaColorById, effectiveStatus } from "./pg_state.js";
@@ -226,6 +241,18 @@ function _syncResult(item) {
       : "?";
     text = "pasted " + (r.output_count || 0) + " layer(s) in " + timing
          + "\n" + layers;
+    // If the daemon reports the override wasn't applied (no
+    // workflow 'prompt' Primitive slot exists), tell the user.
+    // Without this, a successful run with a dropped override looks
+    // identical to a successful run with it applied.  The daemon
+    // sends prompt_override_applied in the resume response data —
+    // see comfy_resume_intercepted in
+    // kritomatic_daemon/handlers/comfyui_intercept.py.  See this
+    // module's docstring, EXPIRY AND PROMPT-OVERRIDE FALLTHROUGH.
+    if (r.prompt_override_applied === false) {
+      text += "\n(prompt not applied \u2014 workflow has no "
+            + "'prompt' Primitive slot)";
+    }
     cls = "ok";
   } else if (item && eff === "error") {
     text = "failed: " + (item.message || "unknown");
@@ -236,6 +263,14 @@ function _syncResult(item) {
   } else if (item && eff === "cancelled") {
     text = "cancelled";
     cls = "";
+  } else if (item && eff === "expired") {
+    // The daemon's 15-minute intercept timeout swept this task.  The
+    // prepared graph has been dropped — there is no in-place
+    // recovery, only a re-intercept from the docker.  See this
+    // module's docstring, EXPIRY AND PROMPT-OVERRIDE FALLTHROUGH,
+    // and interceptor_server.py's "Task expiry".
+    text = "expired \u2014 re-intercept from the docker";
+    cls = "err";
   }
   const sig = text + "|" + cls;
   if (sig === _resultSig) return;
@@ -392,6 +427,10 @@ export function syncPanelFields() {
   // poll still shows "queued", so the buttons disable on click and
   // stay disabled across the click → server-flip window.  See
   // pg_state.py's "PENDING LOCAL RUNS".
+  //
+  // `expired` tasks (daemon swept them) land here as non-"queued",
+  // so the buttons disable — the correct state: there is nothing to
+  // run or discard; the user must re-intercept from the docker.
   const eff = effectiveStatus(summary);
   const canRun     = eff === "queued";
   const canDiscard = eff === "queued";

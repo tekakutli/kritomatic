@@ -15,7 +15,12 @@ it into Krita.
 Routes
 ======
     POST /intercept/intake   daemon → here: new intercepted task
-    POST /intercept/list     browser poll: summary of all tasks
+    POST /intercept/list     browser poll: summary of all tasks.
+                             Also cross-references the daemon's live
+                             `intercepted_batches` registry to mark
+                             locally-queued tasks as `expired` when
+                             the daemon's 15-minute intercept timeout
+                             has swept them.  See "Task expiry" below.
     POST /intercept/item     browser: full task body incl. payload
     POST /intercept/run      browser → daemon: push multimask state,
                              then resume generation
@@ -33,6 +38,37 @@ Task identity
 `intercept_a1b2c3d4e5f6`).  This makes the interceptor's local task
 list and the daemon's `_intercepted_batches` dict the same set of
 keys: reconciliation is a key-set comparison, not a content match.
+
+Task expiry
+===========
+The daemon sweeps `_intercepted_batches` every 300 s and drops
+entries older than `INTERCEPT_TIMEOUT_SEC` (900 s, 15 min).  Before
+this cross-reference existed, an intercepted task that sat idle for
+15+ min without being run or discarded would remain visible in the
+interceptor's panel as `queued` forever.  Clicking Run would then
+fail with the daemon's `"batch expired or unknown"` — accurate but
+15-minutes-late and confusing.
+
+`handle_list` now polls the daemon's `comfy_status` on every
+browser 2-second tick and, when the daemon answered successfully,
+marks any locally-`queued` task whose `task_id` is not in the
+daemon's `intercepted_batches` list as `expired`.  The panel renders
+`expired` with its own status colour and a
+`"re-intercept from the docker"` message.
+
+Only tasks whose status is exactly `queued` are flipped — a task
+that is already `running`, `done`, or `error` is left alone (the
+daemon's sweep cannot remove a task that has already been resumed
+or discarded; those paths remove the record before the sweep can
+see it).  A daemon-unreachable response is treated as "unknown" and
+does NOT mass-expire tasks — a transient blip must not falsely
+retire every queued task.  The next poll after the daemon comes
+back will detect real expiry.
+
+`comfy_status` internally calls the daemon's
+`_sweep_expired_intercepts`, so each interceptor poll also keeps the
+daemon's own sweep current within the interceptor's 2-second cadence
+— much tighter than the daemon's default 300-second sweep tick.
 
 Payload shape
 =============
@@ -144,12 +180,27 @@ def _log(msg):
 
 
 def _gc():
+    """Remove terminal-state tasks older than `_GC_MAX_AGE_SEC`.
+
+    Terminal states are `done`, `error`, `cancelled`, and `expired`.
+    `expired` was added when `handle_list` started cross-referencing
+    the daemon's live `intercepted_batches` registry (see the module
+    docstring, "Task expiry") — a task that the daemon has swept gets
+    flipped to `expired` locally and is then eligible for the same
+    time-based collection the other terminal states use.
+
+    `queued` and `running` are never collected here: the only path to
+    a terminal state for a queued task is Run, Discard, Cancel, or
+    the daemon's own 15-minute sweep (surfaced via the flip in
+    `handle_list`).  Collecting a still-queued task would delete the
+    only record of it before the user has any chance to act on it.
+    """
     now = time.time()
     with _LOCK:
         stale = [
             tid for tid, t in _TASKS.items()
             if (now - t["received_at"]) > _GC_MAX_AGE_SEC
-            and t["status"] in ("done", "error", "cancelled")
+            and t["status"] in ("done", "error", "cancelled", "expired")
         ]
         for tid in stale:
             del _TASKS[tid]
@@ -252,7 +303,59 @@ def handle_intake(payload):
 # ---------------------------------------------------------------------------
 
 def handle_list(_payload):
+    """Return a summary of every tracked task.
+
+    Cross-references the daemon's live `intercepted_batches` registry
+    to detect tasks the daemon has swept (15-minute intercept timeout)
+    and marks them `expired` locally.  Without this, the panel would
+    show a stale `queued` status for a task the daemon has forgotten,
+    and the user would only discover the expiry when clicking Run
+    failed with `"batch expired or unknown"` — accurate but 15-minutes-
+    late and confusing.
+
+    `comfy_status` internally calls the daemon's
+    `_sweep_expired_intercepts`, so each interceptor poll also keeps
+    the daemon's own sweep current within the interceptor's 2-second
+    poll cadence, much tighter than the daemon's 300-second sweep
+    thread.
+
+    A daemon-unreachable response is treated as "unknown" and does
+    NOT mass-expire tasks — a transient blip must not falsely retire
+    every queued task.  The next poll after the daemon comes back
+    will detect real expiry.
+    """
+    # Ask the daemon which intercept batches it still considers alive.
+    # The daemon's `intercepted_batches` field is the authoritative
+    # list; any local `queued` task whose `task_id` is not in it has
+    # been swept.
+    daemon_responded = False
+    daemon_ids: set = set()
+    try:
+        resp = krita_client.send({"type": "comfy_status"}, timeout=3.0)
+        if isinstance(resp, dict) and resp.get("status") == "success":
+            daemon_responded = True
+            data = resp.get("data") or {}
+            for entry in (data.get("intercepted_batches") or []):
+                if isinstance(entry, dict):
+                    tid = entry.get("batch_id")
+                    if isinstance(tid, str) and tid:
+                        daemon_ids.add(tid)
+    except Exception as e:
+        _log(f"list: daemon probe failed: {e}")
+        daemon_responded = False
+
     with _LOCK:
+        if daemon_responded:
+            for tid, t in list(_TASKS.items()):
+                if t["status"] == "queued" and tid not in daemon_ids:
+                    t["status"] = "expired"
+                    t["message"] = (
+                        "expired in daemon "
+                        "(intercepted-batch timeout, 15 min)"
+                    )
+                    _log(f"expired {tid[:8]} "
+                         f"(not in daemon's intercepted_batches)")
+
         tasks = [
             {
                 "task_id":       t["task_id"],
@@ -318,6 +421,12 @@ def handle_run(payload):
     The updated state is always pushed (even with no edits) so that
     drift between intake and Run does not silently override the
     reviewer's intent.
+
+    The `expired` status is rejected here just like `done` and
+    `error`: the daemon has already dropped the batch, so calling
+    `comfy_resume_intercepted` would fail with the same message.
+    Surfacing the rejection at `handle_run` keeps the panel's status
+    consistent with the daemon's state without a round trip.
     """
     payload = payload or {}
     task_id = payload.get("task_id")

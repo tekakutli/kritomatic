@@ -54,6 +54,27 @@ shared `canvas { … }` rule in `pgkit/styles.py`, so
 `background: transparent` wins over the shared
 `background: #0a0e14`.  Without that override the overlay would be
 opaque dark and hide the image layer entirely.
+
+TASK STATUS COLOURS
+===================
+Six statuses are rendered in `.taskStatus`:
+
+    queued     #ffe600 (yellow)  waiting for the user
+    running    #ffc966 (orange)  Run in flight
+    done       #00e5ff (cyan)    pasted successfully
+    error      #d48590 (pink)    run failed (paste, multimask,
+                                 daemon, etc.)
+    cancelled  #5a6774 (grey)    user chose not to run
+    expired    #c8a878 (tan)     daemon swept the batch (15 min
+                                 intercept timeout).  Visible but
+                                 not alarming: the user did nothing
+                                 wrong, they just missed the window.
+
+`expired` was added when `handle_list` started cross-referencing
+the daemon's live `intercepted_batches` registry — see
+`interceptor_server.py`'s "Task expiry" docstring.  Without the
+dedicated colour the status falls through to the default grey,
+indistinguishable from `cancelled`.
 """
 
 PG_CSS = r"""
@@ -131,6 +152,7 @@ PG_CSS = r"""
   .taskStatus.done      { color:#00e5ff; }
   .taskStatus.error     { color:#d48590; }
   .taskStatus.cancelled { color:#5a6774; }
+  .taskStatus.expired   { color:#c8a878; }
 
   #taskInfo {
     font-size:10px; color:#5a6774;

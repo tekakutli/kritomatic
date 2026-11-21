@@ -35,7 +35,15 @@ the event handlers are attached.
 specificity than the shared `canvas { … }` rule in
 `pgkit/styles.py`, so `background: transparent` wins over the
 shared `background: #0a0e14`.  Without that override each overlay
-would be opaque dark and hide the image layer entirely."""
+would be opaque dark and hide the image layer entirely.
+
+MASK PROMPT LOCATION
+====================
+The mask prompt is SAM3-only and lives in the Refine section
+alongside the model radios, because it is a refinement-time input,
+not a Segment-All input.  It shares a section with the model picker
+that determines its visibility: `syncPanelFields` shows it only when
+`board.refineModel === 'sam3'` and a mask is selected."""
 
 PG_CSS = r"""
   #ui button#runBtn {
@@ -330,6 +338,27 @@ PG_CSS = r"""
     background: transparent;
     pointer-events: none;
   }
+
+  /* ---- region tool buttons ----
+     Brush / Lasso / Freehand are one-shot activation buttons.  The
+     `.active` class reflects whether region-edit mode is on with
+     that tool currently armed; it clears automatically when the
+     tool's natural end-of-action fires (see pg_dispatch.js). */
+  #ui button.regionToolBtn {
+    border-color: rgba(255, 200, 90, 0.55);
+    color: #ffd89b;
+    flex: 1 1 0;
+  }
+  #ui button.regionToolBtn:hover:not(:disabled) {
+    border-color: rgba(255, 200, 90, 1.00);
+    background: rgba(255, 200, 90, 0.10);
+    color: #ffe6b8;
+  }
+  #ui button.regionToolBtn.active {
+    border-color: rgba(255, 200, 90, 1.00);
+    background: rgba(255, 200, 90, 0.20);
+    color: #ffe6b8;
+  }
 """
 
 PG_PANEL_BODY = r"""
@@ -375,23 +404,18 @@ PG_PANEL_BODY = r"""
                            padding:4px 6px;outline:none;resize:vertical;"
           ></textarea>
         </div>
-        <div class="field" id="maskPromptRow" style="display:none;align-items:flex-start;flex-direction:column;margin-top:6px;">
-          <label style="text-align:left;flex:0 0 auto;margin-bottom:4px;">
-            Mask prompt <span style="color:#3d4756;">(SAM3 refine only)</span>
-          </label>
-          <textarea id="maskPromptText" rows="2" spellcheck="false"
-                    placeholder="prompt used only when refining this mask"
-          ></textarea>
-        </div>
         <div class="field" style="margin-top:6px;">
           <label id="pointsLabel">Points</label>
           <span id="pointsInfo" style="font-size:10px;color:#7b8794;">0 positive · 0 negative</span>
           <button id="clearPointsBtn" style="flex:0 0 auto;margin-left:auto;">Clear</button>
         </div>
+        <div class="row" style="margin-top:8px;">
+          <button id="segmentAllBtn">SEGMENT</button>
+        </div>
       </div>
     </details>
 
-    <details class="section" open>
+    <details class="section">
       <summary>Settings</summary>
       <div class="section-body">
         <div class="field">
@@ -418,19 +442,37 @@ PG_PANEL_BODY = r"""
     </details>
 
     <details class="section" open>
-      <summary>Refine region</summary>
+      <summary>Refine</summary>
       <div class="section-body">
-        <div class="field">
-          <label>Paint</label>
-          <input type="checkbox" id="regionMode"
-                 title="When on, edit the region on the canvas. Refine only rewrites pixels inside it.">
-          <span style="font-size:9px;color:#3d4756;margin-left:6px;">edit region</span>
+        <div class="modelRow">
+          <span style="color:#5a6774;font-size:9px;letter-spacing:0.14em;text-transform:uppercase;font-weight:700;">Model</span>
+          <label title="SAM2 refines the existing mask incrementally: each click nudges the current mask toward the prompt. Preserves everything the mask already covers.">
+            <input type="radio" name="refineModel" id="modelSam2" checked> SAM2 (true refine)
+          </label>
+          <label title="SAM3 re-detects from points + prompt + bbox. Each click produces a fresh detection, which can move the whole shape rather than nudging it. Useful for re-authoring a bad mask; not incremental.">
+            <input type="radio" name="refineModel" id="modelSam3"> SAM3 (re-detect)
+          </label>
         </div>
-        <div class="toolRow" style="margin-top:4px;">
-          <span style="color:#5a6774;font-size:9px;letter-spacing:0.14em;text-transform:uppercase;font-weight:700;">Tool</span>
-          <label><input type="radio" name="regionTool" id="regionToolBrush" checked> Brush</label>
-          <label><input type="radio" name="regionTool" id="regionToolLasso"> Lasso</label>
-          <label><input type="radio" name="regionTool" id="regionToolFreehand"> Freehand</label>
+        <div class="runHint" style="margin-top:2px;">
+          SAM2 preserves the mask; SAM3 re-detects it. Use SAM3 to
+          author a fresh mask, SAM2 to nudge an existing one.
+        </div>
+
+        <div class="field" id="maskPromptRow"
+             style="display:none;align-items:flex-start;flex-direction:column;margin-top:8px;">
+          <label style="text-align:left;flex:0 0 auto;margin-bottom:4px;">
+            Mask prompt <span style="color:#3d4756;">(SAM3 refine only)</span>
+          </label>
+          <textarea id="maskPromptText" rows="2" spellcheck="false"
+                    placeholder="prompt used only when refining this mask"
+          ></textarea>
+        </div>
+
+        <div class="section-subhead">Region</div>
+        <div class="row" style="gap:4px; margin-top:2px;">
+          <button id="regionToolBrushBtn"    class="regionToolBtn">Brush</button>
+          <button id="regionToolLassoBtn"    class="regionToolBtn">Lasso</button>
+          <button id="regionToolFreehandBtn" class="regionToolBtn">Freehand</button>
         </div>
         <div class="field">
           <label>Subtract</label>
@@ -447,28 +489,9 @@ PG_PANEL_BODY = r"""
           <button id="clearRegionBtn" style="flex:0 0 auto;">Clear region</button>
           <span id="regionStatus" style="flex:1 1 auto;font-size:10px;color:#5a6774;margin-left:8px;">no region</span>
         </div>
-      </div>
-    </details>
 
-    <details class="section" open>
-      <summary>Refine</summary>
-      <div class="section-body">
-        <div class="modelRow">
-          <span style="color:#5a6774;font-size:9px;letter-spacing:0.14em;text-transform:uppercase;font-weight:700;">Model</span>
-          <label title="SAM2 refines the existing mask incrementally: each click nudges the current mask toward the prompt. Preserves everything the mask already covers.">
-            <input type="radio" name="refineModel" id="modelSam2" checked> SAM2 (true refine)
-          </label>
-          <label title="SAM3 re-detects from points + prompt + bbox. Each click produces a fresh detection, which can move the whole shape rather than nudging it. Useful for re-authoring a bad mask; not incremental.">
-            <input type="radio" name="refineModel" id="modelSam3"> SAM3 (re-detect)
-          </label>
-        </div>
-        <div class="runHint" style="margin-top:2px;">
-          SAM2 preserves the mask; SAM3 re-detects it. Use SAM3 to
-          author a fresh mask, SAM2 to nudge an existing one.
-        </div>
-        <div class="row">
+        <div class="row" style="margin-top:10px;">
           <button id="runBtn">Refine</button>
-          <button id="segmentAllBtn">Segment All</button>
         </div>
         <div class="row">
           <button id="cancelBtn">Cancel</button>

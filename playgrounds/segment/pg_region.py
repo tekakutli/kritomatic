@@ -29,6 +29,7 @@ export function clearSelectedMaskRegion() {
   m.regionCanvas = null;
   m._regionEdgePoints = null;
   m._regionChains = null;
+  m._regionVersion = (m._regionVersion || 0) + 1;   // ADD
   board.regionStrokeActive = false;
   _scheduleDraw();
   return true;
@@ -58,8 +59,9 @@ export function paintRegionStroke(ix, iy, isErase, lastX, lastY) {
 
   board.regionStrokeActive = true;
   board.regionStrokeIsErase = !!isErase;
-  m._regionEdgePoints = null;   // invalidate edge cache
-  m._regionChains = null;       // invalidate even-dot chain cache
+  m._regionEdgePoints = null;
+  m._regionChains = null;
+  m._regionVersion = (m._regionVersion || 0) + 1;   // ADD
   return true;
 }
 
@@ -77,6 +79,7 @@ export function fillLassoPolygonInRegion(points, isErase) {
   rctx.fill();
   m._regionEdgePoints = null;
   m._regionChains = null;
+  m._regionVersion = (m._regionVersion || 0) + 1;   // ADD
   return true;
 }
 """

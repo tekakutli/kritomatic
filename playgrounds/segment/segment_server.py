@@ -1,8 +1,8 @@
 """HTTP routes and ComfyUI bridge for the segment playground.
 
-Routes (post-refactor):
+Routes:
 
-  POST /comfy/status         ComfyUI preflight
+  POST /comfy/status         ComfyUI + proxy preflight
   POST /comfy/active_state   proxy the daemon's `comfy_status`
   POST /comfy/segment        Segment All  → SAM3 detection, no mask
   POST /comfy/refine         Refine mask → SAM2 (true refine) or SAM3 (re-detect)
@@ -18,19 +18,40 @@ Routes (post-refactor):
   POST /krita/resource_image resolve a `{source, layer_name}` spec to a PNG
   POST /rebind_document      clear pinned doc + re-capture from activeDocument()
 
-The old POST /comfy/upload_image raw route is gone.  The image now
-comes exclusively from the daemon via `@thesegment` — pulled by the
-browser's autosync poller, cached on the server under its content
-hash by `/krita/resource_image`.  `handle_segment` and `handle_refine`
-look up the cached image by that hash.
+EXECUTION MODEL (native v2)
+===========================
+Segment keeps its own execution path — it does NOT delegate to the
+daemon's `comfy_generate`.  The pipeline is:
 
-PINNED TARGET DOCUMENT
-======================
-Same as inpaint's.  The first successful doc-targeting daemon
-response pins `_target_document_name`; subsequent calls carry it as
-`document` (or `name` for `get_document_composite_b64`).  A
-"document … not found" response clears the pin and retries once
-unpinned.  `/rebind_document` is the manual escape hatch.
+  browser → POST /comfy/segment (hash + points + params)
+    → look up the cached PNG under that hash
+    → upload it to the comfy-api-proxy via POST /api/v2/assets
+    → substitute `@thesegment` and each `Primitive*.value` into the
+      workflow with `substitute_into_graph`
+    → POST /api/v2/jobs
+    → poll GET /api/v2/jobs/{id} to terminal
+    → download each output via GET /api/v2/assets/{id}/content
+    → return base64 PNGs to the browser
+
+The old path — `expand_custom` + `ETN_Parameter` + `ETN_KritaCanvas`
++ `ETN_KritaOutput` + `PUT /api/etn/image/{id}` + `ComfyClient.generate`
+— is gone.  See `kritomatic_shared/comfyui_substitute.py` and
+`pg_comfy/__init__.py` for the native-v2 primitives this module now
+composes.
+
+The workflows are in native ComfyUI v2 form (`LoadImage` with
+`@`-prefixed `image`, `Primitive*` with `_meta.title`, `SaveImage`
+at the terminal).  See `workflows/segment.json` and
+`workflows/sam2_refine.json`.
+
+LAZY `pg_comfy.image` IMPORT
+============================
+`pg_comfy.image` pulls PIL, ~30 MB of RSS and ~500 ms of import time.
+This module does not touch image encoding at import time, so
+`make_encoded_image` is imported lazily inside the handlers that use
+it (`handle_krita_import`, `handle_resource_image`).  The segment
+pipeline itself does not need PIL — the PNG bytes it downloads come
+back from the proxy already in the format `download_outputs` expects.
 """
 
 from __future__ import annotations
@@ -46,8 +67,10 @@ from urllib.parse import unquote
 
 from pg_comfy import (
     ComfyClient, ComfyError, ComfyTimeout, ComfyCancelled,
-    EncodedImage, KritaResources, expand_custom, get_client, reset_client,
-    cached_object_info,
+    EncodedImage, get_client, reset_client, cached_object_info,
+    ProxyV2, ProxyError, ProxyHTTPError, ProxyUnreachable,
+    extract_all_slots,
+    substitute_into_graph,
 )
 
 from . import krita_client
@@ -79,13 +102,23 @@ _workflow_lock = Lock()
 _workflow_segment: Optional[dict] = None
 _workflow_refine:  Optional[dict] = None
 
+_slot_tables_lock = Lock()
+_slot_tables_cache: dict = {}  # str(path) -> (resource_slots, param_slots, output_nodes)
+
 _target_document_name: str = ""
 _target_lock = Lock()
+
+_proxy_lock = Lock()
+_proxy: Optional[ProxyV2] = None
 
 
 def _log(msg: str) -> None:
     print(f"[segment] {msg}", flush=True)
 
+
+# ---------------------------------------------------------------------------
+#  Clients
+# ---------------------------------------------------------------------------
 
 _client: Optional[ComfyClient] = None
 
@@ -101,6 +134,32 @@ def _reset_client() -> None:
     global _client
     reset_client()
     _client = None
+
+
+def _get_proxy() -> ProxyV2:
+    """Return the shared ProxyV2 client.
+
+    Constructed lazily via `ProxyV2.from_pid_file()` — reads the pid
+    file the daemon's `proxy/manager.py` writes on `comfy_proxy_start`
+    and probes `/api/v2/health` before returning.  A missing pid file
+    or a dead proxy raises `ProxyUnreachable`; the caller turns that
+    into a "proxy unavailable" error response.
+    """
+    global _proxy
+    with _proxy_lock:
+        if _proxy is None:
+            _proxy = ProxyV2.from_pid_file()
+        return _proxy
+
+
+def _invalidate_proxy() -> None:
+    """Drop the cached proxy client.  Called after `ProxyUnreachable`
+    so the next call rebuilds it from the (possibly new) pid file.
+    A proxy restart between calls therefore recovers automatically
+    on the next user action, without needing a manual refresh."""
+    global _proxy
+    with _proxy_lock:
+        _proxy = None
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +229,7 @@ def _get_image(hash_hex: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-#  Workflow loading
+#  Workflow loading + slot tables
 # ---------------------------------------------------------------------------
 
 def _load_workflow(path: Path) -> Optional[dict]:
@@ -201,9 +260,27 @@ def _get_refine_workflow() -> Optional[dict]:
         return _workflow_refine
 
 
+def _get_slot_tables(path: Path, workflow: dict):
+    """Return `(resource_slots, param_slots, output_nodes)` for a
+    workflow, cached by path.
+
+    `extract_all_slots` is a pure function of the graph and cheap, but
+    it walks every node on every call; caching means a hot `/comfy/segment`
+    endpoint pays the cost once at first invocation, not per request.
+    """
+    key = str(path)
+    with _slot_tables_lock:
+        cached = _slot_tables_cache.get(key)
+    if cached is not None:
+        return cached
+    result = extract_all_slots(workflow)
+    with _slot_tables_lock:
+        _slot_tables_cache[key] = result
+    return result
+
+
 _SAM3_NODE = "SAM3_Detect"
 _SAM2_NODE = "Sam2Segmentation"
-_TOOLING_NODES = ("ETN_LoadImageCache", "ETN_KritaOutput")
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +288,16 @@ _TOOLING_NODES = ("ETN_LoadImageCache", "ETN_KritaOutput")
 # ---------------------------------------------------------------------------
 
 def handle_status(_payload) -> dict:
+    """Preflight: is ComfyUI reachable, are the SAM nodes installed,
+    is the v2 proxy reachable.
+
+    `has_sam3` / `has_sam2` drive the panel's status flash (see
+    `pg_panel_bindings.js::_checkStatusAction`).  `proxy_reachable` is
+    informational — the panel does not gate on it today, but
+    surfacing the failure here means a user running the pipeline with
+    a dead proxy sees "proxy unreachable" in the terminal log rather
+    than only on the first segment/refine call.
+    """
     client = _get_client()
     try:
         info = cached_object_info(client)
@@ -220,20 +307,29 @@ def handle_status(_payload) -> dict:
         return {
             "success": True,
             "reachable": False,
+            "proxy_reachable": False,
             "message": f"ComfyUI unreachable at {COMFY_HOST}:{COMFY_PORT}: {e}",
         }
 
-    missing_tooling = [n for n in _TOOLING_NODES if n not in info]
     seg_wf = _get_segment_workflow()
     ref_wf = _get_refine_workflow()
+
+    proxy_reachable = True
+    proxy_error = ""
+    try:
+        _get_proxy()
+    except ProxyUnreachable as e:
+        proxy_reachable = False
+        proxy_error = str(e)
+
     return {
         "success": True,
         "reachable": True,
         "node_count": len(info),
         "has_sam3": _SAM3_NODE in info,
         "has_sam2": _SAM2_NODE in info,
-        "has_tooling": not missing_tooling,
-        "missing_tooling": missing_tooling,
+        "proxy_reachable": proxy_reachable,
+        "proxy_error": proxy_error,
         "segment_workflow_loaded": seg_wf is not None,
         "refine_workflow_loaded": ref_wf is not None,
         "segment_workflow_path": str(WORKFLOW_SEGMENT_PATH),
@@ -278,62 +374,268 @@ def handle_playground_reregister(_payload) -> dict:
 
 
 # ---------------------------------------------------------------------------
-#  /comfy/segment and /comfy/refine
+#  v2 pipeline helpers
 # ---------------------------------------------------------------------------
 
-def _run_workflow(workflow: dict, resources: KritaResources,
-                  params: dict, client: ComfyClient,
-                  label: str) -> dict:
-    try:
-        object_info = cached_object_info(client)
-    except ComfyError as e:
-        _reset_client()
-        return {"success": False, "message": f"ComfyUI unreachable: {e}"}
+def _download_outputs(proxy: ProxyV2, job: dict) -> list:
+    """Download every retrievable output of a terminal `Job` dict.
 
-    for n in _TOOLING_NODES:
-        if n not in object_info:
-            return {"success": False,
-                    "message": f"comfyui-tooling-nodes missing {n}."}
+    Mirrors `kritomatic_daemon.handlers.comfyui_paste.download_outputs`,
+    with the daemon-only imports dropped so the playground does not
+    need `krita`.  Same filter (skip `type == "temp"`, require `id`),
+    same tolerance (silently skip individual download failures — the
+    caller decides whether zero results is a hard error).
 
-    try:
-        expanded = expand_custom(workflow, params, resources,
-                                 node_defs=object_info)
-    except Exception as e:
-        traceback.print_exc()
-        return {"success": False,
-                "message": f"workflow rewrite failed: {e}"}
-
-    for blob_hash, blob_bytes in expanded.image_data.items():
+    Returned entries are `{"png_bytes", "name", "node_id", "type"}`.
+    """
+    real_outputs = [
+        o for o in (job.get("outputs") or [])
+        if isinstance(o, dict) and o.get("type") and o["type"] != "temp"
+        and o.get("id")
+    ]
+    downloaded = []
+    for out in real_outputs:
         try:
-            client.upload_image(blob_hash, blob_bytes)
-        except ComfyError as e:
-            return {"success": False,
-                    "message": f"image upload failed: {e}"}
+            png = proxy.download_asset(out["id"])
+        except ProxyHTTPError as e:
+            if e.status == 404 and e.code == "output_unavailable":
+                continue
+            continue
+        except ProxyUnreachable:
+            continue
+        downloaded.append({
+            "png_bytes": png,
+            "name":      out.get("name", ""),
+            "node_id":   out.get("node_id", ""),
+            "type":      out.get("type"),
+        })
+    return downloaded
 
+
+_POLL_INTERVAL_S = 0.25
+_MIN_EXEC_TIMEOUT_S = 300.0
+_MAX_QUEUE_WAIT_S = 300.0
+_MAX_TOTAL_POLL_S = 600.0
+
+
+def _poll_until_done(proxy: ProxyV2, job_id: str, *,
+                     timeout: float) -> Optional[dict]:
+    """Poll one proxy job until it reaches a terminal status.
+
+    Same budget structure as the daemon's `_poll_job`: a floor of
+    `_MIN_EXEC_TIMEOUT_S` on the execution budget, a cap of
+    `_MAX_QUEUE_WAIT_S` on the queue wait, a hard cap of
+    `_MAX_TOTAL_POLL_S` on the total.  Returns the terminal Job dict,
+    or `None` on any budget exhaustion (caller turns that into a
+    "poll timed out" error message).
+    """
+    started = time.monotonic()
+    exec_budget = max(float(timeout), _MIN_EXEC_TIMEOUT_S)
+    queue_deadline = started + _MAX_QUEUE_WAIT_S
+    run_deadline: Optional[float] = None
+    last_snapshot: Optional[tuple] = None
+
+    while True:
+        now = time.monotonic()
+        if now - started > _MAX_TOTAL_POLL_S:
+            _log(f"poll {job_id[:8]}: hit _MAX_TOTAL_POLL_S")
+            return None
+        if run_deadline is not None:
+            if now > run_deadline:
+                _log(f"poll {job_id[:8]}: exec timeout")
+                return None
+        elif now > queue_deadline:
+            _log(f"poll {job_id[:8]}: queue timeout")
+            return None
+
+        try:
+            job = proxy.get_job(job_id)
+        except ProxyUnreachable as e:
+            _log(f"poll {job_id[:8]}: proxy unreachable: {e}")
+            _invalidate_proxy()
+            return None
+        except ProxyHTTPError as e:
+            if e.status == 404:
+                return {
+                    "id": job_id,
+                    "status": "expired",
+                    "outputs": [],
+                    "error": {"code": "not_found",
+                              "message": "job unknown to proxy"},
+                }
+            _log(f"poll {job_id[:8]}: HTTP {e.status}: {e.message}")
+            time.sleep(_POLL_INTERVAL_S)
+            continue
+
+        status = job.get("status")
+        if status in ("succeeded", "failed", "canceled", "expired"):
+            return job
+
+        prog = job.get("progress")
+        if isinstance(prog, dict):
+            snap = (status, tuple(sorted(prog.items())))
+        else:
+            snap = (status, prog, job.get("queue_position"))
+        changed = (snap != last_snapshot)
+
+        if status == "running":
+            if run_deadline is None:
+                run_deadline = now + exec_budget
+            elif changed:
+                run_deadline = now + exec_budget
+        elif status == "queued" and changed:
+            queue_deadline = now + _MAX_QUEUE_WAIT_S
+
+        last_snapshot = snap
+        time.sleep(_POLL_INTERVAL_S)
+
+
+def _submit_and_collect(
+    proxy: ProxyV2,
+    prepared_graph: dict,
+    *,
+    label: str,
+) -> dict:
+    """Submit one prepared graph, poll to terminal, download outputs.
+
+    Returns either a `{"success": True, "masks": [...], "timing": ...}`
+    dict or a `{"success": False, "message": "..."}` dict.  The shape
+    matches what `pg_panel_bindings.js`'s `runSegmentAllAction` /
+    `runRefineAction` expect.
+    """
     t0 = time.monotonic()
     try:
-        result = client.generate(expanded.graph, timeout=GENERATE_TIMEOUT)
-    except ComfyTimeout as e:
-        return {"success": False, "message": f"timeout: {e}"}
-    except ComfyCancelled:
-        return {"success": False, "message": "cancelled"}
-    except ComfyError as e:
-        return {"success": False, "message": f"ComfyUI error: {e}"}
-    except Exception as e:
-        traceback.print_exc()
-        return {"success": False, "message": f"unexpected error: {e}"}
-    elapsed = time.monotonic() - t0
+        job = proxy.submit_job(prepared_graph)
+    except ProxyUnreachable as e:
+        _invalidate_proxy()
+        return {"success": False,
+                "message": f"submit: proxy unreachable: {e}"}
+    except ProxyHTTPError as e:
+        return {"success": False,
+                "message": f"submit: {e.status} {e.code or ''}: {e.message}"}
 
-    masks_b64 = [base64.b64encode(png).decode("ascii")
-                 for png in result.images if png]
-    _log(f"{label}: {len(masks_b64)} mask(s) in {elapsed:.2f}s")
+    job_id = job.get("id")
+    if not job_id:
+        return {"success": False,
+                "message": "proxy did not return a job id"}
 
+    terminal = _poll_until_done(proxy, job_id, timeout=GENERATE_TIMEOUT)
+    if terminal is None:
+        return {"success": False, "message": "poll timed out"}
+
+    status = terminal.get("status")
+    if status != "succeeded":
+        err = terminal.get("error") or {}
+        return {"success": False,
+                "message": f"execution {status}: "
+                           f"{err.get('message') or 'no detail'}"}
+
+    outputs = _download_outputs(proxy, terminal)
+    masks_b64 = [
+        base64.b64encode(o["png_bytes"]).decode("ascii")
+        for o in outputs if o.get("png_bytes")
+    ]
     if not masks_b64:
-        return {"success": False, "message": "no masks produced"}
+        return {"success": False,
+                "message": "job succeeded but produced no retrievable "
+                           "outputs"}
 
-    return {"success": True, "masks": masks_b64,
-            "timing": round(elapsed, 3)}
+    elapsed = time.monotonic() - t0
+    _log(f"{label}: {len(masks_b64)} mask(s) in {elapsed:.2f}s")
+    return {
+        "success": True,
+        "masks":   masks_b64,
+        "timing":  round(elapsed, 3),
+        "backend": label,
+    }
 
+
+def _upload_canvas(proxy: ProxyV2, image_entry: dict) -> dict:
+    """Upload the cached canvas PNG as `@thesegment`.  Returns the
+    proxy's `Asset` dict, ready for `asset_refs["@thesegment"]`."""
+    return proxy.upload_asset(
+        image_entry["raw"], "input/thesegment.png", "image/png",
+    )
+
+
+def _run_segment_pipeline(payload: dict, image_entry: dict,
+                          *, backend_label: str) -> dict:
+    """Shared pipeline for `handle_segment` and the SAM3 refine fallback.
+
+    Both invoke the segment workflow (SAM3_Detect) with the canvas as
+    the only resource.  The difference is only the parameters
+    `_build_segment_params` produces (`individual_masks=True` for the
+    refine fallback; the payload's value for Segment All).
+    """
+    workflow = _get_segment_workflow()
+    if workflow is None:
+        return {"success": False,
+                "message": f"segment workflow not loaded from "
+                           f"{WORKFLOW_SEGMENT_PATH}"}
+
+    client = _get_client()
+    try:
+        info = cached_object_info(client)
+    except ComfyError as e:
+        _reset_client()
+        return {"success": False,
+                "message": f"ComfyUI unreachable: {e}"}
+
+    if _SAM3_NODE not in info:
+        return {"success": False,
+                "message": f"ComfyUI has no {_SAM3_NODE} node."}
+
+    resource_slots, param_slots, output_nodes = _get_slot_tables(
+        WORKFLOW_SEGMENT_PATH, workflow,
+    )
+    if "@thesegment" not in resource_slots:
+        return {"success": False,
+                "message": "segment workflow has no '@thesegment' "
+                           "LoadImage slot (edit workflows/segment.json)"}
+    if not output_nodes:
+        return {"success": False,
+                "message": "segment workflow has no SaveImage output node"}
+
+    try:
+        proxy = _get_proxy()
+    except ProxyUnreachable as e:
+        return {"success": False,
+                "message": f"proxy unavailable: {e}"}
+
+    try:
+        asset = _upload_canvas(proxy, image_entry)
+    except ProxyUnreachable as e:
+        _invalidate_proxy()
+        return {"success": False,
+                "message": f"asset upload: proxy unreachable: {e}"}
+    except ProxyHTTPError as e:
+        return {"success": False,
+                "message": f"asset upload: {e.status}: {e.message}"}
+
+    try:
+        params = _build_segment_params(
+            payload, image_entry["width"], image_entry["height"],
+        )
+    except Exception as e:
+        return {"success": False,
+                "message": f"could not build params: {e}"}
+
+    try:
+        prepared = substitute_into_graph(
+            workflow, resource_slots, param_slots,
+            {"@thesegment": asset}, params,
+            seed=None,
+        )
+    except ValueError as e:
+        return {"success": False,
+                "message": f"substitute failed: {e}"}
+
+    return _submit_and_collect(proxy, prepared, label=backend_label)
+
+
+# ---------------------------------------------------------------------------
+#  /comfy/segment
+# ---------------------------------------------------------------------------
 
 def _clamp_bbox(bbox, image_w: int, image_h: int) -> tuple:
     if not isinstance(bbox, dict):
@@ -377,53 +679,25 @@ def _build_segment_params(payload: dict, image_w: int, image_h: int,
     }
 
 
-_CACHE_MISS_MESSAGE = (
-    "image not in cache \u2014 click Refresh @thesegment in the panel"
-)
-
-
 def handle_segment(payload: dict) -> dict:
-    from pg_comfy.image import make_encoded_image
-
     hash_hex = payload.get("hash")
     if not hash_hex:
         return {"success": False, "message": "no image hash"}
 
     image_entry = _get_image(hash_hex)
     if image_entry is None:
-        return {"success": False, "message": _CACHE_MISS_MESSAGE}
-
-    workflow = _get_segment_workflow()
-    if workflow is None:
         return {"success": False,
-                "message": f"segment workflow not loaded from "
-                           f"{WORKFLOW_SEGMENT_PATH}"}
+                "message": "image not in cache \u2014 click Refresh "
+                           "@thesegment in the panel"}
 
-    client = _get_client()
-    try:
-        info = cached_object_info(client)
-    except ComfyError as e:
-        _reset_client()
-        return {"success": False, "message": f"ComfyUI unreachable: {e}"}
-
-    if _SAM3_NODE not in info:
-        return {"success": False,
-                "message": f"ComfyUI has no {_SAM3_NODE} node."}
-
-    image_enc = make_encoded_image(image_entry["raw"])
-    resources = KritaResources(
-        canvas_image=image_enc,
-        canvas_extent=(image_enc.width, image_enc.height),
-    )
-    params = _build_segment_params(
-        payload, image_entry["width"], image_entry["height"],
+    return _run_segment_pipeline(
+        payload, image_entry, backend_label="sam3",
     )
 
-    result = _run_workflow(workflow, resources, params, client, "segment")
-    if result.get("success"):
-        result["backend"] = "sam3"
-    return result
 
+# ---------------------------------------------------------------------------
+#  /comfy/refine
+# ---------------------------------------------------------------------------
 
 def _build_refine_sam2_params(payload: dict) -> dict:
     def coords_json(points):
@@ -438,58 +712,85 @@ def _build_refine_sam2_params(payload: dict) -> dict:
     }
 
 
-def _run_refine_sam2(payload: dict, image_entry: dict,
-                     workflow: dict, client: ComfyClient) -> dict:
-    from pg_comfy.image import make_encoded_image
+def _run_refine_sam2(payload: dict, image_entry: dict) -> dict:
+    workflow = _get_refine_workflow()
+    if workflow is None:
+        return {"success": False,
+                "message": f"refine workflow not loaded from "
+                           f"{WORKFLOW_REFINE_PATH}"}
 
     mask_b64 = payload.get("mask_b64")
     if not mask_b64:
-        return {"success": False, "message": "no mask_b64 for SAM2 refine"}
+        return {"success": False,
+                "message": "no mask_b64 for SAM2 refine"}
 
     try:
         mask_bytes = base64.b64decode(mask_b64)
-        mask_enc   = make_encoded_image(mask_bytes)
     except Exception as e:
         return {"success": False, "message": f"bad mask_b64: {e}"}
 
-    image_enc = make_encoded_image(image_entry["raw"])
-    resources = KritaResources(
-        canvas_image=image_enc,
-        canvas_extent=(image_enc.width, image_enc.height),
-        layer_images={"current_mask": mask_enc},
+    resource_slots, param_slots, output_nodes = _get_slot_tables(
+        WORKFLOW_REFINE_PATH, workflow,
     )
+    for needed in ("@thesegment", "@current_mask"):
+        if needed not in resource_slots:
+            return {"success": False,
+                    "message": f"refine workflow has no '{needed}' "
+                               f"LoadImage slot (edit "
+                               f"workflows/sam2_refine.json)"}
+    if not output_nodes:
+        return {"success": False,
+                "message": "refine workflow has no SaveImage output node"}
+
+    try:
+        proxy = _get_proxy()
+    except ProxyUnreachable as e:
+        return {"success": False,
+                "message": f"proxy unavailable: {e}"}
+
+    try:
+        canvas_asset = _upload_canvas(proxy, image_entry)
+        mask_asset = proxy.upload_asset(
+            mask_bytes, "input/current_mask.png", "image/png",
+        )
+    except ProxyUnreachable as e:
+        _invalidate_proxy()
+        return {"success": False,
+                "message": f"asset upload: proxy unreachable: {e}"}
+    except ProxyHTTPError as e:
+        return {"success": False,
+                "message": f"asset upload: {e.status}: {e.message}"}
+
+    asset_refs = {
+        "@thesegment":  canvas_asset,
+        "@current_mask": mask_asset,
+    }
     params = _build_refine_sam2_params(payload)
 
-    result = _run_workflow(workflow, resources, params, client, "refine-sam2")
-    if result.get("success"):
-        result["backend"] = "sam2"
-    return result
-
-
-def _run_refine_sam3(payload: dict, image_entry: dict,
-                     client: ComfyClient) -> dict:
-    from pg_comfy.image import make_encoded_image
-
-    workflow = _get_segment_workflow()
-    if workflow is None:
+    try:
+        prepared = substitute_into_graph(
+            workflow, resource_slots, param_slots,
+            asset_refs, params,
+            seed=None,
+        )
+    except ValueError as e:
         return {"success": False,
-                "message": "no segment workflow for SAM3 refine"}
+                "message": f"substitute failed: {e}"}
 
-    image_enc = make_encoded_image(image_entry["raw"])
-    resources = KritaResources(
-        canvas_image=image_enc,
-        canvas_extent=(image_enc.width, image_enc.height),
-    )
-    params = _build_segment_params(
-        payload, image_entry["width"], image_entry["height"],
-        individual_masks_override=True,
-    )
+    return _submit_and_collect(proxy, prepared, label="sam2")
 
-    result = _run_workflow(workflow, resources, params, client,
-                           "refine-sam3")
-    if result.get("success"):
-        result["backend"] = "sam3"
-    return result
+
+def _run_refine_sam3(payload: dict, image_entry: dict) -> dict:
+    """SAM3 refine re-detects using the segment workflow.
+
+    SAM3's detect node has no `mask` input, so this shares the segment
+    pipeline with `individual_masks_override=True`.  Same semantic
+    difference as before: each click produces a fresh detection rather
+    than an incremental refinement of the previous mask.
+    """
+    return _run_segment_pipeline(
+        payload, image_entry, backend_label="sam3",
+    )
 
 
 def handle_refine(payload: dict) -> dict:
@@ -499,12 +800,17 @@ def handle_refine(payload: dict) -> dict:
 
     image_entry = _get_image(hash_hex)
     if image_entry is None:
-        return {"success": False, "message": _CACHE_MISS_MESSAGE}
+        return {"success": False,
+                "message": "image not in cache \u2014 click Refresh "
+                           "@thesegment in the panel"}
 
     model = payload.get("model", "sam2")
     if model not in ("sam2", "sam3"):
         return {"success": False,
                 "message": f"unknown refine model: {model!r}"}
+
+    if model == "sam3":
+        return _run_refine_sam3(payload, image_entry)
 
     client = _get_client()
     try:
@@ -514,13 +820,10 @@ def handle_refine(payload: dict) -> dict:
         return {"success": False,
                 "message": f"ComfyUI unreachable: {e}"}
 
-    if model == "sam3":
-        return _run_refine_sam3(payload, image_entry, client)
-
     refine_wf = _get_refine_workflow()
     if refine_wf is not None and _SAM2_NODE in info:
         try:
-            result = _run_refine_sam2(payload, image_entry, refine_wf, client)
+            result = _run_refine_sam2(payload, image_entry)
             if result.get("success"):
                 return result
             _log(f"sam2 refine failed: {result.get('message')}")
@@ -528,10 +831,16 @@ def handle_refine(payload: dict) -> dict:
             _log(f"sam2 refine raised: {e}")
 
     _log("sam2 unavailable or failed; falling back to sam3 refine")
-    return _run_refine_sam3(payload, image_entry, client)
+    return _run_refine_sam3(payload, image_entry)
 
 
 def handle_interrupt(_payload) -> dict:
+    """POST /interrupt to ComfyUI.
+
+    Segment's per-run jobs are handled through the proxy, but the
+    underlying ComfyUI instance still answers the stock `/interrupt`.
+    A running SAM detection is interruptible exactly as before.
+    """
     client = _get_client()
     try:
         client.interrupt()
@@ -811,7 +1120,7 @@ def handle_resource_image(payload: dict) -> dict:
     """Resolve a `{source, layer_name}` spec to a PNG data URL.
 
     For source=active this is a thin wrapper over `handle_krita_import`
-    — same caching.  For source=layer, fetch the named layer's pixels
+    (same cache).  For source=layer, fetch the named layer's pixels
     and cache the raw bytes under their content hash so segment/refine
     can look the image up later.
     """

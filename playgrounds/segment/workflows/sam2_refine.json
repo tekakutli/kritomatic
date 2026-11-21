@@ -1,7 +1,6 @@
 {
-  "1": { "class_type": "ETN_KritaCanvas", "inputs": {} },
-  "2": { "class_type": "ETN_KritaImageLayer",
-         "inputs": { "name": "current_mask" } },
+  "1": { "class_type": "LoadImage", "inputs": { "image": "@thesegment" } },
+  "2": { "class_type": "LoadImage", "inputs": { "image": "@current_mask" } },
   "3": { "class_type": "ImageToMask",
          "inputs": { "image": ["2", 0], "channel": "red" } },
   "4": {
@@ -16,23 +15,25 @@
   "5": {
     "class_type": "Sam2Segmentation",
     "inputs": {
-      "sam2_model":            ["4", 0],
-      "image":                 ["1", 0],
-      "mask":                  ["3", 0],
-      "coordinates_positive":  ["6", 0],
-      "coordinates_negative":  ["7", 0],
-      "keep_model_loaded":     true,
-      "individual_objects":    false
+      "sam2_model":           ["4", 0],
+      "image":                ["1", 0],
+      "mask":                 ["3", 0],
+      "coordinates_positive": ["6", 0],
+      "coordinates_negative": ["7", 0],
+      "keep_model_loaded":    true,
+      "individual_objects":   false
     }
   },
-  "6": { "class_type": "ETN_Parameter",
-         "inputs": { "name": "positive_coords", "type": "text",
-                     "default": "[{\"x\": 0, \"y\": 0}]" } },
-  "7": { "class_type": "ETN_Parameter",
-         "inputs": { "name": "negative_coords", "type": "text",
-                     "default": "[{\"x\": 0, \"y\": 0}]" } },
-  "8": { "class_type": "MaskToImage",
-         "inputs": { "mask": ["5", 0] } },
-  "9": { "class_type": "ETN_KritaOutput",
-         "inputs": { "name": "refined", "images": ["8", 0] } }
+  "6": { "class_type": "PrimitiveString",
+         "_meta": { "title": "positive_coords" },
+         "inputs": { "value": "[{\"x\": 0, \"y\": 0}]" } },
+  "7": { "class_type": "PrimitiveString",
+         "_meta": { "title": "negative_coords" },
+         "inputs": { "value": "[{\"x\": 0, \"y\": 0}]" } },
+  "8": { "class_type": "MaskToImage", "inputs": { "mask": ["5", 0] } },
+  "9": { "class_type": "SaveImage",
+         "inputs": {
+           "images":          ["8", 0],
+           "filename_prefix": "kritomatic_refine"
+         } }
 }

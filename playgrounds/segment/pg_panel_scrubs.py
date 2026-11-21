@@ -1,4 +1,4 @@
-"""Scrub inputs, checkboxes, tool radios, text inputs, and the
+"""Scrub inputs, checkboxes, tool buttons, text inputs, and the
 `pgkitRegisterField` registrations for every panel field.
 
 STATUS.RUNNING
@@ -20,7 +20,17 @@ path is already in place.
 already honours this, and `remote_panel/rp_client.py` was updated in
 parallel to match that contract.  If a future build omits the
 `rp_client.py` guard, the field would render as a checkbox the user
-could click with no effect; the guard is what keeps the panel honest."""
+could click with no effect; the guard is what keeps the panel honest.
+
+REGION TOOL BUTTONS
+===================
+The Brush / Lasso / Freehand controls are one-shot activation
+buttons: clicking one enters region-edit mode with that tool armed.
+The tool's natural end-of-action (mouseup for brush/freehand,
+Enter for lasso — see `pg_dispatch.js`) exits region mode.  This is
+why the controls are buttons rather than a persistent radio + a
+"Paint" checkbox: region editing is a short-lived gesture, not a
+latched mode."""
 
 PANEL_SCRUBS_JS = r"""
 import { board } from "./pg_state.js";
@@ -28,7 +38,7 @@ import {
   selectedMask, selectedMaskIdx,
   clearMaskSelection, replaceMaskSelection, setMaskPrompt,
 } from "./pg_masks.js";
-import { _installScrubInput } from "./pgkit/panel_core.js";
+import { _installScrubInput, flashStatus } from "./pgkit/panel_core.js";
 import {
   pgkitRegisterField, pgkitNotifyLocal,
 } from "./pgkit/remote_client.js";
@@ -160,19 +170,6 @@ if (autoRunEl) {
   });
 }
 
-const regionModeEl = document.getElementById("regionMode");
-if (regionModeEl) {
-  regionModeEl.checked = !!board.regionMode;
-  regionModeEl.addEventListener("change", () => {
-    board.regionMode = !!regionModeEl.checked;
-    board.lassoPoints = [];
-    board.freehandPoints = [];
-    board.freehandActive = false;
-    pgkitNotifyLocal("region.mode");
-    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-  });
-}
-
 const regionSubtractEl = document.getElementById("regionSubtract");
 if (regionSubtractEl) {
   regionSubtractEl.checked = !!board.regionSubtract;
@@ -208,40 +205,41 @@ if (kritaOpacityEnabledEl && kritaOpacityEl) {
 }
 
 /* ============================================================
-   Tool radios
-   ============================================================ */
+   Region tool buttons
+   ============================================================
+   Each button is a one-shot activation: clicking it enters
+   region-edit mode with that tool. The action completes and
+   region mode exits when the tool's natural end-of-action fires
+   (mouseup for brush / freehand, Enter for lasso) — see
+   pg_dispatch.js. */
 
-const regionToolBrush    = document.getElementById("regionToolBrush");
-const regionToolLasso    = document.getElementById("regionToolLasso");
-const regionToolFreehand = document.getElementById("regionToolFreehand");
+const regionToolBrushBtn    = document.getElementById("regionToolBrushBtn");
+const regionToolLassoBtn    = document.getElementById("regionToolLassoBtn");
+const regionToolFreehandBtn = document.getElementById("regionToolFreehandBtn");
 
-function _syncRegionToolRadios() {
-  if (regionToolBrush)    regionToolBrush.checked    = (board.regionTool === 'brush');
-  if (regionToolLasso)    regionToolLasso.checked    = (board.regionTool === 'lasso');
-  if (regionToolFreehand) regionToolFreehand.checked = (board.regionTool === 'freehand');
-}
-_syncRegionToolRadios();
-
-function _setRegionTool(tool) {
+function _enterRegionTool(tool) {
+  if (!selectedMask()) {
+    flashStatus("Select a mask first", "warn");
+    return;
+  }
+  board.regionMode = true;
   board.regionTool = tool;
   board.lassoPoints = [];
   board.freehandPoints = [];
   board.freehandActive = false;
   board.freehandIsErase = false;
+  pgkitNotifyLocal("region.mode");
   pgkitNotifyLocal("region.tool");
   import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
   import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
 }
 
-if (regionToolBrush) regionToolBrush.addEventListener("change", () => {
-  if (regionToolBrush.checked) _setRegionTool('brush');
-});
-if (regionToolLasso) regionToolLasso.addEventListener("change", () => {
-  if (regionToolLasso.checked) _setRegionTool('lasso');
-});
-if (regionToolFreehand) regionToolFreehand.addEventListener("change", () => {
-  if (regionToolFreehand.checked) _setRegionTool('freehand');
-});
+if (regionToolBrushBtn)
+  regionToolBrushBtn.addEventListener("click", () => _enterRegionTool('brush'));
+if (regionToolLassoBtn)
+  regionToolLassoBtn.addEventListener("click", () => _enterRegionTool('lasso'));
+if (regionToolFreehandBtn)
+  regionToolFreehandBtn.addEventListener("click", () => _enterRegionTool('freehand'));
 
 /* ============================================================
    Text inputs
@@ -373,8 +371,6 @@ pgkitRegisterField("region.mode", {
     board.lassoPoints = [];
     board.freehandPoints = [];
     board.freehandActive = false;
-    if (regionModeEl && document.activeElement !== regionModeEl)
-      regionModeEl.checked = board.regionMode;
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   },
   meta: { kind: "bool", label: "Region paint mode" },
@@ -388,7 +384,6 @@ pgkitRegisterField("region.tool", {
     board.lassoPoints = [];
     board.freehandPoints = [];
     board.freehandActive = false;
-    _syncRegionToolRadios();
     import("./pg_panel_fields.js").then(m => m.syncPanelFields()).catch(() => {});
     import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
   },

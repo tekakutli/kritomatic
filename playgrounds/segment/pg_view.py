@@ -92,6 +92,7 @@ function _regionSig() {
   return (board.imageHash || "none")
        + "|" + idx
        + "|" + (m.regionCanvas ? "1" : "0")
+       + "|" + (m._regionVersion || 0)                 // ADD
        + "|" + (board.regionStrokeActive ? "1" : "0")
        + "|" + (board.regionStrokeIsErase ? "1" : "0")
        + "|" + _transformKey()
@@ -218,7 +219,7 @@ function _drawImageCanvas() {
     ctx.font = "700 12px 'JetBrains Mono', monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText("drop an image to begin", cw / 2, ch / 2);
+    ctx.fillText("waiting for @thesegment", cw / 2, ch / 2);
     return;
   }
 

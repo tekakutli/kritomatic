@@ -5,6 +5,12 @@ The function is called once per frame from `pg_dispatch.draw()`.
 Every DOM write is guarded against the current DOM value so a
 steady-state frame touches nothing.
 
+`kritaImportBtn` is gone along with the removed "+ Import image from
+Krita" button (see `pg_panel_bindings.py`'s module docstring).  The
+image is now pulled exclusively from the daemon via `@thesegment`;
+there is no local import path.  The disable-check for it was null-safe
+and would have done nothing anyway — removing it is dead-code cleanup.
+
 IMPORT SPLIT
 ============
 `board` comes from `pg_state.js` (leaf).  `selectedMask` and
@@ -25,11 +31,13 @@ function _get() {
     pointsLabel:    document.getElementById("pointsLabel"),
     maskPromptRow:  document.getElementById("maskPromptRow"),
     maskPromptEl:   document.getElementById("maskPromptText"),
-    regionModeEl:   document.getElementById("regionMode"),
     regionSizeEl:   document.getElementById("regionSize"),
     regionSizeRow:  document.getElementById("regionSizeRow"),
     regionStatus:   document.getElementById("regionStatus"),
     clearRegionBtn: document.getElementById("clearRegionBtn"),
+    regionToolBrushBtn:    document.getElementById("regionToolBrushBtn"),
+    regionToolLassoBtn:    document.getElementById("regionToolLassoBtn"),
+    regionToolFreehandBtn: document.getElementById("regionToolFreehandBtn"),
     maskCount:      document.getElementById("maskCount"),
     statusLine:     document.getElementById("statusLine"),
     runBtn:         document.getElementById("runBtn"),
@@ -41,11 +49,13 @@ function _get() {
     exportBtn:      document.getElementById("exportBtn"),
     exportCombBtn:  document.getElementById("exportCombinedBtn"),
     kritaStatus:    document.getElementById("kritaStatus"),
-    kritaImportBtn: document.getElementById("kritaImportBtn"),
+    kritaImportMasksBtn: document.getElementById("kritaImportMasksBtn"),
     kritaSelBtn:    document.getElementById("kritaSelectionBtn"),
     kritaTransBtn:  document.getElementById("kritaTransparencyBtn"),
     kritaExtractNewBtn: document.getElementById("kritaExtractNewLayerBtn"),
     kritaExtractDupBtn: document.getElementById("kritaExtractDuplicateBtn"),
+    refreshCanvasBtn:   document.getElementById("refreshCanvasBtn"),
+    rebindDocBtn:       document.getElementById("rebindDocBtn"),
   };
   return _els;
 }
@@ -56,7 +66,7 @@ export function syncPanelFields() {
   if (e.imageInfo) {
     let text;
     if (!board.imageHash) {
-      text = "No image loaded \u2014 drop one on the canvas";
+      text = "No image loaded \u2014 load a workflow in the docker to pull @thesegment";
     } else {
       text = board.imageWidth + " \u00d7 " + board.imageHeight
            + "   [" + board.imageHash.slice(0, 8) + "\u2026]";
@@ -92,7 +102,8 @@ export function syncPanelFields() {
   }
 
   if (e.regionSizeRow) {
-    e.regionSizeRow.style.display = (board.regionTool === 'brush') ? "" : "none";
+    e.regionSizeRow.style.display =
+      (board.regionMode && board.regionTool === 'brush') ? "" : "none";
   }
 
   if (e.regionStatus) {
@@ -112,8 +123,25 @@ export function syncPanelFields() {
     if (e.regionStatus.textContent !== text) e.regionStatus.textContent = text;
   }
 
-  if (e.regionModeEl) e.regionModeEl.disabled = !m;
   if (e.regionSizeEl) e.regionSizeEl.disabled = !m || !board.regionMode;
+
+  const canEditRegion = !!m;
+  if (e.regionToolBrushBtn) {
+    e.regionToolBrushBtn.disabled = !canEditRegion;
+    e.regionToolBrushBtn.classList.toggle(
+      "active", !!board.regionMode && board.regionTool === 'brush');
+  }
+  if (e.regionToolLassoBtn) {
+    e.regionToolLassoBtn.disabled = !canEditRegion;
+    e.regionToolLassoBtn.classList.toggle(
+      "active", !!board.regionMode && board.regionTool === 'lasso');
+  }
+  if (e.regionToolFreehandBtn) {
+    e.regionToolFreehandBtn.disabled = !canEditRegion;
+    e.regionToolFreehandBtn.classList.toggle(
+      "active", !!board.regionMode && board.regionTool === 'freehand');
+  }
+
   if (e.clearRegionBtn) e.clearRegionBtn.disabled = !m || !m.regionCanvas;
 
   if (e.maskCount) {
@@ -163,7 +191,7 @@ export function syncPanelFields() {
             + (m && m.regionCanvas ? " (region-constrained)" : ""));
   }
   if (e.segAllBtn) {
-    e.segAllBtn.textContent = busy ? "Running\u2026" : "Segment All";
+    e.segAllBtn.textContent = busy ? "Running\u2026" : "SEGMENT";
     e.segAllBtn.classList.toggle("busy", busy);
     e.segAllBtn.disabled = !canSegmentAll;
   }
@@ -189,10 +217,18 @@ export function syncPanelFields() {
   if (e.exportBtn)     e.exportBtn.disabled = !hasMasks;
   if (e.exportCombBtn) e.exportCombBtn.disabled = !hasMasks;
 
-  if (e.kritaImportBtn) e.kritaImportBtn.disabled = busy;
+  if (e.kritaImportMasksBtn) e.kritaImportMasksBtn.disabled = busy;
   if (e.kritaSelBtn)    e.kritaSelBtn.disabled    = !hasMasks;
   if (e.kritaTransBtn)  e.kritaTransBtn.disabled  = !hasMasks;
   if (e.kritaExtractNewBtn) e.kritaExtractNewBtn.disabled = !hasMasks;
   if (e.kritaExtractDupBtn) e.kritaExtractDupBtn.disabled = !hasMasks;
+
+  // Refresh @thesegment is disabled only while an action is running
+  // (a concurrent re-fetch would race the in-flight segment/refine
+  // for the same cache slot).  Rebind doc is likewise gated on busy
+  // for the same reason — both actions change the document pin and
+  // start a fetch.
+  if (e.refreshCanvasBtn) e.refreshCanvasBtn.disabled = busy;
+  if (e.rebindDocBtn)     e.rebindDocBtn.disabled     = busy;
 }
 """

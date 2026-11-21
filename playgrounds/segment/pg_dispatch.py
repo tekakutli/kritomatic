@@ -13,6 +13,47 @@ runs on every mouse-move that crosses a mask boundary; using
 `draw()` there would rebuild the mask DOM and re-sync every panel
 field on every crossing.
 
+REGION TOOL LIFECYCLE
+=====================
+Region editing is a short-lived gesture, not a latched mode.  Clicking
+a Brush / Lasso / Freehand button in the Refine section (see
+`pg_panel_scrubs.js`) sets `board.regionMode = true` with that tool
+armed.  The tool's natural end-of-action clears `board.regionMode`
+again:
+
+  · Brush     — mouseup of a stroke (`_regionStroke.active` branch
+                of the window mouseup handler)
+  · Freehand  — mouseup of a drag that produced a fillable polygon
+                (`_finishFreehand`, only when the polyline filters to
+                ≥ 3 points)
+  · Lasso     — any of:
+                  · Enter with ≥ 3 vertices (keydown handler)
+                  · double-click on/near the last placed vertex
+                    (mousedown handler; see below for why)
+                  · click within LASSO_CLOSE_TOL_PX of the first
+                    vertex (mousedown handler)
+
+Incomplete actions (a freehand drag with fewer than 3 filtered
+points, a lasso with fewer than 3 vertices) do NOT exit region mode;
+the user can keep adding vertices / retry the drag.  Escape and the
+"Clear region" button are the explicit cancel paths.
+
+LASSO MOUSE-RELEASE CLOSE
+=========================
+Lasso is click-to-place-vertex, not drag-to-trace, so "mouse release"
+has no single natural vertex to fire on.  The standard equivalent
+for a click-based polygon tool is a double-click: the second click of
+a double-click is the user's "done" gesture.  We detect it on
+mousedown and require the two clicks to be *near each other* (not
+just close in time) so a fast user placing vertices at different
+positions still gets every vertex placed instead of having their 4th
+click swallowed.  Clicking back on the first anchor is the other
+standard polygon close gesture and is handled separately.
+
+All three lasso exit points call full `draw()` (not `drawView()`),
+because exiting region mode flips the tool button's `.active` class
+in the panel, which `syncPanelFields` owns.
+
 IMPORTS SPLIT
 =============
 The old version imported everything from `./pg_core.js`.  This version
@@ -31,8 +72,7 @@ WHAT'S UNCHANGED
 ================
 The pan state (`_panActive`, `_spaceDown`), the region stroke state
 (`_regionStroke`), the shift-drag resize state (`_resizeActive`), the
-lasso close-on-Enter, the freehand finish-on-mouseup, the undo/redo
-keyboard shortcuts, the region-tool cycle on B, the
+freehand finish-on-mouseup, the undo/redo keyboard shortcuts, the
 mask-selection-on-number keys — all untouched."""
 
 DISPATCH_JS = r"""
@@ -112,6 +152,18 @@ let _panStartPanX = 0;
 let _panStartPanY = 0;
 let _spaceDown = false;
 
+// Lasso close-on-mouse-release state.  `_lastLassoClickTime` is the
+// timestamp of the most recent lasso mousedown; a new mousedown that
+// is (a) within LASSO_DOUBLE_CLICK_MS of it and (b) within
+// LASSO_CLOSE_TOL_PX of the last placed vertex counts as the "second
+// click" of a double-click, i.e. the user's "done" gesture.  Both
+// thresholds are in the units their names say: milliseconds and
+// screen pixels (converted to image pixels via the fitted-rect scale
+// at the point of use).
+let _lastLassoClickTime = 0;
+const LASSO_DOUBLE_CLICK_MS = 320;
+const LASSO_CLOSE_TOL_PX    = 12;
+
 function _endResize() {
   if (!_resizeActive) return;
   _resizeActive = false;
@@ -125,8 +177,17 @@ function _isBusyDrawing() {
 }
 
 /* ============================================================
-   Lasso — close ONLY on Enter
-   ============================================================ */
+   Lasso — close paths
+   ============================================================
+   Three ways to complete a lasso: Enter (keydown), double-click on
+   the last vertex (mousedown, below), click near the first anchor
+   (mousedown, below).  All three funnel through `_closeLasso`.
+
+   `_closeLasso` filters near-duplicate vertices (< 2 image px apart)
+   before filling so a double-click's "phantom" vertex that lands on
+   top of the previous one doesn't corrupt the polygon.  It then
+   exits region mode and calls full `draw()` because the tool
+   button's `.active` class lives in the panel. */
 
 function _closeLasso(asErase) {
   if (board.lassoPoints.length < 3) {
@@ -144,13 +205,16 @@ function _closeLasso(asErase) {
   }
   fillLassoPolygonInRegion(filtered, asErase);
   board.lassoPoints = [];
+  board.regionMode = false;              // completion exits region mode
+  _lastLassoClickTime = 0;               // don't bleed into a new lasso
   pgkitNotifyAll();
-  drawView();
+  draw();
 }
 
 function _cancelLasso() {
   if (board.lassoPoints.length === 0) return false;
   board.lassoPoints = [];
+  _lastLassoClickTime = 0;
   pgkitNotifyAll();
   drawView();
   return true;
@@ -158,7 +222,11 @@ function _cancelLasso() {
 
 /* ============================================================
    Freehand — closes automatically on mouseup
-   ============================================================ */
+   ============================================================
+   The freehand tool's completion event is mouseup of a drag that
+   produced a fillable polygon.  A too-short drag does NOT exit
+   region mode — the user can try again.  Full `draw()` for the
+   same reason as `_closeLasso`. */
 
 function _finishFreehand() {
   if (!board.freehandActive) return;
@@ -177,6 +245,7 @@ function _finishFreehand() {
 
   if (filtered.length >= 3) {
     fillLassoPolygonInRegion(filtered, isErase);
+    board.regionMode = false;            // completion exits region mode
   }
   pgkitNotifyAll();
   draw();
@@ -191,7 +260,7 @@ canvas.addEventListener("mousedown", (e) => {
   // preventDefault() on mousedown — which would otherwise leave focus
   // stuck in whatever INPUT/TEXTAREA/SELECT was last focused. That
   // makes the global keydown handler return early, swallowing Enter
-  // (the only way to close a lasso). Blur explicitly so keyboard
+  // (which is still a lasso close path). Blur explicitly so keyboard
   // shortcuts target the body again.
   const active = document.activeElement;
   if (active && active !== canvas
@@ -255,8 +324,18 @@ canvas.addEventListener("mousedown", (e) => {
     return;
   }
 
-  // Lasso drafting. Adds a vertex on left click; right click is a
-  // no-op (lasso only closes on Enter, only cancels on Escape).
+  // Lasso drafting. Adds a vertex on left click. Closes on:
+  //   · Enter with >= 3 vertices (keydown handler)
+  //   · double-click on/near the last placed vertex
+  //   · click within LASSO_CLOSE_TOL_PX (screen) of the first vertex
+  // Right click is a no-op (Escape cancels the draft).
+  //
+  // Double-click is the mouse-release equivalent for a click-based
+  // tool. We require the two clicks to be near each other — not just
+  // close in time — so a user placing vertices rapidly at different
+  // positions still gets every vertex placed. Only a fast click *at
+  // the same spot* closes, which is the standard double-click
+  // gesture.
   if (board.regionMode && board.regionTool === 'lasso' && selectedMask()) {
     if (e.button === 2) {
       e.preventDefault();
@@ -267,6 +346,30 @@ canvas.addEventListener("mousedown", (e) => {
       // First click: require over-image. Subsequent vertices: anywhere
       // in the canvas widget, including outside the image.
       if (board.lassoPoints.length === 0 && !overImage) return;
+
+      const now = performance.now();
+      const lastPt = board.lassoPoints[board.lassoPoints.length - 1];
+      const tolImg = LASSO_CLOSE_TOL_PX / r.s;
+
+      const isDouble = !!lastPt
+        && (now - _lastLassoClickTime) < LASSO_DOUBLE_CLICK_MS
+        && Math.hypot(ix - lastPt.x, iy - lastPt.y) <= tolImg;
+      _lastLassoClickTime = now;
+
+      if (isDouble && board.lassoPoints.length >= 3) {
+        _closeLasso(board.regionSubtract);
+        return;
+      }
+
+      // Click near the first anchor closes (standard polygon UX).
+      if (board.lassoPoints.length >= 3) {
+        const first = board.lassoPoints[0];
+        if (Math.hypot(ix - first.x, iy - first.y) <= tolImg) {
+          _closeLasso(board.regionSubtract);
+          return;
+        }
+      }
+
       board.lassoPoints.push({x: ix, y: iy});
       drawView();
       return;
@@ -522,7 +625,16 @@ canvas.addEventListener("wheel", (e) => {
 
 /* ============================================================
    Mouseup / Keyup
-   ============================================================ */
+   ============================================================
+   The brush-stroke branch here is the brush tool's completion
+   event, so it exits region mode.  Freehand's completion is
+   handled inside `_finishFreehand` (only when the polyline was
+   fillable).  Lasso has no mouseup path — its "mouse release"
+   equivalent is the double-click detection in the mousedown
+   handler, because lasso is click-to-place rather than
+   drag-to-trace.  All exit paths call full `draw()` because
+   region-mode flips the tool button's `.active` class, which
+   lives in the panel. */
 
 window.addEventListener("mouseup", () => {
   if (_panActive) {
@@ -535,8 +647,9 @@ window.addEventListener("mouseup", () => {
   if (_regionStroke.active) {
     _regionStroke.active = false;
     board.regionStrokeActive = false;
+    board.regionMode = false;            // completion exits region mode
     pgkitNotifyAll();
-    drawView();
+    draw();
   }
   if (_resizeActive) {
     _endResize();
@@ -605,8 +718,10 @@ window.addEventListener("keydown", (e) => {
     return;
   }
 
-  // Enter closes the lasso — the ONLY way to finish a lasso.
-  // Subtract mode decides whether it adds or erases.
+  // Enter also closes the lasso — kept as a keyboard-only path for
+  // users who prefer it.  Mouse-only users now have double-click and
+  // anchor-click as alternatives (see mousedown lasso branch).
+  // Subtract mode decides whether the close adds or erases.
   if (e.key === "Enter" && board.regionMode && board.regionTool === 'lasso'
       && board.lassoPoints.length >= 3) {
     e.preventDefault();
@@ -683,20 +798,17 @@ window.addEventListener("keydown", (e) => {
 
   if (e.key.toLowerCase() === "b") {
     e.preventDefault();
+    if (!selectedMask()) return;
     const order = ['brush', 'lasso', 'freehand'];
     const idx = order.indexOf(board.regionTool);
     board.regionTool = order[(idx + 1) % order.length];
+    board.regionMode = true;
     board.lassoPoints = [];
     board.freehandPoints = [];
     board.freehandActive = false;
     board.freehandIsErase = false;
+    _lastLassoClickTime = 0;
     pgkitNotifyAll();
-    const rB = document.getElementById("regionToolBrush");
-    const rL = document.getElementById("regionToolLasso");
-    const rF = document.getElementById("regionToolFreehand");
-    if (rB) rB.checked = (board.regionTool === 'brush');
-    if (rL) rL.checked = (board.regionTool === 'lasso');
-    if (rF) rF.checked = (board.regionTool === 'freehand');
     draw();
     return;
   }
@@ -716,8 +828,6 @@ window.addEventListener("keydown", (e) => {
     if (_cancelLasso()) return;
     if (board.regionMode) {
       board.regionMode = false;
-      const cb = document.getElementById("regionMode");
-      if (cb) cb.checked = false;
       pgkitNotifyAll();
       draw();
       return;

@@ -7,6 +7,51 @@ not contain it, and clamps the area dims up to at least the viewer size.
 
 The fetched Krita image lives *inside* the viewer (contain-fit,
 centred).  The area outside the viewer is a plain filled rectangle.
+
+RENDER SCALE — NO FIT-TO-WINDOW
+===============================
+`view.zoom` is pixels-of-screen per pixel-of-area, and it is the
+*only* thing that scales the rendered area.  There is no automatic
+fit-to-window: a 400-px area renders at 400 screen px at zoom=1, a
+4000-px area renders at 4000 screen px at zoom=1 (extending
+off-screen as needed), and both scale identically with wheel zoom.
+Pan and zoom are the user's navigation, not an auto-fit heuristic.
+
+This is a deliberate choice.  Every previous fit-to-window scheme
+(`min(sx, sy)`, `min(1, sx, sy)`) had a **boundary** at the point
+where the area exceeded the window: growing the area past that
+point made each area-pixel map to *fewer* screen pixels, so the
+rendered area stopped growing and its contents appeared to shrink —
+felt broken.  The user's instruction was "no such thing", which
+means: growing the area must always grow it visually, even if that
+means it extends off-screen.
+
+One-shot auto-fit at boot lives in `pg_panel.js` (`_fitAreaIfOverflow`)
+and is the *only* place where the scale is computed from window
+size.  It never fires during a drag and never fires on `resize()`,
+so the boundary cannot reappear through any interactive path.
+
+AREA CORNER DRAG
+================
+The area's four corners are draggable for resizing (no aspect lock —
+the area is a plain rect, not a viewport).  The area model has no
+origin offset: it always spans `(0, 0) → (areaWidth, areaHeight)`.
+`beginAreaDrag` / `updateAreaDrag` / `endAreaDrag` implement the drag
+with the *opposite* corner anchored:
+
+  · SE drag → `areaWidth`/`areaHeight` grow/shrink; viewer pos fixed.
+  · NW drag → area shrinks/grows from top-left; viewer position is
+    shifted in area-pixel space so it stays visually put.
+  · NE drag → width grows right, height shrinks/grows from top;
+    viewer Y is shifted.
+  · SW drag → height grows down, width shrinks/grows from left;
+    viewer X is shifted.
+
+The mouse → area-pixel conversion uses a **frozen `s`** captured at
+drag-start (in `beginAreaDrag`).  Since `s = view.zoom` is not
+window-dependent anymore, this frozen `s` is also just `view.zoom`,
+which doesn't change mid-drag — so the drag is guaranteed stable
+regardless.
 """
 
 STATE_JS = r"""
@@ -30,15 +75,14 @@ export function resetView() {
 export function clampPan() {
   if (!board.areaWidth || !board.areaHeight) return;
   const cw = window.innerWidth, ch = window.innerHeight;
-  const pad = 40;
-  const sx = (cw - 2 * pad) / board.areaWidth;
-  const sy = (ch - 2 * pad) / board.areaHeight;
-  const s = Math.min(sx, sy) * view.zoom;
+  const m  = VIEW_PAN_MARGIN;
+  // No fit-to-window: scale is view.zoom, always.  See module
+  // docstring, RENDER SCALE — NO FIT-TO-WINDOW.
+  const s = view.zoom;
   const w = board.areaWidth  * s;
   const h = board.areaHeight * s;
   const baseX = (cw - w) / 2;
   const baseY = (ch - h) / 2;
-  const m = VIEW_PAN_MARGIN;
   view.panX = Math.max(m - baseX - w, Math.min(cw - m - baseX, view.panX));
   view.panY = Math.max(m - baseY - h, Math.min(ch - m - baseY, view.panY));
 }
@@ -78,6 +122,14 @@ export const board = {
   viewerDragStart:   null,
   viewerDragStartIx: 0,
   viewerDragStartIy: 0,
+
+  // Area corner drag state.  `areaDragStart` captures { w, h, pxX,
+  // pxY, sx, sy, s } at drag start; `s` is view.zoom at start (it
+  // doesn't change mid-drag, so freezing is defensive rather than
+  // load-bearing).
+  areaDragActive: false,
+  areaDragHandle: null,
+  areaDragStart:  null,
 
   mouse: { x: 0, y: 0, inside: false },
 };
@@ -175,6 +227,89 @@ export function setAreaDims(w, h) {
   return { w: nw, h: nh };
 }
 
+/* ============================================================
+   Area corner drag
+   ============================================================ */
+
+export function beginAreaDrag(handle, sx, sy) {
+  const r = fittedImageRect();
+  if (!r) return false;
+  board.areaDragActive = true;
+  board.areaDragHandle = handle;
+  board.areaDragStart = {
+    w:   board.areaWidth,
+    h:   board.areaHeight,
+    pxX: board.viewer.pxX,
+    pxY: board.viewer.pxY,
+    sx, sy,
+    s:   r.s,   // view.zoom at drag start
+  };
+  return true;
+}
+
+export function updateAreaDrag(sx, sy) {
+  if (!board.areaDragActive) return;
+  const st = board.areaDragStart;
+  if (!st || !st.s) return;
+
+  // Convert screen delta to area-pixel delta using the frozen scale.
+  const dax = (sx - st.sx) / st.s;
+  const day = (sy - st.sy) / st.s;
+
+  const MIN = VIEWER_MIN_SIZE_PX;
+  const pxW = board.viewer.pxW;
+  const pxH = board.viewer.pxH;
+
+  let newW   = st.w;
+  let newH   = st.h;
+  let newPxX = st.pxX;
+  let newPxY = st.pxY;
+
+  const hnd = board.areaDragHandle;
+  if (hnd === 'se') {
+    newW = st.w + dax;
+    newH = st.h + day;
+  } else if (hnd === 'nw') {
+    newW = st.w - dax;
+    newH = st.h - day;
+    newPxX = st.pxX - dax;
+    newPxY = st.pxY - day;
+  } else if (hnd === 'ne') {
+    newW = st.w + dax;
+    newH = st.h - day;
+    newPxY = st.pxY - day;
+  } else if (hnd === 'sw') {
+    newW = st.w - dax;
+    newH = st.h + day;
+    newPxX = st.pxX - dax;
+  } else {
+    return;
+  }
+
+  // Area must always be at least MIN and at least the viewer size —
+  // this is what enforces "area fully contains viewer" during drag.
+  newW = Math.max(MIN, pxW, newW);
+  newH = Math.max(MIN, pxH, newH);
+
+  // Viewer must stay inside the area.
+  newPxX = Math.max(0, Math.min(newW - pxW, newPxX));
+  newPxY = Math.max(0, Math.min(newH - pxH, newPxY));
+
+  board.areaWidth  = newW;
+  board.areaHeight = newH;
+  board.viewer.pxX = newPxX;
+  board.viewer.pxY = newPxY;
+
+  clampPan();
+  _scheduleDraw();
+}
+
+export function endAreaDrag() {
+  board.areaDragActive = false;
+  board.areaDragHandle = null;
+  board.areaDragStart  = null;
+}
+
 export function applyCanvasImage(hash, dataUrl, width, height) {
   board.areaImageHash    = hash;
   board.areaImageDataUrl = dataUrl;
@@ -227,10 +362,9 @@ export function fittedImageRect() {
             + view.panX + "," + view.panY;
   if (key === _firKey) return _firVal;
 
-  const pad = 40;
-  const sx = (cw - 2 * pad) / board.areaWidth;
-  const sy = (ch - 2 * pad) / board.areaHeight;
-  const s = Math.min(sx, sy) * view.zoom;
+  // No fit-to-window: scale is view.zoom, always.  See module
+  // docstring, RENDER SCALE — NO FIT-TO-WINDOW.
+  const s = view.zoom;
   const w = board.areaWidth  * s;
   const h = board.areaHeight * s;
   const x0 = (cw - w) / 2 + view.panX;

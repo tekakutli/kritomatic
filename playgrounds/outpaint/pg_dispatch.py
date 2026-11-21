@@ -1,7 +1,20 @@
-"""Mouse handling: viewer drag/resize + pan/zoom.
+"""Mouse handling: area-handle drag, viewer drag/resize, pan/zoom.
 
-Hit priority: viewer corner handle → viewer interior → nothing.
-Pan (space / middle mouse) and zoom (wheel) unchanged.
+Hit priority on mousedown:
+  0. Area corner handle   → area resize (no aspect lock)
+  1. Viewer corner handle → viewer resize (aspect locked)
+  2. Viewer interior      → viewer drag
+  (space+drag / middle click pan is checked first, before any of the
+  above, so the mode switch always wins.)
+
+AREA-HANDLE DRAG
+================
+The drag itself is implemented in `pg_state.js`
+(`beginAreaDrag` / `updateAreaDrag` / `endAreaDrag`).  `pg_state`
+freezes the fit-scale at drag-start so the per-frame refit that
+happens as dims change can't feedback into the mouse → area-pixel
+conversion.  This module just wires the three phases to the mouse
+events, and puts the resize cursor on hover.
 """
 
 DISPATCH_JS = r"""
@@ -9,9 +22,11 @@ import {
   canvas, board, view,
   screenToImage, fittedImageRect,
   clampPan, zoomAt, resetView,
+  beginAreaDrag, updateAreaDrag, endAreaDrag,
 } from "./pg_state.js";
 import {
   hitTestViewerHandle, hitTestViewerInterior,
+  hitTestAreaHandle,
   viewerCursorFor, applyViewerMove, applyViewerResize,
 } from "./pg_viewer.js";
 
@@ -48,6 +63,15 @@ canvas.addEventListener("mousedown", (e) => {
   const r = fittedImageRect();
   if (!r) return;
   const [cx, cy] = screenToImage(sx, sy);
+
+  // 0) Area corner handle — highest priority
+  const areaHandle = hitTestAreaHandle(sx, sy, r);
+  if (areaHandle) {
+    beginAreaDrag(areaHandle, sx, sy);
+    canvas.style.cursor = viewerCursorFor(areaHandle);
+    e.preventDefault();
+    return;
+  }
 
   // 1) Viewer corner handle
   const viewerHandle = hitTestViewerHandle(sx, sy, r);
@@ -104,6 +128,14 @@ canvas.addEventListener("mousemove", (e) => {
   if (!r) return;
   const [cx, cy] = screenToImage(sx, sy);
 
+  // Area drag beats viewer drag — they cannot both be active, but
+  // checking area first keeps intent obvious.
+  if (board.areaDragActive) {
+    updateAreaDrag(sx, sy);
+    canvas.style.cursor = viewerCursorFor(board.areaDragHandle);
+    return;
+  }
+
   if (board.viewerDragActive) {
     if (board.viewerDragHandle === 'move') {
       const dx = cx - board.viewerDragStartIx;  // area pixels
@@ -116,7 +148,12 @@ canvas.addEventListener("mousemove", (e) => {
     return;
   }
 
-  // Hover
+  // Hover — priority order matches mousedown.
+  const areaHandle = hitTestAreaHandle(sx, sy, r);
+  if (areaHandle) {
+    canvas.style.cursor = viewerCursorFor(areaHandle);
+    return;
+  }
   const viewerHandle = hitTestViewerHandle(sx, sy, r);
   if (viewerHandle) {
     canvas.style.cursor = viewerCursorFor(viewerHandle);
@@ -145,6 +182,10 @@ window.addEventListener("mouseup", () => {
   if (_panActive) {
     _panActive = false;
     canvas.style.cursor = _spaceDown ? "grab" : "crosshair";
+  }
+  if (board.areaDragActive) {
+    endAreaDrag();
+    canvas.style.cursor = "crosshair";
   }
   if (board.viewerDragActive) {
     board.viewerDragActive = false;

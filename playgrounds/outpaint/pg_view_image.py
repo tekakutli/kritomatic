@@ -1,10 +1,17 @@
 """Render: plain area, viewer (with image contained inside), frame.
 
 Render order:
-  1. Area — plain fill, no image ever drawn across the whole area.
+  1. Area — plain fill + border.
   2. Viewer interior — darker background, then the fetched image
      scaled to *contain* (letterboxed) inside the viewer rect.
   3. Viewer frame — dashed white outline, corner handles, label.
+  4. Area corner handles — drawn last so they sit on top of viewer
+     handles when they overlap (viewer touching an area edge).
+
+Area handles use a cyan accent to distinguish them from the white
+viewer handles at a glance.  They mirror the viewer handle visual
+language (dark halo → accent fill → dark stroke) so they read as
+"same family, different role".
 """
 
 VIEW_IMAGE_JS = r"""
@@ -104,9 +111,36 @@ function _drawViewerFrame(r) {
   ctx.restore();
 }
 
+/* Area corner handles — cyan accent, drawn AFTER viewer content and
+ * frame so they sit on top when the viewer touches an area edge.
+ * The handle visual language matches the viewer handles (dark halo,
+ * coloured fill, dark stroke) so they read as the same family. */
+function _drawAreaHandles(r) {
+  const HS = 7;
+  const corners = [
+    [r.x0,       r.y0],
+    [r.x0 + r.w, r.y0],
+    [r.x0,       r.y0 + r.h],
+    [r.x0 + r.w, r.y0 + r.h],
+  ];
+
+  ctx.save();
+  for (const [hx, hy] of corners) {
+    ctx.fillStyle = "rgba(8, 10, 14, 0.9)";
+    ctx.fillRect(hx - HS - 2, hy - HS - 2, (HS + 2) * 2, (HS + 2) * 2);
+    ctx.fillStyle = "rgba(120, 220, 255, 0.95)";
+    ctx.fillRect(hx - HS, hy - HS, HS * 2, HS * 2);
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.9)";
+    ctx.lineWidth = 1.2;
+    ctx.strokeRect(hx - HS, hy - HS, HS * 2, HS * 2);
+  }
+  ctx.restore();
+}
+
 export function drawImageLayer(r) {
   _drawArea(r);
   _drawViewerContent(r);
   _drawViewerFrame(r);
+  _drawAreaHandles(r);
 }
 """

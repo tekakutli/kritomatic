@@ -3,6 +3,16 @@
 The viewer is `{pxX, pxY, pxW, pxH, ratio}` in area-pixel coordinates.
 Aspect ratio locked to `ratio`.  All positions are clamped so the
 viewer is always fully inside the area.
+
+AREA HANDLES
+============
+The area's own four corners are also hit-tested here — they live in
+*screen* space (the area always spans `(r.x0, r.y0) → (r.x0+r.w,
+r.y0+r.h)` on screen), not area-pixel space, because the area is
+the whole fitted rect and has no origin offset in the model.  The
+actual drag logic lives in `pg_state.js` (`beginAreaDrag`,
+`updateAreaDrag`, `endAreaDrag`); this module only surfaces the
+hit-test so `pg_dispatch.js` can route mousedown correctly.
 """
 
 VIEWER_JS = r"""
@@ -134,5 +144,36 @@ export function applyViewerResize(handle, mouseCx, mouseCy) {
   v.pxY = Math.max(0, Math.min(ah - fitH, fy));
   v.pxW = fitW;
   v.pxH = fitH;
+}
+
+/* ============================================================
+   Area corner handles — screen-space
+   ============================================================
+   The area is the whole fitted rect: its corners are at the four
+   corners of `r` on screen.  Unlike the viewer, the area has no
+   origin offset in the model, so hit-testing happens directly in
+   screen space.  Aspect ratio is NOT locked (the area is a plain
+   rect — "not constrained into keeping the ratio" per the feature
+   spec). */
+
+export function getAreaHandlesScreen(r) {
+  if (!r) return [];
+  return [
+    { name: 'nw', x: r.x0,       y: r.y0 },
+    { name: 'ne', x: r.x0 + r.w, y: r.y0 },
+    { name: 'sw', x: r.x0,       y: r.y0 + r.h },
+    { name: 'se', x: r.x0 + r.w, y: r.y0 + r.h },
+  ];
+}
+
+export function hitTestAreaHandle(sx, sy, r) {
+  if (!r) return null;
+  const tol = VIEWER_HANDLE_TOL_PX;
+  for (const h of getAreaHandlesScreen(r)) {
+    if (Math.abs(sx - h.x) <= tol && Math.abs(sy - h.y) <= tol) {
+      return h.name;
+    }
+  }
+  return null;
 }
 """

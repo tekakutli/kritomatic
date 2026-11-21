@@ -524,10 +524,14 @@ def _prepare_cropped(doc, graph, resource_slots, param_slots,
     inpaint_enabled = bool(frame.get("inpaintEnabled", False))
 
     warnings: list[str] = []
+    _user_managed = sorted(
+        set(resource_slots) - {"@thecanvas", "@theselection", "@thecontext"}
+    )
     warnings.append(
         f"cropped prepare: theta={theta} W={W} H={H} "
         f"frame={Wp}x{Hp} crop=({cropX},{cropY},{cropW},{cropH}) "
         f"inpaintEnabled={inpaint_enabled}"
+        + (f" user_managed={_user_managed}" if _user_managed else "")
     )
     print(f"[comfyui] cropped prepare: theta={theta} "
           f"W={W} H={H} frame={Wp}x{Hp} "
@@ -631,6 +635,21 @@ def _prepare_cropped(doc, graph, resource_slots, param_slots,
             blobs[name] = sel_enc_out
         elif name == "@thecontext":
             blobs[name] = ctx_enc_out
+        else:
+            # User-managed resource (e.g. @thereference).  Read from
+            # Krita per the config, then apply the same rotate + crop
+            # the managed resources above went through, so every blob
+            # the workflow sees is at cropW×cropH and lines up with
+            # @thecanvas pixel-for-pixel.  Without this branch, a
+            # workflow with extra @-names reaches
+            # substitute_into_graph with those names missing from
+            # `assets`, and prepare fails with "resource '…' has a
+            # slot but no uploaded asset" — the exact symptom this
+            # branch fixes.
+            blobs[name] = _read_user_resource_blob(
+                doc, name, resource_slots[name], config,
+                W, H, theta, cropX, cropY, cropW, cropH,
+            )
 
     assets = _upload_resource_blobs(blobs, proxy_client)
     prepared_graph = substitute_into_graph(
@@ -675,6 +694,104 @@ def _extend_and_crop(img, cropX, cropY, cropW, cropH):
     painter.drawImage(-int(cropX), -int(cropY), img)
     painter.end()
     return out
+
+
+# ---------------------------------------------------------------------------
+#  User-managed resource read (cropped path)
+# ---------------------------------------------------------------------------
+
+def _read_user_resource_blob(doc,
+                             name: str,
+                             slot: dict,
+                             config: dict,
+                             W: int,
+                             H: int,
+                             theta: float,
+                             cropX: int,
+                             cropY: int,
+                             cropW: int,
+                             cropH: int) -> EncodedImage:
+    """Read a non-managed resource, rotate + crop to the frame.
+
+    "Non-managed" = any `@`-name the inpaint playground does not own.
+    For the three managed names (`@thecanvas`, `@theselection`,
+    `@thecontext`) the blobs come from the inpaint scratch layers and
+    the playground's own context-rect derivation; for everything else
+    (e.g. `@thereference`, a Resources-section layer) the config in
+    `config["resources"][name]` is the source of truth for where the
+    pixels come from.
+
+    Reads at native W×H — the doc's actual pixel grid, before any
+    rotation — then applies the same rotate + extend-and-crop steps
+    `_prepare_cropped` uses for the managed blobs, so the resulting
+    PNG is at `cropW×cropH` and lines up pixel-for-pixel with
+    `@thecanvas`.  Without this, a workflow that declares an extra
+    `@`-name and reaches the cropped path drops the resource silently
+    and fails inside `substitute_into_graph` with
+    "resource '…' has a slot but no uploaded asset".
+
+    Reads pixels via the same `read_*` helpers `_read_resource_blobs`
+    uses for the legacy path, so a resource that works under
+    `_prepare_unrotated` also works under `_prepare_cropped` — the
+    only difference is the rotate/crop step in the middle.
+
+    Raises `ValueError` on:
+      · config omission — the graph declares `@name` but
+        `config["resources"]` has no entry for it;
+      · missing layer — the spec says `source="layer"` but the named
+        layer is not in the document;
+      · dimension mismatch — the read returned a size other than
+        `W×H` (only reachable via a corrupted document).
+    """
+    spec = (config.get("resources") or {}).get(name)
+    if spec is None:
+        raise ValueError(
+            f"resource slot {name!r} exists in the graph but is not "
+            f"covered by [resources] in the config."
+        )
+
+    source = spec.get("source")
+    kind = slot.get("kind", "image")
+
+    if source == "active":
+        enc_native = read_canvas_composite(doc, (0, 0, W, H))
+    elif source == "global":
+        enc_native = read_selection_mask(doc, (0, 0, W, H))
+        if enc_native is None:
+            enc_native = EncodedImage(
+                data=_encode_grayscale_png(b"\xff" * (W * H), W, H),
+                width=W, height=H, is_mask=True,
+            )
+    elif source == "layer":
+        layer_name = spec.get("layer_name")
+        if not layer_name:
+            raise ValueError(
+                f"resource {name!r}: source='layer' requires layer_name"
+            )
+        if kind == "mask":
+            enc_native = read_layer_mask(doc, layer_name, (0, 0, W, H))
+        else:
+            enc_native = read_layer_pixels(doc, layer_name, (0, 0, W, H))
+    else:
+        raise ValueError(
+            f"resource {name!r}: unknown source {source!r}"
+        )
+
+    if (enc_native.width, enc_native.height) != (W, H):
+        raise ValueError(
+            f"resource {name!r}: read "
+            f"{enc_native.width}\u00d7{enc_native.height} but expected "
+            f"{W}\u00d7{H}"
+        )
+
+    # Same transform the managed canvas/selection go through, so the
+    # workflow sees this resource at the same frame as `@thecanvas`.
+    # theta == 0 skips the rotation (no-op on identity) — a direct
+    # `_extend_and_crop` of the native image is what we want there.
+    native_img = _decode_png_to_qimage(enc_native.data)
+    rotated = _rotate_qimage(native_img, theta) if theta != 0 else native_img
+    cropped = _extend_and_crop(rotated, cropX, cropY, cropW, cropH)
+    return _encode_qimage_png(cropped)
 
 
 # ---------------------------------------------------------------------------

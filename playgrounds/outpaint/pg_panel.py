@@ -26,6 +26,16 @@ The old `change`-event handlers are gone.  `write` is now the single
 entry point for area-dim mutations, whether triggered by typing or
 by dragging.
 
+BOOT AUTO-FIT
+=============
+`_fitAreaIfOverflow()` runs once at boot.  If the initial area is
+larger than the window, it sets `view.zoom` so the whole area fits —
+this is the one place where the scale is derived from window size,
+so the boundary that previously re-appeared on every drag is now
+strictly boot-only.  Growth during drag does not re-trigger it; the
+user's wheel zoom owns the scale for the rest of the session.  See
+`pg_state.py`'s module docstring, RENDER SCALE — NO FIT-TO-WINDOW.
+
 Ratio change → `refitViewerAspect()` keeps the current centre.
 
 Boot → `resetViewerToFit()` once.
@@ -33,8 +43,10 @@ Boot → `resetViewerToFit()` once.
 
 PANEL_JS = r"""
  import {
-   board, setAreaDims, resetViewerToFit, refitViewerAspect,
+   board, view, setAreaDims, resetViewerToFit, refitViewerAspect,
+   clampPan,
  } from "./pg_state.js";
+ import { VIEW_ZOOM_MIN } from "./pg_tuning.js";
  import { checkKritaStatus, fetchActiveState } from "./pg_client.js";
  import { fetchSelectedLayer } from "./pg_autosync.js";
  import { flashStatus } from "./pgkit/panel_core.js";
@@ -91,6 +103,23 @@ PANEL_JS = r"""
      const want = String(board.areaHeight);
      if (e.areaH.value !== want) e.areaH.value = want;
    }
+ }
+
+ /* ============================================================
+    Boot auto-fit (one-shot, only if area overflows window)
+    ============================================================ */
+
+ function _fitAreaIfOverflow() {
+   const cw = window.innerWidth, ch = window.innerHeight;
+   const pad = 40;
+   const sx = (cw - 2 * pad) / board.areaWidth;
+   const sy = (ch - 2 * pad) / board.areaHeight;
+   const fit = Math.min(sx, sy);
+   if (fit >= 1) return;   // area already fits at 1:1 — leave zoom alone
+   view.zoom = Math.max(VIEW_ZOOM_MIN, fit);
+   view.panX = 0;
+   view.panY = 0;
+   clampPan();
  }
 
  /* ============================================================
@@ -216,6 +245,12 @@ PANEL_JS = r"""
    // One-time fit: establish sensible viewer bounds for the initial
    // area.  Never called again on area resize.
    resetViewerToFit();
+
+   // One-shot boot fit for the *area* itself, only if it overflows
+   // the window at 1:1.  Never re-runs, so dragging area corners
+   // past window size can never trigger the "shrink the whole
+   // canvas" boundary.  See module docstring, BOOT AUTO-FIT.
+   _fitAreaIfOverflow();
  }
 
  export function layoutBootSync() {

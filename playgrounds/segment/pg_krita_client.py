@@ -146,4 +146,43 @@ export async function importKritaMasks(opts) {
     return { success: false, message: e.message };
   }
 }
+
+/* ------------------------------------------------------------------
+   @thesegment auto-sync helpers
+   ------------------------------------------------------------------
+   `fetchActiveState` returns the daemon's `comfy_status` data so the
+   autosync poller can read `playgrounds[segment].layer_slots[
+   @thesegment].selector` (registry path) or
+   `config.resources["@thesegment"]` (fallback).
+
+   `fetchResourceImage` resolves that spec to a PNG data URL via
+   `/krita/resource_image`. */
+
+export async function fetchActiveState() {
+  try {
+    const res = await fetch("/comfy/active_state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    if (!res.ok) return { success: false, message: "HTTP " + res.status };
+    return await res.json();
+  } catch (e) {
+    return { success: false, message: e.message };
+  }
+}
+
+export async function fetchResourceImage(spec) {
+  try {
+    const res = await fetch("/krita/resource_image", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(spec),
+    });
+    if (!res.ok) return { success: false, message: "HTTP " + res.status };
+    return await res.json();
+  } catch (e) {
+    return { success: false, message: e.message };
+  }
+}
 """

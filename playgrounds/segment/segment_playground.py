@@ -2,20 +2,13 @@
 
     python segment_playground.py
 
-Writes segment.html, serves it at http://127.0.0.1:8773/, and
-serves /modules/* from the module manifest.
-
-Two ComfyUI workflows are expected:
-
-  segment.json   Segment All (detection)
-  sam2_refine.json    Run on a selected mask (refinement)
-
-ComfyUI must be running on 127.0.0.1:8188. The playground checks on
-load and shows status. If SAM2 isn't installed, refine falls back to
-SAM3 (individual_masks: true), which supports additions but not
-reliable negative-point shrinkage.
+Registers with the kritomatic daemon on boot under the id `"segment"`
+with a single user-editable `@thesegment` layer slot, so the docker's
+Playgrounds section can pick which Krita layer (or the composite)
+drives the playground canvas.
 """
 
+import atexit
 import os
 import sys
 
@@ -29,20 +22,23 @@ except ValueError:
 if _PLAYGROUNDS not in sys.path:
     sys.path.insert(0, _PLAYGROUNDS)
 
-from segment import segment_html, segment_server
+from segment import segment_html, segment_server, playground_registry
 
 from pgkit.server import serve as kit_serve
 
 
 HTML_FILE    = "segment.html"
-PORT         = 8773
 OPEN_BROWSER = True
+
+PORT            = segment_server.PLAYGROUND_PORT
+PLAYGROUND_ID   = segment_server.PLAYGROUND_ID
+PLAYGROUND_NAME = segment_server.PLAYGROUND_NAME
+LAYER_SLOTS     = segment_server.LAYER_SLOTS
 
 
 def descriptor():
-    """Return the run_all.py descriptor for this playground."""
     return {
-        "name":           "segment",
+        "name":           PLAYGROUND_ID,
         "port":           PORT,
         "html_file":      HTML_FILE,
         "html_render":    segment_html.render,
@@ -61,6 +57,35 @@ def main():
     print(f"  segment  : {segment_server.WORKFLOW_SEGMENT_PATH}")
     print(f"  refine   : {segment_server.WORKFLOW_REFINE_PATH}")
     print(f"  routes   : {', '.join(sorted(list(segment_server.ROUTES) + list(segment_server.RAW_ROUTES)))}")
+
+    state_url = f"http://127.0.0.1:{PORT}"
+    registered = playground_registry.register(
+        PLAYGROUND_ID, PLAYGROUND_NAME, state_url, PORT,
+        layer_slots=LAYER_SLOTS,
+        retry_s=30.0,
+    )
+    if registered:
+        print(
+            f"  registered with daemon as {PLAYGROUND_ID!r} "
+            f"(slot(s): {[s['id'] for s in LAYER_SLOTS]})",
+            flush=True,
+        )
+    else:
+        print(
+            f"  WARNING: could not register with daemon; "
+            f"playground works independently but the docker will not "
+            f"show its Playgrounds section row.  Restart after daemon "
+            f"is up to register.",
+            file=sys.stderr, flush=True,
+        )
+
+    def _cleanup():
+        try:
+            playground_registry.unregister(PLAYGROUND_ID)
+        except Exception:
+            pass
+
+    atexit.register(_cleanup)
 
     kit_serve(
         port           = PORT,

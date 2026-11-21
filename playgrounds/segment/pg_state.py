@@ -8,12 +8,13 @@ acyclic.
 
 `board` carries every piece of user-visible state.
 
-`setImage` and `clearImage` inline their board-resetting logic (mask
-array, staging points, region stroke, op log) rather than importing
-`pg_masks.clearMasks`.  That preserves this module as a leaf.  The
-behaviour is identical to the original `clearMasks()` call chain — the
-whole synchronous reset block completes before the scheduled
-`requestAnimationFrame` fires.
+`applyCanvasImage` is the sole image-install path: updates the
+displayed image from an external source (the autosync poller, or the
+manual "Refresh @thesegment" button) without clearing masks, staging
+points, per-mask points, region canvases, or view.zoom/pan.  The
+former `setImage` / `clearImage` helpers existed for the removed
+pick-image / clear / drop-overlay buttons and are gone.  Every image
+now enters the playground from the daemon via `@thesegment`.
 
 THREE CANVASES
 ==============
@@ -161,55 +162,46 @@ export function zoomAt(screenX, screenY, newZoom) {
 }
 
 /* ============================================================
-   Image loading / clearing
-   ============================================================ */
+   applyCanvasImage — autosync / manual-refresh target
+   ============================================================
+   Swap the displayed image in response to an `@thesegment`
+   resource spec change or a manual refresh.  This is the sole
+   image-install path: every image enters the playground from
+   the daemon.
 
-export function setImage(hash, dataUrl, width, height) {
-  board.imageHash    = hash;
-  board.imageDataUrl = dataUrl;
-  board.imageWidth   = width;
-  board.imageHeight  = height;
+   Preserves:
+     · mask stack (invalidates pixel / tint / region caches)
+     · staging points, per-mask points, selection, region content
+     · view.zoom / view.panX / view.panY
 
+   Does NOT call resetView() — the user's current zoom/pan is
+   preserved across autosync-triggered image updates.  The sig
+   mechanism in pg_view.js repaints because board.imageHash is in
+   the image sig. */
+
+export function applyCanvasImage(hash, dataUrl, width, height) {
   const img = new Image();
-  img.onload  = () => { board.imageEl = img;  _scheduleDraw(); };
-  img.onerror = () => { board.imageEl = null; _scheduleDraw(); };
+  img.onload = () => {
+    board.imageHash    = hash;
+    board.imageDataUrl = dataUrl;
+    board.imageEl      = img;
+    board.imageWidth   = img.naturalWidth;
+    board.imageHeight  = img.naturalHeight;
+
+    for (const m of board.masks) {
+      m._pixels = null;
+      m._bbox = null;
+      m._tinted = null;
+      m._tintedKey = null;
+      m._regionEdgePoints = null;
+      m._regionChains = null;
+    }
+    _bumpMasksVersion();
+
+    _scheduleDraw();
+  };
+  img.onerror = () => _scheduleDraw();
   img.src = dataUrl;
-
-  resetView();
-  board.masks = [];
-  board.selectedMaskIndices = [];
-  board.hoveredMaskIdx = -1;
-  board.stagingPoints = [];
-  board.lassoPoints = [];
-  board.freehandPoints = [];
-  board.freehandActive = false;
-  board.freehandIsErase = false;
-  board.regionStrokeActive = false;
-  board.opLog = [];
-  board.redoLog = [];
-  _bumpMasksVersion();
-  _scheduleDraw();
-}
-
-export function clearImage() {
-  board.imageHash    = null;
-  board.imageDataUrl = null;
-  board.imageWidth   = 0;
-  board.imageHeight  = 0;
-  board.imageEl      = null;
-  resetView();
-  board.masks = [];
-  board.selectedMaskIndices = [];
-  board.hoveredMaskIdx = -1;
-  board.stagingPoints = [];
-  board.lassoPoints = [];
-  board.freehandPoints = [];
-  board.freehandActive = false;
-  board.freehandIsErase = false;
-  board.regionStrokeActive = false;
-  board.opLog = [];
-  board.redoLog = [];
-  _bumpMasksVersion();
   _scheduleDraw();
 }
 

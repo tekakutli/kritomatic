@@ -23,17 +23,26 @@ The Generate button is wired via `installGenerateButton()` from
 `pg_generate.js`.  Multiple clicks queue multiple concurrent
 generations; the button is never disabled due to a generation in
 flight.
+
+IMAGE INSTALL
+=============
+The current `@thelayout` layer is pulled by `pg_autosync.js` whenever
+the daemon's slot selector changes (including on boot).  `Refresh
+@thelayout` bypasses the selector-change gate to force a re-read when
+the pixels behind a constant selector changed in Krita.
+
+There is no local file pick, no `Clear`, and no explicit composite
+import — the panel-mutation those buttons performed is redundant with
+`applyCanvasImage` (autosync) and `Refresh @thelayout`.  `applyCanvasImage`
+preserves bboxes and viewer state across refreshes.
 """
 PANEL_JS = r"""
  import {
-   board, setImage, applyCanvasImage, clearImage,
+   board,
    addBbox, deleteBbox, clearAllBboxes, seedDefault, selectBbox,
    setBboxText, setBboxMagiLabel, resetViewerToFit,
  } from "./pg_state.js";
- import {
-   uploadImageFile, importFromKrita, checkKritaStatus,
-   fetchActiveState, fetchResourceImage,
- } from "./pg_client.js";
+ import { checkKritaStatus, fetchActiveState } from "./pg_client.js";
  import { fetchSelectedLayer } from "./pg_autosync.js";
  import { flashStatus } from "./pgkit/panel_core.js";
  import { pgkitNotifyAll } from "./pgkit/remote_client.js";
@@ -358,57 +367,6 @@ PANEL_JS = r"""
     Buttons
     ============================================================ */
 
- function _pickImageAction() {
-   const input = document.createElement("input");
-   input.type = "file";
-   input.accept = "image/*";
-   input.addEventListener("change", async () => {
-     const file = input.files && input.files[0];
-     if (!file) return;
-     flashStatus("uploading\u2026", "");
-     try {
-       const info = await uploadImageFile(file);
-       const dataUrl = await _fileToDataUrl(file);
-       setImage(info.hash, dataUrl, info.width, info.height);
-       flashStatus("image loaded", "ok");
-       _scheduleStateSync();
-       _renderBboxList();
-     } catch (e) {
-       flashStatus("upload failed: " + e.message, "bad");
-     }
-   });
-   input.click();
- }
-
- function _fileToDataUrl(file) {
-   return new Promise((resolve, reject) => {
-     const reader = new FileReader();
-     reader.onload = () => resolve(String(reader.result || ""));
-     reader.onerror = () => reject(new Error("could not read file"));
-     reader.readAsDataURL(file);
-   });
- }
-
- function _clearImageAction() {
-   clearImage();
-   _renderBboxList();
-   syncPanelFields();
-   _scheduleStateSync();
- }
-
- async function _importImageFromKritaAction() {
-   flashStatus("importing from Krita\u2026", "");
-   const res = await importFromKrita({});
-   if (!res.success) {
-     flashStatus("import failed: " + (res.message || "unknown"), "bad");
-     return;
-   }
-   setImage(res.hash, res.data_url, res.width, res.height);
-   flashStatus("imported " + res.width + "\u00d7" + res.height, "ok");
-   _renderBboxList();
-   _scheduleStateSync();
- }
-
  async function _refreshCanvasAction() {
    flashStatus("refreshing " + SLOT_ID + "\u2026", "");
    const state = await fetchActiveState();
@@ -526,19 +484,6 @@ PANEL_JS = r"""
     Install
     ============================================================ */
 
- function _showDropOverlay(on) {
-   const el = document.getElementById("dropOverlay");
-   if (el) el.classList.toggle("visible", on);
- }
-
- function _installDropOverlay() {
-   if (document.getElementById("dropOverlay")) return;
-   const el = document.createElement("div");
-   el.id = "dropOverlay";
-   el.textContent = "Drop an image";
-   document.body.appendChild(el);
- }
-
  function _installViewerDropdowns() {
    const ratioSel = document.getElementById("viewerRatio");
    if (!ratioSel) return;
@@ -561,9 +506,6 @@ PANEL_JS = r"""
 
  export function installPanelBindings() {
    const ids = {
-     pickImage:  "pickImageBtn",
-     clearImage: "clearImageBtn",
-     importImg:  "importImageBtn",
      refresh:    "refreshCanvasBtn",
      addText:    "addTextBboxBtn",
      addChar:    "addCharacterBboxBtn",
@@ -574,9 +516,6 @@ PANEL_JS = r"""
    const el = {};
    for (const k in ids) el[k] = document.getElementById(ids[k]);
 
-   if (el.pickImage)   el.pickImage.addEventListener("click", _pickImageAction);
-   if (el.clearImage)  el.clearImage.addEventListener("click", _clearImageAction);
-   if (el.importImg)   el.importImg.addEventListener("click", _importImageFromKritaAction);
    if (el.refresh)     el.refresh.addEventListener("click", _refreshCanvasAction);
    if (el.addText)     el.addText.addEventListener("click", _addTextBboxAction);
    if (el.addChar)     el.addChar.addEventListener("click", _addCharacterBboxAction);
@@ -586,37 +525,6 @@ PANEL_JS = r"""
 
    _installViewerDropdowns();
    installGenerateButton();
-
-   _installDropOverlay();
-   let _dragDepth = 0;
-   window.addEventListener("dragenter", () => {
-     _dragDepth++;
-     _showDropOverlay(true);
-   });
-   window.addEventListener("dragleave", () => {
-     _dragDepth--;
-     if (_dragDepth <= 0) _showDropOverlay(false);
-   });
-   window.addEventListener("dragover", (e) => e.preventDefault());
-   window.addEventListener("drop", async (e) => {
-     e.preventDefault();
-     _dragDepth = 0;
-     _showDropOverlay(false);
-     const file = e.dataTransfer && e.dataTransfer.files
-                  && e.dataTransfer.files[0];
-     if (file && file.type.startsWith("image/")) {
-       flashStatus("uploading\u2026", "");
-       try {
-         const info = await uploadImageFile(file);
-         const dataUrl = await _fileToDataUrl(file);
-         setImage(info.hash, dataUrl, info.width, info.height);
-         _renderBboxList();
-         _scheduleStateSync();
-       } catch (e) {
-         flashStatus("upload failed: " + e.message, "bad");
-       }
-     }
-   });
 
    _bootPull().catch(() => {});
  }

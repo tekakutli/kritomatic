@@ -6,6 +6,23 @@ lives in its own playground (`playgrounds/inpaint`); the Inpainting
 section, the inpaint button, and the inpaint context rectangle have been
 removed from this file along with the rest of the inpaint scaffolding.
 
+IMAGE SOURCE
+============
+The image is pulled exclusively from the daemon via `@thesegment`.
+There is no pick-image, drop-image, or clear-image UI — those were
+removed when the autosync refactor landed.  The two image-section
+controls that remain are:
+
+  · **Refresh @thesegment** — re-read the pixels behind a constant
+    spec (e.g. the user painted on the layer in Krita, but the
+    source/layer picker didn't move).
+
+  · **⟲ Rebind doc** — re-pin segment to whatever document is
+    currently active in Krita.
+
+See `pg_autosync.js`'s module docstring for the poll mechanics and
+`segment_server.py`'s for the pinned-document contract.
+
 OVERLAY CANVASES
 ================
 `#regionCanvas` and `#overlayCanvas` are created dynamically by
@@ -74,9 +91,14 @@ PG_CSS = r"""
     background: rgba(180, 155, 255, 0.10);
     color: #e8e0ff;
   }
-  #ui button#pickImageBtn {
+  #ui button#refreshCanvasBtn {
     border-color: rgba(120, 220, 255, 0.72);
     color: #b8ecff;
+  }
+  #ui button#refreshCanvasBtn:hover:not(:disabled) {
+    border-color: rgba(140, 225, 255, 1.00);
+    background: rgba(120, 220, 255, 0.10);
+    color: #d8f4ff;
   }
   #ui button#exportBtn,
   #ui button#exportCombinedBtn {
@@ -130,6 +152,18 @@ PG_CSS = r"""
     background: rgba(140, 225, 160, 0.10);
     color: #d8ffe0;
   }
+  #ui button#rebindDocBtn {
+    border-color: rgba(255, 200, 90, 0.72);
+    color: #ffd89b;
+    font-size: 9px;
+    padding: 2px 8px;
+    width: auto;
+  }
+  #ui button#rebindDocBtn:hover:not(:disabled) {
+    border-color: rgba(255, 200, 90, 1.00);
+    background: rgba(255, 200, 90, 0.10);
+    color: #ffe6b8;
+  }
   #ui button#kritaSelectionBtn,
   #ui button#kritaTransparencyBtn {
     border-color: rgba(140, 225, 160, 0.72);
@@ -151,15 +185,6 @@ PG_CSS = r"""
     border-color: rgba(200, 180, 255, 1.00);
     background: rgba(180, 155, 255, 0.10);
     color: #e8e0ff;
-  }
-  #ui button#kritaImportBtn {
-    border-color: rgba(140, 225, 160, 0.72);
-    color: #b8ecff;
-  }
-  #ui button#kritaImportBtn:hover:not(:disabled) {
-    border-color: rgba(160, 240, 180, 1.00);
-    background: rgba(140, 225, 160, 0.10);
-    color: #d8ffe0;
   }
   #ui button#kritaImportMasksBtn {
     border-color: rgba(180, 155, 255, 0.72);
@@ -271,22 +296,6 @@ PG_CSS = r"""
     letter-spacing:0 !important;
   }
 
-  #dropOverlay {
-    position:fixed; inset:0; z-index:100;
-    display:none;
-    background:rgba(0,229,255,0.06);
-    border:2px dashed rgba(0,229,255,0.65);
-    box-sizing:border-box;
-    pointer-events:none;
-    align-items:center; justify-content:center;
-    font-family:'JetBrains Mono','Fira Code','Consolas','SF Mono',monospace;
-    font-size:14px; font-weight:700;
-    color:#b8ecff;
-    letter-spacing:0.16em; text-transform:uppercase;
-    text-shadow:0 0 12px rgba(0,229,255,0.55);
-  }
-  #dropOverlay.visible { display:flex; }
-
   #imageInfo {
     font-size:10px; color:#5a6774;
     margin:4px 0;
@@ -328,22 +337,26 @@ PG_PANEL_BODY = r"""
       <summary>Image</summary>
       <div class="section-body">
         <div class="row">
-          <button id="pickImageBtn" title="Pick an image file">+ Pick image…</button>
-          <button id="clearImageBtn" title="Clear the current image">Clear</button>
-        </div>
-        <div class="row">
-          <button id="kritaImportBtn"
-                  title="Import the active document's composite from Krita as the playground image">
-            + Import image from Krita
-          </button>
-        </div>
-        <div class="row">
           <button id="kritaImportMasksBtn"
                   title="Import the selected mask or paint layer(s) from Krita into the playground's mask stack. If multiple layers are selected in Krita, all are imported. Paint layers contribute their alpha channel; mask layers contribute their grayscale pixels.">
             + Import masks from Krita
           </button>
         </div>
-        <div id="imageInfo">No image loaded — drop one on the canvas</div>
+        <div class="row">
+          <button id="refreshCanvasBtn"
+                  title="Re-fetch the current @thesegment from Krita. Use when the canvas changed in Krita but autosync did not pick it up — the poller fires only when the @thesegment *spec* changes, not when the pixels behind a constant spec change.">
+            ↻ Refresh @thesegment
+          </button>
+        </div>
+        <div id="imageInfo">No image loaded — load a workflow in the docker to pull @thesegment</div>
+        <div class="row" style="margin-top:4px;">
+          <button id="kritaCheckBtn">Check Krita</button>
+          <button id="rebindDocBtn"
+                  title="Re-pin segment to whatever document is currently active in Krita.  Use this if another playground or command stole activeDocument() while segment was open.">
+            ⟲ Rebind doc
+          </button>
+          <span id="kritaStatus">not checked</span>
+        </div>
       </div>
     </details>
 

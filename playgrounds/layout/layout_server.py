@@ -2,14 +2,21 @@
 
   POST /state                  set (from browser) or get (from node)
   POST /version                version only (for IS_CHANGED and daemon sweep)
-  POST /import_image           fetch active document composite from Krita
   POST /krita_status           daemon reachable?
   POST /active_state           daemon comfy_status + playground registry
   POST /resource_image         resolve a {source, layer_name} spec to a PNG
-  POST /upload_image           raw body (image file)
   POST /playground_reregister  single-shot re-register with the daemon
   POST /generate               start a Drawatoon generation job
   POST /generate_status        poll a generation job
+
+IMAGE INSTALL
+=============
+The only image-install path is `/resource_image`, resolved from the
+`@thelayout` slot's current selector by `pg_autosync.js` (autosync) or
+`Refresh @thelayout` (manual).  The former `/import_image` and
+`/upload_image` routes, which the pick/clear/import-image buttons used,
+are gone.  `handle_import_image` survives as an internal helper for
+`handle_resource_image`'s `source="active"` branch.
 
 Lock discipline
 ===============
@@ -73,7 +80,6 @@ import time
 import urllib.error
 import urllib.request
 from io import BytesIO
-from urllib.parse import unquote
 
 from PIL import Image
 
@@ -423,6 +429,7 @@ def handle_krita_status(_payload):
 
 
 def handle_import_image(payload):
+    """Internal helper — used by `handle_resource_image` for source=active."""
     name = (payload or {}).get("name") if isinstance(payload, dict) else None
     cmd = {"type": "get_document_composite_b64"}
     if name:
@@ -494,49 +501,15 @@ def handle_resource_image(payload):
         }
     return {
         "success": False,
-        "message": f"source={source!r} cannot be displayed as an image.",
-    }
-
-
-def handle_upload_image(headers, body):
-    if not body:
-        return {"success": False, "message": "empty upload"}
-
-    raw_filename = (headers.get("X-Filename", "")
-                    or headers.get("x-filename", ""))
-    filename = unquote(raw_filename) if raw_filename else "image"
-
-    try:
-        img = Image.open(BytesIO(body))
-        w, h = img.size
-    except Exception as e:
-        return {"success": False,
-                "message": f"could not decode image: {e}"}
-
-    if img.format and img.format.upper() != "PNG":
-        buf = BytesIO()
-        img.save(buf, "PNG")
-        png_bytes = buf.getvalue()
-    else:
-        png_bytes = body
-
-    hash_hex = hashlib.sha256(png_bytes).hexdigest()[:16]
-    data_url = ("data:image/png;base64,"
-                + base64.b64encode(png_bytes).decode("ascii"))
-    return {
-        "success":  True,
-        "hash":     hash_hex,
-        "width":    w,
-        "height":   h,
-        "data_url": data_url,
-        "filename": filename,
+        "message": (
+            f"source={source!r} cannot be displayed as an image."
+        ),
     }
 
 
 ROUTES = {
     "/state":                  handle_state,
     "/version":                handle_version,
-    "/import_image":           handle_import_image,
     "/krita_status":           handle_krita_status,
     "/active_state":           handle_active_state,
     "/resource_image":         handle_resource_image,
@@ -545,6 +518,4 @@ ROUTES = {
     "/generate_status":        handle_generate_status,
 }
 
-RAW_ROUTES = {
-    "/upload_image": handle_upload_image,
-}
+RAW_ROUTES = {}

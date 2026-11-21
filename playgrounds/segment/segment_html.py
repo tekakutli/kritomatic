@@ -20,7 +20,13 @@ the readability of `curl /modules/pg_state.js` debug output.
 
 This playground is segmentation-only.  Inpainting lives in
 `playgrounds/inpaint`; its `pg_inpaint.js` and `pg_view_inpaint.js`
-modules are not part of this manifest."""
+modules are not part of this manifest.
+
+AUTOSYNC
+========
+`startAutosync()` is called at boot to begin polling the daemon for
+`@thesegment` spec changes and batch-end canvas updates.  See
+`pg_autosync.js`'s module docstring."""
 
 import sys
 
@@ -44,6 +50,7 @@ from  .pg_panel_fields import PANEL_FIELDS_JS
 from  .pg_panel_lists import PANEL_LISTS_JS
 from  .pg_panel_scrubs import PANEL_SCRUBS_JS
 from  .pg_panel_bindings import PANEL_BINDINGS_JS
+from  .pg_autosync import AUTOSYNC_JS
 
 from pgkit.html_shell import page
 from pgkit.js_check import JsSyntaxError
@@ -68,6 +75,7 @@ import {
 } from "./pg_state.js";
 import { syncMaskList }                     from "./pg_panel_lists.js";
 import { syncPanelFields }                  from "./pg_panel_fields.js";
+import { startAutosync }                    from "./pg_autosync.js";
 
 console.log("[boot] modules loaded");
 
@@ -86,6 +94,7 @@ try {
   installShellControls();     console.log("[boot] installShellControls");
   installPanelBindings();     console.log("[boot] installPanelBindings");
   segmentBootSync();          console.log("[boot] segmentBootSync");
+  startAutosync();            console.log("[boot] startAutosync");
   resize();                   console.log("[boot] BOOT COMPLETE");
 } catch (e) {
   console.error("[boot] FAILED:", e);
@@ -115,6 +124,7 @@ _MODULE_SOURCES = {
     "pg_panel_lists.js":      PANEL_LISTS_JS,
     "pg_panel_scrubs.js":     PANEL_SCRUBS_JS,
     "pg_panel_bindings.js":   PANEL_BINDINGS_JS,
+    "pg_autosync.js":         AUTOSYNC_JS,
     "_boot.js":               _BOOT_JS,
 }
 
@@ -134,7 +144,7 @@ def render():
             module_sources = _MODULE_SOURCES,
             boot_module    = BOOT_MODULE,
             extra_css      = PG_CSS,
-            status_text    = "drop an image to begin",
+            status_text    = "waiting for @thesegment",
         )
     except JsSyntaxError as err:
         print(file=sys.stderr)

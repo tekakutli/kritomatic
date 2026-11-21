@@ -22,6 +22,17 @@ position.  Empty string means "no pairing" (falls back to the
 learned `character_cls_embedding`, same as if magi were unreachable).
 Layout's server resolves labels to 768-d vectors at read time; the
 browser is the pairing authority, the server is the resolver.
+
+IMAGE INSTALL
+=============
+`applyCanvasImage` is the sole image-install path.  It preserves
+`board.textBboxes`, `board.characterBboxes`, `board.referenceEmbeddings`,
+`board.viewer`, and `view` (pan/zoom), so an autosync pull or a manual
+`Refresh @thelayout` click can never wipe the user's layout work.
+
+The former `setImage` (fresh install, resets everything) and
+`clearImage` (wipe everything) helpers existed for the removed
+pick/clear/import-image buttons and are gone.
 """
 
 STATE_JS = r"""
@@ -155,30 +166,12 @@ export function resetViewerToFit() {
    Image loading
    ============================================================ */
 
-export function setImage(hash, dataUrl, width, height) {
-  board.imageHash    = hash;
-  board.imageDataUrl = dataUrl;
-  board.imageWidth   = width;
-  board.imageHeight  = height;
-  board.imageEl      = null;
-
-  const img = new Image();
-  img.onload  = () => { board.imageEl = img;  _scheduleDraw(); };
-  img.onerror = () => { board.imageEl = null; _scheduleDraw(); };
-  img.src = dataUrl;
-
-  resetView();
-  board.textBboxes          = [];
-  board.characterBboxes     = [];
-  board.referenceEmbeddings = [];
-  board.selectedKind = null;
-  board.selectedIdx  = -1;
-  board.hoveredKind  = null;
-  board.hoveredIdx   = -1;
-  resetViewerToFit();
-  _scheduleDraw();
-}
-
+/* Swap the displayed image in response to an autosync pull or a
+ * manual `Refresh @thelayout` click.  Preserves bboxes, viewer, and
+ * pan/zoom across the swap — only the image and its dims change.
+ * If the new dims differ from the old, refits the viewer so the
+ * bboxes still make geometric sense; otherwise the viewer rect and
+ * per-bbox normalized coords are left alone. */
 export function applyCanvasImage(hash, dataUrl, width, height) {
   const dimsMatch = (
     board.imageWidth === width && board.imageHeight === height
@@ -199,24 +192,6 @@ export function applyCanvasImage(hash, dataUrl, width, height) {
   };
   img.onerror = () => { board.imageEl = null; _scheduleDraw(); };
   img.src = dataUrl;
-  _scheduleDraw();
-}
-
-export function clearImage() {
-  board.imageHash    = null;
-  board.imageDataUrl = null;
-  board.imageWidth   = 0;
-  board.imageHeight  = 0;
-  board.imageEl      = null;
-  resetView();
-  board.textBboxes          = [];
-  board.characterBboxes     = [];
-  board.referenceEmbeddings = [];
-  board.selectedKind = null;
-  board.selectedIdx  = -1;
-  board.hoveredKind  = null;
-  board.hoveredIdx   = -1;
-  resetViewerToFit();
   _scheduleDraw();
 }
 

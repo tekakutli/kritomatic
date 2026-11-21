@@ -1,6 +1,12 @@
 """HTTP bridge to the ComfyUI backend.  Every action is a fetch to the
 Python server; the server does the ComfyUI heavy lifting.
 
+The image-upload path (`uploadImageFile`) is gone.  The canvas is
+pulled exclusively from the daemon via `@thesegment` — the browser's
+autosync poller fetches it, and the server-side
+`/krita/resource_image` route caches the raw bytes under their
+content hash so `handle_segment` / `handle_refine` can look them up.
+
 IMPORT SPLIT
 ============
 `board` comes from `pg_state.js` (leaf).  `computeEffectiveBBox` comes
@@ -17,21 +23,6 @@ import { flashStatus } from "./pgkit/panel_core.js";
 let _inFlightCount = 0;
 
 export function isBusy() { return _inFlightCount > 0; }
-
-export async function uploadImageFile(file) {
-  const res = await fetch("/comfy/upload_image", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/octet-stream",
-      "X-Filename": encodeURIComponent(file.name || "image"),
-    },
-    body: file,
-  });
-  if (!res.ok) throw new Error("HTTP " + res.status);
-  const payload = await res.json();
-  if (!payload.success) throw new Error(payload.message || "upload failed");
-  return payload;
-}
 
 /* POST, not GET.  /comfy/status is registered in segment_server.py's
    ROUTES and dispatched via pgkit/server.py::do_POST.  A GET falls

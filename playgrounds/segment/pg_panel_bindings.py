@@ -1,16 +1,37 @@
 """Panel button handlers, pgkit actions, mask list levels, undo/redo,
 and the boot-sync routine.
 
+IMAGE SOURCE
+============
+The image is pulled exclusively from the daemon via `@thesegment`
+(see `pg_autosync.js`).  There is no local-file pick, drop, or
+clear-image path.  The two image-related controls in the panel are:
+
+  · **Refresh @thesegment** — bypasses the spec-change gate to
+    re-read the pixels behind a constant spec (e.g. the user painted
+    on the layer in Krita, but the source/layer picker didn't move).
+    Routes through `resolveCanvasSpec` + `fetchAndSetCanvas` so it
+    goes through the same registry-first / config-fallback path as
+    the poller.
+
+  · **⟲ Rebind doc** — clears the pinned target document and
+    re-captures from `activeDocument()`.  Use when another playground
+    (e.g. inpaint's default doc) stole `activeDocument()` at boot;
+    the daemon now targets the doc the user is actually looking at.
+
+Both are also exposed as pgkit actions (`action.refreshCanvas`,
+`action.rebindDoc`) for scripting clients.
+
 UPDATE LOG
 ==========
-The Inpainting section and its placeholder button have been removed —
+Inpainting section and its placeholder button have been removed —
 inpainting lives in its own playground (`playgrounds/inpaint`).  Every
 other action — export/import, Krita actions, pgkit registrations,
 mask-row select/delete, `pgkitHandleSelect`, `segmentBootSync` — is
 unchanged."""
 
 PANEL_BINDINGS_JS = r"""
-import { board, setImage, clearImage } from "./pg_state.js";
+import { board } from "./pg_state.js";
 import {
   setMasks, addMaskFromB64, restoreMasks, replaceMaskAt,
   selectedMask, selectedMaskIdx,
@@ -25,57 +46,80 @@ import { clearSelectedMaskRegion } from "./pg_region.js";
 import { compositeRefineWithRegion } from "./pg_composite.js";
 import { syncMaskList } from "./pg_panel_lists.js";
 import { syncPanelFields } from "./pg_panel_fields.js";
-import { uploadImageFile, runSegmentAll, runRefine,
+import { runSegmentAll, runRefine,
          interruptSegmentation, fetchStatus }
   from "./pg_comfy_client.js";
 import { checkKritaStatus, applyToKrita, extractMaskToLayer,
-         exportMaskAsLayer, importFromKrita, importKritaMasks }
+         exportMaskAsLayer, importKritaMasks, fetchActiveState }
   from "./pg_krita_client.js";
+import { resolveCanvasSpec, fetchAndSetCanvas } from "./pg_autosync.js";
 import {
   pgkitRegisterAction, pgkitRegisterLevel, pgkitNotifyAll,
 } from "./pgkit/remote_client.js";
 import { flashStatus } from "./pgkit/panel_core.js";
 
 /* ============================================================
-   File picking / drop
+   Manual @thesegment refresh
    ============================================================ */
 
-function _showDropOverlay(on) {
-  const el = document.getElementById("dropOverlay");
-  if (el) el.classList.toggle("visible", on);
-}
-
-function _installDropOverlay() {
-  if (document.getElementById("dropOverlay")) return;
-  const el = document.createElement("div");
-  el.id = "dropOverlay";
-  el.textContent = "Drop an image";
-  document.body.appendChild(el);
-}
-
-async function _handleDroppedFile(file) {
-  flashStatus("uploading " + file.name + "\u2026", "");
+async function _refreshCanvasAction() {
+  flashStatus("refreshing @thesegment\u2026", "");
+  let state;
   try {
-    const info = await uploadImageFile(file);
-    const dataUrl = await _fileToDataUrl(file);
-    setImage(info.hash, dataUrl, info.width, info.height);
-    flashStatus("image loaded: " + file.name, "ok");
-    syncPanelFields();
-    syncMaskList();
-    pgkitNotifyAll();
-    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
+    state = await fetchActiveState();
   } catch (e) {
-    flashStatus("upload failed: " + e.message, "bad");
+    flashStatus("@thesegment refresh failed: " + e.message, "bad");
+    return;
   }
+  if (!state || !state.success) {
+    flashStatus(
+      "@thesegment refresh failed: "
+        + ((state && state.message) || "no active state"),
+      "bad",
+    );
+    return;
+  }
+
+  // Same registry-first / config-fallback spec resolution the
+  // autosync poller uses, so the manual button and the automatic
+  // path can never diverge.
+  const spec = resolveCanvasSpec(state.data || null);
+  if (!spec) {
+    flashStatus(
+      "@thesegment spec not set \u2014 pick a source in the docker",
+      "warn",
+    );
+    return;
+  }
+
+  await fetchAndSetCanvas(spec);
 }
 
-function _fileToDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ""));
-    reader.onerror = () => reject(new Error("could not read file"));
-    reader.readAsDataURL(file);
-  });
+/* ============================================================
+   Rebind target document
+   ============================================================ */
+
+async function _rebindDocAction() {
+  flashStatus("rebinding target document\u2026", "");
+  try {
+    const res = await fetch("/rebind_document", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const data = await res.json();
+    if (!data.success) {
+      flashStatus(
+        "rebind failed: " + (data.message || "unknown"),
+        "bad",
+      );
+      return;
+    }
+    flashStatus(data.message || "rebound", "ok");
+    await _refreshCanvasAction();
+  } catch (e) {
+    flashStatus("rebind failed: " + e.message, "bad");
+  }
 }
 
 /* ============================================================
@@ -326,25 +370,6 @@ function _clearMasksAction() {
   import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
 }
 
-function _clearImageAction() {
-  clearImage();
-  syncPanelFields();
-  syncMaskList();
-  pgkitNotifyAll();
-  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-}
-
-function _pickImageAction() {
-  const input = document.createElement("input");
-  input.type = "file";
-  input.accept = "image/*";
-  input.addEventListener("change", () => {
-    const file = input.files && input.files[0];
-    if (file) _handleDroppedFile(file);
-  });
-  input.click();
-}
-
 async function _checkStatusAction() {
   const s = await fetchStatus();
   if (!s.reachable) {
@@ -362,29 +387,7 @@ async function _checkStatusAction() {
 
 /* ============================================================
    Export options helpers
-   ============================================================
-   Two checkboxes in the Masks section gate what the two "Export"
-   buttons do:
-
-     exportToKrita         true  → drop the mask into Krita as a
-                                   white-on-transparent paint layer
-                           false → save as PNG file(s) (legacy
-                                   behaviour)
-                           default: true
-
-     exportAtCurrentLayer  true  → place the new paint layer(s)
-                                   directly above the currently
-                                   selected layer in Krita
-                           false → place at the top of the stack
-                           default: true
-
-   When exportToKrita is false, exportAtCurrentLayer is meaningless
-   and gets disabled in the UI. The helper below returns the
-   above_layer argument the daemon expects, resolving through the
-   "Target layer" field first (so a user who filled in a specific
-   layer name targets that one), then falling back to "@active"
-   which the daemon resolves to whatever is active in Krita right
-   now — one round trip saved. */
+   ============================================================ */
 
 function _getExportToKrita() {
   const el = document.getElementById("exportToKrita");
@@ -396,11 +399,6 @@ function _getExportPositionArg() {
   const useCurrent = atCurrent ? !!atCurrent.checked : true;
   if (!useCurrent) return "";
 
-  // Prefer the explicit "Target layer" field when filled, so a user
-  // who typed a specific name for extraction also gets that name for
-  // export. Otherwise fall back to the daemon-side "@active" token,
-  // which resolves to the currently active layer without an extra
-  // round trip.
   const targetEl = document.getElementById("kritaTargetLayer");
   const targetName = targetEl ? (targetEl.value || "").trim() : "";
   return targetName || "@active";
@@ -427,7 +425,6 @@ async function _exportAction() {
   if (indices.length === 0) { flashStatus("no masks selected", "warn"); return; }
 
   if (_getExportToKrita()) {
-    // Create one paint layer per selected mask in Krita.
     const aboveLayer = _getExportPositionArg();
     const edge = _getKritaEdgeOptions();
     flashStatus("exporting " + indices.length + " mask(s) to Krita\u2026", "");
@@ -564,9 +561,6 @@ function _kritaMarkUnreachable(reason) {
   el.textContent = "\u2717 " + (reason || "not reachable");
   el.className = "bad";
   el.title = "Start Krita with the Kritomatic Daemon plugin enabled";
-  // Mirror to the terminal.  The persistent #kritaStatus element is
-  // the panel's at-a-glance indicator; console.error is captured by
-  // pgkit/panel_core.js's override and routed to POST ./__log.
   try {
     console.error("[segment] krita:", reason || "not reachable");
   } catch (_) {}
@@ -610,17 +604,6 @@ function _getKritaEdgeOptions() {
   };
 }
 
-/* Post-apply options for extract modes. Blend mode is "" when the
-   user hasn't chosen one (skip set_layer_blend_mode). Group is ""
-   when blank (skip move_layer_to_group).
-
-   Opacity is the one field whose units change at this boundary.
-   Every other place in the playground — the scrub input, the field
-   registration, the value a remote client sends and receives — uses
-   PERCENT (0-100), which is how a user reads "opacity". Krita's
-   set_layer_opacity expects 0-255. Converting here means the
-   conversion has exactly one call site, and everything upstream of
-   it can stay percent. */
 function _getKritaExtractOptions() {
   const blendEl    = document.getElementById("kritaBlendMode");
   const opacityEl  = document.getElementById("kritaOpacity");
@@ -634,7 +617,6 @@ function _getKritaExtractOptions() {
     const n = parseInt(opacityEl.value, 10);
     if (isFinite(n)) {
       const pct = Math.max(0, Math.min(100, n));
-      // Round to nearest byte; 100% → 255, 50% → 128, 0% → 0.
       opacity = String(Math.round(pct * 255 / 100));
     }
   }
@@ -768,34 +750,8 @@ async function _kritaExportExtract(mode) {
 }
 
 /* ============================================================
-   Import from Krita
+   Import masks from Krita
    ============================================================ */
-
-async function _kritaImportAction() {
-  flashStatus("importing from Krita\u2026", "");
-  try {
-    const res = await importFromKrita({});
-    if (!res.success) {
-      flashStatus("import failed: " + (res.message || "unknown"), "bad");
-      if (/unreachable|connect|refused|timeout/i.test(res.message || "")) {
-        _kritaMarkUnreachable(res.message);
-      }
-      return;
-    }
-    setImage(res.hash, res.data_url, res.width, res.height);
-    flashStatus(
-      "imported from Krita: " + (res.filename || "") +
-      " (" + res.width + "\u00d7" + res.height + ")", "ok",
-    );
-    _kritaMarkReachable();
-    syncPanelFields();
-    syncMaskList();
-    pgkitNotifyAll();
-    import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-  } catch (e) {
-    flashStatus("import failed: " + e.message, "bad");
-  }
-}
 
 async function _kritaImportMasksAction() {
   flashStatus("importing masks from Krita\u2026", "");
@@ -870,10 +826,11 @@ export function installPanelBindings() {
   const el = {};
   const ids = [
     "runBtn", "segmentAllBtn", "cancelBtn", "undoBtn", "redoBtn",
-    "clearPointsBtn", "clearRegionBtn", "pickImageBtn", "clearImageBtn",
-    "kritaImportBtn", "kritaImportMasksBtn",
+    "clearPointsBtn", "clearRegionBtn",
+    "kritaImportMasksBtn",
+    "refreshCanvasBtn", "kritaCheckBtn", "rebindDocBtn",
     "exportBtn", "exportCombinedBtn",
-    "kritaCheckBtn", "kritaSelectionBtn", "kritaTransparencyBtn",
+    "kritaSelectionBtn", "kritaTransparencyBtn",
     "kritaExtractNewLayerBtn", "kritaExtractDuplicateBtn",
   ];
   for (const id of ids) el[id] = document.getElementById(id);
@@ -885,14 +842,13 @@ export function installPanelBindings() {
   if (el.redoBtn)       el.redoBtn.addEventListener("click", redoAction);
   if (el.clearPointsBtn) el.clearPointsBtn.addEventListener("click", _clearPointsAction);
   if (el.clearRegionBtn) el.clearRegionBtn.addEventListener("click", _clearRegionAction);
-  if (el.pickImageBtn)  el.pickImageBtn.addEventListener("click", _pickImageAction);
-  if (el.clearImageBtn) el.clearImageBtn.addEventListener("click", _clearImageAction);
-  if (el.kritaImportBtn) el.kritaImportBtn.addEventListener("click", _kritaImportAction);
   if (el.kritaImportMasksBtn) el.kritaImportMasksBtn.addEventListener("click", _kritaImportMasksAction);
+  if (el.refreshCanvasBtn)    el.refreshCanvasBtn.addEventListener("click", _refreshCanvasAction);
+  if (el.kritaCheckBtn)       el.kritaCheckBtn.addEventListener("click", _kritaStatusRefresh);
+  if (el.rebindDocBtn)        el.rebindDocBtn.addEventListener("click", _rebindDocAction);
   if (el.exportBtn)     el.exportBtn.addEventListener("click", _exportAction);
   if (el.exportCombinedBtn) el.exportCombinedBtn.addEventListener("click", _exportCombinedAction);
 
-  if (el.kritaCheckBtn)        el.kritaCheckBtn.addEventListener("click", _kritaStatusRefresh);
   if (el.kritaSelectionBtn)    el.kritaSelectionBtn.addEventListener("click", _kritaExportSelection);
   if (el.kritaTransparencyBtn) el.kritaTransparencyBtn.addEventListener("click", _kritaExportTransparency);
   if (el.kritaExtractNewLayerBtn) el.kritaExtractNewLayerBtn.addEventListener("click",
@@ -900,11 +856,6 @@ export function installPanelBindings() {
   if (el.kritaExtractDuplicateBtn) el.kritaExtractDuplicateBtn.addEventListener("click",
     () => _kritaExportExtract("extract_duplicate"));
 
-  // Wire the two export-option checkboxes: toggling exportToKrita
-  // disables/enables exportAtCurrentLayer (position is meaningless
-  // when exporting to files). The default states (checked, checked)
-  // mirror the requested defaults: export-to-Krita enabled, at
-  // current layer position.
   const toKritaEl = document.getElementById("exportToKrita");
   const atCurrentEl = document.getElementById("exportAtCurrentLayer");
   if (toKritaEl && atCurrentEl) {
@@ -921,26 +872,6 @@ export function installPanelBindings() {
     statusEl.title = "Click to re-check ComfyUI";
     statusEl.addEventListener("click", _checkStatusAction);
   }
-
-  _installDropOverlay();
-  let _dragDepth = 0;
-  window.addEventListener("dragenter", () => {
-    _dragDepth += 1;
-    if (_dragDepth > 0) _showDropOverlay(true);
-  });
-  window.addEventListener("dragleave", () => {
-    _dragDepth -= 1;
-    if (_dragDepth <= 0) _showDropOverlay(false);
-  });
-  window.addEventListener("dragover", (e) => e.preventDefault());
-  window.addEventListener("drop", (e) => {
-    e.preventDefault();
-    _dragDepth = 0;
-    _showDropOverlay(false);
-    const file = e.dataTransfer && e.dataTransfer.files
-                 && e.dataTransfer.files[0];
-    if (file && file.type.startsWith("image/")) _handleDroppedFile(file);
-  });
 }
 
 /* ============================================================
@@ -979,10 +910,6 @@ pgkitRegisterAction("action.clearMasks", {
   label: "Clear masks", scope: "global", run: _clearMasksAction,
   meta: { variant: "plain" },
 });
-pgkitRegisterAction("action.clearImage", {
-  label: "Clear image", scope: "global", run: _clearImageAction,
-  meta: { variant: "plain" },
-});
 pgkitRegisterAction("action.checkStatus", {
   label: "Check connection", scope: "global", run: _checkStatusAction,
   meta: { variant: "plain" },
@@ -996,12 +923,18 @@ pgkitRegisterAction("action.exportCombined", {
   meta: { variant: "plain" },
 });
 
+pgkitRegisterAction("action.refreshCanvas", {
+  label: "Refresh @thesegment", scope: "global", run: _refreshCanvasAction,
+  meta: { variant: "plain",
+          description: "Re-fetch the current @thesegment from Krita." },
+});
+pgkitRegisterAction("action.rebindDoc", {
+  label: "Rebind doc", scope: "global", run: _rebindDocAction,
+  meta: { variant: "plain",
+          description: "Re-pin segment to the currently active Krita document." },
+});
 pgkitRegisterAction("action.kritaCheck", {
   label: "Check Krita", scope: "global", run: _kritaStatusRefresh,
-  meta: { variant: "plain" },
-});
-pgkitRegisterAction("action.kritaImport", {
-  label: "Import from Krita", scope: "global", run: _kritaImportAction,
   meta: { variant: "plain" },
 });
 pgkitRegisterAction("action.kritaImportMasks", {

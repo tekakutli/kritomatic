@@ -1,13 +1,23 @@
-"""Layout playground's panel body and CSS."""
+"""Layout playground's panel body and CSS.
+
+Sections: Generate, Image, Generation Frame, Layout, State.
+
+The Image section is `@thelayout`-only — no local file pick, no
+clear, no explicit Krita composite import.  The autosync poller
+(`pg_autosync.js`) pulls the current `@thelayout` whenever the
+daemon's slot selector changes; `Refresh @thelayout` forces a
+re-read when the pixels behind a constant selector changed in
+Krita but the selector did not.
+
+There is no drag-and-drop image install path and no `+ From Krita
+(image)` shortcut — the panel-mutations those buttons performed are
+redundant with `applyCanvasImage` (autosync) and are gone.
+"""
 PG_CSS = r"""
-  #ui button#pickImageBtn,
-  #ui button#importImageBtn,
   #ui button#refreshCanvasBtn {
     border-color: rgba(120, 220, 255, 0.72);
     color: #b8ecff;
   }
-  #ui button#pickImageBtn:hover:not(:disabled),
-  #ui button#importImageBtn:hover:not(:disabled),
   #ui button#refreshCanvasBtn:hover:not(:disabled) {
     border-color: rgba(140, 225, 255, 1.00);
     background: rgba(120, 220, 255, 0.10);
@@ -171,21 +181,6 @@ PG_CSS = r"""
     border-color:#7a3e4a !important;
     color:#e8a0a8 !important;
   }
-  #dropOverlay {
-    position:fixed; inset:0; z-index:100;
-    display:none;
-    background:rgba(0,229,255,0.06);
-    border:2px dashed rgba(0,229,255,0.65);
-    box-sizing:border-box;
-    pointer-events:none;
-    align-items:center; justify-content:center;
-    font-family:'JetBrains Mono','Fira Code','Consolas','SF Mono',monospace;
-    font-size:14px; font-weight:700;
-    color:#b8ecff;
-    letter-spacing:0.16em; text-transform:uppercase;
-    text-shadow:0 0 12px rgba(0,229,255,0.55);
-  }
-  #dropOverlay.visible { display:flex; }
   #statusLine {
     font-size:10px; color:#7b8794;
     margin-top:6px;
@@ -292,17 +287,8 @@ PG_PANEL_BODY = r"""
       <summary>Image</summary>
       <div class="section-body">
         <div class="row">
-          <button id="pickImageBtn" title="Pick an image file">+ Pick image…</button>
-          <button id="clearImageBtn" title="Clear the current image">Clear</button>
-        </div>
-        <div class="row">
-          <button id="importImageBtn" title="Import the active document's composite from Krita">
-            + From Krita
-          </button>
-        </div>
-        <div class="row">
           <button id="refreshCanvasBtn"
-                  title="Re-fetch the layer selected at @thelayout.">
+                  title="Re-fetch the layer selected at @thelayout. Use when the canvas image changed in Krita but the autosync poller didn't pick it up — the poller only fires when the @thelayout *spec* changes (active ↔ layer X ↔ layer Y), not when the pixels behind a constant spec change. Bboxes and viewer state are preserved.">
             ↻ Refresh @thelayout
           </button>
         </div>

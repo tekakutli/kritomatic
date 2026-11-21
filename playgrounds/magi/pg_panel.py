@@ -2,7 +2,10 @@
 state sync, label editing, crop viewing, save/load.
 
 Workflow:
-  1. Load image (file / Krita / drop).
+  1. `@thecharacter` is pulled automatically by `pg_autosync.js`
+     whenever the daemon's slot selector changes (and once on boot).
+     `Refresh @thecharacter` forces a re-read when the pixels behind
+     a constant selector change in Krita.
   2. Drag + resize the scratch rect on the canvas.
   3. Click "Add Character" → crop the scratch rect, analyze, add to
      list.
@@ -17,18 +20,32 @@ Labels are user-editable, browser-authoritative, and published to
 `/state` as `character_labels` (parallel to `character_bboxes`).  They
 are the pairing key downstream consumers (layout) use to bind each of
 their position boxes to one of this playground's identities.
+
+IMAGE INSTALL
+=============
+The current `@thecharacter` layer is pulled by `pg_autosync.js`
+whenever the daemon's slot selector changes (including on boot).
+`Refresh @thecharacter` bypasses the selector-change gate to force a
+re-read.
+
+There is no local file pick, no `Clear`, and no explicit composite
+import — the panel-mutation those buttons performed is redundant with
+`applyCanvasImage` (autosync) and `Refresh @thecharacter`.  The
+`Save state` / `Load state` JSON flow remains the way to install a
+`magi-state-v1` file, and `_loadStateAction` calls `setImage` to
+rehydrate the image alongside the characters, crops, and embeddings.
 """
 
 PANEL_JS = r"""
 import {
-  board, setImage, applyCanvasImage, clearImage,
+  board, setImage,
   addCharacterBbox, deleteCharacterBbox,
   clearAllBboxes, setCharacterLabel,
   setReferenceEmbedding, setViewingCharacter,
   setScratchRect,
 } from "./pg_state.js";
 import {
-  uploadImageFile, importFromKrita, checkKritaStatus,
+  checkKritaStatus,
   fetchActiveState, fetchResourceImage, analyzeCharacters,
 } from "./pg_client.js";
 import { fetchSelectedLayer } from "./pg_autosync.js";
@@ -323,67 +340,8 @@ export function syncPanelFields() {
 }
 
 /* ============================================================
-   Image actions
+   Refresh @thecharacter (manual override of autosync)
    ============================================================ */
-
-function _pickImageAction() {
-  const input = document.createElement("input");
-  input.type = "file";
-  input.accept = "image/*";
-  input.addEventListener("change", async () => {
-    const file = input.files && input.files[0];
-    if (!file) return;
-    flashStatus("uploading\u2026", "");
-    try {
-      const info = await uploadImageFile(file);
-      const dataUrl = await _fileToDataUrl(file);
-      setImage(info.hash, dataUrl, info.width, info.height);
-      flashStatus("image loaded", "ok");
-      _lastListSig = "";
-      _renderBboxList();
-      syncPanelFields();
-      _scheduleStateSync();
-      import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-    } catch (e) {
-      flashStatus("upload failed: " + e.message, "bad");
-    }
-  });
-  input.click();
-}
-
-function _fileToDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ""));
-    reader.onerror = () => reject(new Error("could not read file"));
-    reader.readAsDataURL(file);
-  });
-}
-
-function _clearImageAction() {
-  clearImage();
-  _lastListSig = "";
-  _renderBboxList();
-  syncPanelFields();
-  _scheduleStateSync();
-  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-}
-
-async function _importImageFromKritaAction() {
-  flashStatus("importing from Krita\u2026", "");
-  const res = await importFromKrita({});
-  if (!res.success) {
-    flashStatus("import failed: " + (res.message || "unknown"), "bad");
-    return;
-  }
-  setImage(res.hash, res.data_url, res.width, res.height);
-  flashStatus("imported " + res.width + "\u00d7" + res.height, "ok");
-  _lastListSig = "";
-  _renderBboxList();
-  syncPanelFields();
-  _scheduleStateSync();
-  import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-}
 
 async function _refreshCanvasAction() {
   flashStatus("refreshing " + SLOT_ID + "\u2026", "");
@@ -492,7 +450,7 @@ function _backToCanvasAction() {
 }
 
 /* ============================================================
-   Clear all
+   Clear all characters (keeps the image)
    ============================================================ */
 
 function _clearAllAction() {
@@ -648,31 +606,11 @@ async function _kritaStatusAction() {
 }
 
 /* ============================================================
-   Drop overlay
-   ============================================================ */
-
-function _showDropOverlay(on) {
-  const el = document.getElementById("dropOverlay");
-  if (el) el.classList.toggle("visible", on);
-}
-
-function _installDropOverlay() {
-  if (document.getElementById("dropOverlay")) return;
-  const el = document.createElement("div");
-  el.id = "dropOverlay";
-  el.textContent = "Drop a reference image";
-  document.body.appendChild(el);
-}
-
-/* ============================================================
    Install
    ============================================================ */
 
 export function installPanelBindings() {
   const ids = {
-    pickImage:   "pickImageBtn",
-    clearImage:  "clearImageBtn",
-    importImg:   "importImageBtn",
     refresh:     "refreshCanvasBtn",
     addChar:     "addCharacterBtn",
     backToCanvas:"backToCanvasBtn",
@@ -684,9 +622,6 @@ export function installPanelBindings() {
   const el = {};
   for (const k in ids) el[k] = document.getElementById(ids[k]);
 
-  if (el.pickImage)    el.pickImage.addEventListener("click", _pickImageAction);
-  if (el.clearImage)   el.clearImage.addEventListener("click", _clearImageAction);
-  if (el.importImg)    el.importImg.addEventListener("click", _importImageFromKritaAction);
   if (el.refresh)      el.refresh.addEventListener("click", _refreshCanvasAction);
   if (el.addChar)      el.addChar.addEventListener("click", _addCharacterAction);
   if (el.backToCanvas) el.backToCanvas.addEventListener("click", _backToCanvasAction);
@@ -694,40 +629,6 @@ export function installPanelBindings() {
   if (el.saveState)    el.saveState.addEventListener("click", _saveStateAction);
   if (el.loadState)    el.loadState.addEventListener("click", _loadStateAction);
   if (el.kritaCheck)   el.kritaCheck.addEventListener("click", _kritaStatusAction);
-
-  _installDropOverlay();
-  let _dragDepth = 0;
-  window.addEventListener("dragenter", () => {
-    _dragDepth++;
-    _showDropOverlay(true);
-  });
-  window.addEventListener("dragleave", () => {
-    _dragDepth--;
-    if (_dragDepth <= 0) _showDropOverlay(false);
-  });
-  window.addEventListener("dragover", (e) => e.preventDefault());
-  window.addEventListener("drop", async (e) => {
-    e.preventDefault();
-    _dragDepth = 0;
-    _showDropOverlay(false);
-    const file = e.dataTransfer && e.dataTransfer.files
-                 && e.dataTransfer.files[0];
-    if (file && file.type.startsWith("image/")) {
-      flashStatus("uploading\u2026", "");
-      try {
-        const info = await uploadImageFile(file);
-        const dataUrl = await _fileToDataUrl(file);
-        setImage(info.hash, dataUrl, info.width, info.height);
-        _lastListSig = "";
-        _renderBboxList();
-        syncPanelFields();
-        _scheduleStateSync();
-        import("./pg_dispatch.js").then(m => m.draw()).catch(() => {});
-      } catch (e) {
-        flashStatus("upload failed: " + e.message, "bad");
-      }
-    }
-  });
 
   _bootPull().catch(() => {});
 }

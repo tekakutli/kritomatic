@@ -1,26 +1,34 @@
 """HTTP routes for the magi playground.
 
 The magi playground is a reference-image administrator: it displays a
-single image (pulled from Krita via `@thecharacter`, or uploaded),
-lets the user draw character bounding boxes over it, and posts
-`{image, bboxes}` to a MAGI analysis endpoint to obtain 768-d
-reference embeddings per character.  It exposes the resulting
-`character_bboxes` + `character_labels` + `reference_embeddings` at
-`/state` for the layout playground (or any other consumer) to pick up.
+single image (pulled from Krita via `@thecharacter`), lets the user
+draw character bounding boxes over it, and posts `{image, bboxes}` to
+a MAGI analysis endpoint to obtain 768-d reference embeddings per
+character.  It exposes the resulting `character_bboxes` +
+`character_labels` + `reference_embeddings` at `/state` for the
+layout playground (or any other consumer) to pick up.
 
 Routes
 ======
 
     POST /state                  set (from browser) or get (from node)
     POST /version                version only (for IS_CHANGED sweeps)
-    POST /import_image           fetch active document composite from Krita
     POST /krita_status           daemon reachable?
     POST /active_state           daemon comfy_status + playground registry
     POST /resource_image         resolve a {source, layer_name} spec to a PNG
-    POST /upload_image           raw body (image file)
     POST /playground_reregister  single-shot re-register with the daemon
     POST /analyze_characters     send image + bboxes to MAGI; get 768-d
                                  reference embeddings back
+
+IMAGE INSTALL
+=============
+The only image-install path is `/resource_image`, resolved from the
+`@thecharacter` slot's current selector by `pg_autosync.js` (autosync)
+or `Refresh @thecharacter` (manual).  The former `/import_image` and
+`/upload_image` routes, which the pick/clear/import-image buttons used,
+are gone.  `handle_import_image` survives as an internal helper for
+`handle_resource_image`'s `source="active"` branch.  The save/load
+JSON flow (client-side) remains the way to rehydrate a full state.
 
 State shape (POST /state):
 
@@ -55,7 +63,6 @@ import threading
 import urllib.error
 import urllib.request
 from io import BytesIO
-from urllib.parse import unquote
 
 from PIL import Image
 
@@ -337,6 +344,7 @@ def handle_krita_status(_payload):
 
 
 def handle_import_image(payload):
+    """Internal helper — used by `handle_resource_image` for source=active."""
     name = (payload or {}).get("name") if isinstance(payload, dict) else None
     cmd = {"type": "get_document_composite_b64"}
     if name:
@@ -412,45 +420,9 @@ def handle_resource_image(payload):
     }
 
 
-def handle_upload_image(headers, body):
-    if not body:
-        return {"success": False, "message": "empty upload"}
-
-    raw_filename = (headers.get("X-Filename", "")
-                    or headers.get("x-filename", ""))
-    filename = unquote(raw_filename) if raw_filename else "image"
-
-    try:
-        img = Image.open(BytesIO(body))
-        w, h = img.size
-    except Exception as e:
-        return {"success": False,
-                "message": f"could not decode image: {e}"}
-
-    if img.format and img.format.upper() != "PNG":
-        buf = BytesIO()
-        img.save(buf, "PNG")
-        png_bytes = buf.getvalue()
-    else:
-        png_bytes = body
-
-    hash_hex = hashlib.sha256(png_bytes).hexdigest()[:16]
-    data_url = ("data:image/png;base64,"
-                + base64.b64encode(png_bytes).decode("ascii"))
-    return {
-        "success":  True,
-        "hash":     hash_hex,
-        "width":    w,
-        "height":   h,
-        "data_url": data_url,
-        "filename": filename,
-    }
-
-
 ROUTES = {
     "/state":                  handle_state,
     "/version":                handle_version,
-    "/import_image":           handle_import_image,
     "/krita_status":           handle_krita_status,
     "/active_state":           handle_active_state,
     "/resource_image":         handle_resource_image,
@@ -458,6 +430,4 @@ ROUTES = {
     "/analyze_characters":     handle_analyze_characters,
 }
 
-RAW_ROUTES = {
-    "/upload_image": handle_upload_image,
-}
+RAW_ROUTES = {}

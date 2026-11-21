@@ -14,6 +14,29 @@ daemon must be linked to a running ComfyUI (the playground sends a
 `comfy_connect` as part of every inpaint batch, so an already-connected
 daemon is fine but a disconnected one gets auto-connected on first run).
 
+PLAYGROUND IDENTITY
+===================
+`PLAYGROUND_ID`, `PLAYGROUND_NAME`, `PLAYGROUND_PORT`, and
+`LAYER_SLOTS` live in `inpaint_server.py`, not here.  They are needed
+by both this module (registration on boot, teardown on exit) and by
+the server's own routes (`/version`, `/playground_reregister`).
+Putting them in `inpaint_server.py` gives the server a single source
+of truth without creating an import cycle back to this module.
+
+This module re-imports them under the same local names for
+backward compatibility with anything that reads them off
+`inpaint_playground`:
+
+    PORT            = inpaint_server.PLAYGROUND_PORT
+    PLAYGROUND_ID   = inpaint_server.PLAYGROUND_ID
+    PLAYGROUND_NAME = inpaint_server.PLAYGROUND_NAME
+    LAYER_SLOTS     = inpaint_server.LAYER_SLOTS
+
+`descriptor()`, `main()`, and `_cleanup()` all use the imported
+names.  Everything else (`HTML_FILE`, `OPEN_BROWSER`, the pgkit
+`Hub` wiring) stays in this module because those are launch-time
+concerns, not server-side state.
+
 PLAYGROUND REGISTRATION
 =======================
 Like controlnets, inpaint registers a set of layer slots with the
@@ -42,6 +65,13 @@ when building rows.  See `kritomatic_daemon/handlers/panel.py`'s
 `ResourcesProvider` and `kritomatic_daemon/panel/docker.py`'s
 `_update_playgrounds`.
 
+The initial `playground_registry.register(...)` call below is
+retried for ~30 s on boot.  If it fails (daemon down at process
+start), the playground still serves HTTP and the daemon can pick it
+up later via the browser autosync's `/playground_reregister` path
+(see `pg_autosync.js`'s REGISTRY PRESENCE CHECK) — no restart
+required.
+
 CANVAS-PUSH WIRING (Slice D)
 ============================
 `main()` creates a `pgkit.remote_hub.Hub` instance and passes it to
@@ -56,16 +86,17 @@ both:
 
 Then `inpaint_server.start_canvas_subscriber()` spawns the thread
 that connects to the daemon's event stream (port 12347) and forwards
-`canvas_update` events to every connected browser over their
-`/remote` WebSocket as `patch` messages on the `canvas.pushed`
-field.  See `inpaint_server.py`'s module docstring, CANVAS_PUSH
-SUBSCRIBER, and `kritomatic_daemon/handlers/comfyui_generation.py`'s
-`_publish_canvas_update` for the daemon side.
+`canvas_update` and `paste_applied` events to every connected
+browser over their `/remote` WebSocket.  See `inpaint_server.py`'s
+module docstring, CANVAS_PUSH SUBSCRIBER, and
+`kritomatic_daemon/handlers/comfyui_generation.py`'s
+`_publish_canvas_update` / `_publish_paste_applied` for the daemon
+side.
 
 The net effect: after a batch pastes into Krita, the playground's
-canvas updates within ~100 ms instead of waiting for the next
-autosync poll tick + a fresh `doc.projection()` composite read.
-"""
+canvas updates within ~20-90 ms (Slice E's per-paste optimistic
+display), instead of waiting for the next autosync poll tick + a
+fresh `doc.projection()` composite read."""
 
 import atexit
 import os
@@ -88,21 +119,16 @@ from pgkit.server import serve as kit_serve
 
 
 HTML_FILE    = "inpaint.html"
-PORT         = 8774
 OPEN_BROWSER = True
 
-PLAYGROUND_ID   = "inpaint"
-PLAYGROUND_NAME = "Inpaint"
-
-LAYER_SLOTS = [
-    # User-editable via the docker's Playgrounds section.
-    {"id": "@thecanvas"},
-    # Managed internally by the playground.  Claimed from Resources
-    # so the user cannot edit them out of sync with what the
-    # playground derives; not shown in the Playgrounds section.
-    {"id": "@thecontext", "managed_by_playground": True},
-    {"id": "@theselection", "managed_by_playground": True},
-]
+# Source of truth is `inpaint_server.py` — see the module docstring,
+# PLAYGROUND IDENTITY.  Re-imported here under the same names so
+# anything that historically imported them off this module keeps
+# working.
+PORT            = inpaint_server.PLAYGROUND_PORT
+PLAYGROUND_ID   = inpaint_server.PLAYGROUND_ID
+PLAYGROUND_NAME = inpaint_server.PLAYGROUND_NAME
+LAYER_SLOTS     = inpaint_server.LAYER_SLOTS
 
 
 def descriptor():

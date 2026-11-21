@@ -61,10 +61,38 @@ atexit).  Crashes and SIGKILL are caught by a background sweep thread
 that runs every `_SWEEP_INTERVAL_S` seconds and probes each entry's
 `/version` endpoint.
 
+SWEEP: WHAT "DEAD" MEANS
+========================
+The sweep probes each registered entry's `/version` and removes the
+entry only if the process appears to have gone away.  The
+distinction between "gone away" and "route wrong" matters:
+
+  · **Process gone** — connection refused, timeout, bad URL.  The
+    sweep removes the entry.
+
+  · **Process answered with a 4xx/5xx** — the process is alive; only
+    its `/version` handler is missing or broken.  The sweep keeps
+    the entry.  A playground that predates the pgkit built-in
+    `/version` route (see `pgkit/server.py`'s Built-in routes
+    section) would answer a probe with a 404, but should not be
+    swept — it's still serving its own HTTP routes and driving its
+    own slots.
+
+Prior to this distinction, any HTTP error from `/version` was
+treated as dead, which caused the inpaint playground's registration
+to be removed every 300 s (its server did not register a `/version`
+route; the sweep hit 404, marked it dead, and wiped the registry
+entry — which flipped the docker's Resources section back on and
+lost the user's Playground Input row until inpaint was restarted).
+
 Daemon restart: the registry is in-memory and lives on the handler
 singleton, so it vanishes when the daemon process exits.  Playgrounds
 in the wild exit when the daemon dies (each playground's
-daemon-watch thread) and the user restarts both manually.
+daemon-watch thread) and the user restarts both manually.  A
+playground that stays up (inpaint, whose daemon-watch is limited to
+shutting down the whole process) re-registers on its next autosync
+poll via its own `/playground_reregister` route — see
+`playgrounds/inpaint/pg_autosync.py`'s `_reregisterIfMissing`.
 """
 
 from __future__ import annotations
@@ -82,6 +110,41 @@ _SWEEP_INTERVAL_S = 300.0
 _SWEEP_PROBE_TIMEOUT_S = 1.0
 
 _LAYER_SOURCES = frozenset({"active", "global", "layer"})
+
+
+def _probe_alive(url: str) -> bool:
+    """POST `url + "/version"`.  True iff the process answered.
+
+    Any HTTP response — including a 404 from a playground that has
+    not registered its own `/version` — means the process is up.  Only
+    transport-level failures (connection refused, timeout, bad URL,
+    DNS) mean the process is dead.
+
+    See the module docstring, SWEEP: WHAT "DEAD" MEANS.
+
+    `HTTPError` is checked before `Exception` because it is a subclass
+    of `URLError` (which is itself an `OSError`) — the specific
+    exception must win, or the "any HTTP response means alive" rule
+    would never fire.
+    """
+    try:
+        req = urllib.request.Request(
+            url + "/version",
+            data=b"{}",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(
+            req, timeout=_SWEEP_PROBE_TIMEOUT_S,
+        ) as r:
+            r.read()
+        return True
+    except urllib.error.HTTPError:
+        # 4xx/5xx — the process answered; only the route is missing
+        # or wrong.  Not a liveness failure.
+        return True
+    except Exception:
+        return False
 
 
 def _normalize_slot_specs(raw_specs) -> tuple:
@@ -169,18 +232,7 @@ class PlaygroundCommands(AutoDispatchHandler):
             if not url:
                 dead.append(pid)
                 continue
-            try:
-                req = urllib.request.Request(
-                    url + "/version",
-                    data=b"{}",
-                    method="POST",
-                    headers={"Content-Type": "application/json"},
-                )
-                with urllib.request.urlopen(
-                    req, timeout=_SWEEP_PROBE_TIMEOUT_S,
-                ) as r:
-                    r.read()
-            except Exception:
+            if not _probe_alive(url):
                 dead.append(pid)
         if dead:
             with self._lock:

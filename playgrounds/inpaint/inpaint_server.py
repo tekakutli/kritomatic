@@ -19,6 +19,28 @@ Routes
                             `b64` possibly null when no mask is
                             selected — the caller uses all-white)
 
+    POST /version           liveness probe.  The daemon's playground
+                            sweep (see `kritomatic_daemon/handlers/
+                            playgrounds.py`) POSTs this every 300 s
+                            and removes our registry entry if it does
+                            not get an HTTP response.  Registered
+                            here so the playground answers even on
+                            older daemon builds that predate pgkit's
+                            built-in `/version` route.  Response is
+                            `{"success": true, "version": ""}` — we
+                            have no version state worth advertising
+                            (all mutable state is queried via
+                            `/resources`, `/rotation`, and
+                            `/crop_frame`).
+    POST /playground_reregister  single-shot re-registration with
+                            the daemon.  Called by `pg_autosync.js`
+                            when it detects that the daemon has
+                            removed our registry entry — the sweep
+                            can misjudge liveness (see
+                            `kritomatic_daemon/handlers/playgrounds.py`'s
+                            SWEEP: WHAT "DEAD" MEANS), and the
+                            browser's autosync is the fastest path to
+                            recovery.  Response is `{"success": bool}`.
     POST /rotation          return the last rotation pushed via /sync
     POST /crop_frame        authoritative crop frame the daemon applies
                             to @thecanvas before submission; multimask
@@ -216,12 +238,33 @@ from pg_comfy import ComfyError, get_client, reset_client
 from pg_comfy.image import make_encoded_image
 
 from . import krita_client
+from . import playground_registry
 
 
 COMFY_HOST = "127.0.0.1"
 COMFY_PORT = 8188
 
 SYNC_TIMEOUT = 30.0
+
+# Playground identity, matching the daemon-side registration contract.
+# These live here (not in inpaint_playground.py) because
+# `handle_playground_reregister` needs them, and having the server
+# import from its own entry point would create a cycle.
+# `inpaint_playground.py` re-imports these for its own use — see the
+# module docstring, PLAYGROUND IDENTITY.
+PLAYGROUND_ID   = "inpaint"
+PLAYGROUND_NAME = "Inpaint"
+PLAYGROUND_PORT = 8774
+
+LAYER_SLOTS = [
+    # User-editable via the docker's Playgrounds section.
+    {"id": "@thecanvas"},
+    # Managed internally by the playground.  Claimed from Resources
+    # so the user cannot edit them out of sync with what the
+    # playground derives; not shown in the Playgrounds section.
+    {"id": "@thecontext", "managed_by_playground": True},
+    {"id": "@theselection", "managed_by_playground": True},
+]
 
 
 def _log(msg: str) -> None:
@@ -520,6 +563,62 @@ def _fetch_active_state() -> dict:
 def handle_active_state(_payload) -> dict:
     data = _fetch_active_state()
     return {"success": True, "data": data}
+
+
+# ---------------------------------------------------------------------------
+#  /version — liveness probe for the daemon's registry sweep
+# ---------------------------------------------------------------------------
+
+def handle_version(_payload) -> dict:
+    """Liveness probe answered with no state worth versioning.
+
+    The daemon's sweep thread POSTs `/version` at `_SWEEP_INTERVAL_S`
+    (300 s) intervals to decide whether each registered playground
+    is still alive.  Any 2xx response keeps the registry entry alive.
+    See `kritomatic_daemon/handlers/playgrounds.py`'s SWEEP: WHAT
+    "DEAD" MEANS.
+
+    Inpaint has no version state worth advertising — all mutable
+    state is queried via `/resources`, `/rotation`, `/crop_frame`.
+    Controlnets registers its own `/version` that returns the
+    workflow file's content hash, because its
+    `ControlNetsConditioning` ComfyUI node uses that hash as an
+    `IS_CHANGED` value.  Inpaint does not need anything equivalent.
+    """
+    return {"success": True, "version": ""}
+
+
+# ---------------------------------------------------------------------------
+#  /playground_reregister — recovery path when the sweep drops us
+# ---------------------------------------------------------------------------
+
+def handle_playground_reregister(_payload) -> dict:
+    """Single-shot re-registration with the daemon.
+
+    Called by `pg_autosync.js` when its poll notices that our entry
+    is missing from `comfy_status`'s `playgrounds` list — the sweep
+    thread can misjudge liveness (see
+    `kritomatic_daemon/handlers/playgrounds.py`'s SWEEP: WHAT
+    "DEAD" MEANS), and the browser's autosync is the fastest path to
+    recovery.  Before this route existed, the only way to recover
+    was to restart the inpaint playground process.
+
+    Recovery latency: the next autosync tick (≤500 ms) after the
+    sweep removes us, plus the ~2 ms the daemon socket round-trip
+    takes on localhost.
+
+    Fails fast on daemon unreachability — autosync reschedules on
+    its own cadence, so a slow retry loop here would just make
+    `/playground_reregister` block for no benefit.  See
+    `playgrounds/inpaint/playground_registry.py`'s
+    RE-REGISTRATION section.
+    """
+    url = f"http://127.0.0.1:{PLAYGROUND_PORT}"
+    ok = playground_registry.reregister_once(
+        PLAYGROUND_ID, PLAYGROUND_NAME, url, PLAYGROUND_PORT,
+        layer_slots=LAYER_SLOTS,
+    )
+    return {"success": bool(ok)}
 
 
 # ---------------------------------------------------------------------------
@@ -1020,6 +1119,8 @@ def handle_rebind_document(_payload) -> dict:
 
 
 ROUTES = {
+    "/version":              handle_version,
+    "/playground_reregister": handle_playground_reregister,
     "/sync":                 handle_sync,
     "/resources":            handle_resources,
     "/canvas_b64":           handle_canvas_b64,

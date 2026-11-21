@@ -2,8 +2,8 @@
 pgkit.server — HTTP file server, WebSocket endpoint, module serving.
 
 `make_handler(routes, raw_routes, module_sources)` builds a fresh
-`SimpleHTTPRequestHandler` subclass — one per playground, each with
-its own `pgkit.remote_hub.Hub` instance.  `serve()` calls it and then
+`SimpleHTTPRequestHandler` subclass — one per playground, each with its
+own `pgkit.remote_hub.Hub` instance.  `serve()` calls it and then
 blocks; `serve_nonblocking()` calls it and returns the pieces so a
 launcher can own threading and shutdown.
 
@@ -15,16 +15,45 @@ short text body listing the present keys.
 
 Built-in routes
 ===============
-`POST /__log` is installed unconditionally by `make_handler` on every
-playground, ahead of the per-playground `routes` lookup.  The browser
-client (see `pgkit/panel_core.py::_postLog`) uses it to mirror panel
-errors and uncaught JS exceptions to the playground server's stdout,
-so a developer watching the terminal sees the same errors the browser
-shows in the panel's status line.  Route name is `__log` to mark it
-as an internal pgkit endpoint; the client must POST to `./__log`
-(relative to the page), not `/__log`, so that under the pgkit hub the
-request lands on `/<name>/__log` and the hub proxies it back to the
-playground, rather than on the hub root where nothing handles it.
+Two routes are installed unconditionally by `make_handler` on every
+playground, ahead of the per-playground `routes` lookup:
+
+  `POST /__log`
+
+    The browser client (see `pgkit/panel_core.py::_postLog`) uses it
+    to mirror panel errors and uncaught JS exceptions to the
+    playground server's stdout, so a developer watching the terminal
+    sees the same errors the browser shows in the panel's status
+    line.  Route name is `__log` to mark it as an internal pgkit
+    endpoint; the client must POST to `./__log` (relative to the
+    page), not `/__log`, so that under the pgkit hub the request
+    lands on `/<name>/__log` and the hub proxies it back to the
+    playground, rather than on the hub root where nothing handles it.
+
+  `POST /version` and `GET /version` (fallback only)
+
+    Returns `{"success": true, "version": ""}` — a liveness probe
+    that every pgkit playground answers out of the box.  This
+    is the endpoint `kritomatic_daemon/handlers/playgrounds.py`'s
+    sweep thread POSTs at
+    `_SWEEP_INTERVAL_S` (300 s) intervals to decide whether each
+    registered playground is still alive.  A 4xx/5xx from this
+    endpoint would be a false "dead" signal (the sweep treats any
+    HTTP response as alive, but the older sweep treated HTTPError
+    as dead and required this route to respond 2xx).
+
+    The built-in fires only when the playground has NOT registered
+    its own `/version` in its `routes` dict.  Playgrounds that
+    want to advertise a state hash (controlnets does — the
+    `ControlNetsConditioning` ComfyUI node uses it as a
+    `IS_CHANGED` value) register their own handler, which shadows
+    the built-in cleanly.
+
+    Before this fallback existed, every playground had to know to
+    register `/version` for the sweep not to kill it.  Inpaint did
+    not — the sweep would hit a 404, its `except Exception` caught
+    it as "dead", and the registry entry was removed every five
+    minutes.  The built-in makes that failure mode impossible.
 
 Hub registration
 ================
@@ -77,6 +106,13 @@ def make_handler(routes=None, raw_routes=None, module_sources=None, hub=None):
                 name = self.path[len("/modules/"):]
                 self._serve_module(name)
                 return
+            # pgkit built-in /version (fallback).  Only fires if the
+            # playground did not register its own.  Liveness probe
+            # for the daemon's sweep thread.  See the module
+            # docstring, Built-in routes.
+            if self.path == "/version" and "/version" not in routes:
+                self._send_json(200, {"success": True, "version": ""})
+                return
             super().do_GET()
 
         def do_POST(self):
@@ -84,6 +120,12 @@ def make_handler(routes=None, raw_routes=None, module_sources=None, hub=None):
             # playground needs to know about it.
             if self.path == "/__log":
                 self._handle_log()
+                return
+            # pgkit built-in /version (fallback).  Only fires if the
+            # playground did not register its own.  See the module
+            # docstring, Built-in routes.
+            if self.path == "/version" and "/version" not in routes:
+                self._send_json(200, {"success": True, "version": ""})
                 return
             if self.path in raw_routes:
                 self._handle_raw_post(raw_routes[self.path])
@@ -313,18 +355,26 @@ def _public_url(hub_conn, registered, used_port, html_file):
 def serve_nonblocking(*, port, html_file, html_render,
                       routes=None, raw_routes=None, module_sources=None,
                       hub_name=None, hub_role="playground", group=None,
-                      open_browser=False):
+                      open_browser=False, hub=None):
     """Start a playground's HTTP+WS server without blocking.
 
     Returns `(httpd, hub_conn, url)`.  The caller owns
     `httpd.serve_forever()` (in a thread) and `httpd.shutdown()` on
     teardown.  `hub_conn.stop_now()` closes the hub WS cleanly.
+
+    `hub` (optional) is a `pgkit.remote_hub.Hub` instance to use for
+    the `/remote` WebSocket endpoint instead of creating a fresh one.
+    Callers that want to push data to browsers over `/remote` (the
+    inpaint playground's canvas-push subscriber, in particular) pass
+    their own Hub here so they hold the same instance the endpoint
+    serves from.  See `playgrounds/inpaint/inpaint_server.py`'s
+    module docstring, CANVAS_PUSH SUBSCRIBER.
     """
     html = html_render()
     with open(html_file, "w", encoding="utf-8") as f:
         f.write(html)
 
-    handler_cls = make_handler(routes, raw_routes, module_sources)
+    handler_cls = make_handler(routes, raw_routes, module_sources, hub)
     httpd, used_port = _bind_server(port, handler_cls)
     if httpd is None:
         raise RuntimeError(

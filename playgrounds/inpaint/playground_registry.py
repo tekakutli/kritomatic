@@ -1,10 +1,30 @@
 """Playground registry client — announce presence to the kritomatic daemon.
 
 Called once at startup (retry loop, ~30s budget), once at shutdown
-(best-effort).  Same wire protocol as controlnets' copy; the daemon
-does not distinguish callers.  See `controlnets/playground_registry.py`
-for the full contract — this module exists so inpaint can register its
-layer slots without importing from a sibling playground's package.
+(best-effort), and (via `/playground_reregister`) from the browser's
+autosync when it notices the daemon has removed our registry entry.
+Same wire protocol as controlnets' copy; the daemon does not
+distinguish callers.  See `controlnets/playground_registry.py` for the
+full contract — this module exists so inpaint can register its layer
+slots without importing from a sibling playground's package.
+
+RE-REGISTRATION
+===============
+`reregister_once` is the single-shot variant used by the inpaint
+server's `/playground_reregister` route.  The browser's autosync
+poller detects "our entry is missing from `comfy_status`'s
+`playgrounds` list" on its next tick and POSTs to that route, which
+calls this function synchronously.  Recovering in ≤500 ms is what
+keeps the docker's Playgrounds section from flickering when the
+daemon's sweep thread misjudges the process's liveness — see
+`kritomatic_daemon/handlers/playgrounds.py`'s module docstring,
+SWEEP: WHAT "DEAD" MEANS.
+
+The initial `register` call at process startup (from
+`inpaint_playground.py`) uses `register`, not this function — it has
+the retry loop and the "warn on failure, keep serving" semantics
+that boot needs.  `reregister_once` is the fast-fail variant, since
+autosync will try again on its own schedule if this call fails.
 """
 
 from __future__ import annotations
@@ -88,6 +108,25 @@ def register(playground_id, name, url, port, layer_slots=None,
             )
             return False
         time.sleep(1.0)
+
+
+def reregister_once(playground_id, name, url, port,
+                    layer_slots=None) -> bool:
+    """Single-shot registration attempt.  Used by the browser's
+    autosync poller (via the inpaint server's
+    `/playground_reregister` route) when it detects that the daemon
+    has removed our registry entry.
+
+    Fails fast (2 s socket timeout, no retry loop) so the browser's
+    `/playground_reregister` POST returns quickly and autosync can
+    reschedule on its normal cadence.  Contrast with `register`,
+    which retries for ~30 s because it is called once at startup and
+    a silent miss there means the user has to restart the playground
+    manually.  See the module docstring, RE-REGISTRATION.
+    """
+    cmd = _build_register_cmd(playground_id, name, url, port, layer_slots)
+    resp = _send(cmd, timeout=2.0)
+    return _response_is_success(resp)
 
 
 def unregister(playground_id: str) -> None:

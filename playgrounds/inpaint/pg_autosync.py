@@ -19,6 +19,42 @@ visible and re-fetches the canvas under three triggers:
     `@thecanvas` is non-null and the playground has no image loaded
     yet.
 
+REGISTRY PRESENCE CHECK
+=======================
+The daemon keeps an in-memory registry of running playgrounds and
+sweeps it every 300 s, probing each entry's `/version` to decide
+liveness.  Historically the sweep treated any exception from
+`/version` as "dead" — including a 404 from a playground that had
+not registered a `/version` route.  Inpaint did not register one, so
+every 300 s the sweep removed our entry; the docker's Playgrounds
+section then collapsed back to a Resources section, and the only way
+out was a process restart.
+
+Two things fix that:
+
+  · `kritomatic_daemon/handlers/playgrounds.py`'s sweep now
+    distinguishes "process answered with a 4xx/5xx" (alive) from
+    "process did not answer" (dead), and `pgkit/server.py` provides
+    a built-in `/version` fallback so a missing route can never be
+    misread as a dead process.
+
+  · This poller, as a defence in depth, checks on every tick
+    whether our entry is present in `comfy_status`'s
+    `playgrounds` list.  If it is missing (or our `@thecanvas`
+    slot is missing from the entry), it POSTs
+    `/playground_reregister`, which the inpaint server forwards to
+    the daemon as a fresh `playground_register` call.
+
+Before the presence check existed, only a process restart could
+recover from a registry removal.  Now recovery is bounded by one
+poll cycle (≤500 ms) plus the daemon socket round-trip (~2 ms on
+localhost).
+
+The check is gated to fire at most once every 2 s (REREGISTER_COOLDOWN_MS)
+to avoid a re-register storm if the daemon stays unreachable for an
+extended period.  On a successful re-register, the entry appears on
+the next poll and the check goes quiet.
+
 PUSH CHANNELS (Slices D + E)
 ============================
 Two WS push channels feed the canvas:
@@ -124,12 +160,22 @@ import { scheduleSync } from "./pg_sync.js";
    Post-Slice-D, the poll is no longer the primary path for
    post-generation canvas updates — the WS push channels handle
    those.  The poll remains as: (a) the fast-path detector for spec
-   changes and (b) the fallback for batch-end canvas updates when
-   the WS is disconnected. */
+   changes, (b) the fallback for batch-end canvas updates when the
+   WS is disconnected, and (c) the registry-presence check that
+   re-registers the playground if the daemon's sweep drops it. */
 const POLL_INTERVAL_MS = 500;
 
 const PLAYGROUND_ID = "inpaint";
 const SLOT_ID       = "@thecanvas";
+
+/* Minimum gap between `/playground_reregister` POSTs.  The check
+   fires whenever our registry entry (or our slot) is missing from
+   `comfy_status`'s `playgrounds` list; without a cooldown, a daemon
+   that stays down would get one POST per poll tick (2/sec).  2 s
+   keeps the recovery latency at the poll cadence while limiting
+   daemon load during outages.  See the module docstring, REGISTRY
+   PRESENCE CHECK. */
+const REREGISTER_COOLDOWN_MS = 2000;
 
 let _lastSpec = null;
 let _bootstrapped = false;
@@ -137,6 +183,8 @@ let _running = false;
 let _timer = null;
 let _warnedNoWorkflow = false;
 let _warnedBackendDown = false;
+let _warnedNotRegistered = false;
+let _lastReregisterAt = 0;
 /* Tracks active-batches count from the last poll.  Used to detect
    a batch-end transition (N>0 → 0) as the fallback path for
    post-generation canvas updates.  -1 means "not yet polled". */
@@ -199,6 +247,31 @@ export function resolveCanvasSpec(data) {
 
 function _hashSpec(spec) {
   return spec === null ? "" : JSON.stringify(spec);
+}
+
+/* ============================================================
+   Registry presence + re-registration
+   ============================================================ */
+
+function _findRegistryEntry(data) {
+  const playgrounds = (data && data.playgrounds) || [];
+  return playgrounds.find(p => p && p.id === PLAYGROUND_ID) || null;
+}
+
+async function _reregisterIfMissing() {
+  const now = Date.now();
+  if (now - _lastReregisterAt < REREGISTER_COOLDOWN_MS) return;
+  _lastReregisterAt = now;
+  try {
+    await fetch("/playground_reregister", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+  } catch (_) {
+    /* Network failure — autosync reschedules on its own cadence;
+       the next tick's presence check retries after the cooldown. */
+  }
 }
 
 /* ============================================================
@@ -420,6 +493,34 @@ async function _poll() {
       return;
     }
     _warnedBackendDown = false;
+
+    // ---- registry presence check ----
+    //
+    // If we are not in the daemon's registry (or our @thecanvas slot
+    // is gone), POST /playground_reregister.  Recovery is bounded by
+    // one poll cycle plus the daemon socket round-trip.  See the
+    // module docstring, REGISTRY PRESENCE CHECK.
+    //
+    // `_warnedNotRegistered` silences the per-tick flash when the
+    // daemon stays unreachable; the flash re-arms on the first
+    // success tick.
+    const entry = _findRegistryEntry(resp.data || null);
+    const slotPresent = !!entry
+      && (entry.layer_slots || []).some(s => s && s.id === SLOT_ID);
+    if (!entry || !slotPresent) {
+      if (!_warnedNotRegistered) {
+        _warnedNotRegistered = true;
+        flashStatus(
+          entry
+            ? `slot ${SLOT_ID} missing \u2014 re-registering`
+            : "not registered with daemon \u2014 re-registering",
+          "warn",
+        );
+      }
+      await _reregisterIfMissing();
+      return;
+    }
+    _warnedNotRegistered = false;
 
     const spec = _specOf(resp.data || null);
     const specHash = _hashSpec(spec);

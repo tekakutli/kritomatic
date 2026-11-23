@@ -66,7 +66,8 @@ except ValueError:
 if _PLAYGROUNDS not in sys.path:
     sys.path.insert(0, _PLAYGROUNDS)
 
-from magi import magi_html, magi_server, playground_registry
+from magi import magi_html, magi_server
+from pgruntime import daemon_registry as playground_registry
 
 from pgkit.server import serve_nonblocking
 
@@ -97,7 +98,7 @@ def descriptor():
 
 def _watch_daemon_and_exit():
     """Exit the playground when the daemon dies."""
-    from magi import krita_client
+    from pgruntime import daemon_client as krita_client
 
     consecutive = 0
     while True:

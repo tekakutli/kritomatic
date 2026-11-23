@@ -13,10 +13,10 @@ IMAGE INSTALL
 =============
 The only image-install path is `/resource_image`, resolved from the
 `@thelayout` slot's current selector by `pg_autosync.js` (autosync) or
-`Refresh @thelayout` (manual).  The former `/import_image` and
-`/upload_image` routes, which the pick/clear/import-image buttons used,
-are gone.  `handle_import_image` survives as an internal helper for
-`handle_resource_image`'s `source="active"` branch.
+`Refresh @thelayout` (manual). The former /import_image and /upload_image
+routes are gone. The shared daemon_route_handlers() factory's
+import_image handler — used internally by resource_image for
+source="active" — covers the composite-fetch path.
 
 Lock discipline
 ===============
@@ -72,18 +72,16 @@ next queue picks up the new embeddings without any node or workflow
 change.
 """
 
-import base64
 import hashlib
 import json
 import threading
 import time
 import urllib.error
 import urllib.request
-from io import BytesIO
 
-from PIL import Image
-
-from . import krita_client, playground_registry, layout_comfy
+from pgruntime.daemon_routes import daemon_route_handlers
+from pgruntime import daemon_registry as playground_registry
+from . import layout_comfy
 
 
 PLAYGROUND_ID   = "layout"
@@ -393,126 +391,14 @@ def handle_generate_status(payload):
     return {"success": True, **entry}
 
 
-# ---------------------------------------------------------------------------
-#  Krita proxies
-# ---------------------------------------------------------------------------
-
-def _fetch_active_state():
-    try:
-        resp = krita_client.send({"type": "comfy_status"}, timeout=10.0)
-    except Exception as e:
-        return None, str(e)
-    if not isinstance(resp, dict):
-        return None, "bad daemon response"
-    if resp.get("status") != "success":
-        return None, resp.get("message") or "daemon rejected comfy_status"
-    return resp.get("data") or {}, None
-
-
-def handle_active_state(_payload):
-    data, err = _fetch_active_state()
-    if err is not None:
-        return {
-            "success": False,
-            "daemon_reachable": False,
-            "message": err,
-        }
-    return {
-        "success": True,
-        "daemon_reachable": True,
-        "data": data,
-    }
-
-
-def handle_krita_status(_payload):
-    return {"success": True, "reachable": krita_client.is_reachable()}
-
-
-def handle_import_image(payload):
-    """Internal helper — used by `handle_resource_image` for source=active."""
-    name = (payload or {}).get("name") if isinstance(payload, dict) else None
-    cmd = {"type": "get_document_composite_b64"}
-    if name:
-        cmd["name"] = name
-
-    response = krita_client.send(cmd, timeout=60.0)
-    if response.get("status") != "success":
-        return {"success": False,
-                "message": response.get("message") or "daemon rejected"}
-
-    data = response.get("data") or {}
-    data_url = data.get("data_url")
-    if not data_url:
-        return {"success": False, "message": "daemon returned no data_url"}
-    if not data_url.startswith("data:image/png;base64,"):
-        return {"success": False,
-                "message": f"unexpected data_url prefix: {data_url[:30]!r}"}
-
-    try:
-        png_bytes = base64.b64decode(data_url.split(",", 1)[1])
-        img = Image.open(BytesIO(png_bytes))
-        w, h = img.size
-    except Exception as e:
-        return {"success": False, "message": f"decode failed: {e}"}
-
-    hash_hex = hashlib.sha256(png_bytes).hexdigest()[:16]
-    return {
-        "success":   True,
-        "hash":      hash_hex,
-        "width":     w,
-        "height":    h,
-        "data_url":  data_url,
-        "filename":  data.get("name") or "krita_composite",
-    }
-
-
-def handle_resource_image(payload):
-    if not isinstance(payload, dict):
-        return {"success": False, "message": "expected a JSON object"}
-
-    source = payload.get("source", "active")
-    layer_name = payload.get("layer_name")
-
-    if source == "active":
-        return handle_import_image({})
-    if source == "layer":
-        if not layer_name:
-            return {"success": False,
-                    "message": "layer_name is required when source=layer"}
-        response = krita_client.send(
-            {"type": "get_layer_pixels_b64", "name": str(layer_name)},
-            timeout=30.0,
-        )
-        if response.get("status") != "success":
-            return {"success": False,
-                    "message": response.get("message") or "daemon rejected"}
-        data = response.get("data") or {}
-        data_url = data.get("data_url")
-        if not data_url:
-            return {"success": False,
-                    "message": "daemon returned no data_url for layer"}
-        return {
-            "success": True,
-            "hash": "layer_" + str(layer_name),
-            "width": data.get("width"),
-            "height": data.get("height"),
-            "data_url": data_url,
-            "filename": str(layer_name),
-        }
-    return {
-        "success": False,
-        "message": (
-            f"source={source!r} cannot be displayed as an image."
-        ),
-    }
-
+_h = daemon_route_handlers()
 
 ROUTES = {
     "/state":                  handle_state,
     "/version":                handle_version,
-    "/krita_status":           handle_krita_status,
-    "/active_state":           handle_active_state,
-    "/resource_image":         handle_resource_image,
+    "/krita_status":           _h["krita_status"],
+    "/active_state":           _h["active_state"],
+    "/resource_image":         _h["resource_image"],
     "/playground_reregister":  handle_playground_reregister,
     "/generate":               handle_generate,
     "/generate_status":        handle_generate_status,

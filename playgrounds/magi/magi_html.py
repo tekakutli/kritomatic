@@ -14,7 +14,8 @@ from .pg_autosync    import AUTOSYNC_JS
 
 from pgkit.html_shell import page
 from pgkit.js_check   import JsSyntaxError
-from pgkit.modules    import pgkit_modules
+from pgkit.modules     import pgkit_modules
+from pgruntime.modules import pgruntime_modules
 
 
 _BOOT_JS = r"""
@@ -66,6 +67,7 @@ try {
 
 _MODULE_SOURCES = {
     **pgkit_modules(),
+    **pgruntime_modules(),
     "pg_tuning.js":       TUNING_JS,
     "pg_state.js":        STATE_JS,
     "pg_client.js":       CLIENT_JS,

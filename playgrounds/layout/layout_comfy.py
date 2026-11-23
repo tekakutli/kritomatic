@@ -98,7 +98,7 @@ from kritomatic_shared.comfyui_proxy_client import (  # noqa: E402
     ProxyV2,
 )
 
-from . import krita_client
+from pgruntime import daemon_client as krita_client
 
 # ---------------------------------------------------------------------------
 #  Paths + timings

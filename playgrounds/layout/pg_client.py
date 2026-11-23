@@ -1,44 +1,20 @@
-"""HTTP bridge to the layout server."""
+"""HTTP bridge to the layout server.
+
+The three daemon-facing functions are re-exported from pgruntime's
+shared `makeKritaClient` factory — they're identical to magi's,
+controlnets's, multimask's, and inpaint's, with no layout-specific
+behaviour.  Layout's other client-side concerns live elsewhere:
+`/generate` and `/generate_status` are called directly from
+`pg_generate.js`, and `/state` / `/version` are called directly from
+`pg_panel.js`.  Nothing layout-specific remains here.
+"""
 
 CLIENT_JS = r"""
-export async function checkKritaStatus() {
-  try {
-    const res = await fetch("/krita_status", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}",
-    });
-    return await res.json();
-  } catch (e) {
-    return { success: false, reachable: false, message: e.message };
-  }
-}
+import { makeKritaClient } from "./pgruntime/daemon_client.js";
 
-export async function fetchActiveState() {
-  try {
-    const res = await fetch("/active_state", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}",
-    });
-    if (!res.ok) return { success: false, message: "HTTP " + res.status };
-    return await res.json();
-  } catch (e) {
-    return { success: false, message: e.message };
-  }
-}
+const _krita = makeKritaClient();
 
-export async function fetchResourceImage(spec) {
-  try {
-    const res = await fetch("/resource_image", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(spec),
-    });
-    if (!res.ok) return { success: false, message: "HTTP " + res.status };
-    return await res.json();
-  } catch (e) {
-    return { success: false, message: e.message };
-  }
-}
+export const checkKritaStatus   = _krita.checkKritaStatus;
+export const fetchActiveState   = _krita.fetchActiveState;
+export const fetchResourceImage = _krita.fetchResourceImage;
 """

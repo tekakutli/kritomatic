@@ -18,8 +18,9 @@ their server routes (`/import_image`, `/upload_image`) were removed
 along with the drag-drop overlay — the autosync poller and the
 manual refresh cover every install path those buttons provided.
 
-`handle_import_image` remains as an internal helper for
-`handle_resource_image`'s `source="active"` branch.
+The shared daemon_route_handlers() factory's import_image handler —
+used internally by resource_image for source="active" — covers the
+composite-fetch path.
 
 MASK TRANSFORM
 ==============
@@ -88,7 +89,7 @@ from io import BytesIO
 
 from PIL import Image
 
-from . import krita_client
+from pgruntime.daemon_routes import daemon_route_handlers
 
 
 _state_lock = threading.Lock()
@@ -306,16 +307,6 @@ def _public_state():
     return _state
 
 
-def _fetch_active_state():
-    try:
-        resp = krita_client.send({"type": "comfy_status"}, timeout=10.0)
-    except Exception:
-        return {}
-    if not isinstance(resp, dict) or resp.get("status") != "success":
-        return {}
-    return resp.get("data") or {}
-
-
 # ---------------------------------------------------------------------------
 #  /state, /version
 # ---------------------------------------------------------------------------
@@ -473,11 +464,6 @@ def handle_mask(payload):
 
     transformed = _transform_mask_cached(h, b64)
     return {"success": True, "hash": h, "b64": transformed}
-
-
-def handle_active_state(_payload):
-    data = _fetch_active_state()
-    return {"success": True, "data": data}
 
 
 # ---------------------------------------------------------------------------
@@ -905,110 +891,8 @@ def _diagnose_history(details):
 #  /krita_status, /import_masks, /resource_image
 # ---------------------------------------------------------------------------
 
-def handle_krita_status(_payload):
-    return {"success": True, "reachable": krita_client.is_reachable()}
 
-
-def handle_import_masks(payload):
-    cmd = {"type": "import_krita_masks_b64"}
-    if isinstance(payload, dict):
-        if payload.get("layer_names"):
-            cmd["layer_names"] = str(payload["layer_names"])
-        if "include_paint_alpha" in payload:
-            cmd["include_paint_alpha"] = bool(payload["include_paint_alpha"])
-
-    response = krita_client.send(cmd, timeout=60.0)
-    if response.get("status") != "success":
-        return {"success": False,
-                "message": response.get("message") or "daemon rejected"}
-
-    data = response.get("data") or {}
-    return {
-        "success":        True,
-        "masks":          data.get("masks") or [],
-        "skipped":        data.get("skipped") or [],
-        "selection_path": data.get("selection_path") or "unknown",
-        "message":        response.get("message") or "",
-    }
-
-
-def handle_import_image(payload):
-    """Internal helper — used by `handle_resource_image` for source=active."""
-    name = (payload or {}).get("name") if isinstance(payload, dict) else None
-    cmd = {"type": "get_document_composite_b64"}
-    if name:
-        cmd["name"] = name
-
-    response = krita_client.send(cmd, timeout=60.0)
-    if response.get("status") != "success":
-        return {"success": False,
-                "message": response.get("message") or "daemon rejected"}
-
-    data = response.get("data") or {}
-    data_url = data.get("data_url")
-    if not data_url:
-        return {"success": False, "message": "daemon returned no data_url"}
-    if not data_url.startswith("data:image/png;base64,"):
-        return {"success": False,
-                "message": f"unexpected data_url prefix: {data_url[:30]!r}"}
-
-    try:
-        png_bytes = base64.b64decode(data_url.split(",", 1)[1])
-        img = Image.open(BytesIO(png_bytes))
-        w, h = img.size
-    except Exception as e:
-        return {"success": False, "message": f"decode failed: {e}"}
-
-    hash_hex = hashlib.sha256(png_bytes).hexdigest()[:16]
-    return {
-        "success":   True,
-        "hash":      hash_hex,
-        "width":     w,
-        "height":    h,
-        "data_url":  data_url,
-        "filename":  data.get("name") or "krita_composite",
-    }
-
-
-def handle_resource_image(payload):
-    if not isinstance(payload, dict):
-        return {"success": False, "message": "expected a JSON object"}
-
-    source = payload.get("source", "active")
-    layer_name = payload.get("layer_name")
-
-    if source == "active":
-        return handle_import_image({})
-    if source == "layer":
-        if not layer_name:
-            return {"success": False,
-                    "message": "layer_name is required when source=layer"}
-        response = krita_client.send(
-            {"type": "get_layer_pixels_b64", "name": str(layer_name)},
-            timeout=30.0,
-        )
-        if response.get("status") != "success":
-            return {"success": False,
-                    "message": response.get("message") or "daemon rejected"}
-        data = response.get("data") or {}
-        data_url = data.get("data_url")
-        if not data_url:
-            return {"success": False,
-                    "message": "daemon returned no data_url for layer"}
-        return {
-            "success": True,
-            "hash": "layer_" + str(layer_name),
-            "width": data.get("width"),
-            "height": data.get("height"),
-            "data_url": data_url,
-            "filename": str(layer_name),
-        }
-    return {
-        "success": False,
-        "message": (
-            f"source={source!r} cannot be displayed as an image."
-        ),
-    }
+_h = daemon_route_handlers()
 
 
 ROUTES = {
@@ -1017,10 +901,10 @@ ROUTES = {
     "/mask":               handle_mask,
     "/export_graph":       handle_export_graph,
     "/fetch_history":      handle_fetch_history,
-    "/import_masks":       handle_import_masks,
-    "/krita_status":       handle_krita_status,
-    "/active_state":       handle_active_state,
-    "/resource_image":     handle_resource_image,
+    "/import_masks":       _h["import_masks"],
+    "/krita_status":       _h["krita_status"],
+    "/active_state":       _h["active_state"],
+    "/resource_image":     _h["resource_image"],
 }
 
 RAW_ROUTES = {}

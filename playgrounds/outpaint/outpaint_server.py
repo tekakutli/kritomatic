@@ -2,7 +2,7 @@
 
   POST /state                 set (from browser) or get
   POST /version               version only
-  POST /params                current pad values (playground-owned params)
+  POST /params                current pad values + locked booleans
   POST /krita_status          daemon reachable?
   POST /active_state          daemon comfy_status + playground registry
   POST /resource_image        resolve a {source, layer_name} spec to a PNG
@@ -22,7 +22,7 @@ time and merges the returned values into the config's `params` dict
 before calling `prepare_workflow`.  See `kritomatic_daemon/handlers/
 playgrounds.py`'s PARAM SLOTS for the registration side.
 
-The playground claims three groups of params (see PARAM_SLOTS):
+The playground claims two groups of params via PARAM_SLOTS:
 
   · Four ints derived from `_state.viewer` (which the browser keeps
     current via `/state` on every viewer change) and `_state.area_dims`:
@@ -34,19 +34,17 @@ The playground claims three groups of params (see PARAM_SLOTS):
 
     That is: how much empty area lies between each outer edge of the
     outpaint area and the corresponding side of the viewer rect.  All
-    values are rounded to int and clamped to `>= 0` (defensively — the
-    browser's clamp should make the padding non-negative, but a stale
-    state on the server should still produce usable numbers rather
-    than negative paddings the workflow might choke on).
-
-  · Two boolean flags forced to `True`:
-
-        APIv2    = True   (outpaint always uses the v2 proxy path)
-        OUTPAINT = True   (this workflow is an outpaint workflow)
+    values are rounded to int and clamped to `>= 0`.
 
     The corresponding Primitive nodes are hidden from the docker's
     Parameters section (their names are in PARAM_SLOTS), so the user
     cannot switch them off.
+
+  · Two forced-True booleans (`APIv2`, `OUTPAINT`) that lock the
+    workflow into v2-proxy + outpaint mode regardless of the saved
+    panel config.  Returned from `/params` when the workflow graph
+    declares a Primitive of the same name; silently ignored by the
+    merge filter when the graph does not.
 
   · Two hidden-but-not-owned params (`denoise`, `OUTPAINT_DENOISE`)
     appear in PARAM_SLOTS so the docker hides their fields, but the
@@ -54,6 +52,25 @@ The playground claims three groups of params (see PARAM_SLOTS):
     the daemon falls back to `_active_config` for missing claimed
     params; the workflow Primitive default is used when nothing else
     has been set.
+
+CONTROL PARAMS — DESTINATION
+============================
+The playground registers `DESTINATION` as a **control param** — a
+daemon-owned routing hint stored in the playground registry (not
+here).  Its default is `"playground"`, which routes generation
+through the outpaint branch (`_publish_outpaint_result`) and skips
+the Krita paste entirely.  The docker renders a dropdown next to
+this playground's `@thecanvas` row; setting `DESTINATION = "krita"`
+opt-in pastes into Krita (the bounds check still applies — set
+`paste.resize_canvas=true` in the workflow config if you want to
+opt into canvas growth).
+
+See `kritomatic_daemon/handlers/playgrounds.py`'s CONTROL PARAMS and
+`comfyui_generation._comfy_generate_impl`'s routing branch for the
+reader side.
+
+The old `OUTPAINT is True` fallback remains for pre-DESTINATION
+workflows; see PARAM VALUES.
 
 GENERATION AND SEND-TO-KRITA
 ============================
@@ -63,14 +80,12 @@ initiator; it is a receiver.  The `/generate` route is kept for
 external callers / debugging (it still POSTs `comfy_generate
 --no_paste` on the daemon), but is not invoked by the browser UI.
 
-The daemon publishes `paste_applied` after each successful paste
-(see `comfyui_generation._publish_paste_applied`).  When the
-outpaint workflow is set to `paste.resize_canvas=true` — or when
-the daemon is updated to detect `OUTPAINT=True` and skip paste
-entirely — those events carry the outpaint PNG.  The event-bus
-subscriber below captures the latest paste in `_last_pasted`, which
-`handle_active_state` exposes; the browser's autosync poll
-(`pg_autosync.js`) picks it up and calls `applyGeneratedImage`.
+The daemon publishes `outpaint_result` after each successful
+outpaint run (see `comfyui_generation._publish_outpaint_result`).
+The event-bus subscriber below captures the latest one in
+`_last_pasted`, which `handle_active_state` exposes; the browser's
+autosync poll (`pg_autosync.js`) picks it up and calls
+`applyGeneratedImage`.
 
     /send_to_krita   materializes the currently displayed PNG as a
                      brand-new Krita document.  Two existing daemon
@@ -85,11 +100,11 @@ EVENT BUS SUBSCRIPTION
 `start_event_bus_subscriber()` starts a daemon thread that connects
 to the daemon's event server (`127.0.0.1:12347`), reads
 newline-delimited JSON events, and stores the latest
-`paste_applied` payload in `_last_pasted`.  Reconnects on
+`outpaint_result` payload in `_last_pasted`.  Reconnects on
 disconnect with a 2 s backoff.
 
 If the daemon is not running, or if its build predates the
-`paste_applied` event, the subscriber simply reconnects and never
+`outpaint_result` event, the subscriber simply reconnects and never
 stores anything — the browser falls back to showing only the
 source (`@thecanvas`).  Send to Krita will refuse to run in that
 case, which is correct: no generation has been received.
@@ -97,17 +112,17 @@ case, which is correct: no generation has been received.
 The `last_pasted` payload:
 
     {
-      "hash":     str,   # content hash from paste_image
-      "b64":      str,   # base64 PNG of the layer Krita received
+      "hash":     str,   # content hash from the outpaint_result event
+      "b64":      str,   # base64 PNG of the outpaint result
       "width":    int,
       "height":   int,
-      "paste_x":  int,
+      "paste_x":  int,   # always 0 for outpaint results
       "paste_y":  int,
       "ts":       float, # unix time when the event arrived
     }
 
-The browser distinguishes new pastes by `hash:ts` — a stable
-`ts` is required so a repeated poll for the same paste does not
+The browser distinguishes new pastes by `hash:ts` — a stable `ts`
+is required so a repeated poll for the same paste does not
 re-trigger `applyGeneratedImage`.
 """
 
@@ -150,30 +165,40 @@ LAYER_SLOTS = [
     },
 ]
 
-# The four parameter names the playground owns.  Registered with the
-# daemon so they disappear from the docker's Parameters section (same
-# rule as @-resources disappearing from Resources), and computed
-# fresh at generation time from the current viewer/area state via
-# /params.  See the module docstring, PARAM VALUES.
+# The parameter names the playground owns (or hides) in the docker's
+# Parameters section.  See the module docstring, PARAM VALUES.
 PARAM_SLOTS = [
     # Playground-owned, computed fresh from viewer/area state at
-    # generation time.  See the module docstring, PARAM VALUES.
+    # generation time.
     "OUTPAINT_LEFT_PAD",
     "OUTPAINT_RIGHT_PAD",
     "OUTPAINT_TOP_PAD",
     "OUTPAINT_BOTTOM_PAD",
-    # Hidden from the docker's Parameters section.
-    #   · APIv2 and OUTPAINT are forced True — the outpaint path is
-    #     always v2 + outpaint mode, so the workflow's corresponding
-    #     Primitive nodes are locked on.
-    #   · denoise and OUTPAINT_DENOISE are hidden but NOT owned — the
-    #     playground never returns a value for them.  At generation
-    #     time the daemon falls back to _active_config; the workflow
-    #     Primitive default is used when nothing else has been set.
-    "denoise",
-    "OUTPAINT_DENOISE",
+    # Forced True — the outpaint path is always v2 + outpaint mode,
+    # so the workflow's corresponding Primitive nodes are locked on.
+    # `/params` returns these as True; the daemon's merge filter
+    # ignores them when the graph does not declare a matching
+    # Primitive, so this is safe for inpaint-shaped workflows too.
     "APIv2",
     "OUTPAINT",
+    # Hidden from the docker's Parameters section, but NOT owned by
+    # the playground — the daemon falls back to _active_config.
+    "denoise",
+    "OUTPAINT_DENOISE",
+]
+
+# Control params.  These are daemon-owned routing hints, stored in
+# the playground registry, edited from the docker's Playground Input
+# section, and merged into `config["params"]` by
+# `comfyui_generation._fetch_playground_params` at generation time.
+# See the module docstring, CONTROL PARAMS — DESTINATION.
+CONTROL_PARAMS = [
+    {
+        "name":    "DESTINATION",
+        "type":    "select",
+        "options": ["krita", "playground"],
+        "default": "playground",
+    },
 ]
 
 SLOT_ID = "@thecanvas"
@@ -283,12 +308,18 @@ def handle_params(_payload):
       · APIv2, OUTPAINT — booleans forced to True.  The outpaint
         workflow always runs on the v2 proxy in outpaint mode; the
         docker hides the corresponding Primitive fields (see
-        PARAM_SLOTS), so the user cannot switch them off.
+        PARAM_SLOTS), so the user cannot switch them off.  When the
+        graph does not declare a matching Primitive, the daemon's
+        merge filter drops them — no effect, no error.
 
     `denoise` and `OUTPAINT_DENOISE` are in PARAM_SLOTS (hidden from
     the docker) but intentionally NOT returned here — the playground
     does not own a value for them.  At generation time the daemon
     falls back to `_active_config` for missing claimed params.
+
+    `DESTINATION` is a control param and does NOT flow through this
+    route — it lives in the daemon's playground registry.  See the
+    module docstring, CONTROL PARAMS — DESTINATION.
     """
     with _state_lock:
         if _state is None:
@@ -314,8 +345,8 @@ def handle_params(_payload):
         "OUTPAINT_TOP_PAD":    max(0, int(round(pxY))),
         "OUTPAINT_RIGHT_PAD":  max(0, int(round(float(area_w) - pxX - pxW))),
         "OUTPAINT_BOTTOM_PAD": max(0, int(round(float(area_h) - pxY - pxH))),
-        "APIv2":               True,
         "OUTPAINT":            True,
+        "APIv2":               True,
     }
 
     return {"success": True, "values": values}
@@ -327,6 +358,7 @@ def handle_playground_reregister(_payload):
         PLAYGROUND_ID, PLAYGROUND_NAME, url, PLAYGROUND_PORT,
         layer_slots=LAYER_SLOTS,
         param_slots=PARAM_SLOTS,
+        control_params=CONTROL_PARAMS,
     )
     return {"success": bool(ok)}
 
@@ -339,8 +371,8 @@ def _event_bus_subscriber_loop():
     """Connect to the daemon's event bus and stream events.
 
     See the module docstring, EVENT BUS SUBSCRIPTION.  Reconnects on
-    any failure with a 2 s backoff.  Only `paste_applied` events are
-    stored (in `_last_pasted`); everything else is discarded.
+    any failure with a 2 s backoff.  Only `outpaint_result` events
+    are stored (in `_last_pasted`); everything else is discarded.
     """
     global _last_pasted
     daemon_host = "127.0.0.1"
@@ -394,10 +426,9 @@ def _event_bus_subscriber_loop():
                     with _event_bus_lock:
                         _last_pasted = entry
                     _log(
-                        f"paste_applied: "
+                        f"outpaint_result: "
                         f"{entry['width']}\u00d7{entry['height']} "
-                        f"hash={str(entry['hash'])[:8]} "
-                        f"at ({entry['paste_x']},{entry['paste_y']})"
+                        f"hash={str(entry['hash'])[:8]}"
                     )
         except (OSError, socket.timeout) as e:
             _log(f"event bus subscriber: {e}")

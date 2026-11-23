@@ -1,4 +1,4 @@
-"""Playground registry with per-slot layer selectors.
+"""Playground registry with per-slot layer selectors and control params.
 
 Playgrounds call `playground_register` on startup and
 `playground_unregister` on clean exit.  The daemon keeps an in-memory
@@ -84,6 +84,42 @@ whatever client-side state it tracks), and the daemon pulls them at
 generation time.  A playground that has no `param_slots` declares
 contributes nothing to this pass.
 
+CONTROL PARAMS
+==============
+A playground may additionally declare one or more **control params**
+on register.  Control params are *not* substituted into the workflow
+graph — they are pipeline-routing hints that the daemon's own code
+reads from `config["params"]`.  Unlike `param_slots` (whose values
+are pulled fresh from the playground's HTTP `/params` at generation
+time), control-param values live in the registry and are edited by
+the docker.
+
+A control param is a dict:
+
+    control_params = [
+        {
+            "name":    "DESTINATION",
+            "type":    "select",
+            "options": ["krita", "playground"],
+            "default": "playground",
+        },
+    ]
+
+`type` is one of `"select"`, `"toggle"`, `"text"`, `"number"`,
+`"integer"`.  Select requires `options`; toggle requires `default`
+to be a bool.
+
+Control params are **singletons**: at most one playground may claim a
+given `name`.  Attempting to register a second claimant returns
+`{"success": False, "message": "control param ... already claimed by ..."}`.
+This is enforced at `playground_register` time, under the registry
+lock, so two playgrounds registering concurrently cannot both win.
+
+The outpaint playground uses `DESTINATION` to route its generation
+between "publish the raw outpaint result to the playground" (default)
+and "paste into Krita" (bounds check still applies).  See
+`comfyui_generation.py`'s routing branch for the reader side.
+
 No heartbeats.  Clean exits unregister explicitly (signal handler +
 atexit).  Crashes and SIGKILL are caught by a background sweep thread
 that runs every `_SWEEP_INTERVAL_S` seconds and probes each entry's
@@ -105,13 +141,6 @@ distinction between "gone away" and "route wrong" matters:
     section) would answer a probe with a 404, but should not be
     swept — it's still serving its own HTTP routes and driving its
     own slots.
-
-Prior to this distinction, any HTTP error from `/version` was
-treated as dead, which caused the inpaint playground's registration
-to be removed every 300 s (its server did not register a `/version`
-route; the sweep hit 404, marked it dead, and wiped the registry
-entry — which flipped the docker's Resources section back on and
-lost the user's Playground Input row until inpaint was restarted).
 
 Daemon restart: the registry is in-memory and lives on the handler
 singleton, so it vanishes when the daemon process exits.  Playgrounds
@@ -138,6 +167,10 @@ _SWEEP_INTERVAL_S = 300.0
 _SWEEP_PROBE_TIMEOUT_S = 1.0
 
 _LAYER_SOURCES = frozenset({"active", "global", "layer"})
+
+_CONTROL_PARAM_TYPES = frozenset({
+    "select", "toggle", "text", "number", "integer",
+})
 
 
 def _probe_alive(url: str) -> bool:
@@ -258,6 +291,83 @@ def _normalize_param_slot_specs(raw_specs) -> tuple:
     return out, None
 
 
+def _normalize_control_param_specs(raw_specs) -> tuple:
+    """Validate and normalize a list of control-param specs.
+
+    Accepts a Python list (direct socket call) or a JSON string
+    (CLI).  Returns `(control_dict, error)`, where `control_dict` maps
+    name -> `{name, type, options, default}`.  See the module
+    docstring, CONTROL PARAMS.
+
+    Values are NOT included here — the caller initializes `value` from
+    `default` (or preserves an existing value on re-register).
+    """
+    if isinstance(raw_specs, str):
+        try:
+            raw_specs = json.loads(raw_specs)
+        except json.JSONDecodeError as e:
+            return None, f"control_params JSON error: {e}"
+    if raw_specs is None:
+        raw_specs = []
+    if not isinstance(raw_specs, list):
+        return None, "control_params must be a list of spec objects"
+
+    out: dict = {}
+    for i, spec in enumerate(raw_specs):
+        if not isinstance(spec, dict):
+            return None, f"control_params[{i}] must be an object"
+        name = spec.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return None, (
+                f"control_params[{i}].name must be a non-empty string"
+            )
+        name = name.strip()
+        if name in out:
+            return None, f"duplicate control param name {name!r}"
+
+        ctype = spec.get("type", "text")
+        if not isinstance(ctype, str) or ctype not in _CONTROL_PARAM_TYPES:
+            return None, (
+                f"control_params[{i}].type={ctype!r} is not "
+                f"supported; expected one of "
+                f"{sorted(_CONTROL_PARAM_TYPES)}"
+            )
+
+        options = spec.get("options")
+        default = spec.get("default")
+
+        if ctype == "select":
+            if not isinstance(options, list) or not options:
+                return None, (
+                    f"control_params[{i}].options must be a "
+                    f"non-empty list for type='select'"
+                )
+            if default not in options:
+                return None, (
+                    f"control_params[{i}].default {default!r} is not "
+                    f"in options {options!r}"
+                )
+            options = list(options)
+        elif ctype == "toggle":
+            if not isinstance(default, bool):
+                return None, (
+                    f"control_params[{i}].default must be a boolean "
+                    f"for type='toggle'"
+                )
+            options = None
+        else:
+            options = None
+
+        out[name] = {
+            "name": name,
+            "type": ctype,
+            "options": options,
+            "default": default,
+        }
+
+    return out, None
+
+
 class PlaygroundCommands(AutoDispatchHandler):
 
     def __init__(self, parent):
@@ -322,6 +432,13 @@ class PlaygroundCommands(AutoDispatchHandler):
         `param_slots` is a flat list of names — the panel handler's
         `_claimed_param_names` reads it to hide the corresponding
         fields in Parameters.  See the module docstring, PARAM SLOTS.
+
+        `control_params` is a list of dicts, each carrying the full
+        spec plus the current `value` (registry-owned state).  The
+        docker's `_update_playgrounds` renders a row per control
+        param and writes changes back via
+        `playground_set_control_param`.  See the module docstring,
+        CONTROL PARAMS.
         """
         with self._lock:
             out = []
@@ -334,16 +451,27 @@ class PlaygroundCommands(AutoDispatchHandler):
                         "managed_by_playground": slot["managed_by_playground"],
                         "selector":              dict(slot["selector"]),
                     })
+                ctrl = []
+                for cp in e["control_params"].values():
+                    ctrl.append({
+                        "name":    cp["name"],
+                        "type":    cp["type"],
+                        "options": (list(cp["options"])
+                                    if cp["options"] else None),
+                        "default": cp["default"],
+                        "value":   cp["value"],
+                    })
                 out.append({
-                    "id":            e["id"],
-                    "name":          e["name"],
-                    "url":           e["url"],
-                    "port":          e["port"],
-                    "layer_slots":   slots,
-                    "param_slots":   [
+                    "id":              e["id"],
+                    "name":            e["name"],
+                    "url":             e["url"],
+                    "port":            e["port"],
+                    "layer_slots":     slots,
+                    "param_slots":     [
                         p["name"] for p in e["param_slots"].values()
                     ],
-                    "registered_at": e["registered_at"],
+                    "control_params":  ctrl,
+                    "registered_at":   e["registered_at"],
                 })
             return out
 
@@ -355,17 +483,19 @@ class PlaygroundCommands(AutoDispatchHandler):
         category="playgrounds",
         help_text="Register a running playground with the daemon.",
         args={
-            "--id":          {"type": "str",  "required": True},
-            "--name":        {"type": "str",  "required": True},
-            "--url":         {"type": "str",  "required": True},
-            "--port":        {"type": "int",  "required": True},
-            "--layer_slots": {"type": "json", "default": "[]"},
-            "--param_slots": {"type": "json", "default": "[]"},
+            "--id":             {"type": "str",  "required": True},
+            "--name":           {"type": "str",  "required": True},
+            "--url":            {"type": "str",  "required": True},
+            "--port":           {"type": "int",  "required": True},
+            "--layer_slots":    {"type": "json", "default": "[]"},
+            "--param_slots":    {"type": "json", "default": "[]"},
+            "--control_params": {"type": "json", "default": "[]"},
         },
         arg_map={"id": "playground_id"},
     )
     def playground_register(self, playground_id, name, url, port,
-                            layer_slots=None, param_slots=None):
+                            layer_slots=None, param_slots=None,
+                            control_params=None):
         pid = str(playground_id or "").strip()
         name = str(name or "").strip()
         url = str(url or "").strip().rstrip("/")
@@ -391,8 +521,33 @@ class PlaygroundCommands(AutoDispatchHandler):
         if err is not None:
             return {"success": False, "message": err}
 
+        control_dict, err = _normalize_control_param_specs(control_params)
+        if err is not None:
+            return {"success": False, "message": err}
+
         with self._lock:
+            # Singleton enforcement: control-param names must be
+            # claimed by at most one playground.  Checked under the
+            # same lock that guards the write, so two concurrent
+            # registers cannot both win.  Skipped for the calling
+            # playground's own entry (re-register is allowed).
+            for other_pid, other_entry in self._registry.items():
+                if other_pid == pid:
+                    continue
+                other_ctrl = other_entry.get("control_params") or {}
+                for cname in control_dict:
+                    if cname in other_ctrl:
+                        return {
+                            "success": False,
+                            "message": (
+                                f"control param {cname!r} already "
+                                f"claimed by playground {other_pid!r}; "
+                                f"control params are singletons"
+                            ),
+                        }
+
             existing = self._registry.get(pid)
+
             # Preserve any existing selectors for slots that survive
             # the re-registration (same slot id).  New slots get the
             # default `{"source": "active", "layer_name": None}`;
@@ -400,10 +555,7 @@ class PlaygroundCommands(AutoDispatchHandler):
             #
             # `managed_by_playground` is NOT preserved from the
             # existing record — it comes from the new registration
-            # call's slot spec, always.  It is a claim about how the
-            # playground drives the slot, not user state; the
-            # playground is the authority on it and gets to change
-            # its mind on re-register.
+            # call's slot spec, always.
             #
             # `param_slots` is likewise not preserved — it is a fresh
             # claim from each register call, exactly like
@@ -416,32 +568,52 @@ class PlaygroundCommands(AutoDispatchHandler):
                     )
                 new_slots[sid] = new_spec
 
+            # Control params: preserve the current `value` when the
+            # new spec still admits it (same name, value in new
+            # options for select, else default).  A re-register that
+            # drops a control param drops its value with it.
+            new_control: dict = {}
+            for cname, new_spec in control_dict.items():
+                cur_val = None
+                if (existing is not None
+                        and cname in (existing.get("control_params") or {})):
+                    cur_val = existing["control_params"][cname].get("value")
+                opts = new_spec.get("options") or []
+                if cur_val is not None and (not opts or cur_val in opts):
+                    new_spec["value"] = cur_val
+                else:
+                    new_spec["value"] = new_spec["default"]
+                new_control[cname] = new_spec
+
             if existing is not None:
                 print(
                     f"[playgrounds] {pid!r} re-registered "
                     f"(was {existing['url']!r}, now {url!r}; "
                     f"{len(new_slots)} slot(s), "
-                    f"{len(param_dict)} param(s))",
+                    f"{len(param_dict)} param(s), "
+                    f"{len(new_control)} control param(s))",
                     flush=True,
                 )
             self._registry[pid] = {
-                "id":            pid,
-                "name":          name,
-                "url":           url,
-                "port":          port,
-                "layer_slots":   new_slots,
-                "param_slots":   param_dict,
-                "registered_at": time.time(),
+                "id":              pid,
+                "name":            name,
+                "url":             url,
+                "port":            port,
+                "layer_slots":     new_slots,
+                "param_slots":     param_dict,
+                "control_params":  new_control,
+                "registered_at":   time.time(),
             }
 
         return {
             "success": True,
             "message": f"registered {pid!r} at {url}",
             "data": {
-                "id":    pid,
-                "url":   url,
-                "slots": list(new_slots.keys()),
-                "params": list(param_dict.keys()),
+                "id":       pid,
+                "url":      url,
+                "slots":    list(new_slots.keys()),
+                "params":   list(param_dict.keys()),
+                "controls": list(new_control.keys()),
             },
         }
 
@@ -531,4 +703,102 @@ class PlaygroundCommands(AutoDispatchHandler):
                 "slot_id":  sid,
                 "selector": new_selector,
             },
+        }
+
+    @command(
+        category="playgrounds",
+        help_text="Set a control param's value (daemon-owned).",
+        args={
+            "--id":    {"type": "str", "required": True},
+            "--name":  {"type": "str", "required": True},
+            "--value": {"type": "str", "required": True},
+        },
+        arg_map={"id": "playground_id"},
+    )
+    def playground_set_control_param(self, playground_id, name, value):
+        """Update a registered control param's current value.
+
+        Control params are daemon-owned: the registry is the source
+        of truth, and `comfyui_generation._fetch_playground_params`
+        merges `value` into the pipeline's `config["params"]` at
+        generation time.  The playground's own HTTP `/params` route
+        does not carry control params — only `param_slots` values
+        flow through HTTP.
+
+        Coercion follows `type`: select requires `value` to be one of
+        `options`; toggle parses to bool; number/integer parse
+        numerically; text passes through as a string.
+        """
+        pid = str(playground_id or "").strip()
+        cname = str(name or "").strip()
+        raw_value = value
+
+        if not pid:
+            return {"success": False, "message": "id is required"}
+        if not cname:
+            return {"success": False, "message": "name is required"}
+
+        with self._lock:
+            entry = self._registry.get(pid)
+            if entry is None:
+                return {"success": False,
+                        "message": f"playground {pid!r} is not registered"}
+            cp = (entry.get("control_params") or {}).get(cname)
+            if cp is None:
+                return {"success": False,
+                        "message": (
+                            f"playground {pid!r} has no control param "
+                            f"{cname!r}; claimed: "
+                            f"{sorted((entry.get('control_params') or {}).keys())}"
+                        )}
+
+            ctype = cp.get("type", "text")
+            if ctype == "select":
+                if raw_value not in (cp.get("options") or []):
+                    return {"success": False,
+                            "message": (
+                                f"value {raw_value!r} not in options "
+                                f"{cp.get('options')!r}"
+                            )}
+                new_value = raw_value
+            elif ctype == "toggle":
+                if isinstance(raw_value, bool):
+                    new_value = raw_value
+                else:
+                    new_value = str(raw_value).lower() in (
+                        "true", "1", "yes", "on",
+                    )
+            elif ctype == "number":
+                try:
+                    new_value = float(raw_value)
+                except (TypeError, ValueError):
+                    return {"success": False,
+                            "message": (
+                                f"value {raw_value!r} is not a number"
+                            )}
+            elif ctype == "integer":
+                try:
+                    new_value = int(str(raw_value), 10)
+                except (TypeError, ValueError):
+                    return {"success": False,
+                            "message": (
+                                f"value {raw_value!r} is not an integer"
+                            )}
+            else:
+                new_value = "" if raw_value is None else str(raw_value)
+
+            cp["value"] = new_value
+
+        print(
+            f"[playgrounds] {pid!r}.{cname} → {new_value!r}",
+            flush=True,
+        )
+        try:
+            self.parent._publish_state_change()
+        except Exception:
+            pass
+        return {
+            "success": True,
+            "message": f"{cname} = {new_value!r}",
+            "data": {"id": pid, "name": cname, "value": new_value},
         }

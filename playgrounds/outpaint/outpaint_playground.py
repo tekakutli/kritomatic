@@ -5,17 +5,33 @@
 Writes outpaint.html, serves it at http://127.0.0.1:8779/.
 
 Registers with the kritomatic daemon on startup under id `outpaint`,
-with one layer slot `@thecanvas` and eight param slots —
-`OUTPAINT_LEFT_PAD`, `OUTPAINT_RIGHT_PAD`, `OUTPAINT_TOP_PAD`,
-`OUTPAINT_BOTTOM_PAD` (playground-owned, computed fresh at
-generation time), `APIv2` and `OUTPAINT` (forced to `True`), and
-`denoise` / `OUTPAINT_DENOISE` (hidden from the docker but not owned —
-the workflow default is used).  The layer slot is user-editable
-(Playgrounds section in the docker); param slots are
-playground-owned — the panel hides them from Parameters, and the
-daemon queries `/params` at generation time for fresh values, which
-is the "pushed at generation time" step described in
-`outpaint_server.py`'s PARAM VALUES.
+with one layer slot `@thecanvas`, eight param slots
+(`OUTPAINT_LEFT_PAD`, `OUTPAINT_RIGHT_PAD`, `OUTPAINT_TOP_PAD`,
+`OUTPAINT_BOTTOM_PAD` computed fresh at generation time; `APIv2` and
+`OUTPAINT` forced to True; `denoise` and `OUTPAINT_DENOISE` hidden
+from the docker but not owned — the workflow default is used), and
+one control param `DESTINATION` (select `"playground"` / `"krita"`,
+default `"playground"`).
+
+`DESTINATION` is a daemon-owned routing hint that the docker renders
+a dropdown for.  When `DESTINATION == "playground"` (the default),
+`comfyui_generation._comfy_generate_impl` publishes the outpaint
+result via the event bus and never pastes into Krita.  When
+`DESTINATION == "krita"` (user opt-in), the pipeline pastes normally
+— note that the bounds check still applies, so a canvas smaller than
+the outpaint result will still fail.  Set `paste.resize_canvas=true`
+in the workflow config if you want to opt into canvas growth.
+
+The legacy `OUTPAINT is True` fallback is kept for workflows whose
+graph declares an `OUTPAINT` Primitive and were driven by
+pre-DESTINATION playground registrations; see `outpaint_server.py`'s
+PARAM VALUES.
+
+The layer slot is user-editable (Playgrounds section in the docker);
+param slots are playground-owned — the panel hides them from
+Parameters, and the daemon queries `/params` at generation time for
+fresh values, which is the "pushed at generation time" step described
+in `outpaint_server.py`'s PARAM VALUES.
 
 When the daemon dies, the playground exits (background watcher,
 ~10s of consecutive failures); the user restarts both manually.
@@ -59,6 +75,7 @@ PLAYGROUND_ID   = outpaint_server.PLAYGROUND_ID
 PLAYGROUND_NAME = outpaint_server.PLAYGROUND_NAME
 LAYER_SLOTS     = outpaint_server.LAYER_SLOTS
 PARAM_SLOTS     = outpaint_server.PARAM_SLOTS
+CONTROL_PARAMS  = outpaint_server.CONTROL_PARAMS
 
 _DAEMON_WATCH_INTERVAL_S = 2.0
 _DAEMON_WATCH_MAX_FAILS  = 5
@@ -180,13 +197,15 @@ def main():
         PLAYGROUND_ID, PLAYGROUND_NAME, state_url, actual_port,
         layer_slots=LAYER_SLOTS,
         param_slots=PARAM_SLOTS,
+        control_params=CONTROL_PARAMS,
         retry_s=30.0,
     )
     if registered:
         print(
             f"  registered with daemon as {PLAYGROUND_ID!r} "
             f"(slot(s): {[s['id'] for s in LAYER_SLOTS]}, "
-            f"param(s): {PARAM_SLOTS})",
+            f"param(s): {PARAM_SLOTS}, "
+            f"control(s): {[c['name'] for c in CONTROL_PARAMS]})",
             flush=True,
         )
     else:

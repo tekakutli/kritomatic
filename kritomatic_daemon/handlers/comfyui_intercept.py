@@ -1,5 +1,6 @@
 """comfyui_intercept.py — intercept mode: prepare-and-hand-off branch,
-resume / discard / list commands, and the multimask snapshot helpers.
+resume / discard / list commands, and the multimask + controlnets
+snapshot helpers.
 
 Intercept mode is the newest surface in the `comfyui` handler family
 and the most likely to be edited as the interceptor playground
@@ -7,7 +8,9 @@ evolves.  It is grouped here so all of its moving parts live in one
 place:
 
   · Multimask snapshot — `_get_multimask_url_from_graph`,
-    `_post_json`, `_fetch_multimask_snapshot`.
+    `_fetch_multimask_snapshot`.
+  · Controlnets snapshot — `_get_controlnets_url_from_graph`,
+    `_fetch_controlnets_snapshot`.
   · The prepare-and-hand-off branch — `generate_intercepted` (what
     `comfy_generate` calls when the intercept toggle is on).
   · Batch building + intake POST — `_make_intercepted_batch`,
@@ -29,6 +32,40 @@ Dependency direction:
     comfyui_generation.py
         ←  imports InterceptCommands, generate_intercepted,
            notify_interceptor_cancel from this module.
+
+CONTROLNETS SNAPSHOT — DISPLAY-ONLY
+===================================
+When the intercepted workflow contains a `ControlNetsConditioning`
+node, the daemon fetches the controlnets playground's `/state` and,
+for each entry with an image hash, its `/controlnet_image` (which is
+the same rotate+crop transform the node will see at ComfyUI
+execution time).  The snapshot rides to the interceptor as a
+`controlnets` sibling of `payload`, alongside the existing
+`multimask` sibling.
+
+Unlike multimask, the interceptor does NOT push any state back to the
+controlnets playground before resume.  Controlnet chain
+configuration lives in the workflow file plus `/state.apply_enabled`;
+the interceptor treats them as read-only — what the reviewer sees is
+what runs.  Users who want to disable an apply node do so in the
+controlnets playground *before* intercepting.  This asymmetry with
+multimask is intentional: multimask's per-area prompts are
+intrinsically per-run user intent ("I want THIS area to say THIS"),
+while a controlnet apply toggle is workflow configuration (whether
+this checkpoint uses ControlNet X at all).
+
+OUTPAINT ROUTING
+================
+`comfy_resume_intercepted` reads DESTINATION (or legacy OUTPAINT)
+from the batch's `params_snapshot` after download, before paste —
+same routing as the non-intercept path in
+`comfyui_generation._comfy_generate_impl`.  When the routing is
+"playground", the downloaded images are published as
+`outpaint_result` events and pasted into Krita is skipped.  The
+controlnets snapshot handling runs BEFORE this branch, so a
+controlnet workflow with outpaint destination still carries the
+snapshot through intake / item / display; only the paste step is
+skipped.
 """
 
 from __future__ import annotations
@@ -53,8 +90,13 @@ from .comfyui_document import (
     _check_color_mode,
     _get_live_active_document,
 )
-from .comfyui_paste import download_outputs, paste_result
+from .comfyui_paste import (
+    download_outputs,
+    paste_result,
+    _publish_outpaint_result,
+)
 from .comfyui_types import (
+    _DEFAULT_CONTROLNETS_URL,
     _DEFAULT_MULTIMASK_URL,
     InterceptedBatch,
 )
@@ -69,7 +111,10 @@ _POLL_INTERVAL_S = 0.25
 _RESUME_POLL_TIMEOUT_S = 180.0
 
 # Timeout for the intake POST.  The interceptor's intake handler is
-# lightweight (just queues the task); 5 s is generous.
+# lightweight (just queues the task); 5 s is generous.  The payload
+# size grows with the number of controlnet images and multimask areas
+# — on localhost even a several-MB POST completes in well under a
+# second.
 _INTAKE_TIMEOUT_S = 5.0
 
 # Timeouts for the multimask snapshot fetch.  /state is metadata-only
@@ -77,6 +122,11 @@ _INTAKE_TIMEOUT_S = 5.0
 # localhost, but give it room for a few areas).
 _MULTIMASK_STATE_TIMEOUT_S = 5.0
 _MULTIMASK_MASK_TIMEOUT_S = 10.0
+
+# Timeouts for the controlnets snapshot fetch.  Same shape: /state
+# is metadata-only; /controlnet_image triggers a per-hash transform.
+_CONTROLNETS_STATE_TIMEOUT_S = 5.0
+_CONTROLNETS_IMAGE_TIMEOUT_S = 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +232,98 @@ def _fetch_multimask_snapshot(url: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+#  Controlnets helpers (module-level, no state)
+# ---------------------------------------------------------------------------
+
+def _get_controlnets_url_from_graph(graph: dict) -> Optional[str]:
+    """Return the controlnets playground URL if `graph` uses
+    `ControlNetsConditioning`, else None.
+
+    Same discovery shape as `_get_multimask_url_from_graph`: reads
+    the node's `playground_url` widget; blank falls back to
+    `_DEFAULT_CONTROLNETS_URL`.  Multiple `ControlNetsConditioning`
+    nodes pick the first deterministically.
+    """
+    if not isinstance(graph, dict):
+        return None
+    for _node_id, node in graph.items():
+        if not isinstance(node, dict):
+            continue
+        if node.get("class_type") != "ControlNetsConditioning":
+            continue
+        url = (node.get("inputs") or {}).get("playground_url")
+        if isinstance(url, str) and url.strip():
+            return url.strip()
+        return _DEFAULT_CONTROLNETS_URL
+    return None
+
+
+def _fetch_controlnets_snapshot(url: str) -> Optional[dict]:
+    """Fetch controlnets' state and per-entry transformed images.
+
+    Returns `{"url": str, "state": {...}, "images": {hash: b64}}`, or
+    `None` on unrecoverable failure (controlnets unreachable,
+    `/state` rejected, non-JSON).
+
+    Partial image-fetch failure is tolerated: entries whose
+    `/controlnet_image` call failed are simply absent from `images`.
+    The interceptor renders placeholder text for those entries.
+
+    `/controlnet_image?hash=…` returns the image transformed to the
+    prepared frame (rotate+crop per `/crop_frame`) at the moment of
+    the call — same shape as multimask's `/mask`.  Since this runs
+    before the prepare loop, the crop frame it sees matches what
+    `prepare_workflow` will use on the immediately-following
+    iteration.
+    """
+    base = url.rstrip("/")
+    try:
+        state = _post_json(
+            base + "/state", {}, timeout=_CONTROLNETS_STATE_TIMEOUT_S,
+        )
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"[comfyui] controlnets /state failed at {url!r}: {e}",
+              flush=True)
+        return None
+
+    if not isinstance(state, dict) or not state.get("success", False):
+        print(f"[comfyui] controlnets /state rejected at {url!r}",
+              flush=True)
+        return None
+
+    controlnets = list(state.get("controlnets") or [])
+    images: dict = {}
+    for c in controlnets:
+        if not isinstance(c, dict):
+            continue
+        img_meta = c.get("image") or {}
+        h = img_meta.get("hash")
+        if not h:
+            continue
+        try:
+            r = _post_json(
+                base + "/controlnet_image", {"hash": h},
+                timeout=_CONTROLNETS_IMAGE_TIMEOUT_S,
+            )
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            print(f"[comfyui] controlnets /controlnet_image {h[:8]} "
+                  f"failed: {e}", flush=True)
+            continue
+        if r.get("success") and r.get("b64"):
+            images[h] = r["b64"]
+
+    return {
+        "url": url,
+        "state": {
+            "controlnets": controlnets,
+            "apply_enabled": state.get("apply_enabled") or {},
+            "version": state.get("version") or "",
+        },
+        "images": images,
+    }
+
+
+# ---------------------------------------------------------------------------
 #  Intercept branch — prepare and hand off
 # ---------------------------------------------------------------------------
 
@@ -226,10 +368,12 @@ def generate_intercepted(
     interceptor's `comfy_resume_intercepted` runs the
     submit/poll/download/paste half later, on the user's schedule.
 
-    A multimask snapshot (when the workflow uses
-    `MultiAreaConditioning`) is fetched once, before the prepare
-    loop, so all runs share it and the crop frame it uses matches
-    what `prepare_workflow` will use on the first iteration.
+    Both the multimask snapshot (when the graph uses
+    `MultiAreaConditioning`) and the controlnets snapshot (when it
+    uses `ControlNetsConditioning`) are fetched once, before the
+    prepare loop, so all runs share them and the crop frames they
+    use match what `prepare_workflow` will use on the first
+    iteration.
 
     Partial failures are tolerated.  A failed `prepare_workflow` or
     `POST intake` for run i is recorded in `errors` and the loop
@@ -270,6 +414,31 @@ def generate_intercepted(
             n_masks = len(multimask_snapshot.get("masks") or {})
             print(f"[comfyui] intercept: multimask snapshot "
                   f"fetched ({n_areas} area(s), {n_masks} mask(s))",
+                  flush=True)
+
+    # ---- Controlnets snapshot, fetched once before the prepare loop ----
+    controlnets_url = _get_controlnets_url_from_graph(graph)
+    controlnets_snapshot: Optional[dict] = None
+    if controlnets_url:
+        print(f"[comfyui] intercept: fetching controlnets snapshot "
+              f"from {controlnets_url}", flush=True)
+        controlnets_snapshot = _fetch_controlnets_snapshot(controlnets_url)
+        if controlnets_snapshot is None:
+            warnings_list.append(
+                f"controlnets unreachable at {controlnets_url}; "
+                f"workflow may fail at ControlNetsConditioning"
+            )
+            print(f"[comfyui] intercept: controlnets unreachable; "
+                  f"workflow's ControlNetsConditioning node may fail",
+                  flush=True)
+        else:
+            n_cn = len(
+                (controlnets_snapshot.get("state") or {})
+                .get("controlnets") or []
+            )
+            n_imgs = len(controlnets_snapshot.get("images") or {})
+            print(f"[comfyui] intercept: controlnets snapshot "
+                  f"fetched ({n_cn} entr(ies), {n_imgs} image(s))",
                   flush=True)
 
     intercepted_ids: list = []
@@ -318,6 +487,7 @@ def generate_intercepted(
                 seed=seed_i,
                 base_seed=base_seed,
                 multimask_snapshot=multimask_snapshot,
+                controlnets_snapshot=controlnets_snapshot,
                 config=config,
                 param_slots=param_slots,
                 interceptor_url=interceptor_url,
@@ -378,6 +548,12 @@ def generate_intercepted(
                 len((multimask_snapshot.get("state") or {}).get("areas") or [])
                 if multimask_snapshot else 0
             ),
+            "controlnets_url": controlnets_url,
+            "controlnets_entries": (
+                len((controlnets_snapshot.get("state") or {})
+                    .get("controlnets") or [])
+                if controlnets_snapshot else 0
+            ),
         },
     }
 
@@ -391,6 +567,7 @@ def _make_intercepted_batch(
     seed: int,
     base_seed: int,
     multimask_snapshot: Optional[dict],
+    controlnets_snapshot: Optional[dict],
     config: dict,
     param_slots: dict,
     interceptor_url: str,
@@ -401,7 +578,8 @@ def _make_intercepted_batch(
     graph (for submit), crop bounds + paste config + rotation (for
     paste), the prompt node id (for the override), the three
     `@`-resource blobs (for display in the interceptor's canvas),
-    and the multimask snapshot (for area display + prompt edits).
+    and — when present — the multimask and controlnets snapshots
+    (for display in the interceptor's panel).
     """
     # batch_id: suffix per-run index when count > 1 so ids are
     # distinct across runs of the same comfy_generate call.
@@ -450,6 +628,15 @@ def _make_intercepted_batch(
         mm_state = multimask_snapshot.get("state")
         mm_masks = multimask_snapshot.get("masks") or {}
 
+    # Controlnets snapshot fields, flattened from the optional dict.
+    cn_url = None
+    cn_state = None
+    cn_images: dict = {}
+    if controlnets_snapshot:
+        cn_url = controlnets_snapshot.get("url")
+        cn_state = controlnets_snapshot.get("state")
+        cn_images = controlnets_snapshot.get("images") or {}
+
     return InterceptedBatch(
         batch_id=batch_id,
         workflow_name=workflow_name,
@@ -470,6 +657,9 @@ def _make_intercepted_batch(
         multimask_url=mm_url,
         multimask_state=mm_state,
         multimask_masks=mm_masks,
+        controlnets_url=cn_url,
+        controlnets_state=cn_state,
+        controlnets_images=cn_images,
     )
 
 
@@ -482,10 +672,10 @@ def _post_intake(record) -> tuple:
     `(False, reason)` so the caller can accumulate it in the
     batch-level errors list.
 
-    The multimask snapshot rides as a SIBLING of `payload`, not
-    inside it — `payload` is conceptually the inpaint data, and the
-    multimask fields are a different concern the interceptor stores
-    in its own state.
+    The multimask and controlnets snapshots ride as SIBLINGS of
+    `payload`, not inside it — `payload` is conceptually the inpaint
+    data, and the two snapshot fields are a different concern the
+    interceptor stores in its own state.
     """
     url = record.interceptor_url
     body = {
@@ -508,6 +698,12 @@ def _post_intake(record) -> tuple:
             "url": record.multimask_url,
             "state": record.multimask_state,
             "masks": record.multimask_masks or {},
+        }
+    if record.controlnets_state is not None:
+        body["controlnets"] = {
+            "url": record.controlnets_url,
+            "state": record.controlnets_state,
+            "images": record.controlnets_images or {},
         }
 
     data = json.dumps(body).encode("utf-8")
@@ -699,14 +895,16 @@ class InterceptCommands(AutoDispatchHandler):
         category="comfyui",
         help_text="Resume an intercepted batch: apply the prompt "
                   "override (if any) in-place on the prepared graph, "
-                  "then submit / poll / download / paste. Returns the "
-                  "same shape as comfy_generate's success path. The "
-                  "batch record is removed from the daemon on entry — "
-                  "a second call on the same batch_id returns "
-                  "'expired or unknown'.  The interceptor is expected "
-                  "to have pushed an updated multimask state before "
-                  "calling this; the daemon does not push multimask "
-                  "state itself.",
+                  "then submit / poll / download / route-or-paste. "
+                  "Returns the same shape as comfy_generate's success "
+                  "path. The batch record is removed from the daemon "
+                  "on entry — a second call on the same batch_id "
+                  "returns 'expired or unknown'.  The interceptor is "
+                  "expected to have pushed an updated multimask state "
+                  "before calling this; the daemon does not push "
+                  "multimask state itself.  Controlnets state is NOT "
+                  "pushed back — controlnet configuration is "
+                  "workflow-authority, not per-run intent.",
         args={
             "--batch_id":         {"type": "str", "required": True,
                                    "help": "batch id from the intake "
@@ -832,6 +1030,60 @@ class InterceptCommands(AutoDispatchHandler):
                 },
             }
 
+        # ---- routing: DESTINATION (control param) first, OUTPAINT fallback ----
+        #
+        # Mirrors the routing in
+        # comfyui_generation._comfy_generate_impl.  The snapshot was
+        # captured at intake time (in _make_intercepted_batch) from
+        # config["params"], which had already been merged with the
+        # playground registry's control-param values before the
+        # intercept branch ran.  So record.params_snapshot carries
+        # the DESTINATION that was in effect at intercept, not at
+        # resume time — a change to the registry value between
+        # intercept and resume does not retroactively change which
+        # way this batch runs.  That matches "what you reviewed is
+        # what runs."
+        destination = record.params_snapshot.get("DESTINATION")
+        if destination is not None:
+            is_outpaint = (destination == "playground")
+        else:
+            is_outpaint = (
+                record.params_snapshot.get("OUTPAINT") is True
+            )
+
+        if is_outpaint:
+            # Skip paste.  The outpaint result is larger than the
+            # source canvas and pasting would either fail the layer
+            # bounds check or require resize_canvas=true.  Publish
+            # each raw output as an `outpaint_result` event instead;
+            # the outpaint playground's subscriber picks it up and
+            # displays it in the browser, where Send to Krita
+            # materializes it as a new doc on explicit user action.
+            #
+            # The Krita document is untouched — the interceptor's
+            # `result` data reports `outpaint: True` and no layer
+            # names so the UI can render "result published" instead
+            # of "pasted N layer(s)."
+            for out in downloaded:
+                _publish_outpaint_result(out, doc)
+            elapsed = time.time() - started
+            return {
+                "success": True,
+                "message": (
+                    f"Outpaint result published to playground "
+                    f"({len(downloaded)} image(s))"
+                ),
+                "data": {
+                    "batch_id": record.batch_id,
+                    "job_id": job_id,
+                    "workflow": record.workflow_name,
+                    "outpaint": True,
+                    "image_count": len(downloaded),
+                    "timing": round(elapsed, 3),
+                    "prompt_override_applied": prompt_override_applied,
+                },
+            }
+
         # ---- paste ----
         seed_suffix = (
             record.seed if record.base_seed != record.seed else None
@@ -932,6 +1184,8 @@ class InterceptCommands(AutoDispatchHandler):
                     "interceptor_url": r.interceptor_url,
                     "multimask_url":  r.multimask_url,
                     "has_multimask":  r.multimask_state is not None,
+                    "controlnets_url": r.controlnets_url,
+                    "has_controlnets": r.controlnets_state is not None,
                 }
                 for r in parent._intercepted_batches.values()
             ]

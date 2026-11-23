@@ -3,8 +3,9 @@ poll loop, Run / Discard.
 
 Run sends `comfy_resume_intercepted` to the daemon, which applies the
 prompt override, submits the prepared workflow, polls, downloads, and
-pastes.  The daemon returns the same shape as `comfy_generate`: layer
-names, timing, etc.
+either pastes into Krita or publishes the raw result to the outpaint
+playground.  The daemon returns the same shape as `comfy_generate`:
+layer names (or `outpaint: true`), timing, etc.
 
 Discard sends `comfy_discard_intercepted`, which just drops the
 pending record from the daemon's `_intercepted_batches`.
@@ -38,7 +39,33 @@ guaranteed-no-op panel sync per click for zero benefit.
 Task selection, task list refresh, and Run/Discard remain on
 `_scheduleDraw` — those changes actually touch panel state (task
 list highlight, task info text, payload / result lines, multimask
-area cards).
+area cards, controlnets list).
+
+IMAGE PRELOADING
+================
+`_selectTask` warms the browser's image cache for every blob the
+canvas or the panel will show:
+
+  · canvas, selection, context    — decoded via `getCachedImage` so
+                                    the initial `fitView()` and the
+                                    first overlay paint don't stall
+                                    on decode.
+  · multimask masks               — same `getCachedImage` path;
+                                    they're drawn as tint overlays on
+                                    `#overlayCanvas`.
+  · controlnets thumbnails        — loaded as bare `new Image()`
+                                    instances with the same data URL
+                                    the panel's `<img>` tags will use.
+                                    The `new Image()` is discarded;
+                                    the load fires the browser's URL
+                                    cache so the `<img>` tag paints
+                                    instantly when the panel renders
+                                    the row.  DOM `<img>` and
+                                    `Image()` share the decoded-image
+                                    cache for identical URLs in
+                                    practice, which is why this
+                                    works without an explicit
+                                    throwaway tag.
 
 PENDING LOCAL RUNS — SEE ALSO `pg_state.py`'s "PENDING LOCAL RUNS"
 ==================================================================
@@ -165,6 +192,23 @@ export async function _selectTask(taskId) {
     }
     fitView();
   }
+
+  // Preload controlnet thumbnails.  These are drawn by DOM <img>
+  // tags in the panel, not by the canvas, so they don't go through
+  // getCachedImage.  Fire one bare `new Image()` per b64 with the
+  // same data URL the <img> tag will use; the load warms the
+  // browser's decoded-image cache so the panel's first paint of the
+  // row doesn't flash blank.  The Image() instance is discarded.
+  if (item.controlnets && item.controlnets.images) {
+    for (const b64 of Object.values(item.controlnets.images)) {
+      if (typeof b64 !== "string" || !b64) continue;
+      try {
+        const preload = new Image();
+        preload.src = "data:image/png;base64," + b64;
+      } catch (_) {}
+    }
+  }
+
   _scheduleDraw();
 }
 

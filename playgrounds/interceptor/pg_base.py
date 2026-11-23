@@ -1,6 +1,6 @@
 """Interceptor's panel body and CSS.
 
-Sections: Tasks, Selected task, Multimask areas, Canvas.
+Sections: Tasks, Selected task, Multimask areas, Controlnets, Canvas.
 
 The Selected task section shows the workflow name, params, crop
 bounds, and (if present) warnings from the daemon, plus the prompt
@@ -15,6 +15,18 @@ area's name and dimensions, and an editable prompt textarea.  The
 edited prompts are pushed to multimask's `/state` by
 `interceptor_server.handle_run` before the daemon resumes, so
 `MultiAreaConditioning` sees exactly what the user reviewed.
+
+The Controlnets section is populated when the daemon sends a
+controlnets snapshot (i.e. the intercepted workflow uses a
+`ControlNetsConditioning` node).  It is DISPLAY-ONLY — a read-only
+list of the preprocessed images with their titles, dimensions,
+enable state, and a small thumbnail preview of each.  Unlike
+multimask, nothing here is editable and nothing is pushed back to
+the controlnets playground: controlnet chain configuration and
+enable flags live in the workflow file plus
+`/state.apply_enabled` and are treated as workflow authority, not
+per-run intent.  A user who wants to change them does so in the
+controlnets playground before intercepting.
 
 Overlay defaults
 ================
@@ -31,6 +43,12 @@ Selection and context default OFF: the canvas shows the raw
 prepared image unless the user opts in.  Multimask defaults ON when
 a snapshot is present, because seeing the area masks is the whole
 point of reviewing a multimask workflow.
+
+Controlnet thumbnails live in the panel, not on the canvas.  They
+are RGB images (depth maps, canny edges, pose skeletons), not masks
+— tint-overlay semantics do not apply.  The user gets a thumbnail
+per entry to confirm "these are the images the workflow will
+consume".
 
 CANVAS INTERACTION (hinted in the panel, implemented in
 `pg_dispatch.js`):
@@ -288,6 +306,74 @@ PG_CSS = r"""
   }
   .mmAreaPrompt:focus { border-color:#00e5ff; }
 
+  /* ---- Controlnets (display-only) ---- */
+  #controlnetsInfo {
+    font-size:10px; color:#5a6774;
+    line-height:1.5; margin-bottom:6px;
+    white-space: pre-line; overflow-wrap: anywhere;
+  }
+
+  .cnList {
+    display: flex; flex-direction: column;
+    gap: 6px; margin-top: 6px;
+    max-height: 320px; overflow-y: auto;
+  }
+  .cnList::-webkit-scrollbar { width:6px; }
+  .cnList::-webkit-scrollbar-thumb {
+    background:#1e2836; border-radius:3px;
+  }
+  .cnList .empty {
+    font-size:10px; color:#3d4756;
+    font-style:italic; padding:3px 4px;
+  }
+
+  .cnRow {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 6px;
+    border:1px solid #223040;
+    border-radius:3px;
+    background: rgba(220,230,242,0.015);
+    flex: 0 0 auto;
+  }
+  .cnRow:hover { border-color:#34445a; }
+
+  .cnThumb {
+    width: 64px; height: 64px;
+    object-fit: contain;
+    flex: 0 0 auto;
+    border-radius: 2px;
+    background: #050810;
+    border: 1px solid #223040;
+    image-rendering: auto;
+  }
+  .cnThumbEmpty {
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; color: #3d4756;
+  }
+
+  .cnInfo {
+    flex: 1 1 auto; min-width: 0;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .cnName {
+    font-size: 11px; color: #dce6f2; font-weight: 700;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .cnDims {
+    font-size: 9px; color: #5a6774;
+    font-variant-numeric: tabular-nums;
+  }
+  .cnDisabled .cnName {
+    text-decoration: line-through;
+    text-decoration-color: rgba(212, 133, 144, 0.55);
+    color: #7b8794;
+  }
+  .cnDisabledBadge {
+    font-size: 9px; color: #d48590;
+    text-transform: uppercase; letter-spacing: 0.10em;
+    font-weight: 700;
+  }
+
   /* ---- overlay layer (tints + placeholder) ----
      Created dynamically by pg_state.py.  Sits on top of #c, is
      transparent so the image shows through, and passes all pointer
@@ -335,6 +421,14 @@ PG_PANEL_BODY = r"""
       <div class="section-body">
         <div id="multimaskInfo"></div>
         <div id="multimaskList" class="mmAreaList"></div>
+      </div>
+    </details>
+
+    <details class="section" open id="controlnetsSection" style="display:none;">
+      <summary>Controlnets</summary>
+      <div class="section-body">
+        <div id="controlnetsInfo"></div>
+        <div id="controlnetsList" class="cnList"></div>
       </div>
     </details>
 

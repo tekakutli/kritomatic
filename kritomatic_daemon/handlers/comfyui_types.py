@@ -43,6 +43,12 @@ _DEFAULT_INTERCEPT_URL = "http://127.0.0.1:8775/intercept/intake"
 # Mirrors the node's own default in kritomatic_nodes/__init__.py.
 _DEFAULT_MULTIMASK_URL = "http://127.0.0.1:8776"
 
+# Default controlnets playground URL, used when a
+# `ControlNetsConditioning` node declares no `playground_url` widget
+# value (or one that is blank).  Mirrors the node's own default in
+# kritomatic_nodes/controlnets/__init__.py.
+_DEFAULT_CONTROLNETS_URL = "http://127.0.0.1:8779"
+
 
 _READ_ONLY_COMMANDS = frozenset({
     "comfy_status",
@@ -279,6 +285,35 @@ class InterceptedBatch:
     time.  The `multimask_masks` dict is display-only — the interceptor
     never pushes masks, only prompts, so multimask's originals stay
     intact and re-transformation at execution time is correct.
+
+    Controlnets snapshot
+    --------------------
+    Same shape and rationale as the multimask snapshot, for workflows
+    that consume the `controlnets` playground via a
+    `ControlNetsConditioning` node:
+
+      * `controlnets_url` — the URL the daemon used.
+      * `controlnets_state` — the `/state` response body:
+        `{"controlnets": [{id, name, image: {hash, width, height}}],
+          "apply_enabled": {title: bool}, "version": str}`.
+      * `controlnets_images` — `{hash: transformed_b64}` for every
+        controlnet entry that had an image.  These are the
+        `/controlnet_image`-transformed PNGs (rotate+crop per the
+        prepared frame at intercept time), matching the same frame as
+        `canvas_b64`.
+
+    Display-only: unlike multimask, the interceptor does NOT push any
+    state back to the controlnets playground before resume.  The
+    controlnet chain configuration (which ControlNets, strength,
+    start, end) and its enable flags live in the workflow file and in
+    `/state.apply_enabled`; the interceptor treats them as
+    read-only — what the reviewer sees is what runs.  A user who
+    wants to disable an apply node does so in the controlnets
+    playground before intercepting, not in the interceptor.
+
+    If the workflow has no `ControlNetsConditioning` node,
+    `controlnets_state` is `None` and the interceptor hides the
+    controlnets section entirely.
     """
 
     def __init__(self, *,
@@ -300,7 +335,10 @@ class InterceptedBatch:
                  interceptor_url: str,
                  multimask_url: Optional[str] = None,
                  multimask_state: Optional[dict] = None,
-                 multimask_masks: Optional[dict] = None):
+                 multimask_masks: Optional[dict] = None,
+                 controlnets_url: Optional[str] = None,
+                 controlnets_state: Optional[dict] = None,
+                 controlnets_images: Optional[dict] = None):
         self.batch_id = batch_id
         self.workflow_name = workflow_name
         now = time.time()
@@ -324,3 +362,7 @@ class InterceptedBatch:
         self.multimask_url = multimask_url
         self.multimask_state = multimask_state
         self.multimask_masks = dict(multimask_masks or {})
+        # Controlnets snapshot — see class docstring.
+        self.controlnets_url = controlnets_url
+        self.controlnets_state = controlnets_state
+        self.controlnets_images = dict(controlnets_images or {})

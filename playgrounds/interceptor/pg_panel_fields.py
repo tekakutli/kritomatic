@@ -1,5 +1,6 @@
 """Panel sync: task list, selected-task details, prompt textarea,
-multimask area cards, button enable/disable, result display.
+multimask area cards, controlnets list, button enable/disable,
+result display.
 
 `syncPanelFields` is called every frame from `draw()`.  Every DOM
 write is guarded against the current value so a steady-state frame
@@ -25,6 +26,56 @@ never interrupted.  Each card carries:
 
 The section itself is hidden when `board.multimask` is null (no
 snapshot → the workflow doesn't use multimask).
+
+CONTROLNETS LIST
+================
+Display-only.  Rebuilt when the entry-hash set or the enabled-count
+changes.  Each row carries:
+
+    · thumbnail    — 64×64 letterboxed `<img>` decoded from the
+                     snapshot's `images[hash]` b64, or a "?" placeholder
+                     if the transform was missing for that entry
+    · name         — from the snapshot's entry name (or id)
+    · dims         — image hash entry's width × height
+
+The section itself is hidden when `item.controlnets` is null (no
+snapshot → the workflow doesn't use `ControlNetsConditioning`).
+
+Per-entry "disabled" state is NOT rendered.  `state.apply_enabled`
+is keyed by `ControlNetApplyAdvanced` titles; `state.controlnets`
+entries are keyed by preprocessor titles; a preprocessor may feed
+multiple apply nodes.  From the state alone we cannot determine
+whether a given preprocessor is "disabled" (it is, only if every
+downstream apply node is off), so the info line just reports the
+overall "N/M apply node(s) enabled" count and every entry renders
+identically.  The `.cnDisabled` CSS rule exists in `pg_base.py` for a
+future feature that can express the per-entry correlation.
+
+CONTROLNETS THUMBNAIL STALENESS — FIXED
+=======================================
+The interceptor's controlnets thumbnails are DOM `<img>` elements
+whose `src` holds the transformed b64 captured at intake time.
+Prior to this fix, `_syncControlnetsSection`'s rebuild cache keyed
+on the raw preprocessed hashes plus the apply-enabled count, which
+are invariant across inpaint crop-frame rotations — rotating
+inpaint and starting a new intercepted run produces a new snapshot
+with the *same* raw hashes but *different* transformed b64 bytes,
+so the panel's cache would hit and the thumbnails would keep
+showing the previous task's transformed images.
+
+The fix prepends `board.selectedTaskId` to the rebuild signature,
+forcing a rebuild on every task switch.  A new intercepted run
+creates a new `batch_id`, so the signature always changes when the
+user clicks a new queued task; re-selecting the currently-selected
+task does not (its snapshot is frozen at intake).
+
+The same treatment was applied to `_syncMultimaskAreas` as a
+defensive consistency measure.  Its masks are canvas-drawn per frame
+from `board.multimask.masks`, so they were not affected by the same
+bug; its prompt textareas are synced in the else branch, which
+correctly overwrites on task switch.  The task id is still included
+in its signature so both sections in this file follow the same
+"task switch always rebuilds" invariant.
 
 PENDING LOCAL RUNS
 ==================
@@ -60,7 +111,7 @@ EXPIRY AND PROMPT-OVERRIDE FALLTHROUGH
 Two additional states surfaced in `_syncResult`:
 
   · **`expired`** — the daemon's 15-minute intercept timeout swept
-    the batch.  Surfaced with a `"re-intercept from the docker"`
+    the batch.  Surfaced with a `"re-intercept from the docker"` 
     action so the user knows there is a recovery path (there is no
     in-place recovery: the prepared graph has been dropped).
 
@@ -69,7 +120,16 @@ Two additional states surfaced in `_syncResult`:
     `Primitive` node titled `"prompt"`.  In that case the user's
     typed override is silently dropped by the daemon; without the
     suffix below, a successful run with a dropped override is
-    visually identical to a successful run with it applied."""
+    visually identical to a successful run with it applied.
+
+OUTPAINT
+========
+A successful resume whose `result.outpaint` is `true` indicates the
+daemon published the raw images to the outpaint playground instead of
+pasting into Krita.  The user's original document was not modified.
+The result line reads "outpaint result published" instead of "pasted
+N layer(s)"; the outpaint playground's browser tab is the place to
+view / Send to Krita."""
 
 PANEL_FIELDS_JS = r"""
 import { board, areaColorById, effectiveStatus } from "./pg_state.js";
@@ -90,6 +150,9 @@ function _get() {
     multimaskList:    document.getElementById("multimaskList"),
     showMultimaskLabel: document.getElementById("showMultimaskLabel"),
     showMultimaskCb:  document.getElementById("showMultimask"),
+    controlnetsSection: document.getElementById("controlnetsSection"),
+    controlnetsInfo:    document.getElementById("controlnetsInfo"),
+    controlnetsList:    document.getElementById("controlnetsList"),
   };
   return _els;
 }
@@ -217,6 +280,10 @@ function _syncTaskPayload(item) {
       const n = (item.multimask.state.areas || []).length;
       text += "\nmultimask: " + n + " area(s)";
     }
+    if (item.controlnets && item.controlnets.state) {
+      const n = (item.controlnets.state.controlnets || []).length;
+      text += "\ncontrolnets: " + n + " preprocessor image(s)";
+    }
   }
   if (text === _taskPayloadSig) return;
   _taskPayloadSig = text;
@@ -235,12 +302,22 @@ function _syncResult(item) {
   const eff = item ? effectiveStatus(item) : null;
   if (item && item.result) {
     const r = item.result;
-    const layers = (r.layer_names || []).join(", ") || "(none)";
     const timing = r.timing != null
       ? (r.timing.toFixed ? r.timing.toFixed(2) : r.timing) + "s"
       : "?";
-    text = "pasted " + (r.output_count || 0) + " layer(s) in " + timing
-         + "\n" + layers;
+    if (r.outpaint) {
+      // Outpaint workflow: the daemon published the raw result to
+      // the outpaint playground instead of pasting into Krita.  The
+      // user's original document was not modified.  They can view
+      // the result and Send to Krita from the outpaint playground's
+      // browser tab.
+      text = "outpaint result published in " + timing
+           + "\ncheck the outpaint playground tab";
+    } else {
+      const layers = (r.layer_names || []).join(", ") || "(none)";
+      text = "pasted " + (r.output_count || 0) + " layer(s) in " + timing
+           + "\n" + layers;
+    }
     // If the daemon reports the override wasn't applied (no
     // workflow 'prompt' Primitive slot exists), tell the user.
     // Without this, a successful run with a dropped override looks
@@ -359,8 +436,20 @@ function _syncMultimaskAreas(item) {
     e.multimaskInfo.className = "";
   }
 
-  // Rebuild only when the set of area ids changes.
-  const idsSig = areas.map(a => a.id).join("|");
+  // Task id in the signature: the mask PNGs are drawn fresh every
+  // frame (board.selectedItem.multimask.masks), so the mask visuals
+  // are not cached in DOM — but the prompt textareas are, and the
+  // "what to display per card" defaults come from per-task state
+  // (board.areaPromptOverrides[tid] and this snapshot's
+  // area.prompt).  The else branch below *does* correctly overwrite
+  // the textarea on a task switch with matching ids, so this is
+  // defensive rather than a fix for a live bug — included so that a
+  // task switch always rebuilds, matching _syncControlnetsSection's
+  // behavior and preventing any future DOM state that would survive
+  // a task switch unnoticed.  See the module docstring,
+  // CONTROLNETS THUMBNAIL STALENESS — FIXED.
+  const idsSig = (board.selectedTaskId || "") + "||"
+               + areas.map(a => a.id).join("|");
   if (idsSig !== _mmAreasSig) {
     _mmAreasSig = idsSig;
     e.multimaskList.innerHTML = "";
@@ -402,6 +491,130 @@ function _syncMultimaskAreas(item) {
   }
 }
 
+/* ============================================================
+   Controlnets list (display-only)
+   ============================================================ */
+
+let _cnSig = null;
+
+function _makeCnRow(entry, images) {
+  const row = document.createElement("div");
+  row.className = "cnRow";
+
+  const imgMeta = entry.image || {};
+  const hash = imgMeta.hash;
+  const b64 = hash ? images[hash] : null;
+
+  if (b64) {
+    const thumb = document.createElement("img");
+    thumb.className = "cnThumb";
+    thumb.src = "data:image/png;base64," + b64;
+    thumb.alt = entry.name || entry.id || "controlnet";
+    row.appendChild(thumb);
+  } else {
+    // The transform was missing for this entry (controlnets
+    // unreachable at snapshot time, or that entry had no image when
+    // the daemon fetched).  Show a placeholder so the row is still
+    // legible.
+    const placeholder = document.createElement("div");
+    placeholder.className = "cnThumb cnThumbEmpty";
+    placeholder.textContent = "?";
+    placeholder.title = "image not captured at intercept";
+    row.appendChild(placeholder);
+  }
+
+  const info = document.createElement("div");
+  info.className = "cnInfo";
+
+  const name = document.createElement("span");
+  name.className = "cnName";
+  name.textContent = entry.name || entry.id || "(unnamed)";
+  name.title = name.textContent;
+  info.appendChild(name);
+
+  const dims = document.createElement("span");
+  dims.className = "cnDims";
+  dims.textContent = (imgMeta.width || 0) + "\u00d7" + (imgMeta.height || 0);
+  info.appendChild(dims);
+
+  row.appendChild(info);
+  return row;
+}
+
+function _syncControlnetsSection(item) {
+  const e = _get();
+  if (!e.controlnetsSection) return;
+
+  const cn = item && item.controlnets;
+  if (!cn || !cn.state || !Array.isArray(cn.state.controlnets)) {
+    e.controlnetsSection.style.display = "none";
+    _cnSig = null;
+    return;
+  }
+  e.controlnetsSection.style.display = "";
+
+  const entries       = cn.state.controlnets;
+  const images        = cn.images || {};
+  const applyEnabled  = cn.state.apply_enabled || {};
+  const nApplyOn      = Object.values(applyEnabled)
+                          .filter(v => v !== false).length;
+  const nApplyTotal   = Object.keys(applyEnabled).length;
+  const nImgs         = Object.keys(images).length;
+
+  // Info line.  "N/M apply node(s) enabled" is honest about overall
+  // state without per-entry correlation (which the snapshot cannot
+  // provide — apply_enabled is keyed by ControlNetApplyAdvanced
+  // titles, controlnets is keyed by preprocessor titles, and the
+  // mapping between them lives in the workflow file only).  See
+  // the module docstring, CONTROLNETS LIST.
+  let infoText = "source: " + (cn.url || "?") + "\n"
+               + entries.length + " preprocessor image(s), "
+               + nImgs + " drawn";
+  if (nApplyTotal > 0) {
+    infoText += "\n" + nApplyOn + "/" + nApplyTotal
+              + " apply node(s) enabled";
+  }
+  if (e.controlnetsInfo && e.controlnetsInfo.textContent !== infoText) {
+    e.controlnetsInfo.textContent = infoText;
+  }
+
+  // Task id in the signature: raw image hashes do NOT change when
+  // inpaint's crop frame rotates — only the transformed b64 behind
+  // /controlnet_image does (see controlnets_server.py's CROP-FRAME
+  // TRANSFORM).  Two intercepted tasks that share raw hashes but
+  // were captured at different crop frames therefore produce the
+  // same `entrySig` without the task id, and the panel would keep
+  // showing the previous task's thumbnails (their `<img>` `src`
+  // holds the OLD transformed b64; nothing forces a rebuild).  The
+  // task id forces a rebuild on every task switch — a new
+  // intercepted run creates a new batch_id, so the signature always
+  // changes when the user clicks a new queued task; re-selecting
+  // the currently-selected task does not (its snapshot is frozen at
+  // intake).  See the module docstring,
+  // CONTROLNETS THUMBNAIL STALENESS — FIXED.
+  const entrySig = (board.selectedTaskId || "") + "||"
+                 + entries.map(c => (c.image || {}).hash || "").join("|")
+                 + "||" + nApplyOn + "/" + nApplyTotal
+                 + "||" + nImgs;
+  if (entrySig === _cnSig) return;
+  _cnSig = entrySig;
+
+  e.controlnetsList.innerHTML = "";
+  if (entries.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent =
+      "no preprocessed images yet \u2014 click Preprocess in the "
+      + "controlnets playground";
+    e.controlnetsList.appendChild(empty);
+    return;
+  }
+
+  for (const entry of entries) {
+    e.controlnetsList.appendChild(_makeCnRow(entry, images));
+  }
+}
+
 export function syncPanelFields() {
   const e = _get();
   const summary = board.tasks[board.selectedTaskId];
@@ -412,6 +625,7 @@ export function syncPanelFields() {
   _syncTaskPayload(item);
   _syncResult(item);
   _syncMultimaskAreas(item);
+  _syncControlnetsSection(item);
 
   // Hide the multimask overlay toggle when there is no snapshot.
   if (!(item && item.multimask)) {

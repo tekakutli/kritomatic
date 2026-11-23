@@ -6,7 +6,8 @@ Called once at startup (retry loop, ~30s budget), once at shutdown
 Wire commands:
 
     playground_register    { id, name, url, port,
-                             layer_slots: [...], param_slots: [...] }
+                             layer_slots: [...], param_slots: [...],
+                             control_params: [...] }
     playground_unregister  { id }
 
 Wire format: the daemon's socket server returns
@@ -26,6 +27,12 @@ parameters disappear from the docker's Parameters section, and at
 generation time the daemon queries the playground's `/params` route
 for current values.  See `kritomatic_daemon/handlers/playgrounds.py`'s
 PARAM SLOTS.
+
+Additionally, a playground may declare one or more **control params**
+— daemon-owned routing hints (e.g. `DESTINATION`) that live in the
+registry and are edited from the docker.  Control params are
+singletons: at most one playground may claim each name.  See
+`kritomatic_daemon/handlers/playgrounds.py`'s CONTROL PARAMS.
 """
 
 from __future__ import annotations
@@ -84,15 +91,17 @@ def _build_register_cmd(
     playground_id: str, name: str, url: str, port: int,
     layer_slots,
     param_slots,
+    control_params,
 ) -> dict:
     cmd = {
-        "type":        "playground_register",
-        "id":          playground_id,
-        "name":        name,
-        "url":         url,
-        "port":        int(port),
-        "layer_slots": list(layer_slots or []),
-        "param_slots": list(param_slots or []),
+        "type":           "playground_register",
+        "id":             playground_id,
+        "name":           name,
+        "url":            url,
+        "port":           int(port),
+        "layer_slots":    list(layer_slots or []),
+        "param_slots":    list(param_slots or []),
+        "control_params": list(control_params or []),
     }
     return cmd
 
@@ -104,15 +113,21 @@ def register(
     port: int,
     layer_slots=None,
     param_slots=None,
+    control_params=None,
     retry_s: float = 30.0,
 ) -> bool:
     """Register with the daemon, retrying up to `retry_s`.
 
     Returns True on success.  A playground that fails to register
     still works — it just doesn't appear in the docker.
+
+    `control_params` (if provided) must be a list of dicts with
+    `{name, type, options?, default}`.  See
+    `kritomatic_daemon/handlers/playgrounds.py`'s CONTROL PARAMS.
     """
     cmd = _build_register_cmd(
-        playground_id, name, url, port, layer_slots, param_slots,
+        playground_id, name, url, port,
+        layer_slots, param_slots, control_params,
     )
     deadline = time.monotonic() + retry_s
     last_msg = "unknown error"
@@ -138,13 +153,15 @@ def reregister_once(
     playground_id: str, name: str, url: str, port: int,
     layer_slots=None,
     param_slots=None,
+    control_params=None,
 ) -> bool:
     """Single-attempt registration.  Used by the browser self-heal path.
 
     Never retries, never sleeps.
     """
     cmd = _build_register_cmd(
-        playground_id, name, url, port, layer_slots, param_slots,
+        playground_id, name, url, port,
+        layer_slots, param_slots, control_params,
     )
     resp = _send(cmd, timeout=2.0)
     return _response_is_success(resp)

@@ -52,13 +52,60 @@ false value in `apply_enabled`.  Preprocessor entries in
 `controlnets` are NEVER filtered — both DEPTH and DEPTH FULL need the
 same Zoe-preprocessed image, and dropping the preprocessor because
 one of its downstream applies is disabled would break the other.
+
+CROP-FRAME TRANSFORM
+====================
+When the inpaint playground is running, the daemon rotates and crops
+`@thecanvas`, `@theselection`, and `@thecontext` before submitting to
+ComfyUI.  A controlnet hint must undergo the same rotate+crop so it
+lands in the same frame as the latent the sampler denoises — exactly
+the alignment problem multimask solves for its area masks, applied
+here to the preprocessed controlnet images.
+
+Mechanism (`/controlnet_image` only):
+
+  1. Query inpaint's `/crop_frame` (cached for 1 s).
+  2. If the frame is non-null: resize the stored image to the frame's
+     W × H (controlnet hints are often preprocessed at
+     `@thecontrolnet`'s dimensions, which may differ from
+     `@thecanvas`), rotate by `-theta` with an expand canvas and
+     transparent padding, then crop to (cropX, cropY, cropW, cropH).
+  3. If the frame is null (inpaint down, `/crop_frame` unreachable,
+     or malformed): serve the stored bytes unchanged — same fallback
+     as multimask.
+
+Cache: keyed by `(hash, frame_signature)` where the signature
+includes W, H in addition to theta and the crop rect.  Multimask's
+signature omits W, H (its masks are drawn at `@thecanvas` dims so
+cropW/cropH track W/H); controlnet hints are commonly a different
+size, so W, H are part of the key here.
+
+The transform runs at `/controlnet_image` fetch time, not at
+`/preprocess` or `/krita/refresh_controlnets` time.  This has two
+consequences:
+
+  · A crop-frame change (rotation, doc resize) invalidates the
+    transform for every stored hash on the next fetch — no re-push
+    required, no re-preprocess required.  The reviewer opening the
+    interceptor sees the transform that matches the frame in effect
+    at intake.
+
+  · Krita round-trip edits survive.  Pushing the untransformed
+    images, editing them in the scratch doc, and refreshing brings
+    the edited bytes back into `_preprocessed`; `/controlnet_image`
+    then applies the transform to the edited bytes.  If we
+    transformed at push time, the user would be editing a
+    rotate-cropped image, which is not what they asked to edit.
 """
 
 import base64
 import hashlib
 import json
+import os
 import threading
 import time
+import urllib.error
+import urllib.request
 from io import BytesIO
 from pathlib import Path
 
@@ -94,8 +141,168 @@ _preprocessed       = {}
 _PREPROCESSED_MAX   = 64
 
 
+# Inpaint playground URL — used for /crop_frame lookups.  Same
+# default as multimask; the inpaint playground binds 8774 in both
+# playgrounds' shared conventions.
+INPAINT_URL = os.environ.get(
+    "CONTROLNETS_INPAINT_URL", "http://127.0.0.1:8774",
+).rstrip("/")
+
+
+# Crop-frame cache — one /crop_frame query per second at most, so a
+# burst of /controlnet_image calls for N preprocessors still costs
+# one inpaint round-trip.
+_crop_frame_lock = threading.Lock()
+_crop_frame_cache = {"frame": None, "at": 0.0}
+CROP_FRAME_TTL = 1.0
+
+
+# Controlnet-image transform cache — keyed by (hash, frame signature).
+# Raw bytes stay in `_preprocessed`; this cache holds the transformed
+# output.  Bounded like `_PREPROCESSED_MAX`.
+_controlnet_image_transform_lock = threading.Lock()
+_controlnet_image_transform_cache: dict = {}
+_CONTROLNET_IMAGE_TRANSFORM_CACHE_MAX = 64
+
+
 def _log(msg):
     print(f"[controlnets] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+#  Crop-frame fetch + controlnet-image transform
+# ---------------------------------------------------------------------------
+
+def _fetch_crop_frame_uncached():
+    try:
+        req = urllib.request.Request(
+            INPAINT_URL + "/crop_frame",
+            data=b"{}", method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=0.5) as r:
+            data = json.loads(r.read())
+        if not isinstance(data, dict) or not data.get("success"):
+            return None
+        return data.get("frame")
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def _fetch_crop_frame_cached():
+    with _crop_frame_lock:
+        now = time.monotonic()
+        if now - _crop_frame_cache["at"] < CROP_FRAME_TTL:
+            return _crop_frame_cache["frame"]
+    frame = _fetch_crop_frame_uncached()
+    with _crop_frame_lock:
+        _crop_frame_cache["frame"] = frame
+        _crop_frame_cache["at"] = time.monotonic()
+    return frame
+
+
+def _frame_signature(frame):
+    """Hashable key for a crop frame.
+
+    Includes W, H in addition to theta/crop — multimask's signature
+    omits W, H and relies on cropW/cropH tracking W/H in practice;
+    controlnet images routinely arrive at a different size from
+    @thecanvas (e.g. @thecontrolnet at 512, @thecanvas at 1024), so
+    the W, H resize step is a real transform here and a change to
+    W or H without a change to theta/crop must invalidate the cache.
+    """
+    if frame is None:
+        return None
+    return (
+        round(float(frame.get("theta", 0.0)) % 360.0, 3),
+        int(frame.get("W", 0)),
+        int(frame.get("H", 0)),
+        int(frame.get("cropX", 0)),
+        int(frame.get("cropY", 0)),
+        int(frame.get("cropW", 0)),
+        int(frame.get("cropH", 0)),
+    )
+
+
+def _transform_controlnet_b64(b64, stored_w, stored_h, frame):
+    """Apply the inpaint crop-frame transform to a preprocessed image.
+
+    Mirror of multimask's `_transform_mask_b64`, adapted for RGBA
+    color images instead of `L`-mode masks:
+
+      · resize to frame's W × H if the stored image differs (common:
+        @thecontrolnet preprocessed at 512, @thecanvas at 1024);
+      · un-rotate by -theta with an expand canvas (bicubic, transparent
+        outside the rotated diamond);
+      · crop to the frame's (cropX, cropY, cropW, cropH).
+
+    Returns `(transformed_b64, width, height)`.  When the frame is
+    None (inpaint down, /crop_frame unreachable, or malformed) the
+    stored bytes are returned unchanged with their stored dims — same
+    fallback as multimask, so the node and the interceptor see the
+    stored image exactly as before this change.
+    """
+    if frame is None:
+        return b64, stored_w, stored_h
+
+    theta = float(frame.get("theta", 0.0)) % 360.0
+    W = int(frame.get("W", 0))
+    H = int(frame.get("H", 0))
+    cropX = int(frame.get("cropX", 0))
+    cropY = int(frame.get("cropY", 0))
+    cropW = int(frame.get("cropW", 0))
+    cropH = int(frame.get("cropH", 0))
+
+    if cropW <= 0 or cropH <= 0:
+        return b64, stored_w, stored_h
+
+    try:
+        raw = base64.b64decode(b64)
+        img = Image.open(BytesIO(raw)).convert("RGBA")
+    except Exception as e:
+        _log(f"controlnet_image decode failed: {e}")
+        return b64, stored_w, stored_h
+
+    if W > 0 and H > 0 and img.size != (W, H):
+        img = img.resize((W, H), Image.LANCZOS)
+
+    if theta != 0:
+        img = img.rotate(
+            -theta, expand=True,
+            resample=Image.BICUBIC, fillcolor=(0, 0, 0, 0),
+        )
+
+    img = img.crop((cropX, cropY, cropX + cropW, cropY + cropH))
+
+    buf = BytesIO()
+    img.save(buf, "PNG")
+    new_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return new_b64, img.width, img.height
+
+
+def _transform_controlnet_cached(h, b64, stored_w, stored_h):
+    frame = _fetch_crop_frame_cached()
+    sig = _frame_signature(frame)
+    if sig is None:
+        return b64, stored_w, stored_h
+
+    key = (h, sig)
+    with _controlnet_image_transform_lock:
+        cached = _controlnet_image_transform_cache.get(key)
+        if cached is not None:
+            return cached
+
+    transformed = _transform_controlnet_b64(
+        b64, stored_w, stored_h, frame,
+    )
+
+    with _controlnet_image_transform_lock:
+        if (len(_controlnet_image_transform_cache)
+                >= _CONTROLNET_IMAGE_TRANSFORM_CACHE_MAX):
+            oldest = next(iter(_controlnet_image_transform_cache))
+            _controlnet_image_transform_cache.pop(oldest, None)
+        _controlnet_image_transform_cache[key] = transformed
+
+    return transformed
 
 
 # ---------------------------------------------------------------------------
@@ -400,13 +607,17 @@ def handle_controlnet_image(payload):
         entry = _preprocessed.get(h)
     if not entry:
         return {"success": False, "message": f"unknown hash {h!r}"}
-    b64 = base64.b64encode(entry["png_bytes"]).decode("ascii")
+
+    raw_b64 = base64.b64encode(entry["png_bytes"]).decode("ascii")
+    out_b64, out_w, out_h = _transform_controlnet_cached(
+        h, raw_b64, entry["width"], entry["height"],
+    )
     return {
         "success": True,
         "hash":    h,
-        "b64":     b64,
-        "width":   entry["width"],
-        "height":  entry["height"],
+        "b64":     out_b64,
+        "width":   out_w,
+        "height":  out_h,
     }
 
 

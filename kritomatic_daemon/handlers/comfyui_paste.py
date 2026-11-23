@@ -453,6 +453,55 @@ def paste_result(
     }
 
 
+def _publish_outpaint_result(out: dict, doc) -> None:
+    """Publish one raw outpaint result as an `outpaint_result` event.
+
+    Moved here from `comfyui_generation.py` so the intercept-resume
+    path (`comfyui_intercept.py`) can call it without a circular
+    import.  Called from both the normal path (when
+    `DESTINATION=playground`) and from `comfy_resume_intercepted`
+    when the intercepted workflow had `DESTINATION=playground` at
+    intake time.
+
+    The event type is `outpaint_result`, distinct from `paste_applied`,
+    so the inpaint playground's subscriber never receives outpaint
+    outputs (they are far larger than the canvas and would corrupt
+    its optimistic composite).  Payload shape matches `paste_applied`
+    with `paste_x`/`paste_y` set to 0 and an `"outpaint": True`
+    marker.
+
+    Best-effort.  A failure logs one line and continues.
+    """
+    try:
+        png = out.get("png_bytes") or b""
+        if not png:
+            return
+        try:
+            w, h = _png_dimensions(png)
+        except Exception as e:
+            print(f"[comfyui] outpaint_result: _png_dimensions "
+                  f"failed: {e}", flush=True)
+            return
+        h_hex = hashlib.sha256(png).hexdigest()[:16]
+        b64 = base64.b64encode(png).decode("ascii")
+        from ..server.event_bus import get_event_bus
+        get_event_bus().publish("outpaint_result", {
+            "doc_name": doc.name() if doc else "",
+            "hash":     h_hex,
+            "b64":      b64,
+            "paste_x":  0,
+            "paste_y":  0,
+            "width":    int(w),
+            "height":   int(h),
+            "outpaint": True,
+        })
+        print(f"[comfyui] outpaint_result published: "
+              f"{w}x{h} hash={h_hex}", flush=True)
+    except Exception as e:
+        print(f"[comfyui] outpaint_result publish failed: {e}",
+              flush=True)
+
+
 # ---------------------------------------------------------------------------
 #  History
 # ---------------------------------------------------------------------------

@@ -90,6 +90,19 @@ docker side has to know or care: the values are simply absent from
 `comfy_apply_config` payloads because there's no widget to collect
 them from.
 
+Playground-claimed control params
+=================================
+`control_params` are a third claimant kind, parallel to
+`param_slots`.  They are pipeline-routing hints (e.g. `DESTINATION`)
+owned by the daemon's registry, edited from the docker's Playground
+Input section, and never substituted into the graph.  They still
+need to be hidden from the Parameters section, because a workflow
+might happen to declare a graph primitive of the same name and the
+playground's value would silently override it at generation time.
+`_claimed_param_names` folds `control_params` into the same set it
+builds from `param_slots`, so both kinds disappear from Parameters
+under the same rule.
+
 Layer alias kind hints
 ======================
 Each resource slot has a `kind` from `comfyui_inspect`'s resource
@@ -409,10 +422,21 @@ def _claimed_resource_names(playgrounds: list) -> set:
 def _claimed_param_names(playgrounds: list) -> set:
     """Return every parameter name claimed by any registered playground.
 
-    Walks each registration's `param_slots` (flat list of names).
-    Claimed params disappear from the Parameters section, and if every
-    workflow param is claimed the section is suppressed entirely.
-    See the module docstring, "Playground-claimed parameters".
+    Walks each registration's `param_slots` (flat list of names) **and
+    `control_params` (list of `{name, ...}` dicts)**.  Claimed names
+    disappear from the Parameters section, and if every workflow
+    param is claimed the section is suppressed entirely.
+
+    Folding `control_params` in here is what keeps a graph Primitive
+    that happens to share a control-param name (e.g. a workflow that
+    declares its own `DESTINATION` primitive) from being shown in
+    Parameters while the daemon's registry silently overrides its
+    value at generation time.  The daemon's registry is the sole
+    source of truth for a control param; the workflow primitive, if
+    one exists, must not be user-editable.
+
+    See the module docstring, "Playground-claimed parameters" and
+    "Playground-claimed control params".
     """
     out: set = set()
     for p in playgrounds or ():
@@ -421,6 +445,11 @@ def _claimed_param_names(playgrounds: list) -> set:
         for name in (p.get("param_slots") or ()):
             if isinstance(name, str) and name:
                 out.add(name)
+        for cp in (p.get("control_params") or ()):
+            if isinstance(cp, dict):
+                name = cp.get("name")
+                if isinstance(name, str) and name:
+                    out.add(name)
     return out
 
 

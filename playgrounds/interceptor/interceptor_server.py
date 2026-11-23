@@ -72,8 +72,8 @@ daemon's own sweep current within the interceptor's 2-second cadence
 
 Payload shape
 =============
-The daemon sends one `payload` dict per task plus an OPTIONAL
-`multimask` sibling:
+The daemon sends one `payload` dict per task plus OPTIONAL
+`multimask` and `controlnets` siblings:
 
     {
       "payload": {
@@ -100,6 +100,20 @@ The daemon sends one `payload` dict per task plus an OPTIONAL
         },
         "masks": {<hash>: <b64>},   # transformed PNG per area
       },
+      "controlnets": {              # omitted when workflow has no
+                                    # ControlNetsConditioning node
+        "url": "<controlnets base url>",
+        "state": {
+          "controlnets": [
+            {"id": str, "name": str,
+             "image": {"hash": str, "width": int, "height": int}},
+            ...
+          ],
+          "apply_enabled": {<apply_title>: bool},
+          "version":       str,
+        },
+        "images": {<hash>: <b64>},  # transformed PNG per entry
+      },
     }
 
 `canvas_b64` is what the model sees as input (rotated + cropped for
@@ -107,10 +121,10 @@ theta≠0, raw when the inpaint playground was not running at prepare
 time).  `selection_b64` and `context_b64` are the two masks the
 workflow will consume.
 
-`multimask.masks` are the SAME frame as `canvas_b64` — the daemon
-fetched them via multimask's `/mask`, which auto-transforms to the
-prepared crop.  Overlaying them on `canvas_b64` at 1:1 is therefore
-aligned.
+`multimask.masks` and `controlnets.images` are in the SAME frame as
+`canvas_b64` — the daemon fetched them via the respective
+playground's per-hash route, which auto-transforms to the prepared
+crop.  Overlaying them on `canvas_b64` at 1:1 is aligned.
 
 Multimask push-on-run
 =====================
@@ -135,6 +149,22 @@ If step 2 fails (multimask unreachable, `/state` rejected), the run
 aborts before the daemon is called.  The local task flips to `error`
 so the user can retry.  This is safer than submitting a run whose
 multimask state disagrees with what was displayed.
+
+Controlnets — DISPLAY ONLY
+==========================
+Unlike multimask, the controlnets snapshot is **read-only**.  The
+interceptor does NOT push any state back to the controlnets
+playground before resume: controlnet chain configuration (which
+ControlNets, strength, start, end) and enable flags live in the
+workflow file plus `/state.apply_enabled`, and are treated as
+workflow authority, not per-run intent.  A user who wants to change
+them does so in the controlnets playground before intercepting.
+
+The `controlnets` sibling is stored on intake and returned as part of
+`/intercept/item`, so the panel can display the list of preprocessed
+images with their titles, dimensions, and thumbnail previews.  This
+is the "what will the workflow consume" review that makes intercept
+mode useful for controlnet workflows.
 
 Timeouts
 ========
@@ -235,6 +265,12 @@ def handle_intake(payload):
     transformed mask b64s per area.  Stored as-is so `/intercept/item`
     can return it to the browser and `/intercept/run` can push edited
     prompts back to `<url>/state`.
+
+    The `controlnets` sibling (when present) carries the same shape
+    for controlnet workflows: URL, state metadata, and transformed
+    image b64s per entry.  Stored as-is so `/intercept/item` can
+    return it to the browser.  Unlike multimask, no push-back happens
+    on Run — controlnet config is workflow authority.
     """
     payload = payload or {}
     task_id = payload.get("task_id")
@@ -263,6 +299,25 @@ def handle_intake(payload):
                 if isinstance(k, str) and isinstance(v, str)
             }
 
+    # Optional controlnets snapshot, sent as a sibling of `payload`.
+    cn = payload.get("controlnets")
+    cn_url = None
+    cn_state = None
+    cn_images: dict = {}
+    if isinstance(cn, dict):
+        url = cn.get("url")
+        if isinstance(url, str) and url.strip():
+            cn_url = url.strip()
+        state = cn.get("state")
+        if isinstance(state, dict):
+            cn_state = state
+        images = cn.get("images")
+        if isinstance(images, dict):
+            cn_images = {
+                k: v for k, v in images.items()
+                if isinstance(k, str) and isinstance(v, str)
+            }
+
     with _LOCK:
         if task_id in _TASKS:
             return {
@@ -288,13 +343,18 @@ def handle_intake(payload):
             "multimask_url":   mm_url,
             "multimask_state": mm_state,
             "multimask_masks": mm_masks,
+            "controlnets_url":   cn_url,
+            "controlnets_state": cn_state,
+            "controlnets_images": cn_images,
             "result":  None,
             "message": "",
         }
     _gc()
     _log(f"intake {task_id[:8]} from {source_label!r}"
          + (f" (multimask: {len((mm_state or {}).get('areas') or [])} area(s))"
-            if mm_state is not None else ""))
+            if mm_state is not None else "")
+         + (f" (controlnets: {len((cn_state or {}).get('controlnets') or [])} entr(ies))"
+            if cn_state is not None else ""))
     return {"success": True, "task_id": task_id}
 
 
@@ -365,6 +425,7 @@ def handle_list(_payload):
                 "status":        t["status"],
                 "has_result":    t["result"] is not None,
                 "has_multimask": t.get("multimask_state") is not None,
+                "has_controlnets": t.get("controlnets_state") is not None,
             }
             for t in sorted(_TASKS.values(),
                             key=lambda x: -x["received_at"])
@@ -396,6 +457,16 @@ def handle_item(payload):
             }
         else:
             item["multimask"] = None
+        # Controlnets snapshot, same pattern.  Display-only —
+        # interceptor never pushes state back to controlnets.
+        if t.get("controlnets_state") is not None:
+            item["controlnets"] = {
+                "url":    t.get("controlnets_url"),
+                "state":  t.get("controlnets_state"),
+                "images": t.get("controlnets_images") or {},
+            }
+        else:
+            item["controlnets"] = None
         return {"success": True, "task": item}
 
 
@@ -421,6 +492,10 @@ def handle_run(payload):
     The updated state is always pushed (even with no edits) so that
     drift between intake and Run does not silently override the
     reviewer's intent.
+
+    Controlnets state is NOT pushed anywhere — the snapshot is
+    display-only (see the module docstring, "Controlnets — DISPLAY
+    ONLY").
 
     The `expired` status is rejected here just like `done` and
     `error`: the daemon has already dropped the batch, so calling
@@ -537,8 +612,9 @@ def handle_discard(payload):
 
     Idempotent from the daemon's perspective: it returns
     `{success: true}` even if the record was already gone, so this
-    handler can always call it without checking.  No multimask
-    interaction — discard means "do not run", so no state is pushed.
+    handler can always call it without checking.  No multimask or
+    controlnets interaction — discard means "do not run", so no state
+    is pushed.
     """
     task_id = (payload or {}).get("task_id")
     with _LOCK:

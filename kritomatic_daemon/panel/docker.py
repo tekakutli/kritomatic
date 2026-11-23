@@ -67,22 +67,37 @@ The run log prefixes every line with a short suffix of the run's
 request id so concurrent runs' progress entries remain distinguishable
 in the shared log widget.
 
-Playground input section (registry-driven, slot-based)
-======================================================
+Playground input section (registry-driven, slot-based + control params)
+=======================================================================
 Live-running playgrounds register with the daemon; each registration
 carries a list of **layer slots** — each an `@`-prefixed identifier
-with its own `{source, layer_name}` selector.  See
-`handlers/playgrounds.py` for the wire shape.  The docker renders one
-row per (playground, slot), in a QGroupBox pinned between the
-scrollable form and the pinned action row:
+with its own `{source, layer_name}` selector — and, optionally, a
+list of **control params** — daemon-owned routing hints like
+`DESTINATION`.  See `handlers/playgrounds.py` for the wire shape.
+
+The docker renders one row per (playground, slot), in a QGroupBox
+pinned between the scrollable form and the pinned action row:
 
     Layout Editor   @thelayout   [source▼] [layer_name]
 
 The slot's `@`-prefixed id IS the display name — no separate label
 field, no friendly-name indirection.  Resource-name style, same as
 `@thecanvas` for resources.  For multi-slot playgrounds, the
-playground's name appears only on its first slot's row; subsequent
-slots indent under it.  Slots are addressed independently.
+playground's name appears only on its first row; subsequent rows
+indent under it.
+
+Control params get their own rows, rendered after the slots for the
+same playground, following the same name-on-first-row rule:
+
+    Outpaint        @thecanvas       [active▼] [thecanvas___]
+                    DESTINATION      [playground▼]
+
+The control param's name is the label; its widget type comes from
+the spec (`select`, `toggle`, `text`, `number`, `integer`).  Editing
+fires `playground_set_control_param` on the daemon, which updates
+the registry entry; a state push then confirms the value.  Slots
+marked `managed_by_playground: True` are skipped entirely — the
+playground drives them internally with no user-facing state.
 
 The layer picker is a `_LayerComboBox` — the same widget class the
 resources section's alias fields use — so the completer behaviour
@@ -203,7 +218,7 @@ import uuid
 from PyQt6.QtCore import Qt, QSettings, QTimer
 from PyQt6.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
-    QPlainTextEdit, QFrame, QComboBox, QGroupBox,
+    QPlainTextEdit, QFrame, QComboBox, QGroupBox, QCheckBox, QLineEdit,
 )
 
 from .connection import DaemonConnection
@@ -234,10 +249,13 @@ class KritomaticPanel(QDockWidget):
         self._active_batches_count = 0
         self._workflow_loaded = False
 
-        # Playground input rows.  Keyed by `(playground_id, slot_id)`;
-        # values are the per-row widget record.  See the module
+        # Playground input rows.  `_playground_rows` tracks per-slot
+        # rows keyed by `(playground_id, slot_id)`; `_playground_control_rows`
+        # tracks per-control-param rows keyed by `(playground_id, name)`.
+        # Both are populated by `_update_playgrounds`.  See the module
         # docstring, "Playground input section".
         self._playground_rows: dict[tuple, dict] = {}
+        self._playground_control_rows: dict[tuple, dict] = {}
         # Cache of the most recent `layersFetched` payload.  Used by
         # `_update_playgrounds` to populate newly-added rows and by
         # `_maybe_auto_select_layer`.
@@ -613,18 +631,27 @@ class KritomaticPanel(QDockWidget):
     def _update_playgrounds(self, playgrounds: list) -> None:
         """Diff the daemon's playground registry against current rows.
 
-        Each (playground, slot) pair gets its own row; the playground's
-        name is shown only on its first slot's row.
+        Two independent row families are rendered: one row per
+        (playground, layer_slot) pair, and one row per
+        (playground, control_param) pair.  Layer slots show the
+        playground's name on the first row of the group; control
+        params follow the same rule, continuing under the same
+        playground's name.
 
-        Slots marked `managed_by_playground: True` are skipped entirely
-        — they are claimed by the playground so the daemon can filter
-        the corresponding resource out of its Resources section, but
-        the playground drives them internally and has no UI state to
-        expose.  See `handlers/panel.py`'s `ResourcesProvider` and
-        `inpaint_playground.py`'s `LAYER_SLOTS` for the current
-        claimants.
+        Slots marked `managed_by_playground: True` are skipped
+        entirely — they are claimed by the playground so the daemon
+        can filter the corresponding resource out of its Resources
+        section, but the playground drives them internally and has
+        no UI state to expose.  See `handlers/panel.py`'s
+        `ResourcesProvider` and `inpaint_playground.py`'s
+        `LAYER_SLOTS` for the current claimants.
+
+        Control params are always rendered — a playground that
+        registers one wants it visible.
         """
-        desired_keys: set = set()
+        # ---- Pass 1: build the desired key sets. ----
+        desired_slot_keys: set = set()
+        desired_ctrl_keys: set = set()
         for p in playgrounds:
             if not isinstance(p, dict):
                 continue
@@ -639,25 +666,38 @@ class KritomaticPanel(QDockWidget):
                     continue
                 if slot.get("managed_by_playground", False):
                     continue
-                desired_keys.add((pid, sid))
+                desired_slot_keys.add((pid, sid))
+            for cp in (p.get("control_params") or []):
+                if not isinstance(cp, dict):
+                    continue
+                name = cp.get("name")
+                if not name:
+                    continue
+                desired_ctrl_keys.add((pid, name))
 
-        # Remove vanished rows.
+        # ---- Pass 2: remove vanished slot rows. ----
         for key in list(self._playground_rows.keys()):
-            if key not in desired_keys:
+            if key not in desired_slot_keys:
                 entry = self._playground_rows.pop(key)
                 entry["row"].setParent(None)
                 entry["row"].deleteLater()
 
-        # Add or update rows.
+        # ---- Pass 3: remove vanished control rows. ----
+        for key in list(self._playground_control_rows.keys()):
+            if key not in desired_ctrl_keys:
+                entry = self._playground_control_rows.pop(key)
+                entry["row"].setParent(None)
+                entry["row"].deleteLater()
+
+        # ---- Pass 4: add/update slot rows. ----
         for p in playgrounds:
             if not isinstance(p, dict):
                 continue
             pid = p.get("id")
             if not pid:
                 continue
-            slots = p.get("layer_slots") or []
             first_visible_slot_done = False
-            for slot in slots:
+            for slot in (p.get("layer_slots") or []):
                 if not isinstance(slot, dict):
                     continue
                 sid = slot.get("id")
@@ -677,7 +717,49 @@ class KritomaticPanel(QDockWidget):
                     self._playgrounds_layout.addWidget(entry["row"])
                 self._sync_playground_row(entry, p, slot)
 
-        self._playgrounds_container.setVisible(bool(self._playground_rows))
+        # ---- Pass 5: determine which pids already show their name ----
+        # Any slot row with non-empty name_label text has already
+        # shown the playground's name; control param rows for the
+        # same pid inherit that so the group stays visually grouped.
+        pids_with_name_shown: set = set()
+        for (pid, _sid), entry in self._playground_rows.items():
+            nl = entry.get("name_label")
+            if nl is not None and nl.text():
+                pids_with_name_shown.add(pid)
+
+        # ---- Pass 6: add/update control param rows. ----
+        for p in playgrounds:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("id")
+            if not pid:
+                continue
+            first_ctrl_done = pid in pids_with_name_shown
+            for cp in (p.get("control_params") or []):
+                if not isinstance(cp, dict):
+                    continue
+                name = cp.get("name")
+                if not name:
+                    continue
+                key = (pid, name)
+                entry = self._playground_control_rows.get(key)
+                show_name = not first_ctrl_done
+                first_ctrl_done = True
+                if entry is None:
+                    entry = self._make_control_param_row(
+                        p, cp, show_name=show_name,
+                    )
+                    self._playground_control_rows[key] = entry
+                    self._playgrounds_layout.addWidget(entry["row"])
+                self._sync_control_param_row(
+                    entry, p, cp, show_name=show_name,
+                )
+
+        # ---- Visibility ----
+        self._playgrounds_container.setVisible(
+            bool(self._playground_rows)
+            or bool(self._playground_control_rows)
+        )
 
         # Populate newly-added rows' pickers from cache.
         if self._last_layers_payload:
@@ -882,6 +964,136 @@ class KritomaticPanel(QDockWidget):
         bundle = {"id": request_id, "commands": [command]}
         self._conn.enqueue(request_id, bundle)
 
+    # ------------------------------------------------------------------
+    #  Control param rows
+    # ------------------------------------------------------------------
+
+    def _make_control_param_row(self, p: dict, cp: dict,
+                                show_name: bool) -> dict:
+        pid = p.get("id")
+        pname = p.get("name") or pid or "?"
+        name = cp.get("name") or "?"
+        ctype = cp.get("type") or "text"
+
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 1, 0, 1)
+        h.setSpacing(6)
+
+        name_label = QLabel(pname if show_name else "")
+        name_label.setStyleSheet("font-weight:600;")
+        name_label.setMinimumWidth(110)
+        h.addWidget(name_label, 0)
+
+        param_label = QLabel(name)
+        param_label.setToolTip(
+            f"Control parameter {name!r} of the {pname!r} playground.\n"
+            f"Daemon-owned routing hint; merged into "
+            f"config['params'] at generation time."
+        )
+        param_label.setMinimumWidth(90)
+        h.addWidget(param_label, 0)
+
+        if ctype == "select":
+            widget = QComboBox()
+            for opt in (cp.get("options") or []):
+                widget.addItem(str(opt))
+            widget.setMinimumWidth(80)
+        elif ctype == "toggle":
+            widget = QCheckBox()
+        else:
+            widget = QLineEdit()
+            widget.setMinimumWidth(80)
+        h.addWidget(widget, 0)
+        h.addStretch(1)
+
+        entry = {
+            "row": row,
+            "name_label": name_label,
+            "param_label": param_label,
+            "widget": widget,
+            "widget_type": ctype,
+            "playground_id": pid,
+            "param_name": name,
+            "updating": False,
+        }
+
+        # NOTE: `currentTextChanged(str)` and `stateChanged(int)` emit
+        # the new value as a positional argument.  If the handler were
+        # declared `def on_changed(_entry=entry)`, PyQt would bind that
+        # emitted value to `_entry` and the handler would blow up on
+        # `_entry["updating"]`.  `*_args` swallows whatever the signal
+        # sends so `_entry` always binds to its real default.
+        # `editingFinished()` sends nothing, so the same signature
+        # works for the text/number/integer case too.
+        def on_changed(*_args, _entry=entry):
+            if _entry["updating"]:
+                return
+            val = self._read_control_widget(_entry)
+            self._send_playground_set_control_param(
+                _entry["playground_id"], _entry["param_name"], val,
+            )
+
+        if ctype == "select":
+            widget.currentTextChanged.connect(on_changed)
+        elif ctype == "toggle":
+            widget.stateChanged.connect(on_changed)
+        else:
+            widget.editingFinished.connect(on_changed)
+
+        return entry
+
+    @staticmethod
+    def _read_control_widget(entry: dict) -> str:
+        t = entry["widget_type"]
+        w = entry["widget"]
+        if t == "select":
+            return w.currentText()
+        if t == "toggle":
+            return "true" if w.isChecked() else "false"
+        return w.text()
+
+    def _sync_control_param_row(self, entry: dict, p: dict, cp: dict,
+                                show_name: bool) -> None:
+        new_pname = p.get("name") or p.get("id") or "?"
+        expected_label = new_pname if show_name else ""
+        if entry["name_label"].text() != expected_label:
+            entry["name_label"].setText(expected_label)
+
+        current_value = cp.get("value")
+        entry["updating"] = True
+        try:
+            t = entry["widget_type"]
+            w = entry["widget"]
+            if t == "select":
+                idx = w.findText(str(current_value))
+                if idx >= 0 and w.currentIndex() != idx:
+                    w.setCurrentIndex(idx)
+            elif t == "toggle":
+                want = bool(current_value)
+                if w.isChecked() != want:
+                    w.setChecked(want)
+            else:
+                if not w.hasFocus() and w.text() != str(current_value):
+                    w.setText(str(current_value))
+        finally:
+            entry["updating"] = False
+
+    def _send_playground_set_control_param(
+        self, pid: str, name: str, value: str,
+    ) -> None:
+        command = {
+            "type": "playground_set_control_param",
+            "id": pid,
+            "name": name,
+            "value": value,
+        }
+        request_id = (
+            f"playground-ctrl-{pid}-{name}-{int(time.time() * 1000)}"
+        )
+        bundle = {"id": request_id, "commands": [command]}
+        self._conn.enqueue(request_id, bundle)
+
     def _update_workflow_hint(self, description) -> None:
         has_workflow = False
         if isinstance(description, dict):
@@ -929,6 +1141,14 @@ class KritomaticPanel(QDockWidget):
 
     def _on_command_completed(self, request_id: str, ok: bool,
                               summary: dict) -> None:
+        if request_id.startswith("playground-ctrl-"):
+            if not ok:
+                msg = summary.get("message", "") or "unknown error"
+                self._append_log(
+                    "err", f"Playground control failed: {msg}",
+                )
+            return
+
         if request_id.startswith("playground-"):
             if not ok:
                 msg = summary.get("message", "") or "unknown error"

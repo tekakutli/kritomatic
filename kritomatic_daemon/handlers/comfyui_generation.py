@@ -103,6 +103,46 @@ best-effort spirit of the rest of this module.  Intercept batches
 freeze the merged values into `prepared_graph` at intercept time, so
 `comfy_resume_intercepted` requires no extra work.
 
+Playground-owned control params
+===============================
+A playground may *also* claim **control params** (see
+`playgrounds.py`'s CONTROL PARAMS).  Control params live in the
+daemon's playground registry (not in the playground's HTTP `/params`
+route), and are merged into `config["params"]` in exactly the same
+way.  The `DESTINATION` control param the outpaint playground uses
+is the canonical example: it routes the pipeline between
+"publish outpaint_result" and "paste into Krita" independently of
+any graph primitive.
+
+The merge order is: control params (registry) **first**, then
+graph-claimed HTTP params.  When both a playground's registry and
+its `/params` response yield the same key, the HTTP value wins —
+that lets a playground override a control-param's default at
+generation time if it wants to, while still allowing the docker to
+edit the control param's "sticky" value between runs.  In practice
+this precedence never fires for `DESTINATION` today (the outpaint
+playground does not return DESTINATION from `/params`), so the
+distinction is future-proofing rather than behaviour.
+
+Playground-control routing
+==========================
+Routing precedence in `_comfy_generate_impl`:
+
+  1. If `config["params"]` carries a `DESTINATION` value, use it:
+       · `"playground"` → publish outpaint_result, no paste
+       · `"krita"`      → paste into Krita (normal path)
+  2. Else fall back to the legacy `OUTPAINT is True` check — kept
+     for workflows whose graph declares an `OUTPAINT` Primitive
+     and were driven by pre-DESTINATION playground registrations.
+
+The fallback is dropped in a follow-up commit once every outpaint
+workflow has been verified against `DESTINATION`.  Until then, the
+two paths coexist: a workflow with no DESTINATION and no OUTPAINT
+primitive pastes (inpaint); a workflow with OUTPAINT=True publishes
+(legacy outpaint); a workflow with either DESTINATION=playground
+or OUTPAINT=True publishes (both paths agree); a workflow with
+DESTINATION=krita pastes (explicit user override).
+
 Rotation
 ========
 The rotation-aware paste (`paste_result` in `comfyui_paste.py`) is
@@ -142,8 +182,8 @@ failure logs one line and returns without publishing.  The batch
 itself already returned success by that point; the canvas pushes
 are enhancements, not correctness requirements.
 
-OUTPAINT — result publication without paste (Option 3)
-======================================================
+OUTPAINT — result publication without paste
+===========================================
 A workflow whose config carries `OUTPAINT=True` in its `[params]`
 is treated specially: the daemon does NOT paste the result into
 Krita.  Outpaint results are larger than the source canvas, and
@@ -151,14 +191,20 @@ pasting them would either fail the layer bounds check or require
 `resize_canvas=true`, which mutates the user's document without
 their explicit request.
 
-Instead, `_comfy_generate_impl` calls `_publish_outpaint_result`
-once per downloaded output, publishing an `outpaint_result` event
-on the event bus.  The outpaint playground's subscriber stores the
-latest one in `_last_pasted`, exposes it via `/active_state`, and
-the browser's autosync poll calls `applyGeneratedImage` to display
-it.  Send to Krita remains the playground's only document-mutating
-action, and it is user-initiated (the original document is never
-touched).
+**Routing is now via `DESTINATION`**, a control param registered by
+the outpaint playground (default `"playground"`).  The legacy
+`OUTPAINT is True` check remains as a fallback for workflows driven
+by pre-DESTINATION playground registrations.  See
+"Playground-control routing" above.
+
+Instead of pasting, `_comfy_generate_impl` calls
+`_publish_outpaint_result` once per downloaded output, publishing
+an `outpaint_result` event on the event bus.  The outpaint
+playground's subscriber stores the latest one in `_last_pasted`,
+exposes it via `/active_state`, and the browser's autosync poll
+calls `applyGeneratedImage` to display it.  Send to Krita remains
+the playground's only document-mutating action, and it is
+user-initiated (the original document is never touched).
 
 The `outpaint_result` event type is distinct from `paste_applied`
 so the inpaint playground's subscriber never sees outpaint outputs
@@ -208,6 +254,7 @@ from .comfyui_paste import (
     paste_result,
     record_used_layers,
     write_history_record,
+    _publish_outpaint_result,
 )
 from .comfyui_intercept import (
     InterceptCommands,
@@ -232,43 +279,54 @@ _PLAYGROUND_PARAM_TIMEOUT_S = 2.0
 
 
 # ---------------------------------------------------------------------------
-#  Playground-owned parameter fetch
+#  Playground-owned parameter fetch (graph params + control params)
 # ---------------------------------------------------------------------------
 
 def _fetch_playground_params(parent, param_slots: dict) -> dict:
     """Return current values for any workflow param claimed by a
-    registered playground.
+    registered playground, plus any control-param values held in the
+    playground registry.
 
     Called from `_comfy_generate_impl` right after entry-time
     snapshotting and before the intercept branch.  See the module
-    docstring, "Playground-owned parameters".
+    docstring, "Playground-owned parameters" and "Playground-owned
+    control params".
 
     Iterates `parent._playgrounds_cmds.list()`.  For each playground,
-    checks whether any of its `param_slots` names appear in the
-    loaded workflow's `param_slots` — if not, the playground is
-    skipped without an HTTP call, so a registered playground never
-    costs a round-trip when the current workflow doesn't use its
-    params.
+    collects two kinds of values:
 
-    On a match, POSTs `{"": ""}` (empty body) to `<url>/params` and
-    merges whatever `values` dict comes back, filtered to the names
-    the workflow actually declares.  A failure (connection refused,
-    timeout, non-JSON body, `{success: false}`, or an exception) is
-    logged as one `[comfyui] playground param fetch …` line and
-    treated as "no values from this playground".  The caller falls
-    back to `_active_config`'s values for that param — matching the
+      1. **Control params** — daemon-owned registry state, no HTTP
+         round-trip.  Merged unconditionally; they are not filtered
+         by `graph_param_set` because they are pipeline-routing hints
+         that live in `config["params"]` for the daemon's own code,
+         not for graph substitution.
+
+      2. **Graph-claimed params** — POST `<url>/params` and merge
+         whatever `values` dict comes back, filtered to the names
+         the workflow actually declares (so a stale playground that
+         still claims a param the current workflow no longer has
+         cannot pollute the config).
+
+    A graph-param fetch failure (connection refused, timeout,
+    non-JSON body, `{success: false}`, or an exception) is logged as
+    one `[comfyui] playground param fetch …` line and treated as
+    "no values from this playground for that param".  The caller
+    falls back to `_active_config`'s values — matching the
     best-effort convention used elsewhere in this module (canvas
     pushes, history writes) rather than aborting an entire batch
     over one unavailable playground.
 
-    The graph's `param_slots` keys are authoritative: even if a
-    playground returns extra names, only names present in the graph
-    are merged.  This keeps a stale playground that still claims a
-    param the current workflow no longer declares from polluting the
-    config.
+    Merge order: control params first, then graph HTTP values.  If
+    both a registry entry and an HTTP response yield the same name,
+    the HTTP value wins — this lets a playground override its own
+    registry default at generation time, while the docker can still
+    edit the "sticky" registry value between runs.
     """
-    if not isinstance(param_slots, dict) or not param_slots:
-        return {}
+    graph_param_set = (
+        set(param_slots.keys())
+        if isinstance(param_slots, dict)
+        else set()
+    )
 
     try:
         playgrounds = parent._playgrounds_cmds.list()
@@ -279,12 +337,20 @@ def _fetch_playground_params(parent, param_slots: dict) -> dict:
         )
         return {}
 
-    graph_param_set = set(param_slots.keys())
     values: dict = {}
 
     for p in playgrounds or []:
         if not isinstance(p, dict):
             continue
+
+        # ---- 1) Control params (daemon registry, no HTTP). ----
+        for cp in (p.get("control_params") or []):
+            if isinstance(cp, dict):
+                cp_name = cp.get("name")
+                if isinstance(cp_name, str) and "value" in cp:
+                    values[cp_name] = cp["value"]
+
+        # ---- 2) Graph-claimed params (HTTP from playground). ----
         url = (p.get("url") or "").rstrip("/")
         claimed = p.get("param_slots") or []
         if not url or not claimed:
@@ -435,54 +501,6 @@ def _publish_paste_applied(paste: dict, doc) -> None:
         })
     except Exception as e:
         print(f"[comfyui] paste_applied publish failed: {e}",
-              flush=True)
-
-
-def _publish_outpaint_result(out: dict, doc) -> None:
-    """Publish one raw outpaint result as an `outpaint_result` event.
-
-    See the module docstring, OUTPAINT.  Unlike `_publish_paste_applied`,
-    this does not correspond to an actual paste — the outpaint workflow
-    is set to skip the paste stage entirely, so nothing is written to
-    the Krita document.  The event carries the raw downloaded PNG so
-    the outpaint playground can display it in its viewer.
-
-    The event type is `outpaint_result`, distinct from `paste_applied`,
-    so the inpaint playground's subscriber never receives outpaint
-    outputs (they are far larger than the canvas and would corrupt its
-    optimistic composite).  Payload shape matches `paste_applied` with
-    `paste_x`/`paste_y` set to 0 and an `"outpaint": True` marker.
-
-    Best-effort.  A failure logs one line and continues — the batch
-    success is already recorded by the time this is called.
-    """
-    try:
-        png = out.get("png_bytes") or b""
-        if not png:
-            return
-        try:
-            w, h = _png_dimensions(png)
-        except Exception as e:
-            print(f"[comfyui] outpaint_result: _png_dimensions "
-                  f"failed: {e}", flush=True)
-            return
-        h_hex = hashlib.sha256(png).hexdigest()[:16]
-        b64 = base64.b64encode(png).decode("ascii")
-        from ..server.event_bus import get_event_bus
-        get_event_bus().publish("outpaint_result", {
-            "doc_name": doc.name() if doc else "",
-            "hash":     h_hex,
-            "b64":      b64,
-            "paste_x":  0,
-            "paste_y":  0,
-            "width":    int(w),
-            "height":   int(h),
-            "outpaint": True,
-        })
-        print(f"[comfyui] outpaint_result published: "
-              f"{w}x{h} hash={h_hex}", flush=True)
-    except Exception as e:
-        print(f"[comfyui] outpaint_result publish failed: {e}",
               flush=True)
 
 
@@ -781,15 +799,18 @@ class NormalGenerationCommands(AutoDispatchHandler):
 
         batch_id = params.get("_batch_id") or str(uuid.uuid4())
 
-        # ----- fetch playground-owned param values -----
+        # ----- fetch playground-owned param + control-param values -----
         #
         # Runs before the intercept branch so both normal and
         # intercepted paths see the merged config, and before
         # prepare_workflow for the same reason.  A claimed parameter
         # therefore never reads _active_config: the playground that
         # claims it is the source of truth, and this merge is the
-        # "pushed at generation time" step.  See the module docstring,
-        # "Playground-owned parameters".
+        # "pushed at generation time" step.  Control params
+        # (DESTINATION etc.) come through the same merge from the
+        # daemon registry.  See the module docstrings,
+        # "Playground-owned parameters" and
+        # "Playground-owned control params".
         playground_param_values = _fetch_playground_params(
             parent, param_slots,
         )
@@ -844,7 +865,20 @@ class NormalGenerationCommands(AutoDispatchHandler):
         parent._publish_state_change()
 
         any_paste_succeeded = False
-        is_outpaint = config["params"].get("OUTPAINT") is True
+
+        # ----- routing: DESTINATION (control param) first, OUTPAINT fallback -----
+        #
+        # See the module docstring, "Playground-control routing".
+        # `DESTINATION` is the modern signal, set by the outpaint
+        # playground as a control param and editable from the
+        # docker.  `OUTPAINT is True` remains for pre-DESTINATION
+        # workflows so nothing regresses when a user upgrades the
+        # daemon but not their workflow JSONs.
+        destination = config["params"].get("DESTINATION")
+        if destination is not None:
+            is_outpaint = (destination == "playground")
+        else:
+            is_outpaint = config["params"].get("OUTPAINT") is True
 
         try:
             warnings: list = []
@@ -1029,11 +1063,10 @@ class NormalGenerationCommands(AutoDispatchHandler):
                         parent._last_document = doc
                     continue
 
-                # ----- OUTPAINT branch (Option 3) -----
+                # ----- OUTPAINT / DESTINATION=playground branch -----
                 #
-                # The workflow's params carry OUTPAINT=True: skip
-                # the paste stage entirely.  The outpaint result is
-                # larger than the source canvas and pasting would
+                # Skip the paste stage entirely.  The outpaint result
+                # is larger than the source canvas and pasting would
                 # either fail the layer bounds check or require
                 # resize_canvas=true (silently mutating the user's
                 # document).  Instead, publish each raw output as an
@@ -1044,10 +1077,7 @@ class NormalGenerationCommands(AutoDispatchHandler):
                 #
                 # any_paste_succeeded stays False → canvas_update
                 # does NOT fire in the finally block.  The document
-                # was not modified, so its projection is unchanged;
-                # publishing it would be wasted work and, for a
-                # concurrently-open inpaint playground, a spurious
-                # "canvas changed" signal.
+                # was not modified, so its projection is unchanged.
                 #
                 # See the module docstring, OUTPAINT.
                 if is_outpaint:

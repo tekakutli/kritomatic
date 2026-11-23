@@ -56,6 +56,34 @@ new call's slot spec — unlike `selector`, it is not user state, so
 preserving it across restarts would be wrong; the playground is the
 authority on which of its slots are managed.
 
+PARAM SLOTS
+===========
+A playground may also declare one or more **parameter slots** on
+register.  These are the workflow-graph Parameters that the
+playground itself writes, mirroring the way layer slots claim
+`@`-resources.  A param slot is just a string — the parameter title:
+
+    param_slots = [
+        "OUTPAINT_LEFT_PAD",
+        "OUTPAINT_RIGHT_PAD",
+        "OUTPAINT_TOP_PAD",
+        "OUTPAINT_BOTTOM_PAD",
+    ]
+
+Claimed parameters disappear from the docker's Parameters section
+(same rule as `@`-resources disappearing from Resources — see
+`handlers/panel.py::_claimed_param_names`), and if every workflow
+parameter is claimed the Parameters section is suppressed entirely.
+The playground is the sole source of truth for the claimed values.
+
+At generation time the daemon queries each playground's `/params`
+route for current values, which are substituted into the workflow
+graph just before submission.  That's the "pushed at generation
+time" step: the playground writes the values on its end (from
+whatever client-side state it tracks), and the daemon pulls them at
+generation time.  A playground that has no `param_slots` declares
+contributes nothing to this pass.
+
 No heartbeats.  Clean exits unregister explicitly (signal handler +
 atexit).  Crashes and SIGKILL are caught by a background sweep thread
 that runs every `_SWEEP_INTERVAL_S` seconds and probes each entry's
@@ -198,6 +226,38 @@ def _normalize_slot_specs(raw_specs) -> tuple:
     return out, None
 
 
+def _normalize_param_slot_specs(raw_specs) -> tuple:
+    """Validate and normalize a list of param slot names.
+
+    A param slot is simply a workflow-parameter title (a plain string
+    — no `@` prefix, no selector, no per-slot metadata).  Accepts a
+    Python list (direct socket call) or JSON string (CLI).  Returns
+    `(params_dict, error)`, where `params_dict` maps name -> `{name}`
+    on success.  See the module docstring, PARAM SLOTS.
+    """
+    if isinstance(raw_specs, str):
+        try:
+            raw_specs = json.loads(raw_specs)
+        except json.JSONDecodeError as e:
+            return None, f"param_slots JSON error: {e}"
+    if raw_specs is None:
+        raw_specs = []
+    if not isinstance(raw_specs, list):
+        return None, "param_slots must be a list of param names"
+
+    out: dict = {}
+    for i, name in enumerate(raw_specs):
+        if not isinstance(name, str) or not name.strip():
+            return None, (
+                f"param_slots[{i}] must be a non-empty string"
+            )
+        name = name.strip()
+        if name in out:
+            return None, f"duplicate param name {name!r}"
+        out[name] = {"name": name}
+    return out, None
+
+
 class PlaygroundCommands(AutoDispatchHandler):
 
     def __init__(self, parent):
@@ -258,6 +318,10 @@ class PlaygroundCommands(AutoDispatchHandler):
         `_claimed_resource_names` reads only `id`, so a slot that is
         managed still gets filtered out of Resources — the flag only
         affects the Playgrounds section.
+
+        `param_slots` is a flat list of names — the panel handler's
+        `_claimed_param_names` reads it to hide the corresponding
+        fields in Parameters.  See the module docstring, PARAM SLOTS.
         """
         with self._lock:
             out = []
@@ -276,6 +340,9 @@ class PlaygroundCommands(AutoDispatchHandler):
                     "url":           e["url"],
                     "port":          e["port"],
                     "layer_slots":   slots,
+                    "param_slots":   [
+                        p["name"] for p in e["param_slots"].values()
+                    ],
                     "registered_at": e["registered_at"],
                 })
             return out
@@ -293,11 +360,12 @@ class PlaygroundCommands(AutoDispatchHandler):
             "--url":         {"type": "str",  "required": True},
             "--port":        {"type": "int",  "required": True},
             "--layer_slots": {"type": "json", "default": "[]"},
+            "--param_slots": {"type": "json", "default": "[]"},
         },
         arg_map={"id": "playground_id"},
     )
     def playground_register(self, playground_id, name, url, port,
-                            layer_slots=None):
+                            layer_slots=None, param_slots=None):
         pid = str(playground_id or "").strip()
         name = str(name or "").strip()
         url = str(url or "").strip().rstrip("/")
@@ -319,6 +387,10 @@ class PlaygroundCommands(AutoDispatchHandler):
         if err is not None:
             return {"success": False, "message": err}
 
+        param_dict, err = _normalize_param_slot_specs(param_slots)
+        if err is not None:
+            return {"success": False, "message": err}
+
         with self._lock:
             existing = self._registry.get(pid)
             # Preserve any existing selectors for slots that survive
@@ -332,6 +404,10 @@ class PlaygroundCommands(AutoDispatchHandler):
             # playground drives the slot, not user state; the
             # playground is the authority on it and gets to change
             # its mind on re-register.
+            #
+            # `param_slots` is likewise not preserved — it is a fresh
+            # claim from each register call, exactly like
+            # `managed_by_playground`.
             new_slots: dict = {}
             for sid, new_spec in slot_dict.items():
                 if existing is not None and sid in existing["layer_slots"]:
@@ -344,7 +420,8 @@ class PlaygroundCommands(AutoDispatchHandler):
                 print(
                     f"[playgrounds] {pid!r} re-registered "
                     f"(was {existing['url']!r}, now {url!r}; "
-                    f"{len(new_slots)} slot(s))",
+                    f"{len(new_slots)} slot(s), "
+                    f"{len(param_dict)} param(s))",
                     flush=True,
                 )
             self._registry[pid] = {
@@ -353,6 +430,7 @@ class PlaygroundCommands(AutoDispatchHandler):
                 "url":           url,
                 "port":          port,
                 "layer_slots":   new_slots,
+                "param_slots":   param_dict,
                 "registered_at": time.time(),
             }
 
@@ -363,6 +441,7 @@ class PlaygroundCommands(AutoDispatchHandler):
                 "id":    pid,
                 "url":   url,
                 "slots": list(new_slots.keys()),
+                "params": list(param_dict.keys()),
             },
         }
 

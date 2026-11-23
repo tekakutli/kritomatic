@@ -5,9 +5,20 @@
 Writes outpaint.html, serves it at http://127.0.0.1:8779/.
 
 Registers with the kritomatic daemon on startup under id `outpaint`,
-with one layer slot `@theoutpainted`.  When the daemon dies, the
-playground exits (background watcher, ~10s of consecutive failures);
-the user restarts both manually.
+with one layer slot `@thecanvas` and eight param slots —
+`OUTPAINT_LEFT_PAD`, `OUTPAINT_RIGHT_PAD`, `OUTPAINT_TOP_PAD`,
+`OUTPAINT_BOTTOM_PAD` (playground-owned, computed fresh at
+generation time), `APIv2` and `OUTPAINT` (forced to `True`), and
+`denoise` / `OUTPAINT_DENOISE` (hidden from the docker but not owned —
+the workflow default is used).  The layer slot is user-editable
+(Playgrounds section in the docker); param slots are
+playground-owned — the panel hides them from Parameters, and the
+daemon queries `/params` at generation time for fresh values, which
+is the "pushed at generation time" step described in
+`outpaint_server.py`'s PARAM VALUES.
+
+When the daemon dies, the playground exits (background watcher,
+~10s of consecutive failures); the user restarts both manually.
 
 Fixed port, no silent fallback — same rationale as layout: the daemon
 docker and the browser both hardcode 8779, so binding elsewhere would
@@ -47,6 +58,7 @@ OPEN_BROWSER = True
 PLAYGROUND_ID   = outpaint_server.PLAYGROUND_ID
 PLAYGROUND_NAME = outpaint_server.PLAYGROUND_NAME
 LAYER_SLOTS     = outpaint_server.LAYER_SLOTS
+PARAM_SLOTS     = outpaint_server.PARAM_SLOTS
 
 _DAEMON_WATCH_INTERVAL_S = 2.0
 _DAEMON_WATCH_MAX_FAILS  = 5
@@ -154,6 +166,9 @@ def main():
                 pass
         sys.exit(1)
 
+    # ---- Event bus subscriber (receives generated images from daemon) ----
+    outpaint_server.start_event_bus_subscriber()
+
     # ---- On the expected port: register with the daemon at the real URL ----
     state_url = f"http://127.0.0.1:{actual_port}"
     print(f"  routes   : "
@@ -164,12 +179,14 @@ def main():
     registered = playground_registry.register(
         PLAYGROUND_ID, PLAYGROUND_NAME, state_url, actual_port,
         layer_slots=LAYER_SLOTS,
+        param_slots=PARAM_SLOTS,
         retry_s=30.0,
     )
     if registered:
         print(
             f"  registered with daemon as {PLAYGROUND_ID!r} "
-            f"(slot(s): {[s['id'] for s in LAYER_SLOTS]})",
+            f"(slot(s): {[s['id'] for s in LAYER_SLOTS]}, "
+            f"param(s): {PARAM_SLOTS})",
             flush=True,
         )
     else:

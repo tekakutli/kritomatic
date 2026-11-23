@@ -95,17 +95,17 @@ def extract_resource_slots(graph: dict) -> dict:
         if spec is None:
             continue
         field, kind = spec
-        inputs = node.get("inputs", {}) or {}
-        value = inputs.get(field)
-        if not isinstance(value, str) or not value.startswith("@"):
+        meta = node.get("_meta") or {}
+        title = meta.get("title", "")
+        if not isinstance(title, str) or not title.startswith("@"):
             continue
-        if value in out:
+        if title in out:
             raise ValueError(
-                f"duplicate @-prefixed resource {value!r}: appears on "
-                f"node {out[value]['node_id']!r} and node {node_id!r}. "
-                f"Each @-name must be used by exactly one node."
+                f"duplicate @-prefixed title {title!r}: appears on "
+                f"node {out[title]['node_id']!r} and node {node_id!r}. "
+                f"Each @-title must be used by exactly one node."
             )
-        out[value] = {
+        out[title] = {
             "node_id": node_id,
             "input_field": field,
             "kind": kind,
@@ -165,24 +165,86 @@ def extract_output_nodes(graph: dict) -> dict:
 
         {
           "9": {"class_type": "SaveImage",
-                "filename_prefix": "kritomatic"},
+                "filename_prefix": "kritomatic",
+                "title": "",
+                "is_primary": False},
+          "10": {"class_type": "SaveImage",
+                 "filename_prefix": "kritomatic",
+                 "title": "@theoutput",
+                 "is_primary": True},
         }
+
+    `title` is the node's `_meta.title` (empty string if absent).
+
+    `is_primary` marks the canonical output node — the one a playground
+    should read from when it needs *the* output of a workflow.  A
+    `SaveImage` becomes primary when its `_meta.title` starts with `@`,
+    matching the resource-slot convention (`@thecanvas`,
+    `@theselection`, `@thecontext`) and letting an author disambiguate
+    workflows that have multiple `SaveImage` nodes (previews, debug
+    dumps, alternate branches) by marking one as the real output.
+
+    When no node is marked, the first `SaveImage` in graph iteration
+    order becomes primary — backward compatibility with workflows that
+    predate the marker (and with the daemon's paste logic, which does
+    not care which node is primary: it pastes every output node's
+    results).
+
+    Two `SaveImage` nodes sharing an `@`-title (e.g. two `@theoutput`)
+    is an authoring error, matching the resource-slot duplicate check.
+    Raises ValueError naming both node ids.
 
     Empty when the workflow has no recognized output node — ComfyUI
     will reject the submission with "Prompt has no outputs", which the
     proxy surfaces as ``422 invalid_workflow``.
     """
-    out: dict[str, dict] = {}
+    raw: dict = {}
     for node_id, node in graph.items():
         cls = node.get("class_type", "")
         if cls not in _OUTPUT_NODE_CLASSES:
             continue
         inputs = node.get("inputs", {}) or {}
-        out[node_id] = {
+        meta = node.get("_meta") or {}
+        title = meta.get("title", "")
+        if not isinstance(title, str):
+            title = ""
+        raw[node_id] = {
             "class_type": cls,
             "filename_prefix": inputs.get("filename_prefix", ""),
+            "title": title,
+            "is_primary": False,
         }
-    return out
+
+    marked = [
+        nid for nid, info in raw.items()
+        if info["title"].startswith("@")
+    ]
+    if len(marked) > 1:
+        raise ValueError(
+            f"multiple @-titled output nodes ({sorted(marked)}); at "
+            f"most one SaveImage may carry an @-prefixed _meta.title "
+            f"(e.g. '@theoutput') to designate the canonical output."
+        )
+    if marked:
+        raw[marked[0]]["is_primary"] = True
+    elif raw:
+        raw[next(iter(raw))]["is_primary"] = True
+
+    return raw
+
+
+def get_primary_output_node_id(output_nodes: dict):
+    """Return the node_id marked `is_primary`, or None.
+
+    Accepts the dict returned by `extract_output_nodes`; tolerates an
+    empty or missing dict.  Convenience for consumers (the inpaint
+    playground, the interceptor playground) that want *the* output
+    node id without iterating the dict themselves.
+    """
+    for nid, info in (output_nodes or {}).items():
+        if isinstance(info, dict) and info.get("is_primary"):
+            return nid
+    return None
 
 
 def extract_all_slots(graph: dict) -> tuple[dict, dict, dict]:

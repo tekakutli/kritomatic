@@ -85,6 +85,24 @@ invariants survive the split unchanged:
   3. Document-mutating work (`paste_result`) runs under
      `parent._paste_lock`.
 
+Playground-owned parameters
+===========================
+A registered playground may claim parameter names (see
+`playgrounds.py`'s PARAM SLOTS).  `_fetch_playground_params` runs
+right after entry-time snapshotting and before the intercept branch,
+so every path — normal, intercepted, no_paste — gets the same
+treatment: claimed params are fetched from each playground's
+`/params` route, merged into the config's `params` dict, and passed
+to `prepare_workflow`.  A claimed parameter therefore never reads
+`_active_config` — the playground is the source of truth, and the
+merge is what implements "pushed at generation time".  A fetch
+failure is logged and the config falls back to whatever
+`_active_config` held for that param — the claimed field then reads
+a stale default rather than failing the whole run, which matches the
+best-effort spirit of the rest of this module.  Intercept batches
+freeze the merged values into `prepared_graph` at intercept time, so
+`comfy_resume_intercepted` requires no extra work.
+
 Rotation
 ========
 The rotation-aware paste (`paste_result` in `comfyui_paste.py`) is
@@ -123,11 +141,40 @@ Both are best-effort: a closed doc, a null composite, or an encode
 failure logs one line and returns without publishing.  The batch
 itself already returned success by that point; the canvas pushes
 are enhancements, not correctness requirements.
+
+OUTPAINT — result publication without paste (Option 3)
+======================================================
+A workflow whose config carries `OUTPAINT=True` in its `[params]`
+is treated specially: the daemon does NOT paste the result into
+Krita.  Outpaint results are larger than the source canvas, and
+pasting them would either fail the layer bounds check or require
+`resize_canvas=true`, which mutates the user's document without
+their explicit request.
+
+Instead, `_comfy_generate_impl` calls `_publish_outpaint_result`
+once per downloaded output, publishing an `outpaint_result` event
+on the event bus.  The outpaint playground's subscriber stores the
+latest one in `_last_pasted`, exposes it via `/active_state`, and
+the browser's autosync poll calls `applyGeneratedImage` to display
+it.  Send to Krita remains the playground's only document-mutating
+action, and it is user-initiated (the original document is never
+touched).
+
+The `outpaint_result` event type is distinct from `paste_applied`
+so the inpaint playground's subscriber never sees outpaint outputs
+(and vice versa).  Payload shape is identical, plus an
+`"outpaint": True` marker for diagnostics.
+
+For outpaint runs, `any_paste_succeeded` is NOT set and
+`canvas_update` does NOT fire — the document was not modified, so
+the authoritative composite is unchanged.  The batch summary still
+reports `success` per run.
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import time
 import uuid
@@ -149,6 +196,7 @@ from ..utils.comfyui_proxy_client import (
 from .comfyui_document import (
     _check_color_mode,
     _get_live_active_document,
+    _png_dimensions,
     _public_run_record,
 )
 from .comfyui_types import (
@@ -163,6 +211,7 @@ from .comfyui_paste import (
 )
 from .comfyui_intercept import (
     InterceptCommands,
+    _post_json,
     generate_intercepted,
     notify_interceptor_cancel,
 )
@@ -175,6 +224,104 @@ _POLL_INTERVAL_S = 0.25
 _MAX_QUEUE_WAIT_S = 300.0
 _MIN_EXEC_TIMEOUT_S = 300.0
 _MAX_TOTAL_POLL_S = 600.0
+
+# Timeout for the playground-owned param fetch.  Localhost, JSON-only,
+# no rendering — 2 s is generous for a healthy process and short
+# enough that a dead playground doesn't block generation.
+_PLAYGROUND_PARAM_TIMEOUT_S = 2.0
+
+
+# ---------------------------------------------------------------------------
+#  Playground-owned parameter fetch
+# ---------------------------------------------------------------------------
+
+def _fetch_playground_params(parent, param_slots: dict) -> dict:
+    """Return current values for any workflow param claimed by a
+    registered playground.
+
+    Called from `_comfy_generate_impl` right after entry-time
+    snapshotting and before the intercept branch.  See the module
+    docstring, "Playground-owned parameters".
+
+    Iterates `parent._playgrounds_cmds.list()`.  For each playground,
+    checks whether any of its `param_slots` names appear in the
+    loaded workflow's `param_slots` — if not, the playground is
+    skipped without an HTTP call, so a registered playground never
+    costs a round-trip when the current workflow doesn't use its
+    params.
+
+    On a match, POSTs `{"": ""}` (empty body) to `<url>/params` and
+    merges whatever `values` dict comes back, filtered to the names
+    the workflow actually declares.  A failure (connection refused,
+    timeout, non-JSON body, `{success: false}`, or an exception) is
+    logged as one `[comfyui] playground param fetch …` line and
+    treated as "no values from this playground".  The caller falls
+    back to `_active_config`'s values for that param — matching the
+    best-effort convention used elsewhere in this module (canvas
+    pushes, history writes) rather than aborting an entire batch
+    over one unavailable playground.
+
+    The graph's `param_slots` keys are authoritative: even if a
+    playground returns extra names, only names present in the graph
+    are merged.  This keeps a stale playground that still claims a
+    param the current workflow no longer declares from polluting the
+    config.
+    """
+    if not isinstance(param_slots, dict) or not param_slots:
+        return {}
+
+    try:
+        playgrounds = parent._playgrounds_cmds.list()
+    except Exception as e:
+        print(
+            f"[comfyui] playground list failed: {e}",
+            flush=True,
+        )
+        return {}
+
+    graph_param_set = set(param_slots.keys())
+    values: dict = {}
+
+    for p in playgrounds or []:
+        if not isinstance(p, dict):
+            continue
+        url = (p.get("url") or "").rstrip("/")
+        claimed = p.get("param_slots") or []
+        if not url or not claimed:
+            continue
+        wanted = [n for n in claimed if n in graph_param_set]
+        if not wanted:
+            continue
+
+        try:
+            resp = _post_json(
+                url + "/params", {},
+                timeout=_PLAYGROUND_PARAM_TIMEOUT_S,
+            )
+        except Exception as e:
+            print(
+                f"[comfyui] playground param fetch failed at "
+                f"{url}: {e}",
+                flush=True,
+            )
+            continue
+
+        if not isinstance(resp, dict) or not resp.get("success"):
+            print(
+                f"[comfyui] playground param fetch rejected at "
+                f"{url}: {resp!r}",
+                flush=True,
+            )
+            continue
+
+        returned = resp.get("values") or {}
+        if not isinstance(returned, dict):
+            continue
+        for name, val in returned.items():
+            if name in wanted:
+                values[name] = val
+
+    return values
 
 
 # ---------------------------------------------------------------------------
@@ -238,9 +385,8 @@ def _publish_canvas_update(doc) -> None:
             print("[comfyui] canvas_update: empty PNG", flush=True)
             return
 
-        import hashlib as _hashlib
         b64 = base64.b64encode(png_bytes).decode("ascii")
-        h = _hashlib.sha256(png_bytes).hexdigest()[:16]
+        h = hashlib.sha256(png_bytes).hexdigest()[:16]
 
         from ..server.event_bus import get_event_bus
         get_event_bus().publish("canvas_update", {
@@ -289,6 +435,54 @@ def _publish_paste_applied(paste: dict, doc) -> None:
         })
     except Exception as e:
         print(f"[comfyui] paste_applied publish failed: {e}",
+              flush=True)
+
+
+def _publish_outpaint_result(out: dict, doc) -> None:
+    """Publish one raw outpaint result as an `outpaint_result` event.
+
+    See the module docstring, OUTPAINT.  Unlike `_publish_paste_applied`,
+    this does not correspond to an actual paste — the outpaint workflow
+    is set to skip the paste stage entirely, so nothing is written to
+    the Krita document.  The event carries the raw downloaded PNG so
+    the outpaint playground can display it in its viewer.
+
+    The event type is `outpaint_result`, distinct from `paste_applied`,
+    so the inpaint playground's subscriber never receives outpaint
+    outputs (they are far larger than the canvas and would corrupt its
+    optimistic composite).  Payload shape matches `paste_applied` with
+    `paste_x`/`paste_y` set to 0 and an `"outpaint": True` marker.
+
+    Best-effort.  A failure logs one line and continues — the batch
+    success is already recorded by the time this is called.
+    """
+    try:
+        png = out.get("png_bytes") or b""
+        if not png:
+            return
+        try:
+            w, h = _png_dimensions(png)
+        except Exception as e:
+            print(f"[comfyui] outpaint_result: _png_dimensions "
+                  f"failed: {e}", flush=True)
+            return
+        h_hex = hashlib.sha256(png).hexdigest()[:16]
+        b64 = base64.b64encode(png).decode("ascii")
+        from ..server.event_bus import get_event_bus
+        get_event_bus().publish("outpaint_result", {
+            "doc_name": doc.name() if doc else "",
+            "hash":     h_hex,
+            "b64":      b64,
+            "paste_x":  0,
+            "paste_y":  0,
+            "width":    int(w),
+            "height":   int(h),
+            "outpaint": True,
+        })
+        print(f"[comfyui] outpaint_result published: "
+              f"{w}x{h} hash={h_hex}", flush=True)
+    except Exception as e:
+        print(f"[comfyui] outpaint_result publish failed: {e}",
               flush=True)
 
 
@@ -587,6 +781,32 @@ class NormalGenerationCommands(AutoDispatchHandler):
 
         batch_id = params.get("_batch_id") or str(uuid.uuid4())
 
+        # ----- fetch playground-owned param values -----
+        #
+        # Runs before the intercept branch so both normal and
+        # intercepted paths see the merged config, and before
+        # prepare_workflow for the same reason.  A claimed parameter
+        # therefore never reads _active_config: the playground that
+        # claims it is the source of truth, and this merge is the
+        # "pushed at generation time" step.  See the module docstring,
+        # "Playground-owned parameters".
+        playground_param_values = _fetch_playground_params(
+            parent, param_slots,
+        )
+        if playground_param_values:
+            config = {
+                **config,
+                "params": {
+                    **(config.get("params") or {}),
+                    **playground_param_values,
+                },
+            }
+            print(
+                f"[comfyui] playground params merged: "
+                f"{sorted(playground_param_values.keys())}",
+                flush=True,
+            )
+
         # ----- intercept branch -----
         #
         # `no_paste=True` bypasses intercept: the caller explicitly
@@ -624,6 +844,7 @@ class NormalGenerationCommands(AutoDispatchHandler):
         parent._publish_state_change()
 
         any_paste_succeeded = False
+        is_outpaint = config["params"].get("OUTPAINT") is True
 
         try:
             warnings: list = []
@@ -672,6 +893,8 @@ class NormalGenerationCommands(AutoDispatchHandler):
                         seed=seed_i,
                     )
                     any_prepare_succeeded = True
+                    if prepared.warnings:
+                        warnings.extend(prepared.warnings)
                 except ProxyUnreachable as e:
                     # The proxy died between the initial get and now
                     # (or during the upload phase).  Invalidate the
@@ -806,6 +1029,47 @@ class NormalGenerationCommands(AutoDispatchHandler):
                         parent._last_document = doc
                     continue
 
+                # ----- OUTPAINT branch (Option 3) -----
+                #
+                # The workflow's params carry OUTPAINT=True: skip
+                # the paste stage entirely.  The outpaint result is
+                # larger than the source canvas and pasting would
+                # either fail the layer bounds check or require
+                # resize_canvas=true (silently mutating the user's
+                # document).  Instead, publish each raw output as an
+                # `outpaint_result` event on the bus; the outpaint
+                # playground's subscriber forwards it to the browser,
+                # where Send to Krita materializes it as a new doc on
+                # explicit user action.
+                #
+                # any_paste_succeeded stays False → canvas_update
+                # does NOT fire in the finally block.  The document
+                # was not modified, so its projection is unchanged;
+                # publishing it would be wasted work and, for a
+                # concurrently-open inpaint playground, a spurious
+                # "canvas changed" signal.
+                #
+                # See the module docstring, OUTPAINT.
+                if is_outpaint:
+                    for out in downloaded:
+                        _publish_outpaint_result(out, doc)
+                    record.run_records.append({
+                        "seed": seed_i, "prompt_id": job_id,
+                        "status": "success",
+                        "image_count": len(downloaded),
+                        "output_count": len(downloaded),
+                        "layer_names": [],
+                    })
+                    parent._last_result = {
+                        "outputs": downloaded,
+                        "job_id": job_id,
+                        "crop_bounds": prepared.crop_bounds,
+                        "paste_config": paste_config,
+                        "output_rotation": prepared.rotation,
+                    }
+                    parent._last_document = doc
+                    continue
+
                 with parent._paste_lock:
                     try:
                         paste_result_dict = paste_result(
@@ -916,6 +1180,12 @@ class NormalGenerationCommands(AutoDispatchHandler):
                 "runs": [_public_run_record(r) for r in record.run_records],
             }
 
+            if is_outpaint:
+                # For outpaint, layer_count / layer_names are 0 /
+                # empty by design; the browser is the receiver, not
+                # the Krita layer tree.  Surface that explicitly.
+                response_data["outpaint"] = True
+
             if no_paste:
                 images = []
                 for r in record.run_records:
@@ -946,7 +1216,18 @@ class NormalGenerationCommands(AutoDispatchHandler):
                         "message": msg,
                         "data": response_data}
 
-            if no_paste:
+            if is_outpaint:
+                if requested_count == 1:
+                    msg = "Outpaint result published to playground"
+                else:
+                    parts = [f"{successful} succeeded"]
+                    if failed:
+                        parts.append(f"{failed} failed")
+                    if cancelled:
+                        parts.append(f"{cancelled} cancelled")
+                    msg = (f"Outpaint batch of {requested_count}: "
+                           + ", ".join(parts))
+            elif no_paste:
                 msg = (f"Generated {len(response_data.get('images', []))} "
                        f"image(s) in {successful} run(s)")
             elif requested_count == 1:
@@ -974,6 +1255,11 @@ class NormalGenerationCommands(AutoDispatchHandler):
             # this replaces it with ground truth.  The
             # doc.projection() cost here is off the perceived-latency
             # critical path.
+            #
+            # Outpaint runs skip this: `any_paste_succeeded` is
+            # False for them by construction (no paste happened), so
+            # `_publish_canvas_update` does not fire — which is
+            # correct, the document was not modified.
             try:
                 if any_paste_succeeded:
                     _publish_canvas_update(doc)

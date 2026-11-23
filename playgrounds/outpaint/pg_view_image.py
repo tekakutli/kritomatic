@@ -106,7 +106,10 @@ function _drawViewerFrame(r) {
   ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
   ctx.textBaseline = "top";
   ctx.textAlign = "left";
-  ctx.fillText("VIEWER " + v.ratio + ":1", vx0 + 4, vy0 - 16);
+  const label = (board.areaImageW > 0 && board.areaImageH > 0)
+    ? "IMAGE " + board.areaImageW + "\u00d7" + board.areaImageH
+    : "IMAGE";
+  ctx.fillText(label, vx0 + 4, vy0 - 16);
 
   ctx.restore();
 }

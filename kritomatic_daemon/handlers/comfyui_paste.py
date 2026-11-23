@@ -16,7 +16,11 @@ Contents:
     rotation (un-rotate the crop, place at target, clip to doc),
     batch modes (default / layers / animation), per-node grouping,
     and the various failure paths.  Called with the parent's
-    `_paste_lock` held.
+    `_paste_lock` held.  Also returns an `applied` list — one entry
+    per pasted layer, carrying the exact PNG bytes the Krita layer
+    received — which `comfyui_generation` publishes as
+    `paste_applied` events for optimistic display in the inpaint
+    playground.  See the "APPLIED LIST" section below.
 
   · `write_history_record(...)` — append a history JSON for a
     finished batch.  Best-effort; swallows I/O errors.
@@ -46,10 +50,43 @@ rectangle at `(0, 0)`.  The `_paste_result` log line names the
 diamond position and the pasted-region size so the numbers can be
 sanity-checked against the log of the crop frame from
 `prepare_workflow`.
+
+APPLIED LIST
+============
+`paste_result`'s return dict now carries an `applied` list.  Each
+entry is::
+
+    {
+      "hash":    str,   # 16-char hex SHA-256 of the applied PNG
+      "b64":     str,   # base64 PNG of the layer that was pasted
+      "paste_x": int,   # document-space x of the pasted region
+      "paste_y": int,
+      "width":   int,
+      "height":  int,
+    }
+
+The list is populated for `batch_mode="default"` (one entry per
+image, in paste order).  For `batch_mode="layers"` and
+`"animation"` it is empty — `paste_batch_as_layers` and
+`paste_animation` do not return per-image applied bytes, and
+computing them separately would duplicate the paste work.  Callers
+should treat an empty `applied` as "optimistic display unavailable
+for this batch" and rely on the end-of-batch `canvas_update`
+instead.
+
+The daemon's `_publish_paste_applied` iterates `applied` to publish
+one `paste_applied` event per pasted layer.  An `applied` entry's
+`b64` is exactly the bytes the Krita layer received — for
+`rotation == 0` it is the input PNG unchanged, and for
+`rotation != 0` it is the rotated-and-cropped version.  This is
+what lets the browser's optimistic composite match the daemon's
+final projection to the pixel, not just approximately.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import math
 from datetime import datetime, timezone
@@ -107,6 +144,33 @@ def download_outputs(proxy: ProxyV2, job: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
+#  Applied-list helper
+# ---------------------------------------------------------------------------
+
+def _applied_entry(png_bytes: bytes,
+                   paste_x: int, paste_y: int) -> dict:
+    """Build one entry for `paste_result`'s `applied` list.
+
+    `png_bytes` is the exact PNG that was handed to `paste_image` as
+    the layer content.  `paste_x` / `paste_y` are the document-space
+    coordinates the layer was placed at.  See the module docstring,
+    APPLIED LIST.
+    """
+    try:
+        w, h = _png_dimensions(png_bytes)
+    except Exception:
+        w, h = 0, 0
+    return {
+        "hash":    hashlib.sha256(png_bytes).hexdigest()[:16],
+        "b64":     base64.b64encode(png_bytes).decode("ascii"),
+        "paste_x": int(paste_x),
+        "paste_y": int(paste_y),
+        "width":   int(w),
+        "height":  int(h),
+    }
+
+
+# ---------------------------------------------------------------------------
 #  Paste
 # ---------------------------------------------------------------------------
 
@@ -140,6 +204,10 @@ def paste_result(
       · `resize_canvas`: grows the canvas to the first output's
         dimensions before pasting.
 
+    Returns a dict with `success`, `message`, and a `data` block
+    carrying `layer_names`, `frame_count`, `output_count`, and
+    `applied` (see the module docstring, APPLIED LIST).
+
     Caller is expected to hold `parent._paste_lock` for the whole
     call — two concurrent pastes on the same document corrupt its
     layer tree (interleaved `rootNode().addChildNode` calls, lost
@@ -149,7 +217,8 @@ def paste_result(
         return {"success": True,
                 "message": "No outputs to paste",
                 "data": {"layer_names": [],
-                         "output_count": 0, "frame_count": 0}}
+                         "output_count": 0, "frame_count": 0,
+                         "applied": []}}
 
     print(f"[_paste_result] output_rotation={output_rotation} "
           f"crop_bounds={crop_bounds} "
@@ -299,6 +368,7 @@ def paste_result(
     pasted_layers: list = []
     pasted_frames = 0
     failures: list = []
+    applied: list = []
 
     for node_id, group in groups.items():
         images = [o["png_bytes"] for o in group]
@@ -320,13 +390,19 @@ def paste_result(
                 if paste_animation(doc, images):
                     pasted_frames += len(images)
                     pasted_layers.append(f"[Animation] {base_name}")
+                    # No per-frame applied bytes from paste_animation;
+                    # the browser will get the end-of-batch
+                    # canvas_update instead.  See module docstring,
+                    # APPLIED LIST.
                     continue
-                node = paste_image(
+                node, applied_png = paste_image(
                     doc, images[0], paste_x, paste_y, base_name,
                     blend_mode=blend_mode,
                     rotation=effective_rotation,
+                    return_png=True,
                 )
                 pasted_layers.append(node.name())
+                applied.append(_applied_entry(applied_png, paste_x, paste_y))
             elif batch_mode == "layers" and len(images) > 1:
                 nodes = paste_batch_as_layers(
                     doc, images, paste_x, paste_y, base_name,
@@ -334,18 +410,25 @@ def paste_result(
                     rotation=effective_rotation,
                 )
                 pasted_layers.extend(n.name() for n in nodes)
+                # paste_batch_as_layers does not surface per-node
+                # applied bytes; skip optimistic-display entries for
+                # this mode.  See module docstring, APPLIED LIST.
             else:
                 for idx, png in enumerate(images):
                     sub_name = (
                         base_name if len(images) == 1
                         else f"{base_name} #{idx + 1}"
                     )
-                    node = paste_image(
+                    node, applied_png = paste_image(
                         doc, png, paste_x, paste_y, sub_name,
                         blend_mode=blend_mode,
                         rotation=effective_rotation,
+                        return_png=True,
                     )
                     pasted_layers.append(node.name())
+                    applied.append(
+                        _applied_entry(applied_png, paste_x, paste_y)
+                    )
         except ValueError as e:
             failures.append(f"node {node_id}: {e}")
 
@@ -365,6 +448,7 @@ def paste_result(
             "layer_names": pasted_layers,
             "frame_count": pasted_frames,
             "output_count": len(groups),
+            "applied": applied,
         },
     }
 

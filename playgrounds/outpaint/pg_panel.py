@@ -1,4 +1,5 @@
-"""Panel: area size scrub inputs, ratio dropdown, refresh, krita check.
+"""Panel: area size scrub inputs, generated stack, send-to-krita,
+refresh, krita check.
 
 AREA DIM SCRUB INPUTS
 =====================
@@ -15,16 +16,58 @@ playground uses for view rotation.  Behaviour:
     `[8, 16384]`, then hands it to `setAreaDims()`.  `setAreaDims`
     additionally enforces `area ≥ viewer.px*` and
     `area ≥ VIEWER_MIN_SIZE_PX`, so the viewer is always fully
-    contained inside the area — the invariant the panel previously
-    relied on `min="1"` attributes and post-hoc clamping to
-    maintain.  Whatever the clamp chain produces is written back
-    into the other input (only if that input is not focused), so
-    the two widgets stay in sync when `setAreaDims` bumps one
-    dimension to accommodate the viewer's other constraint.
+    contained inside the area.  Whatever the clamp chain produces is
+    written back into the other input (only if that input is not
+    focused), so the two widgets stay in sync when `setAreaDims`
+    bumps one dimension to accommodate the viewer's other constraint.
 
-The old `change`-event handlers are gone.  `write` is now the single
-entry point for area-dim mutations, whether triggered by typing or
-by dragging.
+VIEWER ASPECT
+=============
+There is no aspect-ratio dropdown.  The viewer *is* the currently
+displayed image: its aspect is derived from
+`board.areaImageW / board.areaImageH` inside `viewerAspect()`
+(see `pg_state.js`), and `applyCanvasImage()` re-fits the viewer
+whenever a new source image arrives with a different aspect.  The
+contain-fit inside the viewer therefore degenerates to a full fill,
+with no letterboxing.
+
+GENERATED STACK
+===============
+Thumbnails in the panel's "Generated" section are driven by
+`board.generatedStack`.  The panel rebuilds the strip whenever
+`window` dispatches `pg:stackChanged` (which `pg_state.js` fires
+on push / preview / delete / preview-source).  A `_lastStackKey`
+deduplicates renders so a spurious event from a source refresh does
+not rebuild the DOM.
+
+The strip is a CSS grid (`auto-fill` columns, `max-height` +
+`overflow-y: auto`), so new entries wrap to new rows and overflow
+scrolls vertically instead of running off the right edge of the
+panel.  See `pg_base.py`'s GENERATED SECTION.
+
+Clicking a thumbnail → `previewGenerated(idx)` in `pg_state.js`,
+which saves the source view and shows the generated item at full
+size.  The active thumbnail gets the `.active` class.
+
+The delete (×) button on each thumbnail → `deleteFromStack(idx)`.
+If the deleted item was the active preview, the panel advances to
+the adjacent item (or back to source if the stack becomes empty).
+
+`Show source` button → `previewSource()`, restoring the saved
+source view.
+
+SEND TO KRITA
+=============
+One button, `_sendToKritaAction`.  Requires
+`getPreviewed() != null` — refuses to run when the source is
+showing.  Reads `entry.b64 / entry.width / entry.height` from the
+currently-previewed stack entry (NOT from `board.areaImageDataUrl`,
+which may not match if the user changed preview between render and
+click).  The server-side flow is unchanged: create a new document
+at the image dims, then paste into it.
+
+The button's `disabled` state and text label are kept in sync by
+`_updateSendBtn`, called after every stack change.
 
 BOOT AUTO-FIT
 =============
@@ -36,37 +79,32 @@ strictly boot-only.  Growth during drag does not re-trigger it; the
 user's wheel zoom owns the scale for the rest of the session.  See
 `pg_state.py`'s module docstring, RENDER SCALE — NO FIT-TO-WINDOW.
 
-Ratio change → `refitViewerAspect()` keeps the current centre.
-
-Boot → `resetViewerToFit()` once.
+Boot → `resetViewerToFit()` once.  When the first source image
+arrives, `applyCanvasImage()` may call `refitViewerAspect()` if the
+initial placeholder aspect differs from the image's, keeping the
+centre.
 """
 
 PANEL_JS = r"""
  import {
-   board, view, setAreaDims, resetViewerToFit, refitViewerAspect,
+   board, view, setAreaDims, resetViewerToFit,
    clampPan,
+   pushGeneratedToStack,
+   previewGenerated, previewSource, deleteFromStack,
+   getPreviewed, bufferIsGenerated,
  } from "./pg_state.js";
  import { VIEW_ZOOM_MIN } from "./pg_tuning.js";
- import { checkKritaStatus, fetchActiveState } from "./pg_client.js";
+ import {
+   checkKritaStatus, fetchActiveState, sendToKrita,
+ } from "./pg_client.js";
  import { fetchSelectedLayer } from "./pg_autosync.js";
  import { flashStatus } from "./pgkit/panel_core.js";
  import { _installScrubInput } from "./pgkit/panel_core.js";
 
  const PLAYGROUND_ID = "outpaint";
- const SLOT_ID       = "@theoutpainted";
+ const SLOT_ID       = "@thecanvas";
 
- const RATIO_KEYS = [
-   "0.25", "0.26", "0.27", "0.28",
-   "0.32", "0.33", "0.35", "0.40",
-   "0.42", "0.48", "0.50", "0.52",
-   "0.57", "0.60", "0.68", "0.72",
-   "0.78", "0.82", "0.88", "0.94",
-   "1.00", "1.07", "1.13", "1.21",
-   "1.29", "1.38", "1.46", "1.67",
-   "1.75", "2.00", "2.09", "2.40",
-   "2.50", "2.89", "3.00", "3.11",
-   "3.62", "3.75", "3.88", "4.00",
- ];
+ let _lastStackKey = "";
 
  /* ============================================================
     Panel sync
@@ -75,26 +113,24 @@ PANEL_JS = r"""
  export function syncPanelFields() {
    const e = {
      imageInfo:   document.getElementById("imageInfo"),
-     viewerRatio: document.getElementById("viewerRatio"),
      areaW:       document.getElementById("areaW"),
      areaH:       document.getElementById("areaH"),
    };
 
    if (e.imageInfo) {
+     const mode = bufferIsGenerated()
+       ? "gen " + board.previewIndex
+       : "src";
      const text = board.areaImageEl
        ? "area " + board.areaWidth + "\u00d7" + board.areaHeight
-         + "   \u00b7   image " + board.areaImageW + "\u00d7" + board.areaImageH
+         + "   \u00b7   " + mode
+         + " " + board.areaImageW + "\u00d7" + board.areaImageH
          + "   [" + String(board.areaImageHash).slice(0, 8) + "\u2026]"
        : "area " + board.areaWidth + "\u00d7" + board.areaHeight
          + "   \u00b7   no image";
      if (e.imageInfo.textContent !== text) e.imageInfo.textContent = text;
    }
 
-   if (e.viewerRatio && document.activeElement !== e.viewerRatio) {
-     if (e.viewerRatio.value !== board.viewer.ratio) {
-       e.viewerRatio.value = board.viewer.ratio;
-     }
-   }
    if (e.areaW && document.activeElement !== e.areaW) {
      const want = String(board.areaWidth);
      if (e.areaW.value !== want) e.areaW.value = want;
@@ -166,25 +202,121 @@ PANEL_JS = r"""
  }
 
  /* ============================================================
-    Ratio dropdown
+    Generated-stack rendering
     ============================================================ */
 
- function _installViewerDropdowns() {
-   const ratioSel = document.getElementById("viewerRatio");
-   if (!ratioSel) return;
-   if (ratioSel.options.length === 0) {
-     for (const k of RATIO_KEYS) {
-       const opt = document.createElement("option");
-       opt.value = k;
-       opt.textContent = k;
-       ratioSel.appendChild(opt);
-     }
+ export function _renderGeneratedStack() {
+   const strip   = document.getElementById("genStrip");
+   const empty   = document.getElementById("genEmpty");
+   const countEl = document.getElementById("genCount");
+   if (!strip || !empty) return;
+
+   const stack = board.generatedStack;
+   const key = stack.map(e => e.id).join(",") + "|" + board.previewIndex;
+   if (key === _lastStackKey) {
+     _updateSendBtn();
+     return;
    }
-   ratioSel.value = board.viewer.ratio;
-   ratioSel.addEventListener("change", () => {
-     board.viewer.ratio = ratioSel.value;
-     refitViewerAspect();   // preserve centre, don't reset
-   });
+   _lastStackKey = key;
+
+   if (countEl) countEl.textContent = String(stack.length);
+
+   if (stack.length === 0) {
+     empty.style.display = "";
+     strip.style.display = "none";
+     strip.innerHTML = "";
+     _updateSendBtn();
+     _updatePreviewInfo();
+     return;
+   }
+   empty.style.display = "none";
+   // display: grid — the strip is a wrapping auto-fill grid; new
+   // entries spill into additional rows and overflow scrolls
+   // vertically.  See pg_base.py, #genStrip.
+   strip.style.display = "grid";
+
+   // Rebuild strip.  The previous children are discarded; thumbnails
+   // are tiny so this is cheap even for a couple dozen entries.
+   strip.innerHTML = "";
+   for (let i = 0; i < stack.length; i++) {
+     const entry = stack[i];
+     const div = document.createElement("div");
+     div.className = "gen-thumb" + (i === board.previewIndex ? " active" : "");
+     div.title = entry.width + "\u00d7" + entry.height
+       + "   \u2022   click to preview";
+
+     const img = document.createElement("img");
+     img.src = entry.dataUrl;
+     img.alt = "";
+     img.draggable = false;
+     div.appendChild(img);
+
+     const del = document.createElement("button");
+     del.className = "del";
+     del.textContent = "\u00d7";
+     del.title = "Delete from stack";
+     del.addEventListener("click", (ev) => {
+       ev.stopPropagation();
+       _deleteAction(i);
+     });
+     div.appendChild(del);
+
+     div.addEventListener("click", () => _previewAction(i));
+     strip.appendChild(div);
+   }
+
+   _updateSendBtn();
+   _updatePreviewInfo();
+ }
+
+ function _updatePreviewInfo() {
+   const el = document.getElementById("previewInfo");
+   if (!el) return;
+   if (board.previewIndex >= 0
+       && board.previewIndex < board.generatedStack.length) {
+     const e = board.generatedStack[board.previewIndex];
+     el.textContent = "Previewing " + e.width + "\u00d7" + e.height
+       + "   \u2022   " + (board.previewIndex + 1)
+       + "/" + board.generatedStack.length;
+   } else if (board.generatedStack.length > 0) {
+     el.textContent = "Showing @thecanvas (click a thumbnail to preview)";
+   } else {
+     el.textContent = "";
+   }
+ }
+
+ function _updateSendBtn() {
+   const btn = document.getElementById("sendToKritaBtn");
+   const showSrc = document.getElementById("showSourceBtn");
+   const entry = getPreviewed();
+   if (btn) {
+     btn.disabled = !entry;
+     btn.textContent = entry
+       ? "\u2192 Send " + entry.width + "\u00d7" + entry.height
+         + " to Krita"
+       : "\u2192 Send to Krita";
+   }
+   if (showSrc) {
+     showSrc.style.display = (board.previewIndex >= 0) ? "" : "none";
+   }
+ }
+
+ /* ============================================================
+    Stack actions
+    ============================================================ */
+
+ function _previewAction(idx) {
+   previewGenerated(idx);
+   // previewGenerated fires pg:stackChanged, which re-renders the
+   // strip; no explicit call needed here.
+ }
+
+ function _deleteAction(idx) {
+   deleteFromStack(idx);
+ }
+
+ function _showSourceAction() {
+   previewSource();
  }
 
  /* ============================================================
@@ -224,6 +356,48 @@ PANEL_JS = r"""
    }
  }
 
+ async function _sendToKritaAction() {
+   const entry = getPreviewed();
+   if (!entry) {
+     flashStatus(
+       "no generated image selected \u2014 click a thumbnail first",
+       "warn",
+     );
+     return;
+   }
+   if (!entry.b64) {
+     flashStatus("selected entry has no image data", "bad");
+     return;
+   }
+
+   if (typeof console !== "undefined" && console.log) {
+     console.log(
+       "[send_to_krita] hash=" + String(entry.hash).slice(0, 12)
+       + " size=" + entry.width + "x" + entry.height
+       + " b64_len=" + entry.b64.length
+     );
+   }
+
+   flashStatus("sending to Krita\u2026", "");
+   const res = await sendToKrita(
+     entry.b64, entry.width, entry.height, undefined,
+   );
+   if (!res || !res.success) {
+     flashStatus(
+       "send to krita failed: "
+       + ((res && res.message) || "unknown"),
+       "bad",
+     );
+     return;
+   }
+   flashStatus(
+     "created new document: "
+     + (res.doc_name || "?")
+     + " (" + (res.width || "?") + "\u00d7" + (res.height || "?") + ")",
+     "ok",
+   );
+ }
+
  /* ============================================================
     Install
     ============================================================ */
@@ -232,15 +406,25 @@ PANEL_JS = r"""
    const ids = {
      refresh:    "refreshCanvasBtn",
      kritaCheck: "kritaCheckBtn",
+     send:       "sendToKritaBtn",
+     showSource: "showSourceBtn",
    };
    const el = {};
    for (const k in ids) el[k] = document.getElementById(ids[k]);
 
    if (el.refresh)    el.refresh.addEventListener("click", _refreshCanvasAction);
    if (el.kritaCheck) el.kritaCheck.addEventListener("click", _kritaStatusAction);
+   if (el.send)       el.send.addEventListener("click", _sendToKritaAction);
+   if (el.showSource) el.showSource.addEventListener("click", _showSourceAction);
 
-   _installViewerDropdowns();
+   // Stack re-render on any state change (push / preview / delete).
+   window.addEventListener("pg:stackChanged", () => {
+     _renderGeneratedStack();
+   });
+
    _installAreaInputs();
+   _renderGeneratedStack();
+   _updateSendBtn();
 
    // One-time fit: establish sensible viewer bounds for the initial
    // area.  Never called again on area resize.

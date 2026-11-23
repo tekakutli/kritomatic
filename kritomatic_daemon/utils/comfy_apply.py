@@ -126,6 +126,50 @@ cropped canvas, selection, and context for a theta≠0 prepare, and the
 raw un-rotated blobs for a legacy prepare.  Callers that do not use
 intercept mode ignore it; it costs nothing extra — the blobs are the
 same bytes `_upload_resource_blobs` just PUT to the proxy.
+
+MISSING RESOURCES (LAYER-NOT-FOUND AND MISSING-CONFIG FALLBACK)
+===============================================================
+A resource slot is "truly absent" in three distinct ways, all of
+which are now handled by warn-and-substitute rather than raise:
+
+  1. **Missing `[resources]` entry.**  The workflow declares
+     `@thecontext` (say) but the panel config has no entry for it —
+     typical when a playground claims the slot and hides it from
+     the docker, or when a workflow gains a slot after the config
+     was saved.  Previously this raised
+     `ValueError("resource slot '@thecontext' exists in the graph
+     but is not covered by [resources] in the config.")`.
+
+     For the three playground-managed names (`@thecanvas`,
+     `@theselection`, `@thecontext`) we now fall back to a canonical
+     source — `active`, `global`, `white` respectively — so the
+     workflow gets a sensible default and runs.
+
+     For any other name, we substitute a neutral value (all-white
+     mask for `kind="mask"`, transparent blank ARGB for
+     `kind="image"`) and append one line to `warnings`.
+
+  2. **Missing layer.**  A `[resources]` entry with
+     `source="layer"` points at a Krita layer that does not exist.
+     Same neutral substitution.  (Pre-existing behavior — already
+     handled in both read paths.)
+
+  3. **Unreadable layer / disk error.**  Still propagates as
+     `ValueError` — the fallback is specifically for "resource is
+     not present anywhere", not for "resource is present but
+     unreadable".
+
+Each substitution appends one line to `warnings`, which surfaces in
+the batch summary and in `data/comfy_panel/history/`.
+
+The two read paths are:
+  · `_read_resource_blobs` for the un-rotated / legacy path.
+  · `_read_user_resource_blob` for user-managed (`@-name` not in
+    the managed set) resources on the cropped path.  The managed
+    three are handled explicitly in `_prepare_cropped`, so they
+    never reach this function.
+
+The `_CANONICAL_SOURCE_FOR` map below is what ties the two together.
 """
 
 from __future__ import annotations
@@ -159,6 +203,24 @@ INPAINT_URL = "http://127.0.0.1:8774"
 # from the individual endpoint".  Distinguishes from `None`, which
 # means "pre-fetched and definitively absent" (e.g. no selection).
 _UNSET = object()
+
+# Canonical default sources for the three playground-managed resource
+# names.  When a workflow declares one of these slots but the panel
+# config has no [resources] entry for it (typically because a
+# playground claims the slot and hides it from the docker), the daemon
+# falls back to this source rather than raising.  This is what makes
+# playground-claimed slots work end-to-end.
+#
+# `"white"` is a synthetic source — no `[resources]` spec can request
+# it (comfyui_config._validate_config restricts user sources to
+# active/global/layer); only this map produces it.  It yields an
+# all-white mask, matching `_prepare_cropped`'s ctx_mask and the "no
+# selection" default for @theselection.
+_CANONICAL_SOURCE_FOR = {
+    "@thecanvas":    "active",
+    "@theselection": "global",
+    "@thecontext":   "white",
+}
 
 
 @dataclass
@@ -649,6 +711,7 @@ def _prepare_cropped(doc, graph, resource_slots, param_slots,
             blobs[name] = _read_user_resource_blob(
                 doc, name, resource_slots[name], config,
                 W, H, theta, cropX, cropY, cropW, cropH,
+                warnings=warnings,
             )
 
     assets = _upload_resource_blobs(blobs, proxy_client)
@@ -710,7 +773,8 @@ def _read_user_resource_blob(doc,
                              cropX: int,
                              cropY: int,
                              cropW: int,
-                             cropH: int) -> EncodedImage:
+                             cropH: int,
+                             warnings: Optional[list] = None) -> EncodedImage:
     """Read a non-managed resource, rotate + crop to the frame.
 
     "Non-managed" = any `@`-name the inpaint playground does not own.
@@ -735,54 +799,94 @@ def _read_user_resource_blob(doc,
     `_prepare_unrotated` also works under `_prepare_cropped` — the
     only difference is the rotate/crop step in the middle.
 
-    Raises `ValueError` on:
-      · config omission — the graph declares `@name` but
-        `config["resources"]` has no entry for it;
-      · missing layer — the spec says `source="layer"` but the named
-        layer is not in the document;
+    Missing-spec / missing-layer fallback: when there is no
+    `[resources]` entry for `name`, or the entry points at a Krita
+    layer that does not exist, this substitutes a neutral value
+    (all-white mask for `kind="mask"`, transparent blank ARGB for
+    `kind="image"`) and appends a line to `warnings`, instead of
+    raising.  See the module docstring, MISSING RESOURCES.
+
+    Raises `ValueError` only on:
+      · unknown `source`;
+      · missing `layer_name` when `source="layer"`;
       · dimension mismatch — the read returned a size other than
         `W×H` (only reachable via a corrupted document).
     """
-    spec = (config.get("resources") or {}).get(name)
-    if spec is None:
-        raise ValueError(
-            f"resource slot {name!r} exists in the graph but is not "
-            f"covered by [resources] in the config."
-        )
-
-    source = spec.get("source")
     kind = slot.get("kind", "image")
+    spec = (config.get("resources") or {}).get(name)
 
-    if source == "active":
-        enc_native = read_canvas_composite(doc, (0, 0, W, H))
-    elif source == "global":
-        enc_native = read_selection_mask(doc, (0, 0, W, H))
-        if enc_native is None:
-            enc_native = EncodedImage(
-                data=_encode_grayscale_png(b"\xff" * (W * H), W, H),
-                width=W, height=H, is_mask=True,
-            )
-    elif source == "layer":
-        layer_name = spec.get("layer_name")
-        if not layer_name:
-            raise ValueError(
-                f"resource {name!r}: source='layer' requires layer_name"
+    if spec is None:
+        # No [resources] entry.  Substitute a neutral value at W×H
+        # and warn.  The three managed names (@thecanvas,
+        # @theselection, @thecontext) never reach this function —
+        # `_prepare_cropped` handles them explicitly upstream — so
+        # there is no canonical default to fall back to here; every
+        # name reaching this branch is a user-managed extra.
+        # See the module docstring, MISSING RESOURCES.
+        if warnings is not None:
+            warnings.append(
+                f"resource {name!r}: no [resources] entry; "
+                f"substituting "
+                f"{'all-white mask' if kind == 'mask' else 'blank image'}"
             )
         if kind == "mask":
-            enc_native = read_layer_mask(doc, layer_name, (0, 0, W, H))
+            enc_native = _make_white_mask_enc(W, H)
         else:
-            enc_native = read_layer_pixels(doc, layer_name, (0, 0, W, H))
+            enc_native = _make_blank_image_enc(W, H)
     else:
-        raise ValueError(
-            f"resource {name!r}: unknown source {source!r}"
-        )
+        source = spec.get("source")
 
-    if (enc_native.width, enc_native.height) != (W, H):
-        raise ValueError(
-            f"resource {name!r}: read "
-            f"{enc_native.width}\u00d7{enc_native.height} but expected "
-            f"{W}\u00d7{H}"
-        )
+        if source == "active":
+            enc_native = read_canvas_composite(doc, (0, 0, W, H))
+        elif source == "global":
+            enc_native = read_selection_mask(doc, (0, 0, W, H))
+            if enc_native is None:
+                enc_native = EncodedImage(
+                    data=_encode_grayscale_png(b"\xff" * (W * H), W, H),
+                    width=W, height=H, is_mask=True,
+                )
+        elif source == "white":
+            # Synthetic source (see _CANONICAL_SOURCE_FOR).  Never
+            # produced by user configs; harmless to support here for
+            # symmetry with _read_resource_blobs.
+            enc_native = _make_white_mask_enc(W, H)
+        elif source == "layer":
+            layer_name = spec.get("layer_name")
+            if not layer_name:
+                raise ValueError(
+                    f"resource {name!r}: source='layer' requires layer_name"
+                )
+            try:
+                if kind == "mask":
+                    enc_native = read_layer_mask(doc, layer_name, (0, 0, W, H))
+                else:
+                    enc_native = read_layer_pixels(doc, layer_name, (0, 0, W, H))
+            except ValueError as e:
+                # Layer genuinely absent (no playground providing it,
+                # no Krita layer).  Substitute a neutral value so
+                # prepare does not block the whole run.  See the
+                # module docstring, MISSING RESOURCES.
+                if warnings is not None:
+                    warnings.append(
+                        f"resource {name!r}: layer {layer_name!r} "
+                        f"missing ({e}); substituting "
+                        f"{'all-white mask' if kind == 'mask' else 'blank image'}"
+                    )
+                if kind == "mask":
+                    enc_native = _make_white_mask_enc(W, H)
+                else:
+                    enc_native = _make_blank_image_enc(W, H)
+        else:
+            raise ValueError(
+                f"resource {name!r}: unknown source {source!r}"
+            )
+
+        if (enc_native.width, enc_native.height) != (W, H):
+            raise ValueError(
+                f"resource {name!r}: read "
+                f"{enc_native.width}\u00d7{enc_native.height} but expected "
+                f"{W}\u00d7{H}"
+            )
 
     # Same transform the managed canvas/selection go through, so the
     # workflow sees this resource at the same frame as `@thecanvas`.
@@ -869,6 +973,37 @@ def _encode_qimage_png(qimg):
     buf.close()
     return EncodedImage(
         data=png, width=qimg.width(), height=qimg.height(),
+    )
+
+
+def _make_blank_image_enc(w: int, h: int) -> EncodedImage:
+    """Fully-transparent ARGB PNG of the given dimensions.
+
+    Fallback for image resources whose layer is missing.  Used by
+    `_read_resource_blobs` (un-rotated path) and
+    `_read_user_resource_blob` (cropped path).  See the module
+    docstring, MISSING RESOURCES.
+    """
+    from PyQt6.QtGui import QImage
+    w, h = int(w), int(h)
+    qimg = QImage(w, h, QImage.Format.Format_ARGB32)
+    qimg.fill(0)
+    return _encode_qimage_png(qimg)
+
+
+def _make_white_mask_enc(w: int, h: int) -> EncodedImage:
+    """All-white (255) grayscale mask of the given dimensions.
+
+    Fallback for mask resources whose layer is missing.  Matches the
+    existing "no selection" default (`b"\\xff" * (w * h)`), so the
+    workflow proceeds with "select all" — visible feedback rather
+    than a silent no-op.  See the module docstring,
+    MISSING RESOURCES.
+    """
+    w, h = int(w), int(h)
+    return EncodedImage(
+        data=_encode_grayscale_png(b"\xff" * (w * h), w, h),
+        width=w, height=h, is_mask=True,
     )
 
 
@@ -1060,15 +1195,40 @@ def _read_resource_blobs(doc, resource_slots: dict, config: dict,
     out: dict[str, EncodedImage] = {}
 
     for name, slot in resource_slots.items():
+        kind = slot["kind"]
         spec = config["resources"].get(name)
+
         if spec is None:
-            raise ValueError(
-                f"resource slot {name!r} exists in the graph but is not "
-                f"covered by [resources] in the config."
-            )
+            # No [resources] entry.  Playground-managed slots
+            # (@thecanvas, @theselection, @thecontext) fall back to
+            # a canonical source so the workflow runs with a
+            # sensible default; anything else gets a neutral
+            # substitute.  Either way, warn and continue — raising
+            # here blocks the whole run over a slot the workflow may
+            # not actually need, which is exactly the class of
+            # spurious failure this branch exists to prevent.
+            # See the module docstring, MISSING RESOURCES.
+            default_source = _CANONICAL_SOURCE_FOR.get(name)
+            if default_source is not None:
+                warnings.append(
+                    f"resource {name!r}: no [resources] entry; "
+                    f"using built-in default source={default_source!r}"
+                )
+                spec = {"source": default_source}
+            else:
+                w, h = crop_bounds[2], crop_bounds[3]
+                warnings.append(
+                    f"resource {name!r}: no [resources] entry; "
+                    f"substituting "
+                    f"{'all-white mask' if kind == 'mask' else 'blank image'}"
+                )
+                out[name] = (
+                    _make_white_mask_enc(w, h) if kind == "mask"
+                    else _make_blank_image_enc(w, h)
+                )
+                continue
 
         source = spec["source"]
-        kind = slot["kind"]
 
         try:
             if source == "active":
@@ -1083,6 +1243,12 @@ def _read_resource_blobs(doc, resource_slots: dict, config: dict,
                         ),
                         width=w, height=h, is_mask=True,
                     )
+            elif source == "white":
+                # Synthetic source (see _CANONICAL_SOURCE_FOR):
+                # all-white mask at the crop size, matching
+                # _prepare_cropped's ctx_mask.
+                w, h = crop_bounds[2], crop_bounds[3]
+                blob = _make_white_mask_enc(w, h)
             elif source == "layer":
                 layer_name = spec.get("layer_name")
                 if not layer_name:
@@ -1090,7 +1256,20 @@ def _read_resource_blobs(doc, resource_slots: dict, config: dict,
                         f"source='layer' requires layer_name"
                     )
                 if kind == "image":
-                    blob = read_layer_pixels(doc, layer_name, crop_bounds)
+                    try:
+                        blob = read_layer_pixels(doc, layer_name, crop_bounds)
+                    except ValueError as e:
+                        # Layer genuinely absent (no playground
+                        # providing it, no Krita layer).  Substitute a
+                        # transparent blank so prepare does not block
+                        # the whole run.  See the module docstring,
+                        # MISSING RESOURCES.
+                        w, h = crop_bounds[2], crop_bounds[3]
+                        warnings.append(
+                            f"resource {name!r}: layer {layer_name!r} "
+                            f"missing ({e}); substituting blank image"
+                        )
+                        blob = _make_blank_image_enc(w, h)
                 else:
                     if (name == boundary_name
                             and boundary_bbox is not None):
@@ -1098,7 +1277,19 @@ def _read_resource_blobs(doc, resource_slots: dict, config: dict,
                             crop_bounds, boundary_bbox,
                         )
                     else:
-                        blob = read_layer_mask(doc, layer_name, crop_bounds)
+                        try:
+                            blob = read_layer_mask(
+                                doc, layer_name, crop_bounds,
+                            )
+                        except ValueError as e:
+                            # Same fallback for missing mask layers.
+                            w, h = crop_bounds[2], crop_bounds[3]
+                            warnings.append(
+                                f"resource {name!r}: layer "
+                                f"{layer_name!r} missing ({e}); "
+                                f"substituting all-white mask"
+                            )
+                            blob = _make_white_mask_enc(w, h)
             else:
                 raise ValueError(f"unknown source {source!r}")
         except ValueError as e:

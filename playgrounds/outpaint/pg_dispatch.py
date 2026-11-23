@@ -15,6 +15,16 @@ freezes the fit-scale at drag-start so the per-frame refit that
 happens as dims change can't feedback into the mouse → area-pixel
 conversion.  This module just wires the three phases to the mouse
 events, and puts the resize cursor on hover.
+
+STATE SYNC AT DRAG END
+======================
+Viewer and area drags don't sync on every mousemove — the sync is
+debounced at the state layer, but a drag would still generate
+several round-trips during active motion.  Instead, we call
+`syncNow()` once at mouseup, when the drag has settled.  That
+guarantees the server (and therefore `/params`) has the final
+values before the user can click Run.  See `pg_state.py`'s STATE
+SYNC TO SERVER.
 """
 
 DISPATCH_JS = r"""
@@ -23,6 +33,7 @@ import {
   screenToImage, fittedImageRect,
   clampPan, zoomAt, resetView,
   beginAreaDrag, updateAreaDrag, endAreaDrag,
+  syncNow,
 } from "./pg_state.js";
 import {
   hitTestViewerHandle, hitTestViewerInterior,
@@ -179,6 +190,7 @@ canvas.addEventListener("wheel", (e) => {
 }, { passive: false });
 
 window.addEventListener("mouseup", () => {
+  let dragEnded = false;
   if (_panActive) {
     _panActive = false;
     canvas.style.cursor = _spaceDown ? "grab" : "crosshair";
@@ -186,14 +198,20 @@ window.addEventListener("mouseup", () => {
   if (board.areaDragActive) {
     endAreaDrag();
     canvas.style.cursor = "crosshair";
+    dragEnded = true;
   }
   if (board.viewerDragActive) {
     board.viewerDragActive = false;
     board.viewerDragHandle = null;
     board.viewerDragStart  = null;
     canvas.style.cursor = "crosshair";
+    dragEnded = true;
     if (window._outpaintOnDragEnd) window._outpaintOnDragEnd();
   }
+  // Push final drag position to the server immediately, bypassing
+  // the debounce, so a Run clicked right after the drag sees the
+  // settled values.  See the module docstring, STATE SYNC AT DRAG END.
+  if (dragEnded) syncNow();
 });
 
 window.addEventListener("keyup", (e) => {

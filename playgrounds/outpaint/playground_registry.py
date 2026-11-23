@@ -5,7 +5,8 @@ Called once at startup (retry loop, ~30s budget), once at shutdown
 
 Wire commands:
 
-    playground_register    { id, name, url, port, layer_slots: [...] }
+    playground_register    { id, name, url, port,
+                             layer_slots: [...], param_slots: [...] }
     playground_unregister  { id }
 
 Wire format: the daemon's socket server returns
@@ -18,6 +19,13 @@ register.  A slot is `{"id": "@name", "label": str|None,
 selectors; the docker renders one row per (playground, slot); the
 playground reads its own slot's selector from `comfy_status` and
 re-fetches the displayed layer whenever it changes.
+
+Each registered playground may also declare one or more **param
+slots** — a flat list of workflow-parameter names it owns.  Those
+parameters disappear from the docker's Parameters section, and at
+generation time the daemon queries the playground's `/params` route
+for current values.  See `kritomatic_daemon/handlers/playgrounds.py`'s
+PARAM SLOTS.
 """
 
 from __future__ import annotations
@@ -75,6 +83,7 @@ def _response_is_success(resp: dict) -> bool:
 def _build_register_cmd(
     playground_id: str, name: str, url: str, port: int,
     layer_slots,
+    param_slots,
 ) -> dict:
     cmd = {
         "type":        "playground_register",
@@ -83,6 +92,7 @@ def _build_register_cmd(
         "url":         url,
         "port":        int(port),
         "layer_slots": list(layer_slots or []),
+        "param_slots": list(param_slots or []),
     }
     return cmd
 
@@ -93,6 +103,7 @@ def register(
     url: str,
     port: int,
     layer_slots=None,
+    param_slots=None,
     retry_s: float = 30.0,
 ) -> bool:
     """Register with the daemon, retrying up to `retry_s`.
@@ -101,7 +112,7 @@ def register(
     still works — it just doesn't appear in the docker.
     """
     cmd = _build_register_cmd(
-        playground_id, name, url, port, layer_slots,
+        playground_id, name, url, port, layer_slots, param_slots,
     )
     deadline = time.monotonic() + retry_s
     last_msg = "unknown error"
@@ -126,13 +137,14 @@ def register(
 def reregister_once(
     playground_id: str, name: str, url: str, port: int,
     layer_slots=None,
+    param_slots=None,
 ) -> bool:
     """Single-attempt registration.  Used by the browser self-heal path.
 
     Never retries, never sleeps.
     """
     cmd = _build_register_cmd(
-        playground_id, name, url, port, layer_slots,
+        playground_id, name, url, port, layer_slots, param_slots,
     )
     resp = _send(cmd, timeout=2.0)
     return _response_is_success(resp)

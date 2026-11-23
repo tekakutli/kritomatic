@@ -73,6 +73,23 @@ The docker's Playgrounds section renders the corresponding row for
 slots that are not marked `managed_by_playground: True` — see
 `_update_playgrounds` in `panel/docker.py`.
 
+Playground-claimed parameters
+=============================
+The same mechanism applies to *parameters*.  A registered playground
+may declare one or more param names it owns (via `param_slots` on
+register; see `handlers/playgrounds.py`'s PARAM SLOTS).  Those names
+disappear from the Parameters section, and if every workflow
+parameter is claimed the section is suppressed entirely — same rule
+as Resources.
+
+The claimed values are not shown *anywhere* the user can edit them.
+They are provided by the playground's `/params` route at generation
+time and substituted into the graph by
+`comfyui_generation._fetch_playground_params`.  Nothing on the
+docker side has to know or care: the values are simply absent from
+`comfy_apply_config` payloads because there's no widget to collect
+them from.
+
 Layer alias kind hints
 ======================
 Each resource slot has a `kind` from `comfyui_inspect`'s resource
@@ -389,6 +406,24 @@ def _claimed_resource_names(playgrounds: list) -> set:
     return out
 
 
+def _claimed_param_names(playgrounds: list) -> set:
+    """Return every parameter name claimed by any registered playground.
+
+    Walks each registration's `param_slots` (flat list of names).
+    Claimed params disappear from the Parameters section, and if every
+    workflow param is claimed the section is suppressed entirely.
+    See the module docstring, "Playground-claimed parameters".
+    """
+    out: set = set()
+    for p in playgrounds or ():
+        if not isinstance(p, dict):
+            continue
+        for name in (p.get("param_slots") or ()):
+            if isinstance(name, str) and name:
+                out.add(name)
+    return out
+
+
 class ResourcesProvider:
     """Per-@-name: a single composite row with the source dropdown and
     a conditional layer_name field.
@@ -513,6 +548,12 @@ class ParamsProvider:
     params it hides keep their `config_path` and value, so
     `build_config_from_widgets` still re-applies them through
     `comfy_apply_config` on every subsequent edit.
+
+    Params claimed by a registered playground are dropped from the
+    section entirely — see the module docstring, "Playground-claimed
+    parameters".  If *every* workflow param is claimed, the section
+    is suppressed.  The prefix-filter field goes with it, since
+    there's nothing left for it to filter.
     """
 
     def contribute(self, builder, ctx):
@@ -522,6 +563,18 @@ class ParamsProvider:
             return
         config = status.get("config") or {}
         cfg_params = config.get("params") or {}
+
+        claimed = _claimed_param_names(
+            status.get("playgrounds") or []
+        )
+        visible_titles = [
+            t for t in sorted(slots.keys()) if t not in claimed
+        ]
+        if not visible_titles:
+            # Every workflow param is claimed by a playground.
+            # The section would carry only the prefix field with
+            # nothing below it; suppress the whole section.
+            return
 
         fields = []
 
@@ -540,7 +593,7 @@ class ParamsProvider:
             "local_handler": "param_prefix_filter",
         })
 
-        for title in sorted(slots.keys()):
+        for title in visible_titles:
             slot = slots[title]
             kind = slot.get("kind", "string")
             widget_type, kind_default = _param_widget_and_default(kind)

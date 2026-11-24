@@ -178,10 +178,8 @@ def daemon_route_handlers(
             return None, str(e)
         if not isinstance(resp, dict):
             return None, "bad daemon response"
-        if resp.get("status") != "success":
-            return None, (
-                resp.get("message") or "daemon rejected comfy_status"
-            )
+        if not daemon_client.is_success(resp):
+            return None, resp.get("message") or "daemon rejected comfy_status"
         return resp.get("data") or {}, None
 
     def handle_active_state(_payload):
@@ -224,13 +222,9 @@ def daemon_route_handlers(
             cmd["name"] = name
 
         response = send(cmd, timeout=timeout_import)
-        if response.get("status") != "success":
-            return {
-                "success": False,
-                "message": (
-                    response.get("message") or "daemon rejected"
-                ),
-            }
+        if not daemon_client.is_success(response):
+            return {"success": False,
+                    "message": response.get("message") or "daemon rejected"}
 
         data = response.get("data") or {}
         data_url = data.get("data_url")
@@ -301,13 +295,10 @@ def daemon_route_handlers(
                 {"type": "get_layer_pixels_b64", "name": str(layer_name)},
                 timeout=timeout_layer,
             )
-            if response.get("status") != "success":
-                return {
-                    "success": False,
-                    "message": (
-                        response.get("message") or "daemon rejected"
-                    ),
-                }
+            if not daemon_client.is_success(response):
+                return {"success": False,
+                        "message": response.get("message") or "daemon rejected"}
+
             data = response.get("data") or {}
             data_url = data.get("data_url")
             if not data_url:

@@ -129,15 +129,17 @@ re-trigger `applyGeneratedImage`.
 import base64
 import hashlib
 import json
-import socket
 import threading
 import time
-
 from io import BytesIO
 
 from PIL import Image
 
-from . import krita_client, playground_registry
+from pgruntime import daemon_client as krita_client
+from pgruntime import event_bus
+from pgruntime.daemon_client import is_success as _is_success
+from pgruntime.daemon_registry import reregister_handler
+from pgruntime.daemon_routes import daemon_route_handlers
 
 
 PLAYGROUND_ID   = "outpaint"
@@ -352,122 +354,52 @@ def handle_params(_payload):
     return {"success": True, "values": values}
 
 
-def handle_playground_reregister(_payload):
-    url = f"http://127.0.0.1:{PLAYGROUND_PORT}"
-    ok = playground_registry.reregister_once(
-        PLAYGROUND_ID, PLAYGROUND_NAME, url, PLAYGROUND_PORT,
-        layer_slots=LAYER_SLOTS,
-        param_slots=PARAM_SLOTS,
-        control_params=CONTROL_PARAMS,
-    )
-    return {"success": bool(ok)}
-
+handle_playground_reregister = reregister_handler(
+    PLAYGROUND_ID, PLAYGROUND_NAME, PLAYGROUND_PORT,
+    layer_slots=LAYER_SLOTS,
+    param_slots=PARAM_SLOTS,
+    control_params=CONTROL_PARAMS,
+)
 
 # ---------------------------------------------------------------------------
 #  Event bus subscriber
 # ---------------------------------------------------------------------------
 
-def _event_bus_subscriber_loop():
-    """Connect to the daemon's event bus and stream events.
-
-    See the module docstring, EVENT BUS SUBSCRIPTION.  Reconnects on
-    any failure with a 2 s backoff.  Only `outpaint_result` events
-    are stored (in `_last_pasted`); everything else is discarded.
-    """
+def _handle_outpaint_result(data):
+    """Store the latest outpaint_result event for the browser to poll."""
     global _last_pasted
-    daemon_host = "127.0.0.1"
-    daemon_port = 12347
-
-    while True:
-        sock = None
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5.0)
-            sock.connect((daemon_host, daemon_port))
-            sock.settimeout(None)
-            _log(f"event bus subscriber connected on "
-                 f"{daemon_host}:{daemon_port}")
-
-            buf = b""
-            while True:
-                try:
-                    chunk = sock.recv(65536)
-                except OSError:
-                    break
-                if not chunk:
-                    break
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line.decode("utf-8"))
-                    except Exception:
-                        continue
-                    if not isinstance(event, dict):
-                        continue
-                    if event.get("type") != "outpaint_result":
-                        continue
-                    payload = event.get("data") or {}
-                    b64 = payload.get("b64")
-                    if not b64:
-                        continue
-                    entry = {
-                        "hash":    payload.get("hash"),
-                        "b64":     b64,
-                        "width":   int(payload.get("width") or 0),
-                        "height":  int(payload.get("height") or 0),
-                        "paste_x": int(payload.get("paste_x") or 0),
-                        "paste_y": int(payload.get("paste_y") or 0),
-                        "ts":      time.time(),
-                    }
-                    with _event_bus_lock:
-                        _last_pasted = entry
-                    _log(
-                        f"outpaint_result: "
-                        f"{entry['width']}\u00d7{entry['height']} "
-                        f"hash={str(entry['hash'])[:8]}"
-                    )
-        except (OSError, socket.timeout) as e:
-            _log(f"event bus subscriber: {e}")
-        finally:
-            if sock is not None:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-        time.sleep(2.0)
-
-
-def start_event_bus_subscriber() -> None:
-    """Start the event-bus subscriber thread.  Idempotent."""
-    if getattr(start_event_bus_subscriber, "_started", False):
+    if not isinstance(data, dict):
         return
-    start_event_bus_subscriber._started = True
-    threading.Thread(
-        target=_event_bus_subscriber_loop,
-        name="outpaint-event-bus-subscriber",
-        daemon=True,
-    ).start()
+    b64 = data.get("b64")
+    if not b64:
+        return
+    entry = {
+        "hash":    data.get("hash"),
+        "b64":     b64,
+        "width":   int(data.get("width") or 0),
+        "height":  int(data.get("height") or 0),
+        "paste_x": int(data.get("paste_x") or 0),
+        "paste_y": int(data.get("paste_y") or 0),
+        "ts":      time.time(),
+    }
+    with _event_bus_lock:
+        _last_pasted = entry
+    _log(
+        f"outpaint_result: {entry['width']}\u00d7{entry['height']} "
+        f"hash={str(entry['hash'])[:8]}"
+    )
+
+
+def start_event_bus_subscriber():
+    event_bus.subscribe(
+        {"outpaint_result": _handle_outpaint_result},
+        log_prefix="outpaint",
+    )
 
 
 # ---------------------------------------------------------------------------
 #  Krita proxies
 # ---------------------------------------------------------------------------
-
-def _fetch_active_state():
-    try:
-        resp = krita_client.send({"type": "comfy_status"}, timeout=10.0)
-    except Exception as e:
-        return None, str(e)
-    if not isinstance(resp, dict):
-        return None, "bad daemon response"
-    if not _is_success(resp):
-        return None, resp.get("message") or "daemon rejected comfy_status"
-    return resp.get("data") or {}, None
-
 
 def _is_success(resp):
     """Normalize a daemon response into a success boolean.
@@ -485,102 +417,16 @@ def _is_success(resp):
     return False
 
 
-def handle_active_state(_payload):
-    data, err = _fetch_active_state()
-    if err is not None:
-        return {
-            "success": False,
-            "daemon_reachable": False,
-            "message": err,
-        }
-    with _event_bus_lock:
-        last_pasted = dict(_last_pasted) if _last_pasted else None
-    return {
-        "success": True,
-        "daemon_reachable": True,
-        "data": data,
-        "last_pasted": last_pasted,
-    }
+_h = daemon_route_handlers()
 
+_active_state_base = _h["active_state"]
 
-def handle_krita_status(_payload):
-    return {"success": True, "reachable": krita_client.is_reachable()}
-
-
-def handle_import_image(payload):
-    name = (payload or {}).get("name") if isinstance(payload, dict) else None
-    cmd = {"type": "get_document_composite_b64"}
-    if name:
-        cmd["name"] = name
-
-    response = krita_client.send(cmd, timeout=60.0)
-    if not _is_success(response):
-        return {"success": False,
-                "message": response.get("message") or "daemon rejected"}
-
-    data = response.get("data") or {}
-    data_url = data.get("data_url")
-    if not data_url:
-        return {"success": False, "message": "daemon returned no data_url"}
-    if not data_url.startswith("data:image/png;base64,"):
-        return {"success": False,
-                "message": f"unexpected data_url prefix: {data_url[:30]!r}"}
-
-    try:
-        png_bytes = base64.b64decode(data_url.split(",", 1)[1])
-        img = Image.open(BytesIO(png_bytes))
-        w, h = img.size
-    except Exception as e:
-        return {"success": False, "message": f"decode failed: {e}"}
-
-    hash_hex = hashlib.sha256(png_bytes).hexdigest()[:16]
-    return {
-        "success":   True,
-        "hash":      hash_hex,
-        "width":     w,
-        "height":    h,
-        "data_url":  data_url,
-        "filename":  data.get("name") or "krita_composite",
-    }
-
-
-def handle_resource_image(payload):
-    if not isinstance(payload, dict):
-        return {"success": False, "message": "expected a JSON object"}
-
-    source = payload.get("source", "active")
-    layer_name = payload.get("layer_name")
-
-    if source == "active":
-        return handle_import_image({})
-    if source == "layer":
-        if not layer_name:
-            return {"success": False,
-                    "message": "layer_name is required when source=layer"}
-        response = krita_client.send(
-            {"type": "get_layer_pixels_b64", "name": str(layer_name)},
-            timeout=30.0,
-        )
-        if not _is_success(response):
-            return {"success": False,
-                    "message": response.get("message") or "daemon rejected"}
-        data = response.get("data") or {}
-        data_url = data.get("data_url")
-        if not data_url:
-            return {"success": False,
-                    "message": "daemon returned no data_url for layer"}
-        return {
-            "success": True,
-            "hash": "layer_" + str(layer_name),
-            "width": data.get("width"),
-            "height": data.get("height"),
-            "data_url": data_url,
-            "filename": str(layer_name),
-        }
-    return {
-        "success": False,
-        "message": f"source={source!r} cannot be displayed as an image.",
-    }
+def handle_active_state(payload):
+    res = _active_state_base(payload)
+    if res.get("success"):
+        with _event_bus_lock:
+            res["last_pasted"] = dict(_last_pasted) if _last_pasted else None
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -811,9 +657,9 @@ ROUTES = {
     "/state":                 handle_state,
     "/version":               handle_version,
     "/params":                handle_params,
-    "/krita_status":          handle_krita_status,
+    "/krita_status":          _h["krita_status"],
     "/active_state":          handle_active_state,
-    "/resource_image":        handle_resource_image,
+    "/resource_image":        _h["resource_image"],
     "/playground_reregister": handle_playground_reregister,
     "/generate":              handle_generate,
     "/send_to_krita":         handle_send_to_krita,

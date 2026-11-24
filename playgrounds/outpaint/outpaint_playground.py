@@ -62,7 +62,8 @@ except ValueError:
 if _PLAYGROUNDS not in sys.path:
     sys.path.insert(0, _PLAYGROUNDS)
 
-from outpaint import outpaint_html, outpaint_server, playground_registry
+from outpaint import outpaint_html, outpaint_server
+from pgruntime import daemon_registry as playground_registry
 
 from pgkit.server import serve_nonblocking
 
@@ -94,7 +95,7 @@ def descriptor():
 
 
 def _watch_daemon_and_exit():
-    from outpaint import krita_client
+    from pgruntime import daemon_client as krita_clien
 
     consecutive = 0
     while True:
@@ -199,6 +200,7 @@ def main():
         param_slots=PARAM_SLOTS,
         control_params=CONTROL_PARAMS,
         retry_s=30.0,
+        log_prefix="outpaint",
     )
     if registered:
         print(
@@ -220,7 +222,7 @@ def main():
     # ---- Clean-exit plumbing ----
     def _cleanup():
         try:
-            playground_registry.unregister(PLAYGROUND_ID)
+            playground_registry.unregister(PLAYGROUND_ID, log_prefix="outpaint")
         except Exception:
             pass
         try:

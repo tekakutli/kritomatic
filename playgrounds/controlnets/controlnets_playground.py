@@ -50,7 +50,8 @@ except ValueError:
 if _PLAYGROUNDS not in sys.path:
     sys.path.insert(0, _PLAYGROUNDS)
 
-from controlnets import controlnets_html, controlnets_server, playground_registry
+from controlnets import controlnets_html, controlnets_server
+from pgruntime import daemon_registry as playground_registry
 
 from pgkit.server import serve_nonblocking
 
@@ -80,7 +81,7 @@ def descriptor():
 
 
 def _watch_daemon_and_exit():
-    from controlnets import krita_client
+    from pgruntime import daemon_client as krita_client
 
     consecutive = 0
     while True:
@@ -157,6 +158,7 @@ def main():
         PLAYGROUND_ID, PLAYGROUND_NAME, state_url, actual_port,
         layer_slots=LAYER_SLOTS,
         retry_s=30.0,
+        log_prefix="controlnets",
     )
     if registered:
         print(
@@ -174,7 +176,7 @@ def main():
 
     def _cleanup():
         try:
-            playground_registry.unregister(PLAYGROUND_ID)
+            playground_registry.unregister(PLAYGROUND_ID, log_prefix="controlnets")
         except Exception:
             pass
         try:

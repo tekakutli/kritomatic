@@ -45,24 +45,14 @@ from __future__ import annotations
 import sys
 import time
 
-from .daemon_client import send as _send
-
-
-def _response_is_success(resp: dict) -> bool:
-    if not isinstance(resp, dict):
-        return False
-    if resp.get("status") == "success":
-        return True
-    if resp.get("success") is True:
-        return True
-    return False
+from .daemon_client import is_success as _response_is_success, send as _send
 
 
 def _build_register_cmd(
     playground_id: str, name: str, url: str, port: int,
-    layer_slots,
+    layer_slots, param_slots, control_params,
 ) -> dict:
-    return {
+    cmd = {
         "type":        "playground_register",
         "id":          playground_id,
         "name":        name,
@@ -70,6 +60,16 @@ def _build_register_cmd(
         "port":        int(port),
         "layer_slots": list(layer_slots or []),
     }
+    # Param slots and control params are conditional so that the six
+    # playgrounds that don't use them register with the exact payload
+    # they had before this module grew these fields.  A daemon that
+    # compares registrations byte-for-byte for self-heal purposes
+    # won't see a spurious re-register when nothing changed.
+    if param_slots:
+        cmd["param_slots"] = list(param_slots)
+    if control_params:
+        cmd["control_params"] = list(control_params)
+    return cmd
 
 
 def register(
@@ -78,6 +78,8 @@ def register(
     url: str,
     port: int,
     layer_slots=None,
+    param_slots=None,
+    control_params=None,
     retry_s: float = 30.0,
     log_prefix: str = "playground",
 ) -> bool:
@@ -88,7 +90,8 @@ def register(
     `@*` layer slots don't get a Playgrounds row.
     """
     cmd = _build_register_cmd(
-        playground_id, name, url, port, layer_slots,
+        playground_id, name, url, port,
+        layer_slots, param_slots, control_params,
     )
     deadline = time.monotonic() + retry_s
     last_msg = "unknown error"
@@ -110,18 +113,41 @@ def register(
         time.sleep(1.0)
 
 
+def reregister_handler(
+    playground_id: str, name: str, port: int,
+    layer_slots=None,
+    param_slots=None,
+    control_params=None,
+):
+    """Return a route handler for `/playground_reregister`.
+
+    The handler ignores its payload, builds the local URL from
+    `port`, calls `reregister_once`, and returns
+    ``{"success": bool}``.  This is the shape every playground's
+    `handle_playground_reregister` body has been, verbatim, since the
+    first one was written.
+    """
+    def _handle(_payload):
+        url = f"http://127.0.0.1:{port}"
+        ok = reregister_once(
+            playground_id, name, url, port,
+            layer_slots=layer_slots,
+            param_slots=param_slots,
+            control_params=control_params,
+        )
+        return {"success": bool(ok)}
+    return _handle
+
+
 def reregister_once(
     playground_id: str, name: str, url: str, port: int,
     layer_slots=None,
+    param_slots=None,
+    control_params=None,
 ) -> bool:
-    """Single-attempt registration.  Used by the browser self-heal path.
-
-    Never retries, never sleeps.  A failed reregister is fine — the
-    poller that noticed the missing entry will try again on its next
-    tick, throttled by the browser-side `_reregisterIfMissing` gate.
-    """
     cmd = _build_register_cmd(
-        playground_id, name, url, port, layer_slots,
+        playground_id, name, url, port,
+        layer_slots, param_slots, control_params,
     )
     resp = _send(cmd, timeout=2.0)
     return _response_is_success(resp)

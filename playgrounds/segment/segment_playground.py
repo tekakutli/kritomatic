@@ -22,7 +22,8 @@ except ValueError:
 if _PLAYGROUNDS not in sys.path:
     sys.path.insert(0, _PLAYGROUNDS)
 
-from segment import segment_html, segment_server, playground_registry
+from segment import segment_html, segment_server
+from pgruntime import daemon_registry as playground_registry
 
 from pgkit.server import serve as kit_serve
 
@@ -63,6 +64,7 @@ def main():
         PLAYGROUND_ID, PLAYGROUND_NAME, state_url, PORT,
         layer_slots=LAYER_SLOTS,
         retry_s=30.0,
+        log_prefix="segment",
     )
     if registered:
         print(
@@ -81,7 +83,7 @@ def main():
 
     def _cleanup():
         try:
-            playground_registry.unregister(PLAYGROUND_ID)
+            playground_registry.unregister(PLAYGROUND_ID, log_prefix="segment")
         except Exception:
             pass
 

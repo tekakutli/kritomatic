@@ -73,8 +73,9 @@ from pg_comfy import (
     substitute_into_graph,
 )
 
-from . import krita_client
-from . import playground_registry
+from pgruntime import daemon_client as krita_client
+from pgruntime import daemon_registry as playground_registry
+from pgruntime.daemon_routes import daemon_route_handlers
 
 
 COMFY_HOST = "127.0.0.1"
@@ -335,25 +336,6 @@ def handle_status(_payload) -> dict:
         "segment_workflow_path": str(WORKFLOW_SEGMENT_PATH),
         "refine_workflow_path": str(WORKFLOW_REFINE_PATH),
     }
-
-
-# ---------------------------------------------------------------------------
-#  /comfy/active_state — proxy daemon comfy_status
-# ---------------------------------------------------------------------------
-
-def _fetch_active_state() -> dict:
-    try:
-        resp = krita_client.send({"type": "comfy_status"}, timeout=10.0)
-    except Exception:
-        return {}
-    if not isinstance(resp, dict) or resp.get("status") != "success":
-        return {}
-    return resp.get("data") or {}
-
-
-def handle_active_state(_payload) -> dict:
-    data = _fetch_active_state()
-    return {"success": True, "data": data}
 
 
 # ---------------------------------------------------------------------------
@@ -853,10 +835,6 @@ def handle_interrupt(_payload) -> dict:
 #  Krita export / import
 # ---------------------------------------------------------------------------
 
-def handle_krita_status(_payload) -> dict:
-    reachable = krita_client.is_reachable()
-    return {"success": True, "reachable": reachable}
-
 
 def _coerce_edge_args(payload: dict) -> dict:
     def _int(key):
@@ -1024,166 +1002,6 @@ def handle_krita_apply(payload: dict) -> dict:
     return _extract_with_post_apply(payload, edge)
 
 
-def handle_krita_import(payload: dict) -> dict:
-    from pg_comfy.image import make_encoded_image
-
-    name = None
-    if isinstance(payload, dict):
-        name = payload.get("name")
-
-    if name:
-        command = {"type": "get_document_composite_b64", "name": name}
-        response = krita_client.send(command, timeout=60.0)
-        _capture_document_from_response(response)
-    else:
-        response = _send_with_pin(
-            {"type": "get_document_composite_b64"},
-            doc_arg="name",
-            timeout=60.0,
-        )
-
-    if response.get("status") != "success":
-        return {"success": False,
-                "message": response.get("message") or "daemon rejected"}
-
-    data = response.get("data") or {}
-    data_url = data.get("data_url")
-    if not data_url:
-        return {"success": False, "message": "daemon returned no data_url"}
-    if not data_url.startswith("data:image/png;base64,"):
-        return {"success": False,
-                "message": f"unexpected data_url prefix: {data_url[:30]!r}"}
-
-    try:
-        png_bytes = base64.b64decode(data_url.split(",", 1)[1])
-    except Exception as e:
-        return {"success": False,
-                "message": f"could not decode base64: {e}"}
-
-    try:
-        encoded = make_encoded_image(png_bytes)
-    except Exception as e:
-        return {"success": False,
-                "message": f"could not decode image: {e}"}
-
-    h = encoded.content_hash
-    filename = data.get("name") or "krita_composite"
-    _cache_image(h, png_bytes, encoded.width, encoded.height, filename)
-    _log(f"import {filename!r} {encoded.width}x{encoded.height} → {h}")
-
-    return {
-        "success": True,
-        "hash": h,
-        "width": encoded.width,
-        "height": encoded.height,
-        "data_url": data_url,
-        "filename": filename,
-    }
-
-
-def handle_krita_import_masks(payload: dict) -> dict:
-    command = {"type": "import_krita_masks_b64"}
-    if isinstance(payload, dict):
-        if "layer_names" in payload and payload["layer_names"]:
-            command["layer_names"] = str(payload["layer_names"])
-        if "include_paint_alpha" in payload:
-            command["include_paint_alpha"] = bool(
-                payload["include_paint_alpha"]
-            )
-        if "prefer_selection_mask_children" in payload:
-            command["prefer_selection_mask_children"] = bool(
-                payload["prefer_selection_mask_children"]
-            )
-
-    response = _send_with_pin(command, timeout=60.0)
-    if response.get("status") != "success":
-        return {
-            "success": False,
-            "message": response.get("message") or "daemon rejected",
-        }
-
-    data = response.get("data") or {}
-    masks = data.get("masks") or []
-    skipped = data.get("skipped") or []
-    selection_path = data.get("selection_path") or "unknown"
-
-    return {
-        "success": True,
-        "masks": masks,
-        "skipped": skipped,
-        "selection_path": selection_path,
-        "message": response.get("message") or f"{len(masks)} mask(s)",
-    }
-
-
-def handle_resource_image(payload: dict) -> dict:
-    """Resolve a `{source, layer_name}` spec to a PNG data URL.
-
-    For source=active this is a thin wrapper over `handle_krita_import`
-    (same cache).  For source=layer, fetch the named layer's pixels
-    and cache the raw bytes under their content hash so segment/refine
-    can look the image up later.
-    """
-    from pg_comfy.image import make_encoded_image
-
-    if not isinstance(payload, dict):
-        return {"success": False, "message": "expected a JSON object"}
-
-    source = payload.get("source", "active")
-    layer_name = payload.get("layer_name")
-
-    if source == "active":
-        return handle_krita_import({})
-
-    if source == "layer":
-        if not layer_name:
-            return {"success": False,
-                    "message": "layer_name is required when source=layer"}
-
-        response = _send_with_pin(
-            {"type": "get_layer_pixels_b64", "name": str(layer_name)},
-            timeout=30.0,
-        )
-        if response.get("status") != "success":
-            return {"success": False,
-                    "message": response.get("message") or "daemon rejected"}
-        data = response.get("data") or {}
-        data_url = data.get("data_url")
-        if not data_url:
-            return {"success": False,
-                    "message": "daemon returned no data_url for layer"}
-        if not data_url.startswith("data:image/png;base64,"):
-            return {"success": False,
-                    "message": f"unexpected data_url prefix: {data_url[:30]!r}"}
-
-        try:
-            png_bytes = base64.b64decode(data_url.split(",", 1)[1])
-            encoded = make_encoded_image(png_bytes)
-        except Exception as e:
-            return {"success": False,
-                    "message": f"could not decode layer image: {e}"}
-
-        h = encoded.content_hash
-        _cache_image(h, png_bytes, encoded.width, encoded.height,
-                     str(layer_name))
-        return {
-            "success": True,
-            "hash": h,
-            "width": encoded.width,
-            "height": encoded.height,
-            "data_url": data_url,
-            "filename": str(layer_name),
-        }
-
-    return {
-        "success": False,
-        "message": (
-            f"source={source!r} cannot be displayed as an image "
-            f"(@thesegment expects 'active' or 'layer')."
-        ),
-    }
-
-
 def handle_rebind_document(_payload) -> dict:
     global _target_document_name
     with _target_lock:
@@ -1209,18 +1027,99 @@ def handle_rebind_document(_payload) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+#  Shared daemon routes — adapted to segment's pinning + caching contract
+# ---------------------------------------------------------------------------
+#
+# The shared `daemon_route_handlers(send=...)` factory accepts a uniform
+# `send(command, timeout=...)` callable.  Segment's `_send_with_pin`
+# dispatches on command type:
+#
+#   · get_document_composite_b64  with an explicit `name`  → direct send,
+#                                    then _capture_document_from_response
+#   · get_document_composite_b64  without `name`          → _send_with_pin
+#                                                              doc_arg="name"
+#   · comfy_status                                        → direct send
+#   · everything else                                     → _send_with_pin
+#                                                              doc_arg="document"
+#
+# `_pinned_send` is that dispatch, wired to the shared handlers' uniform
+# signature.  It mirrors the behavior segment has always had:
+# `_fetch_active_state` never pinned `comfy_status`; `handle_krita_import`
+# took the `name`-branch direct; everything else went through
+# `_send_with_pin`.
+
+def _pinned_send(command: dict, *, timeout: float = 60.0) -> dict:
+    ctype = command.get("type")
+    if ctype == "get_document_composite_b64":
+        if command.get("name"):
+            resp = krita_client.send(command, timeout=timeout)
+            _capture_document_from_response(resp)
+            return resp
+        return _send_with_pin(command, doc_arg="name", timeout=timeout)
+    if ctype == "comfy_status":
+        return krita_client.send(command, timeout=timeout)
+    return _send_with_pin(command, doc_arg="document", timeout=timeout)
+
+
+_h = daemon_route_handlers(send=_pinned_send)
+
+
+# Segment caches the raw PNG bytes by hash at import time, so
+# `/comfy/segment` and `/comfy/refine` can look them up without an extra
+# daemon round-trip.  The shared handlers don't have this side effect;
+# wrap both `/krita/import` and `/krita/resource_image` (the latter is
+# the actual autosync path — source="active" calls import_image
+# internally, but the wrapping happens on the outer resource_image
+# result).
+
+def _cache_from_result(res: dict) -> None:
+    if not isinstance(res, dict):
+        return
+    if not res.get("success"):
+        return
+    h = res.get("hash")
+    data_url = res.get("data_url")
+    if not h or not data_url:
+        return
+    try:
+        png_bytes = base64.b64decode(data_url.split(",", 1)[1])
+    except Exception:
+        return
+    _cache_image(
+        h, png_bytes,
+        res.get("width") or 0,
+        res.get("height") or 0,
+        res.get("filename") or "",
+    )
+
+
+_import_base = _h["import_image"]
+def handle_krita_import(payload):
+    res = _import_base(payload)
+    _cache_from_result(res)
+    return res
+
+
+_resource_base = _h["resource_image"]
+def handle_resource_image(payload):
+    res = _resource_base(payload)
+    _cache_from_result(res)
+    return res
+
+
 ROUTES = {
     "/version":               handle_version,
     "/playground_reregister": handle_playground_reregister,
     "/comfy/status":          handle_status,
-    "/comfy/active_state":    handle_active_state,
+    "/comfy/active_state":    _h["active_state"],
     "/comfy/segment":         handle_segment,
     "/comfy/refine":          handle_refine,
     "/comfy/interrupt":       handle_interrupt,
-    "/krita/status":          handle_krita_status,
+    "/krita/status":          _h["krita_status"],
     "/krita/apply":           handle_krita_apply,
     "/krita/import":          handle_krita_import,
-    "/krita/import_masks":    handle_krita_import_masks,
+    "/krita/import_masks":    _h["import_masks"],
     "/krita/resource_image":  handle_resource_image,
     "/rebind_document":       handle_rebind_document,
 }

@@ -62,6 +62,23 @@ def is_reachable(timeout: float = 1.5) -> bool:
                 pass
 
 
+def is_success(resp) -> bool:
+    """Normalize a daemon response to a success boolean.
+
+    Accepts either ``{"status": "success", ...}`` or
+    ``{"success": true, ...}``.  The daemon's socket layer emits the
+    first for every command today; older handlers in the daemon tree
+    use the second shape internally.  Both mean "this worked".
+    """
+    if not isinstance(resp, dict):
+        return False
+    if resp.get("status") == "success":
+        return True
+    if resp.get("success") is True:
+        return True
+    return False
+
+
 def send(command: dict, timeout: float = 60.0) -> dict:
     """Open a fresh socket, send one JSON line, read one JSON line.
 

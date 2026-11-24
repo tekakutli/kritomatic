@@ -55,10 +55,16 @@ need to reverse-look it up.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import sys
 import uuid
 from typing import Optional
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PLAYGROUNDS = os.path.dirname(_HERE)
+if _PLAYGROUNDS not in sys.path:
+    sys.path.insert(0, _PLAYGROUNDS)
 
 try:
     import readline  # noqa: F401 — importing enables line editing
@@ -66,6 +72,7 @@ try:
 except ImportError:
     _READLINE = False
 
+from pgruntime.ports import ws_url_for
 from pgkit.remote_cli_client import (
     RemoteCliClient,
     RemoteCliError,
@@ -244,7 +251,7 @@ def _set_hub_pg_names_from_playgrounds(pgs):
 
 
 def _hub_ws_url(config: dict) -> str:
-    hub = config.get("hub", "ws://127.0.0.1:8780")
+    hub = config.get("hub") or ws_url_for("hub")
     return hub.rstrip("/") + "/__hub_ws"
 
 

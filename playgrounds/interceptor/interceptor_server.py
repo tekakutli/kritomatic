@@ -199,6 +199,9 @@ import urllib.request
 
 from inpaint import krita_client
 
+from pgruntime.ports import port_for
+
+PLAYGROUND_PORT = port_for("interceptor")
 
 _TASKS: dict = {}
 _LOCK = threading.Lock()

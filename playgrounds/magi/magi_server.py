@@ -64,11 +64,12 @@ import urllib.request
 
 from pgruntime.daemon_routes import daemon_route_handlers
 from pgruntime import daemon_registry as playground_registry
+from pgruntime.ports import port_for
 
 
 PLAYGROUND_ID   = "magi"
 PLAYGROUND_NAME = "MAGI Embedding Editor"
-PLAYGROUND_PORT = 8778
+PLAYGROUND_PORT = port_for(PLAYGROUND_ID)
 
 LAYER_SLOTS = [
     {

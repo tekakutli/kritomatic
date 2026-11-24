@@ -23,11 +23,13 @@ if _PLAYGROUNDS not in sys.path:
 
 from text_wall import text_wall_html, text_wall_kra
 
+from pgruntime.ports import port_for
+
 from pgkit.server import serve as kit_serve
 
 
 HTML_FILE    = "text_wall_playground.html"
-PORT         = 8767
+PORT         = port_for("text_wall")
 SERVE        = True
 OPEN_BROWSER = True
 

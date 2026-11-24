@@ -2,7 +2,7 @@
 
     python controlnets_playground.py
 
-Writes controlnets.html, serves it at http://127.0.0.1:8779/.
+Writes controlnets.html
 
 The playground is a state host: it registers with the daemon with an
 `@thecontrolnet` layer slot, pulls the current image from that slot
@@ -20,9 +20,10 @@ shape: `/state` pull + `/version` IS_CHANGED + per-item hash fetch.
 
 Fixed port, no silent fallback
 ==============================
-Downstream consumers will hardcode `http://127.0.0.1:8779/state`.  If
-this playground silently bound to a different port, they'd see a
-stale / empty state.  Bind first, verify, refuse to start otherwise.
+Downstream consumers derive the URL from
+`pgruntime.ports.url_for("controlnets", "/state")`.  If this
+playground silently bound to a different port, they'd see a stale /
+empty state.  Bind first, verify, refuse to start otherwise.
 
 Signal handling
 ===============
@@ -57,7 +58,7 @@ from pgkit.server import serve_nonblocking
 
 
 HTML_FILE    = "controlnets.html"
-PORT         = 8779
+PORT         = controlnets_server.PLAYGROUND_PORT
 OPEN_BROWSER = True
 
 PLAYGROUND_ID   = controlnets_server.PLAYGROUND_ID

@@ -57,11 +57,13 @@ for _p in (_PLAYGROUNDS, _SHARED_CABLE_ROOM):
 
 from cone import cone_html, cone_kra
 
+from pgruntime.ports import port_for
+
 from pgkit.server import serve as kit_serve
 
 
 HTML_FILE    = "cone_playground.html"
-PORT         = 8766
+PORT         = port_for("cone")
 SERVE        = True
 OPEN_BROWSER = True
 

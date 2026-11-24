@@ -27,7 +27,7 @@ from pgkit.server import serve as kit_serve
 
 
 HTML_FILE    = "board_playground.html"
-PORT         = 8770
+PORT         = board_server.PLAYGROUND_PORT
 SERVE        = True
 OPEN_BROWSER = True
 

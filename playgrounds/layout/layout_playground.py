@@ -2,8 +2,8 @@
 
     python layout_playground.py
 
-Writes layout.html, serves it at http://127.0.0.1:8777/.  State is
-served at /state for the `DrawatoonSetIP` ComfyUI node.
+Writes layout.html
+State is served at /state for the `DrawatoonSetIP` ComfyUI node.
 
 Registers with the kritomatic daemon on startup.  The docker renders
 a "Playground Input" section with one row per (playground, layer
@@ -36,9 +36,10 @@ based on the current viewer ratio, so the working size is
 
 Fixed port, no silent fallback
 ==============================
-`DrawatoonSetIP` in the ComfyUI workflow hardcodes
-`http://127.0.0.1:8777/state`.  If this playground silently bound to a
-different port (e.g., because 8777 was occupied by a stale process),
+`DrawatoonSetIP` in the ComfyUI workflow derives its URL from
+`pgruntime.ports.url_for("layout", "/state")`.  If this playground
+silently bound to a different port
+(e.g., because that port was occupied by a stale process),
 the node would fail to fetch bboxes and fall back to `void_ip_embed`
 — generation would succeed but **layout boxes would have no effect**,
 with no error anywhere.
@@ -85,7 +86,7 @@ from pgkit.server import serve_nonblocking
 
 
 HTML_FILE    = "layout.html"
-PORT         = 8777
+PORT         = layout_server.PLAYGROUND_PORT
 OPEN_BROWSER = True
 
 PLAYGROUND_ID   = layout_server.PLAYGROUND_ID

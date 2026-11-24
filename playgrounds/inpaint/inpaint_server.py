@@ -236,6 +236,7 @@ from PIL import Image
 
 from pg_comfy import ComfyError, get_client, reset_client
 from pg_comfy.image import make_encoded_image
+from pgruntime.ports import port_for
 
 from . import krita_client
 from . import playground_registry
@@ -254,7 +255,7 @@ SYNC_TIMEOUT = 30.0
 # module docstring, PLAYGROUND IDENTITY.
 PLAYGROUND_ID   = "inpaint"
 PLAYGROUND_NAME = "Inpaint"
-PLAYGROUND_PORT = 8774
+PLAYGROUND_PORT = port_for(PLAYGROUND_ID)
 
 LAYER_SLOTS = [
     # User-editable via the docker's Playgrounds section.

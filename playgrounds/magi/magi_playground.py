@@ -2,7 +2,7 @@
 
     python magi_playground.py
 
-Writes magi.html, serves it at http://127.0.0.1:8778/.  State is
+Writes magi.html, State is
 served at /state for any consumer (currently the DrawatoonSetIP
 node, which reads it via the layout playground once wiring lands).
 
@@ -30,8 +30,8 @@ All bboxes are normalized [0,1] of image, in (x1,y1,x2,y2) order.
 
 Fixed port, no silent fallback
 ==============================
-Later, the layout playground (or a bridging node) will hardcode
-`http://127.0.0.1:8778/state` to consume this playground's output.
+Later, the layout playground (or a bridging node) will consume this
+playground's output at `pgruntime.ports.url_for("magi", "/state")`.
 If this playground silently bound to a different port, the consumer
 would see a stale / empty state and silently produce wrong output.
 
@@ -73,7 +73,7 @@ from pgkit.server import serve_nonblocking
 
 
 HTML_FILE    = "magi.html"
-PORT         = 8778
+PORT         = magi_server.PLAYGROUND_PORT
 OPEN_BROWSER = True
 
 PLAYGROUND_ID   = magi_server.PLAYGROUND_ID

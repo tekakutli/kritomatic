@@ -76,6 +76,7 @@ from pg_comfy import (
 from pgruntime import daemon_client as krita_client
 from pgruntime import daemon_registry as playground_registry
 from pgruntime.daemon_routes import daemon_route_handlers
+from pgruntime.ports import port_for
 
 
 COMFY_HOST = "127.0.0.1"
@@ -85,7 +86,7 @@ GENERATE_TIMEOUT = 120.0
 # Identity — mirrors inpaint's LAYER_SLOTS contract.
 PLAYGROUND_ID   = "segment"
 PLAYGROUND_NAME = "Segment"
-PLAYGROUND_PORT = 8773
+PLAYGROUND_PORT = port_for(PLAYGROUND_ID)
 
 LAYER_SLOTS = [
     {"id": "@thesegment"},

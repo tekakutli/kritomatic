@@ -2,7 +2,7 @@
 
     python inpaint_playground.py
 
-Writes inpaint.html, serves it at http://127.0.0.1:8774/, and serves
+Writes inpaint.html, and serves
 /modules/* from the module manifest.
 
 The inpaint workflow is whatever the daemon currently has loaded — the

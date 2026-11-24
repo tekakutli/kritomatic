@@ -49,7 +49,6 @@ is checked into the repo, and is edited in place.
 
 ```json
 {
-  "hub": "ws://127.0.0.1:8780",
   "default_target": "segment",
   "timeout": 10.0
 }
@@ -87,8 +86,9 @@ python remote_cli/remote_cli.py --target segment validate flow.json
 # Bypass the hub proxy, still using the registry
 python remote_cli/remote_cli.py --target board --direct ls
 
-# Standalone (no hub running)
-python remote_cli/remote_cli.py --url ws://127.0.0.1:8773/remote ls
+# Standalone (no hub running). Segment binds 8774; see
+# pgruntime.ports for the current value of any playground.
+python remote_cli/remote_cli.py --url ws://127.0.0.1:8774/remote ls
 ```
 
 `--json` produces machine-readable output on the commands that have a
@@ -141,7 +141,7 @@ For anything more complex than the REPL, import the client directly:
 ```python
 from pgkit.remote_cli_client import RemoteCliClient
 
-with RemoteCliClient("ws://127.0.0.1:8780/sam3/remote") as client:
+with RemoteCliClient(ws_url_for("hub") + "/segment/remote") as client:
     client.bundle(
         set={
             "settings.threshold":        0.55,

@@ -60,8 +60,9 @@ from comfy_api.latest import ComfyExtension, io
 import folder_paths
 from comfy_execution.graph_utils import GraphBuilder
 
+from pgruntime.ports import base_url_for, ws_url_for
 
-_DEFAULT_PLAYGROUND_URL = "http://127.0.0.1:8776"
+_DEFAULT_PLAYGROUND_URL = base_url_for("multimask")
 _DEFAULT_CROP_PADDING   = 32
 
 
@@ -249,10 +250,10 @@ class MultiAreaConditioning(io.ComfyNode):
                     default=_DEFAULT_PLAYGROUND_URL,
                     optional=True,
                     tooltip=(
-                        "Base URL of the multimask playground. "
-                        "Standalone: http://127.0.0.1:8776 . "
-                        "Under the pgkit hub: http://127.0.0.1:8780/multimask . "
-                        "Leave blank to use the default."
+                        f"Base URL of the multimask playground. "
+                        f"Standalone: {base_url_for('multimask')} . "
+                        f"Under the pgkit hub: {ws_url_for('hub')}/multimask . "
+                        f"Leave blank to use the default."
                     ),
                 ),
                 io.String.Input(

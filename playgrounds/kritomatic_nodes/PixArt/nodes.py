@@ -28,18 +28,11 @@ import folder_paths
 
 from .conf import pixart_conf
 from .loader import load_pixart
+from pgruntime.ports import url_for
 
 
-# ---------------------------------------------------------------------------
-# Layout playground endpoints — fixed contract.
-#
-# The layout playground is served by `playgrounds/layout/` on port 8777.
-# Change these constants if you relocate it, but note the daemon's
-# playground registry uses the same URL for layer-selector syncing —
-# keep them in sync.
-# ---------------------------------------------------------------------------
-_LAYOUT_STATE_URL   = "http://127.0.0.1:8777/state"
-_LAYOUT_VERSION_URL = "http://127.0.0.1:8777/version"
+_LAYOUT_STATE_URL   = url_for("layout", "/state")
+_LAYOUT_VERSION_URL = url_for("layout", "/version")
 _LAYOUT_FETCH_TIMEOUT_S = 2.0
 
 

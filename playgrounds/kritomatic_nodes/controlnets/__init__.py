@@ -107,9 +107,9 @@ from pathlib import Path
 from comfy_api.latest import ComfyExtension, io
 import folder_paths
 from comfy_execution.graph_utils import GraphBuilder
+from pgruntime.ports import base_url_for, ws_url_for
 
-
-_DEFAULT_PLAYGROUND_URL = "http://127.0.0.1:8779"
+_DEFAULT_PLAYGROUND_URL = base_url_for("controlnets")
 
 
 # ---------------------------------------------------------------------------
@@ -373,10 +373,9 @@ class ControlNetsConditioning(io.ComfyNode):
                     default=_DEFAULT_PLAYGROUND_URL,
                     optional=True,
                     tooltip=(
-                        "Base URL of the controlnets playground. "
-                        "Standalone: http://127.0.0.1:8779 . "
-                        "Under the pgkit hub: "
-                        "http://127.0.0.1:8780/controlnets ."
+                        f"Base URL of the controlnets playground. "
+                        f"Standalone: {base_url_for('controlnets')} . "
+                        f"Under the pgkit hub: {ws_url_for('hub')}/controlnets ."
                     ),
                 ),
                 io.String.Input(

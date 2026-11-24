@@ -2,7 +2,7 @@
 
     python interceptor_playground.py
 
-Writes interceptor.html, serves it at http://127.0.0.1:8775/.
+Writes interceptor.html
 
 The interceptor receives tasks from another playground (by default,
 the inpaint playground's "Route via interceptor" mode), lets the user
@@ -30,7 +30,7 @@ from pgkit.server import serve as kit_serve
 
 
 HTML_FILE    = "interceptor.html"
-PORT         = 8775
+PORT         = interceptor_server.PLAYGROUND_PORT
 OPEN_BROWSER = True
 
 

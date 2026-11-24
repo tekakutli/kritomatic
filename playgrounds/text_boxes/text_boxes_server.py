@@ -39,6 +39,10 @@ import socket
 
 from . import text_boxes_krita
 
+from pgruntime.ports import port_for
+
+PLAYGROUND_PORT = port_for("text_boxes")
+
 
 def _log(msg):
     print(f"[text_boxes] {msg}", flush=True)
@@ -60,7 +64,7 @@ def handle_debug(payload):
     """Diagnostic: report daemon reachability and route table.
 
     Hit this from a browser:  fetch('/debug', {method:'POST', body:'{}'})
-    or from curl:             curl -s -X POST http://127.0.0.1:8771/debug
+    or from curl:             curl -s -X POST http://127.0.0.1:<playground_port>/debug
     """
     info = {
         "success": True,

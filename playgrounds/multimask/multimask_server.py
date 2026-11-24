@@ -90,6 +90,7 @@ from io import BytesIO
 from PIL import Image
 
 from pgruntime.daemon_routes import daemon_route_handlers
+from pgruntime.ports import port_for, base_url_for
 
 
 _state_lock = threading.Lock()
@@ -97,10 +98,11 @@ _state     = None
 _masks     = {}
 _version   = ""
 
+PLAYGROUND_PORT = port_for("multimask")
 COMFY_URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188").rstrip("/")
 
 INPAINT_URL = os.environ.get(
-    "MULTIMASK_INPAINT_URL", "http://127.0.0.1:8774",
+    "MULTIMASK_INPAINT_URL", base_url_for("inpaint"),
 ).rstrip("/")
 
 

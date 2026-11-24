@@ -2,7 +2,7 @@
 
     python multimask_playground.py
 
-Writes multimask.html, serves it at http://127.0.0.1:8776/.
+Writes multimask.html
 The playground's state is served at /state for the
 `MultiAreaConditioning` ComfyUI node.
 
@@ -55,7 +55,7 @@ from pgkit.server import serve as kit_serve
 
 
 HTML_FILE    = "multimask.html"
-PORT         = 8776
+PORT         = multimask_server.PLAYGROUND_PORT
 OPEN_BROWSER = True
 
 

@@ -3,7 +3,7 @@
 remote_cli — command-line client for pgkit playgrounds.
 
     python remote_cli.py --target segment [COMMAND ...]
-    python remote_cli.py --url ws://127.0.0.1:8773/remote [COMMAND ...]
+    python remote_cli.py --url <ws-url> [COMMAND ...]
     python remote_cli.py [COMMAND ...]           # uses default_target
 
 Without a subcommand, opens an interactive REPL.  Without --target and
@@ -28,6 +28,12 @@ html_file, group, available}` for each registration.
     --url URL              literal; no discovery. Use this for
                            standalone playgrounds when the hub is
                            not running.
+
+Playground ports and the hub port are single-sourced from
+`pgruntime.ports` — see `PLAYGROUND_PORTS` there for the current
+values.  `default_target` in `config.json` picks which playground
+`--target` defaults to; `hub` overrides the hub URL (default is
+`pgruntime.ports.ws_url_for("hub")`).
 
 `list-targets` does the same `/__playgrounds` query and prints the
 result — no target connect, no WS traffic.
@@ -75,6 +81,10 @@ what gets read.
 
 A missing or unparseable config falls back to built-in defaults with
 a warning on stderr. The CLI keeps working either way.
+
+The `hub` key is optional: when omitted, the CLI uses
+`pgruntime.ports.ws_url_for("hub")`.  Set it explicitly only to
+override (e.g. a remote hub).
 """
 
 from __future__ import annotations
@@ -88,14 +98,15 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-# --- sys.path: make `pgkit` and `remote_cli` importable regardless of
-#     the working directory the script is run from.
+# --- sys.path: make `pgkit`, `pgruntime`, and `remote_cli` importable
+#     regardless of the working directory the script is run from.
 _HERE = Path(__file__).resolve().parent
 _PARENT = _HERE.parent
 for _p in (_HERE, _PARENT):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+from pgruntime.ports import ws_url_for  # noqa: E402
 from pgkit.remote_cli_client import (  # noqa: E402
     RemoteCliClient,
     RemoteCliError,
@@ -128,7 +139,7 @@ class UnknownTarget(Exception):
 CONFIG_PATH = _HERE / "config.json"
 
 DEFAULT_CONFIG = {
-    "hub": "ws://127.0.0.1:8780",
+    "hub": ws_url_for("hub"),
     "default_target": "segment",
     "timeout": 10.0,
 }
@@ -171,7 +182,7 @@ def _load_config() -> dict:
 # ============================================================================
 
 def _fetch_registry(config: dict):
-    hub_ws = config.get("hub", "ws://127.0.0.1:8780")
+    hub_ws = config.get("hub") or ws_url_for("hub")
     hub_http = hub_ws.replace("ws://", "http://") \
                      .replace("wss://", "https://")
     url = hub_http.rstrip("/") + "/__playgrounds"
@@ -190,7 +201,7 @@ def _fetch_registry(config: dict):
 
 def _hub_host(config: dict) -> str:
     from urllib.parse import urlparse
-    hub_ws = config.get("hub", "ws://127.0.0.1:8780")
+    hub_ws = config.get("hub") or ws_url_for("hub")
     return urlparse(hub_ws).hostname or "127.0.0.1"
 
 
@@ -252,7 +263,7 @@ def resolve_target(config: dict, target_spec: Optional[str],
             )
         return f"ws://{host}:{port}/remote"
 
-    hub_ws = config.get("hub", "ws://127.0.0.1:8780").rstrip("/")
+    hub_ws = (config.get("hub") or ws_url_for("hub")).rstrip("/")
     return f"{hub_ws}/{target_spec}/remote"
 
 
@@ -730,7 +741,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  remote_cli --target segment action action.segmentAll\n"
             "  remote_cli --target segment script flow.json\n"
             "  remote_cli --target board --direct ls     # bypass hub proxy\n"
-            "  remote_cli --url ws://127.0.0.1:8773/remote ls  # standalone\n"
+            f"  remote_cli --url {ws_url_for('segment', '/remote')} ls  # standalone\n"
             "  remote_cli list-targets\n"
             "  remote_cli available\n"
             "  remote_cli start segment\n"

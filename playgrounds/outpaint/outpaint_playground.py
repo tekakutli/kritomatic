@@ -2,7 +2,7 @@
 
     python outpaint_playground.py
 
-Writes outpaint.html, serves it at http://127.0.0.1:8779/.
+Writes outpaint.html
 
 Registers with the kritomatic daemon on startup under id `outpaint`,
 with one layer slot `@thecanvas`, eight param slots
@@ -69,7 +69,7 @@ from pgkit.server import serve_nonblocking
 
 
 HTML_FILE    = "outpaint.html"
-PORT         = 8779
+PORT         = outpaint_server.PLAYGROUND_PORT
 OPEN_BROWSER = True
 
 PLAYGROUND_ID   = outpaint_server.PLAYGROUND_ID
@@ -95,7 +95,7 @@ def descriptor():
 
 
 def _watch_daemon_and_exit():
-    from pgruntime import daemon_client as krita_clien
+    from pgruntime import daemon_client as krita_client
 
     consecutive = 0
     while True:

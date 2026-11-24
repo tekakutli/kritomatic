@@ -81,12 +81,13 @@ import urllib.request
 
 from pgruntime.daemon_routes import daemon_route_handlers
 from pgruntime import daemon_registry as playground_registry
+from pgruntime.ports import port_for, url_for
 from . import layout_comfy
 
 
 PLAYGROUND_ID   = "layout"
 PLAYGROUND_NAME = "Layout Editor"
-PLAYGROUND_PORT = 8777
+PLAYGROUND_PORT = port_for(PLAYGROUND_ID)
 
 LAYER_SLOTS = [
     {
@@ -107,7 +108,7 @@ _DEFAULT_VIEWER = {
 # on its side, so pulling every layout read costs ~1 ms and gives
 # always-fresh data.  Negative results are cached because the failure
 # mode (connect timeout) costs the full `_MAGI_TIMEOUT_S` each attempt.
-_MAGI_STATE_URL  = "http://127.0.0.1:8778/state"
+_MAGI_STATE_URL  = url_for("magi", "/state")
 _MAGI_TIMEOUT_S  = 1.0
 _MAGI_ERR_TTL_S  = 2.0
 

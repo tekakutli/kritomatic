@@ -20,10 +20,11 @@ import urllib.error
 import urllib.request
 
 
-# Fixed contract — the layout playground is served on 8777 by
-# `playgrounds/layout/layout_playground.py`.
-LAYOUT_STATE_URL   = "http://127.0.0.1:8777/state"
-LAYOUT_VERSION_URL = "http://127.0.0.1:8777/version"
+from pgruntime.ports import url_for
+
+LAYOUT_STATE_URL   = url_for("layout", "/state")
+LAYOUT_VERSION_URL = url_for("layout", "/version")
+
 
 STATE_FETCH_TIMEOUT_S   = 2.0
 VERSION_FETCH_TIMEOUT_S = 1.0

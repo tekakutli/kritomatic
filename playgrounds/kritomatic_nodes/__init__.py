@@ -38,6 +38,27 @@ Layout:
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# `kritomatic_nodes` is symlinked into ComfyUI's custom_nodes/
+# (see install.py).  `resolve()` follows the symlink back to
+# <repo>/playgrounds/kritomatic_nodes/, so `.parent.parent` is
+# <repo>/playgrounds — the home of `pgruntime`.
+_PLAYGROUNDS = Path(__file__).resolve().parent.parent
+if str(_PLAYGROUNDS) not in sys.path:
+    sys.path.insert(0, str(_PLAYGROUNDS))
+
+try:
+    import pgruntime  # noqa: F401
+except ImportError as e:
+    raise ImportError(
+        f"kritomatic_nodes requires the 'pgruntime' package, expected "
+        f"at {_PLAYGROUNDS}/pgruntime.  If this pack was installed as "
+        f"a copy (not a symlink), re-run install.py so the symlink "
+        f"points back to the repo."
+    ) from e
+
 from comfy_api.latest import ComfyExtension
 
 from .drawatoon_nodes import DrawatoonCheckpointLoader, DrawatoonSetIP

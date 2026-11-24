@@ -140,11 +140,12 @@ from pgruntime import event_bus
 from pgruntime.daemon_client import is_success as _is_success
 from pgruntime.daemon_registry import reregister_handler
 from pgruntime.daemon_routes import daemon_route_handlers
+from pgruntime.ports import port_for
 
 
 PLAYGROUND_ID   = "outpaint"
 PLAYGROUND_NAME = "Outpaint"
-PLAYGROUND_PORT = 8779
+PLAYGROUND_PORT = port_for(PLAYGROUND_ID)
 
 LAYER_SLOTS = [
     {
@@ -400,22 +401,6 @@ def start_event_bus_subscriber():
 # ---------------------------------------------------------------------------
 #  Krita proxies
 # ---------------------------------------------------------------------------
-
-def _is_success(resp):
-    """Normalize a daemon response into a success boolean.
-
-    The daemon's socket layer may return either
-    `{"status": "success", ...}` or `{"success": true, ...}` depending
-    on the command's return shape.  Both are treated as success.
-    """
-    if not isinstance(resp, dict):
-        return False
-    if resp.get("status") == "success":
-        return True
-    if resp.get("success") is True:
-        return True
-    return False
-
 
 _h = daemon_route_handlers()
 

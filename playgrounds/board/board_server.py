@@ -46,6 +46,9 @@ from urllib.parse import unquote
 
 from . import board_krita
 
+from pgruntime.ports import port_for
+
+PLAYGROUND_PORT = port_for("board")
 
 def _log(msg):
     print(f"[board] {msg}", flush=True)

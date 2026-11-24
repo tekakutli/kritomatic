@@ -114,12 +114,13 @@ from PIL import Image
 from pgruntime import daemon_client as krita_client
 from pgruntime import daemon_registry as playground_registry
 from pgruntime.daemon_routes import daemon_route_handlers
+from pgruntime.ports import port_for, base_url_for
 from . import controlnets_comfy
 
 
 PLAYGROUND_ID   = "controlnets"
 PLAYGROUND_NAME = "Controlnets"
-PLAYGROUND_PORT = 8779
+PLAYGROUND_PORT = port_for(PLAYGROUND_ID)
 
 CONTROLNETS_DOC_NAME = "kritomatic_controlnets"
 
@@ -148,7 +149,7 @@ _PREPROCESSED_MAX   = 64
 # default as multimask; the inpaint playground binds 8774 in both
 # playgrounds' shared conventions.
 INPAINT_URL = os.environ.get(
-    "CONTROLNETS_INPAINT_URL", "http://127.0.0.1:8774",
+    "CONTROLNETS_INPAINT_URL", base_url_for("inpaint"),
 ).rstrip("/")
 
 

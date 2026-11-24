@@ -68,12 +68,14 @@ for _p in (_HERE, _PARENT, _SHARED_CABLE_ROOM):
 import cable_geometry
 import cable_html
 
+from pgruntime.ports import port_for
+
 from pgkit.server import serve as kit_serve
 
 
 HTML_FILE    = "cable_playground.html"
 STATE_FILE   = "room_layout.json"
-PORT         = 8765
+PORT         = port_for("cable")
 SERVE        = True
 OPEN_BROWSER = True
 

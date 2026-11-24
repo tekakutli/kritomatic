@@ -43,11 +43,13 @@ for _p in (_HERE, _PARENT):
 
 import remote_panel_html
 
+from pgruntime.ports import port_for, ws_url_for
+
 from pgkit.server import serve as kit_serve
 
 
 HTML_FILE    = "remote_panel.html"
-PORT         = 8772
+PORT         = port_for("remote_panel")
 SERVE        = True
 OPEN_BROWSER = True
 
@@ -57,7 +59,7 @@ def main():
     with open(HTML_FILE, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"Wrote {HTML_FILE}")
-    print(f"  hub           : ws://127.0.0.1:8780  "
+    print(f"  hub           : {ws_url_for('hub')}  "
           f"(registered targets appear as playgrounds start)")
 
     if SERVE:

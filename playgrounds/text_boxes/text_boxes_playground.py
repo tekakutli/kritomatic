@@ -29,7 +29,7 @@ from pgkit.server import serve as kit_serve
 
 
 HTML_FILE    = "text_boxes.html"
-PORT         = 8771
+PORT         = text_boxes_server.PLAYGROUND_PORT
 SERVE        = True
 OPEN_BROWSER = True
 

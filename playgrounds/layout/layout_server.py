@@ -80,7 +80,7 @@ import urllib.error
 import urllib.request
 
 from pgruntime.daemon_routes import daemon_route_handlers
-from pgruntime import daemon_registry as playground_registry
+from pgruntime.daemon_registry import reregister_handler
 from pgruntime.ports import port_for, url_for
 from . import layout_comfy
 
@@ -360,13 +360,10 @@ def handle_version(_payload):
     return {"success": True, "version": version}
 
 
-def handle_playground_reregister(_payload):
-    url = f"http://127.0.0.1:{PLAYGROUND_PORT}"
-    ok = playground_registry.reregister_once(
-        PLAYGROUND_ID, PLAYGROUND_NAME, url, PLAYGROUND_PORT,
-        layer_slots=LAYER_SLOTS,
-    )
-    return {"success": bool(ok)}
+handle_playground_reregister = reregister_handler(
+    PLAYGROUND_ID, PLAYGROUND_NAME, PLAYGROUND_PORT,
+    layer_slots=LAYER_SLOTS,
+)
 
 
 def handle_generate(payload):

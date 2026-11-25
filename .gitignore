@@ -199,3 +199,6 @@ playgrounds/board/board_drops/
 
 data/comfy_panel/*
 data/convert/*
+
+# LOGS, TRASH
+data/controlnets/last_expansion.json

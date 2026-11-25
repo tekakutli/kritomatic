@@ -92,6 +92,32 @@ ComfyUI refuses to expand any node whose schema does not set
 without it, `execute()` succeeds, builds the graph correctly, and
 then the framework raises "Node … is not expandable, but expand
 included in NodeOutput".
+
+DEBUG DUMP
+==========
+Every successful expansion writes `last_expansion.json` next to the
+workflow file.  It captures:
+
+  · `applied_entries`  — what matched and got wired
+  · `skipped_entries`  — what didn't, and why
+  · `staged_files`     — `{hash → _kritomatic_controlnet_<hash8>.png}`
+  · `expanded`         — the raw GraphBuilder finalize output, i.e.
+                         the exact nodes spliced into the execution DAG
+
+This is the ground truth for "did the images get inserted?" — the
+v2 workflow endpoint (`/api/v2/jobs/{id}/workflow`) returns the
+*submitted* prompt, which contains only the opaque
+`ControlNetsConditioning` node and never sees the expanded
+`LoadImage` / `ControlNetLoader` / `ControlNetApplyAdvanced` nodes
+that `execute()` builds.  Those exist in the runtime DAG only; this
+file is the only on-disk record of them.
+
+The success log line also names each applied entry now (title,
+controlnet model, strength, start→end), so a single grep for
+`[ControlNetsConditioning]` in ComfyUI's stdout answers the same
+question without opening the JSON.  Both surfaces are kept because
+the log is what a user naturally sees first, and the JSON is what a
+bug report needs.
 """
 
 from __future__ import annotations
@@ -500,6 +526,7 @@ class ControlNetsConditioning(io.ComfyNode):
         current_pos = positive
         current_neg = negative
         applied_count = 0
+        applied_entries = []      # NEW — for the success log + dump
         skipped = []
 
         for entry in chain:
@@ -570,6 +597,7 @@ class ControlNetsConditioning(io.ComfyNode):
             current_pos = applied.out(0)
             current_neg = applied.out(1)
             applied_count += 1
+            applied_entries.append(entry)      # NEW
 
         if skipped:
             print(
@@ -587,13 +615,63 @@ class ControlNetsConditioning(io.ComfyNode):
             return io.NodeOutput(positive, negative)
 
         finalized = graph.finalize()
+
+        # NEW — Patch A: name each applied entry in the success line so
+        # the log alone answers "which chain was spliced?".
+        applied_summary = "; ".join(
+            f"{e['apply_title']!r} "
+            f"({e['control_net_name']}, "
+            f"strength={e['strength']:.2f}, "
+            f"{e['start']:.2f}\u2192{e['end']:.2f})"
+            for e in applied_entries
+        )
         print(
             f"[ControlNetsConditioning] built chain of {applied_count} "
-            f"ControlNet(s) from {playground_url} "
+            f"ControlNet(s): {applied_summary} "
+            f"from {playground_url} "
             f"(v{(state.get('version') or '')[:8]}); "
             f"expanded to {len(finalized)} node(s).",
             flush=True,
         )
+
+        # NEW — Patch B: dump the expanded subgraph next to the workflow
+        # file.  This is the only on-disk record of the runtime DAG,
+        # because /api/v2/jobs/{id}/workflow returns the submitted
+        # prompt (opaque ControlNetsConditioning node), never the
+        # expanded LoadImage/ControlNetLoader/ControlNetApplyAdvanced
+        # set that execute() builds.  See module docstring, DEBUG DUMP.
+        try:
+            dump_path = Path(wf_path).with_name("last_expansion.json")
+            dump_path.write_text(
+                json.dumps(
+                    {
+                        "applied_count":      applied_count,
+                        "applied_entries":    applied_entries,
+                        "skipped_entries":    skipped,
+                        "playground_url":     playground_url,
+                        "playground_version": (state.get("version") or ""),
+                        "staged_files":       dict(staged),
+                        "expanded":           finalized,
+                    },
+                    indent=2,
+                    default=lambda o: (
+                        f"<{type(o).__module__}."
+                        f"{type(o).__name__}>"
+                    ),
+                ),
+                encoding="utf-8",
+            )
+            print(
+                f"[ControlNetsConditioning] expansion dumped to "
+                f"{dump_path}",
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                f"[ControlNetsConditioning] debug dump failed: {e}",
+                flush=True,
+            )
+
         return io.NodeOutput(current_pos, current_neg, expand=finalized)
 
 

@@ -225,7 +225,6 @@ from __future__ import annotations
 import base64
 import json
 import math
-import socket
 import struct
 import threading
 import time
@@ -236,10 +235,11 @@ from PIL import Image
 
 from pg_comfy import ComfyError, get_client, reset_client
 from pg_comfy.image import make_encoded_image
+from pgruntime import daemon_client as krita_client
+from pgruntime import event_bus
+from pgruntime.daemon_registry import reregister_handler
+from pgruntime.daemon_routes import daemon_route_handlers
 from pgruntime.ports import port_for
-
-from . import krita_client
-from . import playground_registry
 
 
 COMFY_HOST = "127.0.0.1"
@@ -304,8 +304,6 @@ _target_document_name: str = ""
 # ---------------------------------------------------------------------------
 
 _browser_hub = None
-_subscriber_running = False
-_subscriber_thread = None
 
 
 def set_browser_hub(hub) -> None:
@@ -322,66 +320,20 @@ def set_browser_hub(hub) -> None:
 
 
 def start_canvas_subscriber() -> None:
-    """Spawn the background thread that subscribes to the daemon's
-    event stream and forwards canvas/paste events to browsers.
+    """Spawn the daemon event-bus subscriber that forwards
+    `paste_applied` and `canvas_update` events to browser clients.
 
-    Idempotent.  See the module docstring, CANVAS_PUSH SUBSCRIBER.
+    Idempotent — `pgruntime.event_bus.subscribe` reuses the thread
+    when called with the same handler set.  See the module docstring,
+    CANVAS_PUSH SUBSCRIBER.
     """
-    global _subscriber_running, _subscriber_thread
-    if _subscriber_thread is not None and _subscriber_thread.is_alive():
-        return
-    _subscriber_running = True
-    _subscriber_thread = threading.Thread(
-        target=_canvas_subscriber_loop,
-        name="inpaint-canvas-subscriber",
-        daemon=True,
+    event_bus.subscribe(
+        {
+            "paste_applied": _forward_paste_applied,
+            "canvas_update": _forward_canvas_update,
+        },
+        log_prefix="inpaint",
     )
-    _subscriber_thread.start()
-
-
-def _canvas_subscriber_loop() -> None:
-    """Connect to the daemon event stream, forward canvas/paste events."""
-    while _subscriber_running:
-        sock = None
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(10.0)
-            sock.connect(("127.0.0.1", 12347))
-            sock.settimeout(None)
-            _log("canvas subscriber: connected to daemon event stream")
-            buf = b""
-            while _subscriber_running:
-                try:
-                    chunk = sock.recv(65536)
-                except OSError:
-                    break
-                if not chunk:
-                    break
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line.decode("utf-8"))
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
-                    etype = event.get("type")
-                    if etype == "paste_applied":
-                        _forward_paste_applied(event.get("data") or {})
-                    elif etype == "canvas_update":
-                        _forward_canvas_update(event.get("data") or {})
-        except OSError as e:
-            _log(f"canvas subscriber: {e}")
-        finally:
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-        if _subscriber_running:
-            time.sleep(2.0)
 
 
 def _forward_paste_applied(data: dict) -> None:
@@ -548,25 +500,6 @@ def _decode_bbox(b64: str) -> Optional[tuple[int, int, int, int]]:
 
 
 # ---------------------------------------------------------------------------
-#  Daemon probes
-# ---------------------------------------------------------------------------
-
-def _fetch_active_state() -> dict:
-    try:
-        resp = krita_client.send({"type": "comfy_status"}, timeout=10.0)
-    except Exception:
-        return {}
-    if not isinstance(resp, dict) or resp.get("status") != "success":
-        return {}
-    return resp.get("data") or {}
-
-
-def handle_active_state(_payload) -> dict:
-    data = _fetch_active_state()
-    return {"success": True, "data": data}
-
-
-# ---------------------------------------------------------------------------
 #  /version — liveness probe for the daemon's registry sweep
 # ---------------------------------------------------------------------------
 
@@ -593,33 +526,10 @@ def handle_version(_payload) -> dict:
 #  /playground_reregister — recovery path when the sweep drops us
 # ---------------------------------------------------------------------------
 
-def handle_playground_reregister(_payload) -> dict:
-    """Single-shot re-registration with the daemon.
-
-    Called by `pg_autosync.js` when its poll notices that our entry
-    is missing from `comfy_status`'s `playgrounds` list — the sweep
-    thread can misjudge liveness (see
-    `kritomatic_daemon/handlers/playgrounds.py`'s SWEEP: WHAT
-    "DEAD" MEANS), and the browser's autosync is the fastest path to
-    recovery.  Before this route existed, the only way to recover
-    was to restart the inpaint playground process.
-
-    Recovery latency: the next autosync tick (≤500 ms) after the
-    sweep removes us, plus the ~2 ms the daemon socket round-trip
-    takes on localhost.
-
-    Fails fast on daemon unreachability — autosync reschedules on
-    its own cadence, so a slow retry loop here would just make
-    `/playground_reregister` block for no benefit.  See
-    `playgrounds/inpaint/playground_registry.py`'s
-    RE-REGISTRATION section.
-    """
-    url = f"http://127.0.0.1:{PLAYGROUND_PORT}"
-    ok = playground_registry.reregister_once(
-        PLAYGROUND_ID, PLAYGROUND_NAME, url, PLAYGROUND_PORT,
-        layer_slots=LAYER_SLOTS,
-    )
-    return {"success": bool(ok)}
+handle_playground_reregister = reregister_handler(
+    PLAYGROUND_ID, PLAYGROUND_NAME, PLAYGROUND_PORT,
+    layer_slots=LAYER_SLOTS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -941,142 +851,6 @@ def handle_status(_payload) -> dict:
 
 
 # ---------------------------------------------------------------------------
-#  /krita/* — unchanged
-# ---------------------------------------------------------------------------
-
-def handle_krita_status(_payload) -> dict:
-    reachable = krita_client.is_reachable()
-    return {"success": True, "reachable": reachable}
-
-
-def handle_krita_import(payload: dict) -> dict:
-    name = payload.get("name") if isinstance(payload, dict) else None
-
-    if name:
-        # Explicit caller-supplied name wins over the pin.
-        command = {"type": "get_document_composite_b64", "name": name}
-        response = krita_client.send(command, timeout=60.0)
-        _capture_document_from_response(response)
-    else:
-        # `get_document_composite_b64` uses `--name` for the doc arg,
-        # not `--document`.
-        response = _send_with_pin(
-            {"type": "get_document_composite_b64"},
-            doc_arg="name",
-            timeout=60.0,
-        )
-
-    if response.get("status") != "success":
-        return {"success": False,
-                "message": response.get("message") or "daemon rejected"}
-
-    data = response.get("data") or {}
-    data_url = data.get("data_url")
-    if not data_url:
-        return {"success": False, "message": "daemon returned no data_url"}
-    if not data_url.startswith("data:image/png;base64,"):
-        return {"success": False,
-                "message": f"unexpected data_url prefix: {data_url[:30]!r}"}
-
-    try:
-        png_bytes = base64.b64decode(data_url.split(",", 1)[1])
-    except Exception as e:
-        return {"success": False, "message": f"could not decode base64: {e}"}
-
-    try:
-        encoded = make_encoded_image(png_bytes)
-    except Exception as e:
-        return {"success": False, "message": f"could not decode image: {e}"}
-
-    h = encoded.content_hash
-    filename = data.get("name") or "krita_composite"
-
-    return {
-        "success": True,
-        "hash": h,
-        "width": encoded.width,
-        "height": encoded.height,
-        "data_url": data_url,
-        "filename": filename,
-    }
-
-
-def handle_krita_import_masks(payload: dict) -> dict:
-    command = {"type": "import_krita_masks_b64"}
-    if isinstance(payload, dict):
-        if "layer_names" in payload and payload["layer_names"]:
-            command["layer_names"] = str(payload["layer_names"])
-        if "include_paint_alpha" in payload:
-            command["include_paint_alpha"] = bool(payload["include_paint_alpha"])
-        if "prefer_selection_mask_children" in payload:
-            command["prefer_selection_mask_children"] = bool(
-                payload["prefer_selection_mask_children"]
-            )
-
-    response = _send_with_pin(command, timeout=60.0)
-    if response.get("status") != "success":
-        return {
-            "success": False,
-            "message": response.get("message") or "daemon rejected",
-        }
-
-    data = response.get("data") or {}
-    masks = data.get("masks") or []
-    skipped = data.get("skipped") or []
-    selection_path = data.get("selection_path") or "unknown"
-
-    return {
-        "success": True,
-        "masks": masks,
-        "skipped": skipped,
-        "selection_path": selection_path,
-        "message": response.get("message") or f"{len(masks)} mask(s)",
-    }
-
-
-def handle_resource_image(payload: dict) -> dict:
-    if not isinstance(payload, dict):
-        return {"success": False, "message": "expected a JSON object"}
-
-    source = payload.get("source", "active")
-    layer_name = payload.get("layer_name")
-
-    if source == "active":
-        return handle_krita_import({})
-    if source == "layer":
-        if not layer_name:
-            return {"success": False,
-                    "message": "layer_name is required when source=layer"}
-        response = _send_with_pin(
-            {"type": "get_layer_pixels_b64", "name": str(layer_name)},
-            timeout=30.0,
-        )
-        if response.get("status") != "success":
-            return {"success": False,
-                    "message": response.get("message") or "daemon rejected"}
-        data = response.get("data") or {}
-        data_url = data.get("data_url")
-        if not data_url:
-            return {"success": False,
-                    "message": "daemon returned no data_url for layer"}
-        return {
-            "success": True,
-            "hash": "layer_" + str(layer_name),
-            "width": data.get("width"),
-            "height": data.get("height"),
-            "data_url": data_url,
-            "filename": str(layer_name),
-        }
-    return {
-        "success": False,
-        "message": (
-            f"source={source!r} cannot be displayed as an image "
-            f"(@thecanvas expects 'active' or 'layer')."
-        ),
-    }
-
-
-# ---------------------------------------------------------------------------
 #  /rebind_document — manual escape hatch
 # ---------------------------------------------------------------------------
 
@@ -1119,6 +893,44 @@ def handle_rebind_document(_payload) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+#  Shared daemon routes — adapted to inpaint's pinning contract
+# ---------------------------------------------------------------------------
+#
+# The shared `daemon_route_handlers(send=...)` factory accepts a uniform
+# `send(command, timeout=...)` callable.  Inpaint's `_send_with_pin`
+# dispatches on command type:
+#
+#   · get_document_composite_b64  with an explicit `name`  → direct send,
+#                                    then _capture_document_from_response
+#   · get_document_composite_b64  without `name`          → _send_with_pin
+#                                                              doc_arg="name"
+#   · comfy_status                                        → direct send
+#   · everything else                                     → _send_with_pin
+#                                                              doc_arg="document"
+#
+# `_pinned_send` is that dispatch, wired to the shared handlers' uniform
+# signature.  It exactly mirrors the behavior inpaint has always had:
+# `_fetch_active_state` never pinned `comfy_status`; `handle_krita_import`
+# took the `name`-branch direct; everything else went through
+# `_send_with_pin`.  See the module docstring, PINNED TARGET DOCUMENT.
+
+def _pinned_send(command: dict, *, timeout: float = 60.0) -> dict:
+    ctype = command.get("type")
+    if ctype == "get_document_composite_b64":
+        if command.get("name"):
+            resp = krita_client.send(command, timeout=timeout)
+            _capture_document_from_response(resp)
+            return resp
+        return _send_with_pin(command, doc_arg="name", timeout=timeout)
+    if ctype == "comfy_status":
+        return krita_client.send(command, timeout=timeout)
+    return _send_with_pin(command, doc_arg="document", timeout=timeout)
+
+
+_h = daemon_route_handlers(send=_pinned_send)
+
+
 ROUTES = {
     "/version":              handle_version,
     "/playground_reregister": handle_playground_reregister,
@@ -1129,11 +941,11 @@ ROUTES = {
     "/rotation":             handle_rotation,
     "/crop_frame":           handle_crop_frame,
     "/comfy/status":         handle_status,
-    "/comfy/active_state":   handle_active_state,
-    "/krita/status":         handle_krita_status,
-    "/krita/import":         handle_krita_import,
-    "/krita/import_masks":   handle_krita_import_masks,
-    "/krita/resource_image": handle_resource_image,
+    "/comfy/active_state":   _h["active_state"],
+    "/krita/status":         _h["krita_status"],
+    "/krita/import":         _h["import_image"],
+    "/krita/import_masks":   _h["import_masks"],
+    "/krita/resource_image": _h["resource_image"],
     "/rebind_document":      handle_rebind_document,
 }
 

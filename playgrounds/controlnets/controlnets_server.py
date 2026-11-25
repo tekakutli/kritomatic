@@ -112,7 +112,7 @@ from pathlib import Path
 from PIL import Image
 
 from pgruntime import daemon_client as krita_client
-from pgruntime import daemon_registry as playground_registry
+from pgruntime.daemon_registry import reregister_handler
 from pgruntime.daemon_routes import daemon_route_handlers
 from pgruntime.ports import port_for, base_url_for
 from . import controlnets_comfy
@@ -548,13 +548,10 @@ def handle_version(_payload):
         return {"success": True, "version": _version}
 
 
-def handle_playground_reregister(_payload):
-    url = f"http://127.0.0.1:{PLAYGROUND_PORT}"
-    ok = playground_registry.reregister_once(
-        PLAYGROUND_ID, PLAYGROUND_NAME, url, PLAYGROUND_PORT,
-        layer_slots=LAYER_SLOTS,
-    )
-    return {"success": bool(ok)}
+handle_playground_reregister = reregister_handler(
+    PLAYGROUND_ID, PLAYGROUND_NAME, PLAYGROUND_PORT,
+    layer_slots=LAYER_SLOTS,
+)
 
 
 # ---------------------------------------------------------------------------

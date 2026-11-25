@@ -57,13 +57,15 @@ event bus (port 12347) whenever a batch pastes into Krita:
     `canvas.pushed`.  The browser replaces the canvas with ground
     truth (~200-500 ms later).
 
-The subscriber thread (`_canvas_subscriber_loop`) connects to the
-daemon event stream and forwards both.  Recovery on disconnect is
-automatic — 2 s reconnect delay.  A daemon without an event stream
-(older build) means the subscriber retries forever without
-succeeding; the browser's autosync poll fallback still detects
-batch-end via `active_batches` and re-fetches `@thecanvas`, so
-post-paste updates arrive on the poll cadence instead of via push.
+`pgruntime.event_bus.subscribe` is the connection layer: it reads
+newline-delimited JSON events from the daemon's event port (12347),
+dispatches by event type to the handlers registered in
+`start_canvas_subscriber()`, and reconnects on disconnect with a 2 s
+delay.  A daemon without an event stream (older build) means the
+subscriber retries forever without succeeding; the browser's
+autosync poll fallback still detects batch-end via `active_batches`
+and re-fetches `@thecanvas`, so post-paste updates arrive on the
+poll cadence instead of via push.
 
 `set_browser_hub(hub)` must be called once, before
 `start_canvas_subscriber()`, so the subscriber has somewhere to
@@ -80,7 +82,6 @@ import hashlib
 import json
 import os
 import re
-import socket
 import threading
 import time
 import urllib.error
@@ -89,6 +90,7 @@ from io import BytesIO
 
 from PIL import Image
 
+from pgruntime import event_bus
 from pgruntime.daemon_routes import daemon_route_handlers
 from pgruntime.ports import port_for, base_url_for
 
@@ -123,8 +125,6 @@ _MASK_TRANSFORM_CACHE_MAX = 64
 # ---------------------------------------------------------------------------
 
 _browser_hub = None
-_subscriber_running = False
-_subscriber_thread = None
 
 
 def set_browser_hub(hub) -> None:
@@ -141,66 +141,20 @@ def set_browser_hub(hub) -> None:
 
 
 def start_canvas_subscriber() -> None:
-    """Spawn the background thread that subscribes to the daemon's
-    event stream and forwards canvas/paste events to browsers.
+    """Spawn the daemon event-bus subscriber that forwards
+    `paste_applied` and `canvas_update` events to browser clients.
 
-    Idempotent.  See the module docstring, PUSH CHANNELS.
+    Idempotent — `pgruntime.event_bus.subscribe` reuses the thread
+    when called with the same handler set.  See the module docstring,
+    PUSH CHANNELS.
     """
-    global _subscriber_running, _subscriber_thread
-    if _subscriber_thread is not None and _subscriber_thread.is_alive():
-        return
-    _subscriber_running = True
-    _subscriber_thread = threading.Thread(
-        target=_canvas_subscriber_loop,
-        name="multimask-canvas-subscriber",
-        daemon=True,
+    event_bus.subscribe(
+        {
+            "paste_applied": _forward_paste_applied,
+            "canvas_update": _forward_canvas_update,
+        },
+        log_prefix="multimask",
     )
-    _subscriber_thread.start()
-
-
-def _canvas_subscriber_loop() -> None:
-    """Connect to the daemon event stream, forward canvas/paste events."""
-    while _subscriber_running:
-        sock = None
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(10.0)
-            sock.connect(("127.0.0.1", 12347))
-            sock.settimeout(None)
-            _log("canvas subscriber: connected to daemon event stream")
-            buf = b""
-            while _subscriber_running:
-                try:
-                    chunk = sock.recv(65536)
-                except OSError:
-                    break
-                if not chunk:
-                    break
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line.decode("utf-8"))
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
-                    etype = event.get("type")
-                    if etype == "paste_applied":
-                        _forward_paste_applied(event.get("data") or {})
-                    elif etype == "canvas_update":
-                        _forward_canvas_update(event.get("data") or {})
-        except OSError as e:
-            _log(f"canvas subscriber: {e}")
-        finally:
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-        if _subscriber_running:
-            time.sleep(2.0)
 
 
 def _forward_paste_applied(data: dict) -> None:

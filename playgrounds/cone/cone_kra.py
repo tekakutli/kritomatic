@@ -14,7 +14,13 @@ Five export modes, selected by options.text_warp_mode:
                          on the patch is a direct vector layer inside
                          the group, with its own affine.
 
-No background layer is created in any mode.
+The scaffolding shared with `text_wall` — constants, the batch
+bootstrap, `normalize_band`, `common_header`, `coerce_transform`,
+`prepare_output_path`, and the batch-execute-and-summarize pattern —
+lives in `pgruntime.kra_export`.  What stays here is the command
+emission itself: the five mode builders, `_emit_handle_moves`, and
+the cone-specific `text_warp_mode` option.  See
+`pgruntime/kra_export.py`'s module docstring for the layering.
 
 INLINE-WRAPPED TEXT AND HANDLE ALIGNMENT
 ========================================
@@ -46,39 +52,10 @@ re-enable them for a specific run.
 import json
 import os
 import sys
-from pathlib import Path
 from typing import Any, Dict, List
 
+from pgruntime import kra_export
 
-def _find_repo_src() -> Path:
-    p = Path(__file__).resolve().parent
-    for _ in range(10):
-        cand = p / "src"
-        if (cand / "kritomatic").is_dir():
-            return cand
-        if p == p.parent:
-            break
-        p = p.parent
-    raise RuntimeError(
-        "Could not locate src/kritomatic from " + str(Path(__file__).resolve())
-    )
-
-
-_SRC = _find_repo_src()
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
-
-from kritomatic.batch import BatchExecutor  # noqa: E402
-
-
-DEFAULT_CANVAS_W = 1920
-DEFAULT_CANVAS_H = 1080
-
-DEFAULT_RESOLUTION = 72
-DEFAULT_FONT_FAMILY = "sans-serif"
-FONT_FRACTION = 0.40
-
-EXPORT_GROUP_NAME = "Export"
 
 _DEBUG = bool(os.environ.get("CONE_KRA_DEBUG"))
 
@@ -94,6 +71,12 @@ def _fallback_anchor(W, H):
 
 
 def _normalize_options(raw):
+    """Cone-specific option normalization.  The shared scaffold
+    (`pgruntime.kra_export`) does not include `text_warp_mode` —
+    that key is cone-only.  `draw_rectangles` is normalised the same
+    way text_wall does, but per-playground isolation is cheaper than
+    a shared base with a cone-specific extension.
+    """
     if not isinstance(raw, dict):
         raw = {}
     draw = raw.get("draw_rectangles", True)
@@ -103,44 +86,6 @@ def _normalize_options(raw):
     if mode not in ("square", "patch", "text", "text-shear", "patch-shear"):
         mode = "square"
     return {"draw_rectangles": draw, "text_warp_mode": mode}
-
-
-def _normalize_cone_band(raw):
-    if not isinstance(raw, dict):
-        return {"width": DEFAULT_CANVAS_W, "height": DEFAULT_CANVAS_H}
-    w = raw.get("width", DEFAULT_CANVAS_W)
-    h = raw.get("height", DEFAULT_CANVAS_H)
-    try:
-        w = int(round(float(w)))
-    except (TypeError, ValueError):
-        w = DEFAULT_CANVAS_W
-    try:
-        h = int(round(float(h)))
-    except (TypeError, ValueError):
-        h = DEFAULT_CANVAS_H
-    if w < 1:
-        w = DEFAULT_CANVAS_W
-    if h < 1:
-        h = DEFAULT_CANVAS_H
-    return {"width": w, "height": h}
-
-
-def _common_header(band, doc_name):
-    return [
-        {
-            "type": "create_new_with_dimensions",
-            "name": doc_name,
-            "width": band["width"],
-            "height": band["height"],
-            "resolution": DEFAULT_RESOLUTION,
-        },
-        {
-            "type": "create_layer",
-            "name": EXPORT_GROUP_NAME,
-            "layer_type": "grouplayer",
-            "position": "top",
-        },
-    ]
 
 
 def _inline_size_for(font_px, width=None):
@@ -161,26 +106,7 @@ def _inline_size_for(font_px, width=None):
         return None
     if fs <= 0:
         return None
-    return fs / FONT_FRACTION
-
-
-def _coerce_transform(raw):
-    """Accept a list or a JSON string; return a 6-float list or None."""
-    if raw is None:
-        return None
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except Exception:
-            return None
-    if not isinstance(raw, (list, tuple)):
-        return None
-    if len(raw) != 6:
-        return None
-    try:
-        return [float(v) for v in raw]
-    except (TypeError, ValueError):
-        return None
+    return fs / 0.40
 
 
 def _polygon_target_edges(polygon_pts, baseline_dir):
@@ -213,7 +139,7 @@ def _polygon_target_edges(polygon_pts, baseline_dir):
 
 
 def _emit_handle_moves(commands, layer_name, t, polygon_pts):
-    affine = _coerce_transform(t.get("transform"))
+    affine = kra_export.coerce_transform(t.get("transform"))
 
     _debug("=" * 60)
     _debug("text layer_name = %r" % layer_name)
@@ -257,7 +183,7 @@ def _emit_handle_moves(commands, layer_name, t, polygon_pts):
 
 
 def _build_square_mode(shapes, opts, band, doc_name):
-    commands = _common_header(band, doc_name)
+    commands = kra_export.common_header(band, doc_name)
 
     for sh in shapes:
         layer_name = sh["name"]
@@ -269,7 +195,7 @@ def _build_square_mode(shapes, opts, band, doc_name):
 
         W = max(1.0, float(sh["natural_w"]))
         H = max(1.0, float(sh["natural_h"]))
-        font_px = max(6, int(round(min(W, H) * FONT_FRACTION)))
+        font_px = max(6, int(round(min(W, H) * 0.40)))
 
         anchor = sh.get("text_anchor") or _fallback_anchor(W, H)
         text_x = float(anchor.get("x", W / 2.0))
@@ -280,7 +206,7 @@ def _build_square_mode(shapes, opts, band, doc_name):
             "type": "create_layer",
             "name": layer_name,
             "layer_type": "grouplayer",
-            "parent": EXPORT_GROUP_NAME,
+            "parent": kra_export.EXPORT_GROUP_NAME,
         })
         commands.append({
             "type": "create_layer",
@@ -306,7 +232,7 @@ def _build_square_mode(shapes, opts, band, doc_name):
             "type": "add_vector_text",
             "layer_name": content_name,
             "text": sh.get("label", layer_name),
-            "font_family": DEFAULT_FONT_FAMILY,
+            "font_family": kra_export.DEFAULT_FONT_FAMILY,
             "font_size": font_px,
             "x": text_x,
             "y": text_y,
@@ -332,7 +258,7 @@ def _build_square_mode(shapes, opts, band, doc_name):
 
 
 def _build_patch_mode(patches, opts, band, doc_name):
-    commands = _common_header(band, doc_name)
+    commands = kra_export.common_header(band, doc_name)
 
     for patch in patches:
         for rect in patch.get("rects", []):
@@ -341,7 +267,7 @@ def _build_patch_mode(patches, opts, band, doc_name):
                 "type": "create_layer",
                 "name": rect_layer,
                 "layer_type": "vectorlayer",
-                "parent": EXPORT_GROUP_NAME,
+                "parent": kra_export.EXPORT_GROUP_NAME,
             })
             pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
                    for p in rect["points"]]
@@ -365,7 +291,7 @@ def _build_patch_mode(patches, opts, band, doc_name):
             "type": "create_layer",
             "name": layer_name,
             "layer_type": "grouplayer",
-            "parent": EXPORT_GROUP_NAME,
+            "parent": kra_export.EXPORT_GROUP_NAME,
         })
         commands.append({
             "type": "create_layer",
@@ -380,7 +306,7 @@ def _build_patch_mode(patches, opts, band, doc_name):
                 "type": "add_vector_text",
                 "layer_name": content_name,
                 "text": str(txt.get("text", txt.get("label", ""))),
-                "font_family": DEFAULT_FONT_FAMILY,
+                "font_family": kra_export.DEFAULT_FONT_FAMILY,
                 "font_size": font_px,
                 "x": float(txt["x"]),
                 "y": float(txt["y"]),
@@ -411,7 +337,7 @@ def _build_patch_mode(patches, opts, band, doc_name):
 
 
 def _build_text_mode(texts, rects, opts, band, doc_name):
-    commands = _common_header(band, doc_name)
+    commands = kra_export.common_header(band, doc_name)
 
     for rect in (rects or []):
         rect_layer = rect["name"] + "_rect"
@@ -419,7 +345,7 @@ def _build_text_mode(texts, rects, opts, band, doc_name):
             "type": "create_layer",
             "name": rect_layer,
             "layer_type": "vectorlayer",
-            "parent": EXPORT_GROUP_NAME,
+            "parent": kra_export.EXPORT_GROUP_NAME,
         })
         pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
                for p in rect["points"]]
@@ -443,7 +369,7 @@ def _build_text_mode(texts, rects, opts, band, doc_name):
             "type": "create_layer",
             "name": group_name,
             "layer_type": "grouplayer",
-            "parent": EXPORT_GROUP_NAME,
+            "parent": kra_export.EXPORT_GROUP_NAME,
         })
         commands.append({
             "type": "create_layer",
@@ -455,7 +381,7 @@ def _build_text_mode(texts, rects, opts, band, doc_name):
             "type": "add_vector_text",
             "layer_name": content_name,
             "text": str(t.get("label", t["name"])),
-            "font_family": DEFAULT_FONT_FAMILY,
+            "font_family": kra_export.DEFAULT_FONT_FAMILY,
             "font_size": max(6, int(round(float(t["font_px"])))),
             "x": float(t["text_x"]),
             "y": float(t["text_y"]),
@@ -484,7 +410,7 @@ def _build_text_mode(texts, rects, opts, band, doc_name):
 
 
 def _build_shear_mode(texts, rects, opts, band, doc_name):
-    commands = _common_header(band, doc_name)
+    commands = kra_export.common_header(band, doc_name)
 
     for rect in (rects or []):
         rect_layer = rect["name"] + "_rect"
@@ -492,7 +418,7 @@ def _build_shear_mode(texts, rects, opts, band, doc_name):
             "type": "create_layer",
             "name": rect_layer,
             "layer_type": "vectorlayer",
-            "parent": EXPORT_GROUP_NAME,
+            "parent": kra_export.EXPORT_GROUP_NAME,
         })
         pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
                for p in rect["points"]]
@@ -521,13 +447,13 @@ def _build_shear_mode(texts, rects, opts, band, doc_name):
             "type": "create_layer",
             "name": layer_name,
             "layer_type": "vectorlayer",
-            "parent": EXPORT_GROUP_NAME,
+            "parent": kra_export.EXPORT_GROUP_NAME,
         })
         commands.append({
             "type": "add_vector_text",
             "layer_name": layer_name,
             "text": str(t.get("text", t.get("label", ""))),
-            "font_family": DEFAULT_FONT_FAMILY,
+            "font_family": kra_export.DEFAULT_FONT_FAMILY,
             "font_size": max(6, int(round(float(t["font_px"])))),
             "x": float(t["x"]),
             "y": float(t["y"]),
@@ -544,7 +470,7 @@ def _build_shear_mode(texts, rects, opts, band, doc_name):
 
 
 def _build_patch_shear_mode(patches, opts, band, doc_name):
-    commands = _common_header(band, doc_name)
+    commands = kra_export.common_header(band, doc_name)
 
     for patch in patches:
         for rect in patch.get("rects", []):
@@ -553,7 +479,7 @@ def _build_patch_shear_mode(patches, opts, band, doc_name):
                 "type": "create_layer",
                 "name": rect_layer,
                 "layer_type": "vectorlayer",
-                "parent": EXPORT_GROUP_NAME,
+                "parent": kra_export.EXPORT_GROUP_NAME,
             })
             pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
                    for p in rect["points"]]
@@ -583,7 +509,7 @@ def _build_patch_shear_mode(patches, opts, band, doc_name):
             "type": "create_layer",
             "name": group_name,
             "layer_type": "grouplayer",
-            "parent": EXPORT_GROUP_NAME,
+            "parent": kra_export.EXPORT_GROUP_NAME,
         })
 
         for t in patch.get("texts", []):
@@ -599,7 +525,7 @@ def _build_patch_shear_mode(patches, opts, band, doc_name):
                 "type": "add_vector_text",
                 "layer_name": layer_name,
                 "text": str(t.get("text", t.get("label", ""))),
-                "font_family": DEFAULT_FONT_FAMILY,
+                "font_family": kra_export.DEFAULT_FONT_FAMILY,
                 "font_size": max(6, int(round(float(t["font_px"])))),
                 "x": float(t["x"]),
                 "y": float(t["y"]),
@@ -623,7 +549,7 @@ def build_bundle(shapes: List[Dict[str, Any]],
                  texts: List[Dict[str, Any]] = None,
                  rects: List[Dict[str, Any]] = None) -> Dict[str, Any]:
     opts = _normalize_options(options)
-    band = _normalize_cone_band(cone_band)
+    band = kra_export.normalize_band(cone_band)
 
     if opts["text_warp_mode"] == "patch-shear":
         return _build_patch_shear_mode(patches or [], opts, band, doc_name)
@@ -639,7 +565,7 @@ def build_bundle(shapes: List[Dict[str, Any]],
 
 
 def generate(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Entry point called by cone_server's POST handler."""
+    """Entry point called by cone_playground's POST handler."""
     shapes  = payload.get("shapes", [])
     patches = payload.get("patches", [])
     texts   = payload.get("texts", [])
@@ -668,35 +594,12 @@ def generate(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not output_path:
         return {"success": False, "message": "No output path provided"}
 
-    out = Path(str(output_path)).expanduser()
-    if out.suffix.lower() != ".kra":
-        out = out.with_suffix(".kra")
+    out = kra_export.prepare_output_path(output_path)
 
     bundle = build_bundle(
         shapes=shapes, options=options, cone_band=cone_band,
         doc_name=doc_name, patches=patches, texts=texts, rects=rects,
     )
-    bundle["commands"].append({
-        "type": "save_document",
-        "file_path": str(out),
-    })
-
-    executor = BatchExecutor()
-    try:
-        results = executor.execute(bundle)
-    finally:
-        executor.close()
-
-    failed = [r for r in results if r["status"] == "error"]
-    if failed:
-        summary = "; ".join(
-            f"{r['command']} -> {r['message']}" for r in failed
-        )
-        return {
-            "success": False,
-            "message": f"{len(failed)} command(s) failed: {summary}",
-            "results": results,
-        }
 
     if opts["text_warp_mode"] in ("text", "text-shear"):
         count, kind = len(texts), "text(s)"
@@ -704,9 +607,5 @@ def generate(payload: Dict[str, Any]) -> Dict[str, Any]:
         count, kind = len(patches), "patch(es)"
     else:
         count, kind = len(shapes), "shape(s)"
-    return {
-        "success": True,
-        "message": f"Wrote {out} ({count} {kind})",
-        "output_path": str(out),
-        "results": results,
-    }
+
+    return kra_export.execute_bundle(bundle, out, count=count, kind=kind)

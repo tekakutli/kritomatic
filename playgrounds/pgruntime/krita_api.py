@@ -77,22 +77,24 @@ def find_repo_src() -> Path:
     )
 
 
-def _load_krita_client():
-    """Import `KritaClient` from `src/kritomatic/client.py`, adding
-    the repo's `src/` to `sys.path` on ImportError (which happens
-    when a playground is launched from a directory that doesn't
-    already have the source tree on `PYTHONPATH`)."""
+def _load_from_src(module_path: str, name: str):
+    """Import `name` from `module_path`, adding the repo's `src/` to
+    `sys.path` on ImportError.  Idempotent — a module already
+    importable goes through the direct branch without touching
+    `sys.path`.
+    """
     try:
-        from kritomatic.client import KritaClient
+        mod = __import__(module_path, fromlist=[name])
     except ImportError:
         src = find_repo_src()
         if str(src) not in sys.path:
             sys.path.insert(0, str(src))
-        from kritomatic.client import KritaClient
-    return KritaClient
+        mod = __import__(module_path, fromlist=[name])
+    return getattr(mod, name)
 
 
-KritaClient = _load_krita_client()
+KritaClient   = _load_from_src("kritomatic.client", "KritaClient")
+BatchExecutor = _load_from_src("kritomatic.batch",  "BatchExecutor")
 
 
 # A single lock guards the native file picker against a second

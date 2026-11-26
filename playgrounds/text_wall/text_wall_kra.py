@@ -18,6 +18,14 @@ the group's stack); texts second (so they draw on top).  No
 transform masks exist in this export at all — the warp is encoded
 entirely in the affine the text carries.
 
+The scaffolding shared with `cone` — constants, the batch bootstrap,
+`normalize_band`, `common_header`, `coerce_transform`,
+`prepare_output_path`, and the batch-execute-and-summarize pattern —
+lives in `pgruntime.kra_export`.  What stays here is the command
+emission itself: `_build_bundle` and the text_wall-specific option
+`draw_rectangles`.  See `pgruntime/kra_export.py`'s module
+docstring for the layering.
+
 The affine is computed in the client, on the JS side, from the
 local Jacobian of the segment's parametric map.  This module simply
 forwards the resulting numbers to the daemon.  See pg_kra.py for
@@ -25,61 +33,14 @@ the derivation.
 """
 
 import json
-import sys
-from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
-
-def _find_repo_src() -> Path:
-    p = Path(__file__).resolve().parent
-    for _ in range(10):
-        cand = p / "src"
-        if (cand / "kritomatic").is_dir():
-            return cand
-        if p == p.parent:
-            break
-        p = p.parent
-    raise RuntimeError(
-        "Could not locate src/kritomatic from " + str(Path(__file__).resolve())
-    )
-
-
-_SRC = _find_repo_src()
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
-
-from kritomatic.batch import BatchExecutor  # noqa: E402
-
-
-DEFAULT_CANVAS_W = 1920
-DEFAULT_CANVAS_H = 1080
-DEFAULT_RESOLUTION = 72
-DEFAULT_FONT_FAMILY = "sans-serif"
-
-EXPORT_GROUP_NAME = "Export"
-
-
-def _normalize_band(raw):
-    if not isinstance(raw, dict):
-        return {"width": DEFAULT_CANVAS_W, "height": DEFAULT_CANVAS_H}
-    w = raw.get("width", DEFAULT_CANVAS_W)
-    h = raw.get("height", DEFAULT_CANVAS_H)
-    try:
-        w = int(round(float(w)))
-    except (TypeError, ValueError):
-        w = DEFAULT_CANVAS_W
-    try:
-        h = int(round(float(h)))
-    except (TypeError, ValueError):
-        h = DEFAULT_CANVAS_H
-    if w < 1:
-        w = DEFAULT_CANVAS_W
-    if h < 1:
-        h = DEFAULT_CANVAS_H
-    return {"width": w, "height": h}
+from pgruntime import kra_export
 
 
 def _normalize_options(raw):
+    """text_wall-specific option normalization.  Only `draw_rectangles`
+    is user-settable; cone's `text_warp_mode` doesn't apply here."""
     if not isinstance(raw, dict):
         raw = {}
     draw = raw.get("draw_rectangles", True)
@@ -88,45 +49,8 @@ def _normalize_options(raw):
     return {"draw_rectangles": draw}
 
 
-def _common_header(band, doc_name):
-    return [
-        {
-            "type": "create_new_with_dimensions",
-            "name": doc_name,
-            "width": band["width"],
-            "height": band["height"],
-            "resolution": DEFAULT_RESOLUTION,
-        },
-        {
-            "type": "create_layer",
-            "name": EXPORT_GROUP_NAME,
-            "layer_type": "grouplayer",
-            "position": "top",
-        },
-    ]
-
-
-def _coerce_transform(raw):
-    """Accept a list or a JSON string; return a 6-float list or None."""
-    if raw is None:
-        return None
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except Exception:
-            return None
-    if not isinstance(raw, (list, tuple)):
-        return None
-    if len(raw) != 6:
-        return None
-    try:
-        return [float(v) for v in raw]
-    except (TypeError, ValueError):
-        return None
-
-
 def _build_bundle(texts, rects, opts, band, doc_name):
-    commands = _common_header(band, doc_name)
+    commands = kra_export.common_header(band, doc_name)
 
     # ---- rectangles first (bottom of the group's stack) -----------
     for r in (rects or []):
@@ -135,7 +59,7 @@ def _build_bundle(texts, rects, opts, band, doc_name):
             "type": "create_layer",
             "name": layer_name,
             "layer_type": "vectorlayer",
-            "parent": EXPORT_GROUP_NAME,
+            "parent": kra_export.EXPORT_GROUP_NAME,
         })
         pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
                for p in r.get("points", [])]
@@ -157,14 +81,14 @@ def _build_bundle(texts, rects, opts, band, doc_name):
             "type": "create_layer",
             "name": layer_name,
             "layer_type": "vectorlayer",
-            "parent": EXPORT_GROUP_NAME,
+            "parent": kra_export.EXPORT_GROUP_NAME,
         })
 
         entry = {
             "type": "add_vector_text",
             "layer_name": layer_name,
             "text": str(t.get("text", t.get("label", ""))),
-            "font_family": DEFAULT_FONT_FAMILY,
+            "font_family": kra_export.DEFAULT_FONT_FAMILY,
             "font_size": max(6, int(round(float(t["font_px"])))),
             "x": float(t["x"]),
             "y": float(t["y"]),
@@ -172,7 +96,7 @@ def _build_bundle(texts, rects, opts, band, doc_name):
             "alignment": t.get("alignment", "center"),
             "rotation": 0.0,
         }
-        tf = _coerce_transform(t.get("transform"))
+        tf = kra_export.coerce_transform(t.get("transform"))
         if tf is not None:
             entry["transform"] = json.dumps(tf)
 
@@ -189,7 +113,7 @@ def _build_bundle(texts, rects, opts, band, doc_name):
 
 
 def generate(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Entry point called by the route handler."""
+    """Entry point called by text_wall_playground's POST handler."""
     texts   = payload.get("texts", [])
     rects   = payload.get("rects", [])
     options = payload.get("options", {})
@@ -202,39 +126,13 @@ def generate(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not output_path:
         return {"success": False, "message": "No output path provided"}
 
-    out = Path(str(output_path)).expanduser()
-    if out.suffix.lower() != ".kra":
-        out = out.with_suffix(".kra")
+    out = kra_export.prepare_output_path(output_path)
 
     opts  = _normalize_options(options)
-    nband = _normalize_band(band)
+    nband = kra_export.normalize_band(band)
 
     bundle = _build_bundle(texts, rects, opts, nband, doc_name)
-    bundle["commands"].append({
-        "type": "save_document",
-        "file_path": str(out),
-    })
 
-    executor = BatchExecutor()
-    try:
-        results = executor.execute(bundle)
-    finally:
-        executor.close()
-
-    failed = [r for r in results if r["status"] == "error"]
-    if failed:
-        summary = "; ".join(
-            f"{r['command']} -> {r['message']}" for r in failed
-        )
-        return {
-            "success": False,
-            "message": f"{len(failed)} command(s) failed: {summary}",
-            "results": results,
-        }
-
-    return {
-        "success": True,
-        "message": f"Wrote {out} ({len(texts)} text(s))",
-        "output_path": str(out),
-        "results": results,
-    }
+    return kra_export.execute_bundle(
+        bundle, out, count=len(texts), kind="text(s)",
+    )

@@ -8,6 +8,17 @@ batch — is printed with the daemon's own message intact, so the
 reason is visible where the board was launched and not only in the
 browser.
 
+The client bootstrap (`KritaClient` import), per-command wrapper
+(`_call`), and the three command wrappers (`open_file`,
+`activate_document`, `pick_files`) are shared with `text_boxes` and
+live in `pgruntime.krita_api`.  This module imports them from
+there; the local wrappers below just pin `log_prefix` to
+`"board_krita"` so log lines from this playground stay tagged
+consistently with the rest of the tree.  See
+`pgruntime/krita_api.py`'s module docstring for the extraction
+rationale (including the fix for text_boxes's `activate_document`
+bug).
+
 CROP FALLBACK
 =============
 The daemon does not expose a `create_document` command.  `crop_to_file`
@@ -51,77 +62,64 @@ case, and Python's `dict.get("data", {})` returns `None`, not `{}`,
 when the key is present with value `None`.
 
 Therefore every `_call(...)` caller that inspects `data` must treat
-`err` as the success indicator, not `data`.  `activate_document` was
-the last holdout — it checked `data is None`, which fired on the
-no-data success path and produced `"activate FAILED: unknown"` in
-the logs while Krita actually activated the document.  It now checks
-`err is not None` instead, matching the shape `_call` documents.
+`err` as the success indicator, not `data`.  `krita_api.call`
+documents this in its own docstring; the local `_call` wrapper
+preserves the same convention.
 """
 
-import json
 import os
-import sys
-import threading
 from pathlib import Path
+
+from pgruntime import krita_api
 
 
 def _log(msg):
     print(f"[board_krita] {msg}", flush=True)
 
 
-def _find_repo_src() -> Path:
-    p = Path(__file__).resolve().parent
-    for _ in range(10):
-        cand = p / "src"
-        if (cand / "kritomatic").is_dir():
-            return cand
-        if p == p.parent:
-            break
-        p = p.parent
-    raise RuntimeError(
-        "Could not locate src/kritomatic from " + str(Path(__file__).resolve())
+# ---- shared client bootstrap, re-exported via local wrappers ----
+
+# The five functions below are extracted in `pgruntime.krita_api`;
+# the wrappers just pin `log_prefix` to `"board_krita"` so log lines
+# from this playground stay tagged consistently.  Call sites in
+# `board_server.py` (`board_krita.open_file(...)` etc.) are unchanged.
+
+def _call(cmd_type, **kwargs):
+    return krita_api.call(cmd_type, log_prefix="board_krita", **kwargs)
+
+
+def open_file(path, add_view=True):
+    return krita_api.open_file(path, add_view, log_prefix="board_krita")
+
+
+def activate_document(name):
+    return krita_api.activate_document(name, log_prefix="board_krita")
+
+
+def pick_files():
+    return krita_api.pick_files(
+        title="Add files to the board",
+        filetypes=[
+            ("Krita documents", "*.kra *.krz"),
+            ("Images",          "*.png *.jpg *.jpeg *.tif *.tiff *.webp *.psd"),
+            ("All files",       "*.*"),
+        ],
+        log_prefix="board_krita",
     )
 
 
-try:
-    from kritomatic.client import KritaClient
-except ImportError:
-    _SRC = _find_repo_src()
-    if str(_SRC) not in sys.path:
-        sys.path.insert(0, str(_SRC))
-    from kritomatic.client import KritaClient
+# Re-export `KritaClient` so `paste_transforms` can build a batch
+# without duplicating the import bootstrap.
+KritaClient = krita_api.KritaClient
 
+
+# ---- board-specific functionality begins here ---------------------
 
 def _norm(p):
     try:
         return os.path.realpath(os.path.expanduser(str(p)))
     except Exception:
         return str(p)
-
-
-def _call(cmd_type, **kwargs):
-    """Return (data, None) on success and (None, message) on failure.
-
-    On success `data` may be `{}` *or* `None` — the daemon writes
-    `data: None` for commands that do not return a payload.  Callers
-    must test `err is not None` for failure, not `data is None`.
-    """
-    client = KritaClient()
-    if not client.connect():
-        _log(f"{cmd_type}: daemon not reachable")
-        return None, "Kritomatic daemon not reachable"
-    try:
-        resp = client.execute(cmd_type, **kwargs)
-    finally:
-        client.close()
-    if not resp:
-        _log(f"{cmd_type}: no response")
-        return None, "no response from daemon"
-    if resp.get("status") != "success":
-        msg = resp.get("message", "unknown daemon error")
-        _log(f"{cmd_type}: FAILED: {msg}")
-        return None, msg
-    return resp.get("data", {}), None
 
 
 def status():
@@ -218,41 +216,6 @@ def refresh(paths, max_size=512):
         out["partial"] = True
         out["message"] = partial_msg
     return out
-
-
-def open_file(path, add_view=True):
-    try:
-        data, err = _call("open_document",
-                          file_path=path, add_view=add_view)
-    except Exception as e:
-        return {"success": False, "message": str(e)}
-    if err is not None:
-        return {"success": False, "message": err or "unknown"}
-    return {
-        "success": True,
-        "message": f"opened {path}",
-        "name":    (data or {}).get("name", ""),
-    }
-
-
-def activate_document(name):
-    """Bring `name` (a document name or file path) to the front.
-
-    The daemon command returns `{status: "success", message: ...}`
-    with no `data` on success.  `_call` therefore yields
-    `(None, None)` here, which is success — the trigger to test is
-    `err is not None`, not `data is None`.  The previous
-    `data is None` check fired on every successful call and produced
-    a spurious `"activate FAILED: unknown"` log line while Krita
-    actually activated the document.
-    """
-    try:
-        data, err = _call("activate_document", name=name)
-    except Exception as e:
-        return {"success": False, "message": str(e)}
-    if err is not None:
-        return {"success": False, "message": err or "unknown"}
-    return {"success": True, "message": f"Activated {name}"}
 
 
 def paste_transforms(transforms):
@@ -560,42 +523,3 @@ def crop_to_files(source_path, cells):
         "failed": failed,
         "results": results,
     }
-
-
-_picker_lock = threading.Lock()
-
-
-def pick_files():
-    with _picker_lock:
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-        except ImportError:
-            _log("pick_files: tkinter not available")
-            return {"success": False,
-                    "message": "tkinter not installed; add paths via Load board"}
-
-        try:
-            root = tk.Tk()
-            root.withdraw()
-            try:
-                root.attributes("-topmost", True)
-            except Exception:
-                pass
-            paths = filedialog.askopenfilenames(
-                title="Add files to the board",
-                filetypes=[
-                    ("Krita documents", "*.kra *.krz"),
-                    ("Images",          "*.png *.jpg *.jpeg *.tif *.tiff *.webp *.psd"),
-                    ("All files",       "*.*"),
-                ],
-            )
-            root.destroy()
-            return {"success": True, "paths": [str(p) for p in paths]}
-        except Exception as e:
-            try:
-                root.destroy()
-            except Exception:
-                pass
-            _log(f"pick_files: {e}")
-            return {"success": False, "message": str(e)}

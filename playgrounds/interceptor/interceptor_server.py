@@ -197,7 +197,7 @@ import time
 import urllib.error
 import urllib.request
 
-from inpaint import krita_client
+from pgruntime import daemon_client as krita_client
 
 from pgruntime.ports import port_for
 
@@ -395,7 +395,7 @@ def handle_list(_payload):
     daemon_ids: set = set()
     try:
         resp = krita_client.send({"type": "comfy_status"}, timeout=3.0)
-        if isinstance(resp, dict) and resp.get("status") == "success":
+        if krita_client.is_success(resp):
             daemon_responded = True
             data = resp.get("data") or {}
             for entry in (data.get("intercepted_batches") or []):
@@ -585,7 +585,7 @@ def handle_run(payload):
         if t is None:
             return {"success": False, "message": "task was removed"}
 
-        if resp.get("status") == "success":
+        if krita_client.is_success(resp):
             data = resp.get("data") or {}
             t["status"] = "done"
             t["result"] = data

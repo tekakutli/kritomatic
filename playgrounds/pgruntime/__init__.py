@@ -59,6 +59,14 @@ PACKAGE CONTENTS
                                          "pg_state.js": STATE_JS,
                                          # ...
                                      }
+    pgruntime.krita_api         higher-level `KritaClient` wrapper for
+                                the two playgrounds (board, text_boxes)
+                                that use `src/kritomatic/client.py`'s
+                                client rather than the raw TCP
+                                `daemon_client` the other seven use.
+                                Provides `call`, `open_file`,
+                                `activate_document`, `pick_files`,
+                                and re-exports `KritaClient`.
 """
 
 __version__ = "0.1.0"

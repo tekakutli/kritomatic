@@ -38,6 +38,7 @@ PLAYGROUND_PORTS: dict[str, int] = {
     # the fixed-port surface single-sourced even though it isn't a
     # playground in the same sense.
     "hub":          8780,
+    "workbench":    8781,
 }
 
 

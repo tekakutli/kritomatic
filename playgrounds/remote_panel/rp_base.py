@@ -868,6 +868,10 @@ RP_BODY = r"""
                      it manages with it.">
         Shut down hub
       </button>
+      <button id="rpMgmtOpenWorkbench"
+              title="Open (or focus) the workbench in a browser tab.">
+        Open workbench
+      </button>
       <button id="rpMgmtClose">Close</button>
     </div>
   </div>

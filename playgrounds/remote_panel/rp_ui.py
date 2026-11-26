@@ -460,13 +460,34 @@ function _rpLauncherManaging(name) {
 function _rpBuildOpenButton(pg) {
   const btn = document.createElement("button");
   btn.textContent = "Open";
-  btn.title = "Open " + pg.name + " in a new tab";
-  btn.addEventListener("click", () => {
+
+  const base = _hubHttpBase();
+  if (!base) { btn.disabled = true; return btn; }
+
+  /* Prefer the workbench if it's running: opens the playground as a
+     tab inside the workbench browser tab (reused via the named
+     window "workbench"). Falls back to a new browser tab otherwise,
+     so the button keeps working when no workbench process exists. */
+  const wb = _rp.playgrounds.find(
+    p => p.role === "panel" && p.name === "workbench"
+  );
+
+  if (wb) {
+    const wbHtml = wb.html_file || "workbench.html";
+    const wbUrl  = base + "/workbench/" + wbHtml
+                 + "#" + encodeURIComponent(pg.name);
+    btn.title = "Open " + pg.name + " in the workbench";
+    btn.addEventListener("click", () => {
+      window.open(wbUrl, "workbench");
+    });
+  } else {
     const html = pg.html_file || (pg.name + "_playground.html");
-    const base = _hubHttpBase();
-    if (!base) return;
-    window.open(base + "/" + pg.name + "/" + html, "_blank");
-  });
+    btn.title = "Open " + pg.name + " in a new browser tab "
+              + "(workbench not running)";
+    btn.addEventListener("click", () => {
+      window.open(base + "/" + pg.name + "/" + html, "_blank");
+    });
+  }
   return btn;
 }
 
@@ -815,6 +836,17 @@ function rpRebuildManagementList() {
       }
     });
   }
+
+  const mgmtOpenWb = document.getElementById("rpMgmtOpenWorkbench");
+  if (mgmtOpenWb) mgmtOpenWb.addEventListener("click", () => {
+    const base = _hubHttpBase();
+    const wb = _rp.playgrounds.find(
+      p => p.role === "panel" && p.name === "workbench"
+    );
+    if (!base || !wb) { _mgmtStatusBad("workbench not running"); return; }
+    const wbHtml = wb.html_file || "workbench.html";
+    window.open(base + "/workbench/" + wbHtml, "workbench");
+  });
 
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {

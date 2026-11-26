@@ -175,9 +175,22 @@ function rpLog(kind, text) {
    ========================================================================== */
 
 function rpConnect(target) {
+  const targetChanged = (_rp.target !== target);
   rpDisconnect();
-  _rp.target        = target;
-  _rp.everConnected = false;
+
+  if (targetChanged) {
+    // Switching to a different playground: drop everything we knew
+    // about the old one so the panel doesn't show its fields while
+    // the new socket populates.
+    _rp.everConnected = false;
+    _rp.values = {};
+    _rp.schema = {};
+    _rp.entities = null;
+    _rp.entityOrder = [];
+    if (typeof rpRebuildPanel === "function") rpRebuildPanel();
+  }
+
+  _rp.target = target;
   try { localStorage.setItem("rp.target", target); } catch (e) {}
 
   let sock;
@@ -188,8 +201,10 @@ function rpConnect(target) {
     return;
   }
   _rp.socket = sock;
+  rpSetStatus("connecting");
 
   sock.addEventListener("open", () => {
+    if (_rp.socket !== sock) return;           // stale
     _rp.connected     = true;
     _rp.everConnected = true;
     _rp.reconnectMs   = 1000;
@@ -203,12 +218,14 @@ function rpConnect(target) {
   });
 
   sock.addEventListener("message", (ev) => {
+    if (_rp.socket !== sock) return;           // stale
     let msg;
     try { msg = JSON.parse(ev.data); } catch (e) { return; }
     rpHandle(msg);
   });
 
   sock.addEventListener("close", () => {
+    if (_rp.socket !== sock) return;           // stale — user switched or disconnected
     _rp.connected = false;
     _rp.clientId  = null;
     rpSetStatus("disconnected");
@@ -222,9 +239,21 @@ function rpConnect(target) {
 function rpDisconnect() {
   if (_rp.reconnectTimer) { clearTimeout(_rp.reconnectTimer); _rp.reconnectTimer = null; }
   if (_rp.stateTimer)     { clearTimeout(_rp.stateTimer);     _rp.stateTimer     = null; }
-  if (_rp.socket) { try { _rp.socket.close(); } catch (e) {} _rp.socket = null; }
+
+  const oldSock = _rp.socket;
+  _rp.socket    = null;
   _rp.connected = false;
   _rp.clientId  = null;
+  _rp.presence  = null;
+
+  if (oldSock) {
+    try { oldSock.close(); } catch (e) {}
+  }
+
+  // Set the UI ourselves — the close handler no longer will (identity
+  // check skips it, because `_rp.socket` is already null).
+  rpSetStatus("disconnected");
+  rpRenderPresence();
 }
 
 function rpScheduleReconnect() {

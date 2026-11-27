@@ -1,16 +1,22 @@
 """
 rp_client.py — the remote panel's WebSocket client.
 
-The panel has two WS channels to the hub:
+The panel has two WS channels:
 
-  Control   role="panel", the anonymous listener socket.  Receives
-            `playgrounds` broadcasts and `launcher_result`; sends
-            `kill`, `shutdown_hub`, `launcher_start`, `launcher_stop`,
-            `launcher_restart`.
+  Playground  a direct WS to the selected playground's /remote
+              endpoint (via the hub's proxy).  Drives that
+              playground's values and actions.  Unchanged by this
+              file's extension.
 
-  Playground  a direct WS to the playground's /remote endpoint (via
-            the hub's proxy).  Drives a selected playground's values
-            and actions.  Unchanged by this file's extension.
+  Hub         the panel's own management WS to the hub.  Provides
+              the `playgrounds` broadcast, launcher commands, kill,
+              and hub shutdown.  Implemented by
+              `pgruntime.hub_control.createHubControl` — this file
+              wires its callbacks into the panel's local state.
+
+The two channels are independent: the playground channel is what
+the panel actually drives, the hub channel is what populates the
+dropdown, the management list, and the shutdown flow.
 
 ENTITY AND TARGET FILTERS
 =========================
@@ -22,29 +28,6 @@ entries in the same array are filtered out automatically.
 the running-playgrounds list (role="playground") and the "Available
 to start" list (derived from each launcher's `available` field).
 
-LAUNCHER COMMANDS
-=================
-`rpLauncherStart(name)` and `rpLauncherStop(name)` send
-`launcher_start` / `launcher_stop` over the control WS.  The hub
-forwards to the launcher, which replies with `launcher_result`; the
-reply is handled in `_rpHandleHubMessage` and surfaced via
-`flashStatus`.
-
-GROUPED PLAYGROUNDS
-===================
-A registration may carry a `group` string.  Groups are metadata, not
-routing; the target dropdown still lists each playground
-individually.  The visible consequence: the Kill/Force buttons'
-`title` and the Force confirm dialog mention the group when the
-field is non-None, and the Stop button on a grouped playground is
-offered as the "stop only this one" alternative to Kill (which shuts
-down the group).
-
-HUB SHUTDOWN FLOW
-=================
-Unchanged.  `rpShutdownHub()` promises a `shutdown_ack`; see the
-previous version's docstring for the full lifecycle.
-
 RPLOG — MIRRORING ERRORS AND WARNINGS TO THE TERMINAL
 ====================================================
 `rpLog` is the panel's own log writer.  It records to `_rp.log`,
@@ -53,21 +36,17 @@ renders to the panel's log DOM, and — for kinds "error" and "warn"
 what reach the terminal: the inline script in
 remote_panel_html.py installs the same console override that
 pgkit/panel_core.js installs, and routes every console.error /
-console.warn through POST ./__log.  The panel's own server
-(port 8772) has the standard pgkit built-in `_handle_log` handler,
-so those messages appear on the panel's stdout alongside the
-playground processes' output.
+console.warn through POST ./__log.
 
 Why "error" and "warn" and nothing else: those two kinds represent
 failures and warnings the operator needs to see; "info" and "cmd"
-are progress narration and would flood the terminal.  See
-`rpLog`'s own comment for the full reasoning.
+are progress narration and would flood the terminal.
 
 The `if (typeof flashStatus === "function")` guards elsewhere in
 this file are defensive no-ops — remote_panel doesn't load
 pgkit/panel_core.js as a module, so `flashStatus` is never a global
-on this page.  The mirror is now the primary channel; flashStatus
-would be a secondary panel-local echo if it were ever wired up.
+on this page.  The mirror is the primary channel; flashStatus would
+be a secondary panel-local echo if it were ever wired up.
 """
 
 RP_CLIENT_JS = r"""
@@ -97,65 +76,61 @@ const _rp = {
   log:             [],
   _pendingAction:  null,
 
-  hubSocket:         null,
-  hubUrl:            null,
-  hubConnected:      false,
-  playgrounds:       [],
-  hubReconnectMs:    1000,
-  hubReconnectTimer: null,
-
-  shuttingDown:      false,
-  shutdownTimeoutId: null,
-  shutdownResolve:   null,
+  /* Populated by hubCtrl's callbacks below. */
+  hubConnected:    false,
+  playgrounds:     [],
+  shuttingDown:    false,
 };
 
-const RP_PROTOCOL_VERSION = 1;
-const RP_MAX_LOG           = 300;
-const RP_STATE_DEBOUNCE_MS = 500;
+const RP_PROTOCOL_VERSION   = 1;
+const RP_MAX_LOG            = 300;
+const RP_STATE_DEBOUNCE_MS  = 500;
 const RP_REBUILD_DEBOUNCE_MS = 50;
+
+/* ==========================================================================
+   HUB CONTROL — shared with the workbench
+   ==========================================================================
+   The listener-panel WS to the hub, its reconnect logic, and the
+   launcher / kill / shutdown commands now live in
+   pgruntime/hub_control.py.  We just wire its callbacks into _rp. */
+
+const hubCtrl = createHubControl({
+  onPlaygrounds: function (list) {
+    _rp.playgrounds = list;
+    rpPopulateTargets();
+    if (typeof rpRebuildManagementList === "function") {
+      rpRebuildManagementList();
+    }
+  },
+  onConnected: function () {
+    _rp.hubConnected = true;
+    if (typeof rpRebuildManagementList === "function") {
+      rpRebuildManagementList();
+    }
+  },
+  onDisconnected: function () {
+    _rp.hubConnected = false;
+    _rp.playgrounds = [];
+    rpPopulateTargets();
+    if (typeof rpRebuildManagementList === "function") {
+      rpRebuildManagementList();
+    }
+  },
+  onLauncherResult: function (msg) {
+    rpLog(msg.success ? "info" : "error",
+          "launcher " + (msg.name || "?") + ": " + (msg.message || ""));
+  },
+  onKillResult: function (msg) {
+    rpLog(msg.success ? "info" : "error",
+          "kill " + msg.name + ": " + (msg.message || ""));
+  },
+});
 
 /* ==========================================================================
    LOG
    ==========================================================================
    Panel-local logging that ALSO mirrors errors and warnings to the
-   terminal.
-
-   The panel's log array and its log DOM are the primary display —
-   every kind lands there.  For the two kinds that represent
-   failures ("error") or warnings ("warn"), the entry additionally
-   goes through console.error / console.warn, which the inline
-   script in remote_panel_html.py's <head> has overridden to
-   forward to POST ./__log.  The panel's own server prints those
-   to its stdout.
-
-   Kinds and their mirroring:
-
-     "error"    failures: kill send failed, launcher refused, hub
-                acknowledgment timeout, WebSocket send error, etc.
-                MIRRORED via console.error.
-
-     "warn"     warnings: state-stale conditions, transient
-                network hiccups.  MIRRORED via console.warn.
-
-     "info"     progress narration: connect, disconnect, presence
-                changes, hub registration list updates.  NOT
-                mirrored — would flood the terminal.
-
-     "cmd"      command traffic: every command sent, every
-                command_result received.  NOT mirrored — the
-                successful case is expected chatter, the failure
-                case follows up with an explicit rpLog("error", …)
-                that mirrors independently.
-
-     "state"    state dump notifications.  NOT mirrored.
-     "schema"   schema dump notifications.  NOT mirrored.
-     "entities" entity-list updates.  NOT mirrored.
-     "patch"    field patches.  NOT mirrored.
-
-   The `try/catch` around console.error / console.warn is
-   defensive: those methods never throw, but if a caller in a
-   subclass or a test harness replaces them, a bad replacement
-   should not break `rpLog` itself. */
+   terminal.  See the module docstring for the full contract. */
 
 function rpLog(kind, text) {
   const ts = new Date().toLocaleTimeString();
@@ -179,9 +154,6 @@ function rpConnect(target) {
   rpDisconnect();
 
   if (targetChanged) {
-    // Switching to a different playground: drop everything we knew
-    // about the old one so the panel doesn't show its fields while
-    // the new socket populates.
     _rp.everConnected = false;
     _rp.values = {};
     _rp.schema = {};
@@ -204,33 +176,29 @@ function rpConnect(target) {
   rpSetStatus("connecting");
 
   sock.addEventListener("open", () => {
-    if (_rp.socket !== sock) return;           // stale
+    if (_rp.socket !== sock) return;
     _rp.connected     = true;
     _rp.everConnected = true;
     _rp.reconnectMs   = 1000;
     rpSetStatus("connecting");
-    rpSend({
-      type:     "hello",
-      role:     "remote",
-      protocol: RP_PROTOCOL_VERSION,
-    });
+    rpSend({ type: "hello", role: "remote", protocol: RP_PROTOCOL_VERSION });
     rpLog("info", "connected to " + target);
   });
 
   sock.addEventListener("message", (ev) => {
-    if (_rp.socket !== sock) return;           // stale
+    if (_rp.socket !== sock) return;
     let msg;
     try { msg = JSON.parse(ev.data); } catch (e) { return; }
     rpHandle(msg);
   });
 
   sock.addEventListener("close", () => {
-    if (_rp.socket !== sock) return;           // stale — user switched or disconnected
+    if (_rp.socket !== sock) return;
     _rp.connected = false;
     _rp.clientId  = null;
     rpSetStatus("disconnected");
     rpLog("info", "disconnected");
-    if (!_rp.shuttingDown) rpScheduleReconnect();
+    rpScheduleReconnect();
   });
 
   sock.addEventListener("error", () => {});
@@ -250,20 +218,17 @@ function rpDisconnect() {
     try { oldSock.close(); } catch (e) {}
   }
 
-  // Set the UI ourselves — the close handler no longer will (identity
-  // check skips it, because `_rp.socket` is already null).
   rpSetStatus("disconnected");
   rpRenderPresence();
 }
 
 function rpScheduleReconnect() {
-  if (_rp.shuttingDown)   return;
   if (!_rp.everConnected) return;
   if (!_rp.target)        return;
   if (_rp.reconnectTimer) return;
   _rp.reconnectTimer = setTimeout(() => {
     _rp.reconnectTimer = null;
-    if (!_rp.connected && _rp.target && !_rp.shuttingDown) {
+    if (!_rp.connected && _rp.target) {
       rpLog("info", "reconnecting to " + _rp.target + "\u2026");
       rpConnect(_rp.target);
     }
@@ -756,240 +721,11 @@ function rpRenderPresence() {
 }
 
 /* ==========================================================================
-   HUB MANAGEMENT
-   ========================================================================== */
-
-function rpDiscoverHub() {
-  try {
-    const u = new URL("/__hub_ws", document.baseURI);
-    u.protocol = (u.protocol === "https:") ? "wss:" : "ws:";
-    _rp.hubUrl = u.toString();
-  } catch (e) {
-    _rp.hubUrl = null;
-    return;
-  }
-  _rpConnectHub();
-}
-
-function _rpConnectHub() {
-  if (_rp.hubReconnectTimer) { clearTimeout(_rp.hubReconnectTimer); _rp.hubReconnectTimer = null; }
-  if (_rp.hubSocket) { try { _rp.hubSocket.close(); } catch (e) {} _rp.hubSocket = null; }
-  if (!_rp.hubUrl) return;
-  if (_rp.shuttingDown) return;
-
-  let sock;
-  try { sock = new WebSocket(_rp.hubUrl); }
-  catch (e) { _rpScheduleHubReconnect(); return; }
-  _rp.hubSocket = sock;
-
-  sock.addEventListener("open", () => {
-    _rp.hubConnected = true;
-    _rp.hubReconnectMs = 1000;
-    try { sock.send(JSON.stringify({ type: "hello", role: "panel" })); } catch (e) {}
-    rpLog("info", "hub management connected");
-  });
-
-  sock.addEventListener("message", (ev) => {
-    let msg;
-    try { msg = JSON.parse(ev.data); } catch (e) { return; }
-    _rpHandleHubMessage(msg);
-  });
-
-  sock.addEventListener("close", () => {
-    _rp.hubConnected = false;
-    _rp.playgrounds = [];
-    rpLog("info", "hub management disconnected");
-    rpPopulateTargets();
-    if (typeof rpRebuildManagementList === "function") {
-      rpRebuildManagementList();
-    }
-    if (!_rp.shuttingDown) _rpScheduleHubReconnect();
-  });
-
-  sock.addEventListener("error", () => {});
-}
-
-function _rpScheduleHubReconnect() {
-  if (_rp.shuttingDown) return;
-  if (_rp.hubReconnectTimer) return;
-  _rp.hubReconnectTimer = setTimeout(() => {
-    _rp.hubReconnectTimer = null;
-    _rpConnectHub();
-  }, _rp.hubReconnectMs);
-  _rp.hubReconnectMs = Math.min(_rp.hubReconnectMs * 2, 10000);
-}
-
-function _rpHandleHubMessage(msg) {
-  if (msg.type === "playgrounds") {
-    _rp.playgrounds = msg.playgrounds || [];
-    rpLog("info", "hub: " + _rp.playgrounds.length + " registration(s)");
-    rpPopulateTargets();
-    if (typeof rpRebuildManagementList === "function") {
-      rpRebuildManagementList();
-    }
-    return;
-  }
-  if (msg.type === "kill_result") {
-    rpLog(msg.success ? "info" : "error",
-          "kill " + msg.name + ": " + (msg.message || ""));
-    if (typeof flashStatus === "function") {
-      flashStatus(
-        "kill " + msg.name + ": " + (msg.success ? "ok" : (msg.message || "failed")),
-        msg.success ? "ok" : "bad"
-      );
-    }
-    return;
-  }
-  if (msg.type === "launcher_result") {
-    rpLog(msg.success ? "info" : "error",
-          "launcher " + (msg.name || "?") + ": " + (msg.message || ""));
-    if (typeof flashStatus === "function") {
-      flashStatus(
-        "launcher " + (msg.name || "?") + ": "
-          + (msg.message || (msg.success ? "ok" : "failed")),
-        msg.success ? "ok" : "bad"
-      );
-    }
-    return;
-  }
-  if (msg.type === "shutdown_ack") {
-    rpLog("info", "hub shutdown acknowledged");
-    if (_rp.shutdownResolve) _rp.shutdownResolve({ ok: true });
-    if (_rp.socket) { try { _rp.socket.close(); } catch (e) {} _rp.socket = null; }
-    _rp.connected     = false;
-    _rp.clientId      = null;
-    _rp.hubConnected  = false;
-    _rp.playgrounds   = [];
-    rpSetStatus("disconnected");
-    return;
-  }
-  if (msg.type === "shutdown") {
-    rpLog("info", "hub is shutting down (received shutdown notice)");
-    _rp.shuttingDown = true;
-    if (_rp.shutdownResolve) _rp.shutdownResolve({ ok: true });
-    if (_rp.socket) { try { _rp.socket.close(); } catch (e) {} _rp.socket = null; }
-    _rp.connected     = false;
-    _rp.clientId      = null;
-    _rp.hubConnected  = false;
-    _rp.playgrounds   = [];
-    rpSetStatus("disconnected");
-    return;
-  }
-}
-
-/* ==========================================================================
-   LAUNCHER COMMANDS
-   ========================================================================== */
-
-function rpLauncherStart(name) {
-  if (!_rp.hubSocket || !_rp.hubConnected) {
-    if (typeof flashStatus === "function") flashStatus("hub not connected", "warn");
-    return;
-  }
-  const request_id = "lreq-" + Math.random().toString(36).slice(2, 10);
-  try {
-    _rp.hubSocket.send(JSON.stringify({
-      type: "launcher_start", name, request_id,
-    }));
-    if (typeof flashStatus === "function") flashStatus("starting " + name + "\u2026", "warn");
-  } catch (e) {
-    if (typeof flashStatus === "function") flashStatus("send failed: " + e.message, "bad");
-  }
-}
-
-function rpLauncherStop(name) {
-  if (!_rp.hubSocket || !_rp.hubConnected) {
-    if (typeof flashStatus === "function") flashStatus("hub not connected", "warn");
-    return;
-  }
-  const request_id = "lreq-" + Math.random().toString(36).slice(2, 10);
-  try {
-    _rp.hubSocket.send(JSON.stringify({
-      type: "launcher_stop", name, request_id,
-    }));
-    if (typeof flashStatus === "function") flashStatus("stopping " + name + "\u2026", "warn");
-  } catch (e) {
-    if (typeof flashStatus === "function") flashStatus("send failed: " + e.message, "bad");
-  }
-}
-
-/* ==========================================================================
-   HUB SHUTDOWN
-   ========================================================================== */
-
-function rpShutdownHub() {
-  return new Promise((resolve) => {
-    if (!_rp.hubSocket || !_rp.hubConnected) {
-      resolve({ ok: false, error: "hub not connected" });
-      return;
-    }
-    if (_rp.shuttingDown) {
-      resolve({ ok: false, error: "already shutting down" });
-      return;
-    }
-    if (_rp.shutdownTimeoutId) {
-      clearTimeout(_rp.shutdownTimeoutId);
-      _rp.shutdownTimeoutId = null;
-    }
-    _rp.shuttingDown = true;
-
-    let done = false;
-    const finish = (result) => {
-      if (done) return;
-      done = true;
-      if (_rp.shutdownTimeoutId) {
-        clearTimeout(_rp.shutdownTimeoutId);
-        _rp.shutdownTimeoutId = null;
-      }
-      if (!result.ok) _rp.shuttingDown = false;
-      _rp.shutdownResolve = null;
-      resolve(result);
-    };
-
-    _rp.shutdownResolve = finish;
-
-    _rp.shutdownTimeoutId = setTimeout(() => {
-      finish({ ok: false, error: "no acknowledgment from hub within 5s" });
-    }, 5000);
-
-    try {
-      _rp.hubSocket.send(JSON.stringify({ type: "shutdown_hub" }));
-      rpLog("info", "sent shutdown_hub; waiting for ack\u2026");
-    } catch (e) {
-      finish({ ok: false, error: "send failed: " + e.message });
-    }
-  });
-}
-
-function rpKillPlayground(name, hard) {
-  if (!_rp.hubSocket || !_rp.hubConnected) {
-    rpLog("error", "kill: hub not connected");
-    return;
-  }
-  try {
-    _rp.hubSocket.send(JSON.stringify({
-      type: "kill", name, hard: !!hard,
-    }));
-    rpLog("info", "kill requested: " + name + (hard ? " (hard)" : ""));
-  } catch (e) {
-    rpLog("error", "kill send failed: " + e.message);
-  }
-}
-
-/* ==========================================================================
    TARGET DROPDOWN
-   ========================================================================== */
-
-function _hubHttpBase() {
-  if (!_rp.hubUrl) return null;
-  try {
-    const u = new URL(_rp.hubUrl);
-    const proto = (u.protocol === "wss:") ? "https:" : "http:";
-    return proto + "//" + u.host;
-  } catch (e) {
-    return null;
-  }
-}
+   ==========================================================================
+   Populated from the `playgrounds` broadcast, filtered to
+   role="playground".  Called from hubCtrl's onPlaygrounds callback
+   and once at boot. */
 
 function rpPopulateTargets() {
   const presetEl = document.getElementById("rpPreset");
@@ -1003,8 +739,8 @@ function rpPopulateTargets() {
 
   presetEl.innerHTML = "";
 
-  const base = _hubHttpBase();
-  const playgrounds = (_rp.hubConnected && base)
+  const base = hubCtrl.hubHttpBase();
+  const playgrounds = (hubCtrl.isConnected() && base)
     ? _rp.playgrounds.filter(p => p.role === "playground")
     : [];
   const wsBase = base ? base.replace(/^http/, "ws") : null;
@@ -1047,17 +783,4 @@ function rpPopulateTargets() {
     targetEl.value = presetEl.value;
   }
 }
-
-/* ==========================================================================
-   BOOT
-   ========================================================================== */
-
-(function rpHubBoot() {
-  function start() { setTimeout(rpDiscoverHub, 200); }
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", start);
-  } else {
-    start();
-  }
-})();
 """

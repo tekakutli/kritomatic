@@ -7,6 +7,33 @@ own `pgkit.remote_hub.Hub` instance.  `serve()` calls it and then
 blocks; `serve_nonblocking()` calls it and returns the pieces so a
 launcher can own threading and shutdown.
 
+BROWSER SUPPRESSION
+===================
+Both `serve` and `serve_nonblocking` accept `open_browser=True`, and
+`webbrowser.open(url)` runs in a delayed thread when it is honoured.
+That is the correct default for a user who launched a playground
+from a shell — they want the page.
+
+It is *not* the correct default for a playground started as a
+subprocess of the workbench: the workbench is about to show that
+same playground in an iframe tab, and a browser tab on top of it
+is the duplicate.
+
+The suppression mechanism is a `PGKIT_NO_BROWSER` environment
+variable, checked by `_browser_enabled()` below.  The workbench sets
+it on its children.  Children spawned some other way do not inherit
+it, so standalone `python <name>/<name>_playground.py` keeps opening
+its browser tab.
+
+This is the same pattern `PAGER`, `EDITOR`, and `NO_COLOR` use: an
+env var that says "the caller is driving this programmatically,
+don't try to be interactive".  It is deliberately not a CLI flag —
+the playground entry points build their own argument lists and none
+of them would thread a new kwarg correctly.  It is deliberately not
+a `BROWSER=/bin/true` trick — that fights `webbrowser`'s fallback
+chain and its `%s` substitution heuristics.  One env var, checked at
+the single call site, is the whole mechanism.
+
 Module serving
 ==============
 `GET /modules/<name>` looks up `module_sources[name]` and serves it
@@ -75,6 +102,33 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 from . import ws as _ws
 from .remote_hub import Client, Hub, handle_message
+
+
+def _browser_enabled(open_browser):
+    """True iff webbrowser.open() should fire for this serve() call.
+
+    Two gates, both required:
+
+      1. The caller passed `open_browser=True`.  A playground that
+         explicitly disables the browser wins; the env var cannot
+         re-enable it.
+
+      2. `PGKIT_NO_BROWSER` is not set to a truthy value.  The
+         workbench sets this on child subprocesses so that starting a
+         playground via the `+` button does not open a duplicate
+         browser tab alongside the iframe tab the workbench
+         creates.  See this module's docstring, BROWSER SUPPRESSION.
+
+    Truthy values are the usual suspects: `1`, `true`, `yes`, `on`
+    (case-insensitive, whitespace-stripped).  Everything else,
+    including empty, `0`, `false`, `no`, `off`, and any unrecognized
+    string, means "not suppressed" — a typo'd value must not
+    silently prevent the browser from opening.
+    """
+    if not open_browser:
+        return False
+    val = os.environ.get("PGKIT_NO_BROWSER", "").strip().lower()
+    return val not in ("1", "true", "yes", "on")
 
 
 def make_handler(routes=None, raw_routes=None, module_sources=None, hub=None):
@@ -384,7 +438,10 @@ def serve_nonblocking(*, port, html_file, html_render,
         hub_name, hub_role, used_port, html_file, group=group)
     url = _public_url(hub_conn, registered, used_port, html_file)
 
-    if open_browser:
+    # See this module's docstring, BROWSER SUPPRESSION, for why the
+    # condition is `_browser_enabled(open_browser)` rather than just
+    # `open_browser`.
+    if _browser_enabled(open_browser):
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
 
     return httpd, hub_conn, url
@@ -419,7 +476,10 @@ def serve(*, port=8766, open_browser=True,
               "http://127.0.0.1:%d/%s" % (used_port, html_file))
     print("  Press Ctrl+C to stop.")
 
-    if open_browser:
+    # See this module's docstring, BROWSER SUPPRESSION, for why the
+    # condition is `_browser_enabled(open_browser)` rather than just
+    # `open_browser`.
+    if _browser_enabled(open_browser):
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
 
     try:

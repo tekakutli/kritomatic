@@ -7,7 +7,6 @@ from typing import Dict, Any, Optional, List
 from functools import lru_cache
 
 from kritomatic.helpful_argparse import HelpfulArgumentParser
-from kritomatic.playground_launcher import PLAYGROUNDS
 from kritomatic.xremap_launcher import XREMAP_COMMANDS
 from kritomatic.comfyui_panel.cli import populate_panel_subcommands
 from kritomatic.comfy_convert.cli import populate_convert_args
@@ -273,26 +272,6 @@ class CommandRegistry:
             '--input', '-i', default=None,
             help='Read JSON from this file (default: stdin)'
         )
-
-        # Interactive playgrounds.  Launch is client-side (see
-        # main.py and playground_launcher.py); the parser entry exists
-        # so `kritomatic --help` lists them and `kritomatic
-        # playgrounds` alone prints its own subcommand menu.
-        #
-        # The playground list is imported from playground_launcher so
-        # adding a playground is a one-file edit: append to PLAYGROUNDS
-        # there and both this parser and the launcher pick it up.
-        playgrounds_parser = subparsers.add_parser(
-            'playgrounds',
-            help='Launch an interactive browser-based playground '
-                 'that drives Krita through the daemon'
-        )
-        playgrounds_sub = playgrounds_parser.add_subparsers(
-            dest='playground', metavar='PLAYGROUND',
-            required=True, help='Playgrounds'
-        )
-        for pg in PLAYGROUNDS:
-            playgrounds_sub.add_parser(pg['name'], help=pg['help'])
 
         # xremap helper scripts.  Like playgrounds, this is a client-
         # side launcher: the actual work happens in a subprocess, not

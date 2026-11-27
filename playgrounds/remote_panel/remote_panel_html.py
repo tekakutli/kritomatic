@@ -3,8 +3,17 @@ remote_panel_html.py — assemble the remote panel's HTML page.
 
 The remote panel is not a playground.  It has no canvas, no sidebar,
 and no pgkit shell.  This module writes its own page: RP_CSS from
-rp_base.py, RP_BODY from rp_base.py, and the concatenation of the
-two JS modules.
+rp_base.py, RP_BODY from rp_base.py, and the concatenation of three
+JS strings in this order:
+
+    HUB_CONTROL_JS     (pgruntime/hub_control) — shared with workbench
+    RP_CLIENT_JS       (rp_client)             — panel state + wire
+    RP_UI_JS           (rp_ui)                 — panel DOM
+
+The three are concatenated into one classic `<script>` block.  All
+top-level function declarations across the three are hoisted, so
+`createHubControl` (from the first) is callable from the second's
+top-of-file `const hubCtrl = createHubControl(...)`.
 
 LOG MIRRORING — INLINE, NOT VIA pgkit/panel_core.js
 ===================================================
@@ -49,11 +58,12 @@ Opt-out parity with pgkit/panel_core.js:
                                emits nothing tagged `[boot]`, so
                                there is nothing to silence.
 
-Because the override installs BEFORE rp_client.js and rp_ui.js (it
-is a plain `<script>` in the `<head>`, before the concatenated
-script at the bottom of `<body>`), every `console.error` and every
-`rpLog("error", ...)` that routes through `console.error` from
-either file is captured from the very first line.
+Because the override installs BEFORE rp_client.js, rp_ui.js, and
+hub_control.js (it is a plain `<script>` in the `<head>`, before
+the concatenated script at the bottom of `<body>`), every
+`console.error` and every `rpLog("error", ...)` that routes through
+`console.error` from any of those files is captured from the very
+first line.
 
 `rpLog` itself is unchanged.  It records to the panel's own log
 array and renders to the panel's own log DOM.  Its "error" kind
@@ -76,17 +86,15 @@ for _p in (_HERE, _PARENT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from rp_base   import RP_CSS, RP_BODY
-from rp_client import RP_CLIENT_JS
-from rp_ui     import RP_UI_JS
+from rp_base       import RP_CSS, RP_BODY
+from rp_client     import RP_CLIENT_JS
+from rp_ui         import RP_UI_JS
+from pgruntime.hub_control import HUB_CONTROL_JS
 
 
 # The inline mirror installer.  A classic `<script>` in `<head>` so it
-# executes before the concatenated rp_client+rp_ui block at the bottom
-# of `<body>`.  Same mechanism as pgkit/panel_core.js's override; the
-# only differences are the fixed prefix, the narrower opt-out set
-# (see the module docstring, "Opt-out parity"), and the lack of a
-# `reportPanelError` export (nothing on this page calls it).
+# executes before the concatenated body block.  Same mechanism as
+# pgkit/panel_core.js's override.
 _MIRROR_JS = r"""
 (function installPgkitMirror() {
   if (window.__pgkitMirrorInstalled) return;
@@ -191,6 +199,7 @@ def render():
         + RP_BODY + "\n"
         "<script>\n"
         '"use strict";\n'
+        + HUB_CONTROL_JS + "\n"
         + RP_CLIENT_JS + "\n"
         + RP_UI_JS
         + "\n</script>\n"

@@ -10,10 +10,18 @@ literals.
 `kritomatic_nodes` (symlinked into ComfyUI's `custom_nodes/`) imports
 from here too — see `kritomatic_nodes/__init__.py`'s sys.path
 bootstrap.  Ports are validated unique at import time so a future
-re-collision fails loudly instead of silently.
+re-collision fails loudly instead of silently, and against
+`RESERVED_PORTS` so a playground can never take over a port that
+belongs to another tool on this machine.
 """
 
 from __future__ import annotations
+
+RESERVED_PORTS: dict[int, str] = {
+    8765: "DeepSeek CLI pipe/type/enter",
+    8766: "DeepSeek daemon OpenAI endpoint",
+    8767: "DeepSeek daemon extension SSE/relay",
+}
 
 PLAYGROUND_PORTS: dict[str, int] = {
     # Original 10 in-scope playgrounds.
@@ -28,11 +36,11 @@ PLAYGROUND_PORTS: dict[str, int] = {
     "segment":      8773,
     "text_boxes":   8771,
     # Additional playgrounds added in the follow-up pass.
-    "cable":        8765,
-    "cone":         8766,
+    "cable":        8782,
+    "cone":         8783,
     "remote_panel": 8772,
-    "room":         8769,   # was 8766, collided with cone
-    "text_wall":    8767,
+    "room":         8769,
+    "text_wall":    8784,
     # Non-playground service.  The pgkit hub serves every playground's
     # `/remote` WebSocket under a single port; registering it here keeps
     # the fixed-port surface single-sourced even though it isn't a
@@ -53,7 +61,18 @@ def _validate_unique() -> None:
         seen[port] = pid
 
 
+def _validate_not_reserved() -> None:
+    for pid, port in PLAYGROUND_PORTS.items():
+        if port in RESERVED_PORTS:
+            raise RuntimeError(
+                f"pgruntime.ports: {pid!r} claims port {port}, which "
+                f"is reserved ({RESERVED_PORTS[port]}).  Pick a "
+                f"different port."
+            )
+
+
 _validate_unique()
+_validate_not_reserved()
 
 
 def port_for(playground_id: str) -> int:

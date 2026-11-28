@@ -35,6 +35,9 @@ export function drawView() {
     return;
   }
 
+  ctx.imageSmoothingQuality = "high";
+  ctx.strokeStyle = "#1e2836";
+  ctx.lineWidth = 1;
   drawImageLayer(r);
   _drawChromeText();
 }

@@ -6,7 +6,7 @@ entry point is unchanged: it calls `drawView` then `syncPanelFields`.
 """
 
 DISPATCH_JS = r"""
-import { canvas, view, clampPan, zoomAt, resetView, _scheduleDraw }
+import { canvas, view, clampPan, zoomAt, resetView, _scheduleDrawView }
   from "./pg_state.js";
 import { installPanZoom } from "./pgruntime/js/pan_zoom.js";
 import { drawView } from "./pg_view.js";
@@ -19,6 +19,6 @@ export function draw() {
 
 installPanZoom(canvas, {
   view, clampPan, zoomAt, resetView,
-  _scheduleDrawView: _scheduleDraw,
+  _scheduleDrawView: _scheduleDrawView,
 });
 """

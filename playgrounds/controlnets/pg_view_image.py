@@ -15,8 +15,8 @@ function _drawLetterboxed(img, r) {
   const ch = img.naturalHeight || img.height;
   if (!cw || !ch) return;
 
-  // Dark backdrop — preprocessed images may not match the source
-  // aspect, so their letterbox region is visibly distinct.
+  // Letterbox backdrop — controlnet hint may not share @thecontrolnet's
+  // aspect, so its unpainted region is made visibly distinct.
   ctx.fillStyle = "#050810";
   ctx.fillRect(r.x0, r.y0, r.w, r.h);
 
@@ -26,22 +26,12 @@ function _drawLetterboxed(img, r) {
   const dx = r.x0 + (r.w - dw) / 2;
   const dy = r.y0 + (r.h - dh) / 2;
 
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = "high";
   ctx.drawImage(img, dx, dy, dw, dh);
-
-  ctx.strokeStyle = "#1e2836";
-  ctx.lineWidth = 1;
   ctx.strokeRect(dx + 0.5, dy + 0.5, dw - 1, dh - 1);
 }
 
 function _drawFill(img, r) {
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = "high";
   ctx.drawImage(img, r.x0, r.y0, r.w, r.h);
-
-  ctx.strokeStyle = "#1e2836";
-  ctx.lineWidth = 1;
   ctx.strokeRect(r.x0 + 0.5, r.y0 + 0.5, r.w - 1, r.h - 1);
 }
 

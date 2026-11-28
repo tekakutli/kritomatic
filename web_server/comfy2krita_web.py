@@ -4,116 +4,24 @@ comfy2krita_web.py — standalone browser view of the daemon's state.
 
 A pure HTTP client of the daemon. Reads the same event stream the Krita
 docker reads, renders the same panel description the docker renders,
-and posts the same commands to the same daemon command socket. The
-web panel is "a browser tab you can open next to Krita" — nothing more.
+and posts the same commands to the same daemon command socket.
 
-One process, no external state
-==============================
-This file is self-contained: no imports from `kritomatic_shared`,
-`kritomatic_daemon`, or any playground. It only imports `KritaClient`
-from `kritomatic.client`, and that one import is what makes it
-addressable as a proper package module (the REPO_ROOT/src bootstrap at
-the top of the file does that).
+Parity notes vs. the docker
+===========================
+- Layer-name fields are plain text inputs. No layer list, no completer.
+- Playground section renders both `layer_slots` (skipping
+  `managed_by_playground: true`) and `control_params`.
+- Intercept summary is recognised and shown as "review in interceptor
+  playground".
+- After a structure change, a config push is scheduled so the daemon's
+  `_active_config` stays in sync.
 
-Routes
-======
-    GET  /              HTML shell + inline CSS + inline JS
-    GET  /api/state     Current daemon state snapshot (one shot)
-    GET  /api/batches   Current comfy_batches response (one shot)
-    GET  /api/events    SSE stream: state, panel, run events
-    POST /api/command   One daemon command, one response
-    POST /api/run       Start a long-running generation, returns run_id
-    POST /api/cancel    Cancel the current run or all runs
-
-The distinction between /api/command and /api/run is the daemon's
-command worker. State-mutating commands are short and block the worker
-only for their own duration. `comfy_generate` blocks the worker for the
-entire run (tens of seconds). /api/run spawns the generate on its own
-thread with its own socket, so the worker stays available for cancel
-requests, state reads, and other panel edits that would otherwise be
-stuck in the queue behind the long run.
-
-Concurrent runs
-===============
-The web panel supports multiple concurrent runs from this panel. Each
-`/api/run` call allocates a fresh `run-<ts>-<rand>` id, opens its own
-socket to the daemon inside `_do_run`, and streams progress and the
-final summary back through `/api/events`.
-
-The `comfy_panel_run` command embeds the four config sections from
-widget state at click time (see `runAction`). That is the same
-load-bearing change the docker does — the daemon's `comfy_panel_run`
-passes the validated config as a kwarg to `comfy_generate`, so two
-concurrent clicks' configs never race on `_active_config`.
-
-Cancel semantics
-================
-`scope: "current"` cancels every run this panel started; `scope:
-"all"` cancels every batch on the daemon (across all clients).
-
-Config auto-apply
-=================
-Config fields (resources, params, crop, paste) carry `config_path` and
-neither `set_command` nor a section-level `commit`. Every edit starts
-a 150 ms single-shot debounce; when it fires, `flushApply` assembles
-the four config sections from current widget state and POSTs one
-`comfy_apply_config`, matching the docker's timer.
-
-`startRun` does not await `flushPendingApply` or `commitQueue` before
-posting `/api/run`. The reason that wait existed — "make sure the
-daemon's `_active_config` reflects the panel before Run reads it" — no
-longer applies: `comfy_panel_run` embeds the config in its own payload.
-
-Composite (row) fields
-======================
-A field with `type: "row"` renders as one flex row containing one
-sub-widget per `sub_fields` entry. Sub-widgets carry their own
-`data-field`, so the existing per-field plumbing works unchanged.
-
-Hidden fields (`visible: false`)
-================================
-A field carrying `visible: false` is created and registered exactly
-like any other leaf field, but its `data-field-container` div gets
-`style="display: none;"`. This preserves the per-field plumbing:
-`readConfigWidgetValue` and `buildConfigFromWidgets` still find the
-element, so the field is still submitted to `comfy_apply_config`.
-
-Local handlers (`local_handler`)
-================================
-A field carrying `local_handler: "name"` is a client-side widget whose
-edits are not sent to the daemon.  `commitField` checks the spec for
-`local_handler` and, if present, dispatches to the handler registered
-in `app.localHandlers` under that name instead of scheduling a daemon
-command.
-
-Parameters filter prefix (client-side)
-======================================
-The Parameters section carries a "Filter prefix" text field at the top
-with `local_handler: "param_prefix_filter"`.  This client registers
-a handler for that name which persists the prefix per workflow in
-`localStorage` and triggers a `rebuildPanel` against the latest
-description. The daemon never sees the prefix.
-
-Playground input section (registry-driven, slot-based)
-=====================================================
-Live-running playgrounds register with the daemon; each registration
-carries a list of **layer slots** — each an `@`-prefixed identifier
-with its own `{source, layer_name}` selector.  The web panel renders
-one row per (playground, slot) below the config form:
-
-    Layout Editor   @thelayout   [source▼] [layer_name]
-
-The slot's `@`-prefixed id IS the display name — no separate label
-field.  For multi-slot playgrounds, the playground's name appears only
-on its first slot's row; subsequent slots leave the name cell blank.
-Changes fire `playground_set_layer` via `/api/command`, scoped with
-the slot's `slot_id`.  The selector never touches the workflow graph,
-resource substitution, or `_active_config`.  The section is always
-visible, with a "No playgrounds running" placeholder when empty.
-
-Per-row editing is tracked with `dataset.editing` on the row: while
-the user's change is in flight, state pushes that still carry the
-old selector are ignored for that row.
+Debug logging
+=============
+Every command POST, every daemon call, every run start/finish prints
+to stdout with a `[web_panel]` prefix. The HTML also logs every action
+click to the progress area, and any JS exception / unhandled rejection
+is captured and displayed inline.
 """
 
 import json
@@ -149,6 +57,19 @@ SSE_HEARTBEAT = 15.0
 SUBSCRIBER_QUEUE_SIZE = 256
 
 RUN_READ_TIMEOUT_MARGIN = 60.0
+
+# How long to wait for the daemon's first panel push before falling
+# back to a direct `panel_description` command.  The daemon pushes a
+# panel after every state event, but the browser might connect *before*
+# the daemon has ever published anything (fresh daemon, no workflow
+# loaded yet, no playground registered yet).  Without this fallback
+# the form area stays blank and the user has no way to trigger a
+# workflow load via the UI.
+INITIAL_PANEL_FALLBACK_S = 2.0
+
+
+def _log(msg: str) -> None:
+    print(f"[web_panel] {msg}", flush=True)
 
 
 _state = {
@@ -204,54 +125,6 @@ def _broadcast_state() -> None:
     _broadcast("state", payload)
 
 
-def _daemon_event_client() -> None:
-    while True:
-        sock = None
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(10.0)
-            sock.connect((DAEMON_HOST, DAEMON_EVENT_PORT))
-
-            with _state_lock:
-                _state["daemon_connected"] = True
-            _broadcast_state()
-
-            buffer = b""
-            sock.settimeout(None)
-            while True:
-                try:
-                    chunk = sock.recv(65536)
-                except (ConnectionResetError, OSError):
-                    break
-                if not chunk:
-                    break
-                buffer += chunk
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line.decode("utf-8"))
-                    except Exception:
-                        continue
-                    _handle_daemon_event(event)
-
-        except Exception:
-            pass
-        finally:
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-            with _state_lock:
-                _state["daemon_connected"] = False
-            _broadcast_state()
-
-        time.sleep(RECONNECT_DELAY)
-
-
 def _handle_daemon_event(event: dict) -> None:
     if not isinstance(event, dict):
         return
@@ -272,23 +145,111 @@ def _handle_daemon_event(event: dict) -> None:
         _broadcast("panel", data)
 
 
+def _daemon_event_client() -> None:
+    while True:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10.0)
+            sock.connect((DAEMON_HOST, DAEMON_EVENT_PORT))
+            _log(f"connected to daemon event stream on "
+                 f"{DAEMON_HOST}:{DAEMON_EVENT_PORT}")
+
+            with _state_lock:
+                _state["daemon_connected"] = True
+                _state["last_error"] = None
+            _broadcast_state()
+
+            buffer = b""
+            sock.settimeout(None)
+            while True:
+                try:
+                    chunk = sock.recv(65536)
+                except (ConnectionResetError, OSError) as e:
+                    _log(f"daemon event read error: {e}")
+                    break
+                if not chunk:
+                    _log("daemon event stream closed by peer")
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line.decode("utf-8"))
+                    except Exception as e:
+                        _log(f"daemon event parse error: {e}")
+                        continue
+                    _handle_daemon_event(event)
+
+        except Exception as e:
+            _log(f"daemon event connect failed: {e}")
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            with _state_lock:
+                was_connected = _state["daemon_connected"]
+                _state["daemon_connected"] = False
+                _state["last_error"] = "daemon event stream disconnected"
+            if was_connected:
+                _log("daemon event stream disconnected; reconnecting")
+            _broadcast_state()
+
+        time.sleep(RECONNECT_DELAY)
+
+
 def _daemon_call(command: dict) -> tuple:
+    cmd_type = command.get("type", "?")
     client = KritaClient(host=DAEMON_HOST, port=DAEMON_PORT)
     if not client.connect():
+        _log(f"daemon_call {cmd_type} → CONNECT FAILED")
         return False, "could not connect to daemon", {}
     try:
         args = {k: v for k, v in command.items() if k != "type"}
-        resp = client.execute(command.get("type"), **args)
+        resp = client.execute(cmd_type, **args)
     except Exception as e:
+        _log(f"daemon_call {cmd_type} → EXCEPTION: {e}")
         return False, str(e), {}
     finally:
         client.close()
 
     if not resp:
+        _log(f"daemon_call {cmd_type} → NO RESPONSE")
         return False, "no response from daemon", {}
     if resp.get("status") != "success":
-        return False, resp.get("message", "daemon refused the command"), {}
+        msg = resp.get("message", "daemon refused the command")
+        _log(f"daemon_call {cmd_type} → ERROR: {msg}")
+        return False, msg, {}
+    _log(f"daemon_call {cmd_type} → ok")
     return True, resp.get("message", ""), resp.get("data") or {}
+
+
+def _fetch_initial_panel() -> None:
+    """If no panel has arrived after INITIAL_PANEL_FALLBACK_S, poll it
+    directly via `panel_description`.  The daemon pushes a panel after
+    every state event, but a fresh daemon that has never published
+    anything leaves the browser with an empty form and no button to
+    click.  This fallback is what closes that window."""
+    time.sleep(INITIAL_PANEL_FALLBACK_S)
+    with _state_lock:
+        if _state["panel"] is not None:
+            return
+        if not _state["daemon_connected"]:
+            return
+    _log("no initial panel received; polling panel_description")
+    ok, msg, data = _daemon_call({"type": "panel_description"})
+    if ok and isinstance(data, dict):
+        with _state_lock:
+            _state["panel"] = data
+        _broadcast("panel", data)
+        _log("initial panel_description fetched")
+    else:
+        _log(f"initial panel_description failed: {msg}")
 
 
 _runs: dict = {}
@@ -305,6 +266,7 @@ def _do_run(run_id: str, command: dict) -> None:
         payload.update(extra)
         _broadcast("run", payload)
 
+    _log(f"run {run_id} starting command={command.get('type')}")
     try:
         try:
             timeout = float(command.get("timeout") or 55.0)
@@ -317,11 +279,13 @@ def _do_run(run_id: str, command: dict) -> None:
         count = max(1, count)
 
         read_timeout = timeout * (count + 1) + RUN_READ_TIMEOUT_MARGIN
+        _log(f"run {run_id} read_timeout={read_timeout}s")
 
         bundle = {"id": run_id, "commands": [command]}
 
         client = KritaClient(host=DAEMON_HOST, port=DAEMON_PORT)
         if not client.connect():
+            _log(f"run {run_id} daemon connect FAILED")
             emit("error", error="could not connect to daemon")
             return
 
@@ -330,6 +294,7 @@ def _do_run(run_id: str, command: dict) -> None:
                 cmd_type = result_entry.get("command", "?")
                 status = result_entry.get("status", "?")
                 msg = result_entry.get("message", "")
+                _log(f"run {run_id} progress {index}: {cmd_type} {status}: {msg}")
                 emit("progress",
                      index=index,
                      total=1,
@@ -344,7 +309,25 @@ def _do_run(run_id: str, command: dict) -> None:
             client.close()
 
         if summary is None:
+            _log(f"run {run_id} no summary from daemon")
             emit("error", error="no summary from daemon")
+            return
+
+        _log(f"run {run_id} summary type={summary.get('type')} "
+             f"status={summary.get('status')}")
+
+        intercepted = bool(summary.get("intercepted"))
+        if not intercepted:
+            for r in (summary.get("results") or []):
+                if (isinstance(r, dict)
+                        and isinstance(r.get("data"), dict)
+                        and r["data"].get("intercepted")):
+                    intercepted = True
+                    break
+        if intercepted:
+            _log(f"run {run_id} intercepted")
+            emit("intercepted",
+                 message=summary.get("message", "Run intercepted"))
             return
 
         succ = summary.get("successful", 0)
@@ -356,6 +339,8 @@ def _do_run(run_id: str, command: dict) -> None:
             if r.get("status") == "error"
             and "cancelled" in (r.get("message") or "").lower()
         )
+        _log(f"run {run_id} done: {succ} ok, {fail} failed, "
+             f"{cancelled_count} cancelled")
         if cancelled_count > 0 and succ == 0:
             emit("cancelled",
                  successful=succ, failed=fail,
@@ -366,15 +351,16 @@ def _do_run(run_id: str, command: dict) -> None:
                  cancelled=cancelled_count)
 
     except Exception as e:
+        _log(f"run {run_id} exception: {e}")
         traceback.print_exc()
         emit("error", error=str(e))
     finally:
         with _runs_lock:
             _runs.pop(run_id, None)
-        print(f"[web_panel] run {run_id} finished")
 
 
 def _send_daemon_cancel(batch_id) -> tuple:
+    _log(f"cancel request batch_id={batch_id!r}")
     client = KritaClient(host=DAEMON_HOST, port=DAEMON_PORT)
     if not client.connect():
         return False, "could not connect to daemon"
@@ -412,7 +398,7 @@ def _fetch_batches() -> list:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "KritomaticWebPanel/2.4"
+    server_version = "KritomaticWebPanel/2.6"
 
     def log_message(self, fmt, *args):
         pass
@@ -422,7 +408,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(body)
 
@@ -432,7 +420,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(body)
 
@@ -444,7 +434,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0) or 0)
         except (TypeError, ValueError):
             return None
-        if length <= 0 or length > 65536:
+        if length <= 0 or length > 1048576:
             return None
         try:
             body = self.rfile.read(length)
@@ -476,6 +466,7 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _handle_events(self):
+        _log("SSE client connected")
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -513,6 +504,7 @@ class Handler(BaseHTTPRequestHandler):
             with _subscribers_lock:
                 if q in _subscribers:
                     _subscribers.remove(q)
+            _log("SSE client disconnected")
 
     def _write_sse(self, event_type: str, payload) -> None:
         data = json.dumps(payload)
@@ -540,13 +532,16 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_command_post(self):
         body = self._read_json_body()
         if not isinstance(body, dict):
+            _log("command POST: bad body")
             self._send_error_json("expected a JSON object", status=400)
             return
         command = body.get("command")
         if not isinstance(command, dict) or "type" not in command:
+            _log(f"command POST: bad command shape {command!r}")
             self._send_error_json(
                 "'command' must be an object with a 'type'", status=400)
             return
+        _log(f"command POST: {command.get('type')}")
         ok, msg, data = _daemon_call(command)
         if ok:
             self._send_json({"ok": True, "message": msg, "data": data})
@@ -556,12 +551,14 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_run_post(self):
         body = self._read_json_body()
         if not isinstance(body, dict):
+            _log("run POST: bad body")
             self._send_error_json("expected a JSON object", status=400)
             return
         command = body.get("command")
         if not isinstance(command, dict) \
                 or command.get("type") not in ("comfy_generate",
                                                "comfy_panel_run"):
+            _log(f"run POST: bad command {command!r}")
             self._send_error_json(
                 "'command' must be a comfy_generate or comfy_panel_run "
                 "command", status=400)
@@ -578,7 +575,7 @@ class Handler(BaseHTTPRequestHandler):
             daemon=True,
         )
         t.start()
-        print(f"[web_panel] run {run_id} started")
+        _log(f"run POST: started {run_id}")
         self._send_json({"run_id": run_id})
 
     def _handle_cancel_post(self):
@@ -587,6 +584,7 @@ class Handler(BaseHTTPRequestHandler):
             body = {}
 
         scope = body.get("scope", "current")
+        _log(f"cancel POST: scope={scope}")
 
         if scope == "all":
             with _runs_lock:
@@ -601,11 +599,11 @@ class Handler(BaseHTTPRequestHandler):
 
             ok, msg = _send_daemon_cancel(None)
             if not ok:
-                print(f"[web_panel] cancel_all failed: {msg}")
+                _log(f"cancel_all failed: {msg}")
                 self._send_error_json(msg, status=502)
                 return
 
-            print("[web_panel] cancel_all requested")
+            _log("cancel_all requested")
             self._send_json({"status": "cancelling_all", "message": msg,
                              "run_ids": run_ids})
             return
@@ -627,7 +625,7 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg = _send_daemon_cancel(rid)
             if not ok:
                 errors.append(f"{rid}: {msg}")
-        print(f"[web_panel] cancel requested for {len(run_ids)} run(s)")
+        _log(f"cancel requested for {len(run_ids)} run(s)")
 
         self._send_json({
             "run_ids": run_ids,
@@ -804,7 +802,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .progress .row.warn { color: #a05a00; }
   .progress .row.hdr { color: #333; font-weight: 600; }
 
-  /* Playground input section */
   .playgrounds-section {
     background: #fafafa;
     border: 1px solid #eee;
@@ -814,7 +811,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .playground-row {
     display: grid;
-    grid-template-columns: 140px 110px 90px 1fr;
+    grid-template-columns: 140px 110px 100px 1fr;
     gap: 0.5rem;
     align-items: center;
     padding: 0.35rem 0;
@@ -823,9 +820,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .playground-row:last-child { border-bottom: none; }
   .playground-row .name { font-weight: 600; color: #333; }
-  .playground-row .slot-id { color: #555; font-family: ui-monospace, monospace; }
+  .playground-row .slot-id,
+  .playground-row .param-name {
+    color: #555; font-family: ui-monospace, monospace;
+  }
   .playground-row select,
-  .playground-row input[type=text] {
+  .playground-row input[type=text],
+  .playground-row input[type=number] {
     font: inherit;
     font-size: 0.85rem;
     padding: 0.25rem 0.4rem;
@@ -834,6 +835,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: white;
   }
   .playground-row input[type=text][hidden] { display: none; }
+  .playground-row input[type=checkbox] { margin: 0; }
+  .playground-row .stretch { min-width: 0; }
 </style>
 </head>
 <body>
@@ -862,6 +865,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <script>
 "use strict";
 
+// ---- Global error capture (before anything else) ----
+// Any JS error or unhandled promise rejection is dumped into the
+// progress log so the user can see it without opening devtools.
+function logFatal(msg) {
+  const log = document.getElementById("progress");
+  if (!log) return;
+  const d = document.createElement("div");
+  d.className = "row err";
+  d.textContent = "[JS ERROR] " + msg;
+  log.appendChild(d);
+}
+window.addEventListener("error", function (e) {
+  logFatal((e.message || "error") + " at " + (e.filename || "?")
+           + ":" + (e.lineno || "?"));
+});
+window.addEventListener("unhandledrejection", function (e) {
+  const r = e.reason;
+  logFatal("unhandled rejection: "
+           + (r && r.message ? r.message : String(r)));
+});
+
 const app = {
   latestState: null,
   latestPanel: null,
@@ -881,6 +905,15 @@ const app = {
   paramPrefixByWorkflow: new Map(),
   localHandlers: new Map(),
 };
+
+function logLine(kind, text) {
+  const log = document.getElementById("progress");
+  if (!log) return;
+  const d = document.createElement("div");
+  d.className = "row " + kind;
+  d.textContent = text;
+  log.appendChild(d);
+}
 
 (function restoreParamPrefixMap() {
   try {
@@ -962,7 +995,7 @@ function renderStatus(s) {
   } else if (!s.daemon || !s.daemon.workflow) {
     el.classList.add("warn");
     lines.push("Connected to the daemon; no active workflow.");
-    lines.push('<span class="dim">Select a workflow in the Workflow bar above, or use the CLI.</span>');
+    lines.push('<span class="dim">Select a workflow in the Workflow bar below, then click Load.</span>');
   } else {
     el.classList.add("ok");
     const d = s.daemon;
@@ -983,19 +1016,23 @@ function _filteredDescription(description) {
   if (!description) return description;
   const prefix = app.paramPrefixByWorkflow.get(app.currentWorkflow) || "";
   if (!prefix) return description;
-  const copy = JSON.parse(JSON.stringify(description));
-  for (const s of copy.sections || []) {
-    for (const f of s.fields || []) {
-      const key = f.key || "";
-      if (key.startsWith("cfg-param.")) {
-        const title = key.substring("cfg-param.".length);
-        if (!title.startsWith(prefix)) {
-          f.visible = false;
+  try {
+    const copy = JSON.parse(JSON.stringify(description));
+    for (const s of copy.sections || []) {
+      for (const f of s.fields || []) {
+        const key = f.key || "";
+        if (key.startsWith("cfg-param.")) {
+          const title = key.substring("cfg-param.".length);
+          if (!title.startsWith(prefix)) {
+            f.visible = false;
+          }
         }
       }
     }
+    return copy;
+  } catch (_) {
+    return description;
   }
-  return copy;
 }
 
 function buildWorkflowBarHtml(section) {
@@ -1157,10 +1194,15 @@ function rebuildPanel(description) {
 
   let html = "";
   for (const s of app.sectionSpecs) html += buildSectionHtml(s);
+  if (!html) {
+    html = '<div class="empty">Panel is empty. Load a workflow using '
+         + 'the Workflow bar above.</div>';
+  }
   form.innerHTML = html;
 
   form.querySelectorAll("[data-field]").forEach(el => {
     const key = el.getAttribute("data-field");
+    if (!key) return;
     if (!app.fields.has(key)) app.fields.set(key, []);
     app.fields.get(key).push(el);
   });
@@ -1181,7 +1223,15 @@ function rebuildPanel(description) {
   }
 
   form.querySelectorAll("[data-action-key]").forEach(btn => {
-    btn.addEventListener("click", () => runAction(btn.getAttribute("data-action-key")));
+    btn.addEventListener("click", function (ev) {
+      ev.preventDefault();
+      const k = btn.getAttribute("data-action-key");
+      logLine("hdr", "Click: " + k);
+      runAction(k).catch(function (e) {
+        logLine("err", "runAction(" + k + ") failed: "
+                + (e && e.message ? e.message : String(e)));
+      });
+    });
   });
 
   for (const s of app.sectionSpecs) {
@@ -1351,20 +1401,25 @@ function readConfigWidgetValue(el, spec) {
 function buildConfigFromWidgets() {
   const cfg = { resources: {}, params: {}, crop: {}, paste: {} };
   for (const [key, spec] of app.specs.entries()) {
-    const path = spec.config_path;
-    if (!Array.isArray(path) || path.length === 0) continue;
-    const els = app.fields.get(key) || [];
-    if (els.length === 0) continue;
-    const value = readConfigWidgetValue(els[0], spec);
-    let d = cfg;
-    for (let i = 0; i < path.length - 1; i++) {
-      const step = path[i];
-      if (!(step in d) || typeof d[step] !== "object" || d[step] === null) {
-        d[step] = {};
+    try {
+      const path = spec.config_path;
+      if (!Array.isArray(path) || path.length === 0) continue;
+      const els = app.fields.get(key) || [];
+      if (els.length === 0) continue;
+      const value = readConfigWidgetValue(els[0], spec);
+      let d = cfg;
+      for (let i = 0; i < path.length - 1; i++) {
+        const step = path[i];
+        if (!(step in d) || typeof d[step] !== "object" || d[step] === null) {
+          d[step] = {};
+        }
+        d = d[step];
       }
-      d = d[step];
+      d[path[path.length - 1]] = value;
+    } catch (e) {
+      logLine("err", "buildConfigFromWidgets skipped " + key
+              + ": " + (e && e.message ? e.message : String(e)));
     }
-    d[path[path.length - 1]] = value;
   }
   return cfg;
 }
@@ -1396,7 +1451,7 @@ async function flushApply() {
     crop:      JSON.stringify(cfg.crop),
     paste:     JSON.stringify(cfg.paste),
   };
-  return sendCommand("apply", command, [], _configFieldKeys());
+  return sendCommand("apply", command, [], _configFieldKeys(), false);
 }
 
 async function flushPendingApply() {
@@ -1424,7 +1479,10 @@ function commitField(key) {
     if (!handler) return;
     const els = app.fields.get(key) || [];
     const value = els.length > 0 ? readWidgetValue(els[0], spec) : "";
-    handler(value);
+    try { handler(value); } catch (e) {
+      logLine("err", "local handler failed: "
+              + (e && e.message ? e.message : String(e)));
+    }
     return;
   }
 
@@ -1452,11 +1510,12 @@ function commitField(key) {
   if (!command) return;
 
   const requestId = "field:" + key;
-  const doIt = () => sendCommand(requestId, command, [key]);
+  const doIt = () => sendCommand(requestId, command, [key], undefined, false);
   app.commitQueue = app.commitQueue.then(doIt, doIt);
 }
 
-async function sendCommand(requestId, command, affectedKeys, inFlightKeys) {
+async function sendCommand(requestId, command, affectedKeys, inFlightKeys,
+                            verbose) {
   const track = inFlightKeys !== undefined ? inFlightKeys : affectedKeys;
   for (const k of track) {
     app.inFlight.add(k);
@@ -1473,13 +1532,31 @@ async function sendCommand(requestId, command, affectedKeys, inFlightKeys) {
       let msg = "HTTP " + resp.status;
       try { const b = await resp.json(); if (b && b.error) msg = b.error; } catch (_) {}
       for (const k of affectedKeys) setFieldError(k, msg);
+      if (verbose) {
+        logLine("err", "Command " + (command.type || "?")
+                + " failed: " + msg);
+      }
       revertFields(track);
       return false;
     }
     for (const k of affectedKeys) setFieldError(k, "");
+    if (verbose) {
+      let data = null;
+      try { data = await resp.json(); } catch (_) {}
+      const msg = (data && data.message) || "ok";
+      logLine("ok", (command.type || "?") + ": " + msg);
+    }
     return true;
   } catch (e) {
-    for (const k of affectedKeys) setFieldError(k, "network error: " + e.message);
+    for (const k of affectedKeys) {
+      setFieldError(k, "network error: "
+                    + (e && e.message ? e.message : String(e)));
+    }
+    if (verbose) {
+      logLine("err", "Command " + (command.type || "?")
+              + " network error: "
+              + (e && e.message ? e.message : String(e)));
+    }
     revertFields(track);
     return false;
   } finally {
@@ -1513,9 +1590,15 @@ async function runAction(key) {
   const section = app.sectionSpecs.find(
     s => (s.kind === "actions" || s.kind === "workflow-bar")
       && (s.items || []).some(i => i.key === key));
-  if (!section) return;
+  if (!section) {
+    logLine("err", "runAction: no section found for key=" + key);
+    return;
+  }
   const item = section.items.find(i => i.key === key);
-  if (!item) return;
+  if (!item) {
+    logLine("err", "runAction: no item found for key=" + key);
+    return;
+  }
 
   const command = Object.assign({}, item.command || {});
   const allValues = readAllValues();
@@ -1549,15 +1632,9 @@ async function runAction(key) {
   } else {
     await flushPendingApply();
     const requestId = "action:" + key;
-    await sendCommand(requestId, command, []);
+    // verbose=true so Load / Save-config feedback shows in the log
+    await sendCommand(requestId, command, [], undefined, true);
   }
-}
-
-function rowDiv(cls, text) {
-  const d = document.createElement("div");
-  d.className = "row " + cls;
-  d.textContent = text;
-  return d;
 }
 
 function updateRunButtons() {
@@ -1590,7 +1667,6 @@ function updateRunButtons() {
 }
 
 async function startRun(command) {
-  const log = document.getElementById("progress");
   let resp;
   try {
     resp = await fetch("/api/run", {
@@ -1599,24 +1675,24 @@ async function startRun(command) {
       body: JSON.stringify({command: command}),
     });
   } catch (e) {
-    log.appendChild(rowDiv("err", "Request failed: " + e.message));
+    logLine("err", "Run request failed: "
+            + (e && e.message ? e.message : String(e)));
     return;
   }
   if (!resp.ok) {
     let msg = "HTTP " + resp.status;
     try { const b = await resp.json(); if (b && b.error) msg = b.error; } catch (_) {}
-    log.appendChild(rowDiv("err", "Cannot run: " + msg));
+    logLine("err", "Cannot run: " + msg);
     return;
   }
   const body = await resp.json();
   const runId = body.run_id;
   app.activeRuns.set(runId, { startedAt: Date.now() });
-  log.appendChild(rowDiv("hdr", "Run " + runId + " started."));
+  logLine("hdr", "Run " + runId + " started.");
   updateRunButtons();
 }
 
 async function cancelRun(command, scope) {
-  const log = document.getElementById("progress");
   let resp;
   try {
     resp = await fetch("/api/cancel", {
@@ -1625,51 +1701,57 @@ async function cancelRun(command, scope) {
       body: JSON.stringify({command: command, scope: scope || "current"}),
     });
   } catch (e) {
-    log.appendChild(rowDiv("err", "Cancel request failed: " + e.message));
+    logLine("err", "Cancel request failed: "
+            + (e && e.message ? e.message : String(e)));
     return;
   }
   if (!resp.ok) {
     let msg = "HTTP " + resp.status;
     try { const b = await resp.json(); if (b && b.error) msg = b.error; } catch (_) {}
-    log.appendChild(rowDiv("err", "Cannot cancel: " + msg));
+    logLine("err", "Cannot cancel: " + msg);
     if (resp.status === 409) {
       updateRunButtons();
     }
   } else {
-    log.appendChild(rowDiv("warn",
-      scope === "all" ? "Cancel All sent." : "Cancel sent for all active runs."));
+    logLine("warn",
+      scope === "all" ? "Cancel All sent." : "Cancel sent for all active runs.");
   }
 }
 
 function handleRunEvent(e) {
   const s = JSON.parse(e.data);
-  const log = document.getElementById("progress");
   const runId = s.run_id || "?";
   const short = String(runId).slice(-8);
   const prefix = "[" + short + "] ";
   if (s.status === "progress") {
     const cls = s.run_status === "success" ? "ok"
                : s.run_status === "error" ? "err" : "";
-    log.appendChild(rowDiv(cls,
+    logLine(cls,
       prefix + "[" + (s.index + 1) + "/" + s.total + "] "
-      + s.command + ": " + s.message));
+      + s.command + ": " + s.message);
   } else if (s.status === "cancelling") {
-    log.appendChild(rowDiv("warn", prefix + "Cancelling\u2026"));
+    logLine("warn", prefix + "Cancelling\u2026");
   } else if (s.status === "cancelled") {
     const n = s.cancelled != null ? s.cancelled : "";
-    log.appendChild(rowDiv("warn",
-      prefix + "Cancelled. " + n + " run(s) not completed."));
+    logLine("warn",
+      prefix + "Cancelled. " + n + " run(s) not completed.");
+    app.activeRuns.delete(runId);
+    updateRunButtons();
+  } else if (s.status === "intercepted") {
+    const msg = s.message || "Run intercepted";
+    logLine("hdr",
+      prefix + msg + " \u2014 review in interceptor playground");
     app.activeRuns.delete(runId);
     updateRunButtons();
   } else if (s.status === "done") {
     let text = "Done. " + s.successful + " ok, " + s.failed + " failed.";
     if (s.cancelled) text += " (" + s.cancelled + " cancelled)";
-    log.appendChild(rowDiv("hdr", prefix + text));
+    logLine("hdr", prefix + text);
     app.activeRuns.delete(runId);
     updateRunButtons();
   } else if (s.status === "error") {
-    log.appendChild(rowDiv("err",
-      prefix + "Run failed: " + (s.error || "unknown")));
+    logLine("err",
+      prefix + "Run failed: " + (s.error || "unknown"));
     app.activeRuns.delete(runId);
     updateRunButtons();
   }
@@ -1678,17 +1760,14 @@ function handleRunEvent(e) {
 // ---------------------------------------------------------------------
 // Playground input section
 // ---------------------------------------------------------------------
-//
-// Each (playground, slot) pair gets its own row.  The slot's `id` (an
-// `@`-prefixed name like `@thelayout`) is the display — no separate
-// label field.  Playground name is shown only on the first slot row
-// of each playground.  Rows are keyed by (pid, slot_id) for
-// diff-based updates.
 
 const LAYER_SOURCES = ["active", "global", "layer"];
 
 function _rowKey(pid, sid) {
   return pid + "::" + sid;
+}
+function _ctrlKey(pid, name) {
+  return pid + "::ctrl::" + name;
 }
 
 function renderPlaygrounds(playgrounds) {
@@ -1696,23 +1775,44 @@ function renderPlaygrounds(playgrounds) {
   const container = document.getElementById("playgrounds");
   if (!container) return;
 
-  // Build desired set of (pid, slot_id) keys.
-  const desired = new Map();
+  const desiredSlots = new Map();
+  const desiredCtrls = new Map();
+  const pidsWithNameShown = new Set();
+
   for (const p of playgrounds) {
     if (!p || !p.id) continue;
+
     const slots = p.layer_slots || [];
-    for (let i = 0; i < slots.length; i++) {
-      const slot = slots[i];
+    let firstVisibleSlotDone = false;
+    for (const slot of slots) {
       if (!slot || !slot.id) continue;
-      desired.set(_rowKey(p.id, slot.id), {
+      if (slot.managed_by_playground === true) continue;
+      const showName = !firstVisibleSlotDone;
+      firstVisibleSlotDone = true;
+      if (showName) pidsWithNameShown.add(p.id);
+      desiredSlots.set(_rowKey(p.id, slot.id), {
         playground: p,
         slot: slot,
-        show_name: (i === 0),
+        show_name: showName,
+      });
+    }
+
+    const ctrls = p.control_params || [];
+    let firstCtrlDone = pidsWithNameShown.has(p.id);
+    for (const cp of ctrls) {
+      if (!cp || !cp.name) continue;
+      const showName = !firstCtrlDone;
+      firstCtrlDone = true;
+      desiredCtrls.set(_ctrlKey(p.id, cp.name), {
+        playground: p,
+        ctrl: cp,
+        show_name: showName,
       });
     }
   }
 
-  if (desired.size === 0) {
+  const totalDesired = desiredSlots.size + desiredCtrls.size;
+  if (totalDesired === 0) {
     if (container.querySelector(".playground-row")) {
       container.innerHTML =
         '<div class="empty">No playgrounds running.</div>';
@@ -1720,35 +1820,54 @@ function renderPlaygrounds(playgrounds) {
     return;
   }
 
-  // Remove placeholder.
   const placeholder = container.querySelector(".empty");
   if (placeholder) placeholder.remove();
 
-  // Track existing rows.
-  const existing = new Map();
+  const existingSlots = new Map();
+  const existingCtrls = new Map();
   for (const row of container.querySelectorAll(".playground-row")) {
     const pid = row.getAttribute("data-playground-id");
-    const sid = row.getAttribute("data-slot-id");
-    if (pid && sid) existing.set(_rowKey(pid, sid), row);
-  }
-
-  // Remove vanished rows.
-  for (const [key, row] of existing) {
-    if (!desired.has(key)) {
-      row.remove();
-      existing.delete(key);
+    if (row.hasAttribute("data-ctrl-name")) {
+      const cname = row.getAttribute("data-ctrl-name");
+      if (pid && cname) existingCtrls.set(_ctrlKey(pid, cname), row);
+    } else {
+      const sid = row.getAttribute("data-slot-id");
+      if (pid && sid) existingSlots.set(_rowKey(pid, sid), row);
     }
   }
 
-  // Add or update present rows.
-  for (const [key, meta] of desired) {
-    let row = existing.get(key);
+  for (const [key, row] of existingSlots) {
+    if (!desiredSlots.has(key)) {
+      row.remove();
+      existingSlots.delete(key);
+    }
+  }
+  for (const [key, row] of existingCtrls) {
+    if (!desiredCtrls.has(key)) {
+      row.remove();
+      existingCtrls.delete(key);
+    }
+  }
+
+  for (const [key, meta] of desiredSlots) {
+    let row = existingSlots.get(key);
     if (!row) {
       row = createPlaygroundRow(meta.playground, meta.slot, meta.show_name);
       container.appendChild(row);
-      existing.set(key, row);
+      existingSlots.set(key, row);
     }
     syncPlaygroundRow(row, meta.playground, meta.slot);
+  }
+
+  for (const [key, meta] of desiredCtrls) {
+    let row = existingCtrls.get(key);
+    if (!row) {
+      row = createControlParamRow(
+        meta.playground, meta.ctrl, meta.show_name);
+      container.appendChild(row);
+      existingCtrls.set(key, row);
+    }
+    syncControlParamRow(row, meta.playground, meta.ctrl, meta.show_name);
   }
 }
 
@@ -1767,7 +1886,6 @@ function createPlaygroundRow(p, slot, show_name) {
   nameSpan.textContent = show_name ? pname : "";
   row.appendChild(nameSpan);
 
-  // The slot id IS the display name — no separate label.
   const slotSpan = document.createElement("span");
   slotSpan.className = "slot-id";
   slotSpan.textContent = sid;
@@ -1790,10 +1908,18 @@ function createPlaygroundRow(p, slot, show_name) {
   input.placeholder = "layer name";
   row.appendChild(input);
 
-  // Handlers.
+  const autoSelectHint = (slot.auto_select_layer || "").trim();
+
   select.addEventListener("change", () => {
     const source = select.value;
     input.hidden = (source !== "layer");
+
+    if (source === "layer"
+          && !input.value.trim()
+          && autoSelectHint) {
+      input.value = autoSelectHint;
+    }
+
     row.dataset.editing = "1";
     const layerName = (source === "layer") ? input.value.trim() : "";
     sendPlaygroundSetLayer(pid, sid, source, layerName);
@@ -1866,15 +1992,186 @@ async function sendPlaygroundSetLayer(pid, sid, source, layerName) {
     if (!resp.ok) {
       let msg = "HTTP " + resp.status;
       try { const b = await resp.json(); if (b && b.error) msg = b.error; } catch (_) {}
-      console.error("playground_set_layer failed:", msg);
+      logLine("err", "playground_set_layer failed: " + msg);
       const row = document.querySelector(
         `[data-playground-id="${cssEsc(pid)}"][data-slot-id="${cssEsc(sid)}"]`);
       if (row) delete row.dataset.editing;
     }
   } catch (e) {
-    console.error("playground_set_layer network error:", e.message);
+    logLine("err", "playground_set_layer network error: "
+            + (e && e.message ? e.message : String(e)));
     const row = document.querySelector(
       `[data-playground-id="${cssEsc(pid)}"][data-slot-id="${cssEsc(sid)}"]`);
+    if (row) delete row.dataset.editing;
+  }
+}
+
+function _ctrlValueToStr(ctype, value) {
+  if (ctype === "toggle") {
+    return value ? "true" : "false";
+  }
+  if (value === null || value === undefined) return "";
+  return String(value);
+}
+
+function createControlParamRow(p, cp, show_name) {
+  const pid = p.id;
+  const name = cp.name;
+  const pname = p.name || pid || "?";
+  const ctype = cp.type || "text";
+
+  const row = document.createElement("div");
+  row.className = "playground-row";
+  row.setAttribute("data-playground-id", pid);
+  row.setAttribute("data-ctrl-name", name);
+
+  const nameSpan = document.createElement("span");
+  nameSpan.className = "name";
+  nameSpan.textContent = show_name ? pname : "";
+  row.appendChild(nameSpan);
+
+  const paramSpan = document.createElement("span");
+  paramSpan.className = "param-name";
+  paramSpan.textContent = name;
+  paramSpan.title =
+    "Control parameter '" + name + "' of the '" + pname + "' playground. "
+    + "Daemon-owned routing hint; merged into config['params'] at "
+    + "generation time.";
+  row.appendChild(paramSpan);
+
+  let widget;
+  if (ctype === "select") {
+    widget = document.createElement("select");
+    for (const opt of (cp.options || [])) {
+      const o = document.createElement("option");
+      o.value = String(opt);
+      o.textContent = String(opt);
+      widget.appendChild(o);
+    }
+    widget.value = _ctrlValueToStr("text", cp.value);
+  } else if (ctype === "toggle") {
+    widget = document.createElement("input");
+    widget.type = "checkbox";
+    widget.checked = !!cp.value;
+  } else if (ctype === "number") {
+    widget = document.createElement("input");
+    widget.type = "number";
+    widget.step = "any";
+    widget.value = _ctrlValueToStr("number", cp.value);
+  } else if (ctype === "integer") {
+    widget = document.createElement("input");
+    widget.type = "number";
+    widget.step = "1";
+    widget.value = _ctrlValueToStr("integer", cp.value);
+  } else {
+    widget = document.createElement("input");
+    widget.type = "text";
+    widget.value = _ctrlValueToStr("text", cp.value);
+  }
+  widget.setAttribute("data-playground-ctrl", _ctrlKey(pid, name));
+  row.appendChild(widget);
+
+  const stretch = document.createElement("span");
+  stretch.className = "stretch";
+  row.appendChild(stretch);
+
+  const commit = () => {
+    row.dataset.editing = "1";
+    let value;
+    if (ctype === "toggle") {
+      value = widget.checked ? "true" : "false";
+    } else {
+      value = widget.value;
+    }
+    sendPlaygroundSetControlParam(pid, name, value);
+  };
+
+  if (ctype === "select" || ctype === "toggle") {
+    widget.addEventListener("change", commit);
+  } else {
+    widget.addEventListener("change", commit);
+    widget.addEventListener("blur", commit);
+  }
+
+  return row;
+}
+
+function syncControlParamRow(row, p, cp, show_name) {
+  const pid = p.id;
+  const name = cp.name;
+  const ctype = cp.type || "text";
+  const wantValue = cp.value;
+  const wantName = show_name ? (p.name || pid || "") : "";
+
+  const nameSpan = row.querySelector(".name");
+  if (nameSpan && nameSpan.textContent !== wantName) {
+    nameSpan.textContent = wantName;
+  }
+
+  const paramSpan = row.querySelector(".param-name");
+  if (paramSpan && paramSpan.textContent !== name) {
+    paramSpan.textContent = name;
+  }
+
+  const widget = row.querySelector("[data-playground-ctrl]");
+  if (!widget) return;
+
+  if (row.dataset.editing === "1") {
+    if (ctype === "toggle") {
+      const have = widget.checked ? "true" : "false";
+      const want = _ctrlValueToStr("toggle", wantValue);
+      if (have === want) {
+        delete row.dataset.editing;
+      } else {
+        return;
+      }
+    } else {
+      const want = _ctrlValueToStr(ctype, wantValue);
+      if (widget.value === want) {
+        delete row.dataset.editing;
+      } else {
+        return;
+      }
+    }
+  }
+
+  if (widget === document.activeElement) return;
+
+  if (ctype === "toggle") {
+    const want = !!wantValue;
+    if (widget.checked !== want) widget.checked = want;
+  } else {
+    const want = _ctrlValueToStr(ctype, wantValue);
+    if (widget.value !== want) widget.value = want;
+  }
+}
+
+async function sendPlaygroundSetControlParam(pid, name, value) {
+  const command = {
+    type: "playground_set_control_param",
+    id: pid,
+    name: name,
+    value: value,
+  };
+  try {
+    const resp = await fetch("/api/command", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({command: command}),
+    });
+    if (!resp.ok) {
+      let msg = "HTTP " + resp.status;
+      try { const b = await resp.json(); if (b && b.error) msg = b.error; } catch (_) {}
+      logLine("err", "playground_set_control_param failed: " + msg);
+      const row = document.querySelector(
+        `[data-playground-id="${cssEsc(pid)}"][data-ctrl-name="${cssEsc(name)}"]`);
+      if (row) delete row.dataset.editing;
+    }
+  } catch (e) {
+    logLine("err", "playground_set_control_param network error: "
+            + (e && e.message ? e.message : String(e)));
+    const row = document.querySelector(
+      `[data-playground-id="${cssEsc(pid)}"][data-ctrl-name="${cssEsc(name)}"]`);
     if (row) delete row.dataset.editing;
   }
 }
@@ -1884,6 +2181,7 @@ function connectEvents() {
 
   es.addEventListener("open", function () {
     app.eventsConnected = true;
+    logLine("hdr", "SSE connected.");
   });
 
   es.addEventListener("state", function (e) {
@@ -1908,7 +2206,7 @@ function connectEvents() {
         renderPlaygrounds([]);
       }
     } catch (err) {
-      console.error("state parse error", err);
+      logFatal("state parse: " + (err && err.message ? err.message : err));
     }
   });
 
@@ -1918,21 +2216,26 @@ function connectEvents() {
       if (!desc || typeof desc !== "object") return;
       app.latestPanel = desc;
       app.firstPanelReceived = true;
-      if (desc.structure_id !== app.panelStructureId) {
+      const structureChanged = desc.structure_id !== app.panelStructureId;
+      if (structureChanged) {
         app.panelStructureId = desc.structure_id;
         rebuildPanel(desc);
+        if (app.latestState && app.latestState.daemon
+              && app.latestState.daemon.workflow) {
+          scheduleApply();
+        }
       } else {
         syncValues(desc);
       }
     } catch (err) {
-      console.error("panel parse error", err);
+      logFatal("panel parse: " + (err && err.message ? err.message : err));
     }
   });
 
   es.addEventListener("run", handleRunEvent);
 
   es.onerror = function () {
-    // EventSource reconnects automatically.
+    logLine("warn", "SSE error; browser will retry.");
   };
 
   setTimeout(function () {
@@ -1940,11 +2243,11 @@ function connectEvents() {
     const form = document.getElementById("config-form");
     if (!form) return;
     form.innerHTML = app.eventsConnected
-      ? '<div class="empty">Connected to the panel; waiting for a '
-        + 'panel description from the daemon. Is the daemon running '
-        + 'with the latest code?</div>'
-      : '<div class="empty">Could not reach the panel event stream on '
-        + '/api/events. Check that the web server is running.</div>';
+      ? '<div class="empty">Connected to the daemon; waiting for a '
+        + 'panel description. If this persists, the daemon may not '
+        + 'be publishing panel events.</div>'
+      : '<div class="empty">Could not reach /api/events. '
+        + 'Check that the web server is running.</div>';
   }, 4000);
 }
 
@@ -1970,18 +2273,23 @@ def main() -> int:
     threading.Thread(target=_daemon_event_client,
                      name="web-panel-daemon-client",
                      daemon=True).start()
+    # Fallback: if no panel arrives within INITIAL_PANEL_FALLBACK_S,
+    # poll panel_description once so the browser isn't left staring
+    # at an empty form.
+    threading.Thread(target=_fetch_initial_panel,
+                     name="web-panel-initial-panel",
+                     daemon=True).start()
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
 
-    print(f"Kritomatic web panel listening on http://{HOST}:{PORT}/")
-    print(f"  Daemon command socket: {DAEMON_HOST}:{DAEMON_PORT}")
-    print(f"  Daemon event socket:   {DAEMON_HOST}:{DAEMON_EVENT_PORT}")
-    print("  Ctrl-C to stop.")
+    _log(f"listening on http://{HOST}:{PORT}/")
+    _log(f"daemon command socket: {DAEMON_HOST}:{DAEMON_PORT}")
+    _log(f"daemon event socket:   {DAEMON_HOST}:{DAEMON_EVENT_PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nStopping.")
+        _log("stopping")
     finally:
         server.server_close()
     return 0

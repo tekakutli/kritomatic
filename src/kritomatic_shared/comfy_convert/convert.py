@@ -86,7 +86,7 @@ choices list.  Two important classes live there:
     ask for.  ComfyUI's own prompt validation reports missing
     choices with a clear error at submit time.
 
-The converter's job is to not corrupt what `comfy-cli` produced, not
+The converter's job is not corrupt what `comfy-cli` produced, not
 to be a validator.  Type-level repair is safe and clearly bounded;
 choice-level repair is not.
 
@@ -173,12 +173,22 @@ Requirements:
     itself.  `--print-prompt` exits after printing; it does not
     submit anything.  Only the schema-validation pass queries
     ComfyUI, and it degrades gracefully when ComfyUI is down.
+
+    NOTE: comfy-cli 1.22.0 empirically DOES hit `/object_info` even
+    with `--print-prompt`, in order to map `widgets_values`
+    against the live widget schema.  When ComfyUI is not running,
+    comfy-cli exits non-zero with a structured error envelope; the
+    `_run_comfy_print_prompt` helper detects that case and raises a
+    `ConversionError` tagged `comfyui_unreachable=True` so callers
+    can render a short, actionable message instead of the raw
+    envelope.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -225,7 +235,26 @@ HANDLE_TYPES = {
 
 
 class ConversionError(Exception):
-    """Any failure while converting or invoking comfy-cli."""
+    """Any failure while converting or invoking comfy-cli.
+
+    The `comfyui_unreachable` attribute is True when the failure is
+    specifically "ComfyUI is not running", as detected from a
+    comfy-cli error envelope in `_run_comfy_print_prompt`.  Callers
+    that want to render a short user-facing message (the daemon's
+    `comfy_load` in particular) can check the attribute instead of
+    matching on the exception message text.  The message itself is
+    already clean in that case — the flag exists so the caller can
+    skip its own context-add wrapper without heuristically parsing
+    the message.
+
+    All other failures raise `ConversionError` with
+    `comfyui_unreachable=False` (the default), which is indistinguishable
+    from the pre-attribute behaviour: the caller is expected to wrap
+    the message with its own diagnostic context.
+    """
+    def __init__(self, message, *, comfyui_unreachable: bool = False):
+        super().__init__(message)
+        self.comfyui_unreachable = comfyui_unreachable
 
 
 # ============================================================================
@@ -474,6 +503,111 @@ def _parse_api_graph_from_stdout(raw: str) -> dict:
 
 
 # ============================================================================
+#  comfy-cli error envelope parsing
+# ============================================================================
+#
+# comfy-cli 1.22.0 emits a structured error envelope on stdout when
+# it cannot reach ComfyUI:
+#
+#     {"schema": "envelope/1", "type": "envelope", "ok": false,
+#      "command": "run", "version": "1.22.0", "where": "local",
+#      "data": null,
+#      "error": {"code": "connection_error",
+#                "message": "Failed to fetch /object_info from
+#                            127.0.0.1:8188: [Errno 111] Connection
+#                            refused",
+#                "hint": "override with --host / --port",
+#                "details": null}}
+#
+# The raw envelope (command line, version, hint, details) is far more
+# than the caller needs for the "ComfyUI isn't running" case, which
+# is the common one.  Detect that specific case and raise a short,
+# actionable `ConversionError` tagged `comfyui_unreachable=True` so
+# the daemon's `comfy_load` can render it without its own
+# workflow-name wrapper.  Other envelope errors (bad workflow, bad
+# comfy-cli state) still fall through to the verbose path — those
+# are diagnostic, not self-explanatory.
+
+def _extract_comfy_cli_envelope(raw: str) -> Optional[dict]:
+    """Return the `envelope/1` object from `raw`, or None.
+
+    Tries the whole-of-`raw` fast path first (common case: comfy-cli
+    writes nothing but the envelope to stdout), then falls back to
+    scanning for a top-level `{...}` object via
+    `_extract_json_candidates` — the same scanner the API-graph
+    parser uses, so both see the same JSON objects in the same
+    order.
+    """
+    if not raw:
+        return None
+
+    stripped = raw.strip()
+    if stripped.startswith("{"):
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(obj, dict) and obj.get("schema") == "envelope/1":
+                return obj
+
+    for candidate in _extract_json_candidates(raw):
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj.get("schema") == "envelope/1":
+            return obj
+
+    return None
+
+
+def _find_comfyui_unreachable_message(raw: str) -> Optional[str]:
+    """Return a short user-facing message if `raw` shows ComfyUI
+    unreachable, else None.
+
+    Recognized as "unreachable": an `envelope/1` with `ok: false`
+    whose `error.code` is `"connection_error"` (the current comfy-cli
+    spelling) OR whose `error.message` contains
+    `"Connection refused"` (a defensive fallback, in case comfy-cli
+    renames the code or wraps the message differently in a future
+    release).  Either signal is unambiguous: it can only come from
+    comfy-cli's inability to reach the ComfyUI URL, not from any
+    workflow-authoring mistake.
+
+    Extracts the `host:port` from the message's
+    `"Failed to fetch /object_info from <host:port>"` phrase when
+    present so the returned message names the target that failed.
+    Falls back to `DEFAULT_COMFY_URL` (the value comfy-cli uses when
+    the caller does not pass `--host`/`--port`, which this module
+    never does) if the extraction fails.
+
+    The returned message is intentionally terse: this is the common,
+    self-explanatory failure mode, and the user does not need the
+    subprocess command line or the raw envelope to fix it.
+    """
+    envelope = _extract_comfy_cli_envelope(raw)
+    if envelope is None:
+        return None
+    if envelope.get("ok") is not False:
+        return None
+    err = envelope.get("error")
+    if not isinstance(err, dict):
+        return None
+    code = err.get("code")
+    msg = err.get("message") or ""
+    if code != "connection_error" and "Connection refused" not in msg:
+        return None
+
+    match = re.search(r"from ([\w\.\-]+:\d+)", msg)
+    target = match.group(1) if match else DEFAULT_COMFY_URL
+    return (
+        f"ComfyUI is not running at {target}. "
+        f"Start ComfyUI and retry."
+    )
+
+
+# ============================================================================
 #  comfy-cli invocation
 # ============================================================================
 
@@ -484,6 +618,14 @@ def _run_comfy_print_prompt(workflow_path: Path) -> dict:
     Raises ConversionError with the subprocess output attached when
     the command fails, the executable is missing, or stdout does not
     contain a recognizable API graph.
+
+    When the failure is "ComfyUI is not reachable" — detected from
+    comfy-cli's structured error envelope — the raised
+    `ConversionError` carries `comfyui_unreachable=True` and its
+    message is the short, actionable one-liner from
+    `_find_comfyui_unreachable_message`.  All other failures keep the
+    pre-existing verbose message; those genuinely benefit from the
+    subprocess output for diagnosis.
     """
     comfy = _find_comfy_executable()
     if comfy is None:
@@ -519,8 +661,27 @@ def _run_comfy_print_prompt(workflow_path: Path) -> dict:
         ) from e
 
     if result.returncode != 0:
-        stderr_snippet = (result.stderr or "").strip()
-        stdout_snippet = (result.stdout or "").strip()
+        stderr_text = result.stderr or ""
+        stdout_text = result.stdout or ""
+
+        # Check for the "ComfyUI not reachable" envelope first; if
+        # present, raise a short message and tag it so the caller
+        # (the daemon's `comfy_load` in particular) can skip its own
+        # workflow-name / "convert manually" wrapper — the wrapper is
+        # noise when the fix is simply "start ComfyUI and retry".
+        friendly = (
+            _find_comfyui_unreachable_message(stdout_text)
+            or _find_comfyui_unreachable_message(stderr_text)
+        )
+        if friendly is not None:
+            raise ConversionError(friendly, comfyui_unreachable=True)
+
+        # Every other failure mode: keep the verbose message.  The
+        # subprocess command line and the raw output are what a
+        # maintainer needs to diagnose a comfy-cli regression,
+        # a bad workflow, or a corrupted install.
+        stderr_snippet = stderr_text.strip()
+        stdout_snippet = stdout_text.strip()
         detail = stderr_snippet or stdout_snippet or "(no output)"
         raise ConversionError(
             f"comfy-cli exited with code {result.returncode}.\n"
@@ -1217,6 +1378,13 @@ def convert_if_ui(source_path: Path,
     callers (CLI's `panel run`, daemon's `comfy_load`) treat it as
     fatal — the alternative (falling through to a load of the UI file)
     fails later with a less helpful message.
+
+    When ComfyUI is not reachable at conversion time,
+    `convert_workflow` raises a `ConversionError` with
+    `comfyui_unreachable=True` and a short, actionable message.
+    That message propagates through this function unchanged; the
+    callers can detect the flag and skip their own verbose wrappers
+    if they want.
     """
     try:
         data = json.loads(source_path.read_text(encoding="utf-8"))

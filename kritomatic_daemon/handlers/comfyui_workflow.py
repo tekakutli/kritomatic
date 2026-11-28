@@ -27,6 +27,25 @@ the saved config would fail validation against empty slot tables,
 producing a redundant "config autoload rejected" warning on top of
 the real error.
 
+ComfyUI unreachable during auto-conversion
+==========================================
+comfy-cli (which does the UI→API conversion) needs ComfyUI running
+to fetch `/object_info` for widget-schema mapping.  When it cannot
+reach ComfyUI, it exits non-zero with a structured error envelope
+that, if passed through verbatim, produces a very noisy
+"auto-conversion failed: comfy-cli exited with code 1.
+Command: ... Output: {envelope JSON} Convert manually with ..."
+message.
+
+`comfy_convert.convert_if_ui` detects that specific case and raises
+a `ConversionError` tagged `comfyui_unreachable=True` with a
+short message ("ComfyUI is not running at <host:port>").  This
+handler checks the flag and returns that short message directly,
+skipping the workflow-name wrapper and the "Convert manually" hint —
+neither is useful when the fix is simply "start ComfyUI and retry".
+All other ConversionErrors keep the pre-existing verbose wrapping,
+because the subprocess output is genuinely diagnostic there.
+
 Recent layer aliases
 ====================
 `comfy_list_recent_aliases` reads the MRU list the daemon keeps in
@@ -159,6 +178,27 @@ class WorkflowCommands(AutoDispatchHandler):
                     path, annotate=False,
                 )
             except ConversionError as e:
+                # The "ComfyUI is not running" case: `convert.py`
+                # has already reduced this to a short, actionable
+                # one-liner and tagged the exception so we can
+                # return that message directly.  The
+                # workflow-name wrapper and the "convert manually"
+                # hint that the general branch below adds are both
+                # noise here — the fix is "start ComfyUI and
+                # retry", and the "convert manually" hint would
+                # just fail again.  See the module docstring,
+                # "ComfyUI unreachable during auto-conversion".
+                if getattr(e, "comfyui_unreachable", False):
+                    return {
+                        "success": False,
+                        "message": str(e),
+                    }
+                # Every other conversion failure keeps the verbose
+                # wrapper: the subprocess output that `convert.py`
+                # attached is what a maintainer needs to diagnose
+                # a bad workflow, a comfy-cli regression, or a
+                # corrupted install, and the "convert manually"
+                # hint is a real workaround for those cases.
                 return {
                     "success": False,
                     "message": (

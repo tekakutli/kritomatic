@@ -6,6 +6,12 @@ pgkit.js_check — syntax-check a JS module before serving it.
 parses `import`/`export` as ES module syntax; a `.js` suffix would
 require `--experimental-modules` on older nodes.
 
+`check_js_many(modules)` runs `check_js` on every `(label, source)`
+pair in a thread pool.  `pgkit/html_shell.page()` uses it — the
+sequential loop it replaces cost 2–3 s on a cold cache (10–15
+modules × ~200 ms per `node --check` invocation), and parallelising
+across 4 workers brings that down to ~600 ms.
+
 Non-tool failures (node missing, subprocess error, timeout) do not
 raise — the check is a diagnostic, not a build requirement.
 
@@ -56,10 +62,34 @@ The cache is a dev artifact.  Entries are ~200 B for a success and
 ~1 KB for a failure; even 10,000 entries stay under ~2 MB.  There is
 no evictor.  If it ever matters, `rm -rf ~/.pgkit/js_check_cache/`
 is the fallback.
+
+PARALLELISM
+===========
+`check_js_many` uses a `ThreadPoolExecutor` sized to
+`min(_PARALLEL_WORKERS, len(modules))`.  Concurrency is safe because:
+
+  · `_node_path` and `_node_version` are primed synchronously by
+    `check_js_many` before the pool starts — no thread races on the
+    lazy-init path.
+
+  · `_store_cache` uses `os.replace`, which is atomic on POSIX.
+    Two threads writing the same cache key produce identical bytes,
+    and either write can win harmlessly.
+
+  · `_warned` is mutated without a lock.  Two threads racing on the
+    same warning could print it twice; that's cosmetically noisy
+    but never incorrect.
+
+Failure reporting preserves the sequential semantics: modules are
+walked in their original insertion order after the pool drains, so
+the first failure in the natural order is the one raised.  This
+matches what a sequential loop over `module_sources.items()` would
+have done, keeping error messages stable.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -73,6 +103,13 @@ from typing import Optional
 
 
 _LINENO_RE = re.compile(r'^(.+?):(\d+)(?::\d+)?$')
+
+# Sized to match a typical dev machine without spawning a node
+# process storm.  Four concurrent `node --check` subprocesses is
+# ~4x faster than sequential on a cold cache; pushing higher has
+# diminishing returns and starts competing with the Python process
+# for CPU while it's also initialising.
+_PARALLEL_WORKERS = 4
 
 
 class JsSyntaxError(Exception):
@@ -268,6 +305,58 @@ def check_js(source: str, *, label: str = "bundle") -> None:
             os.unlink(path)
         except OSError:
             pass
+
+
+def check_js_many(modules, *,
+                  max_workers: int = _PARALLEL_WORKERS) -> None:
+    """Run `check_js` on every `(label, source)` pair in `modules`.
+
+    `modules` is any mapping from label to source.  Raises the first
+    `JsSyntaxError` encountered in the mapping's iteration order; the
+    other checks run to completion in the background pool first, so
+    that a failure in module A never leaves module B's subprocess
+    half-written and undisposed (ThreadPoolExecutor's context manager
+    joins all futures on exit, which is what we want here).
+
+    The node-discovery caches (`_node_path`, `_node_version`) are
+    primed synchronously before the pool starts, so no thread races
+    on the lazy-init path.  See the module docstring, PARALLELISM.
+    """
+    # Empty / trivial input — avoid spinning up a pool for nothing.
+    if not modules:
+        return
+    if len(modules) == 1:
+        label, source = next(iter(modules.items()))
+        check_js(source, label=label)
+        return
+
+    node = _get_node()
+    if node is None:
+        _warn_once(
+            "pgkit.js_check: `node` not found on PATH — "
+            "skipping JS syntax check. Install node to enable it.",
+        )
+        return
+    # Prime the version cache synchronously; see docstring.
+    _get_node_version(node)
+
+    labels = list(modules.keys())
+    workers = max(1, min(max_workers, len(labels)))
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers,
+    ) as pool:
+        futures = {
+            label: pool.submit(check_js, modules[label], label=label)
+            for label in labels
+        }
+        # Walk in original mapping order.  Any failure in `futures[l]`
+        # will have already propagated to the future; `.result()`
+        # re-raises it here, so error reports preserve the natural
+        # iteration order callers used to get from the sequential
+        # loop that preceded this function.
+        for label in labels:
+            futures[label].result()
 
 
 # ============================================================================

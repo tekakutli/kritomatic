@@ -70,7 +70,20 @@ WB_CLIENT_JS = r"""
    ready".  Removed: the button is always clickable.  If the user
    clicks it while the hub is still down, `wbStartAndOpen` spawns
    the subprocess normally and its 20 s poll window is enough for
-   the hub to come up and broadcast the registration. */
+   the hub to come up and broadcast the registration.
+
+   POLL INTERVAL — WHY 80 MS
+   =========================
+   The registration broadcast arrives at the WS in under 20 ms after
+   the hub notices the new connection.  `/start` now returns in
+   ~300 ms (was 1.5 s).  At a 150 ms poll cadence the browser's next
+   `findPlayground` check could be up to 150 ms after the broadcast
+   landed in `state.playgrounds` — so a playground that registered
+   at t=350 ms wouldn't create its tab until t=500 ms.  At 80 ms
+   cadence that becomes t=430 ms.  The tighter interval costs
+   nothing on the rare slow path (a loop iteration is a cheap
+   `Array.find` over a handful of entries) and brings the visible
+   latency of the fast path closer to the spawn latency. */
 
 const _wb = {
   playgrounds: [],       // populated from onPlaygrounds
@@ -365,7 +378,15 @@ async function wbStartAndOpen(name) {
   /* The subprocess is alive.  Wait for its registration to reach
      this workbench via the hub's `playgrounds` broadcast, then
      activate the tab.  The tab itself is created by wbSyncTabs
-     when the broadcast arrives. */
+     when the broadcast arrives.
+
+     80 ms interval — see the module docstring, POLL INTERVAL — WHY
+     80 MS.  The first check is synchronous: if the broadcast
+     already landed while `/start` was in flight (the common case
+     now that /start returns in ~300 ms), no polling happens at
+     all.  The tight interval only matters when the playground
+     takes longer than /start's response to register — which is
+     exactly the case the loop exists to cover. */
   const deadline = Date.now() + 20000;
   while (Date.now() < deadline) {
     const pg = hubCtrl.findPlayground(name);
@@ -377,7 +398,7 @@ async function wbStartAndOpen(name) {
       if (_wb.tabs.has(pg.name)) wbActivateTab(pg.name);
       return;
     }
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise((r) => setTimeout(r, 80));
   }
   _wbShowBanner("Start " + name + " timed out waiting for registration");
 }

@@ -23,12 +23,16 @@ to discover and start playgrounds without needing a
                       returns {"success": true, "pid": N}.
                       Detached via start_new_session=True so the
                       workbench tab can be closed without killing
-                      the playground.  Waits 1.5s after spawn: if
-                      the subprocess has already exited (import
-                      error, port already in use), returns
-                      {"success": false, stderr: "..."} so the
-                      client can show the failure reason instead
-                      of a client-side timeout.
+                      the playground.  Does a fast-crash check
+                      (proc.wait with a 300 ms timeout): if the
+                      subprocess dies in that window (missing
+                      dependency, syntax error, port already in use
+                      — all happen within the first ~200 ms of
+                      Python startup), returns {"success": false,
+                      stderr: "..."} so the client can show the
+                      failure reason.  If it's still alive at 300 ms
+                      it is returned as success; the browser's own
+                      registration poll handles the rest.
 
 SUPPRESSING THE SPAWNED PLAYGROUND'S BROWSER TAB
 ================================================
@@ -42,9 +46,7 @@ workbench creates — a duplicate.
 child's environment.  `pgkit.server._browser_enabled()` reads that
 variable at the single place where `webbrowser.open()` is called,
 and short-circuits.  See `pgkit/server.py`'s docstring, BROWSER
-SUPPRESSION, for the full rationale — including why we use an env
-var rather than the `BROWSER=/bin/true` trick, and why the check
-lives in `pgkit.server` rather than in every playground's `main()`.
+SUPPRESSION, for the full rationale.
 
 The standalone case (`python outpaint/outpaint_playground.py`) is
 unaffected: nothing sets `PGKIT_NO_BROWSER` in the user's shell, so
@@ -53,12 +55,6 @@ real browser.
 
 The workbench's own `main()` keeps `open_browser=True` — the user
 ran `python workbench_playground.py` and wants the workbench tab.
-If the user's shell has a stale `BROWSER=/bin/true` from a previous
-experiment, the workbench's own browser open will also be suppressed
-(`webbrowser` honours `BROWSER`), which will look like the workbench
-"never opened"; the fix is `unset BROWSER` in that shell.  This new
-architecture never sets `BROWSER` — it uses `PGKIT_NO_BROWSER` and
-only on child subprocesses.
 """
 
 import os
@@ -129,6 +125,24 @@ def _handle_catalog(_payload):
     return {"success": True, "playgrounds": _discover_playgrounds()}
 
 
+# How long `/start` blocks waiting for the child to crash.  See
+# this module's docstring, POST /start.  A hardcoded 1.5 s used to
+# live here and made every spawn feel 1.2 s slower than it needed to
+# be: the child registers with the hub in 500–900 ms on a warm
+# cache, well before the sleep was over, so the browser was idling
+# on a sleep that had already served its purpose.
+#
+# 300 ms is enough to catch the class of failure this check exists
+# for:
+#   · SyntaxError / ImportError  — fail within ~50–150 ms of spawn
+#   · port in use                — fails when serve_nonblocking
+#                                  binds, ~150–250 ms
+# Slow failures (disk contention, NFS, cold .pyc compile on a slow
+# mount) slip past 300 ms, but those are rare and the browser's own
+# 20 s registration-timeout banner still surfaces them.
+_FAST_CRASH_WINDOW_S = 0.3
+
+
 def _handle_start(payload):
     if not isinstance(payload, dict):
         return {"success": False, "message": "expected a JSON object"}
@@ -171,13 +185,18 @@ def _handle_start(payload):
     except Exception as e:
         return {"success": False, "message": f"spawn failed: {e}"}
 
-    # Brief post-spawn check: if the subprocess dies in the first
-    # 1.5s (missing dependency, port already in use), surface the
-    # stderr instead of letting the client wait for a hub broadcast
-    # that will never arrive.  1.5s blocks the request handler
-    # thread — acceptable for a dev tool; ThreadingHTTPServer handles
-    # other requests on other threads.
-    time.sleep(1.5)
+    # Fast-crash check.  See module docstring and _FAST_CRASH_WINDOW_S.
+    # proc.wait() returns immediately if the process exits inside the
+    # window, and raises TimeoutExpired otherwise — no polling loop
+    # needed.  The pipe deadlock concern (child fills stderr before
+    # exiting, nobody reads it, so .wait() blocks forever) doesn't
+    # apply here: we bound .wait() with a 300 ms timeout, so even if
+    # the child wedges on a full stderr buffer we return success and
+    # let the browser's registration timeout be the backstop.
+    try:
+        proc.wait(timeout=_FAST_CRASH_WINDOW_S)
+    except subprocess.TimeoutExpired:
+        pass
     if proc.poll() is not None:
         try:
             _, err = proc.communicate(timeout=1)

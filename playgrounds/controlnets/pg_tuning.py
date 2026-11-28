@@ -1,10 +1,13 @@
-"""Numeric constants for the controlnets playground."""
+"""Numeric constants for the controlnets playground.
+
+Re-exports the universal constants from pgruntime/js/constants.js.
+Any controlnets-specific constants stay below the re-export; the
+playground currently has none.
+"""
 
 TUNING_JS = r"""
-export const VIEW_ZOOM_MIN   = 0.10;
-export const VIEW_ZOOM_MAX   = 32.0;
-export const VIEW_PAN_MARGIN = 40;
-
-/* Debounce for state sync — same window as multimask/magi. */
-export const SYNC_DEBOUNCE_MS = 250;
+export {
+  VIEW_ZOOM_MIN, VIEW_ZOOM_MAX, VIEW_PAN_MARGIN,
+  SYNC_DEBOUNCE_MS,
+} from "./pgruntime/js/constants.js";
 """

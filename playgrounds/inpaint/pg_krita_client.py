@@ -16,7 +16,7 @@ implementation, so nothing changes on that path.
 """
 
 KRITA_CLIENT_JS = r"""
-import { makeKritaClient } from "./pgruntime/daemon_client.js";
+import { makeKritaClient } from "./pgruntime/js/daemon_client.js";
 
 const _krita = makeKritaClient({
   krita_status:   "/krita/status",

@@ -14,7 +14,7 @@ but no caller reads it on the success path.
 """
 
 CLIENT_JS = r"""
-import { makeKritaClient } from "./pgruntime/daemon_client.js";
+import { makeKritaClient } from "./pgruntime/js/daemon_client.js";
 
 const _krita = makeKritaClient({
   import_masks: "/import_masks",

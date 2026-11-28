@@ -10,7 +10,7 @@ behaviour.  Layout's other client-side concerns live elsewhere:
 """
 
 CLIENT_JS = r"""
-import { makeKritaClient } from "./pgruntime/daemon_client.js";
+import { makeKritaClient } from "./pgruntime/js/daemon_client.js";
 
 const _krita = makeKritaClient();
 

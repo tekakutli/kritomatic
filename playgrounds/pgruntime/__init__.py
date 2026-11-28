@@ -77,6 +77,31 @@ PACKAGE CONTENTS
                                 `normalize_band`, `common_header`,
                                 `prepare_output_path`, and
                                 `execute_bundle`.
+    pgruntime.bootstrap         serve_playground — the launcher
+                                pattern every <name>_playground.py
+                                was implementing locally.  Handles
+                                port-verify, daemon-watch, atexit,
+                                signals, and registration flags.
+    pgruntime.html              render_or_exit — the
+                                JsSyntaxError-to-clean-exit wrapper
+                                every <name>_html.py was duplicating.
+    pgruntime.js_constants      CONSTANTS_JS — shared JS numeric
+                                constants (view zoom bounds, sync
+                                debounce, op log cap, pixel bbox).
+    pgruntime.js_state_base     STATE_BASE_JS — makeStateBase()
+                                factory covering every playground's
+                                canvas/view/fit/transform/schedule
+                                boilerplate, with `overlay` and
+                                `rotation` options.
+    pgruntime.js_pan_zoom       PAN_ZOOM_JS — installPanZoom().
+    pgruntime.js_chrome         CHROME_JS — makeChromeText(), the
+                                cached-chrome-text factory.
+    pgruntime.js_panel_fields   PANEL_FIELDS_JS — syncImageInfo().
+    pgruntime.js_state_sync     STATE_SYNC_JS — makeStateSync(),
+                                debounced deduped state push with
+                                success-only commit.
+    pgruntime.js_autosync       AUTOSYNC_JS — makeAutosync(), the
+                                layer-slot poller.
 """
 
 __version__ = "0.1.0"

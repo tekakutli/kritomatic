@@ -292,4 +292,60 @@ export function makeKritaClient(opts) {
     exportMaskAsLayer,
   };
 }
+
+
+/* ==========================================================================
+   installKritaStatusCheck — the "✓ reachable / ✗ not reachable" indicator.
+   ==========================================================================
+   Opts:
+     client          — the object from makeKritaClient()
+     buttonId        — the button element's id (default "kritaCheckBtn")
+     statusId        — the indicator element's id (default "kritaStatus")
+     labelOk/Bad     — indicator text (defaults: "✓ reachable" / "✗ not reachable")
+     titleOk/Bad     — indicator tooltip on hover
+     onStatus        — optional (reachable, response) => void hook
+
+   Returns the async check function so the caller can invoke it
+   programmatically (e.g. from pgkitBootSync). */
+
+export function installKritaStatusCheck(opts) {
+  const {
+    client,
+    buttonId = "kritaCheckBtn",
+    statusId = "kritaStatus",
+    labelOk  = "\u2713 reachable",
+    labelBad = "\u2717 not reachable",
+    titleOk  = "",
+    titleBad = "",
+    onStatus = null,
+  } = opts;
+
+  const button    = document.getElementById(buttonId);
+  const indicator = document.getElementById(statusId);
+
+  async function check() {
+    let res;
+    try { res = await client.checkKritaStatus(); }
+    catch (e) { res = { reachable: false, message: e.message }; }
+
+    if (indicator) {
+      if (res.reachable) {
+        indicator.textContent = labelOk;
+        indicator.className = "ok";
+        indicator.title = titleOk;
+      } else {
+        indicator.textContent = labelBad;
+        indicator.className = "bad";
+        indicator.title = titleBad;
+      }
+    }
+    if (onStatus) {
+      try { onStatus(!!res.reachable, res); } catch (_) {}
+    }
+    return res;
+  }
+
+  if (button) button.addEventListener("click", check);
+  return check;
+}
 """

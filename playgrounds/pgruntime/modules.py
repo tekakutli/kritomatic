@@ -28,10 +28,28 @@ The `/modules/` prefix is added by pgkit's server; pgruntime doesn't
 need to know about it.
 """
 
+"""
+pgruntime.modules — the module_sources entries for pgruntime's own JS.
+"""
+
 from .js_daemon_client import DAEMON_CLIENT_JS
+from .js_constants     import CONSTANTS_JS
+from .js_state_base    import STATE_BASE_JS
+from .js_pan_zoom      import PAN_ZOOM_JS
+from .js_chrome        import CHROME_JS
+from .js_panel_fields  import PANEL_FIELDS_JS
+from .js_state_sync    import STATE_SYNC_JS
+from .js_autosync      import AUTOSYNC_JS
 
 
 def pgruntime_modules() -> dict:
     return {
-        "pgruntime/daemon_client.js": DAEMON_CLIENT_JS,
+        "pgruntime/js/daemon_client.js":  DAEMON_CLIENT_JS,
+        "pgruntime/js/constants.js":      CONSTANTS_JS,
+        "pgruntime/js/state_base.js":     STATE_BASE_JS,
+        "pgruntime/js/pan_zoom.js":       PAN_ZOOM_JS,
+        "pgruntime/js/chrome.js":         CHROME_JS,
+        "pgruntime/js/panel_fields.js":   PANEL_FIELDS_JS,
+        "pgruntime/js/state_sync.js":     STATE_SYNC_JS,
+        "pgruntime/js/autosync.js":       AUTOSYNC_JS,
     }

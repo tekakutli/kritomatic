@@ -1,59 +1,31 @@
-"""Panel handlers: refresh @thecontrolnet, preprocess, list, apply
-nodes, state sync, and the Krita round-trip (push / refresh).
+"""Panel: preprocess, list, apply nodes, state sync, Krita round-trip.
 
-Preprocess flow: click "Preprocess images" → the browser POSTs
-`@thecontrolnet`'s PNG to `/preprocess` → the server reads
-`data/controlnets/controlnets_workflow.json`, finds every
-ControlNetApply node, runs each one's preprocessor against the
-image, and returns one entry per distinct preprocessor (`{title,
-hash, dataUrl, width, height}` or `{title, error}`).
+State sync goes through `makeStateSync` from pgruntime.  The factory
+owns the debounce, the success-only commit of the dedupe key, and
+the warn-once flash — the same discipline controlnets has always
+had, now centralised.
 
-The panel stores those in `board.controlnets` and renders them as
-clickable rows.  Clicking a done row sets
-`board.viewingControlnetTag = title`; the canvas swaps to that
-image (letterboxed into the fit rect).  Clicking "Back to
-@thecontrolnet" resets the tag.
+Panel fields go through `syncImageInfo` from pgruntime (equality-
+guarded internally, so `_lastImageSig` is gone).
 
-APPLY NODES (per-ControlNetApplyAdvanced enable)
-================================================
-Below the preprocessor list there is a second list: one row per
-`ControlNetApplyAdvanced` in the workflow file, labelled with its
-title, with a checkbox.  `board.applyNodes` is populated from
-`/state`'s `apply_nodes` field at boot (see `_bootPull`), which in
-turn derives from a fresh read of the workflow file — so adding an
-apply node to the file is picked up on the next page refresh.
-
-Only enabled apply titles are sent to `/state` under
-`apply_enabled`.  The `ControlNetsConditioning` node consults that
-dict and skips disabled entries.  This lets two apply nodes that
-share a preprocessor (e.g. DEPTH and DEPTH FULL, both Zoe-based) be
-toggled independently without dropping the preprocessor's pixels
-from the state.  The preprocessor list is always fully serialised
-into `/state.controlnets` — no filter.
-
-Krita round-trip:
-  · "Push to Krita" POSTs every done controlnet to
-    `/krita/push_controlnets`.  The server creates (or replaces) a
-    scratch doc named `kritomatic_controlnets`, one layer per
-    controlnet image, layer names == titles.
-  · "Refresh from Krita" POSTs the current titles to
-    `/krita/refresh_controlnets`.  The server reads each layer,
-    re-encodes as PNG, updates its own cache, and returns new
-    `{title, hash, dataUrl, width, height}` per layer.  The panel
-    updates the entries in place and schedules a state sync so the
-    workflow sees the new hashes.
-
-State sync fires after preprocess / refresh / toggle so the node's
-`/state` pull sees the current hashes and apply_enabled dict.
+Krita status check goes through `installKritaStatusCheck` from
+pgruntime.  The factory installs the button listener and returns
+the check function for programmatic use (from `controlnetsBootSync`
+and from any future re-check trigger).
 """
 
 PANEL_JS = r"""
 import { board } from "./pg_state.js";
 import {
-  checkKritaStatus, fetchActiveState,
+  fetchActiveState,
   pushControlnets, refreshControlnets,
 } from "./pg_client.js";
 import { fetchSelectedLayer } from "./pg_autosync.js";
+import {
+  makeKritaClient, installKritaStatusCheck,
+} from "./pgruntime/js/daemon_client.js";
+import { makeStateSync } from "./pgruntime/js/state_sync.js";
+import { syncImageInfo } from "./pgruntime/js/panel_fields.js";
 import { flashStatus } from "./pgkit/panel_core.js";
 import { pgkitNotifyAll } from "./pgkit/remote_client.js";
 import { SYNC_DEBOUNCE_MS } from "./pg_tuning.js";
@@ -66,11 +38,15 @@ let _pushInProgress    = false;
 let _refreshInProgress = false;
 
 /* ============================================================
-   State sync
+   Krita status check
    ============================================================ */
 
-let _syncTimer = null;
-let _lastSyncedKey = null;
+const _kritaStatusClient = makeKritaClient();
+const _kritaCheck = installKritaStatusCheck({ client: _kritaStatusClient });
+
+/* ============================================================
+   State sync
+   ============================================================ */
 
 function _stateKey() {
   const parts = [
@@ -86,14 +62,7 @@ function _stateKey() {
   return parts.join("|");
 }
 
-function _scheduleStateSync() {
-  if (_syncTimer) clearTimeout(_syncTimer);
-  _syncTimer = setTimeout(_doStateSync, SYNC_DEBOUNCE_MS);
-}
-
-async function _doStateSync() {
-  _syncTimer = null;
-  const key = _stateKey();
+function _buildStatePayload() {
   const wireControlnets = board.controlnets
     .filter(c => c.status === "done")
     .map(c => ({
@@ -102,9 +71,6 @@ async function _doStateSync() {
       image: { hash: c.hash, width: c.width, height: c.height },
     }));
 
-  // Build apply_enabled from the panel's current knowledge.  Omitted
-  // from the POST when the panel hasn't yet bootstrapped (bootPull
-  // not finished) — the server preserves whatever it already had.
   const applyEnabled = {};
   for (const n of board.applyNodes) {
     if (n && typeof n.title === "string" && n.title) {
@@ -121,30 +87,33 @@ async function _doStateSync() {
     nextState.apply_enabled = applyEnabled;
   }
 
-  try {
-    const res = await fetch("/state", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ op: "set", state: nextState }),
-    });
-    const data = await res.json();
-    if (data.success) {
-      _lastSyncedKey = key;
-      board.lastSync = Date.now();
-      board.syncError = null;
-      const v = (data.version || "").slice(0, 8);
-      const el = document.getElementById("stateVersion");
-      if (el) el.textContent = v || "—";
-    } else {
-      board.syncError = data.message || "state sync failed";
-      flashStatus("state sync failed: " + board.syncError, "bad");
-    }
-  } catch (e) {
-    board.syncError = e.message;
-    flashStatus("state sync failed: " + e.message, "bad");
-  }
-  _refreshStatusLine();
-  pgkitNotifyAll();
+  return { op: "set", state: nextState };
+}
+
+const _stateSync = makeStateSync({
+  buildPayload: _buildStatePayload,
+  keyFn:        _stateKey,
+  url:          "/state",
+  debounceMs:   SYNC_DEBOUNCE_MS,
+  onSuccess: (data) => {
+    board.lastSync  = Date.now();
+    board.syncError = null;
+    const v = (data.version || "").slice(0, 8);
+    const el = document.getElementById("stateVersion");
+    if (el) el.textContent = v || "\u2014";
+    _refreshStatusLine();
+    pgkitNotifyAll();
+  },
+  onError: (msg) => {
+    board.syncError = msg;
+    flashStatus("state sync failed: " + msg, "bad");
+    _refreshStatusLine();
+    pgkitNotifyAll();
+  },
+});
+
+function _scheduleStateSync() {
+  _stateSync.schedule();
 }
 
 /* ============================================================
@@ -295,21 +264,10 @@ function _renderApplyNodeList() {
    Panel field sync
    ============================================================ */
 
-let _lastImageSig = "";
-
 export function syncPanelFields() {
   const imageInfo = document.getElementById("imageInfo");
   if (imageInfo) {
-    const sig = (board.imageHash || "")
-              + "|" + board.imageWidth + "x" + board.imageHeight;
-    if (sig !== _lastImageSig) {
-      _lastImageSig = sig;
-      const text = board.imageEl
-        ? board.imageWidth + " \u00d7 " + board.imageHeight
-          + "   [" + String(board.imageHash || "").slice(0, 8) + "\u2026]"
-        : "No image loaded";
-      if (imageInfo.textContent !== text) imageInfo.textContent = text;
-    }
+    syncImageInfo(imageInfo, board, { hint: "No image loaded" });
   }
 
   const backRow = document.getElementById("backToControlnetRow");
@@ -345,11 +303,12 @@ export function syncPanelFields() {
       : "\u2193 Refresh from Krita";
   }
 
-  // State sync on image / controlnets / apply-state change.
-  const key = _stateKey();
-  if (key !== _lastSyncedKey && _syncTimer === null) {
-    _scheduleStateSync();
-  }
+  // Safety net: catches state mutations that happened outside an
+  // explicit mutation handler (e.g., autosync updating the image).
+  // The factory dedupes by key and by pending timer, so calling it
+  // every frame is cheap: on a steady-state frame the key matches
+  // the last synced key and the timer check short-circuits.
+  _scheduleStateSync();
 
   _refreshStatusLine();
 }
@@ -615,23 +574,6 @@ function _backToControlnetAction() {
 }
 
 /* ============================================================
-   Krita status
-   ============================================================ */
-
-async function _kritaStatusAction() {
-  const res = await checkKritaStatus();
-  const el = document.getElementById("kritaStatus");
-  if (!el) return;
-  if (res.reachable) {
-    el.textContent = "\u2713 reachable";
-    el.className = "ok";
-  } else {
-    el.textContent = "\u2717 not reachable";
-    el.className = "bad";
-  }
-}
-
-/* ============================================================
    Install
    ============================================================ */
 
@@ -641,14 +583,14 @@ export function installPanelBindings() {
   const pushBtn     = document.getElementById("pushToKritaBtn");
   const refreshKBtn = document.getElementById("refreshFromKritaBtn");
   const back        = document.getElementById("backToControlnetBtn");
-  const kritaCheck  = document.getElementById("kritaCheckBtn");
 
   if (refresh)     refresh.addEventListener("click", _refreshCanvasAction);
   if (preprocess)  preprocess.addEventListener("click", _preprocessAction);
   if (pushBtn)     pushBtn.addEventListener("click", _pushToKritaAction);
   if (refreshKBtn) refreshKBtn.addEventListener("click", _refreshFromKritaAction);
   if (back)        back.addEventListener("click", _backToControlnetAction);
-  if (kritaCheck)  kritaCheck.addEventListener("click", _kritaStatusAction);
+
+  // Krita status check button is wired by installKritaStatusCheck().
 }
 
 async function _bootPull() {
@@ -662,12 +604,8 @@ async function _bootPull() {
     if (data.success) {
       const v = (data.version || "").slice(0, 8);
       const el = document.getElementById("stateVersion");
-      if (el) el.textContent = v || "—";
+      if (el) el.textContent = v || "\u2014";
 
-      // Populate apply-node list from server.  The server re-reads
-      // the workflow file on every GET /state, so this is also how a
-      // freshly added ControlNetApplyAdvanced gets picked up — on the
-      // next page refresh.
       if (Array.isArray(data.apply_nodes)) {
         board.applyNodes = data.apply_nodes.map(n => ({
           title:              n.title || "",
@@ -677,7 +615,6 @@ async function _bootPull() {
         }));
       }
 
-      _lastSyncedKey = _stateKey();
       _renderApplyNodeList();
     }
   } catch (_) {}
@@ -688,7 +625,7 @@ export function controlnetsBootSync() {
   _renderControlnetList();
   _renderApplyNodeList();
   syncPanelFields();
-  _kritaStatusAction();
+  _kritaCheck();
   _bootPull().catch(() => {});
 }
 

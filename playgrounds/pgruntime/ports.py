@@ -35,6 +35,7 @@ PLAYGROUND_PORTS: dict[str, int] = {
     "outpaint":     8768,
     "segment":      8773,
     "text_boxes":   8771,
+    "rmbg":         8785,
     # Additional playgrounds added in the follow-up pass.
     "cable":        8782,
     "cone":         8783,

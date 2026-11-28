@@ -48,6 +48,10 @@ generate commands. The panel itself only reads/writes
 `resources`/`params`/`crop`/`paste`, and only those are autoloaded on
 `comfy_load`.
 
+`workflow` is optional (may be empty). Empty means the CLI sends no
+`comfy_load` command and the daemon uses whatever workflow is
+currently active. See "Batch construction" below.
+
 Bundle id
 =========
 `build_batch` uses a fresh unique id per invocation. The daemon keys
@@ -110,6 +114,17 @@ class PanelConfig:
     Populated by `parse_config_dict(dict)`. Structural validation
     only — graph-aware validation (does this @-name exist in the
     workflow?) happens daemon-side at `comfy_apply_config` time.
+
+    `workflow` may be empty. Empty means the CLI should not send a
+    `comfy_load` command; the daemon's active workflow is used as-is.
+
+    `config_name` is CLI-only. When set (via `--config NAME`), the
+    CLI's `build_batch` emits an explicit `comfy_apply_config` so
+    that `panel_configs/<NAME>.json` is applied on top of whatever
+    the daemon has active. `None` means "do not send an explicit
+    apply — rely on `comfy_load`'s daemon-side autoload, or the
+    daemon's current `_active_config` when no workflow is loaded."
+    Not read from or written to disk.
     """
     host: str
     port: int
@@ -124,6 +139,7 @@ class PanelConfig:
     crop_context: str = "entire_image"
     crop_padding: int = 0
     paste: PasteSpec = field(default_factory=PasteSpec)
+    config_name: Optional[str] = None
 
 
 # ============================================================================
@@ -221,7 +237,15 @@ def parse_config_dict(data: dict) -> PanelConfig:
     try:
         host = str(data.get("host", "127.0.0.1"))
         port = int(data.get("port", 8188))
-        workflow = str(data.get("workflow", ""))
+        # `or ""` rather than a bare `str(...)`: `data.get("workflow",
+        # "")` returns the literal `None` when the JSON carries
+        # `"workflow": null`, and `str(None)` is the truthy string
+        # `"None"`. A config file that legitimately omits its
+        # workflow (or carries null) would then send
+        # `comfy_load --name None` to the daemon. `or ""` collapses
+        # both cases to the empty string the rest of this module
+        # uses for "no workflow named".
+        workflow = str(data.get("workflow") or "")
         exclusive = bool(data.get("exclusive", True))
         watch = bool(data.get("watch", False))
         timeout = float(data.get("timeout", 55.0))
@@ -338,6 +362,74 @@ def parse_config_dict(data: dict) -> PanelConfig:
 def parse_config_file(path: Path) -> PanelConfig:
     """Read + parse a config file in one call. Raises ValueError."""
     return parse_config_dict(read_config_file(path))
+
+
+# ============================================================================
+#  Batch-time resolution (CLI's (workflow, --config) pair → PanelConfig)
+# ============================================================================
+
+def load_config_for_batch(
+    workflow: Optional[str] = None,
+    config_name: Optional[str] = None,
+) -> PanelConfig:
+    """Resolve the CLI's (positional workflow, --config) pair into a
+    PanelConfig, ready to hand to `build_batch`.
+
+    The returned `config_name` — not the workflow's disk file — is
+    what decides whether `build_batch` emits an explicit
+    `comfy_apply_config`. So naming a workflow on the command line
+    loads it but does not force the CLI's view of its config; only
+    `--config` does that.
+
+    Combinations:
+
+      · workflow=None, config_name=None
+          → PanelConfig defaults. `build_batch` skips both the
+            `comfy_load` and the explicit `comfy_apply_config`, so
+            the daemon runs against whatever workflow and config it
+            currently has active.
+
+      · workflow="X", config_name=None
+          → `comfy_load X`. Config sections come from the daemon's
+            autoload of `panel_configs/X.json` (if present). The CLI
+            does NOT send its own `comfy_apply_config`; run-time
+            fields (timeout, count, seed) are still read from
+            `panel_configs/X.json` here so the batch reflects what
+            the workflow file says.
+
+      · workflow=None, config_name="Y"
+          → use the daemon's active workflow. Explicit
+            `comfy_apply_config` with `panel_configs/Y.json`'s
+            sections, so a different config can be applied on top of
+            the current workflow without reloading it.
+
+      · workflow="X", config_name="Y"
+          → `comfy_load X`, then explicit `comfy_apply_config` with
+            `panel_configs/Y.json`. The positional workflow wins over
+            the config file's own `"workflow"` field, because that's
+            what the user typed on the command line.
+
+    Raises ValueError when the config file exists but is malformed.
+    Silently falls back to defaults when it does not exist.
+    """
+    source_name = config_name or workflow
+    data: dict = {}
+    if source_name:
+        path = CONFIG_DIR / f"{source_name}.json"
+        if path.is_file():
+            data = read_config_file(path)  # raises ValueError on bad JSON
+
+    # Positional workflow wins over the config file's `workflow` field.
+    # When both are absent, `parse_config_dict` defaults to "".
+    data["workflow"] = workflow or ""
+
+    cfg = parse_config_dict(data)
+    # Only an explicit --config triggers a CLI-level apply. Naming a
+    # workflow without --config leaves apply_config to comfy_load's
+    # daemon-side autoload, which is what preserves docker/web-panel
+    # edits across a workflow reload that the user did not ask for.
+    cfg.config_name = config_name if config_name else None
+    return cfg
 
 
 # ============================================================================
@@ -545,13 +637,35 @@ def build_file_template(workflow_ref: str) -> Optional[str]:
 def build_batch(config: PanelConfig) -> dict:
     """Build the batch `panel run` sends to the daemon.
 
-    The bundle id is unique per invocation. The daemon's batch registry
-    keys by that id, so two `panel run` calls from separate terminals
-    are tracked as two distinct batches — a `comfy_cancel` aimed at one
-    does not touch the other, and `comfy_batches` reports both. A static
-    id here (the previous behaviour) made concurrent CLI runs collide:
-    whichever registered second overwrote the first's record, and any
-    cancel during the overlap targeted whichever was last registered.
+    Workflow loading is optional. When `config.workflow` is empty, no
+    `comfy_load` is emitted and the daemon's currently active
+    workflow is used unchanged.
+
+    Config application is optional AND — unlike earlier versions —
+    only driven by `--config`. The explicit `comfy_apply_config`
+    command is emitted *only* when `config.config_name` is set. In
+    that case the file named by `--config` is applied on top of the
+    daemon's current state, whether or not a workflow is also being
+    loaded.
+
+    When no `--config` is given, the CLI deliberately does NOT push
+    a config. That makes `panel run <wf>` defer entirely to the
+    daemon's `comfy_load` autoload (which reads
+    `panel_configs/<wf>.json` from disk if present), and `panel run`
+    defer entirely to whatever `_active_config` the docker or web
+    panel last set. The CLI is then a pure "trigger a run" primitive,
+    never an unsolicited writer to the daemon's config — which is
+    what preserves edits made in the docker / web panel across a CLI
+    invocation.
+
+    The bundle id is unique per invocation. The daemon's batch
+    registry keys by that id, so two `panel run` calls from separate
+    terminals are tracked as two distinct batches — a `comfy_cancel`
+    aimed at one does not touch the other, and `comfy_batches`
+    reports both. A static id here made concurrent CLI runs collide:
+    whichever registered second overwrote the first's record, and
+    any cancel during the overlap targeted whichever was last
+    registered.
     """
     resources_json = json.dumps({
         name: {
@@ -574,9 +688,30 @@ def build_batch(config: PanelConfig) -> dict:
         "resize_canvas": config.paste.resize_canvas,
     })
 
-    load_cmd: dict = {"type": "comfy_load", "name": config.workflow}
-    if config.exclusive:
-        load_cmd["exclusive"] = True
+    commands: list[dict] = [
+        {"type": "comfy_connect",
+         "host": config.host, "port": config.port, "check": True},
+    ]
+
+    if config.workflow:
+        load_cmd: dict = {"type": "comfy_load", "name": config.workflow}
+        if config.exclusive:
+            load_cmd["exclusive"] = True
+        commands.append(load_cmd)
+
+    # Only --config forces a CLI-level apply. Naming a workflow
+    # without --config lets comfy_load's daemon-side autoload decide
+    # what config section values are used, which is what keeps
+    # unsolicited CLI invocations from clobbering docker / web panel
+    # edits.
+    if config.config_name:
+        commands.append({
+            "type": "comfy_apply_config",
+            "resources": resources_json,
+            "params": params_json,
+            "crop": crop_json,
+            "paste": paste_json,
+        })
 
     generate_cmd: dict = {
         "type": "comfy_generate",
@@ -586,22 +721,11 @@ def build_batch(config: PanelConfig) -> dict:
         generate_cmd["count"] = config.count
     if config.seed is not None:
         generate_cmd["seed"] = config.seed
+    commands.append(generate_cmd)
 
     return {
         "id": f"comfy_panel_v2_{uuid.uuid4().hex[:8]}",
-        "commands": [
-            {"type": "comfy_connect",
-             "host": config.host,
-             "port": config.port,
-             "check": True},
-            load_cmd,
-            {"type": "comfy_apply_config",
-             "resources": resources_json,
-             "params": params_json,
-             "crop": crop_json,
-             "paste": paste_json},
-            generate_cmd,
-        ],
+        "commands": commands,
     }
 
 

@@ -1,13 +1,43 @@
 """
 cli.py — command-line interface for the panel.
 
-    kritomatic comfyui panel run    [<workflow>]
+    kritomatic comfyui panel run    [<workflow>] [--config <name>]
     kritomatic comfyui panel reset  [<workflow>]
     kritomatic comfyui panel print  [<workflow>] [--output FILE]
     kritomatic comfyui panel preset apply <name> [<workflow>] [--dry-run]
     kritomatic comfyui panel preset list
     kritomatic comfyui panel queue
     kritomatic comfyui panel cancel [<batch_id>] [--all]
+
+`panel run` semantics (four combinations, controlled by the positional
+`<workflow>` and the `--config` flag):
+
+    panel run
+        Use the daemon's currently-active workflow and config. Only
+        `comfy_connect` and `comfy_generate` are sent. No state
+        mutation. This is the "run the panel as it currently stands"
+        primitive — docker / web panel edits survive.
+
+    panel run <wf>
+        Load <wf> on the daemon. The daemon autoloads
+        `panel_configs/<wf>.json` if it exists. The CLI itself sends
+        no `comfy_apply_config`; run-time fields (timeout, count,
+        seed) are read from that file locally so the batch reflects
+        what the workflow file says. First-ever run on a workflow
+        with no config file writes a fresh template and exits, so
+        the user has something to edit.
+
+    panel run --config <cfg>
+        Use the daemon's active workflow. Apply
+        `panel_configs/<cfg>.json` explicitly on top of the daemon's
+        current state. Missing file is a hard error.
+
+    panel run <wf> --config <cfg>
+        Load <wf>, then apply `panel_configs/<cfg>.json` explicitly.
+
+Only `--config` causes the CLI to send a `comfy_apply_config` command.
+That is what preserves docker / web panel edits across a workflow load
+that did not ask for an override.
 
 Config files are JSON (`.json`). The daemon autoloads them on
 `comfy_load` and saves them via `comfy_save_config`. TOML is no
@@ -41,8 +71,7 @@ from .config import (
     build_file_template,
     existing_configs,
     list_presets,
-    load_config,
-    parse_panel_config,
+    load_config_for_batch,
     resolve_preset_path,
 )
 from .paths import CONFIG_DIR, PRESET_DIR, WORKFLOW_DIR
@@ -187,14 +216,21 @@ def _prepare_workflow_ref(
 
 
 # ============================================================================
-#  Config resolution
+#  Config resolution (used by reset / preset-apply, not run)
 # ============================================================================
 
 def _resolve_config_path(
     workflow_slug: Optional[str],
     json_path: Optional[Path] = None,
 ) -> tuple[Path, str]:
-    """Return (config_path, label). Config files are `<slug>.json`."""
+    """Return (config_path, label). Config files are `<slug>.json`.
+
+    Only `cmd_reset` and `cmd_preset_apply` call this with a `None`
+    slug, and only because they want the "there is exactly one config
+    on disk, use it" ergonomic. `cmd_run` no longer goes through this
+    path: "no workflow named" there means "use the daemon's active
+    state", which is strictly more useful than auto-picking a file.
+    """
     if workflow_slug:
         config_path = CONFIG_DIR / f"{workflow_slug}.json"
         if json_path is not None:
@@ -215,7 +251,7 @@ def _resolve_config_path(
     names = ", ".join(p.stem for p in existing)
     raise SystemExit(
         f"Multiple configs on disk.\n"
-        f"Pick one:  kritomatic comfyui panel run <name>\n"
+        f"Pick one:  kritomatic comfyui panel reset <name>\n"
         f"Available: {names}"
     )
 
@@ -260,48 +296,77 @@ def _get_template_string(workflow_arg: Optional[str]) -> Optional[str]:
 # ============================================================================
 
 def cmd_run(args) -> int:
-    """Run the batch described by the panel config for the named workflow."""
+    """Run the panel against the daemon's active state and/or the
+    (workflow, --config) pair named on the command line.
+
+    See the module docstring for the four combinations. The key rule:
+    only `--config` causes the CLI to send a `comfy_apply_config`;
+    naming a workflow without `--config` relies on the daemon's
+    autoload, which is what keeps docker / web panel edits alive
+    across a workflow load that the user did not ask to override.
+    """
     _ensure_daemon_ready()
 
+    # ---- Normalize the workflow arg (slug or path) ----
     slug, source_path = _normalize_workflow_arg(args.workflow)
-    if slug is None:
-        try:
-            path, label = _resolve_config_path(None)
-        except SystemExit as e:
-            print(str(e), file=sys.stderr)
-            return 1
-        try:
-            cfg = parse_panel_config(path)
-        except ValueError as e:
-            print(f"Error in {path}: {e}", file=sys.stderr)
-            return 1
-    else:
+
+    # ---- UI → API conversion for the workflow file, if any ----
+    # Client-side conversion produces data/convert/<name>.json for
+    # UI-format sources. The daemon also converts, but doing it here
+    # lets the CLI's error message name the file before the batch is
+    # even built.
+    workflow_ref: Optional[str] = None
+    if slug is not None:
         workflow_ref, ok = _prepare_workflow_ref(slug, source_path)
         if not ok:
             return 1
 
-        path, label = _resolve_config_path(slug, source_path)
+    # ---- First-run template creation for `panel run <wf>` ----
+    # Only fires without --config: --config <missing> is a hard error
+    # from load_config_for_batch, not a template generator.
+    if workflow_ref is not None and not args.config:
+        config_path = CONFIG_DIR / f"{slug}.json"
+        if not config_path.exists():
+            return _write_fresh_template(config_path, workflow_ref)
 
-        if not path.exists():
-            return _write_fresh_template(path, workflow_ref)
+    # ---- Resolve the config ----
+    try:
+        cfg = load_config_for_batch(
+            workflow=workflow_ref,
+            config_name=args.config,
+        )
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
-        try:
-            cfg = parse_panel_config(path)
-        except ValueError as e:
-            print(f"Error in {path}: {e}", file=sys.stderr)
-            return 1
-
-        if workflow_ref is not None:
-            cfg.workflow = workflow_ref
-
+    # ---- Build the batch ----
     try:
         batch = build_batch(cfg)
     except ValueError as e:
-        print(f"Error in {path}: {e}", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    print(f"Config:   {path}   ({label})")
-    print(f"Commands: {len(batch['commands'])}\n")
+    # ---- Print the resolved plan ----
+    if cfg.workflow:
+        print(f"Workflow: {cfg.workflow}")
+    else:
+        print("Workflow: (daemon's active)")
+    if cfg.config_name:
+        print(f"Config:   {CONFIG_DIR / f'{cfg.config_name}.json'} "
+              f"(explicit --config)")
+    elif cfg.workflow:
+        autoload_path = CONFIG_DIR / f"{Path(cfg.workflow).stem}.json"
+        if autoload_path.exists():
+            print(f"Config:   {autoload_path} (daemon autoload)")
+        else:
+            print("Config:   (no file on disk; daemon will report "
+                  "'No panel config applied')")
+    else:
+        print("Config:   (daemon's active)")
+    print(f"Commands: {len(batch['commands'])}")
+    for cmd in batch["commands"]:
+        print(f"  · {cmd['type']}")
+    print()
 
     # The daemon's poll loop gives each run:
     #   · up to _MIN_EXEC_TIMEOUT_S (300s) of execution time
@@ -546,16 +611,21 @@ def populate_panel_subcommands(sub) -> None:
     """Populate the panel's subcommands into a subparsers object."""
     run_p = sub.add_parser(
         'run',
-        help='Run the panel config for the named workflow',
+        help='Run the panel against the daemon\'s active state, or '
+             'against a named workflow and/or config',
     )
     run_p.add_argument(
         'workflow', nargs='?', default=None,
-        help='Workflow name, or a path to a workflow .json file. With a '
-             'name, uses panel_configs/<name>.json and '
-             'workflows/<name>.json. With a path, reads the JSON from '
-             'where it is. UI-format sources are auto-converted to API '
-             'format. Defaults to the only config on disk if there is '
-             'exactly one.',
+        help='Workflow name, or a path to a workflow .json file. '
+             'Omit to run against the daemon\'s currently active '
+             'workflow. When a name is given, the daemon loads it and '
+             'autoloads panel_configs/<name>.json if it exists.',
+    )
+    run_p.add_argument(
+        '--config', default=None, metavar='NAME',
+        help='Apply panel_configs/<NAME>.json on top of whatever the '
+             'daemon has active. Omit to leave the daemon\'s current '
+             'config untouched (docker / web panel edits survive).',
     )
     run_p.set_defaults(func=cmd_run)
 

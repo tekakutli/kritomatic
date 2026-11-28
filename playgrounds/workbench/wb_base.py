@@ -1,4 +1,18 @@
 # workbench/wb_base.py
+"""
+wb_base.py — the workbench's CSS and HTML structure.
+
+WB_CSS styles the topbar (tab bar, +, ⚙), the iframe container, the
+start popup, and the transient banner.  The Manage-playgrounds modal
+frame, list rows, and status styles come from
+pgruntime/hub_manage_ui.py (HUB_MANAGE_UI_CSS) so the same modal
+looks identical in remote_panel and workbench.
+
+The ⚙ button (id `wbManageBtn`) is new: clicking it opens the shared
+Manage-playgrounds modal.  It's a `.wb-start-btn` so it inherits the
+existing + button styling — no new CSS needed.
+"""
+
 WB_CSS = """
   html, body {
     margin: 0; padding: 0; height: 100%; overflow: hidden;
@@ -58,6 +72,13 @@ WB_CSS = """
   }
   .wb-start-btn:hover:not(:disabled) { background: rgba(0,229,255,0.08); }
   .wb-start-btn:disabled { color: #3d4756; cursor: not-allowed; }
+
+  /* The ⚙ button uses a slightly smaller glyph size than the + button
+     so both read as peers rather than the gear dominating. */
+  #wbManageBtn {
+    font-size: 15px;
+    padding: 0 14px;
+  }
 
   #wbStartPopup {
     position: absolute;
@@ -130,6 +151,8 @@ WB_BODY = """
   <button id="wbStartBtn" class="wb-start-btn"
           title="Start a playground and open it here"
           disabled>+</button>
+  <button id="wbManageBtn" class="wb-start-btn"
+          title="Manage playgrounds (running + available to start)">&#9881;</button>
   <div id="wbStartPopup" hidden></div>
 </div>
 <div id="wbFrameContainer"></div>

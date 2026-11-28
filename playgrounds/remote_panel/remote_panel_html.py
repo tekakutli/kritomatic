@@ -3,17 +3,40 @@ remote_panel_html.py — assemble the remote panel's HTML page.
 
 The remote panel is not a playground.  It has no canvas, no sidebar,
 and no pgkit shell.  This module writes its own page: RP_CSS from
-rp_base.py, RP_BODY from rp_base.py, and the concatenation of three
-JS strings in this order:
+rp_base.py, RP_BODY from rp_base.py, the shared Manage-playgrounds
+modal CSS + body from pgruntime/hub_manage_ui.py, and the
+concatenation of four JS strings in this order:
 
-    HUB_CONTROL_JS     (pgruntime/hub_control) — shared with workbench
-    RP_CLIENT_JS       (rp_client)             — panel state + wire
-    RP_UI_JS           (rp_ui)                 — panel DOM
+    HUB_CONTROL_JS     (pgruntime/hub_control)   — shared with workbench
+    HUB_MANAGE_UI_JS   (pgruntime/hub_manage_ui) — shared with workbench
+    RP_CLIENT_JS       (rp_client)               — panel state + wire
+    RP_UI_JS           (rp_ui)                   — panel DOM
 
-The three are concatenated into one classic `<script>` block.  All
-top-level function declarations across the three are hoisted, so
+The four are concatenated into one classic `<script>` block.  All
+top-level function declarations across the four are hoisted, so
 `createHubControl` (from the first) is callable from the second's
-top-of-file `const hubCtrl = createHubControl(...)`.
+`createHubManageUI` calls, and `createHubManageUI` (from the second)
+is callable from the fourth's top-level `_hubManageModal = ...`
+assignment.
+
+Ordering matters: HUB_CONTROL_JS must precede HUB_MANAGE_UI_JS
+(which references `openPlayground` / `launchAndOpen` from
+hub_control).  HUB_MANAGE_UI_JS must precede RP_UI_JS (which calls
+`createHubManageUI(hubCtrl, ...)` at its bottom IIFE).
+
+MANAGE-MODAL EXTRACTION
+=======================
+The Manage-playgrounds modal's DOM, CSS, and rendering logic used to
+live in this page (RP_BODY + RP_CSS + rp_ui.py).  It was extracted
+into pgruntime/hub_manage_ui.py so `workbench/wb_client.py` can
+share it — both pages now offer the same "Manage playgrounds"
+experience backed by one implementation.
+
+The extraction is why RP_BODY no longer declares `#rpMgmtModal`,
+and why RP_CSS no longer declares the shared modal frame
+(`.rp-modal`, `.rp-modal-title`, `.rp-modal-buttons`,
+`.rp-modal-status`, `#rpMgmtList .mgmt-*`) — those come from
+HUB_MANAGE_UI_CSS now.
 
 LOG MIRRORING — INLINE, NOT VIA pgkit/panel_core.js
 ===================================================
@@ -58,12 +81,12 @@ Opt-out parity with pgkit/panel_core.js:
                                emits nothing tagged `[boot]`, so
                                there is nothing to silence.
 
-Because the override installs BEFORE rp_client.js, rp_ui.js, and
-hub_control.js (it is a plain `<script>` in the `<head>`, before
-the concatenated script at the bottom of `<body>`), every
-`console.error` and every `rpLog("error", ...)` that routes through
-`console.error` from any of those files is captured from the very
-first line.
+Because the override installs BEFORE rp_client.js, rp_ui.js,
+hub_control.js, and hub_manage_ui.js (it is a plain `<script>` in
+the `<head>`, before the concatenated script at the bottom of
+`<body>`), every `console.error` and every `rpLog("error", ...)`
+that routes through `console.error` from any of those files is
+captured from the very first line.
 
 `rpLog` itself is unchanged.  It records to the panel's own log
 array and renders to the panel's own log DOM.  Its "error" kind
@@ -89,7 +112,10 @@ for _p in (_HERE, _PARENT):
 from rp_base       import RP_CSS, RP_BODY
 from rp_client     import RP_CLIENT_JS
 from rp_ui         import RP_UI_JS
-from pgruntime.hub_control import HUB_CONTROL_JS
+from pgruntime.hub_control   import HUB_CONTROL_JS
+from pgruntime.hub_manage_ui import (
+    HUB_MANAGE_UI_CSS, HUB_MANAGE_UI_BODY, HUB_MANAGE_UI_JS,
+)
 
 
 # The inline mirror installer.  A classic `<script>` in `<head>` so it
@@ -192,15 +218,18 @@ def render():
         + _MIRROR_JS
         + "\n</script>\n"
         "<style>\n"
+        + HUB_MANAGE_UI_CSS + "\n"
         + RP_CSS + "\n"
         "</style>\n"
         "</head>\n"
         "<body>\n"
         + RP_BODY + "\n"
+        + HUB_MANAGE_UI_BODY + "\n"
         "<script>\n"
         '"use strict";\n'
-        + HUB_CONTROL_JS + "\n"
-        + RP_CLIENT_JS + "\n"
+        + HUB_CONTROL_JS   + "\n"
+        + HUB_MANAGE_UI_JS + "\n"
+        + RP_CLIENT_JS     + "\n"
         + RP_UI_JS
         + "\n</script>\n"
         "</body>\n"

@@ -102,6 +102,17 @@ PACKAGE CONTENTS
                                 success-only commit.
     pgruntime.js_autosync       AUTOSYNC_JS — makeAutosync(), the
                                 layer-slot poller.
+    pgruntime.hub_control       JS string shared by remote_panel and
+                                workbench: `createHubControl(opts)`
+                                (the hub-management WebSocket + API),
+                                plus `openInWorkbench` / `openInNewTab`
+                                / `openPlayground` / `launchAndOpen`
+
+    pgruntime.hub_manage_ui     JS string shared by remote_panel and
+                                workbench: the "Manage playgrounds"
+                                modal (DOM, CSS, and rendering logic).
+                                Consumes a `hubCtrl` from
+                                `pgruntime.hub_control`.
 """
 
 __version__ = "0.1.0"

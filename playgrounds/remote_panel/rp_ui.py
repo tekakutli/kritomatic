@@ -9,43 +9,33 @@ Adds:
     rpCopyState()             copy to clipboard
     rpDownloadState()         download as remote_panel_state.json
 
-    rpOpenManagement()        opens the hub-management modal
-    rpCloseManagement()       closes it
-    rpRebuildManagementList() render rows from _rp.playgrounds and
-                              the "Available to start" section
+    rpRebuildManagementList() thin wrapper around
+                              _hubManageModal.render()
 
 Plus the "State JSON" and "Manage" button bindings.
 
-MANAGEMENT MODAL — TWO SECTIONS
-===============================
-`#rpMgmtList` holds one row per registered playground.  Below it,
-`#rpMgmtAvailable` holds a "Start & Open" button per available-but-
-not-running playground.  Availability comes from each launcher's
-`available` list (published by `pgkit/launcher.py` on its control
-channel and merged into the `playgrounds` event by the hub).
+MANAGE PLAYGROUNDS MODAL
+========================
+The DOM, CSS, rendering, and action handlers for the "Manage
+playgrounds" modal live in `pgruntime/hub_manage_ui.py` — shared with
+`workbench/wb_client.py` so both pages show the same UI backed by the
+same code.  This file only:
 
-Per-row action buttons, in order:
+  · constructs the modal once via `createHubManageUI(hubCtrl, {...})`,
+  · wires the panel's `#rpMgmtBtn` to open it,
+  · refreshes it whenever the hub broadcasts a new `playgrounds`
+    event, via `rpRebuildManagementList()` (called from
+    `rp_client.py`'s `onPlaygrounds` callback).
 
-    Open          opens the playground in the workbench if running,
-                  otherwise in a new tab.  Delegates to
-                  `openPlayground` from pgruntime/hub_control.
-    Stop          (only when a launcher in the same group manages
-                  it) stops just this playground; the launcher
-                  process and every other member keep running.
-    Kill          sends `shutdown` to the playground, which for a
-                  grouped member shuts down the whole launcher
-                  process.
-    Force         SIGTERM escalation of Kill.
+Everything else about the modal is unchanged from the pre-extraction
+implementation — row actions, shutdown flow, error mirroring, the
+"Start & Open" buttons on available names.
 
-"Start & Open" on an available row starts the playground AND opens
-it in the workbench (falling back to a new tab if no workbench is
-running).  This is the flag-day change from the previous revision,
-where "Start" started the playground without opening it.
-
-All hub commands (launcher_start / stop / restart, kill,
-shutdown_hub) go through `hubCtrl` — the shared `createHubControl`
-instance from pgruntime/hub_control.py.  This file never touches
-the hub WS directly.
+The old standalone helpers — `_rpBuildOpenButton`,
+`_rpBuildStopButton`, `_rpBuildKillButton`, `_rpBuildForceButton`,
+`_rpBuildStartAndOpenButton`, `_rpRenderAvailableSection`,
+`_rpLauncherManaging`, `_mgmtStatusBad`, `_hubHttpBase` — are gone
+from this file and now live in `pgruntime/hub_manage_ui.py`.
 
 VISIBLE:FALSE FIELDS
 ====================
@@ -54,14 +44,35 @@ carries `visible: false`.  `rpRebuildFields` skips that null.
 
 HUB SHUTDOWN FLOW
 =================
-The "Shut down hub" button calls `hubCtrl.shutdownHub()`, which
-resolves with `{success, message}` on ack or 5s timeout.  Errors are
-surfaced through `_mgmtStatusBad`, which also mirrors each message
-to the terminal via `console.error` (routed to `POST ./__log` by the
-inline head script).
+The shared modal's "Shut down hub" button calls
+`hubCtrl.shutdownHub()`, which resolves with `{success, message}` on
+ack or 5s timeout.  Errors are surfaced through
+`_mgmtStatusBad`-equivalent logic inside the shared module, which
+also mirrors each message to the terminal via `console.error`
+(routed to `POST ./__log` by the inline head script).
 """
 
 RP_UI_JS = r"""
+/* ==========================================================================
+   MANAGE-MODAL HANDLE — populated in the install IIFE at the bottom
+   ==========================================================================
+   Declared here so the onPlaygrounds callback in rp_client.py can
+   call rpRebuildManagementList() safely even before the IIFE runs.
+   `null` until wire-up. */
+
+let _hubManageModal = null;
+
+/* ==========================================================================
+   MANAGE-MODAL REFRESH — called from rp_client.py on every
+   `playgrounds` broadcast
+   ==========================================================================
+   Thin wrapper so rp_client.js's onPlaygrounds callback doesn't
+   need to know about the shared modal's shape. */
+
+function rpRebuildManagementList() {
+  if (_hubManageModal) _hubManageModal.render();
+}
+
 /* ==========================================================================
    PANEL REBUILD
    ========================================================================== */
@@ -359,325 +370,6 @@ function rpDownloadState() {
 }
 
 /* ==========================================================================
-   MANAGEMENT MODAL
-   ==========================================================================
-   Two sections:
-
-   #rpMgmtList         running playgrounds (role="playground")
-   #rpMgmtAvailable    available-to-start (from each launcher's
-                       `available` field, minus currently running)
-
-   The Stop button on a running row calls `hubCtrl.stopPlayground`;
-   the Start & Open button on an available row calls `launchAndOpen`
-   from pgruntime/hub_control.  All hub communication is via
-   `hubCtrl`; this file never touches the WS directly.
-
-   _mgmtStatusBad — MODAL ERROR MIRRORING
-   ======================================
-   `#rpMgmtStatus` is a persistent one-line footer in the modal.  It
-   does NOT auto-clear.  Because persistence means the message is
-   also the durable record a terminal-watching user wants, the two
-   error transitions inside the shutdown-button handler route
-   through `_mgmtStatusBad()`: it writes the footer text and class
-   AND mirrors the message to `console.error`, which the inline
-   script in `remote_panel_html.py`'s `<head>` forwards to `POST
-   ./__log`.
-
-   The "waiting…" and "hub is shutting down…" transitions are
-   progress narration, not failures, and keep their inline writes. */
-
-function _mgmtStatusBad(text) {
-  const el = document.getElementById("rpMgmtStatus");
-  if (el) {
-    el.textContent = text;
-    el.className = "rp-modal-status bad";
-  }
-  try { console.error("[rp-mgmt]", text); } catch (_) {}
-}
-
-function _hubHttpBase() {
-  return hubCtrl.hubHttpBase();
-}
-
-function rpOpenManagement() {
-  const modal = document.getElementById("rpMgmtModal");
-  if (!modal) return;
-  rpRebuildManagementList();
-
-  const btn    = document.getElementById("rpMgmtShutdownHub");
-  const status = document.getElementById("rpMgmtStatus");
-
-  if (!_rp.shuttingDown) {
-    if (btn) { btn.disabled = false; btn.textContent = "Shut down hub"; }
-    if (status) { status.textContent = ""; status.className = "rp-modal-status"; }
-  } else {
-    if (btn) { btn.disabled = true; btn.textContent = "Shutting down\u2026"; }
-    if (status) {
-      status.textContent = "hub is shutting down\u2026";
-      status.className = "rp-modal-status ok";
-    }
-  }
-
-  modal.hidden = false;
-}
-
-function rpCloseManagement() {
-  const modal = document.getElementById("rpMgmtModal");
-  if (!modal) return;
-  modal.hidden = true;
-}
-
-/* ---- launcher helper lookups ------------------------------------- */
-
-function _rpLauncherManaging(name) {
-  return hubCtrl.findLauncherFor(name);
-}
-
-/* ---- per-row button builders ------------------------------------- */
-
-function _rpBuildOpenButton(pg) {
-  const btn = document.createElement("button");
-  btn.textContent = "Open";
-  const base = _hubHttpBase();
-  if (!base) { btn.disabled = true; return btn; }
-
-  btn.title = "Open " + pg.name + " in the workbench"
-            + " (or a new tab if workbench isn't running).";
-  btn.addEventListener("click", () => {
-    openPlayground(pg, {
-      playgrounds: hubCtrl.getPlaygrounds(),
-      hubBase:     base,
-    });
-  });
-  return btn;
-}
-
-function _rpBuildStopButton(pg) {
-  const btn = document.createElement("button");
-  btn.textContent = "Stop";
-  btn.title = "Stop only " + pg.name
-            + ".  The launcher process and its other members keep running.";
-  btn.addEventListener("click", () => {
-    hubCtrl.stopPlayground(pg.name).then((res) => {
-      if (!res.success) _mgmtStatusBad("stop " + pg.name + ": " + (res.message || "failed"));
-    });
-  });
-  return btn;
-}
-
-function _rpBuildKillButton(pg, groupNote) {
-  const btn = document.createElement("button");
-  btn.className = "danger";
-  btn.textContent = "Kill";
-  btn.title = "Ask " + pg.name + " to shut down cooperatively" + groupNote;
-  btn.addEventListener("click", () => {
-    hubCtrl.killPlayground(pg.name, false).then((res) => {
-      if (!res.success) _mgmtStatusBad("kill " + pg.name + ": " + (res.message || "failed"));
-    });
-  });
-  return btn;
-}
-
-function _rpBuildForceButton(pg, groupNote) {
-  const btn = document.createElement("button");
-  btn.className = "danger";
-  btn.textContent = "Force";
-  btn.title = "Escalate to SIGTERM if cooperative shutdown "
-            + "does not complete" + groupNote;
-  btn.addEventListener("click", () => {
-    let msg = "Force-kill " + pg.name
-            + (pg.pid ? (" (pid " + pg.pid + ")") : "")
-            + "?\n\nThis sends SIGTERM if cooperative shutdown "
-            + "fails within five seconds.";
-    if (pg.group) {
-      msg += "\n\nThis playground is in group '" + pg.group + "'. "
-           + "Killing it shuts down every playground in that group.";
-    }
-    if (!confirm(msg)) return;
-    hubCtrl.killPlayground(pg.name, true).then((res) => {
-      if (!res.success) _mgmtStatusBad("force " + pg.name + ": " + (res.message || "failed"));
-    });
-  });
-  return btn;
-}
-
-/* Start & Open — start the playground, then open it in the workbench
-   (falling back to a new browser tab if no workbench is running). */
-function _rpBuildStartAndOpenButton(name) {
-  const btn = document.createElement("button");
-  btn.textContent = "Start & Open";
-  btn.style.cssText = "padding:3px 10px;border:1px solid "
-    + "rgba(140,225,160,0.72);background:transparent;color:#b8ecff;"
-    + "border-radius:2px;font-family:inherit;font-size:10px;"
-    + "letter-spacing:0.08em;text-transform:uppercase;font-weight:700;"
-    + "cursor:pointer;";
-  btn.title = "Start " + name + " and open it in the workbench"
-            + " (or a new browser tab if workbench isn't running)";
-  btn.addEventListener("click", async () => {
-    btn.disabled = true;
-    try {
-      await launchAndOpen(name, hubCtrl, { preferWorkbench: true });
-    } catch (e) {
-      _mgmtStatusBad("start " + name + ": " + (e.message || e));
-    } finally {
-      btn.disabled = false;
-    }
-  });
-  return btn;
-}
-
-/* ---- the two sections -------------------------------------------- */
-
-function _rpRenderAvailableSection(launchers, runningNames) {
-  let section = document.getElementById("rpMgmtAvailable");
-  if (!section) {
-    section = document.createElement("div");
-    section.id = "rpMgmtAvailable";
-    section.style.cssText =
-      "margin-top:12px;border-top:1px solid #1e2836;padding-top:10px;";
-    const listEl = document.getElementById("rpMgmtList");
-    if (listEl && listEl.parentNode) {
-      listEl.parentNode.insertBefore(section, listEl.nextSibling);
-    }
-  }
-  section.innerHTML = "";
-
-  for (const launcher of launchers) {
-    const avail = (launcher.available || []).filter(
-      n => !runningNames.has(n)
-    );
-    if (avail.length === 0) continue;
-
-    const h = document.createElement("div");
-    h.textContent = "Available to start (group '"
-                  + (launcher.group || launcher.name) + "'):";
-    h.style.cssText =
-      "font-size:10px;color:#5a6774;margin-bottom:6px;"
-      + "letter-spacing:0.04em;";
-    section.appendChild(h);
-
-    for (const name of avail) {
-      const row = document.createElement("div");
-      row.style.cssText =
-        "display:flex;align-items:center;gap:10px;"
-        + "padding:6px 12px;border-bottom:1px solid #1e2836;";
-
-      const lbl = document.createElement("span");
-      lbl.textContent = name;
-      lbl.style.cssText = "flex:1;font-size:11px;color:#dce6f2;";
-      row.appendChild(lbl);
-
-      row.appendChild(_rpBuildStartAndOpenButton(name));
-      section.appendChild(row);
-    }
-  }
-}
-
-function rpRebuildManagementList() {
-  const list = document.getElementById("rpMgmtList");
-  const hint = document.getElementById("rpMgmtHint");
-  if (!list) return;
-
-  if (!_rp.hubConnected) {
-    list.innerHTML = "";
-    const empty = document.createElement("div");
-    empty.className = "mgmt-empty";
-    empty.textContent =
-      "Not connected to a hub. Start any playground to spawn it.";
-    list.appendChild(empty);
-    if (hint) {
-      hint.textContent =
-        "The pgkit hub is spawned automatically by the first playground "
-        + "you run. Once it is up, playgrounds register with it and "
-        + "appear here. The hub outlives any individual playground's "
-        + "terminal.";
-    }
-    return;
-  }
-
-  if (hint) {
-    hint.textContent =
-      "Running playgrounds below.  Stop shuts down one member; Kill "
-      + "shuts down its whole group (a shared-process launcher dies as "
-      + "a unit).  Force escalates Kill to SIGTERM if cooperative "
-      + "shutdown does not complete within five seconds.";
-  }
-
-  list.innerHTML = "";
-  const running = _rp.playgrounds.filter(p => p.role === "playground")
-                                .sort((a, b) => (a.name || "")
-                                .localeCompare(b.name || ""));
-
-  const launchers = _rp.playgrounds.filter(p => p.role === "launcher");
-
-  if (running.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "mgmt-empty";
-    empty.textContent = "No playgrounds registered.";
-    list.appendChild(empty);
-    _rpRenderAvailableSection(launchers, new Set());
-    return;
-  }
-
-  const base = _hubHttpBase();
-  const runningNames = new Set(running.map(p => p.name));
-
-  for (const pg of running) {
-    const row = document.createElement("div");
-    row.className = "mgmt-row";
-
-    const name = document.createElement("span");
-    name.className = "mgmt-name";
-    name.textContent = pg.name;
-    name.title = pg.name;
-    row.appendChild(name);
-
-    const role = document.createElement("span");
-    role.className = "mgmt-role";
-    role.textContent = pg.role || "?";
-    row.appendChild(role);
-
-    const port = document.createElement("span");
-    port.className = "mgmt-port";
-    port.textContent = ":" + (pg.port || "?");
-    row.appendChild(port);
-
-    const pid = document.createElement("span");
-    pid.className = "mgmt-pid";
-    pid.textContent = pg.pid ? ("pid " + pg.pid) : "\u2014";
-    row.appendChild(pid);
-
-    const actions = document.createElement("div");
-    actions.className = "mgmt-actions";
-
-    if (base) {
-      actions.appendChild(_rpBuildOpenButton(pg));
-
-      // Stop: offered only when a launcher manages this playground.
-      const manager = _rpLauncherManaging(pg.name);
-      if (manager) actions.appendChild(_rpBuildStopButton(pg));
-
-      const groupNote = pg.group
-        ? " (group '" + pg.group + "'; killing this shuts down every "
-          + "playground in that group)"
-        : "";
-      actions.appendChild(_rpBuildKillButton(pg, groupNote));
-      actions.appendChild(_rpBuildForceButton(pg, groupNote));
-    } else {
-      const note = document.createElement("span");
-      note.style.cssText = "font-size:10px;color:#5a6774;";
-      note.textContent = "(no actions)";
-      actions.appendChild(note);
-    }
-
-    row.appendChild(actions);
-    list.appendChild(row);
-  }
-
-  _rpRenderAvailableSection(launchers, runningNames);
-}
-
-/* ==========================================================================
    INSTALL
    ========================================================================== */
 
@@ -766,71 +458,27 @@ function rpRebuildManagementList() {
     });
   }
 
-  if (mgmtBtn) mgmtBtn.addEventListener("click", rpOpenManagement);
-
-  const mgmtClose    = document.getElementById("rpMgmtClose");
-  const mgmtModal    = document.getElementById("rpMgmtModal");
-  const mgmtShutdown = document.getElementById("rpMgmtShutdownHub");
-  const mgmtStatus   = document.getElementById("rpMgmtStatus");
-
-  if (mgmtClose) mgmtClose.addEventListener("click", rpCloseManagement);
-  if (mgmtModal) {
-    mgmtModal.addEventListener("click", (e) => {
-      if (e.target === mgmtModal) rpCloseManagement();
-    });
-  }
-
-  if (mgmtShutdown) {
-    mgmtShutdown.addEventListener("click", async () => {
-      if (!hubCtrl.isConnected()) {
-        _mgmtStatusBad("hub not connected");
-        return;
-      }
-      if (!confirm(
-            "Shut down the hub AND every playground it manages?\n\n"
-          + "This will close every playground process and the hub "
-          + "itself. You'll need to start a playground again to "
-          + "bring the hub back up."
-      )) return;
-
-      mgmtShutdown.disabled = true;
-      mgmtShutdown.textContent = "Shutting down\u2026";
-      if (mgmtStatus) {
-        mgmtStatus.textContent = "waiting for hub acknowledgment\u2026";
-        mgmtStatus.className = "rp-modal-status warn";
-      }
-      _rp.shuttingDown = true;
-
-      const result = await hubCtrl.shutdownHub();
-
-      if (result.success) {
-        if (mgmtStatus) {
-          mgmtStatus.textContent = "hub is shutting down\u2026";
-          mgmtStatus.className = "rp-modal-status ok";
-        }
-        setTimeout(() => {
-          const m = document.getElementById("rpMgmtModal");
-          if (m) m.hidden = true;
-        }, 1500);
-      } else {
-        _rp.shuttingDown = false;
-        _mgmtStatusBad(result.message || "shutdown failed");
-        mgmtShutdown.disabled = false;
-        mgmtShutdown.textContent = "Shut down hub";
-      }
-    });
-  }
-
-  const mgmtOpenWb = document.getElementById("rpMgmtOpenWorkbench");
-  if (mgmtOpenWb) mgmtOpenWb.addEventListener("click", () => {
-    const base = _hubHttpBase();
-    const wb = _rp.playgrounds.find(
-      p => p.role === "panel" && p.name === "workbench"
-    );
-    if (!base || !wb) { _mgmtStatusBad("workbench not running"); return; }
-    const wbHtml = wb.html_file || "workbench.html";
-    window.open(base + "/workbench/" + wbHtml, "workbench");
+  // ---- Manage playgrounds modal -------------------------------
+  //
+  // The modal's DOM, CSS, and rendering logic live in
+  // pgruntime/hub_manage_ui.py (shared with workbench).  All this
+  // file does is construct it and wire the trigger button.
+  //
+  // `logFn: rpLog` routes the modal's error mirroring through the
+  // panel's own log — which in turn posts to `./__log` via the
+  // console.error override installed in remote_panel_html.py's
+  // inline <head> script.  Same behavior as before the extraction.
+  //
+  // `preferWorkbench: true` matches the old behavior: the "Open"
+  // button delegates to `openInWorkbench` first, falling back to a
+  // new tab only when no workbench is running.
+  _hubManageModal = createHubManageUI(hubCtrl, {
+    logFn:            rpLog,
+    preferWorkbench:  true,
   });
+  if (mgmtBtn) {
+    mgmtBtn.addEventListener("click", () => _hubManageModal.open());
+  }
 
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
@@ -840,9 +488,10 @@ function rpRebuildManagementList() {
         rpCloseStateModal();
         return;
       }
-      if (mgmtModal && !mgmtModal.hidden) {
+      const manageModalEl = document.getElementById("hubManageModal");
+      if (manageModalEl && !manageModalEl.hidden && _hubManageModal) {
         e.preventDefault();
-        rpCloseManagement();
+        _hubManageModal.close();
         return;
       }
     }

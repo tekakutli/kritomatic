@@ -14,6 +14,23 @@ WB_CLIENT_JS = r"""
    This file wires its callbacks into the tab manager and the
    "+ Start & Open" popup.
 
+   THE ⚙ BUTTON — SHARED MANAGE MODAL
+   ==================================
+   The ⚙ button in the tab row opens the same "Manage playgrounds"
+   modal that the remote panel exposes.  The modal's DOM, CSS, and
+   rendering logic live in pgruntime/hub_manage_ui.py
+   (createHubManageUI).  This file constructs one instance, wires
+   the ⚙ button to `_hubManageModal.open()`, and refreshes the modal
+   whenever `playgrounds` changes (via `_hubManageModal.render()` in
+   the onPlaygrounds callback).
+
+   Compared to remote_panel's instance, workbench uses
+   `logFn` that routes errors through `console.error("[wb-mgmt]",...)`
+   (which the inline-head mirror in workbench_html.py forwards to
+   `POST ./__log`) and `preferWorkbench: true` so the modal's "Open"
+   button navigates *this* workbench tab (via hash) rather than
+   spawning a new tab.
+
    START & OPEN — TWO LAYERS
    =========================
    The catalog of *available* playgrounds lives on the workbench's
@@ -53,8 +70,7 @@ WB_CLIENT_JS = r"""
    ready".  Removed: the button is always clickable.  If the user
    clicks it while the hub is still down, `wbStartAndOpen` spawns
    the subprocess normally and its 20 s poll window is enough for
-   the hub to come up and broadcast the registration.
-*/
+   the hub to come up and broadcast the registration. */
 
 const _wb = {
   playgrounds: [],       // populated from onPlaygrounds
@@ -63,6 +79,11 @@ const _wb = {
   catalog:     [],       // populated from POST /catalog
 };
 
+/* Handle to the shared Manage-playgrounds modal.  Populated in the
+   install IIFE at the bottom; declared here so `onPlaygrounds` can
+   safely call `.render()` even before the IIFE runs. */
+let _hubManageModal = null;
+
 /* ============ HUB CONTROL ============ */
 
 const hubCtrl = createHubControl({
@@ -70,6 +91,7 @@ const hubCtrl = createHubControl({
     _wb.playgrounds = list;
     wbSyncTabs();
     wbRefreshStartButton();
+    if (_hubManageModal) _hubManageModal.render();
   },
   onConnected: function () {
     wbRefreshStartButton();
@@ -79,6 +101,7 @@ const hubCtrl = createHubControl({
     wbRefreshStartButton();
     const pop = document.getElementById("wbStartPopup");
     if (pop) pop.hidden = true;
+    if (_hubManageModal) _hubManageModal.render();
   },
   onError: function (msg) {
     try { console.error("[wb hub]", msg); } catch (_) {}
@@ -366,6 +389,27 @@ async function wbStartAndOpen(name) {
     wbRefreshStartButton();
     const btn = document.getElementById("wbStartBtn");
     if (btn) btn.addEventListener("click", () => { wbOpenStartPopup(); });
+
+    // ---- Manage playgrounds modal -------------------------------
+    //
+    // Same shared modal that the remote panel opens; see
+    // pgruntime/hub_manage_ui.py.  Errors route through
+    // console.error so the inline-head mirror in
+    // workbench_html.py forwards them to `POST ./__log`.
+    // `preferWorkbench: true` makes the modal's "Open" button
+    // navigate *this* workbench tab (via hash) rather than
+    // spawning a new tab.
+    _hubManageModal = createHubManageUI(hubCtrl, {
+      logFn: function (kind, text) {
+        if (kind === "error")      { try { console.error("[wb-mgmt]", text); } catch (_) {} }
+        else if (kind === "warn")  { try { console.warn ("[wb-mgmt]", text); } catch (_) {} }
+      },
+      preferWorkbench: true,
+    });
+    const manageBtn = document.getElementById("wbManageBtn");
+    if (manageBtn) {
+      manageBtn.addEventListener("click", () => _hubManageModal.open());
+    }
   }
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", start);

@@ -1,15 +1,26 @@
 """
 rp_base.py — the remote panel's CSS and HTML structure.
 
-Adds a small `#rpMgmtStatus` span to the Manage modal's footer so the
-shutdown flow can report state ("waiting for hub acknowledgment…",
-"hub is shutting down…", "no acknowledgment within 5s") without the
-user having to open the collapsed log panel.  `.rp-modal-status`
-carries the color classes used by that span.
+The shared modal *frame* (`.rp-modal`, `.rp-modal-title`,
+`.rp-modal-buttons`, `.rp-modal-status`, `.hub-modal-backdrop`) has
+been extracted into `pgruntime/hub_manage_ui.py` so both remote_panel
+and workbench render identical modals from one source.  This file
+keeps only the parts specific to remote_panel:
 
-Everything else — topbar, actions panel, fields panel, log panel,
-action-form modal, state-JSON modal, kill/force buttons, management
-list rows — is unchanged.
+  · the topbar, actions panel, fields panel, log panel
+  · the state-JSON modal sizing (`.rp-state-body` and the
+    `#rpStateModal .rp-modal { ... }` override)
+  · the action-form modal's field styles (`.rp-modal-field`,
+    `.rp-modal-file-*`, `#rpModalBody`)
+  · the primary-button variants (`#rpModalSend`, `#rpStateDownload`)
+
+The Manage-playgrounds modal DOM is no longer declared here — it
+arrives via `HUB_MANAGE_UI_BODY` in `remote_panel_html.py`'s render().
+
+The action-form and state-JSON modals gain the shared
+`hub-modal-backdrop` class in `RP_BODY` so they pick up the shared
+frame's fixed-positioning / backdrop-dim / flex-centering rules
+without re-declaring them.
 """
 
 RP_CSS = r"""
@@ -508,48 +519,42 @@ RP_CSS = r"""
   .log-cmd       { color: var(--warn); }
   .log-error     { color: var(--danger); }
 
-  #rpModalBackdrop,
-  #rpStateModal,
-  #rpMgmtModal {
-    position: fixed; inset: 0; z-index: 100;
-    background: rgba(0, 0, 0, 0.55);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  #rpModalBackdrop[hidden],
-  #rpStateModal[hidden],
-  #rpMgmtModal[hidden] { display: none; }
+  /* ==========================================================================
+     STATE-JSON MODAL — frame comes from HUB_MANAGE_UI_CSS; this file
+     only supplies the content-region sizing and styling.
+     ========================================================================== */
 
-  .rp-modal {
-    background: var(--bg-panel);
-    border: 1px solid var(--border-2);
-    border-radius: 4px;
-    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.7);
-    min-width: 380px;
-    max-width: 520px;
-    padding: 16px 20px;
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-  }
   #rpStateModal .rp-modal {
     width: 80vw;
     max-width: 900px;
   }
-  #rpMgmtModal .rp-modal {
-    width: 80vw;
-    max-width: 720px;
-  }
-  .rp-modal-title {
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
+  .rp-state-body {
+    margin: 0;
+    padding: 10px 14px;
+    max-height: 60vh;
+    overflow: auto;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 1.4;
     color: var(--accent);
-    border-bottom: 1px solid var(--border);
-    padding-bottom: 8px;
+    white-space: pre;
+    font-variant-numeric: tabular-nums;
   }
+  .rp-state-body::-webkit-scrollbar { width: 8px; height: 8px; }
+  .rp-state-body::-webkit-scrollbar-track { background: transparent; }
+  .rp-state-body::-webkit-scrollbar-thumb {
+    background: var(--border-3);
+    border-radius: 4px;
+  }
+
+  /* ==========================================================================
+     ACTION-FORM MODAL — frame comes from HUB_MANAGE_UI_CSS; this
+     file supplies the field row styles.
+     ========================================================================== */
+
   #rpModalBody {
     display: flex;
     flex-direction: column;
@@ -609,58 +614,9 @@ RP_CSS = r"""
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .rp-modal-buttons {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    padding-top: 6px;
-    border-top: 1px solid var(--border);
-  }
-  .rp-modal-buttons button {
-    padding: 6px 14px;
-    cursor: pointer;
-    border: 1px solid var(--border-2);
-    background: transparent;
-    color: var(--text-dim);
-    border-radius: 2px;
-    font-family: var(--mono);
-    font-size: 10px;
-    letter-spacing: 0.10em;
-    text-transform: uppercase;
-    font-weight: 700;
-  }
-  .rp-modal-buttons button:hover:not(:disabled) {
-    border-color: var(--border-3);
-    color: var(--text);
-    background: rgba(220,230,242,0.03);
-  }
-  .rp-modal-buttons button:disabled {
-    color: var(--text-faint);
-    border-color: var(--border);
-    cursor: not-allowed;
-  }
 
-  /* Inline status text in the modal footer.  Sits to the left of the
-     buttons (the buttons carry `flex: 0 0 auto` implicitly; the span
-     grows to fill the space in between).  Used by the hub-shutdown
-     flow to report state without requiring the log panel to be
-     open. */
-  .rp-modal-status {
-    flex: 1 1 auto;
-    align-self: center;
-    font-size: 10px;
-    color: var(--text-mute);
-    letter-spacing: 0.02em;
-    text-align: right;
-    padding-right: 6px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .rp-modal-status.ok   { color: var(--accent); }
-  .rp-modal-status.warn { color: var(--warn); }
-  .rp-modal-status.bad  { color: var(--danger); }
-
+  /* Primary-button variants — action-form "Send" and state-modal
+     "Download" get the accent treatment. */
   #rpModalSend,
   #rpStateDownload {
     border-color: rgba(0,229,255,0.55);
@@ -670,116 +626,6 @@ RP_CSS = r"""
   #rpStateDownload:hover:not(:disabled) {
     border-color: var(--accent);
     background: rgba(0,229,255,0.08);
-  }
-  #rpMgmtShutdownHub {
-    border-color: rgba(255,105,125,0.55);
-    color: var(--danger-b);
-  }
-  #rpMgmtShutdownHub:hover:not(:disabled) {
-    border-color: var(--danger-a);
-    background: rgba(255,90,105,0.08);
-    color: #ffd0d8;
-  }
-
-  /* Management list rows (built dynamically by rp_ui.py). */
-  #rpMgmtList .mgmt-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 8px 12px;
-    border-bottom: 1px solid var(--border);
-    font-size: 11px;
-  }
-  #rpMgmtList .mgmt-row:last-child { border-bottom: none; }
-  #rpMgmtList .mgmt-name {
-    flex: 0 0 130px;
-    font-weight: 700;
-    color: var(--text);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  #rpMgmtList .mgmt-role {
-    flex: 0 0 78px;
-    font-size: 9px;
-    color: var(--text-mute);
-    text-transform: uppercase;
-    letter-spacing: 0.10em;
-    font-weight: 700;
-  }
-  #rpMgmtList .mgmt-port {
-    flex: 0 0 60px;
-    font-size: 10px;
-    color: var(--text-faint);
-    font-variant-numeric: tabular-nums;
-  }
-  #rpMgmtList .mgmt-pid {
-    flex: 0 0 90px;
-    font-size: 10px;
-    color: var(--text-faint);
-    font-variant-numeric: tabular-nums;
-  }
-  #rpMgmtList .mgmt-actions {
-    flex: 1 1 auto;
-    display: flex;
-    gap: 6px;
-    justify-content: flex-end;
-  }
-  #rpMgmtList .mgmt-actions button {
-    padding: 3px 10px;
-    cursor: pointer;
-    border: 1px solid var(--border-2);
-    background: transparent;
-    color: var(--text-dim);
-    border-radius: 2px;
-    font-family: var(--mono);
-    font-size: 10px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    font-weight: 700;
-  }
-  #rpMgmtList .mgmt-actions button:hover {
-    border-color: var(--border-3);
-    color: var(--text);
-    background: rgba(220,230,242,0.03);
-  }
-  #rpMgmtList .mgmt-actions button.danger {
-    border-color: rgba(255,105,125,0.55);
-    color: var(--danger-b);
-  }
-  #rpMgmtList .mgmt-actions button.danger:hover {
-    border-color: var(--danger-a);
-    background: rgba(255,90,105,0.08);
-    color: #ffd0d8;
-  }
-  #rpMgmtList .mgmt-empty {
-    padding: 20px;
-    text-align: center;
-    font-size: 11px;
-    color: var(--text-faint);
-    font-style: italic;
-  }
-
-  .rp-state-body {
-    margin: 0;
-    padding: 10px 14px;
-    max-height: 60vh;
-    overflow: auto;
-    background: var(--bg-input);
-    border: 1px solid var(--border);
-    border-radius: 2px;
-    font-family: var(--mono);
-    font-size: 10px;
-    line-height: 1.4;
-    color: var(--accent);
-    white-space: pre;
-    font-variant-numeric: tabular-nums;
-  }
-  .rp-state-body::-webkit-scrollbar { width: 8px; height: 8px; }
-  .rp-state-body::-webkit-scrollbar-track { background: transparent; }
-  .rp-state-body::-webkit-scrollbar-thumb {
-    background: var(--border-3);
-    border-radius: 4px;
   }
 """
 
@@ -825,7 +671,7 @@ RP_BODY = r"""
   <div class="body" id="rpLogBody"></div>
 </div>
 
-<div id="rpModalBackdrop" hidden>
+<div id="rpModalBackdrop" class="hub-modal-backdrop" hidden>
   <div class="rp-modal">
     <div class="rp-modal-title" id="rpModalTitle">Action</div>
     <div id="rpModalBody"></div>
@@ -836,7 +682,7 @@ RP_BODY = r"""
   </div>
 </div>
 
-<div id="rpStateModal" hidden>
+<div id="rpStateModal" class="hub-modal-backdrop" hidden>
   <div class="rp-modal">
     <div class="rp-modal-title">State JSON</div>
     <pre id="rpStateBody" class="rp-state-body">{}</pre>
@@ -844,35 +690,6 @@ RP_BODY = r"""
       <button id="rpStateCopy">Copy</button>
       <button id="rpStateDownload">Download</button>
       <button id="rpStateClose">Close</button>
-    </div>
-  </div>
-</div>
-
-<div id="rpMgmtModal" hidden>
-  <div class="rp-modal">
-    <div class="rp-modal-title">Manage playgrounds</div>
-    <div id="rpMgmtHint"
-         style="font-size:10px;color:#5a6774;line-height:1.5;">
-      Playgrounds are registered with the pgkit hub.  Click Kill to
-      ask one to shut down.  Force escalates to SIGTERM if cooperative
-      shutdown does not complete within five seconds.
-    </div>
-    <div id="rpMgmtList"
-         style="max-height:50vh;overflow:auto;
-                border:1px solid #1e2836;border-radius:2px;">
-    </div>
-    <div class="rp-modal-buttons">
-      <span id="rpMgmtStatus" class="rp-modal-status"></span>
-      <button id="rpMgmtShutdownHub"
-              title="Ask the hub to shut down, and every playground
-                     it manages with it.">
-        Shut down hub
-      </button>
-      <button id="rpMgmtOpenWorkbench"
-              title="Open (or focus) the workbench in a browser tab.">
-        Open workbench
-      </button>
-      <button id="rpMgmtClose">Close</button>
     </div>
   </div>
 </div>
